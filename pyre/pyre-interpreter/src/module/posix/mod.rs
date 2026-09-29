@@ -157,12 +157,8 @@ pub(crate) fn fspath(
     let arg = pyre_object::gc_roots::pin_root(arg);
     let path_type = crate::typedef::r#type(arg);
     if let Some(pt) = path_type
-        && let Some(fspath_descr) = unsafe {
-            crate::baseobjspace::lookup_in_type(
-                pt.as_ptr(),
-                "__fspath__",
-            )
-        }
+        && let Some(fspath_descr) =
+            unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
     {
         let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(fspath_descr);

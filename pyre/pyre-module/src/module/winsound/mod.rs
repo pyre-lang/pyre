@@ -42,10 +42,7 @@ fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, pyre_interpreter::PyError>
         // `type(sound).__fspath__(sound)` — the descriptor read off the type is
         // unbound, so the object is supplied as the sole argument.
         let Some(fspath_fn) = pyre_interpreter::typedef::r#type(sound).and_then(|pt| unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type(
-                pt.as_ptr(),
-                "__fspath__",
-            )
+            pyre_interpreter::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__")
         }) else {
             return Err(pyre_interpreter::PyError::type_error(format!(
                 "expected str, bytes or os.PathLike object, not {}",

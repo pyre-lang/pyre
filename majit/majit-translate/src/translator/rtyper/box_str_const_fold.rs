@@ -158,6 +158,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), payload.to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),
@@ -170,6 +171,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg]),
@@ -187,6 +189,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: vec![LinkArg::from(value)],
@@ -278,6 +281,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: vec![LinkArg::from(crate::flowspace::model::ConstValue::None)],

@@ -244,19 +244,25 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
             }
             // A zero-length shaped aggregate that is read as a call argument.
             // `Tuple<>` is Void (`rtuple.TUPLE_TYPE` of an empty field list).
-            // `Array<T;0>` — the empty argument slice `&[]` — is a prebuilt
-            // zero-length `GcArray`: `ListRepr.convert_const` /
-            // `FixedSizeListRepr.prepare_const` malloc immortal with `n == 0`,
-            // and `_ll_prebuilt_empty_array` memos one empty `GcArray` per
-            // item type. Intern the instance so `emit_const_r` can pool that
-            // prebuilt pointer; `history.CONST_NULL` is only a genuine NULL.
+            // A headerless `Array<ITEM;0>` (`Array<u32;0>`) inherits
+            // `Struct._gckind = 'raw'`, so `lltype.malloc(flavor='gc')`
+            // refuses it: intern a singleton rather than a struct `new`.
+            // `history.CONST_NULL` is only a genuine NULL.
             //
-            // Leaving it as a traced allocation is what
-            // `positional_shape_metadata` derives with zero rows and no
-            // collector-issued type id, which the walker rejects with
-            // `UnregisteredNewGcType` after the descent has already run.
+            // An `Array<ITEM;0>` whose `&[ITEM]` reader is a length-prefixed
+            // GcArray is not that raw array. `rewrite_op_direct_call` already
+            // classifies it with `fixed_list_reader` (`slice_array_type_id` +
+            // `nolength_from_array_type_id`); `_flat_pycall` passes `&[]` as
+            // one `GcArray(OBJECTPTR)` word (`rlist.py`) and
+            // `do_fixed_newlist_clear` allocates it with `new_array_clear(0)`.
+            // `_ll_prebuilt_empty_array` memos one empty `GcArray` per item
+            // type. A HostObject PBC's `identity_id` is not a length-prefixed
+            // block, so `arraylen_gc` / `bh_arraylen_gc` reads a translator
+            // identity as a header. Leave the ctor for `rewrite_op_direct_call`.
+
             if owner_path.is_empty()
                 && is_zero_length_shaped_aggregate(name)
+                && !crate::front::mir::fixed_array_lowers_to_gcarray(name)
                 && let Some(instance) = intern_unit_variant_prebuilt_instance(bk, name, None)
             {
                 op.kind = OpKind::ConstRef(instance);
@@ -498,6 +504,97 @@ mod tests {
         assert!(is_zero_length_shaped_aggregate("Tuple<>"));
         assert!(is_zero_length_shaped_aggregate("Array<*mut PyObject;0>"));
         assert!(is_zero_length_shaped_aggregate("Array<u8;0>"));
+        assert!(crate::front::mir::fixed_array_lowers_to_gcarray(
+            "Array<*mut PyObject;0>"
+        ));
+        assert!(crate::front::mir::fixed_array_lowers_to_gcarray(
+            "Array<*const PyObject;0>"
+        ));
+        assert!(crate::front::mir::fixed_array_lowers_to_gcarray(
+            "Array<i64;0>"
+        ));
+        assert!(!crate::front::mir::fixed_array_lowers_to_gcarray(
+            "Array<u32;0>"
+        ));
+        assert!(!crate::front::mir::fixed_array_lowers_to_gcarray(
+            "Array<*mut i64;0>"
+        ));
+        assert!(crate::front::mir::fixed_array_lowers_to_gcarray(
+            "Array<*mut PyObject;1>"
+        ));
+    }
+
+    fn empty_array_ctor_graph(owner: &str) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("empty_array_ctor");
+        let entry = graph.startblock;
+        graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor(owner.to_string()),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: crate::model::ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .unwrap();
+        fold_unit_variant_ctors(&mut graph, None);
+        graph
+    }
+
+    fn ctor_survived(graph: &FunctionGraph, owner: &str) -> bool {
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == owner
+            )
+        })
+    }
+
+    fn became_pbc(graph: &FunctionGraph) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .any(|op| matches!(&op.kind, OpKind::ConstRef(_)))
+    }
+
+    /// A length-prefixed `&[ITEM]` reader stays a ctor so
+    /// `do_fixed_newlist_clear` / `do_fixed_newlist` can emit
+    /// `new_array_clear(0)` / `new_array(0)`. A HostObject PBC is not a
+    /// GcArray.
+    #[test]
+    fn length_prefixed_empty_array_ctor_is_not_a_pbc() {
+        for owner in ["Array<*mut PyObject;0>", "Array<i64;0>"] {
+            let graph = empty_array_ctor_graph(owner);
+            assert!(
+                ctor_survived(&graph, owner),
+                "{owner} must reach rewrite_op_direct_call"
+            );
+            assert!(
+                !became_pbc(&graph),
+                "{owner} must not become a HostObject PBC"
+            );
+        }
+    }
+
+    /// A headerless `&[ITEM]` reader keeps the interned singleton.
+    #[test]
+    fn headerless_empty_array_ctor_is_a_pbc() {
+        for owner in ["Array<u32;0>", "Array<*mut i64;0>"] {
+            let graph = empty_array_ctor_graph(owner);
+            assert!(
+                became_pbc(&graph),
+                "{owner} must intern as a HostObject PBC"
+            );
+            assert!(
+                !ctor_survived(&graph, owner),
+                "{owner} must not remain a ctor"
+            );
+        }
     }
 
     /// The bare roots are not shaped, and a shape that carries items is not

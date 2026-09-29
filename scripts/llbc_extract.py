@@ -173,9 +173,13 @@ def platform_info() -> tuple[str, str]:
 
 def expand_features(arg: str, cargo_features: str) -> str:
     features = [f.strip() for f in cargo_features.split(",") if f.strip()]
-    if "{features}" not in arg or len(features) <= 1:
-        # No placeholder, or a single/absent feature: whole-string
-        # substitution already yields the right flag.
+    if "{features}" not in arg:
+        # Charon matchers use `{impl Trait for _}`; those braces are
+        # not a features placeholder.
+        return arg
+    if len(features) <= 1:
+        # A single/absent feature: whole-string substitution already
+        # yields the right flag.
         return arg.format(features=cargo_features)
     # Multiple features: a template like `crate/{features}` prefixes the
     # placeholder, so splicing the raw `a,b` list into one slot only

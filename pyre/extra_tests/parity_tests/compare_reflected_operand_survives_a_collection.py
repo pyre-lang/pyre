@@ -72,4 +72,20 @@ for i in range(n):
     if len(junk) > 50:
         junk = []
     validate_comparison(MySet())
+
+
+# A proper subtype's reflected method has priority even when it is not a
+# plain function (a staticmethod, classmethod, or custom descriptor).
+class A:
+    def __lt__(self, other):
+        return 'left'
+
+
+class B(A):
+    pass
+
+
+B.__gt__ = staticmethod(lambda other: 'right')
+assert (A() < B()) == 'right'
+
 print("OK")
