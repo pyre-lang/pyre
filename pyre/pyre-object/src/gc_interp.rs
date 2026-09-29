@@ -92,6 +92,18 @@ pub fn note_eval_activation_exit() {
     if depth <= 2 && EXPLICIT_OLDGEN_REQUEST.load(Ordering::Acquire) {
         majit_gc::collector::request_deferred_major_collection();
     }
+    // A nested Python eval just returned. Its frame is unrooted
+    // (`pyframe.py class PyFrame(W_Root)`). The dispatch-loop poll refuses
+    // while `EVAL_NESTING` is ≥ 3, so a recursive call never collects on
+    // its own bytecodes; arm `EB_GC` so the caller's next opcode — after
+    // CALL has finished — runs `do_collect_oldgen_nonmoving`.
+    if enabled()
+        && collect_enabled()
+        && crate::gc_hook::try_gc_isenabled()
+        && crate::gc_hook::try_gc_major_threshold_reached()
+    {
+        majit_gc::collector::request_deferred_major_collection();
+    }
 }
 
 impl EvalActivationGuard {

@@ -1673,6 +1673,29 @@ pub fn all_liveness() -> &'static [u8] {
     &ALL_LIVENESS
 }
 
+/// Build-time `CallInfoCollection` rows. `descr_index` indexes
+/// [`descr_ref_at`]. `func` is still the build-time address.
+pub fn callinfo_rows() -> &'static [majit_ir::effectinfo::CallInfoRow] {
+    static ROWS: LazyLock<Vec<majit_ir::effectinfo::CallInfoRow>> = LazyLock::new(|| {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/callinfos.bin"));
+        bincode::deserialize(BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize callinfos.bin \
+                 ({} bytes): {e}",
+                BYTES.len(),
+            )
+        })
+    });
+    &ROWS
+}
+
+/// Build-process function address → this process, for addresses that are
+/// not symbolic path hashes. Symbolic hashes are rebound by
+/// `EmbeddedJitCodeTable::rebound_symbolic_fnaddr`.
+pub fn rebind_build_fnaddr(func: i64) -> i64 {
+    crate::runtime_fnaddr_patch::runtime_fnaddr(func)
+}
+
 fn call_descr_arg_types(arg_classes: &str) -> Vec<majit_ir::Type> {
     arg_classes
         .chars()
@@ -3748,6 +3771,32 @@ mod tests {
             violations.is_empty(),
             "listed descr offsets disagree with the Rust layout:\n  {}",
             violations.join("\n  "),
+        );
+    }
+
+    /// A `new_with_vtable` size descr is loaded from `descrs.bin` with a
+    /// type-static sentinel. After the descr-pool load the vtable word is
+    /// the runtime `&INT_TYPE`, the address tracing and `bh_new_with_vtable`
+    /// write into `ob_type`.
+    #[test]
+    fn loaded_new_with_vtable_size_descr_carries_runtime_int_type() {
+        use majit_jitcode::jitcode::BhDescr;
+        let live = &pyre_object::INT_TYPE as *const _ as u64;
+        let mut found = false;
+        for index in 0..descr_count() {
+            let Some(descr) = get_descr_by_index(index) else {
+                continue;
+            };
+            if let BhDescr::Size { vtable, .. } = descr
+                && *vtable == live
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "a runtime-loaded new_with_vtable Size descr must carry &INT_TYPE"
         );
     }
 

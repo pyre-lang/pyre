@@ -1349,6 +1349,45 @@ mod tests {
     }
 
     #[test]
+    fn rebind_type_static_size_vtable_replaces_sentinel_with_live_int_type() {
+        use majit_jitcode::codewriter::assembler::type_static_const_sentinel;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let mut descr = BhDescr::Size {
+            size: 16,
+            type_id: 1,
+            vtable: type_static_const_sentinel(3) as u64,
+            owner: "pyobject::INT_TYPE".into(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
+        };
+        rebind_type_static_size_vtable(&mut descr);
+        let BhDescr::Size { vtable, owner, .. } = descr else {
+            panic!("size descr");
+        };
+        assert_eq!(vtable, &pyre_object::INT_TYPE as *const _ as u64);
+        assert!(
+            owner.is_empty(),
+            "the type-static name is only the wire key"
+        );
+
+        let mut concrete = BhDescr::Size {
+            size: 16,
+            type_id: 1,
+            vtable: 0x1000,
+            owner: "W_IntObject".into(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
+        };
+        rebind_type_static_size_vtable(&mut concrete);
+        let BhDescr::Size { vtable, owner, .. } = concrete else {
+            panic!("size descr");
+        };
+        assert_eq!(vtable, 0x1000);
+        assert_eq!(owner, "W_IntObject");
+    }
+
+    #[test]
     fn materialize_unit_variant_consts_interns_one_cell_per_qualname() {
         let mut jcs = vec![
             jitcode_with_unit_variant_consts(vec![unit_variant_desc("JitAction::Return", 1)]),

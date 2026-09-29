@@ -6319,6 +6319,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 .ensure_oopspec_callinfo(oopspec, descr, func, name);
         }
     }
+    // Codewriter rows (`jtransform.py _handle_oopspec_call` →
+    // `callinfocollection.add`). The seeded `OS_STR_CONCAT` and `OS_STREQ_*`
+    // rows stay: `ensure_oopspec_callinfo` does not replace an existing row.
+    install_build_callinfo_rows(d.meta_interp_mut());
     // rlib/jit.py set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
@@ -6358,6 +6362,38 @@ fn build_jit_driver_pair() -> JitDriverPair {
         pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder(),
     );
     (d, info)
+}
+
+fn install_build_callinfo_rows<M: Clone>(meta: &mut majit_metainterp::MetaInterp<M>) {
+    let bindings = pyre_interpreter::jit_trace_fnaddrs();
+    for row in pyre_jit_trace::jitcode_runtime::callinfo_rows() {
+        let mut owned_path = None;
+        if let Some(path) = pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path(row.func) {
+            owned_path = Some(vec![(row.func, path.to_string())]);
+        }
+        let paths: &[(i64, String)] = owned_path.as_deref().unwrap_or(&[]);
+        let symbolic = majit_metainterp::jitcode::EmbeddedJitCodeTable::rebound_symbolic_fnaddr(
+            row.func, paths, &bindings,
+        );
+        let func = if symbolic != row.func {
+            symbolic
+        } else {
+            pyre_jit_trace::jitcode_runtime::rebind_build_fnaddr(row.func)
+        };
+        let descr = pyre_jit_trace::jitcode_runtime::descr_ref_at(row.descr_index as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "callinfo descr index {} is outside Assembler.descrs",
+                    row.descr_index
+                )
+            });
+        meta.ensure_oopspec_callinfo(
+            row.oopspecindex,
+            descr,
+            func as u64,
+            &format!("{:?}", row.oopspecindex),
+        );
+    }
 }
 
 /// After `write_from_resume_data_partial` copies every

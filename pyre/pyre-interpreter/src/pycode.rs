@@ -640,6 +640,14 @@ pub struct PyCode {
     /// `PyFrame::ncells()` / stack-base query (a per-`pop_value` hot path).
     /// `u32::MAX` sentinel when `code_ptr` is null/unaligned (test stubs).
     pub npure_cellvars: u32,
+    /// `pycode.py self.co_nlocals = nlocals` — the `varnames` count.
+    pub co_nlocals: u32,
+    /// `pycode.py self.co_stacksize = stacksize`.
+    pub co_stacksize: u32,
+    /// `len(pycode.py self.co_freevars)`.
+    pub co_nfreevars: u32,
+    /// `pycode.py self.co_flags = flags`.
+    pub co_flags: u32,
     /// `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name) for name in
     /// cellvars]` — one [`CellFamily`] per cellvar, shared by every cell any
     /// frame of this code creates for that cellvar.
@@ -1368,6 +1376,17 @@ fn w_code_new_owned(
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
         crate::pyframe::npure_cellvars(code_ref) as u32
     };
+    let (co_nlocals, co_stacksize, co_nfreevars, co_flags) = if !code_ptr_aligned {
+        (0, 0, 0, 0)
+    } else {
+        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        (
+            code_ref.varnames.len() as u32,
+            code_ref.max_stackdepth,
+            code_ref.freevars.len() as u32,
+            code_ref.flags.bits(),
+        )
+    };
     // `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name) for name in
     // cellvars]`, laid out by localsplus slot — see the field's doc.
     // pycode.py `PyCode._initialize` leaves the list empty when the code has no cellvars.
@@ -1436,6 +1455,10 @@ fn w_code_new_owned(
         hidden_applevel,
         fast_natural_arity,
         npure_cellvars,
+        co_nlocals,
+        co_stacksize,
+        co_nfreevars,
+        co_flags,
         cell_families,
         globals_caches,
         mapdict_caches,
@@ -4254,6 +4277,12 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
 }
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
+///
+/// A slot that already holds a namespace is only compared by identity: a
+/// frame answered `false` keeps reading the `w_globals` it was handed, which
+/// is that same pointer, so nothing is read through the loaded value and a
+/// `Relaxed` load answers it. Only the first store, which has to be
+/// indivisible from its read, goes through [`w_code_publish_frame_global`].
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -4262,6 +4291,31 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     if obj.is_null() {
         return false;
     }
+    let published = unsafe {
+        std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
+            (*(obj as *mut PyCode)).w_globals
+        ))
+        .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    if published.is_null() {
+        return unsafe { w_code_publish_frame_global(obj, w_globals) };
+    }
+    // The wrapper may have moved since its first globals stamp. The live frame
+    // supplying `obj` is authoritative, so keep the raw-code compatibility
+    // registry synchronized even on the cache-hit path.
+    w_code_register_live_wrapper(obj);
+    !std::ptr::eq(published, w_globals)
+}
+
+/// Refresh [`register_live_code_wrapper`] for the code object `obj`.
+#[majit_macros::dont_look_inside]
+fn w_code_register_live_wrapper(obj: PyObjectRef) {
+    register_live_code_wrapper(unsafe { (*(obj as *const PyCode)).code_ptr }, obj);
+}
+
+/// The first `frame_stores_global` store into a code object's `w_globals`.
+#[majit_macros::dont_look_inside]
+unsafe fn w_code_publish_frame_global(obj: PyObjectRef, w_globals: PyObjectRef) -> bool {
     let roots = pyre_object::gc_roots::push_roots();
     let root_base = roots.publish(&[obj, w_globals]);
     roots.normalize(root_base, 2);
@@ -4307,9 +4361,6 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             Err(winner) => published = winner,
         }
     }
-    // The wrapper may have moved since its first globals stamp. The live frame
-    // supplying `obj` is authoritative, so keep the raw-code compatibility
-    // registry synchronized even on the cache-hit path.
     let obj = roots.get(root_base);
     let w_globals = roots.get(root_base + 1);
     register_live_code_wrapper(
@@ -5828,6 +5879,27 @@ mod tests {
         assert!(bounds.advance());
         assert_eq!((bounds.ar_start, bounds.ar_end, bounds.ar_line), (2, 4, 3));
         assert!(!bounds.advance());
+    }
+
+    #[test]
+    fn pycode_co_flags_matches_generator_code_bits() {
+        let code = compile_exec("def f():\n    yield 1\n").expect("compile failed");
+        let nested = code
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                crate::bytecode::ConstantData::Code { code } => Some(code.as_ref().clone()),
+                _ => None,
+            })
+            .expect("generator code");
+        let bits = nested.flags.bits();
+        let w_code = box_code_object(nested);
+        let pycode = unsafe { &*(w_code as *const PyCode) };
+        assert_ne!(
+            pycode.co_flags & crate::astcompiler::consts::CO_GENERATOR,
+            0
+        );
+        assert_eq!(pycode.co_flags, bits);
     }
 
     #[test]

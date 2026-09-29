@@ -2204,14 +2204,6 @@ impl ExecutionContext {
         dict
     }
 
-    /// `pypy/module/__builtin__/moduledef.py:Module.__init__` — `space.builtin`
-    /// is a `Module` (not a dict).  Lazily build a `Module` whose
-    /// backing dict IS `self.builtins_module`, so subsequent
-    /// `module.getdict(space)` access (`pyframe.py fget_f_builtins`)
-    /// surfaces the same storage as a dict view.  The cache field stores
-    /// the Module identity so identity-sensitive callers (PyPy
-    /// `pick_builtin` `if w_builtin is space.builtin: return space.builtin`)
-    /// observe the same object every call.
     /// The dict half of [`Self::get_builtin`] — `interp->builtins`, the
     /// object 3.14 plants as `__builtins__` in a fresh `exec`/`eval`
     /// namespace and in every imported module (only `__main__` gets the
@@ -2220,11 +2212,35 @@ impl ExecutionContext {
         self.builtins_module
     }
 
+    /// `pypy/module/__builtin__/moduledef.py:Module.__init__` — `space.builtin`
+    /// is a `Module` (not a dict).  Lazily build a `Module` whose
+    /// backing dict IS `self.builtins_module`, so subsequent
+    /// `module.getdict(space)` access (`pyframe.py fget_f_builtins`)
+    /// surfaces the same storage as a dict view.  The cache field stores
+    /// the Module identity so identity-sensitive callers (PyPy
+    /// `pick_builtin` `if w_builtin is space.builtin: return space.builtin`)
+    /// observe the same object every call.
     pub fn get_builtin(&self) -> PyObjectRef {
         let cached = execution_context_builtin_cache_get(self);
         if !cached.is_null() {
             return cached;
         }
+        execution_context_build_builtin(self)
+    }
+}
+
+/// The first [`ExecutionContext::get_builtin`] call: wrap the builtins dict in
+/// its `Module` and cache it.  `space.builtin` is built once at space setup,
+/// so a caller only ever reads the cached object; this construction loops
+/// over the namespace and stays a residual call.
+#[majit_macros::dont_look_inside]
+fn execution_context_build_builtin(ec: *const ExecutionContext) -> PyObjectRef {
+    let this = unsafe { &*ec };
+    this.build_builtin()
+}
+
+impl ExecutionContext {
+    fn build_builtin(&self) -> PyObjectRef {
         // `pypy/interpreter/module.py:Module.__init__` — `space.builtin`
         // is a `Module` whose `w_dict` is the `W_ModuleDictObject`
         // allocated by `allocate_and_init_instance(module=True)`
@@ -3018,6 +3034,14 @@ impl ActionFlagOps for SpaceActionFlag {
 /// this gate to those ops is a later port.
 #[majit_macros::dont_look_inside]
 pub fn space_decrement_ticker(ec: &mut ExecutionContext, by: isize) -> isize {
+    // Compiled back-edges poll `EB_GC` every iteration (`assembler.py`
+    // `_call_footer` / the eval-breaker load). The interpreter's ticker is
+    // that poll: a deferred major armed on eval-loop unwind must enter
+    // `action_dispatcher` on this bytecode instead of waiting out
+    // `checkinterval_scaled`.
+    if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_GC != 0 {
+        return -1;
+    }
     let mut actionflag = ec.actionflag;
     actionflag.decrement_ticker(by)
 }

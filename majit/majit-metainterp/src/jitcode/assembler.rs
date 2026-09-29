@@ -6168,28 +6168,6 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// Reinterpret an int-bank word as a ref — `blackhole.py`
-    /// `bhimpl_cast_int_to_ptr`. `[src][dst]` byte layout per the
-    /// `bhhandler_i_r!` decoder.
-    pub fn record_cast_int_to_ptr(&mut self, dst: u16, src: u16) {
-        self.touch_ref_reg(dst);
-        self.touch_reg(src);
-        self.write_insn("cast_int_to_ptr/i>r");
-        self.push_u8(src as u8);
-        self.push_u8(dst as u8);
-    }
-
-    /// Reinterpret a ref-bank word as an int — `blackhole.py`
-    /// `bhimpl_cast_ptr_to_int`. Inverse of [`Self::record_cast_int_to_ptr`].
-    /// `[src][dst]` byte layout per the `bhhandler_r_i!` decoder.
-    pub fn record_cast_ptr_to_int(&mut self, dst: u16, src: u16) {
-        self.touch_reg(dst);
-        self.touch_ref_reg(src);
-        self.write_insn("cast_ptr_to_int/r>i");
-        self.push_u8(src as u8);
-        self.push_u8(dst as u8);
-    }
-
     /// Narrow a float-bank value to the int bank — RPython `cast_float_to_int`
     /// (`blackhole.py bhimpl_cast_float_to_int`). The inverse of
     /// [`Self::record_cast_int_to_float`]: a VALUE cast that truncates toward
@@ -6199,6 +6177,24 @@ impl JitCodeBuilder {
         self.touch_reg(dst);
         self.touch_float_reg(src);
         self.write_insn("cast_float_to_int/f>i");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
+    /// `cast_ptr_to_int/r>i`. Same bits, ref bank to int bank.
+    pub fn record_cast_ptr_to_int(&mut self, dst: u16, src: u16) {
+        self.touch_reg(dst);
+        self.touch_ref_reg(src);
+        self.write_insn("cast_ptr_to_int/r>i");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
+    /// `cast_int_to_ptr/i>r`. Same bits, int bank to ref bank.
+    pub fn record_cast_int_to_ptr(&mut self, dst: u16, src: u16) {
+        self.touch_ref_reg(dst);
+        self.touch_reg(src);
+        self.write_insn("cast_int_to_ptr/i>r");
         self.push_u8(src as u8);
         self.push_u8(dst as u8);
     }

@@ -2786,16 +2786,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "gc_roots::RootScope::normalize_moved",
         pyre_object::gc_roots::root_scope_normalize_moved_jit_abi,
     );
-    // The rest of the scope-local API a bracket body calls on its guard: the
-    // slice-taking pair through the one-word array ABI `publish_roots` uses,
-    // and the run normalize and slot write, whose arguments are words.
-    cpa2!(
+    // The run normalize and slot write take word arguments. The slice-taking
+    // `publish` / `pin_roots` bridges are the `(save_point, ptr, len)` pair
+    // registered below.
+    cpa3!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::publish",
         "gc_roots::RootScope::publish",
         pyre_object::gc_roots::root_scope_publish_jit_abi,
     );
-    cpa2!(
+    cpa3!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::pin_roots",
         "gc_roots::RootScope::pin_roots",
@@ -2863,13 +2863,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_str_from_codepoint",
         pyre_object::unicodeobject::w_str_from_codepoint,
     );
-    cpa1!(
+    cpa2!(
         &mut entries,
         "pyre_interpreter::runtime_ops::build_tuple_from_refs",
         "pyre_interpreter::build_tuple_from_refs",
         crate::runtime_ops::build_tuple_from_refs_jit_abi,
     );
-    cpa1!(
+    cpa2!(
         &mut entries,
         "pyre_interpreter::runtime_ops::build_list_from_refs",
         "pyre_interpreter::build_list_from_refs",
@@ -3651,14 +3651,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_portal_call_3",
         crate::importing::jit_portal_call_3,
     );
-    // `getdictvalue` mapdict arm: already `#[dont_look_inside]`, but
-    // unpublished so the `_initializing` read was a symbolic residual.
-    push_abi_unsound_argument_alias_pair(
+    // `getdictvalue` mapdict arm. The raw fn returns
+    // `Result<Option<PyObjectRef>, PyError>` through sret and takes `&Wtf8`
+    // as two words. The residual call is the one-word-result trampoline
+    // (`dont_look_inside` + `BH_LAST_EXC_VALUE`), same as the other
+    // `__majit_call_target_*` registrations.
+    cpa2!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue_checked",
         "pyre_interpreter::instance_node_getdictvalue_checked",
-        crate::objspace::std::mapdict::instance_node_getdictvalue_checked as *const (),
+        crate::objspace::std::mapdict::__majit_call_target_instance_node_getdictvalue_checked,
     );
     // The same shape over four more runtime-mutable cells:
     // `_io::unsupported_operation_type` reads the `UNSUPPORTED_OPERATION_TYPE`
@@ -7007,6 +7009,17 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             .into_iter()
             .filter(|(_, addr)| !hand_written.contains(addr)),
     );
+    // Fold in `#[prebuilt_static]` class singletons. The macro publishes the
+    // fully-qualified static path. Dedup is on the address, same rule as the
+    // `#[pyre_class]` fold-in, so a hand-written or `#[pyre_class]` row for
+    // the same singleton wins.
+    let present: std::collections::HashSet<i64> = rows.iter().map(|&(_, addr)| addr).collect();
+    majit_ir::helper_fnaddr::for_each_prebuilt_class_static(|desc| {
+        let addr = desc.get() as i64;
+        if !present.contains(&addr) {
+            rows.push((desc.path, addr));
+        }
+    });
     rows
 }
 
@@ -8279,6 +8292,111 @@ mod tests {
         assert_eq!(
             bindings["function::METHOD_WRAPPER_TYPE"],
             &crate::function::METHOD_WRAPPER_TYPE as *const _ as i64
+        );
+    }
+
+    #[test]
+    fn jit_static_pytype_addrs_covers_frame_type() {
+        let expected = &crate::pyframe::FRAME_TYPE as *const _ as i64;
+        assert!(
+            jit_static_pytype_addrs()
+                .into_iter()
+                .any(|(_, addr)| addr == expected),
+            "FRAME_TYPE must be published as a prebuilt class singleton"
+        );
+    }
+
+    #[test]
+    fn helper_fnaddrs_cover_fieldless_enum_residuals() {
+        let mut compare_slot = false;
+        let mut call_mode = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == "pyre_interpreter::objspace::descroperation::compare_slot_rest"
+                && row.arity == 3
+            {
+                compare_slot = true;
+            }
+            if row.path == "pyre_interpreter::call::call_non_function_callable_with_mode"
+                && row.arity == 6
+            {
+                call_mode = true;
+            }
+        });
+        assert!(
+            compare_slot,
+            "compare_slot_rest must be registered at arity 3"
+        );
+        assert!(
+            call_mode,
+            "call_non_function_callable_with_mode must be registered at arity 6"
+        );
+    }
+
+    /// Mapdict residuals whose `&Wtf8` name is one `Ref` word publish a
+    /// trampoline at the signature's arity. `instance_node_getdictvalue`
+    /// returns `Option<PyObjectRef>`, one nullable Ref word, and is registered
+    /// at arity 2. The `bool`-returning setter is registered at arity 3.
+    #[test]
+    fn helper_fnaddrs_cover_mapdict_wtf8_residuals() {
+        let mut setdict = false;
+        let mut getdict = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == "pyre_interpreter::objspace::std::mapdict::instance_node_setdictvalue"
+                && row.arity == 3
+            {
+                setdict = true;
+            }
+            if row.path == "pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue"
+                && row.arity == 2
+            {
+                getdict = true;
+            }
+        });
+        assert!(
+            setdict,
+            "instance_node_setdictvalue must be registered at arity 3"
+        );
+        assert!(
+            getdict,
+            "instance_node_getdictvalue must be registered at arity 2"
+        );
+    }
+
+    /// A `PyResult`-returning residual with a pair-slice argument and one with
+    /// only word arguments both publish a trampoline.
+    #[test]
+    fn helper_fnaddrs_cover_pyresult_residuals() {
+        let mut getattr_miss = false;
+        let mut builtin_call = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == "pyre_interpreter::baseobjspace::object_getattr_miss" && row.arity == 4 {
+                getattr_miss = true;
+            }
+            if row.path == "pyre_interpreter::gateway::builtin_code_call" && row.arity == 3 {
+                builtin_call = true;
+            }
+        });
+        assert!(
+            getattr_miss,
+            "object_getattr_miss must be registered at arity 4"
+        );
+        assert!(
+            builtin_call,
+            "builtin_code_call must be registered at arity 3"
+        );
+    }
+
+    #[test]
+    fn helper_fnaddrs_cover_sys_exc_info_code() {
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == "pyre_interpreter::function::SYS_EXC_INFO_CODE" && row.arity == 0 {
+                found = true;
+            }
+        });
+        assert!(
+            found,
+            "SYS_EXC_INFO_CODE getter must be registered at arity 0"
         );
     }
 

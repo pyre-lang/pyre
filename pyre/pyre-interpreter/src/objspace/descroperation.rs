@@ -7348,6 +7348,7 @@ unsafe fn view_operand_is_set_like(obj: PyObjectRef) -> bool {
 /// [`compare_slot`] for layouts whose comparison iterates (containers) or
 /// is not the loop-free long/int/str arm.
 #[inline(never)]
+#[majit_macros::dont_look_inside(word_enums(CompareOp))]
 fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResult {
     // RPython inserts a stack check on this recursive object-space call.
     // Container comparisons recurse through [`compare`] without pushing a
@@ -7787,7 +7788,7 @@ pub extern "C" fn compare_slot_jit_abi(a: PyObjectRef, b: PyObjectRef, op: i64) 
 }
 
 /// Comparison operator enum (mirrors RustPython's ComparisonOperator).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, majit_macros::FieldlessEnumArg)]
 pub enum CompareOp {
     Lt,
     Le,

@@ -1871,12 +1871,7 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
         // answer a GC that owns the heap and refused: the dict's strategy and
         // storage edges would sit outside the object graph, behind a header
         // the collector never walks.
-        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
-            W_DICT_GC_TYPE_ID,
-            W_DICT_OBJECT_SIZE,
-        ))
-        .allocated_or_abort(W_DICT_OBJECT_SIZE)
-        .unwrap_or(std::ptr::null_mut())
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
     };
     value.dstorage = crate::gc_roots::shadow_stack_get(save_point) as GCREF;
     if !raw.is_null() {

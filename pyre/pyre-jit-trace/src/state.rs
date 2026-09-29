@@ -10320,16 +10320,11 @@ fn materialize_concrete_virtual_ptr(
             if ptr == 0 {
                 return majit_ir::GcRef::NULL;
             }
-            // Pyre adaptation: bh_new_with_vtable writes vtable at
-            // vtable_offset but PyObject.w_class needs separate init
-            // (`PyObject.w_class` in pyobject.rs).
-            //
-            // `w_class_obj()` — not `get_instantiate(vtable)` — is the source:
-            // a vtable word is only a `PyType` pointer for a pyre object
-            // descr.  `JitVirtualRef` carries the `jit_virtual_ref_vtable`
-            // type-id constant there (`virtualref.py:21-23`) and its offset-8
-            // slot is `virtual_token`, not `w_class`, so it returns None and
-            // this seeding is skipped.
+            // `bh_new_with_vtable` writes the type word and, when the
+            // backend has a class-word offset, `resolve_w_class_obj`.
+            // `materialize_resumed_pyframe_block` writes only the type
+            // word, so seed `w_class` here for that path.
+            // `JitVirtualRef` resolves to None (`virtualref.py`).
             let gcref = majit_ir::GcRef(ptr as usize);
             // VirtualInfo.allocate stores the struct in virtuals_cache before setfields so a circular reference resolves to it
             cache.set_concrete_ptr(vidx, gcref);

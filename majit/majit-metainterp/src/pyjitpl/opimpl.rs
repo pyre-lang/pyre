@@ -546,7 +546,7 @@ where
         // *records* New / NewWithVtable so the optimizer can virtualize
         // the struct away when it does not escape.
         let with_vtable = bytecode == jitcode::insns::BC_NEW_WITH_VTABLE;
-        let (size, vtable, type_id, headerless, descr, dest) = {
+        let (size, bh_vtable, type_id, headerless, descr, dest) = {
             let frame = self.frames.current_mut();
             let (descr_idx, dest) = frame.read_new();
             let bh = frame
@@ -560,6 +560,18 @@ where
                 size_descr_ref_from_bh(bh),
                 dest,
             )
+        };
+        // `pyjitpl.py opimpl_new_with_vtable`: the class word is
+        // `descr.get_vtable()`. Assembler may leave BhDescr.vtable
+        // at 0; the published size descr in `_cache_size` holds it.
+        let vtable = if with_vtable {
+            descr
+                .as_size_descr()
+                .map(|sd| sd.vtable())
+                .filter(|&v| v != 0)
+                .unwrap_or(bh_vtable)
+        } else {
+            bh_vtable
         };
         // A `headerless` descr means the interpreter owns this struct in
         // its own collected pool (`headerless_structs`), which is what
@@ -618,7 +630,28 @@ where
             return TraceAction::Abort;
         }
         if with_vtable && vtable != 0 {
-            unsafe { *(ptr as *mut usize) = vtable };
+            // Allocation stays in this arm. `cpu.bh_new_with_vtable`
+            // refuses a raw fallback once a collector is installed,
+            // and cranelift's copy skips a headerless descr. Tests
+            // trace with no backend installed
+            // (`TraceCtx::for_test`), so there is no cpu to call.
+            // The header stores are still the one helper the
+            // backends use. An unconfigured `vtable_offset` keeps
+            // the offset-0 type word this arm has always written;
+            // a configured offset replaces it. The class word is
+            // written only when the backend was given one.
+            let (vtable_offset, w_class_offset) = match ctx.blackhole_cpu() {
+                Some(cpu) => (cpu.vtable_offset().or(Some(0)), cpu.w_class_offset()),
+                None => (Some(0), None),
+            };
+            unsafe {
+                majit_backend::write_new_with_vtable_header(
+                    ptr as *mut u8,
+                    vtable,
+                    vtable_offset,
+                    w_class_offset,
+                );
+            }
         }
         let kind = if with_vtable {
             OpCode::NewWithVtable

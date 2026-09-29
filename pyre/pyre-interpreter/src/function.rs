@@ -222,7 +222,7 @@ pub const QUASI_IMMUT_SLOT_COUNT: usize = (QuasiImmutSlot::WKwDefs as usize) + 1
 /// `quasiimmut.py` keys everything off the mutate-field *name*; pyre needs a
 /// value it can pass through the descr-index dispatch in
 /// `pyre-jit-trace state.rs` / `pyre-jit eval.rs`, so the name becomes a tag.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 pub enum QuasiImmutSlot {
     Code,
     WFuncGlobalsObj,
@@ -2912,19 +2912,18 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
         // generator, coroutine, and async generator remains permitted for
         // compatibility, but warns because the callable's result protocol
         // changes underneath existing references.
-        let old_code = &*(get_pycode(obj) as *const crate::CodeObject);
-        let kind_mask = crate::CodeFlags::GENERATOR
-            | crate::CodeFlags::COROUTINE
-            | crate::CodeFlags::ASYNC_GENERATOR;
+        let kind_mask = crate::astcompiler::consts::CO_GENERATOR
+            | crate::astcompiler::consts::CO_COROUTINE
+            | crate::astcompiler::consts::CO_ASYNC_GENERATOR;
+        let old_flags = (*(getcode(obj) as *const crate::pycode::PyCode)).co_flags;
+        let new_flags = (*(w_code as *const crate::pycode::PyCode)).co_flags;
         // `warn_deprecation` runs the app-level warnings machinery and
         // `function_get_doc` realizes the docstring; both allocate, so publish
         // the two operands and read them back from their root slots rather
         // than storing through a pre-move address.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[obj, w_code]);
-        if old_code.flags.intersection(kind_mask).bits()
-            != (*raw_code).flags.intersection(kind_mask).bits()
-        {
+        if old_flags & kind_mask != new_flags & kind_mask {
             crate::warn::warn_deprecation(
                 "Assigning a code object of non-matching type is deprecated (e.g., from a generator to a plain function)",
             )?;
@@ -4261,6 +4260,7 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
 /// paired `direct_fn` returns the same `(type, value, traceback)` tuple as the
 /// regular closure but skips the builtin-call setup.
 type ExcInfoDirectFn = fn(&mut crate::pyframe::PyFrame) -> PyObjectRef;
+#[majit_macros::prebuilt_static]
 static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn> = std::sync::OnceLock::new();

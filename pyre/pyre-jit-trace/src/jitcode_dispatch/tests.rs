@@ -3405,8 +3405,7 @@ fn alloc_records_the_alloc_and_writes_the_ref_dst() {
 }
 
 /// Backend stub for the allocation-rooting tests: `bh_new*` hands back one
-/// caller-owned block so the handler observes a real, dereferenceable
-/// pointer (`new_with_vtable` writes `w_class` into it).
+/// caller-owned block so the recorded ref names real storage.
 struct AllocTestCpu {
     block: i64,
 }
@@ -3483,8 +3482,7 @@ impl majit_backend::Backend for AllocTestCpu {
 /// shadow, so pin it here rather than relying on a side list of executed
 /// allocations, which would duplicate a root the op graph already owns.
 fn alloc_result_is_stamped_onto_its_recorded_op(opname: &str, expected_opcode: OpCode) {
-    // Real backing storage: `new_with_vtable` writes `w_class` into the
-    // returned block, so a synthetic address would be a wild store.
+    // Real backing storage: the recorded ref names this allocation.
     let block: Box<[usize; 32]> = Box::new([0; 32]);
     let cpu = AllocTestCpu {
         block: block.as_ref().as_ptr() as i64,

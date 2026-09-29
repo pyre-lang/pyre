@@ -1754,6 +1754,7 @@ mod tests {
             ("inline_call_nested_ext/P", insns::BC_INLINE_CALL),
             // Ref-result variant of the borrow-checker abort signal.
             ("abort/>r", majit_jitcode::insns::BC_ABORT_RESULT_R),
+            ("abort/>i", majit_jitcode::insns::BC_ABORT_RESULT_I),
             // dyn-trait method pointer reification (backend epic).
             (
                 "vtable_method_ptr/rd>i",

@@ -70,6 +70,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "insns.bin",
     "descrs.bin",
     "descrs_index.bin",
+    "callinfos.bin",
     "descr_layouts.bin",
     "descr_layouts_index.bin",
     "effect_infos.bin",
@@ -136,6 +137,7 @@ const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
     "jitcodes.bin",
     "indirectcalltargets.bin",
     "descrs.bin",
+    "callinfos.bin",
     "descr_layouts.bin",
     "effect_infos.bin",
     "fnaddr_bindings.bin",
@@ -1999,6 +2001,14 @@ fn real_main() {
         .unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
         std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
+        // `CallControl.callinfocollection` rows, indexed into the descr
+        // table just written. `func` is the build-time address (or a
+        // symbolic path hash), so the file is host-addressed.
+        std::fs::write(
+            format!("{out_dir}/callinfos.bin"),
+            bincode::serialize(&pipeline.callinfo_rows).unwrap(),
+        )
+        .unwrap();
 
         let mut descr_layouts_bin = Vec::new();
         let mut descr_layout_offsets = Vec::with_capacity(canonical_layouts.len() + 1);

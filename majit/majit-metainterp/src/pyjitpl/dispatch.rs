@@ -8,6 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use majit_backend::Backend;
 use majit_ir::{GreenKey, GreenType, OpCode, OpRef, Type, Value};
 use smallvec::SmallVec;
 

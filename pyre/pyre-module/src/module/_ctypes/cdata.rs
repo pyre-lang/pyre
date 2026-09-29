@@ -984,8 +984,9 @@ fn set_simple_value(obj: PyObjectRef, value: PyObjectRef) -> Result<(), pyre_int
     let tc =
         type_code_of(cls).ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     // `value` is an arbitrary object, so under `"O"` it can be a `list` or a
-    // `dict`, both of which move, and `encode_value_into` can run Python: pin it
-    // and read the slot back where it is stored.
+    // `dict`, both of which move, and `encode_value_into` can run Python: pin
+    // the value, the instance and the class and read the slots back where they
+    // are stored.
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[value, obj, cls]);
     let mut bytes = encode_value_into(&tc, roots.get(base), roots.get(base + 1), "0")?;

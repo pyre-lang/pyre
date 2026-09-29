@@ -144,19 +144,41 @@ impl EmbeddedJitCodeTable {
         symbolic_paths: &[(i64, String)],
         runtime_bindings: &[(&str, i64)],
     ) -> &'static Self {
-        let builtins = Self::builtin_fnaddrs();
         let replacements: Vec<(i64, i64)> = symbolic_paths
             .iter()
-            .filter_map(|(symbolic, path)| {
-                runtime_bindings
-                    .iter()
-                    .chain(builtins.iter())
-                    .find(|(binding_path, _)| *binding_path == path)
-                    .map(|(_, runtime)| *runtime)
-                    .map(|runtime| (*symbolic, runtime))
+            .filter_map(|(symbolic, _)| {
+                let runtime =
+                    Self::rebound_symbolic_fnaddr(*symbolic, symbolic_paths, runtime_bindings);
+                (*symbolic != runtime).then_some((*symbolic, runtime))
             })
             .collect();
         Self::materialize_with_replacements(canonical, descrs, &replacements)
+    }
+
+    /// Replace one build-time function address the way
+    /// [`Self::materialize_with_symbolic_fnaddrs`] replaces jitcode constants.
+    ///
+    /// An address that is not a recorded symbolic path hash is returned
+    /// unchanged. A recorded hash is replaced when `runtime_bindings` (or the
+    /// shared builtin table) names its path.
+    pub fn rebound_symbolic_fnaddr(
+        fnaddr: i64,
+        symbolic_paths: &[(i64, String)],
+        runtime_bindings: &[(&str, i64)],
+    ) -> i64 {
+        let Some((_, path)) = symbolic_paths
+            .iter()
+            .find(|(symbolic, _)| *symbolic == fnaddr)
+        else {
+            return fnaddr;
+        };
+        let builtins = Self::builtin_fnaddrs();
+        runtime_bindings
+            .iter()
+            .chain(builtins.iter())
+            .find(|(binding_path, _)| *binding_path == path)
+            .map(|(_, runtime)| *runtime)
+            .unwrap_or(fnaddr)
     }
 
     fn materialize_with_replacements(

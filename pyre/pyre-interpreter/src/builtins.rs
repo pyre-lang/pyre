@@ -15139,6 +15139,9 @@ pub(crate) fn builtin_set_add_items_intersection(
     builtin_set_add_items_impl(Some(set), items, false).map(|_| ())
 }
 
+/// The per-item `add` loop of `pyopcode.py BUILD_SET`, which is
+/// `@jit.unroll_safe`: the item count is the opcode's constant argument.
+#[majit_macros::unroll_safe]
 fn builtin_set_add_items_impl(
     set: Option<PyObjectRef>,
     items: &[PyObjectRef],
@@ -20986,6 +20989,10 @@ pub(crate) fn frozendict_structural_hash(obj: PyObjectRef) -> Result<i64, crate:
     Ok(_hash_frozenset(&pair_hashes))
 }
 
+/// `space.hash` for interpreter-level dict and set probes.  The exact-type
+/// scan and the `__hash__` protocol it falls back to are not traced; the call
+/// stays a residual.
+#[majit_macros::dont_look_inside]
 pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));

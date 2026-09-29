@@ -15552,21 +15552,9 @@ fn handle<Sym: WalkSym>(
                 }
                 _ => None,
             };
-            if let Some(ptr) =
-                alloc_pin
-                    .as_ref()
-                    .map(|pin| pin.get().0)
-                    .or_else(|| match concrete {
-                        Some(Value::Ref(r)) => Some(r.0),
-                        _ => None,
-                    })
-                && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
-            {
-                unsafe {
-                    (*(ptr as *mut pyre_object::PyObject)).w_class =
-                        w_class as pyre_object::PyObjectRef;
-                }
-            }
+            // `bh_new_with_vtable` writes both header words when the backend
+            // has a class-word offset, so this arm does not store `w_class`
+            // again.
             let concrete = alloc_pin
                 .as_ref()
                 .map(|pin| Value::Ref(pin.get()))

@@ -3463,3 +3463,309 @@ fn call_names_owner_root_guard(call: &str) -> bool {
         || call.contains("shadow_stack::<Impl>::set")
         || call.contains("shadow_stack::<Impl>::drop")
 }
+
+/// lowered body, not a `__cast_pointer` of the `FrameBox` onto `PyFrame`.
+#[test]
+fn flat_pycall_frame_comes_from_deref_mut() {
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
+    use std::collections::HashSet;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let context = LowerContext::new(&llbc);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::function::_flat_pycall")
+        .unwrap_or_else(|| {
+            let hits: Vec<_> = llbc
+                .iter_local_fns()
+                .filter(|fd| fd.item_meta.name_path().contains("_flat_pycall"))
+                .map(|fd| fd.item_meta.name_path())
+                .collect();
+            panic!("missing pyre_interpreter::function::_flat_pycall, hits: {hits:?}");
+        });
+    let graph =
+        lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower _flat_pycall: {err}"));
+    let live = reachable_blocks(&graph);
+
+    fn value_id(arg: &LinkArg) -> Option<u64> {
+        match arg {
+            LinkArg::Value(var) => Some(var.id()),
+            LinkArg::Const(_) => None,
+        }
+    }
+
+    fn call_leaf(target: &CallTarget) -> &str {
+        match target {
+            CallTarget::Method { name, .. } => name,
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().map(String::as_str).unwrap_or("")
+            }
+            _ => "",
+        }
+    }
+
+    fn op_result<'a>(graph: &'a FunctionGraph, id: u64) -> Option<&'a SpaceOperation> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref().is_some_and(|var| var.id() == id))
+        })
+    }
+
+    fn phi_sources(
+        graph: &FunctionGraph,
+        id: u64,
+        live: &HashSet<majit_translate::model::BlockId>,
+    ) -> Vec<u64> {
+        let Some(block) = graph
+            .blocks
+            .iter()
+            .find(|block| block.inputargs.iter().any(|var| var.id() == id))
+        else {
+            return Vec::new();
+        };
+        let pos = block
+            .inputargs
+            .iter()
+            .position(|var| var.id() == id)
+            .expect("input position");
+        graph
+            .blocks
+            .iter()
+            .filter(|pred| live.contains(&pred.id))
+            .flat_map(|pred| pred.exits.iter())
+            .filter(|link| link.target == block.id)
+            .filter_map(|link| link.args.get(pos).and_then(value_id))
+            .collect()
+    }
+
+    fn is_frame_box_new(llbc: &Llbc, kind: &OpKind) -> bool {
+        let OpKind::Call { target, .. } = kind else {
+            return false;
+        };
+        let Some(id) = target.fun_decl_id() else {
+            return false;
+        };
+        llbc.fn_by_id(id).is_some_and(|fd| {
+            fd.item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+        })
+    }
+
+    fn receiver_id(kind: &OpKind) -> Option<u64> {
+        let OpKind::Call { args, .. } = kind else {
+            return None;
+        };
+        args.first().and_then(value_id)
+    }
+
+    let mut frame_boxes = HashSet::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            if is_frame_box_new(&llbc, &op.kind)
+                && let Some(var) = &op.result
+            {
+                frame_boxes.insert(var.id());
+            }
+        }
+    }
+    assert!(
+        !frame_boxes.is_empty(),
+        "no FrameBox::new result in _flat_pycall"
+    );
+    // A loop-carried block argument is the same handle when every source
+    // reaches `FrameBox::new` and none reaches a different value. A source
+    // that only cycles counts once some other source is grounded.
+    fn frame_box_verdict(
+        graph: &FunctionGraph,
+        id: u64,
+        live: &HashSet<majit_translate::model::BlockId>,
+        known: &HashSet<u64>,
+        stack: &mut HashSet<u64>,
+    ) -> u8 {
+        if known.contains(&id) {
+            return 2;
+        }
+        if !stack.insert(id) {
+            return 1;
+        }
+        let verdict = if let Some(op) = op_result(graph, id) {
+            match &op.kind {
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    frame_box_verdict(graph, operand.id(), live, known, stack)
+                }
+                _ => 0,
+            }
+        } else {
+            let srcs = phi_sources(graph, id, live);
+            if srcs.is_empty() {
+                0
+            } else {
+                let mut any_yes = false;
+                let mut any_no = false;
+                for src in srcs {
+                    match frame_box_verdict(graph, src, live, known, stack) {
+                        2 => any_yes = true,
+                        0 => any_no = true,
+                        _ => {}
+                    }
+                }
+                if any_no {
+                    0
+                } else if any_yes {
+                    2
+                } else {
+                    1
+                }
+            }
+        };
+        stack.remove(&id);
+        verdict
+    }
+    let mut candidates = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        candidates.extend(block.inputargs.iter().map(|var| var.id()));
+        for op in &block.operations {
+            let OpKind::UnaryOp { op: name, .. } = &op.kind else {
+                continue;
+            };
+            if name == "same_as"
+                && let Some(var) = &op.result
+            {
+                candidates.push(var.id());
+            }
+        }
+    }
+    loop {
+        let before = frame_boxes.len();
+        for id in &candidates {
+            if frame_boxes.contains(id) {
+                continue;
+            }
+            let mut stack = HashSet::new();
+            if frame_box_verdict(&graph, *id, &live, &frame_boxes, &mut stack) == 2 {
+                frame_boxes.insert(*id);
+            }
+        }
+        if frame_boxes.len() == before {
+            break;
+        }
+    }
+
+    fn is_frame_box_pyframe_cast(kind: &OpKind, frame_boxes: &HashSet<u64>) -> bool {
+        majit_translate::model::cast_pointer_root(kind) == Some("PyFrame")
+            && receiver_id(kind).is_some_and(|id| frame_boxes.contains(&id))
+    }
+
+    let mut cast_ops = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            if is_frame_box_pyframe_cast(&op.kind, &frame_boxes) {
+                cast_ops.push(format!("{:?}", op.kind));
+            }
+        }
+    }
+    assert!(
+        cast_ops.is_empty(),
+        "__cast_pointer(PyFrame) of the FrameBox value: {cast_ops:?}"
+    );
+
+    fn forward_id(kind: &OpKind) -> Option<u64> {
+        match kind {
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => Some(operand.id()),
+            OpKind::Call { .. } if majit_translate::model::cast_instance_root(kind).is_some() => {
+                receiver_id(kind)
+            }
+            _ => None,
+        }
+    }
+
+    fn from_deref_mut_or_body(
+        graph: &FunctionGraph,
+        id: u64,
+        frame_boxes: &HashSet<u64>,
+        live: &HashSet<majit_translate::model::BlockId>,
+        seen: &mut HashSet<u64>,
+    ) -> bool {
+        if !seen.insert(id) {
+            return false;
+        }
+        let ok = if frame_boxes.contains(&id) {
+            false
+        } else if let Some(op) = op_result(graph, id) {
+            if is_frame_box_pyframe_cast(&op.kind, frame_boxes) {
+                false
+            } else if let OpKind::Call { target, .. } = &op.kind
+                && receiver_id(&op.kind).is_some_and(|recv| frame_boxes.contains(&recv))
+                && matches!(call_leaf(target), "deref_mut" | "frame_ptr")
+            {
+                true
+            } else if let OpKind::FieldRead { field, base, .. } = &op.kind
+                && matches!(field.name.as_str(), "owner_root" | "ptr")
+                && frame_boxes.contains(&base.id())
+            {
+                true
+            } else if let Some(next) = forward_id(&op.kind) {
+                from_deref_mut_or_body(graph, next, frame_boxes, live, seen)
+            } else {
+                false
+            }
+        } else {
+            let srcs = phi_sources(graph, id, live);
+            !srcs.is_empty()
+                && srcs
+                    .iter()
+                    .all(|src| from_deref_mut_or_body(graph, *src, frame_boxes, live, seen))
+        };
+        seen.remove(&id);
+        ok
+    }
+
+    let mut eval_args = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if call_leaf(target) != "eval_current_frame_raw" {
+                continue;
+            }
+            let arg = args
+                .first()
+                .and_then(value_id)
+                .unwrap_or_else(|| panic!("eval_current_frame_raw has no value argument"));
+            eval_args.push(arg);
+        }
+    }
+    assert!(
+        !eval_args.is_empty(),
+        "no eval_current_frame_raw call in _flat_pycall"
+    );
+    for arg in eval_args {
+        let mut seen = HashSet::new();
+        assert!(
+            from_deref_mut_or_body(&graph, arg, &frame_boxes, &live, &mut seen),
+            "eval_current_frame_raw argument v{arg} is not the deref_mut result or its lowered body"
+        );
+    }
+}

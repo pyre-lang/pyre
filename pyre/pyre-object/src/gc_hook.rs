@@ -299,7 +299,10 @@ pub fn clear_gc_alloc_young_nonmoving_hook() {
 /// block has to be a root across the call and read back afterwards, the
 /// way `FrameBox::new` publishes a frame's inputs; a caller that builds the
 /// payload first takes [`try_gc_alloc_young_nonmoving_no_collect_raw`].
+/// Frames themselves do not move, which is why a live `&mut PyFrame`
+/// across this allocation stays valid.
 ///
+
 /// With no young hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> GCREF {
