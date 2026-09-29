@@ -36,7 +36,7 @@ impl crate::lltype::GcType for W_BoolObject {
     /// Every bool flows through the two process-global prebuilt allocations
     /// owned by [`w_bool_from`].
     fn type_id() -> u32 {
-        5
+        BOOL_GC_TYPE_ID
     }
     const SIZE: usize = W_BOOL_OBJECT_SIZE;
 }
@@ -52,44 +52,67 @@ pub unsafe fn w_bool_get_value(obj: PyObjectRef) -> bool {
 
 // ── Bool singletons ──────────────────────────────────────────────────
 //
-// `boolobject.py` builds `W_BoolObject.w_False` / `W_BoolObject.w_True` at
-// import time and `StdObjSpace.initialize` (`objspace.py`) installs them as
-// `space.w_False` / `space.w_True`; every `space.newbool(value)`
-// (`baseobjspace.py`) returns one of the two prebuilt objects. pyre keeps
-// the two as process-global prebuilt objects and routes all callers through
-// [`w_bool_from`]. Their host allocations carry the same GC header as an
-// RPython translated prebuilt object.
-//
-// Translation freezes upstream's two objects into the binary. pyre builds
-// each on first use instead, so the slot is a `OnceLock`: concurrent first
-// callers without a GIL must all observe the one object, since `is` on
-// bools is pointer identity. The JIT never sees the lazy path — the
-// registered prebuilt address stands in for the initialized static.
+// `boolobject.py` builds `W_BoolObject.w_False` / `W_BoolObject.w_True`.
+// `baseobjspace.py` `newbool` returns one of those two prebuilt objects.
+// The header sits immediately in front of the payload so `header_of` reads
+// the immortal flags. `w_bool_from` chooses between the two addresses.
 
-static TRUE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static FALSE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// GC type id of `W_BoolObject` (`GcType::type_id`).
+const BOOL_GC_TYPE_ID: u32 = 5;
 
-fn new_bool_singleton(intval: i64) -> usize {
-    crate::lltype::malloc_typed_immortal(W_BoolObject {
-        ob_header: PyObject {
-            ob_type: &BOOL_TYPE as *const PyType,
-            w_class: std::ptr::null_mut(),
-        },
-        intval,
-    }) as usize
+#[repr(C)]
+struct PrebuiltBool {
+    header: majit_gc::header::GcHeader,
+    obj: W_BoolObject,
 }
 
-/// baseobjspace.py `newbool`: `w_True` if `value` else `w_False`, the two
-/// prebuilt singletons.  Each arm reads its singleton's static, which the
-/// translator resolves to the registered prebuilt address, so a traced call
-/// is the branch on `value` and a constant.
+const fn prebuilt_bool(ob_type: &'static PyType, intval: i64) -> PrebuiltBool {
+    let flags = majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS.bits()
+        | majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS.bits();
+    PrebuiltBool {
+        header: majit_gc::header::GcHeader {
+            tid_and_flags: (flags << majit_gc::header::FLAG_SHIFT) | (BOOL_GC_TYPE_ID as u64),
+        },
+        obj: W_BoolObject {
+            ob_header: PyObject {
+                ob_type: ob_type as *const PyType,
+                w_class: std::ptr::null_mut(),
+            },
+            intval,
+        },
+    }
+}
+
+static TRUE_BLOCK: PrebuiltBool = prebuilt_bool(&BOOL_TYPE, 1);
+static FALSE_BLOCK: PrebuiltBool = prebuilt_bool(&BOOL_TYPE, 0);
+
+/// Word-ABI residual for blackhole resume of `bool_singleton`.
+/// `intval` selects the singleton.
+pub extern "C" fn bool_singleton_jit_abi(_slot: i64, intval: i64) -> i64 {
+    w_bool_from(intval != 0) as i64
+}
+
+/// Pointer-sized so a read is the payload address (`ObjSpace.w_True`),
+/// not the address of a reference slot.
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct SyncObj(*mut PyObject);
+unsafe impl Sync for SyncObj {}
+
+static TRUE_SINGLETON: SyncObj = SyncObj(&raw const TRUE_BLOCK.obj as *mut PyObject);
+static FALSE_SINGLETON: SyncObj = SyncObj(&raw const FALSE_BLOCK.obj as *mut PyObject);
+
+/// `ObjSpace.newbool`: `w_True` when `value` is true, otherwise `w_False`.
+#[majit_macros::elidable_cannot_raise]
 #[inline]
 pub fn w_bool_from(value: bool) -> *mut PyObject {
-    if value {
-        *TRUE_SINGLETON.get_or_init(|| new_bool_singleton(1)) as PyObjectRef
+    let obj = if value {
+        TRUE_SINGLETON
     } else {
-        *FALSE_SINGLETON.get_or_init(|| new_bool_singleton(0)) as PyObjectRef
-    }
+        FALSE_SINGLETON
+    };
+    // `SyncObj` is `repr(transparent)` over the payload pointer.
+    unsafe { std::mem::transmute(obj) }
 }
 
 // ── W_BoolObject.descr_and/or/xor (boolobject.py) ──────────────

@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=load_type_attr
 # A method-form `LOAD_ATTR` + `CALL` whose callee forces the calling frame and
 # then raises, caught in the loop body. The callee's own body is outside every
 # journal, so a walk that cannot commit makes the legacy entry replay run it a

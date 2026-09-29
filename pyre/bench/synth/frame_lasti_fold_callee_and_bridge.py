@@ -1,6 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main
-# pyre-check: spec-folds=frame_lasti
 # pyre-check: skip-backends=wasm
 # wasm still prints PASS but compiles `root:leaf` and `root:caller_view`
 # after five loop aborts, so it cannot declare the native `main` loop.

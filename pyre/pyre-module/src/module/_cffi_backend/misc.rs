@@ -655,8 +655,11 @@ pub fn object_as_bool(w_ob: PyObjectRef) -> Result<bool, PyError> {
     // instance's, so a cdata never takes the float branch.
     let has_float = !is_cdata
         && pyre_interpreter::typedef::r#type(w_ob).is_some_and(|w_type| unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type_where(w_type.as_ptr(), "__float__")
-                .is_some()
+            pyre_interpreter::baseobjspace::lookup_in_type_where(
+                w_type.as_ptr(),
+                "__float__",
+            )
+            .is_some()
         });
     let w_io = if has_float {
         pyre_object::w_float_new(pyre_interpreter::baseobjspace::float_w(w_ob)?)

@@ -7978,7 +7978,10 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         (callable, None)
     } else if type_new_3arg {
         let tp_new = unsafe {
-            let found = pyre_interpreter::baseobjspace::lookup_in_type(callable_operand, "__new__");
+            let found = pyre_interpreter::baseobjspace::lookup_in_type(
+                callable_operand,
+                "__new__",
+            );
             match found {
                 Some(w) if pyre_object::function::is_exact_staticmethod(w) => {
                     let func = pyre_object::function::w_staticmethod_get_func(w);
@@ -13930,10 +13933,18 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     let metaclass_to_pin = if std::ptr::eq(w_metaclass, w_metatype) {
         None
     } else {
-        let meta_call =
-            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_metaclass, "__call__") };
-        let type_call =
-            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_metatype, "__call__") };
+        let meta_call = unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                w_metaclass,
+                "__call__",
+            )
+        };
+        let type_call = unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                w_metatype,
+                "__call__",
+            )
+        };
         if meta_call != type_call {
             return type_call_decline("metaclass overrides __call__");
         }
@@ -14248,7 +14259,12 @@ pub(crate) fn try_walker_inline_object_new<Sym: WalkSym>(
     if w_object.is_null() {
         return Ok(None);
     }
-    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    let obj_new = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_object,
+            "__new__",
+        )
+    };
     if obj_new != Some(callable) {
         return Ok(None);
     }
@@ -14391,16 +14407,23 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     if version_tag == 0 {
         return Ok(None);
     }
-    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            dunder,
+        )
+    }) else {
         return Ok(None);
     };
     let Some(base_exception) = pyre_interpreter::builtins::lookup_exc_class("BaseException") else {
         return Ok(None);
     };
-    let Some(default_method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base_exception, dunder) })
-    else {
+    let Some(default_method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            base_exception,
+            dunder,
+        )
+    }) else {
         return Ok(None);
     };
     if std::ptr::eq(method, default_method) {
@@ -14558,9 +14581,12 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
     if version_tag == 0 {
         return Ok(None);
     }
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__hash__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_type,
+            "__hash__",
+        )
+    }) else {
         return Ok(None);
     };
     // `__hash__ = None` raises in the residual; a non-Python `__hash__`
@@ -15335,12 +15361,18 @@ fn diag_nondatadescr_miss(pc: usize, name: &str, obj: pyre_object::PyObjectRef) 
         unsafe { pyre_interpreter::baseobjspace::w_type_version_tag(w_type) }
     };
     let getattr = !w_type.is_null()
-        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }
-            .is_some();
+        && unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type_where(
+                w_type, "__getattr__")
+        }
+        .is_some();
     let looked = if w_type.is_null() {
         None
     } else {
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type_where(w_type, name) }
+        unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type_where(
+                w_type, name)
+        }
     };
     let cell_null = w_type.is_null()
         || unsafe {
@@ -20056,7 +20088,12 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         );
     }
 
-    let forward_method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) };
+    let forward_method = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            dunder,
+        )
+    };
     if let Some(method) = forward_method
         && let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) })
     {
@@ -20181,8 +20218,12 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
             pyre_object::typeobject::w_type_get_name(w_typ_r)
         }));
     }
-    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_typ_r, dunder) })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_typ_r,
+            dunder,
+        )
+    }) else {
         decline!(format_args!("{} has no {dunder}", unsafe {
             pyre_object::typeobject::w_type_get_name(w_typ_r)
         }));
@@ -20723,8 +20764,12 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            dunder,
+        )
+    }) else {
         return Ok(None);
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
@@ -20953,9 +20998,12 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ));
     }
 
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__format__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            "__format__",
+        )
+    }) else {
         decline!(format_args!("{} has no __format__", unsafe {
             pyre_object::typeobject::w_type_get_name(w_class)
         }));
@@ -21196,9 +21244,10 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
         decline!("haystack class has no version tag");
     }
 
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__contains__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class, "__contains__")
+    }) else {
         decline!("haystack class has no __contains__");
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
@@ -21332,9 +21381,10 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
     if version_tag == 0 {
         decline!("metaclass has no version tag");
     }
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(metaclass, "__instancecheck__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            metaclass, "__instancecheck__")
+    }) else {
         decline!("metaclass has no __instancecheck__");
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
