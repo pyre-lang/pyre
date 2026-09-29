@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=builtin_len_descent
 # pyre-check: trace-shape=hot:absent=CallMayForceR
 # pyre-check: max-wasm-ratio=5.2
 # The inner loop retraces once per layout: the oracle compiles 1 loop and 14

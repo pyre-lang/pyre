@@ -596,9 +596,10 @@ impl<'a> Lowering<'a> {
     ///     `UnwindResume`, `Drop`, `Assert`), plus calls and assignments that
     ///     do *not* write `_0`, are permitted: none of them define the const
     ///     value, so with no `Switch` the single `size_of` call is its
-    ///     unconditional sole definer.  Primitive widths (`usize`, `u64`, …)
-    ///     fold through the same lane as an inline `size_of`/`align_of` call;
-    ///     a pointer / tuple / unresolved layout stays residual.
+    ///     unconditional sole definer.  Primitive widths (`usize`, `u64`, …),
+    ///     thin pointers, tuples, and structs whose Charon offsets did not
+    ///     resolve fold through the same lane as an inline `size_of` /
+    ///     `align_of` call (`llmemory.sizeof`).
     pub(in crate::front::mir) fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
         if gd.global_kind_str() != Some("NamedConst") {
@@ -651,9 +652,10 @@ impl<'a> Lowering<'a> {
                     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
                         return None;
                     };
-                    let want_align = match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
-                        "core::mem::size_of" => false,
-                        "core::mem::align_of" => true,
+                    let fd = self.llbc.fn_by_id(*id)?;
+                    let want_align = match fd.item_meta.name_path().as_str() {
+                        "core::mem::size_of" | "std::mem::size_of" => false,
+                        "core::mem::align_of" | "std::mem::align_of" => true,
                         // `_0` defined by some other function: not a bare
                         // size_of/align_of const.
                         _ => return None,
@@ -663,7 +665,7 @@ impl<'a> Lowering<'a> {
                     if found.is_some() {
                         return None;
                     }
-                    let ty = reg.generics.get("types")?.as_array()?.first()?.clone();
+                    let ty = size_align_call_type_arg(fd, &reg.generics)?.clone();
                     found = Some((want_align, ty));
                 }
                 // `Goto` / `Abort` / `UnwindResume` / `Drop` / `Assert`, and
@@ -708,60 +710,35 @@ impl<'a> Lowering<'a> {
     /// NamedConst-initializer form) and the inline `size_of`/`align_of` call
     /// fold in [`Self::lower_call`].
     ///
-    /// ADT arguments read Charon's `layout_for_target` (wasm32 folds the
-    /// wasm32 width, not the host's). Primitive widths (`usize`, `u64`,
-    /// …) reuse [`primitive_size_align`], the same lane a NamedConst
-    /// initializer already uses, so an inline `align_of::<usize>()`
-    /// folds too.  A pointer to a sized pointee is one address word.
-    /// `None` for a fat pointer / tuple / unresolved layout.
+    /// Mirrors `llmemory.sizeof` (`llmemory.py`): a symbolic constant the
+    /// codewriter folds from the type, not a residual call. Delegates to
+    /// [`size_align_of_tyexpr`].
     pub(in crate::front::mir) fn size_align_const_from_tyexpr(
         &self,
         want_align: bool,
         ty: &serde_json::Value,
     ) -> Option<i64> {
-        if let Some(adt) = self.resolve_tyexpr_to_adt_def_id(ty) {
-            // Read the layout for the build's `TARGET` (empty for the host
-            // extraction target), matching the target-aware field-offset lookup
-            // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
-            // size, not the host's.
-            let target = std::env::var("TARGET").unwrap_or_default();
-            let decl = self.llbc.type_by_id(adt)?;
-            if let Some((size, align)) = decl.size_align_for_target(self.llbc, &target) {
-                let value = if want_align { align } else { size };
-                if let Some(value) = value {
-                    return Some(value as i64);
-                }
-            }
-            // `bytecode::CodeObject` is a foreign struct. Charon records
-            // only an `AtLeast` guarantee, no chosen align. Its fields are
-            // pointers, boxes and `u32`s, so the alignment is the target
-            // word (`CARGO_CFG_TARGET_POINTER_WIDTH`).
-            if want_align && decl.item_meta.name_path().ends_with("bytecode::CodeObject") {
-                return Some(crate::layout::target_word_size() as i64);
-            }
-            // Charon leaves a generic struct's `chosen` layout null. The
-            // declaration-order walk still yields a concrete size once the
-            // type arguments are instantiated, when the recorded repr keeps
-            // that order (`repr(C)` or `repr(transparent)`).
-            if let Some((size, align)) = mem_size_align(self.llbc, ty, &[], 0) {
-                return i64::try_from(if want_align { align } else { size }).ok();
-            }
-            return None;
-        }
-        let body = tyexpr_body(self.llbc, ty)?;
-        // `{"RawPtr": [ty, kind]}` / `{"Ref": [region, ty, kind]}`.
-        let pointee = match (body.get("RawPtr"), body.get("Ref")) {
-            (Some(raw), _) => raw.get(0),
-            (_, Some(reference)) => reference.get(1),
-            _ => None,
+        // A `cachedgraph` copy (`specialize.py`) is a separate graph whose
+        // types are the call's concrete arguments. A generic helper body
+        // still spells `align_of::<GcEntries<K, V>>()` with depth-0
+        // `TypeVar`s; substitute those so `llmemory.sizeof` folds.
+        let substituted = if self.spec_body
+            && !(self.spec_types.is_empty() && self.spec_const_generics.is_empty())
+        {
+            let mut value = ty.clone();
+            crate::front::clause_spec::substitute_type_vars(
+                &mut value,
+                self.llbc,
+                self.spec_types,
+                self.spec_const_generics,
+            );
+            Some(value)
+        } else {
+            None
         };
-        if let Some(pointee) = pointee {
-            // A pointer to a sized pointee is one address word.
-            let pointee = tyexpr_body(self.llbc, pointee)?;
-            let sized = pointee.get("Scalar").is_some() || nominal_adt_pointee(self.llbc, pointee);
-            return sized.then(|| crate::layout::target_word_size() as i64);
-        }
-        i64::try_from(primitive_size_align(want_align, body.get("Scalar")?)?).ok()
+        let ty = substituted.as_ref().unwrap_or(ty);
+        i64::try_from(size_align_of_tyexpr(self.llbc, want_align, ty)?).ok()
+
     }
 }
 
@@ -2908,10 +2885,7 @@ pub(in crate::front::mir) fn const_transparent_aggregate_field(
 /// `core::mem::size_of` / `align_of`. Any other callee stays unharvested:
 /// that refusal is the fail-closed default
 /// [`const_eval_init_body_lit`] used before this exemption.
-pub(in crate::front::mir) fn const_eval_size_align_call(
-    llbc: &Llbc,
-    call: &CallPayload,
-) -> Option<ConstLit> {
+pub(in crate::front::mir) fn const_eval_size_align_call(llbc: &Llbc, call: &CallPayload) -> Option<ConstLit> {
     if !call.args.is_empty() {
         return None;
     }
@@ -2921,12 +2895,13 @@ pub(in crate::front::mir) fn const_eval_size_align_call(
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
-    let want_align = match llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
-        "core::mem::size_of" => false,
-        "core::mem::align_of" => true,
+    let fd = llbc.fn_by_id(*id)?;
+    let want_align = match fd.item_meta.name_path().as_str() {
+        "core::mem::size_of" | "std::mem::size_of" => false,
+        "core::mem::align_of" | "std::mem::align_of" => true,
         _ => return None,
     };
-    let ty = reg.generics.get("types")?.as_array()?.first()?;
+    let ty = size_align_call_type_arg(fd, &reg.generics)?;
     let bytes = size_align_of_tyexpr(llbc, want_align, ty)?;
     Some(const_narrow_to_target(
         const_literal_ty(llbc, &call.dest.ty),
@@ -2948,37 +2923,230 @@ pub(in crate::front::mir) fn const_eval_size_align_call(
 /// back to the host width when that cfg is unset (the host *is* the
 /// target). A wasm32 prepass therefore harvests 4, not the host's 8.
 ///
-/// ADT arguments reuse the same Charon `layout_for_target` lane
-/// [`Lowering::fold_size_const_global`] uses. Anything else (tuple,
-/// slice, an unresolved layout) stays unharvested.
-pub(in crate::front::mir) fn size_align_of_tyexpr(
+/// This is `llmemory.sizeof` (`llmemory.py`): a thin pointer, `Box` of a
+/// sized pointee, or `fn` pointer is one address word; a fat pointer is
+/// two. A tuple or a struct whose Charon field offsets did not resolve
+/// still folds from its field types — alignment is the max of the
+/// fields (`ItemOffset` of a `lltype.Struct`).
+pub(in crate::front::mir) fn size_align_of_tyexpr(llbc: &Llbc, want_align: bool, ty: &serde_json::Value) -> Option<u64> {
+    size_align_of_tyexpr_depth(llbc, want_align, ty, 0)
+}
+
+/// Type argument of a `size_of` / `align_of` call.
+///
+/// A generic call carries `T` in `Call.generics.types`. A monomorphized
+/// FunDecl (`name_path` still `core::mem::align_of`) stores `T` on the
+/// `Instantiated` name segment (`ItemMeta::instantiation`); the call
+/// site generics are then empty.
+pub(in crate::front::mir) fn size_align_call_type_arg<'a>(
+    fd: &'a FunDecl,
+    call_generics: &'a serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    call_generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+        .or_else(|| {
+            fd.item_meta
+                .instantiation()?
+                .get("types")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.first())
+        })
+}
+
+pub(in crate::front::mir) fn size_align_of_tyexpr_depth(
     llbc: &Llbc,
     want_align: bool,
     ty: &serde_json::Value,
+    depth: u8,
 ) -> Option<u64> {
-    let body = tyexpr_body(llbc, ty)?;
+    if depth > 24 {
+        return None;
+    }
+    let body = strip_ty_indirections(ty, llbc)?;
     if let Some(lit) = body.get("Scalar") {
         return primitive_size_align(want_align, lit);
     }
-    // `size_align_const_from_tyexpr`: a thin `RawPtr` / `Ref` to a sized
-    // pointee is one address word. A slice or trait object stays unharvested.
-    let pointee = match (body.get("RawPtr"), body.get("Ref")) {
-        (Some(raw), _) => raw.get(0),
-        (_, Some(reference)) => reference.get(1),
-        _ => None,
-    };
-    if let Some(pointee) = pointee {
-        let pointee = tyexpr_body(llbc, pointee)?;
-        let sized = pointee.get("Scalar").is_some() || nominal_adt_pointee(llbc, pointee);
-        return sized.then(|| crate::layout::target_word_size() as u64);
+    if matches!(body.as_str(), Some("Never")) {
+        return Some(if want_align { 1 } else { 0 });
     }
-    let adt = inline_adt_def_id(body).or_else(|| resolve_tyexpr_to_adt_def_id_free(llbc, ty))?;
+    let word = crate::layout::target_word_size() as u64;
+    if body.get("FnPtr").is_some() {
+        return Some(word);
+    }
+    if let Some(pointee) = type_node_box_pointee(body, llbc) {
+        // `Box<T>` of a sized `T` is one word; `Box<[T]>` / `Box<str>` /
+        // `Box<dyn Trait>` is a fat pointer (two words, word aligned).
+        if json_ty_is_statically_sized(pointee, llbc) {
+            return Some(word);
+        }
+        return Some(if want_align {
+            word
+        } else {
+            word.checked_mul(2)?
+        });
+    }
+    if let Some(pointee) = raw_ptr_or_ref_pointee(body) {
+        let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+        // A nominal ADT is thin only with ptr_metadata "None"
+        // (`lltypelayout.py` `get_fixed_size`). Length / VTable /
+        // InheritFrom stays unharvested so `size_of` remains a Call.
+        if pointee.get("Adt").is_some() {
+            if !nominal_adt_pointee(llbc, pointee) {
+                return None;
+            }
+            return Some(word);
+        }
+        // Unsized pointee: a fat pointer is two words, word aligned.
+        if !json_ty_is_statically_sized(pointee, llbc) {
+            return Some(if want_align {
+                word
+            } else {
+                word.checked_mul(2)?
+            });
+        }
+        return Some(word);
+    }
+    if let Some(array) = body.get("Array").and_then(serde_json::Value::as_array)
+        && array.len() >= 2
+    {
+        let elem_align = size_align_of_tyexpr_depth(llbc, true, &array[0], depth + 1)?;
+        if want_align {
+            return Some(elem_align);
+        }
+        let len = charon_array_len_to_string(&array[1], llbc)
+            .parse::<u64>()
+            .ok()?;
+        let elem_size = size_align_of_tyexpr_depth(llbc, false, &array[0], depth + 1)?;
+        return elem_size.checked_mul(len);
+    }
+    if let Some(slice) = body.get("Slice").and_then(serde_json::Value::as_array)
+        && let Some(elem) = slice.first()
+    {
+        // `[T]` is unsized. Alignment is the element's (`ItemOffset` of
+        // an array); size is not a translation-time constant.
+        if want_align {
+            return size_align_of_tyexpr_depth(llbc, true, elem, depth + 1);
+        }
+        return None;
+    }
+    // `C::Name` on `CodeObject<C>` (`w_code_const`'s
+    // `align_of::<CodeObject<ConstantData>>()`). The unique impl binds
+    // the projection (`llmemory.sizeof` after specialize).
+    if let Some(arr) = body.get("TraitType").and_then(serde_json::Value::as_array)
+        && arr.len() >= 2
+        && let Some(resolved) = resolve_trait_assoc_type_value(&arr[0], &arr[1], llbc)
+    {
+        return size_align_of_tyexpr_depth(llbc, want_align, resolved, depth + 1);
+    }
+    // A leftover TypeVar is not a layout. Spec copies substitute first
+    // (`size_align_const_from_tyexpr`).
+    if body.get("TypeVar").is_some() {
+        return None;
+    }
+    let adt = body.get("Adt")?.as_object()?;
+    if adt.get("builtin").and_then(serde_json::Value::as_str) == Some("Str") {
+        // `str` is unsized; `align_of::<str>()` is 1.
+        return want_align.then_some(1);
+    }
+    let id = adt.get("id")?.as_u64()?;
+    let decl = llbc.type_by_id(id)?;
+    if let TypeDeclKind::Alias(aliased) = &decl.kind {
+        return size_align_of_tyexpr_depth(llbc, want_align, aliased, depth + 1);
+    }
     let target = std::env::var("TARGET").unwrap_or_default();
-    let layout = llbc.type_by_id(adt)?.layout_for_target(llbc, &target)?;
+    if let Some((size, align)) = decl.size_align_for_target(llbc, &target) {
+        let value = if want_align { align } else { size };
+        if let Some(value) = value {
+            return Some(value);
+        }
+    }
+    // Charon leaves `bytecode::CodeObject` offsets unresolved (`chosen`
+    // null). `llmemory.sizeof` still has the host/wasm probe.
+    let canonical = strip_crate_prefix(&decl.item_meta.name_path());
+    if let Some(exact) = crate::codeobject_layout::exact_layout_for(&canonical) {
+        let value = if want_align { exact.align } else { exact.size };
+        if let Some(value) = value {
+            return Some(value);
+        }
+    }
+    if let Some(layout) = decl.layout_for_target(llbc, &target) {
+        let value = if want_align {
+            layout.align
+        } else {
+            layout.size
+        };
+        if let Some(value) = value {
+            return Some(value);
+        }
+    }
+    adt_size_align_from_fields(llbc, decl, body, want_align, depth + 1)
+}
+
+pub(in crate::front::mir) fn raw_ptr_or_ref_pointee(body: &serde_json::Value) -> Option<&serde_json::Value> {
+    let obj = body.as_object()?;
+    if let Some(raw) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+        return raw.first();
+    }
+    obj.get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.get(1))
+}
+
+pub(in crate::front::mir) fn adt_size_align_from_fields(
+    llbc: &Llbc,
+    decl: &TypeDecl,
+    owner: &serde_json::Value,
+    want_align: bool,
+    depth: u8,
+) -> Option<u64> {
+    let mut field_tys: Vec<TyRef> = Vec::new();
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            for field in fields {
+                field_tys.push(size_align_subst_field(field, owner, llbc)?);
+            }
+        }
+        TypeDeclKind::Enum(variants) => {
+            for variant in variants {
+                for field in &variant.fields {
+                    field_tys.push(size_align_subst_field(field, owner, llbc)?);
+                }
+            }
+        }
+        TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => return None,
+    }
+    let mut align = 1u64;
+    let mut off = 0u64;
+    let mut size_known = true;
+    for field_ty in &field_tys {
+        let field_node = tyref_node(field_ty, llbc)?;
+        let stripped = strip_ty_indirections(field_node, llbc)?;
+        let field_node = if let Some(arr) = stripped
+            .get("TraitType")
+            .and_then(serde_json::Value::as_array)
+        {
+            size_align_trait_type_from_owner(llbc, arr, owner).unwrap_or(stripped)
+        } else {
+            stripped
+        };
+        let field_align = size_align_of_tyexpr_depth(llbc, true, field_node, depth)?;
+        align = align.max(field_align);
+        if size_known {
+            if let Some(field_size) = size_align_of_tyexpr_depth(llbc, false, field_node, depth) {
+                off = align_up(off, field_align)?.checked_add(field_size)?;
+            } else {
+                size_known = false;
+            }
+        }
+    }
     if want_align {
-        layout.align
+        Some(align)
+    } else if size_known {
+        align_up(off, align)
     } else {
-        layout.size
+        None
     }
 }
 
@@ -3001,17 +3169,113 @@ pub(in crate::front::mir) fn nominal_adt_pointee(llbc: &Llbc, pointee: &serde_js
         .is_some_and(|decl| decl.ptr_metadata.as_str() == Some("None"))
 }
 
-pub(in crate::front::mir) fn tyexpr_body<'a>(
+/// Field type with the owner's generic arguments substituted.
+///
+/// `substitute_spill_typevars` walks every Deduplicated id through the
+/// type table, so a `[T; 0]` field whose length lives in the const table
+/// declines. Size/align only need the element type (`llmemory.sizeof` of
+/// an array is `n * sizeof(T)` / `alignof(T)`), so a Deduplicated id that
+/// is not a type body is left in place.
+pub(in crate::front::mir) fn size_align_subst_field(
+    field: &majit_charon_reader::ullbc::FieldDecl,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
+    let node = tyref_node(&field.ty, llbc)?;
+    let value = size_align_subst_value(node, owner, llbc, 0)?;
+    Some(TyRef::Other(value))
+}
+
+pub(in crate::front::mir) fn size_align_subst_value(
+    node: &serde_json::Value,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+    depth: u8,
+) -> Option<serde_json::Value> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return match llbc.dedup_body(id) {
+            Some(body) => size_align_subst_value(body, owner, llbc, depth + 1),
+            None => Some(node.clone()),
+        };
+    }
+    if node.get("TypeVar").is_some() {
+        // `clause_spec::type_var_index`: depth-0 `Bound[0, i]` or `Free i`.
+        // Charon type_decls spell the struct's own parameters both ways;
+        // `llmemory.sizeof` of an instantiated `GcEntries<K, V>` must
+        // read the owner's `generics.types[i]` for either spelling.
+        let index = crate::front::clause_spec::type_var_index(node)?;
+        let arg = type_decl_ref_generics(owner.get("Adt")?.as_object()?, llbc)?
+            .get("types")?
+            .as_array()?
+            .get(index)?;
+        return Some(arg.clone());
+    }
+    if let Some(items) = node.as_array() {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(size_align_subst_value(item, owner, llbc, depth + 1)?);
+        }
+        return Some(serde_json::Value::Array(out));
+    }
+    if let Some(obj) = node.as_object() {
+        let mut out = serde_json::Map::new();
+        for (key, value) in obj {
+            out.insert(
+                key.clone(),
+                size_align_subst_value(value, owner, llbc, depth + 1)?,
+            );
+        }
+        return Some(serde_json::Value::Object(out));
+    }
+    Some(node.clone())
+}
+
+/// `C::Name` on an instantiated ADT: a `Clause Bound[0, i]` is that
+/// Adt's `trait_refs[i]` (`specialize.py` cachedgraph). The unique impl
+/// is the fallback when the owner has no binding.
+pub(in crate::front::mir) fn size_align_trait_type_from_owner<'a>(
     llbc: &'a Llbc,
-    ty: &'a serde_json::Value,
+    projection: &'a [serde_json::Value],
+    owner: &'a serde_json::Value,
 ) -> Option<&'a serde_json::Value> {
-    if let Some(arr) = ty.get("Value").and_then(serde_json::Value::as_array) {
-        return arr.get(1);
+    if projection.len() < 2 {
+        return None;
     }
-    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        return llbc.dedup_body(id);
+    if let Some(index) = traitref_clause_bound0_index(&projection[0], llbc)
+        && let Some(tr) = type_decl_ref_generics(owner.get("Adt")?.as_object()?, llbc)?
+            .get("trait_refs")?
+            .as_array()?
+            .get(index)
+        && let Some(impl_id) = traitref_impl_id(tr, llbc, 0)
+        && let Some(value) = trait_impl_assoc_value(llbc, impl_id, &projection[1])
+    {
+        return Some(value);
     }
-    Some(ty)
+    resolve_trait_assoc_type_value(&projection[0], &projection[1], llbc)
+}
+
+pub(in crate::front::mir) fn traitref_clause_bound0_index(v: &serde_json::Value, llbc: &Llbc) -> Option<usize> {
+    let obj = traitref_unwrap(v, llbc, 0)?;
+    let bound = obj.get("kind")?.get("Clause")?.get("Bound")?.as_array()?;
+    if bound.first()?.as_u64()? != 0 {
+        return None;
+    }
+    Some(bound.get(1)?.as_u64()? as usize)
+}
+
+pub(in crate::front::mir) fn align_up(offset: u64, align: u64) -> Option<u64> {
+    if align == 0 {
+        return Some(offset);
+    }
+    let rem = offset % align;
+    if rem == 0 {
+        Some(offset)
+    } else {
+        offset.checked_add(align - rem)
+    }
 }
 
 pub(in crate::front::mir) fn primitive_size_align(
@@ -3745,7 +4009,7 @@ pub(in crate::front::mir) fn mem_size_align(
     if depth > 32 {
         return None;
     }
-    let body = tyexpr_body(llbc, ty)?;
+    let body = strip_ty_indirections(ty, llbc)?;
     if let Some(slot) = typevar_slot(body) {
         let repl = subst.get(slot)?;
         return mem_size_align(llbc, repl, &[], depth + 1);
@@ -3821,7 +4085,7 @@ pub(in crate::front::mir) fn subst_type_args(
     ty: &serde_json::Value,
     subst: &[serde_json::Value],
 ) -> serde_json::Value {
-    let Some(body) = tyexpr_body(llbc, ty) else {
+    let Some(body) = strip_ty_indirections(ty, llbc) else {
         return ty.clone();
     };
     if let Some(slot) = typevar_slot(body) {
@@ -3914,7 +4178,7 @@ pub(in crate::front::mir) fn instantiated_field_size_align(
         return Some(sa);
     }
     let substituted = subst_type_args(llbc, ty, subst);
-    let body = tyexpr_body(llbc, &substituted)?;
+    let body = strip_ty_indirections(&substituted, llbc)?;
     if let Some(slot) = typevar_slot(body) {
         let repl = subst.get(slot)?;
         return instantiated_field_size_align(llbc, repl, &[], clauses, depth + 1);
@@ -4060,7 +4324,7 @@ pub(in crate::front::mir) fn subst_bind_projected_field(
         return subst;
     };
     let field_ty = tyref_json(&field.ty);
-    let Some(body) = tyexpr_body(llbc, &field_ty) else {
+    let Some(body) = strip_ty_indirections(&field_ty, llbc) else {
         return subst;
     };
     let Some(slot) = typevar_slot(body) else {
@@ -4071,7 +4335,7 @@ pub(in crate::front::mir) fn subst_bind_projected_field(
     }
     let slot_is_open = match subst.get(slot) {
         None => true,
-        Some(ty) => tyexpr_body(llbc, ty).is_some_and(|body| typevar_slot(body).is_some()),
+        Some(ty) => strip_ty_indirections(ty, llbc).is_some_and(|body| typevar_slot(body).is_some()),
     };
     if slot_is_open {
         if subst.len() <= slot {

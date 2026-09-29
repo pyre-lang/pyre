@@ -2220,12 +2220,16 @@ fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef,
     live.extend_from_slice(args);
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&live);
-    let w_new =
-        pyre_interpreter::baseobjspace::getattr_str_impl(roots.get(base), "__new__", true, false)
-            .map_err(|mut err| {
-            err.enrich_attribute_error_str(roots.get(base), "__new__");
-            err
-        })?;
+    let w_new = pyre_interpreter::baseobjspace::getattr_str_impl(
+        roots.get(base),
+        "__new__",
+        true,
+        false,
+    )
+    .map_err(|mut err| {
+        err.enrich_attribute_error_str(roots.get(base), "__new__");
+        err
+    })?;
     let w_cls = roots.get(base);
     let mut reloaded_args = vec![pyre_object::PY_NULL; nargs];
     pyre_object::gc_roots::shadow_stack_copy_range(base + 1, &mut reloaded_args);

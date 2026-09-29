@@ -41,6 +41,8 @@ where
         table[jitcode::insns::BC_RAW_STORE_I as usize] = Self::opimpl_raw_store_i;
         table[jitcode::insns::BC_RAW_LOAD_I as usize] = Self::opimpl_raw_load_i;
         table[jitcode::insns::BC_RAW_LOAD_F as usize] = Self::opimpl_raw_load_f;
+        table[jitcode::insns::BC_GC_LOAD_INDEXED_I as usize] = Self::opimpl_gc_load_indexed_i;
+        table[jitcode::insns::BC_GC_LOAD_INDEXED_F as usize] = Self::opimpl_gc_load_indexed_f;
         table[jitcode::insns::BC_GETFIELD_GC_I as usize] = Self::opimpl_getfield_gc_i;
         table[jitcode::insns::BC_GETFIELD_GC_R as usize] = Self::opimpl_getfield_gc_i;
         table[jitcode::insns::BC_GETFIELD_GC_I_PURE as usize] = Self::opimpl_getfield_gc_i;
@@ -48,6 +50,7 @@ where
         table[jitcode::insns::BC_GETFIELD_GC_F as usize] = Self::opimpl_getfield_gc_f;
         table[jitcode::insns::BC_GETFIELD_GC_F_PURE as usize] = Self::opimpl_getfield_gc_f;
         table[jitcode::insns::BC_GETFIELD_RAW_I as usize] = Self::opimpl_getfield_raw_i;
+        table[jitcode::insns::BC_GETFIELD_RAW_R as usize] = Self::opimpl_getfield_raw_r;
         table[jitcode::insns::BC_GETFIELD_RAW_F as usize] = Self::opimpl_getfield_raw_f;
         table[jitcode::insns::BC_SETFIELD_VABLE_I_IMM as usize] = Self::opimpl_setfield_vable_i_imm;
         table[jitcode::insns::BC_SETFIELD_VABLE_I as usize] = Self::opimpl_setfield_vable_i;
@@ -65,6 +68,8 @@ where
         table[jitcode::insns::BC_SETARRAYITEM_GC_I as usize] = Self::opimpl_setarrayitem_gc_i;
         table[jitcode::insns::BC_SETARRAYITEM_GC_R as usize] = Self::opimpl_setarrayitem_gc_i;
         table[jitcode::insns::BC_SETARRAYITEM_GC_F as usize] = Self::opimpl_setarrayitem_gc_i;
+        table[jitcode::insns::BC_SETARRAYITEM_GC_R_C as usize] = Self::opimpl_setarrayitem_gc_i;
+        table[jitcode::insns::BC_SETARRAYITEM_GC_I_C as usize] = Self::opimpl_setarrayitem_gc_i;
         table[jitcode::insns::BC_GETARRAYITEM_RAW_I as usize] = Self::opimpl_getarrayitem_raw_i;
         table[jitcode::insns::BC_GETARRAYITEM_RAW_F as usize] = Self::opimpl_getarrayitem_raw_f;
         table[jitcode::insns::BC_SETARRAYITEM_RAW_I as usize] = Self::opimpl_setarrayitem_raw_i;
@@ -249,13 +254,16 @@ where
         table[jitcode::insns::BC_ABORT_PERMANENT as usize] = Self::opimpl_abort_permanent;
         table[jitcode::insns::BC_NEW_ARRAY as usize] = Self::opimpl_new_array;
         table[jitcode::insns::BC_NEW_ARRAY_CLEAR as usize] = Self::opimpl_new_array;
+        table[jitcode::insns::BC_NEW_ARRAY_CLEAR_C as usize] = Self::opimpl_new_array;
         table[jitcode::insns::BC_NEWLIST_CLEAR as usize] = Self::opimpl_newlist_clear;
         table[jitcode::insns::BC_INT_ISCONSTANT as usize] = Self::opimpl_int_isconstant;
         table[jitcode::insns::BC_REF_ISCONSTANT as usize] = Self::opimpl_ref_isconstant;
         table[jitcode::insns::BC_INT_ISVIRTUAL as usize] = Self::opimpl_int_isvirtual;
+        table[jitcode::insns::BC_INT_ISVIRTUAL_R as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_REF_ISVIRTUAL as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_STRLEN as usize] = Self::opimpl_strlen;
         table[jitcode::insns::BC_STRGETITEM as usize] = Self::opimpl_strgetitem;
+        table[jitcode::insns::BC_STRGETITEM_C as usize] = Self::opimpl_strgetitem;
         table
     };
 
@@ -552,7 +560,7 @@ where
         // *records* New / NewWithVtable so the optimizer can virtualize
         // the struct away when it does not escape.
         let with_vtable = bytecode == jitcode::insns::BC_NEW_WITH_VTABLE;
-        let (size, vtable, type_id, headerless, descr, dest) = {
+        let (size, bh_vtable, type_id, headerless, descr, dest) = {
             let frame = self.frames.current_mut();
             let (descr_idx, dest) = frame.read_new();
             let bh = frame
@@ -566,6 +574,18 @@ where
                 size_descr_ref_from_bh(bh),
                 dest,
             )
+        };
+        // `pyjitpl.py opimpl_new_with_vtable`: the class word is
+        // `descr.get_vtable()`. Assembler may leave BhDescr.vtable
+        // at 0; the published size descr in `_cache_size` holds it.
+        let vtable = if with_vtable {
+            descr
+                .as_size_descr()
+                .map(|sd| sd.vtable())
+                .filter(|&v| v != 0)
+                .unwrap_or(bh_vtable)
+        } else {
+            bh_vtable
         };
         // A `headerless` descr means the interpreter owns this struct in
         // its own collected pool (`headerless_structs`), which is what
@@ -624,7 +644,28 @@ where
             return TraceAction::Abort;
         }
         if with_vtable && vtable != 0 {
-            unsafe { *(ptr as *mut usize) = vtable };
+            // Allocation stays in this arm. `cpu.bh_new_with_vtable`
+            // refuses a raw fallback once a collector is installed,
+            // and cranelift's copy skips a headerless descr. Tests
+            // trace with no backend installed
+            // (`TraceCtx::for_test`), so there is no cpu to call.
+            // The header stores are still the one helper the
+            // backends use. An unconfigured `vtable_offset` keeps
+            // the offset-0 type word this arm has always written;
+            // a configured offset replaces it. The class word is
+            // written only when the backend was given one.
+            let (vtable_offset, w_class_offset) = match ctx.blackhole_cpu() {
+                Some(cpu) => (cpu.vtable_offset().or(Some(0)), cpu.w_class_offset()),
+                None => (Some(0), None),
+            };
+            unsafe {
+                majit_backend::write_new_with_vtable_header(
+                    ptr as *mut u8,
+                    vtable,
+                    vtable_offset,
+                    w_class_offset,
+                );
+            }
         }
         let kind = if with_vtable {
             OpCode::NewWithVtable
@@ -773,6 +814,16 @@ where
                     }
                 }
             }
+            let shadow = match bytecode {
+                jitcode::insns::BC_SETFIELD_GC_R => {
+                    majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize))
+                }
+                jitcode::insns::BC_SETFIELD_GC_F => {
+                    majit_ir::Value::Float(f64::from_bits(concrete as u64))
+                }
+                _ => majit_ir::Value::Int(concrete),
+            };
+            ctx.sync_shadow_if_vable_heap_store(struct_ptr, offset, value_opref, shadow);
         }
         TraceAction::Continue
     }
@@ -1049,6 +1100,138 @@ where
             OpCode::RawLoadF,
             Some(descr),
             &[base_opref, ea_opref],
+            Some(Value::Float(f64::from_bits(concrete_bits as u64))),
+            self.last_exception_value,
+        );
+        self.set_float_reg(ctx, dst, Some(opref), Some(concrete_bits));
+        TraceAction::Continue
+    }
+
+    // `pyjitpl.py` `opimpl_gc_load_indexed_i`: `execute(rop.GC_LOAD_INDEXED_I,
+    // addr, index, _remove_symbolics(scale), _remove_symbolics(baseofs), bytes)`.
+    // Encoding `gc_load_indexed_i/riiii>i`:
+    // [addr_reg][index_reg][scale_reg][baseofs_reg][bytes_reg][dst].
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_gc_load_indexed_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let (addr_reg, index_reg, scale_reg, baseofs_reg, bytes_reg, dst) = {
+            let frame = self.frames.current_mut();
+            let addr_reg = frame.next_reg() as usize;
+            let index_reg = frame.next_reg() as usize;
+            let scale_reg = frame.next_reg() as usize;
+            let baseofs_reg = frame.next_reg() as usize;
+            let bytes_reg = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
+            (
+                addr_reg,
+                index_reg,
+                scale_reg,
+                baseofs_reg,
+                bytes_reg,
+                dst,
+            )
+        };
+        let (addr_opref, addr) = self.read_ref_reg(ctx, addr_reg);
+        let (index_opref, index) = self.read_int_reg(ctx, index_reg);
+        let (scale_opref, scale) = self.read_int_reg(ctx, scale_reg);
+        let (baseofs_opref, base_ofs) = self.read_int_reg(ctx, baseofs_reg);
+        let (bytes_opref, bytes) = self.read_int_reg(ctx, bytes_reg);
+        let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
+        let item_addr = (addr as usize).wrapping_add(offset as usize);
+        let itemsize = bytes.unsigned_abs() as usize;
+        let is_signed = bytes < 0;
+        let concrete = unsafe {
+            match (itemsize, is_signed) {
+                (1, true) => core::ptr::read_unaligned(item_addr as *const i8) as i64,
+                (1, false) => core::ptr::read_unaligned(item_addr as *const u8) as i64,
+                (2, true) => core::ptr::read_unaligned(item_addr as *const i16) as i64,
+                (2, false) => core::ptr::read_unaligned(item_addr as *const u16) as i64,
+                (4, true) => core::ptr::read_unaligned(item_addr as *const i32) as i64,
+                (4, false) => core::ptr::read_unaligned(item_addr as *const u32) as i64,
+                (8, _) => core::ptr::read_unaligned(item_addr as *const i64),
+                other => {
+                    panic!(
+                        "BC_GC_LOAD_INDEXED_I: unsupported (itemsize, signed) = {:?}",
+                        other
+                    )
+                }
+            }
+        };
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::GcLoadIndexedI,
+            None,
+            &[
+                addr_opref,
+                index_opref,
+                scale_opref,
+                baseofs_opref,
+                bytes_opref,
+            ],
+            Some(Value::Int(concrete)),
+            self.last_exception_value,
+        );
+        self.set_int_reg(ctx, dst, Some(opref), Some(concrete));
+        TraceAction::Continue
+    }
+
+    // `pyjitpl.py` `opimpl_gc_load_indexed_f`. Encoding `riiii>f`.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_gc_load_indexed_f(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let (addr_reg, index_reg, scale_reg, baseofs_reg, bytes_reg, dst) = {
+            let frame = self.frames.current_mut();
+            let addr_reg = frame.next_reg() as usize;
+            let index_reg = frame.next_reg() as usize;
+            let scale_reg = frame.next_reg() as usize;
+            let baseofs_reg = frame.next_reg() as usize;
+            let bytes_reg = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
+            (
+                addr_reg,
+                index_reg,
+                scale_reg,
+                baseofs_reg,
+                bytes_reg,
+                dst,
+            )
+        };
+        let (addr_opref, addr) = self.read_ref_reg(ctx, addr_reg);
+        let (index_opref, index) = self.read_int_reg(ctx, index_reg);
+        let (scale_opref, scale) = self.read_int_reg(ctx, scale_reg);
+        let (baseofs_opref, base_ofs) = self.read_int_reg(ctx, baseofs_reg);
+        let (bytes_opref, bytes) = self.read_int_reg(ctx, bytes_reg);
+        let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
+        let item_addr = (addr as usize).wrapping_add(offset as usize);
+        assert_eq!(
+            bytes.unsigned_abs() as usize,
+            std::mem::size_of::<f64>(),
+            "BC_GC_LOAD_INDEXED_F: item size must be f64"
+        );
+        let concrete_bits = unsafe { core::ptr::read_unaligned(item_addr as *const i64) };
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::GcLoadIndexedF,
+            None,
+            &[
+                addr_opref,
+                index_opref,
+                scale_opref,
+                baseofs_opref,
+                bytes_opref,
+            ],
             Some(Value::Float(f64::from_bits(concrete_bits as u64))),
             self.last_exception_value,
         );
@@ -1461,6 +1644,60 @@ where
             Some(Value::Float(f64::from_bits(loaded_bits as u64))),
         );
         self.set_float_reg(ctx, dest, Some(op), Some(loaded_bits));
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_getfield_raw_r(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        // pyjitpl.py `opimpl_getfield_raw_r` (for pure only):
+        // `execute_with_descr(rop.GETFIELD_RAW_R, fielddescr, box)`.
+        // `blackhole.py bhimpl_getfield_raw_r` (`id>r`).
+        let (struct_reg, descr_idx, dest) = {
+            let frame = self.frames.current_mut();
+            frame.read_getfield_gc()
+        };
+        let (offset, fielddescr) = {
+            let frame = self.frames.current_mut();
+            let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
+                panic!("BC_GETFIELD_RAW_R: descrs[{descr_idx}] is not a BhDescr entry")
+            });
+            let offset = field_offset_from_bh(bh, "BC_GETFIELD_RAW_R");
+            let fielddescr = frame
+                .runtime_optimizer_descr(descr_idx)
+                .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+            (offset, fielddescr)
+        };
+        let (struct_opref, struct_ptr) = self.read_int_reg(ctx, struct_reg);
+        // `llmodel.py bh_getfield_raw_r = bh_getfield_gc_r` /
+        // `read_ref_at_mem`: GCREF width, not FLOATSTORAGE.
+        let loaded = if struct_ptr == 0 {
+            0
+        } else {
+            let addr = (struct_ptr as usize).wrapping_add(offset);
+            let acquire = fielddescr
+                .as_field_descr()
+                .map(|f| f.load_is_acquire())
+                .unwrap_or(false);
+            unsafe { majit_backend::llmodel::read_ref_at_mem(addr, acquire) as i64 }
+        };
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawR, crate::counters::OPS);
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawR, crate::counters::RECORDED_OPS);
+        let op = ctx.record_op_with_descr_value(
+            OpCode::GetfieldRawR,
+            &[struct_opref],
+            fielddescr,
+            Some(Value::Ref(majit_ir::GcRef(loaded as usize))),
+        );
+        self.set_ref_reg(ctx, dest, Some(op), Some(loaded));
         TraceAction::Continue
     }
 
@@ -2138,10 +2375,24 @@ where
             return TraceAction::Abort;
         };
         let (array_opref, array_addr) = self.read_ref_reg(ctx, array_reg);
-        let (index_opref, index_value) = self.read_int_reg(ctx, index_reg);
+        // `_get_opimpl_method`: argcode `c` is `ConstInt(signedord(byte))`.
+        // `setarrayitem_gc_r/rcrd` inlines the index; `setarrayitem_gc_i/ricd`
+        // inlines the stored int (`assembler.py` USE_C_FORM).
+        let (index_opref, index_value) = if bytecode == jitcode::insns::BC_SETARRAYITEM_GC_R_C {
+            let v = index_reg as u8 as i8 as i64;
+            (OpRef::ConstInt(v), v)
+        } else {
+            self.read_int_reg(ctx, index_reg)
+        };
         let (value_opref, value_concrete) = match bytecode {
-            jitcode::insns::BC_SETARRAYITEM_GC_R => self.read_ref_reg(ctx, value_reg),
+            jitcode::insns::BC_SETARRAYITEM_GC_R | jitcode::insns::BC_SETARRAYITEM_GC_R_C => {
+                self.read_ref_reg(ctx, value_reg)
+            }
             jitcode::insns::BC_SETARRAYITEM_GC_F => self.read_float_reg(ctx, value_reg),
+            jitcode::insns::BC_SETARRAYITEM_GC_I_C => {
+                let v = value_reg as u8 as i8 as i64;
+                (OpRef::ConstInt(v), v)
+            }
             _ => self.read_int_reg(ctx, value_reg),
         };
         let descr_index = descr.index();
@@ -2194,8 +2445,10 @@ where
             // A ref store adds a heap edge array→value; notify the GC on
             // the container so a young value survives a minor collection
             // triggered later in the walk (mirrors bh_setarrayitem_gc_r).
-            if bytecode == jitcode::insns::BC_SETARRAYITEM_GC_R
-                && majit_gc::gc_owns_object(array_addr as usize)
+            if matches!(
+                bytecode,
+                jitcode::insns::BC_SETARRAYITEM_GC_R | jitcode::insns::BC_SETARRAYITEM_GC_R_C
+            ) && majit_gc::gc_owns_object(array_addr as usize)
             {
                 majit_gc::gc_write_barrier(majit_ir::GcRef(array_addr as usize));
             }
@@ -4136,15 +4389,19 @@ where
         // greens/reds split by kind in `(I, R, F, I, R, F)`
         // order (mirrors `bhimpl_jit_merge_point`'s
         // `@arguments("self", "i", "I", "R", "F", "I", "R",
-        // "F")`, blackhole.py).  Each register byte must
-        // fall within the JitCode's per-kind register bank.
+        // "F")`, blackhole.py).  Each register byte indexes
+        // `MIFrame.registers_X` after `copy_constants`
+        // (`jitcode.py num_regs_and_consts_*`): working
+        // registers at `[0, num_regs_X)` and the constant
+        // pool at `num_regs_X + i`. A Constant green
+        // (`pycode` on a per-CodeObject body) is that suffix.
         let max_regs = [
-            frame.jitcode.num_regs_i(),
-            frame.jitcode.num_regs_r(),
-            frame.jitcode.num_regs_f(),
-            frame.jitcode.num_regs_i(),
-            frame.jitcode.num_regs_r(),
-            frame.jitcode.num_regs_f(),
+            frame.jitcode.num_regs_and_consts_i(),
+            frame.jitcode.num_regs_and_consts_r(),
+            frame.jitcode.num_regs_and_consts_f(),
+            frame.jitcode.num_regs_and_consts_i(),
+            frame.jitcode.num_regs_and_consts_r(),
+            frame.jitcode.num_regs_and_consts_f(),
         ];
         // Slice (audit Issue #4) — verify_green_args
         // (pyjitpl.py).  Slots 0..3 hold the green
@@ -4614,6 +4871,38 @@ where
                         return TraceAction::Continue;
                     }
                 }
+                // pyjitpl.py:1616
+                // `frame.do_recursive_call(jitdriver_sd, greenboxes + redboxes, orgpc,
+                //                          assembler_call=True)`.
+                // The reds live on this inlined callee frame. `finishframe`
+                // pops it, and the caller frame is a different register
+                // file, so read them here.
+                let mut pre_args = Vec::new();
+                let mut pre_red_values = Vec::new();
+                let mut pre_arg_types = Vec::new();
+                for &src in &red_i_regs {
+                    let (op, bits) = self.read_int_reg(ctx, src as usize);
+                    pre_args.push(op);
+                    pre_red_values.push(majit_ir::Value::Int(bits));
+                    pre_arg_types.push(majit_ir::Type::Int);
+                }
+                for &src in &red_r_regs {
+                    let (op, bits) = self.read_ref_reg(ctx, src as usize);
+                    pre_args.push(op);
+                    pre_red_values.push(majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)));
+                    pre_arg_types.push(majit_ir::Type::Ref);
+                }
+                for &src in &red_f_regs {
+                    let (op, bits) = self.read_float_reg(ctx, src as usize);
+                    pre_args.push(op);
+                    pre_red_values.push(majit_ir::Value::Float(f64::from_bits(bits as u64)));
+                    pre_arg_types.push(majit_ir::Type::Float);
+                }
+                let prebuilt_reds = if pre_args.is_empty() {
+                    None
+                } else {
+                    Some((pre_args, pre_red_values, pre_arg_types))
+                };
                 //
                 // (1) capture old_frame (the inlined portal callee, top
                 //     of stack) before the pop (pyjitpl.py) so its
@@ -4668,6 +4957,10 @@ where
                     jdindex,
                     result_dst,
                     &green_values,
+                    &[],
+                    &[],
+                    &[],
+                    prebuilt_reds,
                 ) {
                     TraceAction::Continue => {}
                     // Abort propagates (missing fresh-reds / target).
@@ -4737,6 +5030,9 @@ where
             // emission.  `record_state_guard` captures the matching resume
             // snapshot at `mp_opcode_pc`, mirroring `generate_guard`'s
             // `capture_resumedata` (pyjitpl.py).
+            if !self.opcode_preceded_by_live(mp_opcode_pc) {
+                return TraceAction::Abort;
+            }
             self.record_state_guard(
                 ctx,
                 sym,
@@ -4769,11 +5065,17 @@ where
             // a degenerate empty bridge that jumps back with no forward
             // progress. A primary trace still self-closes at `header_pc`.
             let close_target_pc = if ctx.is_bridge_trace {
-                ctx.bridge_target_header_pc.unwrap_or(ctx.header_pc)
+                ctx.bridge_target_header_pc
             } else {
-                ctx.header_pc
+                Some(ctx.header_pc)
             };
-            let pc_matches = mp_green_pc.is_none_or(|pc| pc == close_target_pc as i64);
+            // A bridge with no parent-loop pc must not treat `header_pc`
+            // (`resume_pc`, the failing opcode) as a close target: that
+            // bakes a degenerate empty bridge at the guard's Python pc.
+            let pc_matches = match close_target_pc {
+                Some(target) => mp_green_pc.is_none_or(|pc| pc == target as i64),
+                None => false,
+            };
             // pyjitpl.py/3912 same_greenkey: beyond the pc, close
             // only when EVERY green — the scalars and the ref the
             // consumer declares — equals the trace-start header's.  Compare
@@ -4822,7 +5124,7 @@ where
             let header_matches = pc_matches && same_greenkey;
             if crate::mptrace_enabled() {
                 eprintln!(
-                    "@@@MPTRACE visit pc={mp_green_pc:?} header_pc={} close_target={close_target_pc} matches={header_matches} num_ops={}",
+                    "@@@MPTRACE visit pc={mp_green_pc:?} header_pc={} close_target={close_target_pc:?} matches={header_matches} num_ops={}",
                     ctx.header_pc,
                     ctx.num_ops(),
                 );
@@ -4830,7 +5132,7 @@ where
             if header_matches {
                 if crate::jitdriver::spdiag_enabled() {
                     eprintln!(
-                        "@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}"
+                        "@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc:?} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}"
                     );
                 }
                 // pyjitpl.py `get_procedure_token(greenboxes)` —
@@ -4918,6 +5220,22 @@ where
                     // `recover`.
                     ctx.walk_final_pc = mp_green_pc.map(Self::guest_pc_position);
                     ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
+                }
+                // pyjitpl.py `reached_loop_header`: before `compile_loop`,
+                // `get_procedure_token(greenboxes)` + `has_compiled_targets`
+                // records a JUMP into the loop that already owns this merge
+                // point (`compile_trace`). A root trace has no `bridge_info`,
+                // so the guard-origin block never runs; publishing the token
+                // key is what makes the driver take `compile_trace_from_interp`
+                // instead of `compile_loop`'s `ABORT_BAD_LOOP`.
+                if !ctx.is_bridge_trace
+                    && let Some(close_key) = ctx.close_green_key_hash()
+                    && ctx
+                        .has_compiled_targets_fn
+                        .as_ref()
+                        .is_some_and(|f| f(close_key))
+                {
+                    ctx.close_jump_into_key = Some(close_key);
                 }
                 // GUARD_FUTURE_CONDITION already emitted unconditionally at
                 // the reached_loop_header entry above (pyjitpl.py).
@@ -5496,7 +5814,7 @@ where
                 exc_value: 0,
             };
         } else {
-            return typed_return_without_caller_destination("BC_INT_RETURN", 'i');
+            return typed_return_without_caller_destination("BC_INT_RETURN", 'i', self.frames);
         }
         TraceAction::Continue
     }
@@ -5546,7 +5864,7 @@ where
                 exc_value: 0,
             };
         } else {
-            return typed_return_without_caller_destination("BC_INT_RETURN_C", 'i');
+            return typed_return_without_caller_destination("BC_INT_RETURN_C", 'i', self.frames);
         }
         TraceAction::Continue
     }
@@ -5595,7 +5913,7 @@ where
                 exc_value: 0,
             };
         } else {
-            return typed_return_without_caller_destination("BC_REF_RETURN", 'r');
+            return typed_return_without_caller_destination("BC_REF_RETURN", 'r', self.frames);
         }
         TraceAction::Continue
     }
@@ -5644,7 +5962,7 @@ where
                 exc_value: 0,
             };
         } else {
-            return typed_return_without_caller_destination("BC_FLOAT_RETURN", 'f');
+            return typed_return_without_caller_destination("BC_FLOAT_RETURN", 'f', self.frames);
         }
         TraceAction::Continue
     }
@@ -5859,6 +6177,17 @@ where
             let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
             let is_loopinvariant =
                 effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
+
+            if let Some(action) = self.try_record_set_current_exception(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                effectinfo.runtime_helper,
+                &args,
+                &raw_r,
+            ) {
+                return action;
+            }
 
             // pyjitpl.py execute_varargs parity (plain
             // CALL_N / LOOPINVARIANT_N branch) and pyjitpl.py
@@ -6270,6 +6599,13 @@ where
             {
                 return action;
             }
+            // `dont_look_inside_cannot_raise` residuals skip the
+            // may_force finalize. `dispatch_exception_handler`
+            // still `frame.push`es the caught exception, so the
+            // heap vsd moves while the vable shadow does not.
+            // Reload vsd/stack only — a full static reload
+            // clobbers last_instr (shadow newer than heap).
+            ctx.reload_vable_stack_if_heap_moved();
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
             // `is_forces` because the before-hook only stamps
@@ -6369,13 +6705,18 @@ where
                     let frame = self.frames.current_mut();
                     eprintln!(
                         "[interpret] residual may_force jitcode={} last_op={} cursor={} \
-                         extraeffect={:?} can_raise={} next={:?}",
+                         extraeffect={:?} can_raise={} next={:?} fnaddr={:#x} classes={:?} \
+                         ret={} last_exc={:#x}",
                         frame.jitcode.name(),
                         frame.last_opcode_position,
                         frame.code_cursor,
                         effectinfo.extraeffect,
                         effectinfo.check_can_raise(false),
                         frame.jitcode.code.get(frame.code_cursor),
+                        concrete_ptr as usize,
+                        calldescr.arg_classes,
+                        concrete,
+                        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
                     );
                 }
                 let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -6579,6 +6920,25 @@ where
                 return TraceAction::Continue;
             }
 
+            if let Some(action) = self.try_record_load_global_exc_class(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                &raw_i,
+                dst,
+            ) {
+                return action;
+            }
+            if let Some(action) = self.try_record_get_current_exception(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                effectinfo.runtime_helper,
+                dst,
+            ) {
+                return action;
+            }
+
             // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_R branch parity:
             // clear_exception precedes vable_and_vrefs_before_residual_call
             // (vrefs walk + vinfo stamp; see void arm for full citation).
@@ -6617,6 +6977,13 @@ where
             {
                 return action;
             }
+            // `dont_look_inside_cannot_raise` residuals skip the
+            // may_force finalize. `dispatch_exception_handler`
+            // still `frame.push`es the caught exception, so the
+            // heap vsd moves while the vable shadow does not.
+            // Reload vsd/stack only — a full static reload
+            // clobbers last_instr (shadow newer than heap).
+            ctx.reload_vable_stack_if_heap_moved();
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
             // `is_forces` because the before-hook only stamps
@@ -9190,7 +9557,8 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        let clear = bytecode == jitcode::insns::BC_NEW_ARRAY_CLEAR;
+        let clear = bytecode == jitcode::insns::BC_NEW_ARRAY_CLEAR
+            || bytecode == jitcode::insns::BC_NEW_ARRAY_CLEAR_C;
         let (length_reg, array_descr_idx, dest) = {
             let frame = self.frames.current_mut();
             frame.read_new_array()
@@ -9211,7 +9579,13 @@ where
         let Some(array_descr) = self.dispatch_array_descr_ref(ctx, array_descr_idx) else {
             return TraceAction::Abort;
         };
-        let (length_opref, length_val) = self.read_int_reg(ctx, length_reg);
+        let (length_opref, length_val) = if bytecode == jitcode::insns::BC_NEW_ARRAY_CLEAR_C {
+            // `new_array_clear/cd>r`: length is `signedord` (`_get_opimpl_method`).
+            let v = length_reg as u8 as i8 as i64;
+            (OpRef::ConstInt(v), v)
+        } else {
+            self.read_int_reg(ctx, length_reg)
+        };
         let length_count =
             usize::try_from(length_val).expect("BC_NEW_ARRAY: negative array length");
         let array_payload = array_itemsize
@@ -9650,7 +10024,13 @@ where
             (src, index_reg, dst)
         };
         let (string, addr) = self.read_ref_reg(ctx, src);
-        let (index, index_value) = self.read_int_reg(ctx, index_reg);
+        let (index, index_value) = if bytecode == jitcode::insns::BC_STRGETITEM_C {
+            // `strgetitem/rc>i`: index is `signedord` (`_get_opimpl_method`).
+            let v = index_reg as u8 as i8 as i64;
+            (OpRef::ConstInt(v), v)
+        } else {
+            self.read_int_reg(ctx, index_reg)
+        };
         assert_ne!(addr, 0, "strgetitem: null string");
         let len = unsafe {
             ((addr as usize).wrapping_add(std::mem::size_of::<usize>()) as *const usize)

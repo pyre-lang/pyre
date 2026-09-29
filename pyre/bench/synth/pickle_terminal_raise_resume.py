@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=load_attr,builtin_getattr
+# pyre-check: trace-shape=<module>:present=GetarrayitemGcR,entry-bridge:find_class:absent=GuardNonnull
 # pyre-check: max-wasm-ratio=4.1
 # Function.call_args now enters every application-level callee through the
 # recursive portal, matching PyPy's PyCode.funcrun -> PyFrame.run chain.  The

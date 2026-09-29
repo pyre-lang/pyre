@@ -50,6 +50,7 @@ majit-gc = { workspace = true }
 majit-rlib = { workspace = true }
 majit-jitcode = { workspace = true }
 majit-config = { workspace = true }
+majit-macros = { workspace = true }
 bit-set = { workspace = true }
 smallvec = { workspace = true }
 vecset = { workspace = true }

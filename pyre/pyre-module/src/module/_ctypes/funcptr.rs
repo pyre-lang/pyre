@@ -913,10 +913,13 @@ fn restype_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
         return Ok(v);
     }
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    Ok(
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") }
-            .unwrap_or_else(pyre_object::w_none),
-    )
+    Ok(unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            "_restype_",
+        )
+    }
+    .unwrap_or_else(pyre_object::w_none))
 }
 
 fn restype_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -938,10 +941,13 @@ fn argtypes_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
         return Ok(v);
     }
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    Ok(
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_argtypes_") }
-            .unwrap_or_else(pyre_object::w_none),
-    )
+    Ok(unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            "_argtypes_",
+        )
+    }
+    .unwrap_or_else(pyre_object::w_none))
 }
 
 fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -1040,8 +1046,12 @@ pub(super) enum Ret {
 
 pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, pyre_interpreter::PyError> {
     let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let rt = pyre_object::with_roots!(cls => instance_get(obj, RESTYPE_KEY))
-        .or_else(|| unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") });
+    let rt = pyre_object::with_roots!(cls => instance_get(obj, RESTYPE_KEY)).or_else(|| unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            "_restype_",
+        )
+    });
     match rt {
         // CDLL functions default to c_int when no restype is set.
         None => Ok(Ret::Code(DEFAULT_RESTYPE_CODE)),
@@ -1068,12 +1078,22 @@ pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, pyre_interpreter:
 /// raises `OSError` rather than being handed back as a negative number.
 fn resolve_checker(obj: PyObjectRef) -> Option<PyObjectRef> {
     let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let rt = pyre_object::with_roots!(cls => instance_get(obj, RESTYPE_KEY))
-        .or_else(|| unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") })?;
+    let rt =
+        pyre_object::with_roots!(cls => instance_get(obj, RESTYPE_KEY)).or_else(|| unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                cls,
+                "_restype_",
+            )
+        })?;
     if !unsafe { pyre_object::is_type(rt) } {
         return None;
     }
-    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(rt, "_check_retval_") }
+    unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            rt,
+            "_check_retval_",
+        )
+    }
 }
 
 /// `errcheck(result, self, arguments)` — the last word on what a call returns.
@@ -1170,7 +1190,12 @@ pub(super) fn resolve_argtypes(mut obj: PyObjectRef) -> Option<Vec<PyObjectRef>>
 /// The `_argtypes_` declared on type `cls` — what a constructor has to check
 /// paramflags against, the instance having none of its own yet.
 fn type_argtypes(cls: PyObjectRef) -> Option<Vec<PyObjectRef>> {
-    argtypes_seq(unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_argtypes_") }?)
+    argtypes_seq(unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            "_argtypes_",
+        )
+    }?)
 }
 
 /// A settled `argtypes` value as a Vec; `None` means unset.
@@ -1312,7 +1337,12 @@ fn seq_to_vec(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
 
 pub(super) fn funcptr_flags(obj: PyObjectRef) -> i64 {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_flags_") } {
+    match unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            "_flags_",
+        )
+    } {
         Some(o) if unsafe { pyre_object::is_int(o) } => unsafe { pyre_object::w_int_get_value(o) },
         _ => 0,
     }
@@ -3235,7 +3265,13 @@ pub(super) fn is_funcptr_type(t: PyObjectRef) -> bool {
     !t.is_null()
         && unsafe { pyre_object::is_type(t) }
         && !std::ptr::eq(t, cfuncptr_type())
-        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(t, "_flags_") }.is_some()
+        && unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                t,
+                "_flags_",
+            )
+        }
+        .is_some()
 }
 
 fn is_funcptr_instance(obj: PyObjectRef) -> bool {

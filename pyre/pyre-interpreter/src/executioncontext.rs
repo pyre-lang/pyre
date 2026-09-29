@@ -2,6 +2,7 @@ use pyre_object::PyObjectRef;
 use pyre_object::quasiimmut::{
     QuasiImmut, QuasiImmutField, QuasiImmutLock, null_mutate_lock, null_mutate_word,
 };
+use rustpython_wtf8::Wtf8;
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::ptr::NonNull;
@@ -4068,8 +4069,12 @@ impl UserDelAction {
         let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());
         let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
-        let Some(w_del) = (unsafe { crate::baseobjspace::lookup_in_type(w_type(), "__del__") })
-        else {
+        let Some(w_del) = (unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_type(),
+                "__del__",
+            )
+        }) else {
             return;
         };
         if !self.begin_finalizer(current()) {
