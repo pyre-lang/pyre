@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=len_user_dunder
 # pyre-check: trace-shape=hot_plain:absent=CallMayForceR
 # pyre-check: jitstats-band=guard_failures=125
 # `hot_plain(Nested(...))` inlines Nested.__len__, which calls len() on the

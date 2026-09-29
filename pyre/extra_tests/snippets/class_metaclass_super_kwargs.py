@@ -18,3 +18,10 @@ result = node.rootpath
 assert result == 'ok'
 
 assert result == 'ok'
+
+class M(type):
+    def __call__(cls, *args):
+        return ('meta', args)
+class C(metaclass=M):
+    pass
+assert C(7) == ('meta', (7,))

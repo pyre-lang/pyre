@@ -60,7 +60,7 @@ impl OptSimplifyState {
         _ctx: &mut OptContext,
     ) -> OptimizationResult {
         match op.opcode {
-            // CALL_PURE_* -> CALL_*
+            // CALL_PURE_* -> CALL_* (`simplify.py optimize_CALL_PURE_I`)
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
                 OptimizationResult::Emit(Self::rewrite_call(op))
             }
@@ -178,13 +178,15 @@ mod tests {
             (OpCode::CallPureF, OpCode::CallF),
             (OpCode::CallPureN, OpCode::CallN),
         ] {
-            // pure_op(i0, i1) over two header inputargs.
+            // pure_op(i0, i1) over two header inputargs; Finish keeps
+            // the result live so rewrite (not unused-Remove) runs.
             let mut b = TraceBuilder::new();
             let i0 = b.input(Type::Int, 0);
             let i1 = b.input(Type::Int, 1);
-            b.op(pure_op, &[i0, i1]);
+            let v = b.op(pure_op, &[i0, i1]);
+            b.op(OpCode::Finish, &[v]);
             let result = run_trace(b);
-            assert_eq!(result.len(), 1);
+            assert_eq!(result.len(), 2);
             assert_eq!(result[0].opcode, expected_op);
             assert_eq!(
                 &result[0]
@@ -275,9 +277,10 @@ mod tests {
         let i0 = b.input(Type::Int, 0);
         let i1 = b.input(Type::Int, 1);
         let i2 = b.input(Type::Int, 2);
-        b.op(OpCode::CallPureI, &[i0, i1, i2]);
+        let v = b.op(OpCode::CallPureI, &[i0, i1, i2]);
+        b.op(OpCode::Finish, &[v]);
         let result = run_trace(b);
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallI);
         assert_eq!(
             result[0]
@@ -296,11 +299,12 @@ mod tests {
         let i0 = b.input(Type::Int, 0);
         let i1 = b.input(Type::Int, 1);
         b.op(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
-        b.op(OpCode::CallPureI, std::slice::from_ref(&i0));
+        let call = b.op(OpCode::CallPureI, std::slice::from_ref(&i0));
         b.op(OpCode::RecordExactClass, &[i0.clone(), i1.clone()]);
         b.op(OpCode::IntSub, &[i0, i1]);
+        b.op(OpCode::Finish, &[call]);
         let result = run_trace(b);
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 4);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::CallI);
         assert_eq!(result[2].opcode, OpCode::IntSub);
@@ -344,6 +348,19 @@ mod tests {
         b.op(OpCode::Finish, &[]);
         let result = run_trace(b);
         assert!(result.iter().any(|o| o.opcode == OpCode::SameAsR));
+    }
+
+    #[test]
+    fn test_call_pure_rewrites_to_call() {
+        // `simplify.py optimize_CALL_PURE_I` always rewrites to CALL_*
+        // and emits. Unused results stay; they are not deleted.
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        b.op(OpCode::CallPureR, &[i0]);
+        b.op(OpCode::Finish, &[]);
+        let result = run_trace(b);
+        assert!(result.iter().any(|o| o.opcode == OpCode::CallR));
+        assert!(!result.iter().any(|o| o.opcode == OpCode::CallPureR));
     }
 
     #[test]
