@@ -457,6 +457,7 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
 
     let mut field_reads: Vec<(String, Option<String>)> = Vec::new();
     let mut field_writes: Vec<(String, Option<String>)> = Vec::new();
+    let mut field_write_tys: Vec<majit_translate::model::ValueType> = Vec::new();
     let mut ctor_count = 0usize;
     for b in &graph.blocks {
         for op in &b.operations {
@@ -464,8 +465,9 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
                 OpKind::FieldRead { field, .. } => {
                     field_reads.push((field.name.clone(), field.owner_root.clone()));
                 }
-                OpKind::FieldWrite { field, .. } => {
+                OpKind::FieldWrite { field, ty, .. } => {
                     field_writes.push((field.name.clone(), field.owner_root.clone()));
+                    field_write_tys.push(ty.clone());
                 }
                 OpKind::Call {
                     target: CallTarget::SyntheticTransparentCtor { .. },
@@ -490,6 +492,14 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
             ("__pos_1".to_string(), Some("Tuple<i64,i64>".to_string())),
         ],
         "tuple construction must emit a __pos_0 / __pos_1 FieldWrite chain"
+    );
+    assert_eq!(
+        field_write_tys,
+        vec![
+            majit_translate::model::ValueType::Int,
+            majit_translate::model::ValueType::Int
+        ],
+        "tuple i64 items are Signed (`history.py` getkind), not the empty-spelling Ref fallback"
     );
 
     // Exactly the two genuine tuple reads become FieldReads. The three
@@ -724,10 +734,11 @@ fn front_graph_carries_no_synthesized_exception_edges() {
 /// answer `Ref` for every container that was not `front::range_iter`'s
 /// `range()` builtin, because the `iter` op carries the iterator and not
 /// the container's item type — so this graph typed a raw `i64` into the
-/// ref register bank.  `result_ty` is not a hint the rtyper can overrule:
-/// `resolve_call_result_kind` consults `concretetype` only when
-/// `result_ty` is `Unknown`, and `authoritative_result_types` stamps the
-/// derived kind back over it.
+/// ref register bank.  `resolve_call_result` reads `op.result.concretetype`
+/// first (`jtransform.py rewrite_call` `reskind = getkind(op.result.concretetype)[0]`);
+/// `result_ty` is the pre-rtyper-cell path when that cell is still
+/// `Unknown`. `authoritative_result_types` stamps the rewritten
+/// `result_kind` back over it.
 #[test]
 fn branch_loop_sum_next_yields_an_int_element() {
     use majit_translate::model::{CallTarget, OpKind, ValueType};
@@ -1233,73 +1244,28 @@ fn header_read_narrows_to_a_typed_field_read() {
     );
 }
 
-/// A boxing allocation becomes `NewWithVtable` only after its class-static
-/// address is known. Exercise the fusion directly so the unresolved and
-/// resolved cases differ by that input alone.
+/// A boxing allocation becomes `NewWithVtable` once its class-static
+/// address is a constant. An immutable static is that constant
+/// (`bookkeeper.py immutablevalue`); a residual FunctionPath of the
+/// static's name was the deviation this branch deleted.
 #[test]
 fn boxing_cluster_fuses_once_the_class_address_resolves() {
-    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    use majit_translate::model::{CallTarget, OpKind};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
-    let attrs = std::collections::HashMap::from([
-        (
-            "ObjectHeader".to_string(),
-            vec![
-                ("ob_type".to_string(), ValueType::Ref(None)),
-                ("w_class".to_string(), ValueType::Ref(None)),
-            ],
-        ),
-        (
-            "W_IntObject".to_string(),
-            vec![
-                ("ob_header".to_string(), ValueType::Ref(None)),
-                ("intval".to_string(), ValueType::Int),
-            ],
-        ),
-    ]);
 
     let llbc = load_corpus();
 
-    // Without a resolvable class address the cluster is left alone.
-    let mut graph = lower_function(llbc, "w_new_int").expect("lowering");
-    assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
-        0,
-        "an unresolvable class-static address declines the fuse, silently",
-    );
-
-    // Stand in for the driver-supplied static address.
-    let mut graph = lower_function(llbc, "w_new_int").expect("lowering");
-    let mut substituted = 0usize;
-    for b in &mut graph.blocks {
-        for op in &mut b.operations {
-            let is_class_static = matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.last().map(String::as_str) == Some("INT_CLASS")
-            );
-            if is_class_static {
-                op.kind = OpKind::ConstRefAddr(CLASS_ADDR);
-                substituted += 1;
-            }
-        }
-    }
-    assert_eq!(
-        substituted, 2,
-        "ob_type and w_class each read the class static",
-    );
-
-    assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
-        1,
-        "the cluster fuses once the class address is a constant",
-    );
-
+    // `bookkeeper.py immutablevalue`: an immutable class static is a
+    // ConstRefAddr of the declaration itself, never a residual
+    // FunctionPath of the static's name. Lowering fuses from that
+    // identity; the host-registered address is the sibling
+    // `boxing_cluster_fuses_from_the_host_supplied_class_address`.
+    let graph = lower_function(llbc, "w_new_int").expect("lowering");
     let mut fused = Vec::new();
     let mut payload_stores = 0usize;
     let mut residual_mallocs = 0usize;
+    let mut residual_class_reads = 0usize;
     for b in &graph.blocks {
         for op in &b.operations {
             match &op.kind {
@@ -1308,27 +1274,42 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if segments.last().map(String::as_str) == Some("malloc_typed") => {
-                    residual_mallocs += 1
-                }
+                } => match segments.last().map(String::as_str) {
+                    Some("malloc_typed") => residual_mallocs += 1,
+                    Some("INT_CLASS") => residual_class_reads += 1,
+                    _ => {}
+                },
                 _ => {}
             }
         }
     }
     assert_eq!(
-        fused,
-        vec![("W_IntObject".to_string(), CLASS_ADDR)],
-        "one NewWithVtable carrying the real class pointer",
+        residual_class_reads, 0,
+        "INT_CLASS is a ConstRefAddr, not a residual call",
     );
-    // Two: the re-emitted store after the `NewWithVtable`, plus the original
-    // aggregate store, which is dead but not yet swept — `fuse_boxing_alloc`
-    // leaves that to the `remove_dead_aggregates` pass in
-    // `simplify_lowered_graph`.
-    assert_eq!(payload_stores, 2, "the intval payload store is re-emitted");
     assert_eq!(
         residual_mallocs, 0,
         "the malloc_typed call is consumed, not left residual",
     );
+    assert_eq!(
+        fused.len(),
+        1,
+        "the cluster fuses from the immutable static"
+    );
+    assert_eq!(
+        fused[0].0, "W_IntObject",
+        "one NewWithVtable carrying the class static"
+    );
+    assert_ne!(
+        fused[0].1, 0,
+        "vtable is the static's identity, not a null placeholder"
+    );
+    assert_ne!(
+        fused[0].1, CLASS_ADDR,
+        "without HostStaticAddrs the vtable is the declaration sentinel"
+    );
+    // Whole-graph lowering runs `remove_dead_aggregates` after the fuse.
+    assert_eq!(payload_stores, 1, "the intval payload store is re-emitted");
 }
 
 /// The production lowering receives class-static addresses through
@@ -2775,6 +2756,7 @@ fn mem_replace_through_box_deref_names_enum_fields() {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         let named: Vec<String> = descriptor
@@ -4249,6 +4231,29 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
     });
 }
 
+/// `from_type_and_value` does `unwrap_or(PyErrorKind::RuntimeError)`.
+/// `PyErrorKind` is a fieldless enum (Int). Recasting the tag onto the
+/// enum class (`rclass.py` `cast_instance`) is the non-pointer operand
+/// the annotator rejects, and dual-gate Skip then hydrates a Ref first
+/// arg for residual `make_pyerror` (FUNC.ARGS Int).
+#[test]
+fn from_type_and_value_does_not_cast_fieldless_kind() {
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let graph = lower_named(llbc, "from_type_and_value")
+        .unwrap_or_else(|e| panic!("lower from_type_and_value: {e}"));
+    let kind_casts: Vec<&str> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| majit_translate::model::cast_instance_root(&op.kind))
+        .filter(|root| *root == "PyErrorKind")
+        .collect();
+    assert!(
+        kind_casts.is_empty(),
+        "PyErrorKind is a fieldless enum; must not __cast_instance_intrinsic the tag; roots={kind_casts:?}"
+    );
+}
+
 /// Graphs that pass a guard-containing pointer to a residual callee are
 /// declined. The interpreter corpus has none. `pyre-jit` used to resume a
 /// native `FailArgSource` (it holds the guard) through residual `llmodel`
@@ -4614,324 +4619,304 @@ fn object_key_field_read_narrows_to_object_key_class() {
     );
 }
 
-fn last_ident<'a>(fd: &'a FunDecl) -> Option<(&'a str, u64)> {
-    fd.item_meta
-        .template_name()
-        .rev()
-        .find_map(|seg| match seg {
-            NameSeg::Ident {
-                ident: (name, disambiguator),
-            } => Some((name.as_str(), *disambiguator)),
-            _ => None,
-        })
-}
-
-fn ident_disambiguator(fd: &FunDecl, name: &str) -> Option<u64> {
-    fd.item_meta.template_name().find_map(|seg| match seg {
-        NameSeg::Ident {
-            ident: (ident, disambiguator),
-        } if ident == name => Some(*disambiguator),
-        _ => None,
-    })
-}
-
-fn name_path_contains(fd: &FunDecl, needle: &str) -> bool {
-    fd.item_meta.name_path().contains(needle)
-}
-
-fn assert_unique_call_paths(llbc: &Llbc, members: &[&FunDecl], label: &str) {
-    assert!(
-        members.len() >= 2,
-        "{label}: expected a colliding group, got {}",
-        members.len()
-    );
-    let mut by_path: std::collections::HashMap<Vec<String>, Vec<u64>> =
-        std::collections::HashMap::new();
-    let mut by_scope: std::collections::HashMap<String, Vec<u64>> =
-        std::collections::HashMap::new();
-    for fd in members {
-        let path = registered_path_for_fun_decl(llbc, fd).segments;
-        by_path.entry(path).or_default().push(fd.def_id);
-        by_scope
-            .entry(scope_owner_identity(llbc, fd))
-            .or_default()
-            .push(fd.def_id);
-    }
-    let path_collisions: Vec<_> = by_path.iter().filter(|(_, ids)| ids.len() > 1).collect();
-    assert!(
-        path_collisions.is_empty(),
-        "{label}: CallPath still shared by distinct FunDecls: {path_collisions:?}"
-    );
-    let scope_collisions: Vec<_> = by_scope.iter().filter(|(_, ids)| ids.len() > 1).collect();
-    assert!(
-        scope_collisions.is_empty(),
-        "{label}: scope_owner_identity shared by distinct FunDecls: {scope_collisions:?}"
-    );
-}
-
-fn assert_distinct_graph_keys(llbc: &'static Llbc, members: &[&FunDecl], label: &str) {
-    let pair: Vec<&FunDecl> = members.iter().copied().take(2).collect();
-    if pair.len() < 2 {
-        return;
-    }
-    let keys: Vec<_> = with_shared_lowering(llbc, |ctx| {
-        pair.iter()
-            .map(|fd| {
-                lower_fun_decl(ctx, fd)
-                    .unwrap_or_else(|err| {
-                        panic!("{label}: lower FunDecl {} failed: {err}", fd.def_id)
-                    })
-                    .graph_key()
-            })
-            .collect()
-    });
-    assert_ne!(
-        keys[0], keys[1],
-        "{label}: first two FunDecls share a GraphKey"
-    );
-}
-
-/// Distinct FunDecls in the OWNER#k, destructor#k, and `_ast::convert`
-/// closure groups occupy distinct graphs; a Call from OWNER#2::call_mut
-/// names OWNER#2::call.
-///
-/// rustc used to number the ObjectConverter vs Converter pair
-/// `stmt::closure#8::call_mut`. Current interpreter LLBC renders that
-/// pair as a shared `expr::closure::call_once` name_path (`closure#8` is
-/// a singleton `call_once`). Group by name_path and take a size ≥ 2 set.
+/// lowered body, not a `__cast_pointer` of the `FrameBox` onto `PyFrame`.
 #[test]
-fn colliding_fundecl_groups_occupy_distinct_graphs() {
-    let Some(interpreter) = load_llbc_if_present(INTERPRETER_LLBC) else {
-        return;
-    };
-    let Some(module) = load_llbc_if_present(MODULE_LLBC) else {
-        return;
-    };
+fn flat_pycall_frame_comes_from_deref_mut() {
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
+    use std::collections::HashSet;
 
-    let owner_calls: Vec<&FunDecl> = interpreter
+    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let context = LowerContext::new(&llbc);
+    let fd = llbc
         .iter_local_fns()
-        .filter(|fd| {
-            name_path_contains(fd, "method_owner")
-                && ident_disambiguator(fd, "OWNER").is_some()
-                && last_ident(fd).is_some_and(|(name, _)| name == "call")
-        })
-        .collect();
-    assert_unique_call_paths(interpreter, &owner_calls, "OWNER#k call");
-    assert_distinct_graph_keys(interpreter, &owner_calls, "OWNER#k call");
+        .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::function::_flat_pycall")
+        .unwrap_or_else(|| {
+            let hits: Vec<_> = llbc
+                .iter_local_fns()
+                .filter(|fd| fd.item_meta.name_path().contains("_flat_pycall"))
+                .map(|fd| fd.item_meta.name_path())
+                .collect();
+            panic!("missing pyre_interpreter::function::_flat_pycall, hits: {hits:?}");
+        });
+    let graph =
+        lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower _flat_pycall: {err}"));
+    let live = reachable_blocks(&graph);
 
-    let owner_call_muts: Vec<&FunDecl> = interpreter
-        .iter_local_fns()
-        .filter(|fd| {
-            name_path_contains(fd, "method_owner")
-                && ident_disambiguator(fd, "OWNER").is_some()
-                && last_ident(fd).is_some_and(|(name, _)| name == "call_mut")
-        })
-        .collect();
-    assert_unique_call_paths(interpreter, &owner_call_muts, "OWNER#k call_mut");
-    assert_distinct_graph_keys(interpreter, &owner_call_muts, "OWNER#k call_mut");
-
-    let destructors: Vec<&FunDecl> = module
-        .iter_local_fns()
-        .filter(|fd| {
-            name_path_contains(fd, "gc_types")
-                && last_ident(fd).is_some_and(|(name, _)| name == "destructor")
-        })
-        .collect();
-    assert_unique_call_paths(module, &destructors, "gc_types::destructor#k");
-    assert_distinct_graph_keys(module, &destructors, "gc_types::destructor#k");
-
-    let convert_closures: Vec<&FunDecl> = {
-        let mut by_path: std::collections::BTreeMap<String, Vec<&FunDecl>> =
-            std::collections::BTreeMap::new();
-        for fd in interpreter.iter_local_fns().filter(|fd| {
-            name_path_contains(fd, "_ast")
-                && name_path_contains(fd, "convert")
-                && name_path_contains(fd, "closure")
-        }) {
-            by_path
-                .entry(fd.item_meta.name_path())
-                .or_default()
-                .push(fd);
-        }
-        by_path
-            .into_values()
-            .find(|group| group.len() >= 2)
-            .unwrap_or_default()
-    };
-    assert_unique_call_paths(
-        interpreter,
-        &convert_closures,
-        "_ast::convert colliding closures",
-    );
-    assert_distinct_graph_keys(
-        interpreter,
-        &convert_closures,
-        "_ast::convert colliding closures",
-    );
-
-    let owner2_call = owner_calls
-        .iter()
-        .copied()
-        .find(|fd| ident_disambiguator(fd, "OWNER") == Some(2))
-        .expect("OWNER#2::call");
-    let owner2_call_mut = owner_call_muts
-        .iter()
-        .copied()
-        .find(|fd| ident_disambiguator(fd, "OWNER") == Some(2))
-        .expect("OWNER#2::call_mut");
-    let owner2_call_path = registered_path_for_fun_decl(interpreter, owner2_call);
-    let owner2_call_harvest = harvest_path_for_fun_decl(interpreter, owner2_call);
-    assert!(
-        owner2_call_path.segments.iter().any(|seg| seg == "OWNER#2"),
-        "OWNER#2::call path must carry Ident #2: {:?}",
-        owner2_call_path.segments
-    );
-
-    let call_mut_graph = with_shared_lowering(interpreter, |ctx| {
-        lower_fun_decl(ctx, owner2_call_mut).expect("lower OWNER#2::call_mut")
-    });
-    let resolved: Vec<(bool, Vec<String>)> = call_mut_graph
-        .blocks
-        .iter()
-        .flat_map(|block| block.operations.iter())
-        .filter_map(|op| match &op.kind {
-            OpKind::Call {
-                target:
-                    CallTarget::FunctionPath {
-                        segments,
-                        resolved_path,
-                        fun_decl_id: Some(id),
-                        ..
-                    },
-                ..
-            } if *id == owner2_call.def_id => Some((
-                true,
-                resolved_path
-                    .as_ref()
-                    .map(|path| path.segments.clone())
-                    .unwrap_or_else(|| segments.clone()),
-            )),
-            OpKind::Call {
-                target:
-                    CallTarget::Method {
-                        resolved_path: Some(path),
-                        fun_decl_id: Some(id),
-                        ..
-                    },
-                ..
-            } if *id == owner2_call.def_id => Some((false, path.segments.clone())),
-            _ => None,
-        })
-        .collect();
-    if resolved.is_empty() {
-        let body = owner2_call_mut
-            .unstructured()
-            .expect("OWNER#2::call_mut has a body");
-        let callee_ids: Vec<u64> = body
-            .body()
-            .iter()
-            .filter_map(|bb| {
-                let Ok(TermKind::Call { call, .. }) = bb.term_ref(interpreter) else {
-                    return None;
-                };
-                match &call.func {
-                    CallFunc::Regular(reg) => match &reg.kind {
-                        CallKind::Fun(FunId::Regular { id }) => Some(*id),
-                        _ => None,
-                    },
-                    _ => None,
-                }
-            })
-            .collect();
-        assert!(
-            callee_ids.contains(&owner2_call.def_id),
-            "OWNER#2::call_mut MIR must name OWNER#2::call FunDecl {}; callees={callee_ids:?}",
-            owner2_call.def_id
-        );
-        panic!(
-            "OWNER#2::call_mut lowered without a Call to OWNER#2::call {}",
-            owner2_call.def_id
-        );
-    }
-    for (is_function_path, segments) in &resolved {
-        if *is_function_path {
-            assert_eq!(
-                segments, &owner2_call_path.segments,
-                "OWNER#2::call_mut FunctionPath identity must be OWNER#2::call"
-            );
-        } else {
-            assert_eq!(
-                segments, &owner2_call_harvest.segments,
-                "OWNER#2::call_mut Method harvest must be OWNER#2::call"
-            );
+    fn value_id(arg: &LinkArg) -> Option<u64> {
+        match arg {
+            LinkArg::Value(var) => Some(var.id()),
+            LinkArg::Const(_) => None,
         }
     }
-}
 
-/// Distinct `scope_owner_identity` values never share a
-/// [`registered_path_for_fun_decl`] CallPath. Occupancy keys on the
-/// identity (`Bookkeeper.getdesc`); the CallPath is the FunDecl name
-/// walk, so two identities on one path would be a renderer collapse.
-#[test]
-fn distinct_scope_owners_never_share_a_registered_call_path() {
-    let artifacts: &[(&str, &str)] = &[
-        ("pyre-object.ullbc", OBJECT_LLBC),
-        ("pyre-interpreter.ullbc", INTERPRETER_LLBC),
-        ("pyre-module.ullbc", MODULE_LLBC),
-        ("pyre-jit.ullbc", JIT_LLBC),
-    ];
-    let mut total_collisions = 0usize;
-    let mut total_span = 0usize;
-    let mut admitted = 0usize;
-    for (label, path) in artifacts {
-        let Some(llbc) = load_llbc_if_present(path) else {
-            continue;
-        };
-        let mut by_path: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-            std::collections::BTreeMap::new();
-        let mut span = 0usize;
-        for fd in llbc.iter_fun_decls() {
-            admitted += 1;
-            let call = registered_path_for_fun_decl(llbc, fd);
-            if call
-                .segments
+    fn call_leaf(target: &CallTarget) -> &str {
+        match target {
+            CallTarget::Method { name, .. } => name,
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().map(String::as_str).unwrap_or("")
+            }
+            _ => "",
+        }
+    }
+
+    fn op_result<'a>(graph: &'a FunctionGraph, id: u64) -> Option<&'a SpaceOperation> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
                 .iter()
-                .any(|s| s.contains("@span") || s.starts_with('@'))
-            {
-                span += 1;
-            }
-            by_path
-                .entry(call.canonical_key())
-                .or_default()
-                .insert(scope_owner_identity(llbc, fd));
-        }
-        let collisions: Vec<_> = by_path
+                .find(|op| op.result.as_ref().is_some_and(|var| var.id() == id))
+        })
+    }
+
+    fn phi_sources(
+        graph: &FunctionGraph,
+        id: u64,
+        live: &HashSet<majit_translate::model::BlockId>,
+    ) -> Vec<u64> {
+        let Some(block) = graph
+            .blocks
             .iter()
-            .filter(|(_, ids)| ids.len() > 1)
-            .map(|(key, ids)| (key.clone(), ids.len()))
-            .collect();
-        total_collisions += collisions.len();
-        total_span += span;
-        if !collisions.is_empty() {
-            let mut samples = Vec::new();
-            for fd in llbc.iter_fun_decls() {
-                let call = registered_path_for_fun_decl(llbc, fd);
-                let key = call.canonical_key();
-                if collisions.iter().any(|(k, _)| k == &key) && samples.len() < 12 {
-                    samples.push((key, call.segments.clone(), scope_owner_identity(llbc, fd)));
+            .find(|block| block.inputargs.iter().any(|var| var.id() == id))
+        else {
+            return Vec::new();
+        };
+        let pos = block
+            .inputargs
+            .iter()
+            .position(|var| var.id() == id)
+            .expect("input position");
+        graph
+            .blocks
+            .iter()
+            .filter(|pred| live.contains(&pred.id))
+            .flat_map(|pred| pred.exits.iter())
+            .filter(|link| link.target == block.id)
+            .filter_map(|link| link.args.get(pos).and_then(value_id))
+            .collect()
+    }
+
+    fn is_frame_box_new(llbc: &Llbc, kind: &OpKind) -> bool {
+        let OpKind::Call { target, .. } = kind else {
+            return false;
+        };
+        let Some(id) = target.fun_decl_id() else {
+            return false;
+        };
+        llbc.fn_by_id(id).is_some_and(|fd| {
+            fd.item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+        })
+    }
+
+    fn receiver_id(kind: &OpKind) -> Option<u64> {
+        let OpKind::Call { args, .. } = kind else {
+            return None;
+        };
+        args.first().and_then(value_id)
+    }
+
+    let mut frame_boxes = HashSet::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            if is_frame_box_new(&llbc, &op.kind)
+                && let Some(var) = &op.result
+            {
+                frame_boxes.insert(var.id());
+            }
+        }
+    }
+    assert!(
+        !frame_boxes.is_empty(),
+        "no FrameBox::new result in _flat_pycall"
+    );
+    // A loop-carried block argument is the same handle when every source
+    // reaches `FrameBox::new` and none reaches a different value. A source
+    // that only cycles counts once some other source is grounded.
+    fn frame_box_verdict(
+        graph: &FunctionGraph,
+        id: u64,
+        live: &HashSet<majit_translate::model::BlockId>,
+        known: &HashSet<u64>,
+        stack: &mut HashSet<u64>,
+    ) -> u8 {
+        if known.contains(&id) {
+            return 2;
+        }
+        if !stack.insert(id) {
+            return 1;
+        }
+        let verdict = if let Some(op) = op_result(graph, id) {
+            match &op.kind {
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    frame_box_verdict(graph, operand.id(), live, known, stack)
+                }
+                _ => 0,
+            }
+        } else {
+            let srcs = phi_sources(graph, id, live);
+            if srcs.is_empty() {
+                0
+            } else {
+                let mut any_yes = false;
+                let mut any_no = false;
+                for src in srcs {
+                    match frame_box_verdict(graph, src, live, known, stack) {
+                        2 => any_yes = true,
+                        0 => any_no = true,
+                        _ => {}
+                    }
+                }
+                if any_no {
+                    0
+                } else if any_yes {
+                    2
+                } else {
+                    1
                 }
             }
-            panic!(
-                "{label}: distinct scope_owner_identity sharing CallPath ({n}): {sample:?}\nidentities: {samples:#?}",
-                n = collisions.len(),
-                sample = collisions.iter().take(8).collect::<Vec<_>>(),
-            );
-        }
-        assert_eq!(span, 0, "{label}: CallPath contains @span");
+        };
+        stack.remove(&id);
+        verdict
     }
-    eprintln!(
-        "call-path census: admitted={admitted} collisions={total_collisions} @span={total_span}"
+    let mut candidates = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        candidates.extend(block.inputargs.iter().map(|var| var.id()));
+        for op in &block.operations {
+            let OpKind::UnaryOp { op: name, .. } = &op.kind else {
+                continue;
+            };
+            if name == "same_as"
+                && let Some(var) = &op.result
+            {
+                candidates.push(var.id());
+            }
+        }
+    }
+    loop {
+        let before = frame_boxes.len();
+        for id in &candidates {
+            if frame_boxes.contains(id) {
+                continue;
+            }
+            let mut stack = HashSet::new();
+            if frame_box_verdict(&graph, *id, &live, &frame_boxes, &mut stack) == 2 {
+                frame_boxes.insert(*id);
+            }
+        }
+        if frame_boxes.len() == before {
+            break;
+        }
+    }
+
+    fn is_frame_box_pyframe_cast(kind: &OpKind, frame_boxes: &HashSet<u64>) -> bool {
+        majit_translate::model::cast_pointer_root(kind) == Some("PyFrame")
+            && receiver_id(kind).is_some_and(|id| frame_boxes.contains(&id))
+    }
+
+    let mut cast_ops = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            if is_frame_box_pyframe_cast(&op.kind, &frame_boxes) {
+                cast_ops.push(format!("{:?}", op.kind));
+            }
+        }
+    }
+    assert!(
+        cast_ops.is_empty(),
+        "__cast_pointer(PyFrame) of the FrameBox value: {cast_ops:?}"
     );
-    assert_eq!(total_collisions, 0);
-    assert_eq!(total_span, 0);
+
+    fn forward_id(kind: &OpKind) -> Option<u64> {
+        match kind {
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => Some(operand.id()),
+            OpKind::Call { .. } if majit_translate::model::cast_instance_root(kind).is_some() => {
+                receiver_id(kind)
+            }
+            _ => None,
+        }
+    }
+
+    fn from_deref_mut_or_body(
+        graph: &FunctionGraph,
+        id: u64,
+        frame_boxes: &HashSet<u64>,
+        live: &HashSet<majit_translate::model::BlockId>,
+        seen: &mut HashSet<u64>,
+    ) -> bool {
+        if !seen.insert(id) {
+            return false;
+        }
+        let ok = if frame_boxes.contains(&id) {
+            false
+        } else if let Some(op) = op_result(graph, id) {
+            if is_frame_box_pyframe_cast(&op.kind, frame_boxes) {
+                false
+            } else if let OpKind::Call { target, .. } = &op.kind
+                && receiver_id(&op.kind).is_some_and(|recv| frame_boxes.contains(&recv))
+                && matches!(call_leaf(target), "deref_mut" | "frame_ptr")
+            {
+                true
+            } else if let OpKind::FieldRead { field, base, .. } = &op.kind
+                && matches!(field.name.as_str(), "owner_root" | "ptr")
+                && frame_boxes.contains(&base.id())
+            {
+                true
+            } else if let Some(next) = forward_id(&op.kind) {
+                from_deref_mut_or_body(graph, next, frame_boxes, live, seen)
+            } else {
+                false
+            }
+        } else {
+            let srcs = phi_sources(graph, id, live);
+            !srcs.is_empty()
+                && srcs
+                    .iter()
+                    .all(|src| from_deref_mut_or_body(graph, *src, frame_boxes, live, seen))
+        };
+        seen.remove(&id);
+        ok
+    }
+
+    let mut eval_args = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if call_leaf(target) != "eval_current_frame_raw" {
+                continue;
+            }
+            let arg = args
+                .first()
+                .and_then(value_id)
+                .unwrap_or_else(|| panic!("eval_current_frame_raw has no value argument"));
+            eval_args.push(arg);
+        }
+    }
+    assert!(
+        !eval_args.is_empty(),
+        "no eval_current_frame_raw call in _flat_pycall"
+    );
+    for arg in eval_args {
+        let mut seen = HashSet::new();
+        assert!(
+            from_deref_mut_or_body(&graph, arg, &frame_boxes, &live, &mut seen),
+            "eval_current_frame_raw argument v{arg} is not the deref_mut result or its lowered body"
+        );
+    }
 }

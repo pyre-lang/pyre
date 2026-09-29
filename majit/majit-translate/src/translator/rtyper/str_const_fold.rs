@@ -72,6 +72,7 @@ mod tests {
                 segments: vec!["__str_const".to_string(), payload],
                 resolved_path: None,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: vec![],

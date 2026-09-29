@@ -1133,6 +1133,7 @@ mod tests {
                 .collect(),
             resolved_path: None,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -1784,6 +1785,7 @@ mod tests {
                 .collect(),
             resolved_path: None,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -1806,6 +1808,7 @@ mod tests {
                 .collect(),
             resolved_path: None,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -1971,6 +1974,7 @@ mod tests {
                 .collect(),
             resolved_path: None,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }

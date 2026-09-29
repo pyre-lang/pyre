@@ -345,6 +345,7 @@ fn byte_at(string_byte_view: bool, slice: Variable, index: Variable) -> OpKind {
             nolength: crate::front::typestr::nolength_from_array_type_id(Some("[u8]")),
             gckind: crate::front::typestr::gckind_from_array_type_id(Some("[u8]")),
             pure: false,
+            taken_by_address: false,
         }
     }
 }
@@ -376,6 +377,7 @@ mod tests {
                     segments: is_ascii_segments(),
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![slice]),
@@ -601,6 +603,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert!(

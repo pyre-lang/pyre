@@ -47,6 +47,7 @@ impl<'a> Lowering<'a> {
                     segments: vec!["core".into(), "cmp".into(), leaf.clone()],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args.iter().cloned()),
@@ -1211,6 +1212,7 @@ impl<'a> Lowering<'a> {
                     ],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![arg]),
@@ -1316,6 +1318,7 @@ impl<'a> Lowering<'a> {
                     ],
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![arg.clone()]),
@@ -1547,6 +1550,7 @@ impl<'a> Lowering<'a> {
                     segments: residual,
                     resolved_path: None,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![receiver.clone(), divisor.clone()]),
@@ -1593,8 +1597,11 @@ impl<'a> Lowering<'a> {
                     owner_root: None,
                     cell_address: false,
                     peeled_shared_primitive: false,
+                    ty: ValueType::Ref(Some("RBigInt".to_string())),
+                    skip_signed_paint: false,
                 })
                 .collect(),
+            raw: false,
         };
         let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items)?;
         let disc = push_op(&mut self.graph, OpKind::ConstInt(0));
@@ -1713,6 +1720,7 @@ impl<'a> Lowering<'a> {
                             .collect(),
                         resolved_path: None,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![arg]),

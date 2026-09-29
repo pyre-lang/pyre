@@ -76,7 +76,6 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     sweep_dead_vars: bool,
-    guard_words: &std::collections::HashSet<Variable>,
     expand_inline_struct: &dyn Fn(&str, &str) -> Option<crate::model::InlineStructExpansion>,
     func_hints: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<(), LowerError> {
@@ -250,11 +249,6 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
         crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)
             .map_err(LowerError::Unsupported)?;
     }
-    // `get().0 as *mut T` is emitted as `cast_int_to_ptr` while the
-    // loaded word is still a reference field. After empty-block
-    // elimination the cast's operand is that load (through block
-    // arguments). Fold it back so the reference is what the cast returns.
-    fold_int_to_ptr_of_ref_load(graph, guard_words);
     refuse_inlined_struct_field_writes(graph, expand_inline_struct)?;
     Ok(())
 }

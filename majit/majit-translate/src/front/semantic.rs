@@ -1207,6 +1207,11 @@ impl StructFieldRegistry {
         let receiver_leaf = owner.rsplit("::").next().unwrap_or(owner);
         let canonical = majit_ir::descr::canonical_struct_name(receiver_leaf);
         if canonical != receiver_leaf
+            // A qualified miss must not bind a different module's class
+            // merely because its leaf has a registered canonical origin.
+            && (!owner.contains("::")
+                || is_path_suffix(owner, &canonical)
+                || is_path_suffix(&canonical, owner))
             && let Some(fields) = self.fields.get(&canonical)
         {
             return Some(fields.as_slice());
@@ -1382,6 +1387,15 @@ impl StructFieldRegistry {
             let mut ambiguous = false;
             if let Some(bucket) = index.by_last.get(leaf) {
                 for key in bucket {
+                    if owner.contains("::") && !key.contains("::") {
+                        let canonical = majit_ir::descr::canonical_struct_name(key);
+                        if !canonical.contains("::")
+                            || !(is_path_suffix(owner, &canonical)
+                                || is_path_suffix(&canonical, owner))
+                        {
+                            continue;
+                        }
+                    }
                     let matches = is_path_suffix(owner, key) || is_path_suffix(key, owner);
                     if !matches {
                         continue;
@@ -1668,6 +1682,8 @@ pub struct SemanticProgram {
     /// `get_size_descr` cache[STRUCT]). One `Rc` per translation, shared
     /// with every crate's lowering and with `CallControl`.
     pub struct_layouts: crate::codewriter::call::StructLayoutTable,
+    /// Local FunDecls harvested for residual-call shims (genc analogue).
+    pub residual_fn_catalog: Vec<crate::residual_shim::LlbcFnCatalogEntry>,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so registration and
@@ -2121,6 +2137,24 @@ mod tests {
             "a leaf that only shares the entry family's last segment is not that family"
         );
         assert!(!other.struct_root_rows_known("counter::Entry<i64>"));
+    }
+
+    #[test]
+    fn qualified_field_owner_does_not_bind_an_unrelated_same_leaf() {
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "Layout".to_string(),
+            "typeobject".to_string(),
+        )]));
+        let mut reg = StructFieldRegistry::default();
+        let fields = vec![("typedef".to_string(), "usize".to_string())];
+        reg.fields
+            .insert("typeobject::Layout".to_string(), fields.clone());
+        reg.fields.insert("Layout".to_string(), fields);
+        assert_eq!(reg.field_type("alloc::layout::Layout", "typedef"), None);
+        assert_eq!(
+            reg.field_type("pyre_object::typeobject::Layout", "typedef"),
+            Some("usize")
+        );
     }
 
     fn free_fn(name: &str) -> SemanticFunction {

@@ -155,6 +155,11 @@ pub fn spelling_is_alloc_vec(type_str: &str) -> bool {
 
 /// A field-layout spelling that is an inline `Vec<T>`, not `Box<Vec<T>>`
 /// and not `&Vec<T>`.
+///
+/// `alloc::string::String { vec: Vec<u8> }` is that same three-word
+/// header, so a by-value `String` field is the inline `Vec<u8>`. The
+/// helper has only the type spelling (no LLBC decl), so the leaf matches
+/// `String` the way it matches `Vec<`.
 pub fn field_layout_is_inline_vec(type_str: &str) -> bool {
     let type_str = type_str.trim();
     if type_str.starts_with('&')
@@ -166,6 +171,7 @@ pub fn field_layout_is_inline_vec(type_str: &str) -> bool {
         return false;
     }
     spelling_is_alloc_vec(type_str)
+        || type_str.rsplit("::").next().unwrap_or(type_str) == "String"
 }
 
 #[cfg(test)]
@@ -196,6 +202,18 @@ mod tests {
             offsets.sort();
             assert_eq!(offsets, [0, word]);
         }
+    }
+
+    #[test]
+    fn string_leaf_is_the_inline_vec_u8_header() {
+        assert!(super::field_layout_is_inline_vec("String"));
+        assert!(super::field_layout_is_inline_vec("alloc::string::String"));
+        assert!(super::field_layout_is_inline_vec("Vec<u8>"));
+        assert!(super::field_layout_is_inline_vec("alloc::vec::Vec<u8>"));
+        assert!(!super::field_layout_is_inline_vec("&String"));
+        assert!(!super::field_layout_is_inline_vec("Box<String>"));
+        assert!(!super::field_layout_is_inline_vec("&Vec<u8>"));
+        assert!(!super::field_layout_is_inline_vec("OsString"));
     }
 
     #[test]

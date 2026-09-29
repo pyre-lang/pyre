@@ -14,7 +14,8 @@
 //!   `ll_vec_newlist_hint_*` and `ll_vec_newemptylist_*` carry the upstream
 //!   oopspecs (`list.len`, `list.getitem`, `list.setitem`, `newlist_hint`,
 //!   `newlist`), which jtransform rewrites into raw header and item accesses.
-//! * `ll_vec_append_*` and `ll_vec_resize_ge_*` are looked inside;
+//! * `ll_vec_append_*`, `ll_vec_extend_from_slice_*`, `ll_vec_extend_r`
+//!   and `ll_vec_resize_ge_*` are looked inside;
 //!   `ll_vec_resize_hint_really_*` and `ll_vec_reverse_*` are looked inside
 //!   only under their upstream `look_inside_iff` predicates.
 //! * Item buffers have one allocator. [`vec_buf_alloc`], [`vec_buf_realloc`]
@@ -153,10 +154,11 @@ const GCARRAY_ITEMS_OFFSET: usize = WORD;
 
 const ITEM_SIZE_I: usize = std::mem::size_of::<usize>();
 const ITEM_ALIGN_I: usize = std::mem::align_of::<usize>();
-const ITEM_SIZE_R: usize = std::mem::size_of::<*mut u8>();
-const ITEM_ALIGN_R: usize = std::mem::align_of::<*mut u8>();
+const ITEM_SIZE_R: usize = std::mem::size_of::<GCREF>();
+const ITEM_ALIGN_R: usize = std::mem::align_of::<GCREF>();
 const ITEM_SIZE_F: usize = std::mem::size_of::<f64>();
 const ITEM_ALIGN_F: usize = std::mem::align_of::<f64>();
+const ITEM_SIZE_C: usize = 1;
 
 // ── header words ────────────────────────────────────────────────────────
 
@@ -703,6 +705,27 @@ pub fn ll_slice_contains_i(items: usize, length: usize, item: usize) -> bool {
     false
 }
 
+/// `ll_getitem_fast` on a byte slice: `index` is in bounds. Item stride is
+/// one byte (`rlist.py` `ll_getitem_fast` over `Array(Char)`).
+pub fn ll_slice_getitem_fast_c(items: usize, index: usize) -> usize {
+    unsafe { *(slice_item_addr(items, index, ITEM_SIZE_C) as *const u8) as usize }
+}
+
+/// `ll_listcontains` on a byte `(items, length)` slice.
+///
+/// `ll_listcontains` is "not inlined by the JIT -- contains a loop".
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_contains_c(items: usize, length: usize, item: usize) -> bool {
+    let mut i = 0;
+    while i < length {
+        if ll_slice_getitem_fast_c(items, i) == item {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// The item at `addr`, an [`ll_slice_get_addr_i`] result, or `default` when
 /// `addr` is 0: `opt.copied().unwrap_or(default)`.
 pub fn ll_slice_load_or_i(addr: usize, default: usize) -> usize {
@@ -840,7 +863,10 @@ fn ll_vec_zero_or_null_r(item: GCREF) -> bool {
     item.is_null()
 }
 
-/// `rgc.ll_arrayclear`. Writes null into each of the `count` slots.
+/// `rgc.ll_arrayclear`. Raw memory is not zero-filled. Upstream skips this
+/// for a `Ptr` item because `ll_newlist` already ran
+/// `zero_gc_pointers_inside`; this raw header does not, so null slots are
+/// cleared here too.
 #[majit_macros::dont_look_inside_cannot_raise]
 fn ll_vec_arrayclear_r(l: &mut Vec<GCREF>, count: usize) {
     let mut i = 0;
@@ -1710,6 +1736,22 @@ mod tests {
     use super::super::rffi::raw_malloc_varsize_char;
     use super::*;
 
+    /// `rlist.py` `ll_setitem_fast` over a GC-pointer item: the `_r` family
+    /// takes `GCREF`, not `*mut u8` (`rffi.CCHARP`).
+    #[test]
+    fn ref_item_helpers_take_gcref() {
+        fn assert_setitem(_: fn(&mut Vec<GCREF>, usize, GCREF)) {}
+        fn assert_getitem(_: fn(&mut Vec<GCREF>, usize) -> GCREF) {}
+        fn assert_slice_setitem(_: fn(usize, usize, GCREF)) {}
+        fn assert_slice_getitem(_: fn(usize, usize) -> GCREF) {}
+        assert_setitem(ll_vec_setitem_fast_r);
+        assert_getitem(ll_vec_getitem_fast_r);
+        assert_slice_setitem(ll_slice_setitem_fast_r);
+        assert_slice_getitem(ll_slice_getitem_fast_r);
+        assert_eq!(ITEM_SIZE_R, std::mem::size_of::<GCREF>());
+        assert_eq!(ITEM_ALIGN_R, std::mem::align_of::<GCREF>());
+    }
+
     /// The oopspec helpers are callable residuals: a by-value `Vec` result
     /// comes back as the address of a header `ll_vec_free_*` releases, and a
     /// `&mut Vec` argument takes that address.
@@ -1826,6 +1868,15 @@ mod tests {
         assert_eq!(ll_vec_as_ptr(header), ll_vec_items_i(&mut words));
         assert_eq!(ll_vec_as_len(header), words.len());
         assert_eq!(ll_vec_as_len(header), ll_vec_length_i(&mut words));
+    }
+
+    #[test]
+    fn slice_contains_c_walks_byte_items() {
+        let v: Vec<u8> = vec![1, 0, 3];
+        let items = v.as_ptr() as usize;
+        assert!(ll_slice_contains_c(items, 3, 0));
+        assert!(!ll_slice_contains_c(items, 3, 2));
+        assert_eq!(ll_slice_getitem_fast_c(items, 2), 3);
     }
 
     #[test]
@@ -2120,6 +2171,7 @@ mod tests {
             "ll_copy_raw_array_to_raw_array_r",
             "ll_slice_arraycopy_r",
             "ll_gcarray_arraycopy_r",
+            "ll_slice_contains_c",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(

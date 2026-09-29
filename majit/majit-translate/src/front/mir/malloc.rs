@@ -38,16 +38,26 @@ pub(in crate::front::mir) fn scalar_replace_named_struct_aggregates(
 ) -> usize {
     let malloc_args = boxing_cluster_ctor_results(graph);
     let mut rewritten = 0usize;
+    let mut skipped: std::collections::HashSet<Variable> = std::collections::HashSet::new();
     loop {
-        let Some(site) = next_struct_aggregate_ctor(graph, &malloc_args, struct_field_attrs) else {
+        let Some(site) =
+            next_struct_aggregate_ctor(graph, &malloc_args, struct_field_attrs, &skipped)
+        else {
             break;
         };
-        if !scalar_replace_one_struct_aggregate(graph, site, &malloc_args, struct_field_attrs) {
-            break;
+        match scalar_replace_one_struct_aggregate(graph, site, &malloc_args, struct_field_attrs) {
+            StructReplace::Rewritten => rewritten += 1,
+            StructReplace::Skipped(result) => {
+                skipped.insert(result);
+            }
         }
-        rewritten += 1;
     }
     rewritten
+}
+
+pub(in crate::front::mir) enum StructReplace {
+    Rewritten,
+    Skipped(Variable),
 }
 
 pub(in crate::front::mir) struct StructAggregateCtorSite {
@@ -55,6 +65,46 @@ pub(in crate::front::mir) struct StructAggregateCtorSite {
     pub(in crate::front::mir) op_idx: usize,
     pub(in crate::front::mir) result: Variable,
     pub(in crate::front::mir) owner: String,
+    /// Annotator `SomePtr` of a raw stack struct (`tyref_is_raw_struct_value`).
+    /// Not GC-allocatable; the New fallback must not fire.
+    pub(in crate::front::mir) raw: bool,
+}
+
+/// Owner of a niladic named-struct `SyntheticTransparentCtor`.
+///
+/// A GC instance is `ValueType::Ref(Some(owner))`. A raw stack struct
+/// (`DictOperationGuard`) is annotator `SomePtr` (`Ref(None)`); the
+/// owner is the ctor path. `raw` keeps the New fallback from firing.
+pub(in crate::front::mir) fn named_struct_ctor_owner(
+    target: &CallTarget,
+    result_ty: &ValueType,
+) -> Option<(String, bool)> {
+    match result_ty {
+        ValueType::Ref(Some(owner)) if !owner.is_empty() => Some((owner.clone(), false)),
+        ValueType::Ref(None) | ValueType::Int => {
+            let CallTarget::SyntheticTransparentCtor {
+                name,
+                owner_path,
+                is_struct: true,
+                ..
+            } = target
+            else {
+                return None;
+            };
+            if name.is_empty() {
+                return None;
+            }
+            let owner = if owner_path.is_empty() {
+                name.clone()
+            } else {
+                let mut parts = owner_path.clone();
+                parts.push(name.clone());
+                parts.join("::")
+            };
+            Some((owner, true))
+        }
+        _ => None,
+    }
 }
 
 #[expect(
@@ -65,25 +115,29 @@ pub(in crate::front::mir) fn next_struct_aggregate_ctor(
     graph: &FunctionGraph,
     malloc_args: &std::collections::HashSet<Variable>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    skipped: &std::collections::HashSet<Variable>,
 ) -> Option<StructAggregateCtorSite> {
     for (block_idx, block) in graph.blocks.iter().enumerate() {
         for (op_idx, op) in block.operations.iter().enumerate() {
             let Some(result) = op.result.as_ref() else {
                 continue;
             };
-            if malloc_args.contains(result) {
+            if malloc_args.contains(result) || skipped.contains(result) {
                 continue;
             }
             let OpKind::Call {
-                target:
-                    CallTarget::SyntheticTransparentCtor {
-                        name,
-                        is_struct: true,
-                        ..
-                    },
+                target,
                 args,
                 result_ty,
             } = &op.kind
+            else {
+                continue;
+            };
+            let CallTarget::SyntheticTransparentCtor {
+                name,
+                is_struct: true,
+                ..
+            } = target
             else {
                 continue;
             };
@@ -99,14 +153,11 @@ pub(in crate::front::mir) fn next_struct_aggregate_ctor(
             if is_mut_ref_cell_name(name) {
                 continue;
             }
-            let ValueType::Ref(Some(owner)) = result_ty else {
+            let Some((owner, raw)) = named_struct_ctor_owner(target, result_ty) else {
                 continue;
             };
-            if owner.is_empty() {
-                continue;
-            }
             let layout_empty = struct_field_attrs
-                .get(owner)
+                .get(&owner)
                 .or_else(|| {
                     owner
                         .rsplit("::")
@@ -125,7 +176,8 @@ pub(in crate::front::mir) fn next_struct_aggregate_ctor(
                 block_idx,
                 op_idx,
                 result: result.clone(),
-                owner: owner.clone(),
+                owner,
+                raw,
             });
         }
     }
@@ -278,12 +330,24 @@ pub(in crate::front::mir) fn try_inline_malloc_lifetime(
     malloc_args: &std::collections::HashSet<Variable>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> bool {
-    let Some(flatnames) = struct_flatnames(owner, struct_field_attrs) else {
+    let flatnames = struct_flatnames(owner, struct_field_attrs)
+        .filter(|names| !names.is_empty())
+        .or_else(|| {
+            let discovered = struct_ctor_discovered_fields(graph, result);
+            if discovered.is_empty() {
+                None
+            } else {
+                Some(
+                    discovered
+                        .into_iter()
+                        .map(|(field, _, ty)| (field.name, ty))
+                        .collect(),
+                )
+            }
+        });
+    let Some(flatnames) = flatnames else {
         return false;
     };
-    if flatnames.is_empty() {
-        return false;
-    }
     let lifetimes = compute_lifetimes(graph);
     let Some(info_idx) = lifetimes.index.get(&(block_idx, result.clone())).copied() else {
         return false;
@@ -406,6 +470,66 @@ pub(in crate::front::mir) fn concretetype_for_field(ty: &ValueType) -> crate::mo
     }
 }
 
+/// `rtyper.py` `setconcretetype` from `FUNC.RESULT` / the op's result
+/// kind. `IndirectCall` carries the same `result_ty` cell as `Call`.
+/// Call results go through [`valuetype_to_concrete_for_legacy`] so a
+/// flavor-raw `Ref(Some(intern_key))` is `Signed` (`history.getkind` of
+/// that raw `Ptr`).
+pub(in crate::front::mir) fn concretetype_for_op_kind(
+    op_kind: &OpKind,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> crate::model::ConcreteType {
+    match op_kind {
+        OpKind::Call { result_ty: ty, .. } | OpKind::IndirectCall { result_ty: ty, .. } => {
+            crate::codewriter::type_state::valuetype_to_concrete_for_legacy(
+                ty,
+                raw_alloc_flavor_structs,
+            )
+        }
+        OpKind::BinOp { result_ty: ty, .. } | OpKind::UnaryOp { result_ty: ty, .. } => {
+            concretetype_for_field(ty)
+        }
+        OpKind::FieldRead { ty, .. } | OpKind::Input { ty, .. } => concretetype_for_field(ty),
+        // `hint` is `same_as` of its value (`unaryop.py` `hint(self, *args_s):
+        // return self`; `jtransform.py` `rewrite_op_hint`). Stamp the dest
+        // from that word; Unknown here left `promote(self.version.0)` untyped
+        // so the annotator rebuilt a `VersionTag` instance.
+        OpKind::Hint { value, .. } => FunctionGraph::concretetype_of(value),
+        OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
+        | OpKind::ConstBool(_)
+        | OpKind::ConstFnAddr { .. } => crate::model::ConcreteType::Signed,
+        _ => crate::model::ConcreteType::Unknown,
+    }
+}
+
+/// `rtyper.py` `setconcretetype` writes `v.concretetype =
+/// bindingrepr(v).lowleveltype` before `jtransform.py`
+/// `rewrite_op_setfield` reads `RESULT = v_value.concretetype`. An
+/// `Unknown` cell has not been through that step; paint it from the
+/// field lltype, which is the stored value's binding at this site.
+pub(in crate::front::mir) fn field_store_value(value: Variable, ty: &ValueType) -> Variable {
+    let want = concretetype_for_field(ty);
+    if want == crate::model::ConcreteType::Unknown {
+        return value;
+    }
+    let have = FunctionGraph::concretetype_of(&value);
+    if have == want {
+        return value;
+    }
+    if have == crate::model::ConcreteType::Unknown {
+        FunctionGraph::set_concretetype_of_inline(&value, want);
+    }
+    value
+}
+
+pub(in crate::front::mir) fn field_store_link_arg(value: LinkArg, ty: &ValueType) -> LinkArg {
+    match value {
+        LinkArg::Value(var) => LinkArg::Value(field_store_value(var, ty)),
+        other => other,
+    }
+}
+
 /// Typed zero, matching `emit_zero_constant_of_ty`. `Ref` is null.
 pub(in crate::front::mir) fn zero_field_cur(ty: &ValueType) -> FieldCur {
     match ty {
@@ -473,15 +597,18 @@ pub(in crate::front::mir) fn aggregate_ctor_owner(
         return None;
     }
     let OpKind::Call {
-        target:
-            CallTarget::SyntheticTransparentCtor {
-                name,
-                is_struct: true,
-                ..
-            },
+        target,
         args,
         result_ty,
     } = &op.kind
+    else {
+        return None;
+    };
+    let CallTarget::SyntheticTransparentCtor {
+        name,
+        is_struct: true,
+        ..
+    } = target
     else {
         return None;
     };
@@ -497,14 +624,9 @@ pub(in crate::front::mir) fn aggregate_ctor_owner(
     if is_mut_ref_cell_name(name) {
         return None;
     }
-    let ValueType::Ref(Some(owner)) = result_ty else {
-        return None;
-    };
-    if owner.is_empty() {
-        return None;
-    }
+    let (owner, _raw) = named_struct_ctor_owner(target, result_ty)?;
     let layout_empty = struct_field_attrs
-        .get(owner)
+        .get(&owner)
         .or_else(|| {
             owner
                 .rsplit("::")
@@ -519,7 +641,7 @@ pub(in crate::front::mir) fn aggregate_ctor_owner(
     if layout_empty && struct_ctor_has_whole_value_use(graph, result) {
         return None;
     }
-    Some(owner.clone())
+    Some(owner)
 }
 
 pub(in crate::front::mir) struct MallocLifetimes {
@@ -972,12 +1094,13 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
     site: StructAggregateCtorSite,
     malloc_args: &std::collections::HashSet<Variable>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
-) -> bool {
+) -> StructReplace {
     let StructAggregateCtorSite {
         block_idx,
         op_idx,
         result,
         owner,
+        raw,
     } = site;
     let foreign_field_ops = graph.blocks.iter().enumerate().any(|(idx, block)| {
         idx != block_idx
@@ -998,7 +1121,11 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
             malloc_args,
             struct_field_attrs,
         ) {
-            return true;
+            return StructReplace::Rewritten;
+        }
+        if raw {
+            // A raw stack struct is not GC-allocatable.
+            return StructReplace::Skipped(result);
         }
         let has_vtable =
             crate::codewriter::heaptracker::attrs_have_vtable(&owner, struct_field_attrs);
@@ -1007,7 +1134,20 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
         materialize_whole_value_copies_in_block(
             graph, block_idx, op_idx, &result, &owner, has_vtable,
         );
-        return true;
+        return StructReplace::Rewritten;
+    }
+
+    if raw {
+        let escapes = graph.blocks[block_idx].exits.iter().any(|link| {
+            link.args
+                .iter()
+                .any(|arg| arg.as_variable() == Some(&result))
+                || link.last_exception.as_ref().and_then(LinkArg::as_variable) == Some(&result)
+                || link.last_exc_value.as_ref().and_then(LinkArg::as_variable) == Some(&result)
+        });
+        if escapes {
+            return StructReplace::Skipped(result);
+        }
     }
 
     let has_vtable = crate::codewriter::heaptracker::attrs_have_vtable(&owner, struct_field_attrs);
@@ -1149,7 +1289,7 @@ pub(in crate::front::mir) fn scalar_replace_one_struct_aggregate(
     graph.blocks[block_idx].operations = out;
     graph.blocks[block_idx].exits = exits;
     bind_struct_phi_copies(graph, &result, &phi_copies);
-    true
+    StructReplace::Rewritten
 }
 
 /// When the successor parameter *is* the aggregate variable, point that

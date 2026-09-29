@@ -367,8 +367,8 @@ pub fn union(w1: Option<&Hlvalue>, w2: Option<&Hlvalue>) -> Result<Option<Hlvalu
         (Some(a), Some(b)) if a == b => Ok(Some(a.clone())),
         (None, _) | (_, None) => Ok(None),
         (Some(Hlvalue::Variable(_)), _) | (_, Some(Hlvalue::Variable(_))) => {
-            // `Variable()` (framestate.py `union`): a fresh phi, no
-            // annotation and no concretetype.
+            // `framestate.py union`: generalization creates an untyped Variable;
+            // the annotator/rtyper supplies its representation after flow building.
             Ok(Some(Hlvalue::Variable(Variable::new())))
         }
         (Some(Hlvalue::Constant(c1)), Some(Hlvalue::Constant(c2))) => {
@@ -567,6 +567,34 @@ mod test {
         let fs1 = build_state(vec![Some(Hlvalue::Constant(fresh_spectag_constant()))]);
         let fs2 = build_state(vec![Some(Hlvalue::Constant(fresh_spectag_constant()))]);
         assert!(fs1.union(&fs2).is_none());
+    }
+
+    #[test]
+    fn union_generalization_does_not_inherit_a_predecessor_type() {
+        // `framestate.py union` returns Variable(), even when both input
+        // Variables happen to carry an already assigned representation.
+        let typed = Variable::new();
+        typed.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+        ));
+        let also_typed = Variable::new();
+        also_typed.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+        ));
+        for other in [
+            Hlvalue::Variable(Variable::new()),
+            Hlvalue::Variable(also_typed),
+            Hlvalue::Constant(Constant::new(ConstValue::Int(1))),
+        ] {
+            let left = Hlvalue::Variable(typed.clone());
+            for (a, b) in [(&left, &other), (&other, &left)] {
+                let Some(Hlvalue::Variable(phi)) = union(Some(a), Some(b)).unwrap() else {
+                    panic!("union must generalize to a Variable");
+                };
+                assert_ne!(phi, typed);
+                assert!(phi.concretetype().is_none());
+            }
+        }
     }
 
     #[test]

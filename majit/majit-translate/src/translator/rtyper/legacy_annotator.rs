@@ -1079,6 +1079,19 @@ fn ccharp_someptr_incoming() -> Incoming {
     Incoming::Annotation(Rc::new(ccharp_someptr()))
 }
 
+fn voidp_someptr() -> SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let LowLevelType::Ptr(ptr_ty) = (*VOIDP).clone() else {
+        unreachable!("VOIDP is a pointer");
+    };
+    SomeValue::Ptr(SomePtr::new(*ptr_ty))
+}
+
+fn voidp_someptr_incoming() -> Incoming {
+    Incoming::Annotation(Rc::new(voidp_someptr()))
+}
+
 /// `lltype.py` `ann_malloc`: `SomePtr(Ptr(s_T.const))` when TYPE is the
 /// allocated Struct/Array (`Ptr::from_container_type`). `TYPE: None` is
 /// a front-end scalar spill / `std::alloc` byte buffer
@@ -1109,8 +1122,11 @@ fn stamp_someptr_lltype(var: &Variable, sv: &SomeValue) {
 /// `ann_cast_int_to_ptr(PtrT, s_int)` → `SomePtr(PtrT.const)`. Dest
 /// already carrying a `Ptr` (`emit_dest_typed_cast_int_to_ptr`) keeps
 /// that `PtrT`. 1-arg `cast_int_to_ptr_call` omits PtrT; dest is
-/// `llmemory.GCREF` (`emit_host_cast_llop` / `result_ty: Ref`). Missing
-/// PtrT on a non-Ref dest is `CCHARP` (`emit_ccharp_nullptr`).
+/// `llmemory.GCREF` (`emit_host_cast_llop` / `result_ty: Ref`), matching
+/// `builtin.rs` `lltype_cast_int_to_ptr`. `stamp_declared_return` may
+/// overlay canonical `OBJECTPTR` on that result (`rclass.py`); that is
+/// not PtrT. Missing PtrT on a non-Ref dest is `CCHARP`
+/// (`emit_ccharp_nullptr`).
 fn someptr_from_cast_int_to_ptr(
     result: &Variable,
     args: &[LinkArg],
@@ -1123,7 +1139,11 @@ fn someptr_from_cast_int_to_ptr(
     {
         return SomeValue::Ptr(SomePtr::new((**ptr_ty).clone()));
     }
-    if let Some(ct) = result.concretetype().as_ref()
+    // 2-arg overlay stamp (`emit_dest_typed_cast_int_to_ptr`) when the
+    // PtrT constant is not in `args`. 1-arg is GCREF even when
+    // `stamp_declared_return` wrote `OBJECTPTR` on the result cell.
+    if args.len() == 2
+        && let Some(ct) = result.concretetype().as_ref()
         && let LowLevelType::Ptr(ptr_ty) = ct
     {
         return SomeValue::Ptr(SomePtr::new((**ptr_ty).clone()));
@@ -1184,6 +1204,16 @@ fn someptr_from_voidp_concretetype(var: &Variable) -> Incoming {
 /// comparison matches this const, not a duplicate literal.
 pub(crate) const MULTIPLE_FROZEN_PBC_UNSUPPORTED: &str =
     "MultipleFrozenPBCRepr is unsupported on this path (getFrozenPBCRepr)";
+
+/// Production stamps `rffi.py` `VOIDP` / `CONST_VOIDP` on a declared
+/// `*mut c_void` / `*const c_void` (`stamp_raw_c_void_voidp`).
+fn var_concretetype_is_voidp(var: &Variable) -> bool {
+    use crate::translator::rtyper::lltypesystem::rffi::{CONST_VOIDP, VOIDP};
+    matches!(
+        var.concretetype().as_ref(),
+        Some(ct) if *ct == *VOIDP || *ct == *CONST_VOIDP
+    )
+}
 
 /// `getFrozenPBCRepr`: `follow_link` / `mergeinputargs` union incoming
 /// annotations (`bookkeeper.immutablevalue` for a constant, `annotation(v)`
