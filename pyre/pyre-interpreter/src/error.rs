@@ -421,10 +421,32 @@ pub type PyResult = Result<PyObjectRef, PyError>;
 /// `Some.__pos_0` with every other `Option` instantiation and unions
 /// the string payload with unrelated types. `FromExcObject` is a unit
 /// variant so `from_exc_object` does not construct a `Wtf8Buf`.
+///
+/// The JIT banks this as nullable rstr `STR` (null = `FromExcObject`).
+/// Residual `make_pyerror` rebuilds the enum from that word with the
+/// TypeDecl variant names and [`wtf8buf_from_residual_str`];
+/// `residual_word_to_value` cannot `ptr::read` a 32-byte `Wtf8Buf` enum
+/// from that one-word STR.
 #[derive(Debug, Clone)]
 pub enum DisplayMessage {
     FromExcObject,
     Text(Wtf8Buf),
+}
+
+/// Same TypeDecl shape as [`DisplayMessage`] under a different name:
+/// one fieldless variant and one string-family payload. Pins the
+/// nullable-STR predicate off the type ident.
+#[derive(Debug, Clone)]
+pub enum AltStrMessage {
+    Empty,
+    Body(Wtf8Buf),
+}
+
+/// Two string-family payloads: not a nullable STR word.
+#[derive(Debug, Clone)]
+pub enum TwoPayloadStr {
+    Left(Wtf8Buf),
+    Right(Wtf8Buf),
 }
 
 /// `OperationError` (`pypy/interpreter/error.py`) as a GC object.
@@ -740,6 +762,21 @@ fn wtf8_from_message_str(ptr: pyre_object::gc_hook::GCREF) -> rustpython_wtf8::W
     rustpython_wtf8::Wtf8::from_bytes(bytes)
         .expect("message STR bytes were written from a Wtf8")
         .to_owned()
+}
+
+/// Rebuild an owned `Wtf8Buf` from one residual-call STR word.
+///
+/// A nullable-STR enum banks as one address (`tyref_to_value_type_with`).
+/// `residual_word_to_value` would `ptr::read` the native enum from that
+/// STR, and `Drop` of a reconstructed `Wtf8Buf` would free a non-malloc
+/// pointer. Copy the STR bytes the same way [`fused_raise_message`] reads
+/// a fused helper's `Ptr(STR)` argument. The shim wraps this buffer in
+/// the payload variant it reads from the TypeDecl.
+///
+/// # Safety
+/// `word` is 0 or a live rstr `STR` payload.
+pub unsafe fn wtf8buf_from_residual_str(word: i64) -> Wtf8Buf {
+    wtf8_from_message_str(word as usize as pyre_object::gc_hook::GCREF)
 }
 
 /// The text and the exception-object forms are separate entries so the
@@ -3950,16 +3987,13 @@ fn exc_object_class_name(exc: PyObjectRef) -> Option<String> {
             return pyre_object::w_type_get_name(w_type).to_string();
         }
         let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
-        let module = crate::baseobjspace::lookup_in_type(
-            w_type,
-            "__module__",
-        )
-        .filter(|value| pyre_object::is_str(*value))
-        .and_then(|value| {
-            crate::baseobjspace::str_utf8_w(value)
-                .ok()
-                .map(str::to_string)
-        });
+        let module = crate::baseobjspace::lookup_in_type(w_type, "__module__")
+            .filter(|value| pyre_object::is_str(*value))
+            .and_then(|value| {
+                crate::baseobjspace::str_utf8_w(value)
+                    .ok()
+                    .map(str::to_string)
+            });
         match module.as_deref() {
             Some(module) if module != "builtins" && module != "__main__" => {
                 format!("{module}.{qualname}")

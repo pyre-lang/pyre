@@ -4004,11 +4004,88 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// 3.14 `Objects/object.c:do_richcompare` tries `tp_richcompare` in both
 /// operand directions when the first call returns `NotImplemented`; pyre's
 /// Python 3.14 compatibility rule takes precedence here.
+/// Plain-function `__lt__` (and the other five) on `a`, or null when the
+/// pair needs the full MRO walk (no method, a descriptor, or reflected
+/// subclass priority). The caller traces the call.
+#[majit_macros::dont_look_inside]
+unsafe fn lookup_plain_compare_function(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: CompareOp,
+) -> PyObjectRef {
+    let dunder = match op {
+        CompareOp::Lt => "__lt__",
+        CompareOp::Le => "__le__",
+        CompareOp::Gt => "__gt__",
+        CompareOp::Ge => "__ge__",
+        CompareOp::Eq => "__eq__",
+        CompareOp::Ne => "__ne__",
+    };
+    let rdunder = reverse_dunder(dunder).unwrap_or(dunder);
+    let a_method = plain_compare_function(a, dunder);
+    if a_method.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    let b_method = plain_compare_function(b, rdunder);
+    let b_first = !b_method.is_null()
+        && match (crate::typedef::r#type(a), crate::typedef::r#type(b)) {
+            (Some(at), Some(bt)) => at != bt && issubtype_cached(bt.as_ptr(), at.as_ptr()),
+            _ => false,
+        };
+    if b_first {
+        pyre_object::PY_NULL
+    } else {
+        a_method
+    }
+}
+
+#[majit_macros::dont_look_inside]
+unsafe fn plain_compare_function(obj: PyObjectRef, name: &str) -> PyObjectRef {
+    let method = if is_instance(obj) {
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return pyre_object::PY_NULL;
+        };
+        lookup_in_type_where(w_type.as_ptr(), name)
+    } else {
+        crate::baseobjspace::subclass_special_override(obj, name).map(|(method, _)| method)
+    };
+    let Some(method) = method else {
+        return pyre_object::PY_NULL;
+    };
+    let direct = std::ptr::eq(
+        unsafe { (*method).ob_type },
+        &crate::function::FUNCTION_TYPE as *const _,
+    ) || std::ptr::eq(
+        unsafe { (*method).ob_type },
+        &crate::function::METHOD_DESCRIPTOR_TYPE as *const _,
+    );
+    if direct { method } else { pyre_object::PY_NULL }
+}
+
 #[majit_macros::dont_look_inside]
 unsafe fn try_compare_override(
     a: PyObjectRef,
     b: PyObjectRef,
     op: CompareOp,
+) -> Result<Option<PyObjectRef>, PyError> {
+    try_compare_override_inner(a, b, op, false)
+}
+
+#[majit_macros::dont_look_inside]
+unsafe fn try_compare_override_reflected(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: CompareOp,
+) -> Result<Option<PyObjectRef>, PyError> {
+    try_compare_override_inner(a, b, op, true)
+}
+
+#[majit_macros::dont_look_inside]
+unsafe fn try_compare_override_inner(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: CompareOp,
+    forward_done: bool,
 ) -> Result<Option<PyObjectRef>, PyError> {
     let dunder = match op {
         CompareOp::Lt => "__lt__",
@@ -4062,8 +4139,16 @@ unsafe fn try_compare_override(
     let ov_get = |i: usize| pyre_object::gc_roots::shadow_stack_get(ov_base + i);
     // `_make_comparison_impl` swaps the two values; swapping the *index*
     // keeps the pinned copies authoritative across a collection.
-    let (first, second) = if b_first { (1, 0) } else { (0, 1) };
-    for (recv_i, other_i) in [(first, second), (second, first)] {
+    // `forward_done`: the caller already ran the forward method, so only
+    // the reflected override remains.
+    let pairs: &[(usize, usize)] = if forward_done {
+        &[(1, 0)]
+    } else if b_first {
+        &[(1, 0), (0, 1)]
+    } else {
+        &[(0, 1), (1, 0)]
+    };
+    for &(recv_i, other_i) in pairs {
         let method = ov_get(recv_i * 2);
         if method.is_null() {
             continue;
@@ -4264,7 +4349,6 @@ pub fn init_interned_binop_names() {
     set_shortcut_binop(&BOOL_TYPE, &BOOL_BINOP_SHORTCUTS as *const _ as *mut ());
     set_shortcut_binop(&FLOAT_TYPE, &FLOAT_BINOP_SHORTCUTS as *const _ as *mut ());
 }
-
 
 /// Unary special-method name, carried as a word for the same reason as
 /// [`BinopDunder`].
@@ -4549,11 +4633,7 @@ unsafe fn numeric_base_type_of_overriding_subclass(
 /// subclass routes through dispatch: a non-overriding subclass keeps the
 /// Rust fast path, which both matches the builtin result and avoids
 /// re-entering the inherited slot (it would recurse back into this op).
-unsafe fn numeric_operand_overrides(
-    obj: PyObjectRef,
-    dunder: &str,
-    rdunder: &str,
-) -> bool {
+unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &str) -> bool {
     let Some(t) = numeric_base_type_of_overriding_subclass(obj) else {
         return false;
     };
@@ -4836,89 +4916,14 @@ pub(crate) unsafe fn obj_has_binop_shortcut(obj: PyObjectRef) -> bool {
 #[allow(non_upper_case_globals)]
 pub const _elidable_function_obj_has_binop_shortcut: bool = true;
 
-/// `typedef.py use_special_method_shortcut` — one function pointer
-/// per binop, the `W_Root.shortcut___mod__` class attribute after
-/// `getattr(self, shortcut_name)`.
-type BinopShortcutFn = unsafe fn(PyObjectRef, PyObjectRef) -> PyResult;
+/// `typedef.py use_special_method_shortcut` — a non-null token stored
+/// on the builtin type. `try_binop_shortcut` still does `space.lookup`;
+/// the pointer is only tested for null (`obj_has_binop_shortcut`).
+struct BinopShortcutVtable;
 
-struct BinopShortcutVtable {
-    add: Option<BinopShortcutFn>,
-    sub: Option<BinopShortcutFn>,
-    mul: Option<BinopShortcutFn>,
-    floordiv: Option<BinopShortcutFn>,
-    mod_: Option<BinopShortcutFn>,
-    lshift: Option<BinopShortcutFn>,
-    rshift: Option<BinopShortcutFn>,
-    and: Option<BinopShortcutFn>,
-    or: Option<BinopShortcutFn>,
-    xor: Option<BinopShortcutFn>,
-}
-
-unsafe fn bool_and_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bool_descr_and(a, b))
-}
-unsafe fn bool_or_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bool_descr_or(a, b))
-}
-unsafe fn bool_xor_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bool_descr_xor(a, b))
-}
-
-static INT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
-    add: Some(int_add),
-    sub: Some(int_sub),
-    mul: Some(int_mul),
-    floordiv: Some(int_floordiv),
-    mod_: Some(int_mod),
-    lshift: Some(int_lshift),
-    rshift: Some(int_rshift),
-    and: Some(int_bitand),
-    or: Some(int_bitor),
-    xor: Some(int_bitxor),
-};
-
-static BOOL_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
-    add: Some(int_add),
-    sub: Some(int_sub),
-    mul: Some(int_mul),
-    floordiv: Some(int_floordiv),
-    mod_: Some(int_mod),
-    lshift: Some(int_lshift),
-    rshift: Some(int_rshift),
-    and: Some(bool_and_shortcut),
-    or: Some(bool_or_shortcut),
-    xor: Some(bool_xor_shortcut),
-};
-
-static FLOAT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
-    add: Some(float_add),
-    sub: Some(float_sub),
-    mul: Some(float_mul),
-    floordiv: Some(float_floordiv),
-    mod_: Some(float_mod),
-    lshift: None,
-    rshift: None,
-    and: None,
-    or: None,
-    xor: None,
-};
-
-#[inline(always)]
-fn binop_shortcut_fn(vtable: &BinopShortcutVtable, op: BinopDunder) -> Option<BinopShortcutFn> {
-    match op {
-        BinopDunder::Add => vtable.add,
-        BinopDunder::Sub => vtable.sub,
-        BinopDunder::Mul => vtable.mul,
-        BinopDunder::FloorDiv => vtable.floordiv,
-        BinopDunder::Mod => vtable.mod_,
-        BinopDunder::LShift => vtable.lshift,
-        BinopDunder::RShift => vtable.rshift,
-        BinopDunder::And => vtable.and,
-        BinopDunder::Or => vtable.or,
-        BinopDunder::Xor => vtable.xor,
-        BinopDunder::TrueDiv | BinopDunder::Pow | BinopDunder::DivMod | BinopDunder::MatMul => None,
-    }
-}
+static INT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable;
+static BOOL_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable;
+static FLOAT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable;
 
 /// `descroperation.py shortcut_binop`: `space.lookup` + `get_and_call_function`.
 ///
@@ -4958,8 +4963,13 @@ pub(crate) fn try_binop_shortcut(
 /// Signature is `(w_obj1, w_obj2, op)` — three words.  Upstream's
 /// generated `binop_mod_impl(space, w_obj1, w_obj2)` closes over the
 /// TypeError symbol; a `&str` argument is two words and shifts `op`.
-pub(crate) fn binop_with_shortcut(a: PyObjectRef, b: PyObjectRef, op: BinopDunder) -> PyResult {
-    if let Some(w_res) = try_binop_shortcut(a, b, op)? {
+pub(crate) fn binop_with_shortcut(
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
+    op: BinopDunder,
+) -> PyResult {
+    // The shortcut can allocate (`lookup` + `get_and_call_function`).
+    if let Some(w_res) = pyre_object::with_roots!(a, b => try_binop_shortcut(a, b, op))? {
         return Ok(w_res);
     }
     let symbol = op.symbol();
@@ -5065,8 +5075,8 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         }
         if is_str(a) {
             let str_type = crate::typedef::gettypefor(&pyre_object::STR_TYPE);
-            let uses_builtin_add =
-                str_type.is_some_and(|str_type| !dunder_overridden(a, "__add__", str_type.as_ptr()));
+            let uses_builtin_add = str_type
+                .is_some_and(|str_type| !dunder_overridden(a, "__add__", str_type.as_ptr()));
             if uses_builtin_add {
                 if let Some(result) = pyre_object::with_roots!(a, b => try_reflected_binary_special(a, b, "__radd__"))?
                 {
@@ -5098,8 +5108,8 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             // wording either way: its `slot_nb_add` stands in for the base's
             // `sq_concat`, so nothing reaches this refusal.
             let list_type = crate::typedef::gettypefor(&pyre_object::LIST_TYPE);
-            let uses_builtin_add =
-                list_type.is_some_and(|list_type| !dunder_overridden(a, "__add__", list_type.as_ptr()));
+            let uses_builtin_add = list_type
+                .is_some_and(|list_type| !dunder_overridden(a, "__add__", list_type.as_ptr()));
             if uses_builtin_add {
                 if let Some(result) = pyre_object::with_roots!(a, b => try_reflected_binary_special(a, b, "__radd__"))?
                 {
@@ -5324,17 +5334,11 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         let operands = pyre_object::gc_roots::pin_roots(&[a, b]);
         let dispatched = match (a_seq, b_seq) {
             (true, true) => None,
-            (true, false) => match lookup_type_special(
-                b,
-                "__rmul__",
-            ) {
+            (true, false) => match lookup_type_special(b, "__rmul__") {
                 Some(method) => try_call_special(method, &[b, a])?,
                 None => None,
             },
-            (false, true) => match lookup_type_special(
-                a,
-                "__mul__",
-            ) {
+            (false, true) => match lookup_type_special(a, "__mul__") {
                 Some(method) => try_call_special(method, &[a, b])?,
                 None => None,
             },
@@ -5904,17 +5908,14 @@ pub(crate) fn xor_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 // reflected operand.
 
 /// `space.lookup(w_obj, dunder)` — descroperation.py.
-pub(crate) unsafe fn lookup_type_special(
-    obj: PyObjectRef,
-    dunder: &str,
-) -> Option<PyObjectRef> {
+pub(crate) unsafe fn lookup_type_special(obj: PyObjectRef, dunder: &str) -> Option<PyObjectRef> {
     crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp.as_ptr(), dunder))
 }
 
-/// Residual 3-word call: `get_and_call_function` takes a slice, which
-/// the walk cannot pass.  Rust builds the one-argument list here.
+/// Three-word call. Not `dont_look_inside`: the metainterp follows this
+/// into `get_and_call_function`, which is where a user `__add__` / `__lt__`
+/// records. The one-element slice is built here, not passed in by the walk.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn call_descr_obj_arg(
     w_impl: PyObjectRef,
     w_obj1: PyObjectRef,
@@ -6122,18 +6123,13 @@ fn try_dispatch_ternary_pow_special(
         let _roots = pyre_object::gc_roots::push_roots();
         let operands = pyre_object::gc_roots::pin_roots(&[*base, *exp, *modulus]);
         let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
-        let (w_base_src, w_base_impl) = match lookup_where_with_method_cache(
-            w_base_type.as_ptr(),
-            "__pow__",
-        ) {
-            Some((src, imp)) => (Some(src), Some(imp)),
-            None => (None, None),
-        };
+        let (w_base_src, w_base_impl) =
+            match lookup_where_with_method_cache(w_base_type.as_ptr(), "__pow__") {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            };
         let (w_exp_src, w_exp_impl) = if w_base_type != w_exp_type {
-            match lookup_where_with_method_cache(
-                w_exp_type.as_ptr(),
-                "__rpow__",
-            ) {
+            match lookup_where_with_method_cache(w_exp_type.as_ptr(), "__rpow__") {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
             }
@@ -6224,12 +6220,7 @@ pub(crate) fn try_inplace_special(
         return Ok(None);
     }
     // descroperation.py:826 — only when the lhs in-place method exists.
-    if let Some(method) = unsafe {
-        lookup_type_special(
-            lhs,
-            idunder,
-        )
-    } {
+    if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
         // descroperation.py:831 seq_bug_compat — for `+=` / `*=` where the
         // lhs is a builtin sequence and the rhs is not, try the rhs
         // reflected method before the lhs in-place method.
@@ -6240,12 +6231,7 @@ pub(crate) fn try_inplace_special(
             && crate::baseobjspace::flag_sequence_bug_compat(lhs_type.as_ptr())
             && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type.as_ptr())
         {
-            unsafe {
-                lookup_type_special(
-                    rhs,
-                    rd,
-                )
-            }
+            unsafe { lookup_type_special(rhs, rd) }
         } else {
             None
         };
@@ -7227,7 +7213,24 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
             let cmp_base = pyre_object::gc_roots::pin_roots(&[a, b]);
             let a_live = pyre_object::gc_roots::shadow_stack_get(cmp_base);
             let b_live = pyre_object::gc_roots::shadow_stack_get(cmp_base + 1);
-            if let Some(result) = try_compare_override(a_live, b_live, op)? {
+            let method = lookup_plain_compare_function(a_live, b_live, op);
+            if !method.is_null() {
+                let method_base = pyre_object::gc_roots::pin_roots(&[method]);
+                if let Some(result) = invoke_binop(
+                    pyre_object::gc_roots::shadow_stack_get(method_base),
+                    pyre_object::gc_roots::shadow_stack_get(cmp_base),
+                    pyre_object::gc_roots::shadow_stack_get(cmp_base + 1),
+                )? {
+                    return Ok(result);
+                }
+                if let Some(result) = try_compare_override_reflected(
+                    pyre_object::gc_roots::shadow_stack_get(cmp_base),
+                    pyre_object::gc_roots::shadow_stack_get(cmp_base + 1),
+                    op,
+                )? {
+                    return Ok(result);
+                }
+            } else if let Some(result) = try_compare_override(a_live, b_live, op)? {
                 return Ok(result);
             }
             a = pyre_object::gc_roots::shadow_stack_get(cmp_base);
@@ -7389,6 +7392,7 @@ unsafe fn view_operand_is_set_like(obj: PyObjectRef) -> bool {
 /// [`compare_slot`] for layouts whose comparison iterates (containers) or
 /// is not the loop-free long/int/str arm.
 #[inline(never)]
+#[majit_macros::dont_look_inside(word_enums(CompareOp))]
 fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResult {
     // RPython inserts a stack check on this recursive object-space call.
     // Container comparisons recurse through [`compare`] without pushing a
@@ -7828,7 +7832,7 @@ pub extern "C" fn compare_slot_jit_abi(a: PyObjectRef, b: PyObjectRef, op: i64) 
 }
 
 /// Comparison operator enum (mirrors RustPython's ComparisonOperator).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, majit_macros::FieldlessEnumArg)]
 pub enum CompareOp {
     Lt,
     Le,

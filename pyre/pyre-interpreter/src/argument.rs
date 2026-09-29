@@ -413,21 +413,24 @@ pub fn combine_starargs_wrapped(
             arguments_w.extend(args_w);
             Ok(())
         }
-        Err(e) => {
+        Err(mut e) => {
             // [3.15-spec] `_Py_Check_ArgsIterable` formats
             // "Value after * must be an iterable, not %.200s" with no
             // `object_functionstr` prefix. `raise_type_error` in
             // `argument.py` prefixes `"%s " + msg`. Evidence:
             // `lib-python/3/test/pickletester.py` `test_bad_newobj_ex_args`.
             // `raise_type_error` has `@specialize.arg(2)` and no `@jit.*`.
+            let err_slot = e.pin(&_roots);
             if e.kind == crate::PyErrorKind::TypeError
                 && !crate::baseobjspace::is_iterable(w_stararg())
             {
+                e.reload(&_roots, err_slot);
                 Err(type_error_oefmt(
                     "Value after * must be an iterable, not %T",
                     &[FmtArg::Obj(w_stararg())],
                 ))
             } else {
+                e.reload(&_roots, err_slot);
                 Err(e)
             }
         }

@@ -1155,7 +1155,7 @@ impl<'a> Lowering<'a> {
         let bb_id = self.emit_bb(mir_bb);
         let loaded = self
             .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(loaded.clone()),
             kind: OpKind::FieldRead {
@@ -1564,6 +1564,45 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// A by-value multi-word argument is the address of its storage.
+    /// RPython never passes a struct by value: a GcStruct is a pointer
+    /// (`'r'`), a non-GC Struct is `Ptr` (`'i'`). Kind comes from
+    /// `GcType` / size, not the type's name.
+    pub(in crate::front::mir) fn pass_by_value_multiword_as_addr(
+        &mut self,
+        mir_bb: usize,
+        func: &CallFunc,
+        args: &mut [Variable],
+    ) {
+        let CallFunc::Regular(reg) = func else {
+            return;
+        };
+        let Some(id) = regular_call_fun_decl_id(&reg.kind) else {
+            return;
+        };
+        let Some(fd) = self.llbc.fn_by_id(id) else {
+            return;
+        };
+        // Regular callees keep the classed-instance Ref bank. Only a
+        // residual ABI (dont_look_inside / no body) passes a raw
+        // multi-word value as an address integer.
+        if !fun_decl_is_residual(fd, self.dont_look_inside) {
+            return;
+        }
+        let bb_id = self.block_id[mir_bb];
+        for (index, ty) in fd.signature.inputs.iter().enumerate() {
+            let Some(kind) = pass_by_value_multiword_kind(ty, self.llbc) else {
+                continue;
+            };
+            let Some(arg) = args.get_mut(index) else {
+                continue;
+            };
+            if matches!(kind, ValueType::Int) {
+                *arg = push_cast_ptr_to_int(&mut self.graph, bb_id, arg.clone());
+            }
+        }
+    }
+
     /// Parameters where the callee wants a raw address and the operand
     /// is a borrow of the pointee word.
     ///
@@ -1592,7 +1631,7 @@ impl<'a> Lowering<'a> {
     /// ABI (`ResidualSlot` for `&T`), so the aliased word is stored
     /// in the same cell and the address is passed. A callee with an
     /// `oopspec:jit.*` hint is skipped: jtransform rewrites that call
-    /// to a box query. A byte pointer stays `Ref`.
+    /// to a box query. A byte pointer (`*mut u8`, `rffi.CCHARP`) is `int`.
     pub(in crate::front::mir) fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,
@@ -3193,9 +3232,59 @@ pub(in crate::front::mir) fn substitute_spill_typevars(
     owner: &serde_json::Value,
     llbc: &Llbc,
 ) -> Option<TyRef> {
+    substitute_typevars(ty, owner, llbc, true)
+}
+
+/// Field-kind substitution: a nested TypeVar in the looked-up argument
+/// (Vec's allocator, a trait ref) does not make the argument unknown.
+/// A root TypeVar is still unknown. `RustVecRepr.lowleveltype` is a raw
+/// `Ptr`, so `Result<Vec<T>, E>::Ok.__pos_0` is `'int'` (`history.py`
+/// `getkind`) for every item type T.
+pub(in crate::front::mir) fn substitute_field_typevars(
+    ty: &TyRef,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
+    substitute_typevars(ty, owner, llbc, false)
+}
+
+/// Call-site generics as the `Adt` owner `substitute_field_typevars`
+/// reads (`instantiate_adt_field_ty`). `reg.generics` is the
+/// `types`/`const_generics` object, not an `Adt` node.
+pub(in crate::front::mir) fn substitute_fun_output_typevars(
+    output: &TyRef,
+    generics: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
+    let owner = serde_json::json!({ "Adt": { "generics": generics } });
+    substitute_field_typevars(output, &owner, llbc)
+}
+
+pub(in crate::front::mir) fn substitute_typevars(
+    ty: &TyRef,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+    nested_typevar_unknown: bool,
+) -> Option<TyRef> {
     let node = tyref_node(ty, llbc)?;
-    let value = substitute_spill_value(node, owner, llbc, &mut Vec::new(), 0)?;
+    let value = substitute_spill_value(
+        node,
+        owner,
+        llbc,
+        &mut Vec::new(),
+        0,
+        nested_typevar_unknown,
+    )?;
     Some(TyRef::Other(value))
+}
+
+/// Whether `node` is a TypeVar after peeling `Deduplicated` / `Value`.
+/// Nested TypeVars (a Vec allocator, a trait ref) are not this.
+pub(in crate::front::mir) fn argument_root_is_typevar(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> bool {
+    strip_ty_indirections(node, llbc).is_none_or(|stripped| stripped.get("TypeVar").is_some())
 }
 
 /// `arg` was copied out of an aggregate's generic arguments, so it is
@@ -3245,6 +3334,7 @@ pub(in crate::front::mir) fn substitute_spill_value(
     llbc: &Llbc,
     dedup_stack: &mut Vec<u64>,
     depth: u32,
+    nested_typevar_unknown: bool,
 ) -> Option<serde_json::Value> {
     if depth > 32 {
         return None;
@@ -3255,7 +3345,14 @@ pub(in crate::front::mir) fn substitute_spill_value(
         }
         dedup_stack.push(id);
         let body = llbc.dedup_body(id)?;
-        let replaced = substitute_spill_value(body, owner, llbc, dedup_stack, depth + 1);
+        let replaced = substitute_spill_value(
+            body,
+            owner,
+            llbc,
+            dedup_stack,
+            depth + 1,
+            nested_typevar_unknown,
+        );
         dedup_stack.pop();
         return replaced;
     }
@@ -3270,7 +3367,11 @@ pub(in crate::front::mir) fn substitute_spill_value(
             .get("types")?
             .as_array()?
             .get(index as usize)?;
-        if spill_argument_carries_typevar(arg, llbc, &mut Vec::new(), 0) {
+        if nested_typevar_unknown {
+            if spill_argument_carries_typevar(arg, llbc, &mut Vec::new(), 0) {
+                return None;
+            }
+        } else if argument_root_is_typevar(arg, llbc) {
             return None;
         }
         return Some(arg.clone());
@@ -3284,6 +3385,7 @@ pub(in crate::front::mir) fn substitute_spill_value(
                 llbc,
                 dedup_stack,
                 depth + 1,
+                nested_typevar_unknown,
             )?);
         }
         return Some(serde_json::Value::Array(out));
@@ -3293,7 +3395,14 @@ pub(in crate::front::mir) fn substitute_spill_value(
         for (key, value) in obj {
             out.insert(
                 key.clone(),
-                substitute_spill_value(value, owner, llbc, dedup_stack, depth + 1)?,
+                substitute_spill_value(
+                    value,
+                    owner,
+                    llbc,
+                    dedup_stack,
+                    depth + 1,
+                    nested_typevar_unknown,
+                )?,
             );
         }
         return Some(serde_json::Value::Object(out));
@@ -6581,6 +6690,25 @@ pub(in crate::front::mir) fn output_is_raw_address_word(
     let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let kind_src = payload.as_ref().unwrap_or(output);
     ty_is_raw_address(kind_src, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+}
+
+/// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a
+/// `(ptr, len)` pair slice (`&[i64]`, `&mut [PyObjectRef]`, …). The
+/// residual token is the pointer word (`u64`); a looked-inside body
+/// that folds to a GcArray (`IntArray::as_slice` / `ll_items`) answers
+/// `ref` on the CFG instead.
+pub(in crate::front::mir) fn output_is_pair_slice(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    let ty = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    let ty = ty.as_ref().unwrap_or(output);
+    tyref_pair_slice_item_kind(ty, llbc).is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
 }
 
 /// `ty` itself is a Charon primitive scalar, not a pointer to one.

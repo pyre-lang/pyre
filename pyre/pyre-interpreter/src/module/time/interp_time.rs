@@ -380,7 +380,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             })?
             .checked_mul(SECS_TO_NS)
             .ok_or_else(|| overflow(w_secs))?
-        } else if crate::builtins::index_check(w_secs) {
+        } else if pyre_object::with_roots!(w_secs => crate::builtins::index_check(w_secs)) {
             // `pytime_from_object`: `PyIndex_Check` takes `PyLong_AsLongLong`
             // (`space.index`), so a huge int overflows rather than rounding
             // through float. An object with only `__int__` still uses `float_w`.

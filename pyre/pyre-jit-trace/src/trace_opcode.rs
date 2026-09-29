@@ -64,7 +64,8 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
         pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
     }
 
-    let cause = if raw_cause.is_null() {
+    let mut exc = exc;
+    let mut cause = if raw_cause.is_null() {
         None
     } else {
         // pyopcode.py:706-707 — cause class-call must mirror the exc
@@ -97,10 +98,27 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
                 raise_exception_jit(err as i64);
                 return err;
             }
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.publish(&[
+                exc,
+                cause.map_or(std::ptr::null_mut(), |c| c.as_pyobject_ref()),
+            ]);
+            roots.normalize(base, 2);
             let result = {
                 let _plain_guard = pyre_interpreter::call::force_plain_eval();
                 pyre_interpreter::call::call_function_impl_result(exc, &[])
             };
+            exc = roots.get(base);
+            if cause.is_some() {
+                let forwarded = roots.get(base + 1);
+                cause = if forwarded.is_null() {
+                    None
+                } else {
+                    Some(pyre_interpreter::eval::RaiseCauseRef::from_pyobject_ref(
+                        forwarded,
+                    ))
+                };
+            }
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,
                 Ok(obj) => pyre_interpreter::error::exception_from_call_type_error(exc, obj)
@@ -3324,7 +3342,7 @@ mod tests {
     #[test]
     fn normalize_raise_varargs_jit_null_frame_still_publishes_pending_exception() {
         clear_pending_jit_exception();
-        let execution_context = pyre_interpreter::PyExecutionContext::default();
+        let execution_context = pyre_interpreter::alloc_execution_context();
         let exc_class = unsafe {
             pyre_object::w_dict_getitem_str(execution_context.get_builtin_dict(), "ValueError")
         }

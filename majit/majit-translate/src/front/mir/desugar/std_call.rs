@@ -202,7 +202,7 @@ impl<'a> Lowering<'a> {
         });
         let result = self
             .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            .alloc_value_var_with_type(concretetype_for_field(&ValueType::Str));
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
             kind: OpKind::FieldRead {
@@ -343,6 +343,15 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             crate::front::slice_get::is_slice_get_mut_name_path(&fd.item_meta.name_path())
+        })
+    }
+
+    pub(in crate::front::mir) fn is_slice_get_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            crate::front::slice_get::is_slice_get_name_path(&fd.item_meta.name_path())
         })
     }
 
@@ -557,12 +566,50 @@ impl<'a> Lowering<'a> {
             self.instantiated_elem_align_of_var(&found.0, &found.2),
             dest_ty.and_then(|ty| self.instantiated_elem_align_from_tyref(ty, &found.2)),
         );
-        let offset = Self::array_field_items_offset(
-            self.array_field_tail_offset(&found.1, &found.2, instantiated_align),
-            &found.1,
-            &found.2,
-        )?;
+        let offset = self.array_field_tail_offset(&found.1, &found.2, instantiated_align);
+        if offset.is_none() && !self.owner_field_is_array_tail(&found.1, &found.2) {
+            return Ok(None);
+        }
+        let offset = Self::array_field_items_offset(offset, &found.1, &found.2)?;
         Ok(Some((found.0, offset)))
+    }
+
+    /// Whether `owner.field` is a `[T; N]` tail on some matching Struct decl.
+    /// Used to distinguish "not an array field" (`Ok(None)`) from "array
+    /// field whose items offset is unknown" (translation error).
+    pub(in crate::front::mir) fn owner_field_is_array_tail(
+        &self,
+        owner: &str,
+        field_name: &str,
+    ) -> bool {
+        let leaf = owner
+            .rsplit("::")
+            .next()
+            .unwrap_or(owner)
+            .split('<')
+            .next()
+            .unwrap_or(owner);
+        self.llbc.iter_type_decls().any(|td| {
+            let name = td.item_meta.name_path();
+            let td_leaf = name.rsplit("::").next().unwrap_or("");
+            if td_leaf.split('<').next().unwrap_or(td_leaf) != leaf {
+                return false;
+            }
+            let TypeDeclKind::Struct(fields) = &td.kind else {
+                return false;
+            };
+            fields.iter().any(|field| {
+                field.name.as_deref() == Some(field_name)
+                    && tyref_node(&field.ty, self.llbc)
+                        .and_then(|node| strip_ty_wrappers(node, self.llbc))
+                        .is_some_and(|stripped| {
+                            stripped
+                                .get("Array")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some()
+                        })
+            })
+        })
     }
 
     /// Alignment of the array element named by MIR local `var`.
@@ -606,7 +653,7 @@ impl<'a> Lowering<'a> {
         ty: &serde_json::Value,
         field_name: &str,
     ) -> Option<usize> {
-        let body = tyexpr_body(self.llbc, ty)?;
+        let body = strip_ty_indirections(ty, self.llbc)?;
         if let Some(raw) = body.get("RawPtr").and_then(serde_json::Value::as_array) {
             return self.instantiated_elem_align_from_json(raw.first()?, field_name);
         }
@@ -827,6 +874,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![sum]),
@@ -850,8 +898,11 @@ impl<'a> Lowering<'a> {
     ///
     /// `index_words_ptr` returns that raw address; look-inside of the
     /// alias would feed `SomeInstance` to the caller's `direct_ptradd`
-    /// (`ann_direct_ptradd`, `rffi.py` `ptradd`). An already-int raw
-    /// scalar (`*const usize as *mut usize`, `HashStateStorage::as_mut_ptr`)
+    /// (`ann_direct_ptradd`, `rffi.py` `ptradd`). The source kind is the
+    /// SSA `getkind` of the operand (`rtyper.py` `setconcretetype` of the
+    /// items-base call, `Ref` of the GcArray header). The place spelling
+    /// `*mut u8` is CCHARP `int` and would skip the cast. An already-int
+    /// raw scalar (`*const usize as *mut usize`, `HashStateStorage::as_mut_ptr`)
     /// stays in the int bank. An items-base accessor (`IntArray::base`)
     /// and a function that stores through the same spelling
     /// (`set_sizehint_state_value`) keep the header so getarrayitem /
@@ -859,7 +910,7 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn should_emit_rffi_cast_identity_to_raw_scalar(
         &self,
         dest_ty: &TyRef,
-        src_ty: Option<&TyRef>,
+        src_kind: Option<&ValueType>,
     ) -> bool {
         if graph_is_items_block_base_accessor(&self.graph.name) {
             return false;
@@ -867,10 +918,10 @@ impl<'a> Lowering<'a> {
         if raw_scalar_address_value_type(dest_ty, self.llbc).is_none() {
             return false;
         }
-        if src_ty.is_some_and(|ty| raw_scalar_address_value_type(ty, self.llbc).is_some()) {
+        if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned)) {
             return false;
         }
-        if !src_ty.is_some_and(|ty| matches!(self.value_type_of(ty), ValueType::Ref(_))) {
+        if !matches!(src_kind, Some(ValueType::Ref(_))) {
             return false;
         }
         self.body
@@ -1087,6 +1138,7 @@ impl<'a> Lowering<'a> {
                                         crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                     ],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: Vec::new(),
@@ -1157,6 +1209,60 @@ impl<'a> Lowering<'a> {
             _ => return Ok(false),
         }
         let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `Option::take(&mut self) -> Option<T>`: read the slot, write `None`,
+    /// return the old value. `core::mem::take` is Default; this is the
+    /// inherent None store (`option.rs take`). FunDecl path is exact
+    /// (`is_reflexive_into_iter`).
+    pub(in crate::front::mir) fn try_lower_option_take(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        arg_locals: &[Option<usize>],
+        call_args: &[Operand],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Ok(false);
+        };
+        let is_take = self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            impl_method_owner_for_fundecl(self.llbc, fd)
+                .is_some_and(|(owner, leaf)| owner == "option::Option" && leaf == "take")
+        });
+        if !is_take {
+            return Ok(false);
+        }
+        // The slot is the borrowed Option place. `mem_slot` covers an
+        // `atomic_ref_place` / `index_elem_alias` local; a field borrow
+        // (`self.pending_loop_exit.take()`) is the referent
+        // `argument_borrow_place` already walks, or the operand Place
+        // when Charon passes the field projection directly.
+        let Some(place) =
+            self.resolved_option_receiver_place(arg_locals.first().copied().flatten(), call_args)
+        else {
+            return Ok(false);
+        };
+        let Some(option_ty) = self.tyref_peel_ref_to_pointee(&place.ty) else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_option(&option_ty, self.llbc) {
+            return Ok(false);
+        }
+        let old = self.read_mem_slot(mir_bb, &MemSlot::Place(clone_place(&place)))?;
+        let bb_id = self.emit_bb(mir_bb);
+        let none = if self.tyref_is_niche_option_ptr(&option_ty) {
+            self.push_niche_null_ptr(mir_bb, &option_ty)
+        } else {
+            self.graph.push_niche_null(bb_id, None)
+        };
+        self.write_mem_slot(mir_bb, MemSlot::Place(place), none)?;
+        self.local_var[dest_local] = Some(LocalValue::One(old));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -1258,6 +1364,7 @@ impl<'a> Lowering<'a> {
             None => CallTarget::FunctionPath {
                 segments,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
         };
@@ -1799,15 +1906,15 @@ impl<'a> Lowering<'a> {
         span: &MoveSpan,
     ) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
-        let result = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         let SpanKind::Field {
             name,
             owner,
             owner_id,
             ty,
         } = &span.kind;
+        let result = self
+            .graph
+            .alloc_value_var_with_type(concretetype_for_field(ty));
         let kind = OpKind::FieldRead {
             base: base.clone(),
             field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
@@ -1836,11 +1943,19 @@ impl<'a> Lowering<'a> {
             owner_id,
             ty,
         } = &span.kind;
+        let value = self.coerce_gcref_null_store(
+            bb_id,
+            owner,
+            name,
+            Some(ty),
+            crate::model::LinkArg::Value(value),
+        );
+        let value = field_store_link_arg(value, ty);
         let kind = OpKind::FieldWrite {
             base: base.clone(),
             field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
                 .with_owner_id(Some(*owner_id)),
-            value: crate::model::LinkArg::Value(value),
+            value,
             ty: ty.clone(),
         };
         self.graph
@@ -1877,7 +1992,9 @@ impl<'a> Lowering<'a> {
         );
         let bb_id = self.emit_bb(mir_bb);
         for leaf in leaves {
-            let read = self.graph.alloc_value_var();
+            let read = self
+                .graph
+                .alloc_value_var_with_type(concretetype_for_field(&leaf.ty));
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(read.clone()),
                 kind: OpKind::FieldRead {
@@ -1887,12 +2004,13 @@ impl<'a> Lowering<'a> {
                     pure: false,
                 },
             });
+            let value = field_store_value(read, &leaf.ty);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: dest.clone(),
                     field: container_leaf_descriptor(container_field, at_offset_zero, &leaf),
-                    value: LinkArg::Value(read),
+                    value: LinkArg::Value(value),
                     ty: leaf.ty,
                 },
             });
@@ -3079,6 +3197,12 @@ impl<'a> Lowering<'a> {
         if !first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc)) {
             return false;
         }
+        // A rust-heap `String` (behind `&`) is a Vec-shaped header and
+        // does not share a repr class with `&str` Str. That `as_*` stays
+        // the residual call.
+        if first_arg_ty.is_some_and(|ty| tyref_is_rust_heap_string(ty, self.llbc)) {
+            return false;
+        }
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
@@ -3224,6 +3348,7 @@ impl<'a> Lowering<'a> {
                         crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header.clone()]),
@@ -3239,6 +3364,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header]),
@@ -3269,6 +3395,7 @@ impl<'a> Lowering<'a> {
                             .to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![list]),
@@ -3335,6 +3462,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![list]),
@@ -3559,6 +3687,7 @@ impl<'a> Lowering<'a> {
         let mut target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         if let Some(fun_decl_id) = fun_decl_id {
@@ -4350,6 +4479,7 @@ impl<'a> Lowering<'a> {
     ) -> bool {
         if is_as_view_noop(self.llbc, reg, first_arg_ty, dest_ty)
             && first_arg_ty.is_some_and(|ty| tyref_is_w1_str_receiver(ty, self.llbc))
+            && tyref_is_w1_str_view_dest(dest_ty, self.llbc)
         {
             return true;
         }
@@ -4503,12 +4633,11 @@ impl<'a> Lowering<'a> {
         args: Vec<Variable>,
         result_ty: ValueType,
     ) -> Variable {
-        let result = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let result = self.alloc_legacy_result(&result_ty);
         let target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
         .with_fun_decl_id(fun_decl_id);
@@ -5584,6 +5713,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
             },
         });
+        let mut intern_fields: Vec<(String, ValueType)> = Vec::new();
         for (i, field) in ctor.fields.iter().enumerate() {
             if field.void {
                 continue;
@@ -5603,6 +5733,7 @@ impl<'a> Lowering<'a> {
                 &field.name,
                 ty,
             );
+            intern_fields.push((field.name.clone(), ty.clone()));
             let value = match &field.narrow_root {
                 Some(root) => {
                     let narrowed = self
@@ -5639,6 +5770,10 @@ impl<'a> Lowering<'a> {
                 },
             });
         }
+        intern_positional_ctor_field_kinds(
+            &ctor.result_owner,
+            intern_fields.iter().map(|(name, ty)| (name.as_str(), ty)),
+        );
         res
     }
 
@@ -6247,6 +6382,31 @@ impl<'a> Lowering<'a> {
         self.tyref_is_niche_option_ptr(&receiver_ty) && self.tyref_is_niche_option_ptr(dest_ty)
     }
 
+    /// Borrowed Option place behind residual `as_ref` / `take`.
+    /// `mem_slot` covers `atomic_ref_place`; a field projection on the
+    /// operand is used when Charon passes it directly.
+    pub(in crate::front::mir) fn resolved_option_receiver_place(
+        &self,
+        recv_local: Option<usize>,
+        call_args: &[Operand],
+    ) -> Option<Place> {
+        let place = if let Some(MemSlot::Place(p)) = self.mem_slot(recv_local) {
+            p
+        } else if let Some(p) = self.resolved_borrow_place(recv_local) {
+            p
+        } else {
+            match call_args.first() {
+                Some(Operand::Copy(p) | Operand::Move(p))
+                    if !matches!(p.kind, PlaceKind::Local(_)) =>
+                {
+                    clone_place(p)
+                }
+                _ => return None,
+            }
+        };
+        Some(self.concrete_borrow_place(place))
+    }
+
     /// `alloc::fmt::format(args)` (the `format!` macro's String producer)
     /// — the call whose `format_args!` argument the #277 recognizer
     /// back-traces.  `write!`/`writeln!` lower to `fmt::Write::write_fmt`
@@ -6713,13 +6873,6 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// `as_bytes()` aliases the dest to the `W_UnicodeObject` and marks
-    /// that local; a later `slice::len` / `slice::is_empty` often
-    /// receives `Copy(*local)` rather than the local itself, so the
-    /// mark must follow the projection the same way `Rvalue::Len` does.
-    /// Last-write-wins for a call dest aliased to `args[0]`.  Inherit the
-    /// mark when the receiver is already a string byte view (`x = x.as_slice()`
-    /// after `as_bytes`); drop it when the receiver is an ordinary `&[u8]`.
     pub(in crate::front::mir) fn alias_dest_to_arg0(
         &mut self,
         dest_local: usize,
@@ -6928,6 +7081,17 @@ impl<'a> Lowering<'a> {
             matches!(
                 path.as_str(),
                 "core::ptr::copy_nonoverlapping" | "std::ptr::copy_nonoverlapping"
+            )
+        })
+    }
+
+    /// `core::ptr::null_mut` / `null` (`rbuiltin.py` `rtype_const_result`
+    /// of `lltype.nullptr`). FunDecl identity, not a residual path leaf.
+    pub(in crate::front::mir) fn is_ptr_null_mut(&self, reg: &RegularCall) -> bool {
+        regular_call_name_path(reg, self.llbc).is_some_and(|path| {
+            matches!(
+                path.as_str(),
+                "core::ptr::null_mut" | "std::ptr::null_mut" | "core::ptr::null" | "std::ptr::null"
             )
         })
     }
@@ -7270,6 +7434,39 @@ impl<'a> Lowering<'a> {
             .is_some_and(|(owner, leaf)| leaf_is_word(&leaf) && owner_is_cell(&owner))
     }
 
+    /// `Cell::set(&self, val)`: store of the inner word.
+    pub(in crate::front::mir) fn is_cell_word_set(&self, reg: &RegularCall) -> bool {
+        self.is_std_cell_word_method(reg, "set")
+    }
+
+    pub(in crate::front::mir) fn is_std_cell_word_method(
+        &self,
+        reg: &RegularCall,
+        leaf: &str,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let owner_is_cell = |owner: &str| {
+            owner == "cell::Cell"
+                || owner == "core::cell::Cell"
+                || owner == "std::cell::Cell"
+                || owner.ends_with("::cell::Cell")
+        };
+        let path = fd.item_meta.name_path();
+        if let Some((owner, path_leaf)) = path.rsplit_once("::")
+            && path_leaf == leaf
+            && owner_is_cell(owner)
+        {
+            return true;
+        }
+        impl_method_owner_for_fundecl(self.llbc, fd)
+            .is_some_and(|(owner, path_leaf)| path_leaf == leaf && owner_is_cell(&owner))
+    }
+
     /// `<[T]>::as_ptr` — the data-pointer projection of a slice receiver.  In
     /// the erased value-model a `&[T]` collapses to a single GC array pointer
     /// (its length is read from the array header by `ArrayLen`, not a companion
@@ -7499,6 +7696,47 @@ impl<'a> Lowering<'a> {
             return;
         }
         stamp_as_ccharp(value);
+    }
+
+    /// `<[T]>::as_ptr` / `as_mut_ptr` dest is `*mut T`. `history.py`
+    /// `getkind` of a raw `Ptr` (`*mut u8` / `rffi.CCHARP`) is `'int'`;
+    /// of a GCREF is `'ref'`. A GC slice in the erased array-pointer
+    /// model is the array itself (`'ref'`). Crossing into the address
+    /// bank is `rbuiltin.py` `rtype_cast_ptr_to_int`.
+    ///
+    /// `unknown_is_gc_array` is the identity-path receiver (`<[T]>` in
+    /// that erased model). An untyped cell there is still the array;
+    /// `rewrite_op_cast_ptr_to_int` keeps a Ref/Unknown source as
+    /// `cast_ptr_to_int/r>i` so the FieldWrite names a fresh Signed
+    /// result across `same_as` identity folding. A pair-path pointer
+    /// word may already be an untyped int, so it stays GcRef-only.
+    pub(in crate::front::mir) fn slice_as_ptr_word(
+        &mut self,
+        mir_bb: usize,
+        dest_ty: &TyRef,
+        data: Variable,
+        unknown_is_gc_array: bool,
+    ) -> Variable {
+        let dest_kind = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        if !matches!(dest_kind, ValueType::Int | ValueType::Unsigned) {
+            return data;
+        }
+        let src_kind = crate::model::FunctionGraph::concretetype_of(&data);
+        let needs_cast = src_kind == crate::model::ConcreteType::GcRef
+            || (unknown_is_gc_array && src_kind == crate::model::ConcreteType::Unknown);
+        if !needs_cast {
+            return data;
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let word = push_cast_ptr_to_int(&mut self.graph, bb_id, data.clone());
+        self.cast_ptr_to_int_src.insert(word.clone(), data);
+        word
     }
 
     /// `core::hint::must_use(value)` — the identity wrapper
@@ -7969,6 +8207,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "intrinsics".into(), leaf.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![lhs, rhs]),
@@ -8210,6 +8449,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["longlong2float".to_string(), leaf.to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![operand]),
@@ -8396,7 +8636,10 @@ impl<'a> Lowering<'a> {
             let fd = self.llbc.fn_by_id(fn_id)?;
             let path = fd.item_meta.name_path();
             let leaf = path.rsplit("::").next().unwrap_or("from");
-            return Some(IntoDevirt::Target(spec_segments(self.llbc, fd, leaf)));
+            return Some(IntoDevirt::Target {
+                segments: spec_segments(self.llbc, fd, leaf),
+                fun_decl_id: fn_id,
+            });
         }
         None
     }

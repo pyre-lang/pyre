@@ -435,7 +435,7 @@ pub fn harvest_alloc_flavor_raw_from_llbcs(llbcs: &[Llbc]) -> HashSet<String> {
 /// Intern key for a TypeDecl path: `canonical_struct_name` of the
 /// crate-stripped name, matching `Bookkeeper::intern_class_by_qualname`
 /// / `intern_class_by_qualname_with_bases`.
-fn alloc_flavor_class_intern_key(type_name_path: &str) -> String {
+pub(crate) fn alloc_flavor_class_intern_key(type_name_path: &str) -> String {
     majit_ir::descr::canonical_struct_name(&strip_crate_prefix(type_name_path))
 }
 

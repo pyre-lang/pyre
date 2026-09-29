@@ -573,6 +573,7 @@ fn root_scope_drop_is_classified_and_live() {
                 "frame_anchor_release".to_string(),
             ],
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: Vec::new(),
@@ -626,7 +627,6 @@ fn root_scope_drop_is_classified_and_live() {
     });
     let body: Unstructured =
         serde_json::from_value(body_json).expect("fixture Unstructured parses");
-
     let no_cells = BitSet::new();
     let erased =
         super::compute_mir_liveness(&fixture_llbc(), &body, &[], &BitSet::new(), &no_cells);
@@ -634,7 +634,6 @@ fn root_scope_drop_is_classified_and_live() {
         !erased[1].contains(1),
         "an erased drop reads nothing, so the guard is not live-in at bb1"
     );
-
     let mut as_call = BitSet::new();
     as_call.insert(1);
     let lowered = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &as_call, &no_cells);
@@ -1315,7 +1314,7 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
     let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Read": place(i)});
+    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
     let mv = |i: u64| serde_json::json!({"Move": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
@@ -1334,7 +1333,9 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args}, "dest": place(dest),
+                "args": args,
+                "dest": place(dest)
+            },
             "target": target,
             "on_unwind": 99
         }})
@@ -1511,6 +1512,39 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
     for bb in [1, 3, 5] {
         assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
     }
+
+    // Charon records `&[T; N] as &[T]` as `Rvalue::Cast` (`pin_src`), and
+    // rustc may copy that temporary. The walk must still name the array.
+    let stmt_of = |value: serde_json::Value| -> majit_charon_reader::ullbc::Statement {
+        serde_json::from_value(value).expect("statement JSON")
+    };
+    let mut cast_unsize = body_of(vec![mv(19), mv(20)]);
+    cast_unsize.body[1].statements[5] = stmt_of(assign(
+        9,
+        serde_json::json!({"Cast": [
+            {"Unsize": [ty(), ty(), {"Length": usize_lit(2)}]},
+            mv(8),
+            ty()
+        ]}),
+    ));
+    cast_unsize.body[1].statements.push(stmt_of(assign(
+        18,
+        serde_json::json!({"Use": [copy(9), "No"]}),
+    )));
+    cast_unsize.body[1].set_terminator_kind(call(3, vec![copy(4), mv(18)], 5, 2));
+    let plan = super::analyze_root_brackets_with(
+        &fixture_llbc(),
+        &cast_unsize,
+        &super::MovedOutLocals::with_set(&cast_unsize, bit_set::BitSet::new()),
+        name_of,
+        touches,
+    );
+    assert!(
+        plan.scopes.contains(3),
+        "a Cast Unsize of the array, copied, must still be erased"
+    );
+    assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+    assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
 
     // A read of a slot some other guard's pin filled is not this one's.
     let mut stray = body_of(vec![mv(19), mv(20)]);
@@ -2002,7 +2036,7 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
     let ty = || serde_json::json!({"Deduplicated": 0});
     let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
     let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Read": place(i)});
+    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
     let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
     let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
     let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
@@ -2019,7 +2053,9 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
         serde_json::json!({"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args}, "dest": place(dest),
+                "args": args,
+                "dest": place(dest)
+            },
             "target": target,
             "on_unwind": 99
         }})
@@ -2162,8 +2198,10 @@ fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
     );
 
     // A call inside the bracket unwinds to that same `UnwindResume`
-    // once cleanup blocks are stripped. Visiting it must not refuse
-    // a bracket whose normal path is still balanced.
+    // once cleanup blocks are stripped. `on_unwind` is the panic-cleanup
+    // chain the lowering drops (`lower_call`); Python exceptions ride
+    // the success edge as `Result`. Visiting the terminator itself is
+    // also a known stack no-op, so a balanced normal path stays erased.
     let mut inner_unwinding = body_of(blocks(second_pin(), vec![]));
     let resume = inner_unwinding.body.len();
     inner_unwinding

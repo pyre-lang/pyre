@@ -6,9 +6,13 @@
 //! `FunctionPath` / `Method` calls to those bodies (Opaque in the LLBC),
 //! and every caller then dies at `translate_op` with an unregistered
 //! `CallRegistry` miss.  A pointer cast or a transparent one-field
-//! layout is `same_as`.  A payload that sits beside other fields is a
-//! field read.  An opaque layout stays a residual call.  `Default` on a
-//! machine-word integer / bool is a typed zero.
+//! layout is `same_as`.  `Cell::set` is a field store of that word
+//! (`setfield` on the owning struct).  `Cell::get` of a struct field
+//! is that field's value read in `lower_call` (`is_cell_get` /
+//! `address_field_read_of`).  A payload that sits beside other fields
+//! is a field read.
+//! An opaque layout stays a residual call.  `Default` on a machine-word
+//! integer / bool is a typed zero.
 //!
 //! `core::mem::replace` / `swap` / `take` are not rewritten here.  The
 //! front models `&mut T` as the referent value (`Rvalue::Ref` aliases
@@ -47,7 +51,7 @@ fn function_leaf(segments: &[String]) -> Option<&str> {
     segments.last().map(String::as_str)
 }
 
-fn is_identity_wrapper_target(
+pub(crate) fn is_identity_wrapper_target(
     target: &CallTarget,
     receiver_path: Option<&str>,
     dest_path: Option<&str>,
@@ -336,6 +340,22 @@ pub(crate) fn lower_std_primitive_op(
     else {
         return op_kind;
     };
+    if args.len() == 2 && is_std_cell_method(target, receiver_path, "set") {
+        let Some(base) = args[0].as_variable().cloned() else {
+            return op_kind;
+        };
+        let (name, field_ty) = match layout.and_then(|fields| fields.first()) {
+            Some((name, field_ty)) => (name.as_str(), field_ty.clone()),
+            None => ("value", ValueType::Unknown),
+        };
+        return cell_word_write(
+            base,
+            name,
+            cell_field_owner(receiver_path),
+            args[1].clone(),
+            field_ty,
+        );
+    }
     if args.len() == 1
         && is_identity_wrapper_target(target, receiver_path, dest_path, receiver_is_thin_box)
     {
@@ -408,6 +428,43 @@ pub(crate) fn lower_std_primitive_op(
         }
     }
     op_kind
+}
+
+fn is_core_cell_impl_leaf(segments: &[String], leaf: &str) -> bool {
+    let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        parts.as_slice(),
+        ["core", "cell", "<Impl>", l] | ["std", "cell", "<Impl>", l] if *l == leaf
+    )
+}
+
+fn is_std_cell_method(target: &CallTarget, receiver_path: Option<&str>, leaf: &str) -> bool {
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => {
+            name == leaf
+                && path_leaf(receiver_root.as_deref()) == Some("Cell")
+                && is_std_type_path(receiver_root.as_deref().or(receiver_path))
+        }
+        CallTarget::FunctionPath { segments, .. } => {
+            function_leaf(segments) == Some(leaf)
+                && is_std_fn_path(segments)
+                && !path_has(segments, "RefCell")
+                && (path_has(segments, "Cell")
+                    || is_core_cell_impl_leaf(segments, leaf)
+                    || path_leaf(receiver_path) == Some("Cell") && is_std_type_path(receiver_path))
+        }
+        _ => false,
+    }
+}
+
+fn cell_field_owner(receiver_path: Option<&str>) -> Option<&str> {
+    receiver_path
+        .filter(|path| is_std_type_path(Some(path)))
+        .or(Some("core::cell::Cell"))
 }
 
 fn function_leaf_is(target: &CallTarget, leaf: &str) -> bool {
@@ -585,6 +642,21 @@ fn payload_field_read(
     }
 }
 
+fn cell_word_write(
+    base: Variable,
+    name: &str,
+    owner: Option<&str>,
+    value: crate::model::LinkArg,
+    ty: ValueType,
+) -> OpKind {
+    OpKind::FieldWrite {
+        base,
+        field: FieldDescriptor::new(name, owner.map(str::to_string)),
+        value,
+        ty,
+    }
+}
+
 /// Real JIT banks only. Non-value kinds never compare equal, so an unknown
 /// payload cannot become `same_as`.
 fn same_value_bank(lhs: &ValueType, rhs: &ValueType) -> bool {
@@ -716,6 +788,7 @@ mod tests {
         CallTarget::FunctionPath {
             segments: segments.iter().map(|s| s.to_string()).collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -735,10 +808,9 @@ mod tests {
     }
 
     #[test]
-    fn a_cross_bank_wrapper_member_stays_residual() {
-        // `Cell::get(&Cell<T>) -> T` is a load: the receiver is in the
-        // ref bank and the result in the int bank.  Aliasing it spells
-        // `int_same_as/r>i`, which the blackhole leaves unwired.
+    fn cell_get_is_a_load_when_layout_is_unknown() {
+        // `Cell::get(&Cell<T>) -> T` is a load of the inner word, even
+        // when Charon left `Cell` Opaque without a field list.
         let v = dummy_var();
         let get = lower_std_primitive_op(
             call(
@@ -755,10 +827,20 @@ mod tests {
             None,
             false,
         );
-        assert!(
-            matches!(get, OpKind::Call { .. }),
-            "a cross-bank wrapper member must keep its residual call"
-        );
+        match get {
+            OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
+            } => {
+                assert_eq!(base, v);
+                assert_eq!(field.name, "value");
+                assert_eq!(ty, ValueType::Int);
+                assert!(!pure);
+            }
+            other => panic!("Cell::get must be a field load, got {other:?}"),
+        }
     }
 
     #[test]
@@ -803,6 +885,41 @@ mod tests {
             matches!(new, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
             "AtomicUsize::new is identity on the inner usize"
         );
+    }
+
+    #[test]
+    fn cell_impl_get_and_set_are_the_inner_word() {
+        let v = dummy_var();
+        let stored = dummy_var();
+        let set = lower_std_primitive_op(
+            call(
+                path(&["core", "cell", "Cell", "set"]),
+                vec![v.clone(), stored.clone()],
+                ValueType::Void,
+            ),
+            Some("core::cell::Cell"),
+            None,
+            None,
+            None,
+            false,
+            false,
+            Some(&[("value".into(), ValueType::Unsigned)]),
+            false,
+        );
+        match set {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, v);
+                assert_eq!(field.name, "value");
+                assert_eq!(value.as_variable(), Some(&stored));
+                assert_eq!(ty, ValueType::Unsigned);
+            }
+            other => panic!("Cell::set must be a field store, got {other:?}"),
+        }
     }
 
     #[test]

@@ -27,7 +27,7 @@ use majit_backend::Backend;
 use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
 use majit_ir::operand::Operand;
-use majit_ir::{Type, Value};
+use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::jit_env::{env_var, env_var_os};
 use majit_metainterp::warmstate::FunctionEntryStep;
@@ -5536,6 +5536,15 @@ fn build_gc() -> Box<MiniMarkGC> {
         .without_app_level_typedef(),
     );
     pyre_object::rweakvaldict::set_weakdict_gc_type_id(weakdict_tid);
+    // RaiseCause is a plain GC object (`GcType`). Both fields are GC
+    // references; `Option<PyError>` is two words, so the custom trace
+    // visits `w_cause` and the PyError word inside `invalid`. Absolute tail
+    // so no hardcoded / `#[pyre_class(type_id = N)]` id moves.
+    let raise_cause_tid = gc.register_type(TypeInfo::with_custom_trace(
+        std::mem::size_of::<pyre_interpreter::eval::RaiseCause>(),
+        pyre_interpreter::eval::raise_cause_trace,
+    ));
+    pyre_interpreter::eval::RAISE_CAUSE_GC_TYPE_ID.set(raise_cause_tid);
     // ExecutionContext is a plain GC object (`GcType`), not a PyObject
     // subclass. Custom trace visits every GC slot it owns; the destructor
     // runs drop glue for Vec/RefCell/quasi-immut watchers. Absolute tail
@@ -6173,75 +6182,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // residual actually calls so interpret emits wrapint
     // (`new_with_vtable` + `setfield_gc`) with a concrete pointer.
     {
-        majit_metainterp::register_identity_ref_residual(majit_metainterp::IdentityRefResidual {
-            fnaddrs: {
-                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| {
-                        (name.contains("reload_top_root")
-                            || name.contains("try_gc_current_object_address"))
-                        .then_some(addr)
-                    })
-                    .collect();
-                addrs.push(pyre_object::gc_roots::reload_top_root as *const () as i64);
-                addrs.push(pyre_object::gc_roots::reload_top_root_jit_abi as *const () as i64);
-                addrs.push(pyre_object::gc_hook::try_gc_current_object_address as *const () as i64);
-                addrs
-            },
-        });
-        majit_metainterp::register_elidable_int_residual(majit_metainterp::ElidableIntResidual {
-            fnaddrs: {
-                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| {
-                        (name.ends_with("::enabled")
-                            || name.contains("gc_interp::enabled")
-                            || name.contains("binary_op_arg")
-                            || name.contains("comparison_op_arg")
-                            || name.contains("jump_target_forward")
-                            || name.contains("jump_target_backward")
-                            || name.ends_with("::nlocals")
-                            || name.ends_with("::ncells")
-                            || name.contains("ll_issubclass")
-                            || name.contains("raise_kind_arg")
-                            || name.contains("label_arg_to_usize")
-                            || name.contains("exception_match")
-                            || name.contains("is_valid_check_exc_match_class"))
-                        .then_some(addr)
-                    })
-                    .collect();
-                addrs.push(pyre_object::gc_interp::enabled as *const () as i64);
-                addrs.push(pyre_object::ll_issubclass as *const () as i64);
-                addrs.push(
-                    pyre_object::pyobject::__majit_call_target_ll_issubclass as *const () as i64,
-                );
-                addrs.push(pyre_interpreter::baseobjspace::exception_match as *const () as i64);
-                addrs.push(
-                    pyre_interpreter::eval::is_valid_check_exc_match_class as *const () as i64,
-                );
-                addrs
-            },
-        });
-        majit_metainterp::register_frame_anchor_live_residual(
-            majit_metainterp::FrameAnchorLiveResidual {
-                fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| name.contains("frame_anchor_live").then_some(addr))
-                    .collect(),
-            },
-        );
-        majit_metainterp::register_void_skip_residual(majit_metainterp::VoidSkipResidual {
-            fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
-                .into_iter()
-                .filter_map(|(name, addr)| {
-                    // `frame_anchor_push` is a recorded `CallI` whose depth
-                    // word the trace keeps, so its release is recorded too.
-                    // `set_in_flight_exception` is not here: it publishes the
-                    // propagating exception as a GC root and must stay emitted.
-                    name.contains("stack_check").then_some(addr)
-                })
-                .collect(),
-        });
         majit_metainterp::register_exception_trace_residual(
             majit_metainterp::ExceptionTraceResidual {
                 load_global_fnaddrs: Vec::new(),
@@ -6571,6 +6511,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 .ensure_oopspec_callinfo(oopspec, descr, func, name);
         }
     }
+    // Codewriter rows (`jtransform.py _handle_oopspec_call` →
+    // `callinfocollection.add`). The seeded `OS_STR_CONCAT` and `OS_STREQ_*`
+    // rows stay: `ensure_oopspec_callinfo` does not replace an existing row.
+    install_build_callinfo_rows(d.meta_interp_mut());
     // rlib/jit.py set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
@@ -6610,6 +6554,38 @@ fn build_jit_driver_pair() -> JitDriverPair {
         pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder(),
     );
     (d, info)
+}
+
+fn install_build_callinfo_rows<M: Clone>(meta: &mut majit_metainterp::MetaInterp<M>) {
+    let bindings = pyre_interpreter::jit_trace_fnaddrs();
+    for row in pyre_jit_trace::jitcode_runtime::callinfo_rows() {
+        let mut owned_path = None;
+        if let Some(path) = pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path(row.func) {
+            owned_path = Some(vec![(row.func, path.to_string())]);
+        }
+        let paths: &[(i64, String)] = owned_path.as_deref().unwrap_or(&[]);
+        let symbolic = majit_metainterp::jitcode::EmbeddedJitCodeTable::rebound_symbolic_fnaddr(
+            row.func, paths, &bindings,
+        );
+        let func = if symbolic != row.func {
+            symbolic
+        } else {
+            pyre_jit_trace::jitcode_runtime::rebind_build_fnaddr(row.func)
+        };
+        let descr = pyre_jit_trace::jitcode_runtime::descr_ref_at(row.descr_index as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "callinfo descr index {} is outside Assembler.descrs",
+                    row.descr_index
+                )
+            });
+        meta.ensure_oopspec_callinfo(
+            row.oopspecindex,
+            descr,
+            func as u64,
+            &format!("{:?}", row.oopspecindex),
+        );
+    }
 }
 
 /// After `write_from_resume_data_partial` copies every
@@ -7258,6 +7234,12 @@ impl PyPyJitDriver {
         let next_instr = skip_caches(code, next_instr);
         let env = PyreEnv;
         let (driver, info) = driver_pair();
+        // This body runs only as a native warm entry (`jtransform` rewrites
+        // the traced call to `loop_header`). A residual that re-enters the
+        // interpreter while a trace is open must not start a second one.
+        if driver.is_tracing() {
+            return false;
+        }
         let loop_pycode = pycode as *const ();
         let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
         let green_key = driver.resolve_cell_key(green_key_hash, || {
@@ -7267,15 +7249,15 @@ impl PyPyJitDriver {
         // the `can_enter_jit` call into the `loop_header` operation, so this
         // body is never part of a traced graph.  See `PORTAL_DIAG_LABELS`.
         portal_diag_bump(0);
-        if let Some(result) = portal_metatrace_maybe(
+        if portal_metatrace_maybe(
             driver,
             info,
             &env,
             green_key,
             next_instr,
             frame as *mut PyFrame,
+            ec,
         ) {
-            set_pending_loop_exit(ec, result);
             portal_diag_bump(1);
             return true;
         }
@@ -8198,6 +8180,7 @@ static PORTAL_METATRACE_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 struct PortalMetatraceSym {
     header_pc: usize,
+    redboxes: Vec<(OpRef, Type)>,
 }
 
 impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
@@ -8207,6 +8190,26 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
 
     fn loop_header_pc(&self) -> usize {
         self.header_pc
+    }
+
+    fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+        // pyjitpl.py `opimpl_jit_merge_point` → `reached_loop_header(greenboxes, redboxes)`.
+        self.redboxes = redboxes.to_vec();
+    }
+
+    fn loop_carried_boxes(&self, vable_boxes: &[(OpRef, Type)]) -> Option<Vec<(OpRef, Type)>> {
+        // pyjitpl.py `reached_loop_header`:
+        //   live_arg_boxes = greenboxes + redboxes
+        //   live_arg_boxes += self.virtualizable_boxes
+        //   live_arg_boxes.pop()
+        // `compile_loop` slices greens (`original_boxes[num_green_args:]`),
+        // so the LABEL/JUMP are reds plus every virtualizable field except
+        // the trailing identity. Same list `collect_jump_args_with_boxes`
+        // builds for the close.
+        let mut boxes = self.redboxes.clone();
+        let n = vable_boxes.len().saturating_sub(1);
+        boxes.extend_from_slice(&vable_boxes[..n]);
+        if boxes.is_empty() { None } else { Some(boxes) }
     }
 }
 
@@ -8312,15 +8315,16 @@ fn portal_metatrace_maybe(
     green_key: u64,
     next_instr: usize,
     frame: *mut PyFrame,
-) -> Option<LoopResult> {
+    ec: *const PyExecutionContext,
+) -> bool {
     if portal_metatrace_enabled()
         && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             >= portal_metatrace_skip()
         && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
-        drive_portal_metatrace(driver, info, env, green_key, next_instr, frame)
+        drive_portal_metatrace(driver, info, env, green_key, next_instr, frame, ec)
     } else {
-        None
+        false
     }
 }
 
@@ -8334,7 +8338,8 @@ fn drive_portal_metatrace(
     green_key: u64,
     loop_header_pc: usize,
     frame: *mut PyFrame,
-) -> Option<LoopResult> {
+    ec_pending: *const PyExecutionContext,
+) -> bool {
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
@@ -8342,7 +8347,7 @@ fn drive_portal_metatrace(
     // this key only. A live session on another key or driver may still
     // `bound_reached` a nested MetaInterp.
     if driver.cell_is_tracing(green_key) {
-        return None;
+        return false;
     }
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
@@ -8359,10 +8364,14 @@ fn drive_portal_metatrace(
         "iirrr",
         "portal metatracing requires the split eval portal"
     );
-    let header_pc = pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
-        .find(|op| op.opname == "jit_merge_point")
-        .expect("jd0 portal must contain its merge point")
-        .pc;
+    let mut header_pc = None;
+    for op in pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code) {
+        if op.opname == "jit_merge_point" {
+            header_pc = Some(op.pc);
+            break;
+        }
+    }
+    let header_pc = header_pc.expect("jd0 portal must contain its merge point");
     eprintln!(
         "[jd0-mt] portal jitcode name={} code_len={} entry=start pc=0 header_pc={}",
         canonical.name,
@@ -8382,7 +8391,7 @@ fn drive_portal_metatrace(
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
     driver.force_start_tracing(green_key, None, loop_header_pc, &mut jit_state, env);
     if !driver.is_tracing() {
-        return None;
+        return false;
     }
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     driver.arm_close_on_drop(starting_tracing_key);
@@ -8413,13 +8422,21 @@ fn drive_portal_metatrace(
     // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
     // at translation. Close before the portal walk reads it.
     majit_gc::ensure_type_registry_closed();
-    let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
+    let action = meta.interpret(
+        &mut PortalMetatraceSym {
+            header_pc,
+            redboxes: Vec::new(),
+        },
+        loop_header_pc,
+    );
     let depth = meta.framestack.len();
-    let top = meta.framestack.frames.last();
+    let (stop_jitcode, stop_cursor) = if let Some(top) = meta.framestack.frames.last() {
+        (top.jitcode.name(), top.code_cursor)
+    } else {
+        ("<empty>", 0)
+    };
     eprintln!(
-        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={} stop_cursor={}",
-        top.map_or("<empty>", |f| f.jitcode.name()),
-        top.map_or(0, |f| f.code_cursor)
+        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={stop_jitcode} stop_cursor={stop_cursor}"
     );
     let outcome = match action {
         TraceAction::Finish {
@@ -8466,10 +8483,15 @@ fn drive_portal_metatrace(
             if let Some(pc) = green_pc_position(args.green_int[0]) {
                 unsafe { &mut *resumed }.set_last_instr_from_next_instr(pc);
             }
-            Some(LoopResult::ContinueRunningNormally)
+            set_pending_loop_exit(ec_pending, LoopResult::ContinueRunningNormally);
+            true
         }
         JitException::DoneWithThisFrameRef(value) => {
-            Some(LoopResult::Done(Ok(value.0 as pyre_object::PyObjectRef)))
+            set_pending_loop_exit(
+                ec_pending,
+                LoopResult::Done(Ok(value.0 as pyre_object::PyObjectRef)),
+            );
+            true
         }
         JitException::ExitFrameWithExceptionRef(value) => {
             // `BlackholeInterpreter.handle_exception_in_frame` already
@@ -8477,9 +8499,13 @@ fn drive_portal_metatrace(
             // (`codewriter.rs` `catch_for_pc` from the Python exception
             // table). A hit jumped to the except landing; this leftover is
             // uncaught in this frame (`warmspot.py handle_jitexception`).
-            Some(LoopResult::Done(Err(unsafe {
-                pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
-            })))
+            set_pending_loop_exit(
+                ec_pending,
+                LoopResult::Done(Err(unsafe {
+                    pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
+                })),
+            );
+            true
         }
         other => panic!("incomplete portal blackhole continuation: {other:?}"),
     }
@@ -9487,7 +9513,7 @@ fn drive_unpack_iterable_trace(
     let w_iterator = roots.get(base + 1);
     let items = roots.get(base + 2);
 
-    // Extracted merge-point reds: root_base, items_slot, RootScope cell.
+    // Extracted merge-point reds: root_base, items_slot, RootScope save_point.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
@@ -9688,7 +9714,8 @@ fn drive_unpack_iterable_trace(
     }
 
     // Seed every bank the extracted `jit_merge_point` names.  Green is
-    // the type object; reds are root_base / items_slot / RootScope cell.
+    // the type object; reds are root_base / items_slot / RootScope
+    // save_point (`history.py` `getkind` of a raw Ptr is `'int'`).
     let green_args = [(
         majit_metainterp::JitArgKind::Ref,
         greenkey_raw as usize as i64,
@@ -9706,9 +9733,9 @@ fn drive_unpack_iterable_trace(
             root_base + 1,
         ),
         (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
-            pyre_object::gc_roots::shadow_stack_cell() as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+            root_base,
         ),
     ];
 
@@ -9716,7 +9743,7 @@ fn drive_unpack_iterable_trace(
         greenkey: pyre_object::PY_NULL,
         root_base: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
         items_slot: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
     };
 
     // The `jit_merge_point` opcode byte offset in the extracted body — the
@@ -13811,6 +13838,7 @@ fn compile_and_run_once(
             let action = if interpret {
                 let mut portal_sym = PortalMetatraceSym {
                     header_pc: target_pc,
+                    redboxes: Vec::new(),
                 };
                 if majit_metainterp::majit_log_enabled() {
                     let (name, cursor, first) = if meta.framestack.is_empty() {
@@ -13967,7 +13995,13 @@ fn compile_and_run_once(
                 eprintln!("[interpret] abort blackhole resume_pc={bh_pc}");
             }
             if let Some(name) = driver.take_interpret_bail_residual() {
-                panic!("interpret blackhole bailed on residual {name}");
+                // `blackhole.py convert_and_run_from_pyjitpl` never returns.
+                // An unbound residual has no callable `fnaddr`, so the chain
+                // bails (`reject_unresolved_call`) and the interpreter replays
+                // the opcode from the pre-walk snapshot below (`bh_pc == MAX`).
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[interpret] abort blackhole bailed on residual {name}");
+                }
             }
             if bh_pc != usize::MAX {
                 frame_root.frame().set_last_instr_from_next_instr(bh_pc);
@@ -14286,6 +14320,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         &majit_ir::PYPYJIT_GREEN_TYPES,
     );
 
+    // One MetaInterp. A nested Python call that arrives while a trace is
+    // already running must not start its own (`compile_and_run_once` is
+    // may-force, so the outer trace would record `CallMayForce` and the
+    // callee would compile apart from the caller). Falling through runs
+    // the portal body, which the metainterp inlines.
+    if pair.0.is_tracing() {
+        return None;
+    }
     // `warmstate.py maybe_compile_and_run` tests `cell.flags & JC_TRACING` on
     // the cell the chain walk found (`function_entry_step` → AlreadyTracing,
     // no tick) and ticks every other greenkey. `is_tracing_key` also matches
@@ -16000,20 +16042,25 @@ pub(crate) fn decode_and_restore_guard_failure(
         // _copy_resume_data_from`) must restart at the storage's pc
         // (`pyjitpl.py handle_guard_failure` -> `resume.py
         // rebuild_from_resumedata` -> `MIFrame.setup_resume_at_op`).
+        //
+        // Helper jitcodes have no Python `CodeObject`
+        // (`raw_code_for_jitcode_index`); `resume_py_pc_for_jitcode_word`
+        // then falls back to the containing/trivia lookup and reports 0.
+        // Using that mapped word as the portal merge-point green CloseLoops
+        // at the function entry and the bridge re-runs `q = [0]*n`. The
+        // innermost *Python* section is the innermost `resumed_frames` entry
+        // whose jitcode maps to a Python code object — a property of the
+        // section's jitcode/code, never `py_pc == 0` as a sentinel. If no
+        // section has a Python twin, keep the vable `last_instr` (`ni`).
         let ni = jit_state.next_instr();
-        let innermost = resumed_frames.last();
-        let resume_pc = if innermost.is_some_and(|f| f.py_pc == usize::MAX) {
-            // Helper innermost: the live frame's vable next-instr, not
-            // a fake Python pc. Continuations keep their twin / trivia pc.
-            ni
-        } else {
-            innermost.map(|f| f.py_pc).unwrap_or(ni)
-        };
-        // `write_from_resume_data_partial` / `consume_vable_info` write the
-        // virtualizable (outermost) frame. An inlined callee is a separate
-        // object this rebuild materializes; its depth does not index the
-        // portal `locals_cells_stack_w`. Correct vsd only when the innermost
-        // section IS that physical frame.
+        let innermost = innermost_python_twin_section(&resumed_frames);
+        let resume_pc = resume_pc_for_guard_failure(ni, &resumed_frames);
+        // virtualizable.py `write_from_resume_data_partial` /
+        // `consume_vable_info` write the virtualizable (outermost) frame.
+        // An inlined callee is a separate object this rebuild materializes;
+        // its depth does not index the portal `locals_cells_stack_w`.
+        // Correct vsd only when the innermost Python section IS that
+        // physical frame.
         let outermost_ptr = resumed_frames.first().map(|f| f.frame_ptr);
         if resume_pc != ni || resumed_frames.len() > 1 {
             if let Some(inner) = innermost {
@@ -16043,7 +16090,7 @@ pub(crate) fn decode_and_restore_guard_failure(
         // resumed section. The caller needs them to ask each frame's own
         // exception table — or a helper section's `catch_exception` — whether
         // it catches at its own resume pc. `resume_pc` alone only addresses
-        // the innermost section.
+        // the innermost Python section.
         let coords: Vec<(usize, usize, i32, i32)> = resumed_frames
             .iter()
             .map(|f| (f.code as usize, f.py_pc, f.jitcode_index, f.jitcode_pc))
@@ -16057,6 +16104,24 @@ pub(crate) fn decode_and_restore_guard_failure(
     } else {
         None
     }
+}
+
+/// Innermost rd_numb section whose jitcode maps to a Python `CodeObject`.
+///
+/// `resume.py` `rebuild_from_resumedata` / `setup_resume_at_op` resume each
+/// section at its jitcode pc; helper jitcodes have no Python twin.
+fn innermost_python_twin_section(
+    frames: &[crate::call_jit::ResumedFrame],
+) -> Option<&crate::call_jit::ResumedFrame> {
+    frames.iter().rev().find(|f| f.has_python_twin)
+}
+
+/// Guard-failure resume pc: every section count resumes at the innermost
+/// Python-twin section's pc; `ni` only when no section has a Python twin.
+fn resume_pc_for_guard_failure(ni: usize, frames: &[crate::call_jit::ResumedFrame]) -> usize {
+    innermost_python_twin_section(frames)
+        .map(|f| f.py_pc)
+        .unwrap_or(ni)
 }
 
 /// Decode rd_numb to produce typed values via
@@ -16801,6 +16866,12 @@ fn build_resumed_frames(
             vsd,
             namespace,
             values,
+            // `raw_code_for_jitcode_index`: non-null `code_ptr` on the
+            // section's jitcode. The same identity `resume_py_pc_for_jitcode_word`
+            // needs a Python code object; helpers have none and their mapped
+            // py_pc is the trivia fallback (often 0).
+            has_python_twin: pyre_jit_trace::state::raw_code_for_jitcode_index(frame.jitcode_index)
+                .is_some(),
         });
     }
 
@@ -17582,6 +17653,53 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resumed_section(py_pc: usize, has_python_twin: bool) -> crate::call_jit::ResumedFrame {
+        crate::call_jit::ResumedFrame {
+            code: std::ptr::null(),
+            py_pc,
+            jitcode_index: 0,
+            jitcode_pc: 0,
+            frame_ptr: std::ptr::null_mut(),
+            vsd: 0,
+            namespace: std::ptr::null(),
+            values: Vec::new(),
+            has_python_twin,
+        }
+    }
+
+    #[test]
+    fn single_frame_guard_failure_resumes_at_section_pc() {
+        // #2444 + #158: one twin section resumes at its py_pc; a helper
+        // section has no Python twin and falls back to vable `last_instr`.
+        let twin = [resumed_section(12, true)];
+        assert_eq!(resume_pc_for_guard_failure(24, &twin), 12);
+        let helper = [resumed_section(0, false)];
+        assert_eq!(resume_pc_for_guard_failure(24, &helper), 24);
+    }
+
+    #[test]
+    fn inlined_python_callee_resumes_at_innermost_py_pc() {
+        // #2444: multi-frame whose innermost section IS an inlined Python
+        // callee resumes at that section's py_pc, not the portal `ni`.
+        let frames = [resumed_section(24, true), resumed_section(12, true)];
+        assert_eq!(resume_pc_for_guard_failure(24, &frames), 12);
+    }
+
+    #[test]
+    fn helper_innermost_section_resumes_at_portal_pc_not_zero() {
+        // Guard failure inside an inlined helper (no Python twin; mapped
+        // py_pc 0) resumes at the portal section's py_pc, not 0.
+        let frames = [resumed_section(24, true), resumed_section(0, false)];
+        assert_eq!(resume_pc_for_guard_failure(24, &frames), 24);
+        assert_ne!(resume_pc_for_guard_failure(24, &frames), 0);
+    }
+
+    #[test]
+    fn helper_only_chain_falls_back_to_vable_last_instr() {
+        let frames = [resumed_section(0, false), resumed_section(0, false)];
+        assert_eq!(resume_pc_for_guard_failure(18, &frames), 18);
+    }
 
     #[test]
     fn opcode_method_name_underscores_numeric_suffixes() {

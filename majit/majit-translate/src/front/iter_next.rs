@@ -492,13 +492,14 @@ fn exclusive_ranges(counts: &[u32]) -> Vec<(u32, u32)> {
 /// container the op was given is what separates them — hence the backward
 /// walk rather than a test on the op.
 ///
-/// Getting this wrong is not inert.  `result_ty` is read straight off the
-/// op: `resolve_call_result_kind` (`codewriter/jtransform.rs`) consults the
-/// rtyper's `concretetype` *only* when `result_ty` is `Unknown`, and
-/// `authoritative_result_types` (`codewriter/type_state.rs`) then stamps the
-/// derived kind back over it.  So a wrong answer here outranks the real
-/// rtyper for every graph that gets a JitCode, not just the legacy tier: the
-/// induction variable lands in the wrong register bank, and an `array[i]` in
+/// Getting this wrong is not inert.  `resolve_call_result`
+/// (`codewriter/jtransform.rs`) reads `op.result.concretetype` first
+/// (`jtransform.py rewrite_call` `reskind = getkind(op.result.concretetype)[0]`).
+/// The front `result_ty` is only the pre-rtyper-cell path, when that cell
+/// is still `Unknown`.  `authoritative_result_types`
+/// (`codewriter/type_state.rs`) then stamps the rewritten `result_kind`
+/// back onto the cell.  A wrong `Unknown`-cell `result_ty` still lands the
+/// induction variable in the wrong register bank, and an `array[i]` in
 /// the loop body assembles as a `getarrayitem_gc` with a ref-kind index,
 /// which `assembler.rs` asserts on.
 ///
@@ -1839,6 +1840,7 @@ fn rewire_one_next_site(
             target: CallTarget::FunctionPath {
                 segments: next_op_segments(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![match &enumerate_site {
@@ -1935,6 +1937,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: container_segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
@@ -1950,6 +1953,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![container]),
@@ -2414,6 +2418,7 @@ mod tests {
                             "make".to_string(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
@@ -2429,6 +2434,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![container]),
@@ -2560,6 +2566,7 @@ mod tests {
                         CallTarget::FunctionPath {
                             segments,
                             fun_decl_id,
+                            generic_rust_args: _,
                             specialization,
                         },
                     args,
@@ -2605,6 +2612,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -2625,6 +2633,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
@@ -2640,6 +2649,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![s]),
@@ -2817,6 +2827,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
@@ -2832,6 +2843,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![s]),
@@ -2998,6 +3010,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
@@ -3013,6 +3026,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![s]),
@@ -3141,6 +3155,7 @@ mod tests {
                             .map(|s| (*s).to_string())
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![k]),

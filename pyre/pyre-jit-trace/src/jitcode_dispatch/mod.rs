@@ -11909,12 +11909,7 @@ unsafe fn lookup_instance_dunder_call(
     if version_tag == 0 {
         return None;
     }
-    let method = unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            w_class,
-            "__call__",
-        )
-    }?;
+    let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__call__") }?;
     Some((method, w_class, version_tag))
 }
 
@@ -17193,6 +17188,12 @@ fn handle<Sym: WalkSym>(
             write_hint_bool(ctx, op.pc, dst, ctx.trace_ctx.is_likely_virtual(src))?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        "int_isvirtual/r>i" => {
+            let src = read_ref_reg(code, op, 0, ctx)?;
+            let dst = code[op.pc + 2] as usize;
+            write_hint_bool(ctx, op.pc, dst, ctx.trace_ctx.is_likely_virtual(src))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "ref_isvirtual/r>i" => {
             let src = read_ref_reg(code, op, 0, ctx)?;
             let dst = code[op.pc + 2] as usize;
@@ -17267,21 +17268,9 @@ fn handle<Sym: WalkSym>(
                 }
                 _ => None,
             };
-            if let Some(ptr) =
-                alloc_pin
-                    .as_ref()
-                    .map(|pin| pin.get().0)
-                    .or_else(|| match concrete {
-                        Some(Value::Ref(r)) => Some(r.0),
-                        _ => None,
-                    })
-                && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
-            {
-                unsafe {
-                    (*(ptr as *mut pyre_object::PyObject)).w_class =
-                        w_class as pyre_object::PyObjectRef;
-                }
-            }
+            // `bh_new_with_vtable` writes both header words when the backend
+            // has a class-word offset, so this arm does not store `w_class`
+            // again.
             let concrete = alloc_pin
                 .as_ref()
                 .map(|pin| Value::Ref(pin.get()))

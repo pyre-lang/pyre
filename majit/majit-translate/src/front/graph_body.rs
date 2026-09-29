@@ -225,6 +225,7 @@ impl GraphBodyProvider {
             &mut program.enum_variant_by_discriminant,
             Some(&program.struct_ids),
         );
+        self.tables.crates.borrow_mut().push(krate.clone());
         self.crates.push(krate);
         program
     }
@@ -263,6 +264,7 @@ impl GraphBodyProvider {
             &mut program.enum_variant_by_discriminant,
             Some(&program.struct_ids),
         );
+        self.tables.crates.borrow_mut().push(krate.clone());
         self.crates.push(krate);
         program
     }
@@ -551,6 +553,28 @@ fn declaration(
 }
 
 impl ProviderTables {
+    /// The artefact that extracted an `Unstructured` body for `name_path`.
+    /// `None` when no crate has one, or two do (`source_for_name_path`).
+    fn crate_with_fun_body(&self, name_path: &str) -> Option<(Rc<ProvidedCrate>, u64)> {
+        let crates = self.crates.borrow();
+        let mut found = None;
+        for krate in crates.iter() {
+            for fd in krate.llbc.iter_local_fns() {
+                if fd.item_meta.name_path() != name_path {
+                    continue;
+                }
+                if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((krate.clone(), fd.def_id));
+            }
+        }
+        found
+    }
+
     /// Run `f` with the borrowed [`crate::HostStaticAddrs`] view of the
     /// owned tables.
     fn with_static_addrs<R>(&self, f: impl FnOnce(crate::HostStaticAddrs<'_>) -> R) -> R {

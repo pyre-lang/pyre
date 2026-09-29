@@ -326,7 +326,12 @@ impl<'a> Lowering<'a> {
                 }
                 None
             }
-            "base" | "pin_roots" | "shadow_stack_len" if receiver_scope.is_some() => None,
+            "base" | "pin_roots" | "shadow_stack_len" | "publish" | "publish_roots"
+            | "normalize" | "normalize_roots"
+                if receiver_scope.is_some() =>
+            {
+                None
+            }
             "shadow_stack_copy_range" | "shadow_stack_copy_range_into_vec"
                 if receiver_scope.is_some() =>
             {
@@ -425,6 +430,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     Some(loaded)
@@ -530,6 +536,8 @@ impl<'a> Lowering<'a> {
                         ))
                     })?
                     .one()?;
+                // `get().0 as *mut T` is this word (`owner_root_guard.rs`).
+                self.guard_word_vars.insert(value.clone());
                 self.local_var[dest_local] = Some(LocalValue::One(value));
             }
             owner_root_guard::Op::Set => {
@@ -917,6 +925,11 @@ impl<'a> Lowering<'a> {
     /// Charon leaves the declaration generic (`monomorphize:false`), so
     /// `fn f<T>(x: &T)` is a `TypeVar` and does not name the wrapper. The
     /// operand's place type is the type the call actually passes.
+    ///
+    /// An inherent method of that wrapper is the other case: `&self` *is*
+    /// the word (`history.py` `getkind` of a raw `Ptr`), and the residual
+    /// ABI takes it by value. A generic that merely instantiates `T` with
+    /// the wrapper still has no such ABI.
     pub(in crate::front::mir) fn refuse_borrowed_transparent_scalar_residual(
         &self,
         mir_bb: usize,
@@ -932,6 +945,13 @@ impl<'a> Lowering<'a> {
         if !fun_decl_is_residual(fd, self.dont_look_inside) {
             return Ok(());
         }
+        let inherent = scalar_inherent_method_path(
+            reg,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
             let passed = arg_tys.get(index).and_then(Option::as_ref);
             if std::iter::once(declared).chain(passed).any(|ty| {
@@ -943,6 +963,12 @@ impl<'a> Lowering<'a> {
                     &self.raw_alloc_flavor_structs,
                 )
             }) {
+                // `&self` of the wrapper is the word the jit_abi already
+                // takes. A later argument that is also a borrowed wrapper
+                // is the generic case this refuse still catches.
+                if index == 0 && inherent.is_some() {
+                    continue;
+                }
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: residual `{}` argument {index} borrows a \
                      repr(transparent) scalar; the word is not an address",
@@ -2460,6 +2486,31 @@ pub(in crate::front::mir) fn block_successors(
     body: &Unstructured,
     bb: usize,
 ) -> Vec<usize> {
+    block_successors_kind(llbc, body, bb, true)
+}
+
+/// The edges the lowering keeps: `Call` / `Assert` / `Drop` `target` only.
+///
+/// `on_unwind` is a Rust panic-cleanup chain the front drops
+/// (`lower_terminator` `UnwindResume`, `lower_call`). Python exceptions ride
+/// the success edge as `Result::Err`. A bracket proof that followed those
+/// chains would charge destructor glue and `UnwindResume`
+/// (`root_bracket_stack_effects_are_known` `_ => return false`) and keep
+/// every bracket that contains a call.
+pub(in crate::front::mir) fn block_normal_successors(
+    llbc: &Llbc,
+    body: &Unstructured,
+    bb: usize,
+) -> Vec<usize> {
+    block_successors_kind(llbc, body, bb, false)
+}
+
+pub(in crate::front::mir) fn block_successors_kind(
+    llbc: &Llbc,
+    body: &Unstructured,
+    bb: usize,
+    include_unwind: bool,
+) -> Vec<usize> {
     let n = body.body.len();
     let mut out = Vec::new();
     let mut push = |target: u64| {
@@ -2492,7 +2543,9 @@ pub(in crate::front::mir) fn block_successors(
             target, on_unwind, ..
         }) => {
             push(*target);
-            push(*on_unwind);
+            if include_unwind {
+                push(*on_unwind);
+            }
         }
         _ => {}
     }
@@ -2608,7 +2661,7 @@ pub(in crate::front::mir) fn root_bracket_region(
         {
             continue;
         }
-        work.extend(block_successors(llbc, body, bb));
+        work.extend(block_normal_successors(llbc, body, bb));
     }
     region
 }
@@ -2841,7 +2894,7 @@ pub(in crate::front::mir) fn root_bracket_stack_effects_are_known(
                     // `dyn Trait` dispatch: see `RootStackAnalyzer`'s
                     // pointer arm.
                     CallFunc::Dynamic(..) => {
-                        work.extend(block_successors(llbc, body, bb));
+                        work.extend(block_normal_successors(llbc, body, bb));
                         continue;
                     }
                     CallFunc::Unknown => return false,
@@ -2857,7 +2910,16 @@ pub(in crate::front::mir) fn root_bracket_stack_effects_are_known(
                     // leaf only when `free_sites` recorded that call for it.
                     let own_leaf = matches!(
                         path.as_deref().and_then(|path| path.rsplit("::").next()),
-                        Some("base" | "pin_root" | "pin_roots" | "get")
+                        Some(
+                            "base"
+                                | "pin_root"
+                                | "pin_roots"
+                                | "publish"
+                                | "publish_roots"
+                                | "normalize"
+                                | "normalize_roots"
+                                | "get",
+                        )
                     ) && operand_local(call.args.first())
                         .and_then(|receiver| aliases.get(&receiver).copied())
                         == Some(scope)
@@ -2900,7 +2962,7 @@ pub(in crate::front::mir) fn root_bracket_stack_effects_are_known(
             ) => {}
             _ => return false,
         }
-        work.extend(block_successors(llbc, body, bb));
+        work.extend(block_normal_successors(llbc, body, bb));
     }
     true
 }
@@ -2930,9 +2992,11 @@ pub(in crate::front::mir) fn mentions_local(
 /// the temporaries its slice argument was built through.
 ///
 /// MIR spells the argument as `_arr = [move _a, move _b]`, `_r = &_arr`, a
-/// reborrow `_r2 = &(*_r)` and `_s = _r2 as &[_] (Unsize)`.  Each temporary
-/// has to be assigned exactly once, and each element a plain local, or the
-/// pin is not one this pass can answer a read-back for.
+/// reborrow `_r2 = &(*_r)` and `_s = _r2 as &[_] (Unsize)`.  Charon records
+/// that Unsize as [`Rvalue::Cast`] (`liveness.rs` `pin_src`); a copy of any
+/// of those temporaries is [`Rvalue::Use`].  Each temporary has to be
+/// assigned exactly once, and each element a plain local, or the pin is not
+/// one this pass can answer a read-back for.
 pub(in crate::front::mir) fn pin_roots_slice_values(
     body: &Unstructured,
     slice: usize,
@@ -2959,6 +3023,18 @@ pub(in crate::front::mir) fn pin_roots_slice_values(
             }
         })
     };
+    let alias_place = |place: Place| -> Option<usize> {
+        match place.kind {
+            PlaceKind::Local(src) => Some(src as usize),
+            PlaceKind::Projection(base, ProjectionElem::Atom(elem)) if elem == "Deref" => {
+                match base.kind {
+                    PlaceKind::Local(src) => Some(src as usize),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
     let mut temps = Vec::new();
     let mut local = slice;
     loop {
@@ -2967,23 +3043,15 @@ pub(in crate::front::mir) fn pin_roots_slice_values(
             return None;
         }
         match definition(local)? {
-            Rvalue::UnaryOp(kind, operand)
-                if kind
-                    .get("Cast")
-                    .is_some_and(|cast| cast.get("Unsize").is_some()) =>
-            {
+            Rvalue::UnaryOp(kind, operand) if cast_kind_is_unsize(&kind) => {
                 local = operand_local(Some(&operand))?;
             }
-            Rvalue::Ref { place, .. } => match place.kind {
-                PlaceKind::Local(src) => local = src as usize,
-                PlaceKind::Projection(base, ProjectionElem::Atom(elem)) if elem == "Deref" => {
-                    match base.kind {
-                        PlaceKind::Local(src) => local = src as usize,
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            },
+            Rvalue::Cast(_, operand, _) | Rvalue::Use(operand, _) => {
+                local = operand_local(Some(&operand))?;
+            }
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                local = alias_place(place)?;
+            }
             Rvalue::Aggregate(kind, operands) if kind.get("Array").is_some() => {
                 let values = operands
                     .iter()
@@ -4264,6 +4332,11 @@ pub fn harvest_published_structs(llbc: &Llbc) -> Vec<PublishedStructBody> {
 /// stripping applies to the declaration path, not to `::` inside
 /// generic arguments. An existing `Struct` is left alone. A path that does not
 /// resolve to a destination decl stays a `{"Path": ...}` id.
+///
+/// A destination already classified by `transparent_scalar_kind` or
+/// `is_raw_struct_path` stays `Opaque`: the linked `getkind` is the
+/// defining crate's layout, and a copied field list would be walked as
+/// if it were that layout.
 pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
     if rows.is_empty() {
         return;
@@ -4303,6 +4376,14 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
         std::collections::HashMap::new();
     for td in llbc.iter_type_decls() {
         if !matches!(td.kind, TypeDeclKind::Opaque | TypeDeclKind::Unknown) {
+            continue;
+        }
+        // A linked raw / transparent path already has `getkind`. Copying
+        // fields onto that hole makes `adt_def_is_raw_storage` walk a
+        // remap that can leave a GC field in a raw owner (`jtransform.py`
+        // `rewrite_op_getfield` refuses `getfield_raw_r`).
+        let path = td.item_meta.name_path();
+        if llbc.transparent_scalar_kind(&path).is_some() || llbc.is_raw_struct_path(&path) {
             continue;
         }
         let Some(key) = dest_key_by_id.get(&td.def_id) else {
@@ -5158,6 +5239,56 @@ pub(in crate::front::mir) fn analyze_root_brackets(
     )
 }
 
+/// The locals `pin_roots(&[...])` publishes, for tests of the slice walk.
+pub fn pin_roots_published_locals(
+    llbc: &Llbc,
+    body: &Unstructured,
+    slice: usize,
+) -> Option<Vec<usize>> {
+    let mut assigned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let PlaceKind::Local(dest) = place.kind
+            {
+                *assigned.entry(dest as usize).or_default() += 1;
+            }
+        }
+    }
+    pin_roots_slice_values(body, slice, &assigned, &forward_blocks).map(|(values, _)| values)
+}
+
+/// Whether [`RootStackAnalyzer`] charges `path` with a root-stack effect.
+pub fn function_touches_root_stack(llbc: &Llbc, path: &str) -> Option<bool> {
+    let fd = llbc
+        .iter_fun_decls()
+        .find(|fd| fd.item_meta.name_path() == path)?;
+    let state = RootStackState::new(llbc);
+    let analyzer = RootStackAnalyzer::new(llbc, &state);
+    Some(analyzer.fn_touches_root_stack(fd.def_id))
+}
+
+/// Whether [`erase_shadow_stack`] rewrote this body, after the same
+/// [`ensure_stack_sensitive_fns`] the lowering runs.  `Ok(true)` is a
+/// rewrite, `Ok(false)` is a body with no bracket, `Err` is the refusal
+/// that left the brackets in.
+pub fn shadow_stack_erase_status(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    body: &Unstructured,
+) -> Result<bool, String> {
+    shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
+    match shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(reason) => Err(reason.into_owned()),
+    }
+}
+
 /// The root-bracket guards [`lower_fun_decl`] takes out of this body, as MIR
 /// locals.
 ///
@@ -5175,6 +5306,10 @@ pub fn erased_root_bracket_guards(
     root_stack_state: &RootStackState,
 ) -> Vec<usize> {
     // A body the scalar replacement rewrote keeps no bracket at all.
+    // The lowering runs [`ensure_stack_sensitive_fns`] first; a caller that
+    // only asks the plan must too, or the rewrite always refuses with
+    // `callee-stack-effects-unknown`.
+    shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
     if let Ok(Some(_)) = shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
         return (0..body.locals.locals.len())
             .filter(|local| shadow_stack_erase::is_root_scope_local(body, llbc, *local))
@@ -5344,11 +5479,16 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
         let Some(path) = name_of(reg) else {
             continue;
         };
-        // `gc_roots::pin_roots(&[..])` pins onto the bracket open where it
-        // runs, and answers with the slot its first value took. A later run
-        // in the same bracket is not the guard's base; `run_dests` names it.
-        if path.rsplit("::").next() == Some("pin_roots")
-            && call.args.len() == 1
+        // `gc_roots::pin_roots(&[..])` / `publish_roots(&[..])` pin onto
+        // the bracket open where they run, and answer with the slot the
+        // first value took. `get_and_call_function` uses `publish` then
+        // `normalize` so later slices are visible before the first query.
+        // A later run in the same bracket is not the guard's base;
+        // `run_dests` names it.
+        if matches!(
+            path.rsplit("::").next(),
+            Some("pin_roots" | "publish_roots")
+        ) && call.args.len() == 1
             && path.split("::").any(|s| s == ROOT_SCOPE_MODULE)
         {
             let (Some(slice), PlaceKind::Local(dest)) =
@@ -5417,7 +5557,8 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
             }
             continue;
         }
-        let pins_many = path.rsplit("::").next() == Some("pin_roots") && call.args.len() == 2;
+        let pins_many = matches!(path.rsplit("::").next(), Some("pin_roots" | "publish"))
+            && call.args.len() == 2;
         if !(gc_root_scope_base_path(&path) && call.args.len() == 1) && !pins_many {
             continue;
         }
@@ -5855,7 +5996,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
                 }
                 if call.args.len() == 1 && !dest_is_guard {
                     match free_leaf.as_deref() {
-                        Some("pin_roots") => {
+                        Some("pin_roots" | "publish_roots") => {
                             if let Some((scope, values, _)) = pin_runs.get(&bb_idx)
                                 && free_sites.get(&bb_idx) == Some(scope)
                                 && candidates.contains(*scope)
@@ -5933,7 +6074,7 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
                                 ("base", Some(dest)) if call.args.len() == 1 => {
                                     bases.get(&dest) == Some(scope)
                                 }
-                                ("pin_roots", Some(dest)) if call.args.len() == 2 => {
+                                ("pin_roots" | "publish", Some(dest)) if call.args.len() == 2 => {
                                     match pin_runs.get(&bb_idx) {
                                         Some((run_scope, values, _))
                                             if run_scope == scope
@@ -5960,6 +6101,8 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
                                         None => false,
                                     }
                                 }
+                                ("normalize", _) if call.args.len() == 3 => true,
+                                ("normalize_roots", _) if call.args.len() == 2 => true,
                                 _ => false,
                             }
                         }

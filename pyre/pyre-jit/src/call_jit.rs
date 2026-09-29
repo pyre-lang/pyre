@@ -1289,19 +1289,22 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     // A recording MIFrame may pass a null / sentinel `w_code` (the portal
     // virtualizable is the caller's frame). Resolve this jitcode's own
     // pycode; a helper with no Python code contributes no node.
-    let (w_code_value, w_globals_value) =
-        if w_code_value == 0 || w_code_value as usize == usize::MAX {
-            match pyre_jit_trace::state::code_for_jitcode_index(jitcode_index) {
-                Some(w_code) if !w_code.is_null() && w_code as usize != usize::MAX => {
-                    let w_globals =
-                        unsafe { pyre_interpreter::w_code_get_w_globals(w_code as PyObjectRef) };
-                    (w_code as i64, w_globals as i64)
-                }
-                _ => return,
-            }
-        } else {
-            (w_code_value, w_globals_value)
-        };
+    //
+    // Keep the caller-supplied `w_globals`. `PyCode.w_globals` is only the
+    // first namespace (`pycode.py frame_stores_global`); another function
+    // using the same code can have different frame-owned globals
+    // (`pyframe.py get_w_globals`).
+    let w_code_value = if w_code_value == 0 || w_code_value as usize == usize::MAX {
+        match pyre_jit_trace::state::code_for_jitcode_index(jitcode_index) {
+            Some(w_code) if !w_code.is_null() && w_code as usize != usize::MAX => w_code as i64,
+            _ => return,
+        }
+    } else {
+        w_code_value
+    };
+    if w_globals_value == 0 || w_globals_value as usize == usize::MAX {
+        return;
+    }
     if w_code_value == 0 {
         return;
     }
@@ -2104,6 +2107,10 @@ pub struct ResumedFrame {
     /// Structure: [live_registers...] — no scalar inputarg header.
     /// RPython parity: vable values come from snapshot, not fail_args.
     pub values: Vec<majit_ir::Value>,
+    /// Whether this section's jitcode maps to a Python `CodeObject`
+    /// (`raw_code_for_jitcode_index`). Helper jitcodes have none; an
+    /// inlined Python callee does, including when its mapped `py_pc` is 0.
+    pub has_python_twin: bool,
 }
 
 /// resume.py decode_ref / getvirtual_ptr parity.
@@ -2406,6 +2413,13 @@ fn materialize_str_call_for_cranelift(
 
 /// Interpreter hooks for `MetaInterpStaticData.host`. One constructor
 /// replaces the former `register_*` / `set_*` scatter.
+fn make_portal_quasi_immut_descr(
+    struct_ptr: i64,
+    field: &majit_ir::DescrRef,
+) -> Option<majit_ir::DescrRef> {
+    pyre_jit_trace::state::quasi_immut_descr_for_struct(struct_ptr, field, None)
+}
+
 pub fn publish_pyre_host_hooks() {
     fn criticalcode_start_adapter() {
         pyre_interpreter::stack_check::pyre_stack_criticalcode_start();
@@ -2435,6 +2449,7 @@ pub fn publish_pyre_host_hooks() {
             pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path,
         ),
         assertion_error_typeptr: Some(assertion_error_typeptr_adapter),
+        make_quasi_immut_descr: Some(make_portal_quasi_immut_descr),
     });
 }
 
@@ -2485,12 +2500,6 @@ pub fn install_jit_call_bridge() {
             pyre_object::interp_exceptions::memory_error_singleton() as i64
         });
         publish_pyre_host_hooks();
-        majit_metainterp::register_allow_small_ref_residual(
-            pyre_interpreter::is_one_word_guard_residual,
-        );
-        majit_metainterp::register_bh_portal_frame(|| {
-            pyre_interpreter::eval::current_frame() as i64
-        });
         #[cfg(feature = "cranelift")]
         {
             majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
@@ -4737,14 +4746,19 @@ fn trace_and_compile_from_bridge_body(
             false,
         ) {
             let pc = resume.resume_pc().unwrap_or(usize::MAX);
-            let compiled = driver
-                .meta_interp()
-                .bridge_was_compiled(green_key, trace_id, fail_index);
+            // `assembler.py patch_jump_for_descr` marks the guard once a
+            // bridge is attached (`Backend::bridge_attached`).
+            let compiled = {
+                use majit_backend::Backend;
+                descr_arc
+                    .as_fail_descr()
+                    .is_some_and(|fd| driver.meta_interp().backend().bridge_attached(fd))
+            };
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-trace] interpret-from-resume key={} trace={} fail={} \
+                    "[jit][bridge-trace] interpret-from-resume key={} descr=0x{:x} \
                      resume_pc={} walk_pc={} compiled={}",
-                    green_key, trace_id, fail_index, resume_pc, pc, compiled
+                    green_key, descr_id, resume_pc, pc, compiled
                 );
             }
             // `pyjitpl.py handle_guard_failure` never goes back to the
@@ -8559,9 +8573,7 @@ pub extern "C" fn bh_load_method_self_fn(
         return pyre_object::PY_NULL;
     }
     let name = code.names[idx].as_ref();
-    let w_name =
-        unsafe { pyre_interpreter::pycode::w_code_getname_w_or_new(w_code_ptr, idx, name) };
-    pyre_interpreter::eval::compute_load_method_bound(obj, attr, w_name)
+    pyre_interpreter::eval::compute_load_method_bound(obj, attr, name)
 }
 
 #[inline]
@@ -8985,7 +8997,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.publish(&[
                 exc,
-                cause.as_ref().map_or(std::ptr::null_mut(), |c| c.w_cause),
+                cause.map_or(std::ptr::null_mut(), |c| c.as_pyobject_ref()),
             ]);
             roots.normalize(base, 2);
             let result = {
@@ -8993,8 +9005,15 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
                 pyre_interpreter::call::call_function_impl_result(exc, &[])
             };
             exc = roots.get(base);
-            if let Some(c) = cause.as_mut() {
-                c.w_cause = roots.get(base + 1);
+            if cause.is_some() {
+                let forwarded = roots.get(base + 1);
+                cause = if forwarded.is_null() {
+                    None
+                } else {
+                    Some(pyre_interpreter::eval::RaiseCauseRef::from_pyobject_ref(
+                        forwarded,
+                    ))
+                };
             }
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,

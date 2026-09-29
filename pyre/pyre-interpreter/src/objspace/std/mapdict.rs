@@ -1719,8 +1719,6 @@ unsafe fn load_attr_slowpath(
     name: &str,
     map: MapRef,
 ) -> Result<PyObjectRef, PyError> {
-    // mapdict.py:1490 `w_name = pycode.co_names_w[nameindex]`.
-    let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, name) };
     // mapdict.py:1495 `if map is not None:`.
     if !map.is_null() {
         // mapdict.py:1496 `w_type = map.terminator.w_cls`.
@@ -1729,7 +1727,7 @@ unsafe fn load_attr_slowpath(
         // pyre has no separate `_handle_getattribute`; `space.getattr`
         // re-dispatches the custom `__getattribute__`, the same result.
         if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
-            return crate::baseobjspace::getattr(w_obj, w_name);
+            return crate::baseobjspace::getattr_str(w_obj, name);
         }
         // mapdict.py:1500 `version_tag = w_type.version_tag()`.
         let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
@@ -1800,7 +1798,7 @@ unsafe fn load_attr_slowpath(
         }
     }
     // mapdict.py `return space.getattr(w_obj, w_name)`.
-    crate::baseobjspace::getattr(w_obj, w_name)
+    crate::baseobjspace::getattr_str(w_obj, name)
 }
 
 /// The JIT LOAD_ATTR fast-path resolver: the `load_attr_slowpath`
@@ -1850,12 +1848,7 @@ pub unsafe fn load_attr_fast_path(
         return None;
     }
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    };
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
     // mapdict.py `if attrkind != INVALID:`.
     if attrkind == INVALID {
@@ -1947,23 +1940,12 @@ pub unsafe fn class_attr_fast_path(
     } {
         return None;
     }
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    }?;
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
     if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
         return None;
     }
     let value_type = crate::typedef::r#type(w_descr)?.as_ptr();
-    if unsafe {
-        crate::baseobjspace::lookup_in_type(
-            value_type,
-            "__get__",
-        )
-    }
-    .is_some()
+    if unsafe { crate::baseobjspace::lookup_in_type(value_type, "__get__") }.is_some()
         || unsafe { pyre_object::w_type_is_heaptype(value_type) }
     {
         return None;
@@ -2062,12 +2044,7 @@ pub unsafe fn getattr_hook_fast_path(
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef, PyObjectRef)> {
     let (w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
-    let w_getattr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            "__getattr__",
-        )
-    }?;
+    let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
     // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
     // cell is what `write_cell` updates; the caller getfields its payload.
     let cell = unsafe {
@@ -2115,14 +2092,7 @@ pub unsafe fn getattribute_hook_fast_path(
         return None;
     }
     let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            "__getattr__",
-        )
-    }
-    .is_some()
-    {
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some() {
         return None;
     }
     // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
@@ -2166,14 +2136,7 @@ pub unsafe fn own_getattribute_fast_path(
         return None;
     }
     let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            "__getattr__",
-        )
-    }
-    .is_some()
-    {
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some() {
         return None;
     }
     let cell = unsafe {
@@ -2210,13 +2173,8 @@ pub unsafe fn type_getattribute_hook_fast_path(
     // and the cell read.
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[metatype, w_getattribute]);
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            roots.get(base),
-            "__getattr__",
-        )
-    }
-    .is_some()
+    if unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(base), "__getattr__") }
+        .is_some()
     {
         return None;
     }
@@ -2248,14 +2206,7 @@ pub unsafe fn getattr_absent_fast_path(
     // A hook would run application code whose answer neither pin describes,
     // and which can return a value or raise something other than
     // AttributeError.
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            pins.0,
-            "__getattr__",
-        )
-    }
-    .is_some()
-    {
+    if unsafe { crate::baseobjspace::lookup_in_type_where(pins.0, "__getattr__") }.is_some() {
         return None;
     }
     Some(pins)
@@ -2301,14 +2252,7 @@ unsafe fn getattr_resolves_nowhere(
     // `classify_attr` reads a `__slots__` member under the `"slot"` name rather
     // than its own, so a descriptor found here says nothing about what
     // `find_map_attr(name)` below would answer.
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    }
-    .is_some()
-    {
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }.is_some() {
         return None;
     }
     // A devolved instance keeps its attributes in a real dictionary, and
@@ -2391,12 +2335,7 @@ pub unsafe fn instance_dict_attr_fast_path(
         return None;
     }
     // mapdict.py:1504-1526 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    };
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
     if attrkind != DICT || is_slot {
         return None;
@@ -2475,10 +2414,7 @@ unsafe fn property_descr_fast_path_wtf8(
     if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, name) } {
         return None;
     }
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where_wtf8(
-            w_type, name)
-    }?;
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(w_type, name) }?;
     // Exact type: the fold calls `fget`/`fset` directly, which stands in for
     // `type(w_descr).__get__` only where that cannot have been overridden
     // (`descroperation.py get_and_call_function`). A property subclass is
@@ -2564,22 +2500,16 @@ pub unsafe fn type_property_get_fast_path(
     if version_tag == 0 {
         return None;
     }
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            roots.get(meta_at),
-            "__getattr__",
-        )
-    }
-    .is_some()
+    if unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(meta_at), "__getattr__") }
+        .is_some()
     {
         return None;
     }
     if unsafe { crate::baseobjspace::type_attr_stored_is_cell(roots.get(meta_at), name) } {
         return None;
     }
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where_wtf8(roots.get(meta_at), name)
-    }?;
+    let w_descr =
+        unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(roots.get(meta_at), name) }?;
     let descr_at = roots.pin_roots(&[roots.get(meta_at), w_descr]);
     if !unsafe { crate::baseobjspace::is_data_descr(roots.get(descr_at + 1)) }
         || !unsafe { pyre_object::descriptor::is_exact_property(roots.get(descr_at + 1)) }
@@ -2635,13 +2565,7 @@ pub unsafe fn data_descriptor_get_fast_path(
     let w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null()
         || unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some()
-        || unsafe {
-            crate::baseobjspace::lookup_in_type_where(
-                w_type,
-                "__getattr__",
-            )
-        }
-        .is_some()
+        || unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some()
     {
         return None;
     }
@@ -2654,12 +2578,7 @@ pub unsafe fn data_descriptor_get_fast_path(
     } {
         return None;
     }
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    }?;
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
     if !unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
         return None;
     }
@@ -2683,12 +2602,7 @@ pub unsafe fn data_descriptor_get_fast_path(
     if unsafe { crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__")) } {
         return None;
     }
-    let w_get = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            descr_type,
-            "__get__",
-        )
-    }?;
+    let w_get = unsafe { crate::baseobjspace::lookup_in_type_where(descr_type, "__get__") }?;
     Some((
         w_type,
         version_tag,
@@ -2772,12 +2686,7 @@ pub unsafe fn python_descr_get_pins(
     } {
         return None;
     }
-    let w_get = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            roots.get(base),
-            "__get__",
-        )
-    }?;
+    let w_get = unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(base), "__get__") }?;
     Some((roots.get(base), descr_version_tag, descr_map, w_get))
 }
 
@@ -2830,13 +2739,8 @@ unsafe fn nondatadescr_instance_get_fast_path(
     let roots = pyre_object::gc_roots::push_roots();
     let type_at = roots.pin_roots(&[w_type]);
     if unsafe { crate::baseobjspace::getattribute_if_not_from_object(roots.get(type_at)) }.is_some()
-        || unsafe {
-            crate::baseobjspace::lookup_in_type_where(
-                roots.get(type_at),
-                "__getattr__",
-            )
-        }
-        .is_some()
+        || unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(type_at), "__getattr__") }
+            .is_some()
     {
         return None;
     }
@@ -2865,9 +2769,7 @@ unsafe fn nondatadescr_instance_get_fast_path(
     {
         return None;
     }
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(roots.get(cell_at), name)
-    }?;
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(cell_at), name) }?;
     let descr_at = roots.pin_roots(&[roots.get(cell_at), roots.get(cell_at + 1), w_descr]);
     // Data descriptors ignore the instance dict and have their own inline.
     if unsafe { crate::baseobjspace::is_data_descr(roots.get(descr_at + 2)) } {
@@ -2911,13 +2813,8 @@ unsafe fn nondatadescr_type_get_fast_path(
     let meta_at = roots.pin_roots(&[roots.get(obj_at), metatype]);
     // `descr_getattribute` raises into the metaclass `__getattr__`. This
     // sub-walk has no fallback frame for that hook.
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            roots.get(meta_at + 1),
-            "__getattr__",
-        )
-    }
-    .is_some()
+    if unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(meta_at + 1), "__getattr__") }
+        .is_some()
     {
         return None;
     }
@@ -2927,9 +2824,9 @@ unsafe fn nondatadescr_type_get_fast_path(
     }
     // typeobject.py `W_TypeObject.descr_getattribute`: a metatype data
     // descriptor preempts the class MRO. `__name__` is that case.
-    if let Some(descr) = unsafe {
-        crate::baseobjspace::lookup_in_type_where(roots.get(meta_at + 1), name)
-    } {
+    if let Some(descr) =
+        unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(meta_at + 1), name) }
+    {
         let gate = roots.pin_roots(&[roots.get(meta_at), descr]);
         if unsafe { crate::baseobjspace::is_data_descr(roots.get(gate + 1)) } {
             return None;
@@ -2953,9 +2850,7 @@ unsafe fn nondatadescr_type_get_fast_path(
     {
         return None;
     }
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(roots.get(cell_at), name)
-    }?;
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(cell_at), name) }?;
     let descr_at = roots.pin_roots(&[roots.get(cell_at), roots.get(cell_at + 1), w_descr]);
     if unsafe { crate::baseobjspace::is_data_descr(roots.get(descr_at + 2)) } {
         return None;
@@ -3039,12 +2934,7 @@ pub unsafe fn load_attr_unboxed_fast_path(
         return None;
     }
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    };
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
     // mapdict.py `if attrkind != INVALID:`.
     if attrkind == INVALID {
@@ -3126,12 +3016,7 @@ pub unsafe fn store_attr_unboxed_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    };
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
     if attrkind == INVALID {
         return None;
@@ -3201,12 +3086,7 @@ pub unsafe fn store_attr_boxed_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    };
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
     if attrkind == INVALID {
         return None;
@@ -3322,12 +3202,7 @@ pub unsafe fn store_attr_add_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            name,
-        )
-    };
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
     if attrkind == INVALID {
         return None;
@@ -3626,8 +3501,6 @@ unsafe fn store_attr_slowpath(
     mut w_value: PyObjectRef,
     entry: Option<MapdictCacheEntry>,
 ) -> Result<(), PyError> {
-    // mapdict.py:1590 `w_name = pycode.co_names_w[nameindex]`.
-    let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, name) };
     // `object.__class__` is a getset data descriptor in PyPy, so `_classify_attr`
     // (classify_attr) marks it INVALID and the store falls through to
     // `space.setattr` (mapdict.py) — the assignment re-roots the instance
@@ -3638,7 +3511,7 @@ unsafe fn store_attr_slowpath(
     // that special-case instead of being mis-stored as an ordinary instance-dict
     // attribute (which leaves the real type unchanged).
     if name == "__class__" {
-        return crate::baseobjspace::setattr(w_obj, w_name, w_value).map(|_| ());
+        return crate::baseobjspace::setattr_str(w_obj, name, w_value).map(|_| ());
     }
     // mapdict.py:1591 `if map is not None:`.
     if !map.is_null() {
@@ -3711,7 +3584,7 @@ unsafe fn store_attr_slowpath(
         // mapdict.py:1612-1614 — a custom `__setattr__` handles the store. pyre
         // re-dispatches through `space.setattr` (no separate helper).
         if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
-            return crate::baseobjspace::setattr(w_obj, w_name, w_value).map(|_| ());
+            return crate::baseobjspace::setattr_str(w_obj, name, w_value).map(|_| ());
         }
         // mapdict.py:1616 `if version_tag is not None:` (0 = None).
         if version_tag != 0 {
@@ -3770,7 +3643,7 @@ unsafe fn store_attr_slowpath(
                         w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
                         w_value = pyre_object::gc_roots::shadow_stack_get(base + 3);
                         if !written {
-                            return crate::baseobjspace::setattr(w_obj, w_name, w_value)
+                            return crate::baseobjspace::setattr_str(w_obj, name, w_value)
                                 .map(|_| ());
                         }
                         // mapdict.py:1630-1631 — fill only when there is no custom
@@ -3842,7 +3715,7 @@ unsafe fn store_attr_slowpath(
                             w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
                             w_value = pyre_object::gc_roots::shadow_stack_get(base + 3);
                             if mapnew.is_null() {
-                                return crate::baseobjspace::setattr(w_obj, w_name, w_value)
+                                return crate::baseobjspace::setattr_str(w_obj, name, w_value)
                                     .map(|_| ());
                             }
                             // mapdict.py:1642-1648 — fill only when no attribute
@@ -3875,7 +3748,7 @@ unsafe fn store_attr_slowpath(
         }
     }
     // mapdict.py `space.setattr(w_obj, w_name, w_value)`.
-    crate::baseobjspace::setattr(w_obj, w_name, w_value).map(|_| ())
+    crate::baseobjspace::setattr_str(w_obj, name, w_value).map(|_| ())
 }
 
 // ── obj storage protocol (mapdict.py MapdictStorageMixin) ──────

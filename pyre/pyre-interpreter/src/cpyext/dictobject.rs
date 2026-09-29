@@ -621,14 +621,8 @@ fn iterates_as_dict(object: PyObjectRef) -> bool {
     let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
     unsafe {
         match (
-            crate::baseobjspace::lookup_in_type(
-                own_type.as_ptr(),
-                "__iter__",
-            ),
-            crate::baseobjspace::lookup_in_type(
-                dict_type,
-                "__iter__",
-            ),
+            crate::baseobjspace::lookup_in_type(own_type.as_ptr(), "__iter__"),
+            crate::baseobjspace::lookup_in_type(dict_type, "__iter__"),
         ) {
             (Some(own), Some(canonical)) => std::ptr::eq(own, canonical),
             _ => true,

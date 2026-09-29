@@ -237,6 +237,19 @@ CHARON_CORE_INCLUDE = [
     "--include",
     "core::convert::_::from",
 ]
+# `llmemory.GCREF` is `Ptr(GcOpaqueType)`. The gckind declaration
+# `harvest_declared_gc_facts` reads is `impl GcType for GCREFOpaque`
+# in majit-gc (`header.rs`). Interpreter LLBC otherwise carries that
+# type as Opaque without the impl. Charon matcher `{impl Trait for _}`
+# is the shape `--include` documents for
+# `core::convert::{impl core::convert::Into<_> for _}`. `--start-from
+# crate` stays so this extra start does not replace the crate walk.
+CHARON_GCTYPE_IMPL_START = [
+    "--start-from",
+    "crate",
+    "--start-from-if-exists",
+    "{impl majit_gc::header::GcType for _}",
+]
 CHARON_ARGS = [
     "--hide-marker-traits",
     *CHARON_BODY_SHAPE_ARGS,
@@ -252,6 +265,7 @@ CHARON_ARGS = [
     "--include",
     "rustpython_compiler_core::bytecode::_",
     *CHARON_CORE_INCLUDE,
+    *CHARON_GCTYPE_IMPL_START,
 ]
 
 
@@ -318,6 +332,19 @@ def interpreter_charon_args(crate_dir: Path) -> list[str]:
         "crate::module",
         "--include",
         "crate::module::_",
+        # `Constants` and `CodeUnits` are included so the `CodeObject`
+        # field types (`constants`, `instructions`) are declared structs
+        # with Charon layouts, not Opaque. `ConstantData` is the item
+        # type of `Constants`' `Box<[C]>`: `getarraysubstruct` needs
+        # Charon's sizeof for that raw items region. `bytecode::_` in
+        # CHARON_ARGS translates reached bodies including CO_FAST_*;
+        # these named types still need a layout even when unreached.
+        "--include",
+        "rustpython_compiler_core::bytecode::Constants",
+        "--include",
+        "rustpython_compiler_core::bytecode::CodeUnits",
+        "--include",
+        "rustpython_compiler_core::bytecode::ConstantData",
         "--start-from",
         "crate",
     ]
@@ -337,7 +364,7 @@ SPECS: dict[str, CrateSpec] = {
             "majit/charon-corpus/Cargo.toml",
             "majit/charon-corpus/src/",
         ],
-        charon_args=CHARON_BODY_SHAPE_ARGS,
+        charon_args=[*CHARON_BODY_SHAPE_ARGS, *CHARON_GCTYPE_IMPL_START],
         # A reader fixture, not a build input: nothing consumes its layouts
         # for a cross target.
         layout_targets=(),

@@ -314,23 +314,6 @@ pub(crate) enum AggregateShape {
     Ctor(AggregateCtor),
 }
 
-/// Unsuffixed `core::ops::range::{leaf}` aggregate. Accepts both the
-/// historical `["core","ops","range"]` + `Range<T>` split and the class
-/// identity split `["core"]` + `ops::range::Range<T>`.
-pub(in crate::front::mir) fn is_core_ops_range_adt_ctor(
-    owner_path: &[String],
-    ctor_name: &str,
-    leaf: &str,
-) -> bool {
-    let joined = if owner_path.is_empty() {
-        ctor_name.to_string()
-    } else {
-        format!("{}::{ctor_name}", owner_path.join("::"))
-    };
-    let base = joined.split_once('<').map_or(joined.as_str(), |(b, _)| b);
-    base == format!("core::ops::range::{leaf}")
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregateCtor {
     pub(in crate::front::mir) target: CallTarget,
@@ -340,6 +323,12 @@ pub(crate) struct AggregateCtor {
     pub(in crate::front::mir) ctor_name: String,
     /// One row per operand.
     pub(in crate::front::mir) fields: Vec<AggregateField>,
+    /// The destination is a by-value raw struct
+    /// (`tyref_is_raw_struct_value`). The annotator result is `SomePtr`
+    /// (`lltype.malloc(T, flavor='raw')`); `history.py` `getkind` `'int'`
+    /// is the JIT kind (`get_type_flag`). `raw` selects that malloc
+    /// flavor so `rewrite_op_malloc` does not emit `new(GcStruct)`.
+    pub(in crate::front::mir) raw: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -380,6 +369,15 @@ pub(in crate::front::mir) struct AggregateField {
     /// Declaring class of a marked exception-class field
     /// (`ClassDef.get_owner`). `None` keeps the constructor's result class.
     pub(in crate::front::mir) owner_root: Option<String>,
+    /// Register kind of this operand (`history.py` `getkind` of the
+    /// item lltype). `rewrite_op_setfield` and
+    /// `coerce_gcref_null_store` take the kind from the field
+    /// (`CONST_NULL` vs `CONST_0`), not from a host `0`.
+    pub(in crate::front::mir) ty: ValueType,
+    /// Field lltype is a raw-flavored `Ptr` (`rclass.py getgcflavor`).
+    /// Dual-gate stamps that `Ptr`; painting `Signed` first makes the
+    /// annotator `SomeInteger`.
+    pub(in crate::front::mir) skip_signed_paint: bool,
 }
 
 /// Owner of a constructor `setfield`.
@@ -402,6 +400,25 @@ fn ctor_field_write_owner(
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
 /// values `args`, returning the constructed value.
+
+pub(in crate::front::mir) fn aggregate_ctor_result_bank(
+    ctor: &AggregateCtor,
+) -> (ValueType, crate::model::ConcreteType, Option<bool>) {
+    if ctor.raw {
+        (
+            ValueType::Ref(None),
+            crate::model::ConcreteType::Unknown,
+            Some(false),
+        )
+    } else {
+        (
+            ValueType::Ref(Some(ctor.result_owner.clone())),
+            crate::model::ConcreteType::Unknown,
+            None,
+        )
+    }
+}
+
 pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -412,13 +429,14 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
     if pair_lens.iter().all(Option::is_none) {
         return emit_aggregate_ctor(graph, block, ctor, args);
     }
-    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let (result_ty, concrete, owner_declared_gc) = aggregate_ctor_result_bank(ctor);
+    let res = graph.alloc_value_var_with_type(concrete);
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::Call {
             target: ctor.target.clone(),
             args: Vec::new(),
-            result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+            result_ty,
         },
     });
     for (i, field) in ctor.fields.iter().enumerate() {
@@ -497,13 +515,15 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
             let len_name = pair_len_field_name(&field.name);
             let (field_owner, field_owner_id) = ctor_field_write_owner(ctor, field);
             for (name, value) in [(field.name.clone(), value.clone()), (len_name, len.clone())] {
+                let value = field_store_value(value, &ValueType::Unsigned);
                 graph.block_mut(block).operations.push(SpaceOperation {
                     result: None,
                     kind: OpKind::FieldWrite {
                         base: res.clone(),
                         field: crate::model::FieldDescriptor::new(name, Some(field_owner.clone()))
                             .with_owner_id(field_owner_id)
-                            .with_base_is_deref(false),
+                            .with_base_is_deref(false)
+                            .with_owner_declared_gc(owner_declared_gc),
                         value: crate::model::LinkArg::Value(value),
                         ty: ValueType::Unsigned,
                     },
@@ -513,6 +533,11 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
         }
         let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
         let (field_owner, field_owner_id) = ctor_field_write_owner(ctor, field);
+        let value = if field.skip_signed_paint {
+            value
+        } else {
+            field_store_value(value, &ty)
+        };
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -527,7 +552,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
-                    owner_declared_gc: None,
+                    owner_declared_gc,
                     host_index: None,
                     scalar_word: None,
                 },
@@ -545,13 +570,14 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
     ctor: &AggregateCtor,
     args: &[Variable],
 ) -> Result<Variable, LowerError> {
-    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let (result_ty, concrete, owner_declared_gc) = aggregate_ctor_result_bank(ctor);
+    let res = graph.alloc_value_var_with_type(concrete);
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::Call {
             target: ctor.target.clone(),
             args: Vec::new(),
-            result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+            result_ty,
         },
     });
     for (field, value) in ctor.fields.iter().zip(args) {
@@ -560,6 +586,11 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
         }
         let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
         let (field_owner, field_owner_id) = ctor_field_write_owner(ctor, field);
+        let value = if field.skip_signed_paint {
+            value
+        } else {
+            field_store_value(value, &ty)
+        };
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -574,7 +605,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
-                    owner_declared_gc: None,
+                    owner_declared_gc,
                     host_index: None,
                     scalar_word: None,
                 },
@@ -647,7 +678,7 @@ fn ctor_ccharp_field_store(
     };
     Ok((
         stored,
-        positional_ctor_field_value_type(&ctor.result_owner, &field.name),
+        positional_ctor_field_value_type(&ctor.result_owner, &field.name, field.ty.clone()),
     ))
 }
 
@@ -674,25 +705,45 @@ fn ctor_field_is_raw_u8(ctor: &AggregateCtor, field: &AggregateField) -> bool {
 
 /// `TupleRepr` field bank of a positional ctor write (`rtuple.py`).
 ///
-/// [`positional_shape_metadata`] intern's `__pos_N` from the shape
-/// spelling; a raw `*mut usize` item is `int` (`history.py` `getkind`).
-/// The write has to use that same bank so setattr and getattr agree.
+/// The write kind is the item lltype (`items_r[i].lowleveltype`,
+/// [`tyref_aggregate_field_value_type`]). A spelling table `_ => Ref`
+/// overlay would paint a raw `Ptr` (`*mut usize`) as `Ref` while the
+/// stored word is Signed.
 pub(in crate::front::mir) fn positional_ctor_field_value_type(
     result_owner: &str,
     field_name: &str,
+    fallback: ValueType,
 ) -> ValueType {
     crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
         result_owner,
         field_name,
-        positional_shape_metadata(result_owner)
-            .and_then(|(_, attrs)| {
-                attrs
-                    .into_iter()
-                    .find(|(name, _)| name == field_name)
-                    .map(|(_, vt)| vt)
-            })
-            .unwrap_or(ValueType::Ref(None)),
+        fallback,
     )
+}
+
+/// Intern `__pos_N` FORCE from the constructor's item TyRef kinds
+/// (`rtuple.py` `TupleRepr` `items_r[i].lowleveltype`). Shaped tuples
+/// have no TypeDecl harvest; `_init_classdef` would otherwise seed
+/// `positional_shape_forced_attributes` from the spelling table.
+pub(in crate::front::mir) fn intern_positional_ctor_field_kinds<'a, I>(
+    result_owner: &str,
+    fields: I,
+) where
+    I: IntoIterator<Item = (&'a str, &'a ValueType)>,
+{
+    if !majit_ir::descr::is_shaped_tuple_name(result_owner)
+        && !majit_ir::descr::is_shaped_array_name(result_owner)
+    {
+        return;
+    }
+    let kinds: Vec<(String, ValueType)> = fields
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty.clone()))
+        .collect();
+    if kinds.is_empty() {
+        return;
+    }
+    crate::annotator::classdesc::register_struct_fields_with_layout(result_owner, &kinds, None);
 }
 
 /// Build `shape` in `block` from operand values already in hand — a call of

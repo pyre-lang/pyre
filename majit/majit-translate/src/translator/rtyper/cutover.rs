@@ -50,7 +50,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
+use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete_for_legacy};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
     AlwaysInline, Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, GraphFunc,
@@ -5878,12 +5878,14 @@ fn drive_lifted_subject(
 
     if do_rtype {
         select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates, Some(&rtyper))?;
+        let harvest = call_registry.bookkeeper().raw_alloc_flavor_structs();
         reconcile_projection_aliases(
             legacy,
             &mut value_to_var,
             &mut constant_hlvalues,
             &mut constant_concretetypes,
             Some(&rtyper),
+            &harvest,
         );
         map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
     }
@@ -9165,16 +9167,19 @@ fn lltype_for_named_ref(
 /// `real=Unknown` against the legacy walker's `GcRef` — the legacy
 /// walker types the same slot from this identical `result_ty` at
 /// `legacy_resolve::infer_concrete_from_op` (`OpKind::Call { result_ty }
-/// => valuetype_to_concrete(result_ty)`).
+/// => valuetype_to_concrete_for_legacy(result_ty)`), plus its final
+/// kind backfill.
 ///
 /// A twin with an annotator binding is typed through
 /// `RPythonTyper.setconcretetype` (`bindingrepr` → `getrepr` →
 /// `SomeInstance.rtyper_makerepr` → `getinstancerepr`). Only a
 /// variable with **no** binding may use the front-end `result_ty`:
 /// - `Ref(Some(name))`: `project_struct_field_type(name)` then
-///   `getinstancerepr` when that is `SomeInstance(classdef)`. An alias
-///   (`PyObjectRef`) resolves to the same classdef as the pointee.
-///   No classdef → `llmemory.GCREF`, never `OBJECTPTR`.
+///   `getinstancerepr` when that is `SomeInstance(classdef)`.
+///   `rclass.py getgcflavor` reads `_alloc_flavor_` off that classdesc,
+///   so a harvested raw owner is `Ptr(raw)` (`history.getkind` Signed).
+///   An alias (`PyObjectRef`) resolves to the same classdef as the
+///   pointee. No classdef → `llmemory.GCREF`, never `OBJECTPTR`.
 /// - `Ref(None)` is `llmemory.GCREF` (`Ptr(Opaque)`).
 ///
 /// One equally erased scalar shape is admitted, but only at the producer
@@ -9209,7 +9214,9 @@ fn backfill_untyped_call_results(
     legacy: &LegacyGraph,
     value_to_var: &LegacyToTyped,
     rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
+    raw_alloc_flavor_structs: &HashSet<String>,
 ) {
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
     for block in &legacy.blocks {
         for op in &block.operations {
             let crate::model::OpKind::Call {
@@ -9249,7 +9256,8 @@ fn backfill_untyped_call_results(
                 }
                 continue;
             }
-            let declared_kind = valuetype_to_concrete(result_ty);
+            let declared_kind =
+                valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs);
             let closure_scalar_call = matches!(
                 target,
                 crate::model::CallTarget::Method {
@@ -9265,9 +9273,7 @@ fn backfill_untyped_call_results(
                 crate::model::ValueType::Ref(Some(name)) if !name.is_empty() => {
                     Some(lltype_for_named_ref(rtyper, name))
                 }
-                crate::model::ValueType::Ref(None) => {
-                    Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone())
-                }
+                crate::model::ValueType::Ref(None) => Some(GCREF.clone()),
                 crate::model::ValueType::Str | crate::model::ValueType::StringBuilder => {
                     valuetype_to_lltype(result_ty)
                 }
@@ -9275,6 +9281,7 @@ fn backfill_untyped_call_results(
                     ConcreteType::Signed | ConcreteType::Float if closure_scalar_call => {
                         crate::model::concrete_to_canonical_lltype(declared_kind)
                     }
+                    ConcreteType::GcRef => Some(GCREF.clone()),
                     _ => None,
                 },
             };
@@ -9357,8 +9364,9 @@ fn reconcile_projection_aliases(
     constants: &mut HashMap<Variable, Hlvalue>,
     constant_types: &mut HashMap<Variable, LowLevelType>,
     rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
+    raw_alloc_flavor_structs: &HashSet<String>,
 ) {
-    backfill_untyped_call_results(legacy, value_to_var, rtyper);
+    backfill_untyped_call_results(legacy, value_to_var, rtyper, raw_alloc_flavor_structs);
     loop {
         let hint_changed = reconcile_elided_hint_results(legacy, value_to_var);
         let phi_changed =
@@ -9536,6 +9544,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
         &mut constant_values,
         &mut constants,
         rtyper.as_ref(),
+        &call_registry.bookkeeper().raw_alloc_flavor_structs(),
     );
     map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
     // Phi reconcile may alias an unfollowed Ok-arm Void producer onto a
@@ -10530,14 +10539,12 @@ mod tests {
                 crate::model::SpaceOperation {
                     result: Some(v_fn.clone()),
                     kind: crate::model::OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath {
-                            segments: vec![
-                                crate::model::FN_CONST_HEAD.into(),
-                                "dummy_compute".into(),
-                            ],
-                            fun_decl_id: None,
-                            specialization: crate::parse::GraphSpecialization::Regular,
-                        },
+                        // Dummy fn-const: no FunDecl, so
+                        // `call_site_generic_rust_args` has no types to stamp.
+                        target: crate::model::CallTarget::function_path([
+                            crate::model::FN_CONST_HEAD,
+                            "dummy_compute",
+                        ]),
                         args: vec![],
                         result_ty: ValueType::Int,
                     },
@@ -10545,15 +10552,13 @@ mod tests {
                 crate::model::SpaceOperation {
                     result: Some(v_out.clone()),
                     kind: crate::model::OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath {
-                            segments: vec![
-                                "majit_rlib".into(),
-                                "jit".into(),
-                                "conditional_call_elidable1".into(),
-                            ],
-                            fun_decl_id: None,
-                            specialization: crate::parse::GraphSpecialization::Regular,
-                        },
+                        // HOST_ENV builtin: not a generic Rust item.
+                        // `attach_call_generic_instance` needs a FunDecl.
+                        target: crate::model::CallTarget::function_path([
+                            "majit_rlib",
+                            "jit",
+                            "conditional_call_elidable1",
+                        ]),
                         args: crate::model::call_args(vec![
                             v_value.clone(),
                             v_fn.clone(),
@@ -10957,11 +10962,7 @@ mod tests {
             crate::model::SpaceOperation {
                 result: None,
                 kind: crate::model::OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath {
-                        segments: vec!["no_such".into(), "callee".into()],
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
+                    target: crate::model::CallTarget::function_path(["no_such", "callee"]),
                     args: Vec::new(),
                     result_ty: ValueType::Void,
                 },
@@ -15758,6 +15759,7 @@ mod tests {
             &mut HashMap::new(),
             &mut HashMap::new(),
             None,
+            &HashSet::new(),
         );
         for alias in aliases {
             assert_eq!(variables.get(&alias), Some(&typed_source));
@@ -15966,7 +15968,7 @@ mod tests {
                     ),
                     result_ty.clone(),
                 );
-                backfill_untyped_call_results(&graph, &value_to_var, None);
+                backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
                 assert_eq!(
                     kind_of_in(&value_to_var, &result),
                     expected,
@@ -15982,11 +15984,12 @@ mod tests {
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["ordinary_scalar_call".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Int,
         );
-        backfill_untyped_call_results(&graph, &value_to_var, None);
+        backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
         assert_eq!(
             kind_of_in(&value_to_var, &result),
             ConcreteType::Void,
@@ -16002,6 +16005,7 @@ mod tests {
                 crate::model::CallTarget::FunctionPath {
                     segments: vec!["erased_gcref_call".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 ValueType::Ref(None),
@@ -16012,7 +16016,7 @@ mod tests {
                     .expect("twin")
                     .set_concretetype(None);
             }
-            backfill_untyped_call_results(&graph, &value_to_var, None);
+            backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
             assert_eq!(
                 value_to_var.get(&result).expect("twin").concretetype(),
                 Some(GCREF.clone()),
@@ -16028,6 +16032,7 @@ mod tests {
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["erased_named_ref_call".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Ref(Some("NotARegisteredClass".to_string())),
@@ -16036,7 +16041,7 @@ mod tests {
             .get(&result)
             .expect("twin")
             .set_concretetype(None);
-        backfill_untyped_call_results(&graph, &value_to_var, None);
+        backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
         assert_eq!(
             value_to_var.get(&result).expect("twin").concretetype(),
             Some(GCREF.clone()),
@@ -16068,6 +16073,7 @@ mod tests {
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["erased_function_ref".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Ref(Some("Function".to_string())),
@@ -16076,7 +16082,7 @@ mod tests {
             .get(&result)
             .expect("twin")
             .set_concretetype(None);
-        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
         let expected =
             getinstancerepr(&rtyper, Some(&function_cd), Flavor::Gc).expect("getinstancerepr");
         Repr::setup(expected.as_ref()).expect("setup");
@@ -16124,6 +16130,7 @@ mod tests {
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["erased_object_ref".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Ref(Some("PyObjectRef".to_string())),
@@ -16132,7 +16139,7 @@ mod tests {
             .get(&result)
             .expect("twin")
             .set_concretetype(None);
-        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
         let expected =
             getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
         Repr::setup(expected.as_ref()).expect("setup");
@@ -16212,6 +16219,80 @@ mod tests {
             layout_result.concretetype(),
             Some(expected.lowleveltype().clone()),
             "CAST dest intern uses the ByteStr leaf when result_ty is the layout owner"
+        );
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_stamps_flavor_raw_ref_as_signed() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "bytecode::CodeObject".to_string(),
+            vec![("co_name".to_string(), "PyObjectRef".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk.clone());
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("bytecode::CodeObject")
+            .expect("CodeObject classdef");
+        classdef
+            .borrow()
+            .classdesc
+            .borrow()
+            .pyobj
+            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        let (_, rtyper) = registry.ensure_session().expect("session");
+
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["w_code_get_ptr".to_string()],
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(Some("bytecode::CodeObject".to_string())),
+        );
+        value_to_var
+            .get(&result)
+            .expect("twin")
+            .set_concretetype(None);
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
+        let expected =
+            getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(expected.as_ref()).expect("setup");
+        assert_eq!(
+            kind_of_in(&value_to_var, &result),
+            ConcreteType::Signed,
+            "rclass.py getgcflavor of a raw *const T is int"
+        );
+        assert_eq!(
+            value_to_var.get(&result).expect("twin").concretetype(),
+            Some(expected.lowleveltype().clone()),
+            "registered raw named Ref is getinstancerepr, history.getkind Signed"
+        );
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_gc_ref_without_harvest_stays_gcref() {
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["w_code_get_ptr".to_string()],
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(Some("bytecode::CodeObject".to_string())),
+        );
+        backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
+        assert_eq!(
+            kind_of_in(&value_to_var, &result),
+            ConcreteType::GcRef,
+            "a Ref with no harvest key stays the GCREF backfill"
         );
     }
 
@@ -17097,6 +17178,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
             }],
             exitswitch: None,
@@ -17168,6 +17250,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["side_effect".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![base.clone(), index.clone()]),
@@ -17466,6 +17549,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["consume".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![pay.clone()]),
@@ -17545,6 +17629,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["consume_carrier".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![consumed_carrier.clone()]),
@@ -18179,6 +18264,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
             };
             let (exitswitch, exits) = if raises {
@@ -18254,6 +18340,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["consume".into()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![threaded.clone()]),
@@ -18674,6 +18761,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: hint_path.split("::").map(str::to_string).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![length.clone()]),
@@ -18708,6 +18796,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: free_path.split("::").map(str::to_string).collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![header.clone()]),
@@ -19421,6 +19510,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
@@ -19653,6 +19743,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: callee_segments.iter().map(|s| s.to_string()).collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![arg]),
@@ -19829,6 +19920,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![v1_var.clone(), v2_var.clone()]),
@@ -19878,6 +19970,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![foo_v10_var.clone(), foo_v11_var.clone()]),
@@ -21508,8 +21601,8 @@ mod tests {
         };
         assert_eq!(
             vec.item_kind(),
-            Some(majit_ir::rvec::VecItemKind::Ref),
-            "Vec<*mut u8> items are managed references"
+            Some(majit_ir::rvec::VecItemKind::Int),
+            "Vec<*mut u8> items are CCHARP / Address words (`history.py` getkind of a primitive pointer is int)"
         );
     }
 
@@ -23120,7 +23213,7 @@ mod tests {
             ("Vec<isize>", LowLevelType::Signed),
             ("Vec<usize>", LowLevelType::Unsigned),
             ("Vec<f64>", LowLevelType::Float),
-            ("Vec<*mut u8>", (*GCREF).clone()),
+            ("Vec<GCREF>", (*GCREF).clone()),
         ] {
             let header = rust_vec_lltype(&item);
             let key = to_vec_registry_key(&bare_segs, Some(&header)).expect("item key");
@@ -23224,7 +23317,7 @@ mod tests {
         );
 
         let (graph, result) =
-            slice_to_vec_call_graph(Some(rust_vec_lltype(&*GCREF)), Some("Vec<*mut u8>"));
+            slice_to_vec_call_graph(Some(rust_vec_lltype(&*GCREF)), Some("Vec<GCREF>"));
         let (map, _) =
             specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
                 .expect("one-word to_vec annotates");

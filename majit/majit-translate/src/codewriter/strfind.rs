@@ -1789,6 +1789,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         )
     }
 

@@ -587,6 +587,7 @@ pub fn size_descr_same_struct_layout(
     cached_offsets == incoming
 }
 
+
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
 /// `module_path` before hashing.  PyPy/RPython has no notion of a crate
 /// boundary — `lltype.Struct` identity is keyed on the Python module
@@ -11702,6 +11703,7 @@ mod tests {
             "the stamp is a collector id, not an analyzer counter that aliases W_BufferedRWPairUser"
         );
     }
+
 
     /// A struct-array descr and its interior field descrs point at each
     /// other (the "CYCLE, accepted" row of the Arc cycle audit at the top

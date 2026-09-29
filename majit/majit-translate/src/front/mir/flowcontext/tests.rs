@@ -23,10 +23,10 @@ use crate::front::mir::tests::{
     empty_llbc, empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops,
     i64_field, ident_path, interior_bb, interior_caller, interior_i64, interior_local,
     interior_meta, interior_opaque, interior_raw_mut, interior_return, interior_usize,
-    leftover_fmt_message_paths, llbc_with_types, lower_object_fn, named_adt, ok_ctor_shape,
-    option_adt_node, option_enum, option_int_arg, option_ok_or_else_site, push_fn_const,
-    replace_struct_ctors, result_adt_node, result_enum, rows, same_as_count, some_ctor_ops,
-    some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
+    leftover_fmt_message_paths, llbc_with_types, llbc_with_types_and_traits, lower_object_fn,
+    named_adt, ok_ctor_shape, option_adt_node, option_enum, option_int_arg, option_ok_or_else_site,
+    push_fn_const, replace_struct_ctors, result_adt_node, result_enum, rows, same_as_count,
+    some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
     type_decl_struct, tyref_to_attr_value_type, window_call_leafs, window_empty_generics,
     window_graph_ops, window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun,
     window_place, window_shared_slice, window_slice, window_span, window_u8,
@@ -3895,6 +3895,7 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
                     "new_display".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
@@ -3964,6 +3965,7 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
                     "new".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr.clone(), args_arr]),
@@ -4148,6 +4150,7 @@ fn single_arg_display_fmt_fixture_spill(
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![spilled.clone()]),
@@ -4217,6 +4220,7 @@ fn single_arg_display_fmt_fixture_spill(
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
@@ -4239,6 +4243,7 @@ fn single_arg_display_fmt_fixture_spill(
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
@@ -4255,10 +4260,164 @@ fn single_arg_display_fmt_fixture_spill(
 #[test]
 fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
     use super::collapse_fmt_chains;
-    use crate::model::{CallTarget, OpKind};
+    use crate::flowspace::model::Variable;
+    use crate::model::{
+        CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+        ValueType,
+    };
 
-    let (mut graph, b0, bp, bf, ctx, arg_in, fmt_args_in, formatted) =
-        single_arg_display_fmt_fixture(None);
+    // Reconstruct the full `f(format!("hi{}", ctx))` shape charon
+    // lowers across three blocks: B0 builds `new_display(&ctx)` off the
+    // arg Tuple, Bp builds the args/pieces arrays + `Arguments::new`,
+    // Bf calls `alloc::fmt::format`, then returns the String.
+    let mut graph = FunctionGraph::new("fmt_collapse");
+    let b0 = graph.create_block();
+    let bp = graph.create_block();
+    let bf = graph.create_block();
+    let bret = graph.create_block();
+
+    // ── B0: Argument::new_display(&ctx) via the arg Tuple ──
+    let ctx = Variable::new();
+    graph.block_mut(b0).inputargs = vec![ctx.clone()];
+    let tuple = Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(tuple.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Tuple"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Tuple".to_string())),
+        },
+    });
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: tuple.clone(),
+            field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            value: LinkArg::Value(ctx.clone()),
+            ty: ValueType::Ref(None),
+        },
+    });
+    let arg_ref = Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(arg_ref.clone()),
+        kind: OpKind::FieldRead {
+            base: tuple,
+            field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            ty: ValueType::Ref(None),
+            pure: false,
+        },
+    });
+    let new_display = Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(new_display.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["fmt", "rt", "Argument", "new_display"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![arg_ref]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let arg_in = Variable::new();
+    graph.block_mut(bp).inputargs = vec![arg_in.clone()];
+    graph.block_mut(b0).exits =
+        vec![Link::from_variables(&graph, vec![new_display], bp, None).with_prevblock(b0)];
+
+    // ── Bp: args array, pieces array, Arguments::new ──
+    let args_arr = Variable::new();
+    graph.block_mut(bp).operations.push(SpaceOperation {
+        result: Some(args_arr.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Array"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Array".to_string())),
+        },
+    });
+    graph.block_mut(bp).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: args_arr.clone(),
+            field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
+            value: LinkArg::Value(arg_in.clone()),
+            ty: ValueType::Ref(None),
+        },
+    });
+    let pieces_arr = Variable::new();
+    graph.block_mut(bp).operations.push(SpaceOperation {
+        result: Some(pieces_arr.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Array"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Array".to_string())),
+        },
+    });
+    for (i, byte) in [2i64, 104, 105, 0xC0, 0].iter().enumerate() {
+        let v = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::ConstInt(*byte),
+        });
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: pieces_arr.clone(),
+                field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                value: LinkArg::Value(v),
+                ty: ValueType::Int,
+            },
+        });
+    }
+    let fmt_args = Variable::new();
+    graph.block_mut(bp).operations.push(SpaceOperation {
+        result: Some(fmt_args.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["fmt", "Arguments", "new"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![pieces_arr, args_arr]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let fmt_args_in = Variable::new();
+    graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
+    graph.block_mut(bp).exits =
+        vec![Link::from_variables(&graph, vec![fmt_args], bf, None).with_prevblock(bp)];
+
+    // ── Bf: alloc::fmt::format(args) → String ──
+    let formatted = Variable::new();
+    graph.block_mut(bf).operations.push(SpaceOperation {
+        result: Some(formatted.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["alloc", "fmt", "format"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![fmt_args_in.clone()]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let ret = Variable::new();
+    graph.block_mut(bret).inputargs = vec![ret];
+    graph.block_mut(bf).exits =
+        vec![Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf)];
+
     collapse_fmt_chains(&mut graph);
 
     // Bf's `alloc::fmt::format` is replaced by the orthodox
@@ -4382,6 +4541,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
@@ -4446,6 +4606,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
@@ -4467,6 +4628,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
@@ -5213,6 +5375,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
@@ -5277,6 +5440,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
@@ -5298,6 +5462,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
@@ -5420,6 +5585,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
@@ -5484,6 +5650,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
@@ -5505,6 +5672,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
@@ -5807,6 +5975,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
@@ -5871,6 +6040,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
@@ -5892,6 +6062,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
@@ -6005,6 +6176,7 @@ fn collapse_fmt_chains_multi_expands_two_arg_chain() {
     let fpath = |segs: &[&str]| CallTarget::FunctionPath {
         segments: segs.iter().map(|s| s.to_string()).collect(),
         fun_decl_id: None,
+        generic_rust_args: Vec::new(),
         specialization: crate::parse::GraphSpecialization::Regular,
     };
 
@@ -6286,6 +6458,7 @@ fn collapse_fmt_chains_multi_eliminates_cross_block_local_tuple() {
     let fpath = |segs: &[&str]| CallTarget::FunctionPath {
         segments: segs.iter().map(|s| s.to_string()).collect(),
         fun_decl_id: None,
+        generic_rust_args: Vec::new(),
         specialization: crate::parse::GraphSpecialization::Regular,
     };
 
@@ -11957,6 +12130,46 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
             .clone()
     };
 
+    let llbc = fixture_llbc();
+    let tomb = no_tombstoned_leaves();
+    let gc_struct_ids = std::collections::HashSet::new();
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let pointee = serde_json::json!({"RawPtr": [{"Adt": {"id": 7}}, "Mut"]});
+    let mut_ref = serde_json::json!({"Ref": ["Erased", pointee, "Mut"]});
+    let locals: majit_charon_reader::ullbc::Locals = serde_json::from_value(serde_json::json!({
+        "arg_count": 1,
+        "locals": [
+            {
+                "index": 0,
+                "name": null,
+                "span": span,
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}}
+            },
+            {"index": 1, "name": "slot", "span": span, "ty": mut_ref}
+        ]
+    }))
+    .unwrap();
+    let pointee_ty: TyRef = serde_json::from_value(pointee).unwrap();
+    let root = super::mut_ref_cell_root_of(
+        &pointee_ty,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        &std::collections::HashSet::<String>::new(),
+    )
+    .expect("raw GC pointer behind &mut is a cell");
+    let slot = |graph: &FunctionGraph| {
+        graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "slot"))
+            .expect("slot input")
+            .clone()
+    };
+
     let cells = super::gc_mut_ref_param_locals(
         &locals,
         &llbc,
@@ -11978,6 +12191,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
+        false,
     );
     let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
         panic!("slot op is an input");
@@ -12006,6 +12220,7 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
+        true,
     );
     let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
         panic!("slot op is an input");
@@ -13289,7 +13504,27 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         ],
         vec![interior_bb(vec![], interior_return())],
     );
-    let llbc = llbc_with_types(
+    let gctype_trait = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], true)
+    });
+    let gctype_self = serde_json::json!({
+        "Value": [gc_entries, {
+            "Adt": {
+                "id": gc_entries,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }]
+    });
+    let gctype_impl = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {"types": [gctype_self]}}
+    });
+    let llbc = llbc_with_types_and_traits(
         "pyre_object",
         vec![
             struct_decl(obj_ty, &["pyre_object", "pyobject", "PyObject"], vec![]),
@@ -13322,6 +13557,8 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
             ),
         ],
         vec![malloc, generic],
+        vec![gctype_trait],
+        vec![gctype_impl],
     );
     use crate::model::ValueType;
     let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();

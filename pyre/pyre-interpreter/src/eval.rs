@@ -307,11 +307,9 @@ impl Drop for FrameAnchor {
     }
 }
 
-/// Shadow-stack slot publication behind [`FrameAnchor`].  The slot ops live
-/// in `majit_gc`, which has no jitcode graphs, so a walked handler graph
-/// reaching them found only a symbolic path hash.  First-party
-/// `dont_look_inside` wrappers with word-sized signatures keep each op a
-/// bound residual the tracer can execute (`jit_trace_fnaddrs()` rows).
+/// Shadow-stack slot publication behind [`FrameAnchor`]. The translator
+/// erases these the way gctransform drops `push_roots` / `pop_roots`;
+/// the bodies remain for native execution.
 #[majit_macros::dont_look_inside]
 pub fn frame_anchor_push(frame: *mut PyFrame) -> usize {
     majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize))
@@ -321,16 +319,7 @@ pub fn frame_anchor_push(frame: *mut PyFrame) -> usize {
 /// between push and read leaves the forwarded address here.
 #[majit_macros::dont_look_inside]
 pub fn frame_anchor_live(depth: usize) -> *mut PyFrame {
-    // Interpret records `push` as the frame OpRef (the red vable), not
-    // the tracing-time slot index. Blackhole resume then hands that
-    // pointer to `live`. A slot index is always in range; a frame
-    // pointer is not — treat an out-of-range word as the frame.
-    // `interp_jit.py` has no shadow-stack slot.
-    if depth < majit_gc::shadow_stack::depth() {
-        majit_gc::shadow_stack::get(depth).0 as *mut PyFrame
-    } else {
-        depth as *mut PyFrame
-    }
+    majit_gc::shadow_stack::get(depth).0 as *mut PyFrame
 }
 
 /// Release the anchor's slot (and any deeper ones) on drop.
@@ -625,16 +614,15 @@ pub unsafe fn walk_enrolled_code_roots(
         visitor(&mut *(&mut code.w_filename as *mut PyObjectRef as *mut majit_ir::GcRef));
         // `PyCode._signature` is the host box from `make_signature`, freed
         // by `pycode_destructor`. It is not a GC reference.
-        // `PyCode.co_consts_w` is a GCREF to a `GcArray(OBJECTPTR)` whose
-        // own trace names the items. An item store barriers the array
-        // (`FixedObjectArray::set_ref`), so an old array holding a young
-        // item is in the remembered set.
+        // `PyCode.co_consts_w` and `co_names_w` are GCREFs to a
+        // `GcArray(OBJECTPTR)` whose own trace names the items
+        // (`pycode.py _immutable_fields_ co_consts_w[*]` / `co_names_w[*]`).
+        // An item store barriers the array (`FixedObjectArray::set_ref`), so
+        // an old array holding a young item is in the remembered set.
         visitor(
             &mut *(&mut code.co_consts_w as *mut *mut pyre_object::FixedObjectArray
                 as *mut majit_ir::GcRef),
         );
-        // `pycode.py _immutable_fields_ co_names_w[*]`. The array's own
-        // trace names the interned strings.
         visitor(
             &mut *(&mut code.co_names_w as *mut *mut pyre_object::FixedObjectArray
                 as *mut majit_ir::GcRef),
@@ -1869,8 +1857,19 @@ unsafe fn instantiate_raised_class(mut w_type: PyObjectRef) -> Result<PyObjectRe
     Ok(result)
 }
 
+/// Runtime-assigned GC type id. Stamped at the absolute tail of
+/// `pyre-jit::eval::build_gc` so no hardcoded / `#[pyre_class(type_id = N)]`
+/// id moves (`AllVirtuals` uses the same tail rule).
+pub static RAISE_CAUSE_GC_TYPE_ID: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+
 /// The `from` cause of a `raise X from Y`, after the class call, together with
 /// the wording owed if it turns out not to name an exception.
+///
+/// Both fields are GC references, so this is a `GcStruct` (`GcType`) allocated
+/// on the nursery. `Option<PyError>` is two words (`*mut PyObject` has no
+/// niche), so TypeInfo walks it with a custom trace.
+#[repr(C)]
 pub struct RaiseCause {
     /// The object `__cause__` receives.  Null when there is no cause.
     pub w_cause: PyObjectRef,
@@ -1883,7 +1882,85 @@ pub struct RaiseCause {
     /// cleared by the `pop`, and keeping the class and the answer alive across
     /// the raised value's own constructor would owe them both a root.  The
     /// formatting itself is on the error path only.
-    invalid: Option<PyError>,
+    pub invalid: Option<PyError>,
+}
+
+/// One-word GC handle to [`RaiseCause`]. `Option<RaiseCauseRef>` is a
+/// nullable word (`NonNull` niche).
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct RaiseCauseRef(std::ptr::NonNull<RaiseCause>);
+
+const _: () = assert!(std::mem::size_of::<Option<RaiseCauseRef>>() == std::mem::size_of::<usize>());
+
+impl RaiseCauseRef {
+    #[inline]
+    pub fn as_pyobject_ref(self) -> PyObjectRef {
+        self.0.as_ptr() as PyObjectRef
+    }
+
+    /// Rebuild a handle from a forwarded shadow-stack word.
+    ///
+    /// # Safety
+    /// `ptr` is a live [`RaiseCause`] payload, or null is not passed.
+    #[inline]
+    pub unsafe fn from_pyobject_ref(ptr: PyObjectRef) -> Self {
+        debug_assert!(!ptr.is_null());
+        Self(unsafe { std::ptr::NonNull::new_unchecked(ptr as *mut RaiseCause) })
+    }
+}
+
+impl std::ops::Deref for RaiseCauseRef {
+    type Target = RaiseCause;
+    fn deref(&self) -> &RaiseCause {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl pyre_object::lltype::GcType for RaiseCause {
+    fn type_id() -> u32 {
+        RAISE_CAUSE_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = std::mem::size_of::<RaiseCause>();
+}
+
+/// Visit `w_cause` and the `PyError` word inside `invalid`.
+///
+/// `Option<PyError>` is two words, so an offset list would walk the
+/// Option discriminant.
+pub unsafe fn raise_cause_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe {
+        let rc = obj_addr as *mut RaiseCause;
+        f(std::ptr::addr_of_mut!((*rc).w_cause) as *mut majit_ir::GcRef);
+        if let Some(err) = &mut (*rc).invalid {
+            f(std::ptr::addr_of_mut!(err.0) as *mut majit_ir::GcRef);
+        }
+    }
+}
+
+fn alloc_raise_cause(w_cause: PyObjectRef, invalid: Option<PyError>) -> RaiseCauseRef {
+    let invalid_word = invalid
+        .as_ref()
+        .map(|err| err.0)
+        .unwrap_or(pyre_object::PY_NULL);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cause_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_cause);
+    let invalid_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(invalid_word);
+    let ptr = pyre_object::lltype::malloc_typed_managed(RaiseCause {
+        w_cause: pyre_object::PY_NULL,
+        invalid: None,
+    });
+    unsafe {
+        (*ptr).w_cause = pyre_object::gc_roots::shadow_stack_get(cause_slot);
+        let inv = pyre_object::gc_roots::shadow_stack_get(invalid_slot);
+        if !inv.is_null() {
+            (*ptr).invalid = Some(PyError(inv));
+        }
+        pyre_object::gc_hook::try_gc_write_barrier_managed(ptr as pyre_object::gc_hook::GCREF);
+    }
+    RaiseCauseRef(unsafe { std::ptr::NonNull::new_unchecked(ptr) })
 }
 
 /// Instantiate the `from` cause of a `raise X from Y` when it is an exception
@@ -1915,12 +1992,9 @@ pub struct RaiseCause {
 /// `pyopcode.py`), delete this standalone fn, and either route
 /// the BH path through the inlined sequence or rewrite it to match
 /// RPython's inline shape.
-pub fn normalize_raise_cause(mut cause: PyObjectRef) -> Result<RaiseCause, PyError> {
+pub fn normalize_raise_cause(mut cause: PyObjectRef) -> Result<RaiseCauseRef, PyError> {
     if !unsafe { crate::baseobjspace::exception_is_valid_obj_as_class_w(cause) } {
-        return Ok(RaiseCause {
-            w_cause: cause,
-            invalid: None,
-        });
+        return Ok(alloc_raise_cause(cause, None));
     }
     // `space.call_function(w_cause)` propagates the constructor's own error;
     // pyre's answers `PY_NULL` with the error parked in the pending-call slot,
@@ -1943,13 +2017,10 @@ pub fn normalize_raise_cause(mut cause: PyObjectRef) -> Result<RaiseCause, PyErr
         (!unsafe { pyre_object::is_exception(result) })
             .then(|| crate::error::exception_from_call_type_error(cause, result))
     });
-    Ok(RaiseCause {
-        w_cause: result,
-        invalid,
-    })
+    Ok(alloc_raise_cause(result, invalid))
 }
 
-pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<RaiseCause>) -> Result<(), PyError> {
+pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<RaiseCauseRef>) -> Result<(), PyError> {
     // `pypy/interpreter/pyopcode.py do_raise` /
     // `pypy/interpreter/executioncontext.py:325 _normalize_exception` —
     // when a `raise` runs while another exception is being handled,
@@ -1966,9 +2037,18 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<RaiseCause>) -> Result
     // chain.  It must still become the context of a new exception raised by
     // the generator. `get_sys_exception` is residual, so this does not expose
     // the virtualizable frame to the tracer.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cause_slot = cause.map(|c| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(c.as_pyobject_ref());
+        slot
+    });
     crate::error::chain_context(exc, get_sys_exception());
-    if let Some(RaiseCause { w_cause, invalid }) = cause
-        && !w_cause.is_null()
+    let cause = cause_slot.map(|slot| unsafe {
+        RaiseCauseRef::from_pyobject_ref(pyre_object::gc_roots::shadow_stack_get(slot))
+    });
+    if let Some(cause) = cause
+        && !cause.w_cause.is_null()
     {
         // `error.py set_cause` checks the cause here, after the raised
         // value has been normalized: `raise Cls from 42` therefore runs `Cls()`
@@ -1981,7 +2061,8 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<RaiseCause>) -> Result
         // `_exception_getclass(space, w_cause, "exception causes")`, which also
         // admits `None` and whose wording is not the one `descr_setcause` uses
         // for `e.__cause__ = x`.
-        if let Some(err) = invalid {
+        let w_cause = cause.w_cause;
+        if let Some(err) = cause.invalid.clone() {
             return Err(err);
         }
         let valid = unsafe { pyre_object::is_none(w_cause) || pyre_object::is_exception(w_cause) };
@@ -3575,7 +3656,6 @@ impl NamespaceOpcodeHandler for PyFrame {
         ))
     }
 
-
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
         Ok(PY_NULL)
     }
@@ -3662,17 +3742,12 @@ pub unsafe fn load_global_via_cache_extern(
 ///
 /// Answers `false` when `w_ns` is not a dict, leaving the caller on the
 /// object-keyed path. `hash` is `ll_strhash` of the shared name string.
-fn store_name_into_dict_w(
-    w_ns: PyObjectRef,
-    w_name: PyObjectRef,
-    hash: i64,
-    value: PyObjectRef,
-) -> bool {
+fn store_name_into_dict(w_ns: PyObjectRef, name: &str, hash: i64, value: PyObjectRef) -> bool {
     if !unsafe { pyre_object::is_dict(w_ns) } {
         return false;
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w(w_ns, w_name, hash, value);
+        pyre_object::dictmultiobject::w_dict_setitem_str_hashed(w_ns, name, hash, value);
     }
     true
 }
@@ -4271,11 +4346,7 @@ impl IterOpcodeHandler for PyFrame {
             // this only sees non-iterator containers.
             if pyre_object::is_instance(iter)
                 || crate::typedef::r#type(iter).is_some_and(|t| {
-                    crate::baseobjspace::lookup_in_type_where(
-                        t.as_ptr(),
-                        "__iter__",
-                    )
-                    .is_some()
+                    crate::baseobjspace::lookup_in_type_where(t.as_ptr(), "__iter__").is_some()
                 })
             {
                 let result = crate::baseobjspace::iter(iter)?;
@@ -4298,10 +4369,7 @@ impl IterOpcodeHandler for PyFrame {
                     }
                 };
                 if let Some(metaclass) = mc
-                    && let Some(method) = crate::baseobjspace::lookup_in_type(
-                        metaclass,
-                        "__iter__",
-                    )
+                    && let Some(method) = crate::baseobjspace::lookup_in_type(metaclass, "__iter__")
                 {
                     let result = crate::call_function(method, &[iter]);
                     let tos = self.valuestackdepth - 1;
@@ -4583,11 +4651,7 @@ unsafe fn method_descriptor_bound(
 ///    `__get__` produced `attr` through that override and takes no binding
 ///  - everything else (staticmethod / non-method descriptors / shadowed
 ///    or arbitrary class attrs) → no binding (NULL)
-pub fn compute_load_method_bound(
-    obj: PyObjectRef,
-    attr: PyObjectRef,
-    w_name: PyObjectRef,
-) -> PyObjectRef {
+pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str) -> PyObjectRef {
     unsafe {
         if pyre_object::is_method(attr) {
             return PY_NULL;
@@ -4602,7 +4666,7 @@ pub fn compute_load_method_bound(
             let base = pyre_object::gc_roots::pin_roots(&[obj, attr]);
             let shadowed = crate::objspace::std::mapdict::instance_node_getdictvalue(
                 pyre_object::gc_roots::shadow_stack_get(base),
-                pyre_object::w_str_get_wtf8(w_name),
+                rustpython_wtf8::Wtf8::new(name),
             )
             .is_some();
             let obj = pyre_object::gc_roots::shadow_stack_get(base);
@@ -4629,7 +4693,7 @@ pub fn compute_load_method_bound(
             if !crate::baseobjspace::has_object_getattribute(w_type) {
                 return PY_NULL;
             }
-            let raw = crate::baseobjspace::lookup_in_type_where_wtf8(w_type, pyre_object::w_str_get_wtf8(w_name));
+            let raw = crate::baseobjspace::lookup_in_type(w_type, name);
             match raw {
                 _ if shadowed => PY_NULL,
                 // staticmethod / classmethod wrappers: getattr already
@@ -4672,7 +4736,7 @@ pub fn compute_load_method_bound(
             if !metatype_is_type {
                 return PY_NULL;
             }
-            let raw = crate::baseobjspace::lookup_in_type_where_wtf8(obj, pyre_object::w_str_get_wtf8(w_name));
+            let raw = crate::baseobjspace::lookup_in_type(obj, name);
             match raw {
                 // Exact for the reason given on the instance arm above.
                 Some(d) if pyre_object::is_exact_classmethod(d) => obj,
@@ -4682,7 +4746,7 @@ pub fn compute_load_method_bound(
                     // metaclass MRO; bind the type for a method-descriptor
                     // function getattr surfaced unchanged.
                     match crate::typedef::r#type(obj)
-                        .and_then(|meta| crate::baseobjspace::lookup_in_type_where_wtf8(meta.as_ptr(), pyre_object::w_str_get_wtf8(w_name)))
+                        .and_then(|meta| crate::baseobjspace::lookup_in_type(meta.as_ptr(), name))
                     {
                         Some(d) => method_descriptor_bound(d, attr, obj),
                         None => PY_NULL,
@@ -4709,7 +4773,7 @@ pub fn compute_load_method_bound(
             if !crate::baseobjspace::has_object_getattribute(w_type.as_ptr()) {
                 return PY_NULL;
             }
-            match crate::baseobjspace::lookup_in_type_where_wtf8(w_type.as_ptr(), pyre_object::w_str_get_wtf8(w_name)) {
+            match crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) {
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                 // Exact for the reason given on the instance arm above.
                 Some(d) if pyre_object::is_exact_classmethod(d) => w_type.as_ptr(),
@@ -4874,28 +4938,6 @@ fn import_module_importhook(
 }
 
 impl PyFrame {
-    /// pyopcode.py LOAD_ATTR as traced: `w_attributename =
-    /// self.getname_w(nameindex)`; `space.getattr(w_obj, w_attributename)`.
-    fn load_attr_w(&mut self, nameindex: usize) -> Result<(), PyError> {
-        let obj = self.pop_value()?;
-        let roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = roots.base();
-        let obj = roots.pin_root(obj);
-        let w_name =
-            unsafe { crate::pycode::w_code_getname_w(self.pycode as PyObjectRef, nameindex) };
-        let anchor = FrameAnchor::new(self);
-        let w_value = match crate::baseobjspace::getattr(obj, w_name) {
-            Ok(w_value) => w_value,
-            Err(error) => {
-                if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
-                    unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
-                }
-                return Err(error);
-            }
-        };
-        Self::push_anchored(&anchor, w_value)
-    }
-
     /// `argument.py` `make_arguments` copies the explicit args, then calls.
     /// `@jit.unroll_safe` so the `nargs` walk is not a backedge of `call`.
     /// The list stays here: returning a `Vec` is a pointer plus a length,
@@ -5282,32 +5324,41 @@ impl OpcodeStepExecutor for PyFrame {
                 let w_value = self.pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
-                        // Root the class and the normalized `cause` across the
-                        // instantiation. `instantiate_raised_class` allocates
-                        // (`malloc_fixedsize` → `collect_and_reserve`), and both
-                        // live only in this Rust local until `attach_raise_cause`
-                        // reads them. Re-read each slot afterwards.
+                        // Root the class and the normalized `RaiseCause` handle
+                        // across the instantiation. `instantiate_raised_class`
+                        // allocates (`malloc_fixedsize` → `collect_and_reserve`).
+                        // The handle's trace keeps `w_cause` and `invalid`.
                         let _roots = pyre_object::gc_roots::push_roots();
                         let value_slot = pyre_object::gc_roots::shadow_stack_len();
                         let _ = pyre_object::gc_roots::pin_root(w_value);
-                        let cause_slot = cause.as_ref().map(|c| {
+                        let cause_slot = cause.map(|c| {
                             let slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(c.w_cause);
+                            let _ = pyre_object::gc_roots::pin_root(c.as_pyobject_ref());
                             slot
                         });
                         let result = instantiate_raised_class(
                             pyre_object::gc_roots::shadow_stack_get(value_slot),
                         )?;
                         let _ = pyre_object::gc_roots::shadow_stack_get(value_slot);
-                        let cause = cause.map(|mut c| {
-                            if let Some(slot) = cause_slot {
-                                c.w_cause = pyre_object::gc_roots::shadow_stack_get(slot);
-                            }
-                            c
+                        let cause = cause_slot.map(|slot| unsafe {
+                            RaiseCauseRef::from_pyobject_ref(
+                                pyre_object::gc_roots::shadow_stack_get(slot),
+                            )
                         });
                         attach_raise_cause(result, cause)?;
                         Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let cause_slot = cause.map(|c| {
+                            let slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(c.as_pyobject_ref());
+                            slot
+                        });
+                        let cause = cause_slot.map(|slot| unsafe {
+                            RaiseCauseRef::from_pyobject_ref(
+                                pyre_object::gc_roots::shadow_stack_get(slot),
+                            )
+                        });
                         attach_raise_cause(w_value, cause)?;
                         Err(PyError::from_exc_object(w_value))
                     } else {
@@ -6517,15 +6568,7 @@ impl OpcodeStepExecutor for PyFrame {
     // The default trait impl always pushes [attr, NULL], which is what
     // the JIT tracer uses — no runtime branch in the shared path.
     fn load_method(&mut self, name: &str) -> Result<(), PyError> {
-        OpcodeStepExecutor::load_method_cached(self, name, crate::pyopcode::NO_NAMEINDEX)
-    }
-
-    fn load_method_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         let obj = self.pop();
-        // callmethod.py:42 `w_name = f.getname_w(nameindex)`.
-        let w_name = unsafe {
-            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-        };
         // callmethod.py:60-78 fast method path: a plain method descriptor in
         // the class, nothing shadowing it in the instance, on a type that uses
         // the default __getattribute__.  Pushes [w_descr, w_obj] (the unbound
@@ -6537,18 +6580,18 @@ impl OpcodeStepExecutor for PyFrame {
         // through the forwarded frame (shadowstack.py pop_roots), matching
         // the slow path.
         let roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = roots.pin_roots(&[obj, w_name]);
-        let w_name_slot = obj_slot + 1;
+        let obj_slot = roots.base();
+        let _ = roots.pin_root(obj);
         let anchor = FrameAnchor::new(self);
-        if let Some((_, _, w_descr)) = unsafe {
-            crate::baseobjspace::load_method_fast_path(roots.get(obj_slot), roots.get(w_name_slot))
-        } {
+        if let Some((_, _, w_descr)) =
+            unsafe { crate::baseobjspace::load_method_fast_path(roots.get(obj_slot), name) }
+        {
             let live = unsafe { &mut *anchor.live() };
             live.push(w_descr);
             live.push(roots.get(obj_slot));
             return Ok(());
         }
-        let attr = crate::baseobjspace::getattr(roots.get(obj_slot), roots.get(w_name_slot))?;
+        let attr = crate::baseobjspace::getattr_str(roots.get(obj_slot), name)?;
         let attr_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(attr);
         // LOOKUP_METHOD pushes (attr, null_or_self): the resolved attribute
@@ -6557,12 +6600,16 @@ impl OpcodeStepExecutor for PyFrame {
         let bound = compute_load_method_bound(
             roots.get(obj_slot),
             pyre_object::gc_roots::shadow_stack_get(attr_slot),
-            roots.get(w_name_slot),
+            name,
         );
         let live = unsafe { &mut *anchor.live() };
         live.push(pyre_object::gc_roots::shadow_stack_get(attr_slot));
         live.push(bound);
         Ok(())
+    }
+
+    fn load_method_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError> {
+        OpcodeStepExecutor::load_method(self, name)
     }
 
     fn load_special(&mut self, name: &str) -> Result<(), PyError> {
@@ -6587,7 +6634,7 @@ impl OpcodeStepExecutor for PyFrame {
         // the annotator off the bare-`!` hazard. The cache path's helpers are
         // `dont_look_inside`, so the JIT never traces into them.
         if majit_metainterp::jit::we_are_jitted() {
-            return self.load_attr_w(nameindex);
+            return OpcodeStepExecutor::load_attr(self, name);
         }
         // Graceful underflow (`shared_opcode.rs`'s `opcode_load_attr` →
         // `pop_value()?`): a corrupted concrete-execution stack during
@@ -6619,14 +6666,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn store_attr_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         // pyopcode.py:920 `if not jit.we_are_jitted():` — positive form.
         if majit_metainterp::jit::we_are_jitted() {
-            // pyopcode.py STORE_ATTR: `w_attributename = self.getname_w(nameindex)`;
-            // `space.setattr(w_obj, w_attributename, w_newvalue)`.
-            let obj = self.pop_value()?;
-            let value = self.pop_value()?;
-            let w_name =
-                unsafe { crate::pycode::w_code_getname_w(self.pycode as PyObjectRef, nameindex) };
-            crate::baseobjspace::setattr(obj, w_name, value)?;
-            return Ok(());
+            return OpcodeStepExecutor::store_attr(self, name);
         }
         // pyopcode.py:918-919 — obj is the top of stack, value below it.
         // Graceful underflow like `opcode_store_attr` (`shared_opcode.rs`)
@@ -6893,20 +6933,15 @@ impl OpcodeStepExecutor for PyFrame {
     // ── delete_attr ──
     // PyPy: DELETE_ATTR → space.delattr(obj, name)
     fn delete_attr(&mut self, name: &str) -> Result<(), PyError> {
-        OpcodeStepExecutor::delete_attr_cached(self, name, crate::pyopcode::NO_NAMEINDEX)
-    }
-
-    fn delete_attr_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         let mut obj = self.pop();
         // pyopcode.py DELETE_ATTR: pop then space.delattr. Root the popped
         // receiver across that collecting call (shadowstack.py push_roots).
-        pyre_object::with_roots!(obj => {
-            let w_name = unsafe {
-                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-            };
-            crate::baseobjspace::delattr(obj, w_name)
-        })?;
+        pyre_object::with_roots!(obj => crate::baseobjspace::delattr_str(obj, name))?;
         Ok(())
+    }
+
+    fn delete_attr_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError> {
+        OpcodeStepExecutor::delete_attr(self, name)
     }
 
     // ── set_update ──
@@ -7246,20 +7281,19 @@ mod tests {
             // is a plain MRO walk, while anything going through
             // `has_object_getattribute` would memoize the default back and
             // hide exactly what this pins.
-            let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("m"));
             let w_descr = crate::baseobjspace::lookup_in_type(w_type, "m").expect("C.m");
             pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, false);
 
             assert!(
-                std::ptr::eq(compute_load_method_bound(obj, w_descr, w_name), obj),
+                std::ptr::eq(compute_load_method_bound(obj, w_descr, "m"), obj),
                 "an unmemoized default `__getattribute__` must still bind self",
             );
 
             // The companion admits the same receiver, and pushes `w_descr`
             // unbound — which is what makes the NULL above a dropped `self`
             // rather than a missed optimisation.  Last, because it memoizes.
-            let (_, _, fast_descr) = crate::baseobjspace::load_method_fast_path(obj, w_name)
-                .expect("fast path admits C.m");
+            let (_, _, fast_descr) =
+                crate::baseobjspace::load_method_fast_path(obj, "m").expect("fast path admits C.m");
             assert!(std::ptr::eq(fast_descr, w_descr));
         }
     }

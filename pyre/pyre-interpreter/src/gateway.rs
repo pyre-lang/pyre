@@ -1362,6 +1362,13 @@ pub(crate) unsafe fn builtin_code_check_receiver(
 /// otherwise root a peeked argument, so a frame dispatch has to publish before
 /// it drops, not after.
 ///
+/// Residual in the JIT: its body hands `args` to the builtin's Rust-ABI
+/// `func` / `wrapper.call` through an indirect call, and a slice argument
+/// through an indirect call has no word-ABI lowering. `gateway.py
+/// BuiltinCode.funcrun` is traced upstream and only the fastcall itself is
+/// a residual call; that shape needs the builtin bodies to expose word-ABI
+/// entry points.
+///
 /// # Safety
 /// `obj` must point to a valid `BuiltinCode`.
 ///
@@ -3098,12 +3105,9 @@ fn path_or_fd_w(
             // without losing that observable descriptor value.
             (Vec::new(), obj_slot, fd, true)
         } else {
-            let Some(fspath_descr) = crate::typedef::r#type(obj).and_then(|pt| {
-                crate::baseobjspace::lookup_in_type(
-                    pt.as_ptr(),
-                    "__fspath__",
-                )
-            }) else {
+            let Some(fspath_descr) = crate::typedef::r#type(obj)
+                .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
+            else {
                 return Err(reject(obj));
             };
             let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
