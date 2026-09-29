@@ -391,9 +391,14 @@ fn create_spec_for_method(w_function: PyObjectRef, w_type: PyObjectRef) -> PyObj
         && !w_type.is_null()
         && unsafe { pyre_object::is_type(w_type) }
     {
-        unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_type, &name) }
-            .map(|(w_realclass, _)| unsafe { pyre_object::w_type_get_name(w_realclass) })
-            .unwrap_or_else(|| unsafe { pyre_object::w_type_get_name(w_type) })
+        unsafe {
+            pyre_interpreter::baseobjspace::lookup_where_pair(
+                w_type,
+                name.as_str(),
+            )
+        }
+        .map(|(w_realclass, _)| unsafe { pyre_object::w_type_get_name(w_realclass) })
+        .unwrap_or_else(|| unsafe { pyre_object::w_type_get_name(w_type) })
     } else if !w_type.is_null() && unsafe { pyre_object::is_type(w_type) } {
         unsafe { pyre_object::w_type_get_name(w_type) }
     } else {

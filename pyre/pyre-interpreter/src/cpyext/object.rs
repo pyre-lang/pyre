@@ -309,16 +309,10 @@ pub unsafe extern "C" fn PyObject_GenericSetAttr(
         return -1;
     };
     let value = unsafe { pyobject::from_ref(value) };
-    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    let outcome = match (name.as_str(), value.is_null()) {
-        (Ok(name), false) => crate::baseobjspace::object_setattr(object, name, value),
-        (Ok(name), true) => crate::baseobjspace::object_delattr(object, name),
-        (Err(_), false) => unsafe {
-            crate::baseobjspace::object_setattr_surrogate(object, w_name, name, value)
-        },
-        (Err(_), true) => unsafe {
-            crate::baseobjspace::object_delattr_surrogate(object, w_name, name)
-        },
+    let outcome = if value.is_null() {
+        crate::baseobjspace::object_delattr(object, w_name)
+    } else {
+        crate::baseobjspace::object_setattr(object, w_name, value)
     };
     if trap(outcome).is_none() { -1 } else { 0 }
 }

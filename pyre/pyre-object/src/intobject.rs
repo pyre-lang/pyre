@@ -179,7 +179,13 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
         let idx = (value - PREBUILTINTFROM) as usize;
         return (&SMALL_INTS.0[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
     }
-    if crate::gc_interp::enabled() {
+    // `intobject.py wrapint` is look-inside. The collector arm is
+    // `dont_look_inside`; when jitted, take `malloc_typed` so
+    // `jtransform.py rewrite_op_malloc` / `fuse_boxing_alloc` emit
+    // `new_with_vtable` + `setfield_gc`. Interpreter graphs fold
+    // `we_are_jitted` to false and keep the collector path.
+    let use_collector = !majit_rlib::jit::we_are_jitted() && crate::gc_interp::enabled();
+    if use_collector {
         let boxed = w_int_gc_alloc(value);
         if !boxed.is_null() {
             return boxed;

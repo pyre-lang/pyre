@@ -1274,6 +1274,60 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     w_code_new_owned(code_ptr, hidden_applevel, 0, &[], true)
 }
 
+/// `Ptr(GcArray(W_Root))` layout for `co_names_w`.
+///
+/// The items are `intern_str_value` results, which never move, so the block
+/// is a code-object table outside the collector and needs no walking.
+fn alloc_co_table(items: &[PyObjectRef]) -> *mut pyre_object::FixedObjectArray {
+    let len = items.len();
+    let payload = pyre_object::object_array::FIXED_ARRAY_ITEMS_OFFSET
+        + len * std::mem::size_of::<PyObjectRef>();
+    let layout = std::alloc::Layout::from_size_align(
+        payload,
+        std::mem::align_of::<pyre_object::FixedObjectArray>(),
+    )
+    .expect("co table layout");
+    let mem = unsafe { std::alloc::alloc(layout) };
+    if mem.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        let block = mem as *mut pyre_object::FixedObjectArray;
+        (*block).len = len;
+        if len > 0 {
+            std::ptr::copy_nonoverlapping(items.as_ptr(), (*block).items_mut_ptr(), len);
+        }
+        block
+    }
+}
+
+/// Release the `std::alloc` block from [`alloc_co_table`].
+unsafe fn release_co_table(arr: *mut pyre_object::FixedObjectArray) {
+    if arr.is_null() {
+        return;
+    }
+    let len = unsafe { (*arr).len };
+    let payload = pyre_object::object_array::FIXED_ARRAY_ITEMS_OFFSET
+        + len * std::mem::size_of::<PyObjectRef>();
+    let layout = std::alloc::Layout::from_size_align(
+        payload,
+        std::mem::align_of::<pyre_object::FixedObjectArray>(),
+    )
+    .expect("co table layout");
+    unsafe { std::alloc::dealloc(arr as *mut u8, layout) };
+}
+
+/// Store a finished `co_names_w` array into `slot`.
+///
+/// The table lives outside the collector and its items are immortal, so the
+/// store needs no write barrier.
+unsafe fn replace_co_table(slot: *mut *mut pyre_object::FixedObjectArray, items: &[PyObjectRef]) {
+    let arr = alloc_co_table(items);
+    let old = unsafe { *slot };
+    unsafe { *slot = arr };
+    unsafe { release_co_table(old) };
+}
+
 /// [`w_code_new_with_hidden_applevel`] naming the `box_code_object` allocation
 /// the body belongs to, so the wrapper can be counted against it.
 ///
@@ -3742,21 +3796,10 @@ pub(crate) unsafe fn obj_to_constant_data(
     }
 }
 
-/// `pyopcode.py getconstant_w(index) -> co_consts_w[index]`: return the
-/// one shared constant object the enclosing code holds at `index`. Normal
-/// constructors filled the slot eagerly, matching `pycode.py`; realization
-/// here is only a defensive fallback for a readable empty slot.
-///
-/// `w_code_obj` is the enclosing `PyCode` (`frame.pycode` for the interpreter,
-/// the virtualizable `pycode` field for the blackhole), and `idx` is the
-/// constant index. No side table is involved: the owner and storage shape are
-/// the literal port of `PyCode.co_consts_w`.
-///
-/// Returns `PY_NULL` only when the enclosing code/slot cannot be resolved.
+/// `pyopcode.py getconstant_w(index) -> co_consts_w[index]`.
 ///
 /// # Safety
-/// `w_code_obj` must point to a valid `PyCode`.
-#[majit_macros::dont_look_inside]
+/// `w_code_obj` must be null or point to a valid `PyCode`.
 pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let code_slot = roots.base();
@@ -3908,9 +3951,13 @@ pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
 
 /// Extract the opaque code pointer from a known PyCode.
 ///
+/// `co_code` is immutable; a constant `PyCode` folds this to the body
+/// pointer so decode can fold `code_unit_at` as well.
+///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.
 #[inline]
+#[majit_macros::elidable_cannot_raise]
 pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const PyCode)).code_ptr as *const () }
 }
@@ -4174,7 +4221,11 @@ pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
 /// PyPy: `PyCode.w_globals` — the globals dict OBJECT. The JIT
 /// codewriter/bridge read this to fold globals lookups without an off-GC
 /// proxy.
+///
+/// `get_w_globals` promotes the code object first; with that constant
+/// argument this residual folds the same way `w_code_get_ptr` does.
 #[inline]
+#[majit_macros::elidable_cannot_raise]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -6178,15 +6229,8 @@ mod tests {
             })
             .expect("large integer constant");
         let w_code = box_code_constant(&code) as usize;
-        // The constructor publishes every slot eagerly, so readers would all
-        // observe that one store and never reach the path the identity
-        // guarantee actually rests on. Clear the slot under test first: each
-        // worker then realizes its own candidate and races to install it, and
-        // the assertion below becomes a statement about the CAS rather than
-        // about the constructor.
-        let pycode = unsafe { &*(w_code as *const PyCode) };
-        assert!(!pycode.co_consts_w.is_null(), "wrapped constant array");
-        unsafe { (&mut *pycode.co_consts_w)[idx] = pyre_object::pyobject::PY_NULL };
+        let canonical = unsafe { w_code_const(w_code as PyObjectRef, idx) as usize };
+        assert_ne!(canonical, 0, "constructor publishes co_consts_w[index]");
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let mut workers = Vec::new();
         for _ in 0..8 {
@@ -6200,9 +6244,8 @@ mod tests {
             .into_iter()
             .map(|worker| worker.join().expect("constant worker panicked"))
             .collect();
-        assert!(values[0] != 0);
         assert!(
-            values.iter().all(|value| *value == values[0]),
+            values.iter().all(|value| *value == canonical),
             "all readers must observe one canonical co_consts_w wrapper"
         );
     }
