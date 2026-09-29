@@ -4299,6 +4299,12 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
 }
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
+///
+/// A slot that already holds a namespace is only compared by identity: a
+/// frame answered `false` keeps reading the `w_globals` it was handed, which
+/// is that same pointer, so nothing is read through the loaded value and a
+/// `Relaxed` load answers it. Only the first store, which has to be
+/// indivisible from its read, goes through [`w_code_publish_frame_global`].
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -4307,6 +4313,34 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     if obj.is_null() {
         return false;
     }
+    let published = unsafe {
+        std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
+            (*(obj as *mut PyCode)).w_globals
+        ))
+        .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    if published.is_null() {
+        return unsafe { w_code_publish_frame_global(obj, w_globals) };
+    }
+    // The wrapper may have moved since its first globals stamp. The live frame
+    // supplying `obj` is authoritative, so keep the raw-code compatibility
+    // registry synchronized even on the cache-hit path.
+    w_code_register_live_wrapper(obj);
+    !std::ptr::eq(published, w_globals)
+}
+
+/// Refresh [`register_live_code_wrapper`] for the code object `obj`.
+#[majit_macros::dont_look_inside]
+fn w_code_register_live_wrapper(obj: PyObjectRef) {
+    register_live_code_wrapper(
+        unsafe { (*(obj as *const PyCode)).code_ptr as *const () },
+        obj,
+    );
+}
+
+/// The first `frame_stores_global` store into a code object's `w_globals`.
+#[majit_macros::dont_look_inside]
+unsafe fn w_code_publish_frame_global(obj: PyObjectRef, w_globals: PyObjectRef) -> bool {
     let roots = pyre_object::gc_roots::push_roots();
     let root_base = roots.publish(&[obj, w_globals]);
     roots.normalize(root_base, 2);
@@ -4352,9 +4386,6 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             Err(winner) => published = winner,
         }
     }
-    // The wrapper may have moved since its first globals stamp. The live frame
-    // supplying `obj` is authoritative, so keep the raw-code compatibility
-    // registry synchronized even on the cache-hit path.
     let obj = roots.get(root_base);
     let w_globals = roots.get(root_base + 1);
     register_live_code_wrapper(

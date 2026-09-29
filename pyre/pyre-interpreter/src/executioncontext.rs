@@ -3387,6 +3387,14 @@ impl ActionFlagOps for SpaceActionFlag {
 /// this gate to those ops is a later port.
 #[majit_macros::dont_look_inside]
 pub fn space_decrement_ticker(ec: &mut ExecutionContext, by: isize) -> isize {
+    // Compiled back-edges poll `EB_GC` every iteration (`assembler.py`
+    // `_call_footer` / the eval-breaker load). The interpreter's ticker is
+    // that poll: a deferred major armed on eval-loop unwind must enter
+    // `action_dispatcher` on this bytecode instead of waiting out
+    // `checkinterval_scaled`.
+    if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_GC != 0 {
+        return -1;
+    }
     let mut actionflag = ec.actionflag;
     actionflag.decrement_ticker(by)
 }

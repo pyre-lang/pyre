@@ -551,28 +551,6 @@ impl RootScope {
         }
     }
 
-    /// One-word residual ABI for [`Self::publish`], the
-    /// [`publish_roots_jit_abi`] twin.
-    #[majit_macros::dont_look_inside_cannot_raise]
-    pub extern "C" fn publish_jit_abi(
-        &self,
-        array: *const crate::object_array::GcTypedArray,
-    ) -> i64 {
-        let items = gcarray_ref_items(array);
-        self.publish(&items) as i64
-    }
-
-    /// One-word residual ABI for [`Self::pin_roots`], the
-    /// [`publish_roots_jit_abi`] twin.
-    #[majit_macros::dont_look_inside_cannot_raise]
-    pub extern "C" fn pin_roots_jit_abi(
-        &self,
-        array: *const crate::object_array::GcTypedArray,
-    ) -> i64 {
-        let items = gcarray_ref_items(array);
-        self.pin_roots(&items) as i64
-    }
-
     /// Scope-local [`normalize_roots`] on this thread's root-stack cell.
     #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
@@ -734,34 +712,39 @@ pub extern "C" fn root_scope_normalize_moved_jit_abi(
     usize::from(root_scope_from_word(save_point).normalize_moved(base, len))
 }
 
-// A `&[PyObjectRef]` argument reaches a jitcode as the GC array its
-// `Rvalue::Aggregate` built (`majit::object_ref_gcarray`: the length word at
-// offset 0, the ref items from the next word).  The residual passes that one
-// Ref; these bridges read the slice back out of it.
+// A `&[PyObjectRef]` argument reaches a residual call as its `(ptr, len)`
+// pair: the item pointer, then the length word right after it.  These
+// bridges rebuild the slice from the two words.
 
-/// View the items of a `majit::object_ref_gcarray` as a slice.
+/// View a `(ptr, len)` pair argument as a slice.
 ///
 /// # Safety
-/// `array` must be a live `object_ref_gcarray`, and no collection may run
-/// while the returned slice is in use.
-unsafe fn object_ref_gcarray_items<'a>(array: *const usize) -> &'a [PyObjectRef] {
-    unsafe {
-        let len = *array;
-        std::slice::from_raw_parts(array.add(1) as *const PyObjectRef, len)
+/// `items` must point at `len` live refs, and no collection may run while
+/// the returned slice is in use.
+unsafe fn pair_items<'a>(items: *const PyObjectRef, len: usize) -> &'a [PyObjectRef] {
+    if len == 0 {
+        return &[];
     }
+    unsafe { std::slice::from_raw_parts(items, len) }
 }
 
-/// [`RootScope::publish`] over the guard word and the lowered slice array.
-pub extern "C" fn root_scope_publish_jit_abi(save_point: usize, roots: *const usize) -> usize {
-    root_scope_from_word(save_point).publish(unsafe { object_ref_gcarray_items(roots) })
+/// [`RootScope::publish`] over the guard word and the slice pair.
+pub extern "C" fn root_scope_publish_jit_abi(
+    save_point: usize,
+    items: *const PyObjectRef,
+    len: usize,
+) -> usize {
+    root_scope_from_word(save_point).publish(unsafe { pair_items(items, len) })
 }
 
-/// [`RootScope::pin_roots`] over the guard word and the lowered slice array.
-pub extern "C" fn root_scope_pin_roots_jit_abi(save_point: usize, roots: *const usize) -> usize {
+/// [`RootScope::pin_roots`] over the guard word and the slice pair.
+pub extern "C" fn root_scope_pin_roots_jit_abi(
+    save_point: usize,
+    items: *const PyObjectRef,
+    len: usize,
+) -> usize {
     let scope = root_scope_from_word(save_point);
-    let items = unsafe { object_ref_gcarray_items(roots) };
-    let len = items.len();
-    let base = scope.publish(items);
+    let base = scope.publish(unsafe { pair_items(items, len) });
     scope.normalize(base, len);
     base
 }
@@ -1168,11 +1151,7 @@ pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
     })
 }
 
-/// One-word residual ABI for [`publish_roots`].
-///
-/// `&[PyObjectRef]` is `Ptr(GcArray(Ptr(PyObject)))`: one word, length at
-/// offset 0 (`bh_newtuple_from_array`). The executor passes that word, not a
-/// fat `(ptr, len)` pair.
+/// Residual ABI for [`publish_roots`] over the slice pair.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn publish_roots_jit_abi(array: *const crate::object_array::GcTypedArray) -> i64 {
     let items = gcarray_ref_items(array);
@@ -1840,19 +1819,20 @@ mod tests {
         assert_eq!(shadow_stack_len(), before);
     }
 
-    /// A `&[PyObjectRef]` residual argument arrives as an
-    /// `object_ref_gcarray`: the length word, then the items.
+    /// Free `publish_roots` takes one length-prefixed `GcTypedArray`;
+    /// `RootScope::publish` still takes the `(ptr, len)` pair.
     #[test]
-    fn slice_bridges_read_the_lowered_gcarray() {
+    fn slice_bridges_read_the_pair() {
+        let items = vec![dummy(0x10), dummy(0x20)];
+        let array =
+            gcarray_from_pyobject_vec_jit_abi(&items as *const Vec<PyObjectRef> as *const u8);
         let before = shadow_stack_len();
-        let array: [usize; 3] = [2, dummy(0x10) as usize, dummy(0x20) as usize];
         let word = push_roots_jit_abi();
-        let base = publish_roots_jit_abi(array.as_ptr() as *const crate::object_array::GcTypedArray)
-            as usize;
+        let base = publish_roots_jit_abi(array) as usize;
         assert_eq!(base, before);
         assert_eq!(root_scope_get_jit_abi(word, base), dummy(0x10));
         assert_eq!(root_scope_get_jit_abi(word, base + 1), dummy(0x20));
-        let base = root_scope_publish_jit_abi(word, array.as_ptr());
+        let base = root_scope_publish_jit_abi(word, items.as_ptr(), items.len());
         assert_eq!(base, before + 2);
         assert_eq!(shadow_stack_len(), before + 4);
         root_scope_close_jit_abi(word);

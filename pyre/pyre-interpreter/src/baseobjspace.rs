@@ -2134,9 +2134,10 @@ pub unsafe fn get_and_call_function0(
     }
 }
 
-/// Residual (`look_inside_graph` sees the `args_w` loop). The word-ABI
-/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
-#[majit_macros::getfunctionptr]
+/// descroperation.py `get_and_call_function(space, w_descr, w_obj, *args_w)`.
+/// The `*args_w` tuple has a fixed length per call site, so the loops over
+/// `args_w` unroll.
+#[majit_macros::unroll_safe]
 pub unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
@@ -7429,6 +7430,14 @@ pub fn getattr_str_impl(
     let _ = pyre_object::gc_roots::pin_root(obj);
     // Reload at each use: a live `obj` local across collecting helpers is an
     // unbracketed `PyObjectRef`. The caller opened the bracket; pin into it.
+    let getattr_miss = |call_getattr: bool, suppress: bool| {
+        object_getattr_miss_str(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            name,
+            call_getattr,
+            suppress,
+        )
+    };
 
     if name == "__dict__"
         && let Some(obj_type) =
@@ -7736,12 +7745,7 @@ pub fn getattr_str_impl(
                             Err(err) => Err(err),
                         };
                     }
-                    return object_getattr_miss(
-                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                        name,
-                        call_getattr,
-                        suppress,
-                    );
+                    return getattr_miss(call_getattr, suppress);
                 }
                 let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7958,12 +7962,7 @@ pub fn getattr_str_impl(
     // own AttributeError must reach the caller rather than be overwritten by the
     // generic module-miss message.
     if call_getattr && unsafe { is_module(pyre_object::gc_roots::shadow_stack_get(obj_slot)) } {
-        let err = match object_getattr_miss(
-            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            name,
-            false,
-            false,
-        ) {
+        let err = match getattr_miss(false, false) {
             Ok(value) => return Ok(value),
             Err(e) => e,
         };
@@ -7980,12 +7979,7 @@ pub fn getattr_str_impl(
         };
     }
 
-    let err = match object_getattr_miss(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot),
-        name,
-        call_getattr,
-        suppress,
-    ) {
+    let err = match getattr_miss(call_getattr, suppress) {
         Ok(value) => return Ok(value),
         Err(e) => e,
     };
@@ -8083,16 +8077,28 @@ unsafe fn super_getattribute_wtf8(
 /// is what that selected builtin slot executes.  Keeping the two levels apart
 /// lets a `super` subclass override the slot without making an inherited or
 /// explicit `super.__getattribute__(obj, name)` call recurse.
-fn super_getattribute_str(mut obj: PyObjectRef, name: &str) -> PyResult {
+fn super_getattribute_str(obj: PyObjectRef, name: &str) -> PyResult {
+    // The MRO walk allocates, so the receiver is re-read from the shadow stack
+    // before the miss path.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
     unsafe {
         if name != "__class__"
-            && let Some(value) =
-                pyre_object::with_roots!(obj => super_getattribute_wtf8(obj, Wtf8::new(name)))?
+            && let Some(value) = super_getattribute_wtf8(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                Wtf8::new(name),
+            )?
         {
             return Ok(value);
         }
     }
-    object_getattr_miss(obj, name, false, false)
+    object_getattr_miss_str(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        name,
+        false,
+        false,
+    )
 }
 
 /// Wrapped-name entry point for the builtin `super.__getattribute__`
@@ -8976,7 +8982,7 @@ pub fn object_getattribute(mut obj: PyObjectRef, name: &str) -> PyResult {
 /// typeobject.py `W_TypeObject.descr_getattribute` — the canonical
 /// metatype-data-descriptor, class-MRO, metatype-non-data-descriptor lookup.
 pub(crate) fn type_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
-    object_getattr_miss(obj, name, false, false)
+    object_getattr_miss_str(obj, name, false, false)
 }
 
 /// module.py `Module.descr_getattribute` — run the object-default descriptor
@@ -10057,26 +10063,59 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
     Ok(pyre_object::PY_NULL)
 }
 
+/// `&str` twin of [`object_getattr_miss`] for a caller that does not already
+/// hold a wrapped name. Boxes `name` with `w_str_new_managed`, the constructor
+/// `enrich_attribute_error_str` uses for a fresh name object.
+#[majit_macros::dont_look_inside]
+pub(crate) fn object_getattr_miss_str(
+    obj: PyObjectRef,
+    name: &str,
+    call_getattr: bool,
+    suppress: bool,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let w_name = pyre_object::w_str_new_managed(name);
+    object_getattr_miss(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        w_name,
+        call_getattr,
+        suppress,
+    )
+}
+
 /// The attribute-miss / special-attribute path of `getattribute`, reached only
 /// after the fast descriptor and instance-dict lookups return nothing (a hot
 /// attribute that resolves never enters here). Its `[Option<PyObjectRef>; 2]`
 /// metaclass walks (`.iter().flatten()`), array indexing, and `__getattr__`
 /// callback are opaque to the annotator; it returns the blessed `PyResult`
 /// carrier, so the whole cold path is residualised behind one boundary.
+///
+/// `w_name` is a UTF-8 str object. A non-UTF-8 name never reaches this
+/// function; those callers take `getattr_surrogate`.
 #[majit_macros::dont_look_inside]
 pub(crate) fn object_getattr_miss(
     obj: PyObjectRef,
-    name: &str,
+    w_name: PyObjectRef,
     call_getattr: bool,
     suppress: bool,
 ) -> PyResult {
     // The receiver may be a nursery exception (or another moving object).
     // Several arms below allocate — instance dict, AttributeError name,
     // bound methods — so the word is published here and reloaded after
-    // each of those safepoints before it is stored or passed on.
+    // each of those safepoints before it is stored or passed on. `w_name`
+    // is pinned for the same reason: the body allocates before it is used.
     let _getattr_miss_roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_name);
+    let name: &str = unsafe {
+        pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(pyre_object::w_str_get_wtf8(
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+        ))
+    };
     let mut obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if name == "__dict__" && unsafe { is_module(obj) } {
         let dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
@@ -16158,7 +16197,7 @@ pub(crate) fn exception_attr_set(
 /// through the descriptor / instance-dict path.  Called by
 /// `object.__setattr__` and as the default path in `setattr`.
 pub fn object_setattr(
-    mut obj: PyObjectRef,
+    obj: PyObjectRef,
     mut w_name: PyObjectRef,
     mut value: PyObjectRef,
 ) -> PyResult {
@@ -17100,7 +17139,7 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
 }
 
 /// Terminal `object.__delattr__` — bypasses user override.
-pub fn object_delattr(mut obj: PyObjectRef, mut w_name: PyObjectRef) -> PyResult {
+pub fn object_delattr(obj: PyObjectRef, mut w_name: PyObjectRef) -> PyResult {
     let mut obj = pyre_object::with_roots!(w_name => {
         crate::module::_weakref::interp__weakref::force(obj)
     })?;
