@@ -190,10 +190,11 @@ pub fn poll_due() -> bool {
 /// rollback switch for the born-old interpreter stepping stone. Reads the env
 /// once, then caches.
 ///
-/// Reads (and lazily initialises) the runtime `STATE` atomic; the value is not
-/// a build-time constant, so the JIT residualises the call instead of tracing
-/// into it (`@dont_look_inside`).
-#[majit_macros::dont_look_inside]
+/// Reads (and lazily initialises) the runtime `STATE` atomic. The env
+/// read is idempotent and cached, so `@elidable` (`rlib/jit.py`) can
+/// fold a traced result; `@dont_look_inside` would leave a residual
+/// `CallI` in every compiled loop.
+#[majit_macros::elidable_cannot_raise]
 pub fn enabled() -> bool {
     match STATE.load(Ordering::Relaxed) {
         1 => false,

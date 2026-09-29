@@ -1208,6 +1208,20 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // `space.newbool` (`baseobjspace.py` `newbool`): `if b:
+                // return w_True; else: return w_False`. The residual
+                // wrapper is `dont_look_inside`; these bodies are the
+                // look-inside graphs portal interpret descends.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "opcode_ops",
+                    "bool_value_from_truth",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "boolobject",
+                    "w_bool_from",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.

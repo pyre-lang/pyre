@@ -18,6 +18,7 @@ use super::cdata;
 use super::stginfo::{self, ParamFunc, StgInfoData};
 use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 use super::cfield;
 
@@ -420,7 +421,14 @@ fn structure_setattr(args: &[PyObjectRef]) -> PyResult {
             || (unsafe { pyre_object::is_list(slots) }
                 && unsafe { pyre_object::w_list_len(slots) } == 0)
     });
-    if slots_empty && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, name) }.is_none()
+    if slots_empty
+        && unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                cls,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+            )
+        }
+        .is_none()
     {
         return Err(pyre_interpreter::PyError::attribute_error(format!(
             "'{}' object has no attribute '{}'",
@@ -428,7 +436,7 @@ fn structure_setattr(args: &[PyObjectRef]) -> PyResult {
             name,
         )));
     }
-    pyre_interpreter::baseobjspace::object_setattr(obj, name, args[2])
+    pyre_interpreter::baseobjspace::object_setattr(obj, args[1], args[2])
 }
 
 fn finish_aggregate_base(tp: PyObjectRef, metaclass: PyObjectRef, paramfunc: &'static str) {
@@ -774,7 +782,12 @@ fn first_base_stginfo(cls: PyObjectRef) -> Option<PyObjectRef> {
 }
 
 fn usize_attr(cls: PyObjectRef, name: &str, default: usize) -> usize {
-    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, name) } {
+    match unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    } {
         Some(o) if unsafe { pyre_object::is_int(o) } => {
             (unsafe { pyre_object::w_int_get_value(o) }).max(0) as usize
         }
@@ -783,7 +796,12 @@ fn usize_attr(cls: PyObjectRef, name: &str, default: usize) -> usize {
 }
 
 fn align_attr(cls: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
-    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_align_") } {
+    match unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_align_")),
+        )
+    } {
         Some(o) if unsafe { pyre_object::is_int(o) } => {
             let value = unsafe { pyre_object::w_int_get_value(o) };
             if value < 0 {
@@ -830,21 +848,26 @@ fn promote_anonymous_fields(
     base_offset: usize,
 ) -> Result<(), pyre_interpreter::PyError> {
     let anonymous = anonymous_names(proto)?;
-    let fields = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, "_fields_") }
-        .ok_or_else(|| {
-            pyre_interpreter::PyError::attribute_error("anonymous field has no _fields_")
-        })?;
-    for entry in pyre_object::with_roots!(cls, proto => field_entries(fields))? {
+    let fields = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            proto,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_fields_")),
+        )
+    }
+    .ok_or_else(|| pyre_interpreter::PyError::attribute_error("anonymous field has no _fields_"))?;
+    for entry in field_entries(fields)? {
         let name = entry.name;
         let mut child_proto = entry.ty;
-        let mut child = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, &name) }
-            .ok_or_else(|| {
-                pyre_interpreter::PyError::attribute_error(format!(
-                    "type has no attribute '{name}'"
-                ))
-            })?;
-        let offset = base_offset
-            + pyre_object::with_roots!(child, child_proto, cls, proto => cf_usize(child, "offset"));
+        let mut child = unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                proto,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name.as_str())),
+            )
+        }
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::attribute_error(format!("type has no attribute '{name}'"))
+        })?;
+        let offset = base_offset + cf_usize(child, "offset");
         if anonymous.iter().any(|anon| anon == &name) {
             pyre_object::with_roots!(cls, proto => promote_anonymous_fields(cls, child_proto, offset))?;
         } else {
@@ -1080,14 +1103,24 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         }
     }
 
-    let is_swapped =
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls(), "_swappedbytes_") }
-            .is_some();
+    let is_swapped = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_swappedbytes_")),
+        )
+    }
+    .is_some();
     let pack = usize_attr(cls(), "_pack_", 0);
     let forced = align_attr(cls())?;
     if pack > 0
         && !cfg!(windows)
-        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls(), "_layout_") }.is_none()
+        && unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                cls(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("_layout_")),
+            )
+        }
+        .is_none()
     {
         // `do_warn` can collect. `FieldEntry.ty` lives in a native Vec, so
         // pin and reload it the way `gct_direct_call` would push livevars.
@@ -1493,9 +1526,14 @@ fn pointer_type_set(args: &[PyObjectRef]) -> PyResult {
 
 fn fields_get(args: &[PyObjectRef]) -> PyResult {
     let cls = args[1];
-    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_fields_") }
-        .filter(|&f| !f.is_null())
-        .ok_or_else(|| pyre_interpreter::PyError::attribute_error("_fields_"))
+    unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_fields_")),
+        )
+    }
+    .filter(|&f| !f.is_null())
+    .ok_or_else(|| pyre_interpreter::PyError::attribute_error("_fields_"))
 }
 
 fn fields_set(args: &[PyObjectRef]) -> PyResult {
@@ -1628,9 +1666,20 @@ fn field_needs_swap(obj: PyObjectRef, proto: PyObjectRef, size: usize) -> bool {
         return false;
     }
     let oc = unsafe { pyre_object::w_instance_get_type(obj) };
-    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(oc, "_swappedbytes_") }.is_some()
-        || unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, "_swappedbytes_") }
-            .is_some()
+    unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            oc,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_swappedbytes_")),
+        )
+    }
+    .is_some()
+        || unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                proto,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("_swappedbytes_")),
+            )
+        }
+        .is_some()
 }
 
 fn cfield_get(args: &[PyObjectRef]) -> PyResult {
@@ -2076,7 +2125,14 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let mut cls = args[0];
-    if unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_abstract_") }.is_some() {
+    if unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_abstract_")),
+        )
+    }
+    .is_some()
+    {
         return Err(pyre_interpreter::PyError::type_error("abstract class"));
     }
     let mut info = stginfo::stginfo_of(cls)
@@ -2884,8 +2940,13 @@ fn cpointertype_init(args: &[PyObjectRef]) -> PyResult {
 /// `PyCPointerType` layout: pointer-sized `StgInfo` with `ISPOINTER`, and
 /// memoise the pointer type on the pointed-to type (`POINTER` identity).
 fn pointer_init_stginfo(mut cls: PyObjectRef) -> PyResult {
-    let proto = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_type_") }
-        .filter(|&t| !t.is_null() && unsafe { pyre_object::is_type(t) });
+    let proto = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_type_")),
+        )
+    }
+    .filter(|&t| !t.is_null() && unsafe { pyre_object::is_type(t) });
     let has_proto = proto.is_some();
     // `proto` is read again after every layout query below.
     let roots = pyre_object::gc_roots::push_roots();

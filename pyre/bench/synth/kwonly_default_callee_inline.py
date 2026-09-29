@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=3.2
-# pyre-check: spec-folds=kwonly_defaults_inline
 # pyre-check: trace-shape=main:absent=CallMayForceR
 # A hot call into a keyword-only callee that supplies nothing for it, so the
 # inline has to fill `step` from `__kwdefaults__` itself.

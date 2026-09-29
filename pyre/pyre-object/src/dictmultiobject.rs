@@ -2067,29 +2067,106 @@ pub fn w_module_dict_new() -> PyObjectRef {
 /// hashing or equality may collect, so callers still publish and reload every
 /// live `PyObjectRef` across the operation.
 pub struct DictOperationGuard {
-    roots: crate::gc_roots::RootScope,
+    /// One-word cell pointer. `RootScope` is a two-word ADT the residual
+    /// ABI collapses, so the guard stores the cell and save-point itself.
+    stack_slot: *const crate::gc_roots::RootStack,
+    save_point: usize,
     root_base: usize,
 }
 
 impl DictOperationGuard {
+    fn open_scope() -> (*const crate::gc_roots::RootStack, usize) {
+        let stack_slot = crate::gc_roots::shadow_stack_cell();
+        let save_point = crate::gc_roots::shadow_stack_cell_len(stack_slot);
+        (stack_slot, save_point)
+    }
+
+    /// Slice form for native callers. `&[PyObjectRef]` is two words, so
+    /// the residual ABI cannot describe it; translated sites use the
+    /// fixed-arity constructors below.
+    ///
     /// # Safety
     /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
     /// invariant required by the object and pointer arguments for the entire call.
+    #[majit_macros::dont_look_inside]
     pub unsafe fn new(obj: PyObjectRef, refs: &[PyObjectRef]) -> Self {
-        let roots = crate::gc_roots::push_roots();
-        // The dictionary and its operands become visible in one write phase
-        // before any hashing/equality callback can collect. `refs` is a
-        // caller-owned native slice no collection rewrites, so publish all
-        // values before normalizing any one of them.
-        //
-        // Every slot access goes through the scope's cached root-stack cell:
-        // a dict operation touches each of its operands again on the way out,
-        // and the free `gc_roots` functions re-resolve the thread local on
-        // every call — which on Darwin is an out-of-line `_tlv_get_addr`.
-        let root_base = roots.publish(&[obj]);
-        roots.publish(refs);
-        roots.normalize(root_base, 1 + refs.len());
-        Self { roots, root_base }
+        match refs {
+            [] => unsafe { Self::new0(obj) },
+            [a] => unsafe { Self::new1(obj, *a) },
+            [a, b] => unsafe { Self::new2(obj, *a, *b) },
+            [a, b, c] => unsafe { Self::new3(obj, *a, *b, *c) },
+            _ => {
+                let (stack_slot, save_point) = Self::open_scope();
+                let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
+                for &r in refs {
+                    let _ = crate::gc_roots::publish_one_at(stack_slot, r);
+                }
+                crate::gc_roots::normalize_at(stack_slot, root_base, 1 + refs.len());
+                Self {
+                    stack_slot,
+                    save_point,
+                    root_base,
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// Same contract as [`Self::new`].
+    pub unsafe fn new0(obj: PyObjectRef) -> Self {
+        let (stack_slot, save_point) = Self::open_scope();
+        let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
+        crate::gc_roots::normalize_at(stack_slot, root_base, 1);
+        Self {
+            stack_slot,
+            save_point,
+            root_base,
+        }
+    }
+
+    /// # Safety
+    /// Same contract as [`Self::new`].
+    pub unsafe fn new1(obj: PyObjectRef, a: PyObjectRef) -> Self {
+        let (stack_slot, save_point) = Self::open_scope();
+        let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
+        let _ = crate::gc_roots::publish_one_at(stack_slot, a);
+        crate::gc_roots::normalize_at(stack_slot, root_base, 2);
+        Self {
+            stack_slot,
+            save_point,
+            root_base,
+        }
+    }
+
+    /// # Safety
+    /// Same contract as [`Self::new`].
+    pub unsafe fn new2(obj: PyObjectRef, a: PyObjectRef, b: PyObjectRef) -> Self {
+        let (stack_slot, save_point) = Self::open_scope();
+        let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
+        let _ = crate::gc_roots::publish_one_at(stack_slot, a);
+        let _ = crate::gc_roots::publish_one_at(stack_slot, b);
+        crate::gc_roots::normalize_at(stack_slot, root_base, 3);
+        Self {
+            stack_slot,
+            save_point,
+            root_base,
+        }
+    }
+
+    /// # Safety
+    /// Same contract as [`Self::new`].
+    pub unsafe fn new3(obj: PyObjectRef, a: PyObjectRef, b: PyObjectRef, c: PyObjectRef) -> Self {
+        let (stack_slot, save_point) = Self::open_scope();
+        let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
+        let _ = crate::gc_roots::publish_one_at(stack_slot, a);
+        let _ = crate::gc_roots::publish_one_at(stack_slot, b);
+        let _ = crate::gc_roots::publish_one_at(stack_slot, c);
+        crate::gc_roots::normalize_at(stack_slot, root_base, 4);
+        Self {
+            stack_slot,
+            save_point,
+            root_base,
+        }
     }
 
     /// Re-read a rooted operand.
@@ -2102,17 +2179,23 @@ impl DictOperationGuard {
     /// `object_key_for_checked`, which runs the key's own `__hash__`.
     #[inline]
     pub fn root(&self, index: usize) -> PyObjectRef {
-        self.roots.get(self.root_base + index)
+        crate::gc_roots::get_at(self.stack_slot, self.root_base + index)
+    }
+}
+
+impl Drop for DictOperationGuard {
+    fn drop(&mut self) {
+        crate::gc_roots::shadow_stack_cell_truncate(self.stack_slot, self.save_point);
     }
 }
 
 macro_rules! lock_dict_refs {
     ($guard:ident, $obj:ident) => {
-        let $guard = unsafe { DictOperationGuard::new($obj, &[]) };
+        let $guard = unsafe { DictOperationGuard::new0($obj) };
         let $obj = $guard.root(0);
     };
     ($guard:ident, $obj:ident, $one:ident) => {
-        let $guard = unsafe { DictOperationGuard::new($obj, &[$one]) };
+        let $guard = unsafe { DictOperationGuard::new1($obj, $one) };
         let $obj = $guard.root(0);
         let $one = $guard.root(1);
     };
@@ -2120,7 +2203,7 @@ macro_rules! lock_dict_refs {
     // dictionary follows a step that collects reads it off `root(0)` there,
     // and a binding here would only offer the pre-collection word.
     (defer $guard:ident, $obj:ident, $one:ident) => {
-        let $guard = unsafe { DictOperationGuard::new($obj, &[$one]) };
+        let $guard = unsafe { DictOperationGuard::new1($obj, $one) };
         let $one = $guard.root(1);
     };
     // Both words are re-read from the guard after a collecting step, so the
@@ -2129,13 +2212,13 @@ macro_rules! lock_dict_refs {
         let $guard = unsafe { DictOperationGuard::new($obj, &[$one]) };
     };
     ($guard:ident, $obj:ident, $one:ident, $two:ident) => {
-        let $guard = unsafe { DictOperationGuard::new($obj, &[$one, $two]) };
+        let $guard = unsafe { DictOperationGuard::new2($obj, $one, $two) };
         let $obj = $guard.root(0);
         let $one = $guard.root(1);
         let $two = $guard.root(2);
     };
     ($guard:ident, $obj:ident, $one:ident, $two:ident, $three:ident) => {
-        let $guard = unsafe { DictOperationGuard::new($obj, &[$one, $two, $three]) };
+        let $guard = unsafe { DictOperationGuard::new3($obj, $one, $two, $three) };
         let $obj = $guard.root(0);
         let $one = $guard.root(1);
         let $two = $guard.root(2);
@@ -4123,6 +4206,34 @@ pub unsafe fn w_dict_getitem_str_hashed(
     w_dict_get_strategy(obj).getitem_str_hashed(obj, key, hash)
 }
 
+/// Word-ABI residual of [`w_dict_getitem_str_hashed`].
+///
+/// PyPy's `getitem_str(w_dict, key)` takes an rpython `str` (`Ptr(STR)`,
+/// one GCREF). pyre's borrowed `&str` is two words, so a residual of
+/// the `&str` spelling cannot describe the key. The wrapped name from
+/// `co_names_w` is already one GCREF. Null result is a miss (`None`).
+///
+/// Residualised so interpret does not walk the `DictStrategy` trait
+/// object: `&dyn Trait` is also two words, and a parentless
+/// `method_getitem_str_hashed` getfield at offset 0 answers 0.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_getitem_str_hashed_w(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    hash: i64,
+) -> PyObjectRef {
+    if obj.is_null() || key.is_null() {
+        return crate::pyobject::PY_NULL;
+    }
+    lock_dict_refs!(_dict_guard, obj, key);
+    // A lone-surrogate name has no `&str` view; it takes `space.getitem`.
+    let found = match crate::unicodeobject::w_str_get_value_opt(key) {
+        Some(s) => w_dict_getitem_str_hashed(obj, s, hash),
+        None => w_dict_lookup(obj, key),
+    };
+    found.unwrap_or(crate::pyobject::PY_NULL)
+}
+
 /// Error-propagating sibling of [`w_dict_getitem_str`], the str-keyed
 /// counterpart of [`w_dict_lookup_checked`].
 ///
@@ -4157,6 +4268,26 @@ pub unsafe fn w_dict_getitem_str_checked_hashed(
         return Err(DictKeyError);
     }
     Ok(hit)
+}
+
+/// [`w_dict_getitem_str_checked_hashed`] over a wrapped name.
+///
+/// # Safety
+/// Same as [`w_dict_getitem_str_checked_hashed`]; `key` is an exact `str`.
+pub unsafe fn w_dict_getitem_str_checked_hashed_w(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    hash: i64,
+) -> Result<Option<PyObjectRef>, DictKeyError> {
+    let hit = w_dict_getitem_str_hashed_w(obj, key, hash);
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    if hit.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(hit))
+    }
 }
 
 /// Internal helper for `ObjectDictStrategy::getitem_str`. Kept as a free
@@ -4234,6 +4365,31 @@ pub unsafe fn w_dict_setitem_str_hashed(
     }
     lock_dict_refs!(_dict_guard, obj, value);
     w_dict_get_strategy(obj).setitem_str_hashed(obj, key, hash, value)
+}
+
+/// Word-ABI residual of [`w_dict_setitem_str_hashed`].
+///
+/// PyPy's `setitem_str(w_dict, key, w_value)` takes an rpython `str`
+/// (`Ptr(STR)`, one GCREF). pyre's borrowed `&str` is two words, so a
+/// residual of the `&str` spelling cannot be bound and stays a
+/// symbolic hash. The wrapped name from `co_names_w` is already one
+/// GCREF.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_setitem_str_hashed_w(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    hash: i64,
+    value: PyObjectRef,
+) {
+    if obj.is_null() || key.is_null() {
+        return;
+    }
+    lock_dict_refs!(_dict_guard, obj, value, key);
+    // A lone-surrogate name has no `&str` view; it takes `space.setitem`.
+    match crate::unicodeobject::w_str_get_value_opt(key) {
+        Some(s) => w_dict_setitem_str_hashed(obj, s, hash, value),
+        None => w_dict_store(obj, key, value),
+    }
 }
 
 /// Compatibility spelling retained until the remaining callers are collapsed.

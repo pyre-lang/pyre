@@ -14,6 +14,7 @@
 //! / `_getnewargs`.
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 use crate::PyResult;
 use crate::error::PyError;
@@ -448,10 +449,14 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         let w_type = crate::typedef::r#type(current_obj())
             .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
         let supplies_getstate = unsafe {
-            let w_cls_getstate =
-                crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__getstate__");
-            let w_obj_getstate =
-                crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__getstate__");
+            let w_cls_getstate = crate::baseobjspace::lookup_in_type(
+                w_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getstate__")),
+            );
+            let w_obj_getstate = crate::baseobjspace::lookup_in_type(
+                crate::typedef::w_object(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getstate__")),
+            );
             match (w_cls_getstate, w_obj_getstate) {
                 (Some(w_cls), Some(w_obj)) => !crate::baseobjspace::is_w(w_cls, w_obj),
                 (w_cls, _) => w_cls.is_some(),

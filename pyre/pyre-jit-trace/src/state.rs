@@ -2426,6 +2426,51 @@ pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, 
 /// frame/ec colors from the current MIFrame's own red inputs. Root bridge
 /// setup keeps `ec` in its second root inputarg, outside the resumed
 /// MIFrame's semantic register bank.
+/// Recover the portal `ec` red for a bridge.
+///
+/// The translated portal jitcode is installed with degenerate
+/// `portal_ec_reg = u16::MAX` (`from_core_degenerate`), so the color
+/// lookup below is usually empty. The peel still carries `ec` as a
+/// loop-carried red; when the failing guard snapshotted that box it
+/// sits in `fail_values` and must be rebound as the matching bridge
+/// inputarg. A residual `getexecutioncontext` would leave a Call after
+/// opt; a missing box becomes `OpRef::NONE` and `close_bridge` panics
+/// in `arg_to_box`.
+fn recover_bridge_execution_context(
+    ctx: &mut majit_metainterp::TraceCtx,
+    portal_ec_reg: u16,
+    bridge_registers_r: &[OpRef],
+    fail_values: &[i64],
+    fail_types: &[Type],
+) -> OpRef {
+    if portal_ec_reg != u16::MAX
+        && let Some(&op) = bridge_registers_r.get(portal_ec_reg as usize)
+        && !op.is_none()
+    {
+        return op;
+    }
+    let ec_ptr = pyre_interpreter::call::getexecutioncontext() as i64;
+    if ec_ptr == 0 {
+        return OpRef::NONE;
+    }
+    for (i, (&val, &ty)) in fail_values.iter().zip(fail_types.iter()).enumerate() {
+        if ty == Type::Ref && val == ec_ptr {
+            return OpRef::input_arg_typed(i as u32, Type::Ref);
+        }
+    }
+    for &op in bridge_registers_r {
+        if op.is_none() {
+            continue;
+        }
+        if let Some(majit_ir::Value::Ref(r)) = ctx.concrete_of_opref(op)
+            && r.0 as i64 == ec_ptr
+        {
+            return op;
+        }
+    }
+    ctx.const_ref(ec_ptr)
+}
+
 pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -7901,7 +7946,14 @@ impl PyreJitState {
     }
 
     fn frame_ptr(&self) -> Option<*mut u8> {
-        (self.frame != 0).then_some(self.frame as *mut u8)
+        // An abort writeback can leave a leftover integer in `frame`
+        // (0, or a small/unaligned word). Those are not PyFrame
+        // pointers; refuse them so last_instr restore cannot fault.
+        let p = self.frame;
+        if p < 0x1000 || p % std::mem::align_of::<PyFrame>() != 0 {
+            return None;
+        }
+        Some(p as *mut u8)
     }
 
     fn frame_array(&self, offset: usize) -> Option<&pyre_object::FixedObjectArray> {
@@ -7974,6 +8026,13 @@ impl PyreJitState {
         let Some(&frame) = values.first() else {
             return;
         };
+        // The red `frame` word of resume data is a live `PyFrame`
+        // (`resume.py rebuild_from_resumedata`). Rebuilding onto anything
+        // else would resume with the pc, pycode, locals and stack missing.
+        assert!(
+            frame as usize >= 0x1000 && frame as usize % std::mem::align_of::<PyFrame>() == 0,
+            "resume data red frame word {frame:#x} is not a PyFrame"
+        );
         self.frame = frame as usize;
         if values.len() == 1 {
             return;
@@ -8066,32 +8125,32 @@ impl PyreJitState {
     // directly to the heap.  These accessors do the same via frame_ptr.
 
     pub fn last_instr_as_usize(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe { (*(frame_ptr as *const PyFrame)).last_instr as usize }
     }
 
     pub fn set_last_instr(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (*(frame_ptr as *mut PyFrame)).last_instr = value as isize;
         }
     }
 
     pub fn next_instr(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe { (&*(frame_ptr as *const PyFrame)).next_instr() }
     }
 
     pub fn set_next_instr(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (&mut *(frame_ptr as *mut PyFrame)).set_last_instr_from_next_instr(value);
         }
@@ -8099,14 +8158,11 @@ impl PyreJitState {
 
     pub fn valuestackdepth(&self) -> usize {
         self.read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+            .unwrap_or(0)
     }
 
     pub fn set_valuestackdepth(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
+        let _ = self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value);
     }
 
     /// Null the locals_cells_stack slots at and above `depth`, the
@@ -8121,8 +8177,7 @@ impl PyreJitState {
 
     /// Read the code pointer (pycode) from the heap frame.
     pub fn pycode_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_PYCODE_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+        self.read_frame_usize(PYFRAME_PYCODE_OFFSET).unwrap_or(0)
     }
 
     /// Read the execution context red independently of the virtualizable frame.
@@ -8146,9 +8201,9 @@ impl PyreJitState {
 
     /// Read the namespace pointer from the heap frame.
     pub fn namespace_as_usize(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe {
             (&*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame)).get_w_globals() as usize
         }
@@ -8157,10 +8212,7 @@ impl PyreJitState {
     /// Write the pycode pointer to the heap frame.
     /// virtualizable.py write_boxes: ALL static fields written.
     pub fn set_pycode(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(PYFRAME_PYCODE_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
+        let _ = self.write_frame_usize(PYFRAME_PYCODE_OFFSET, value);
     }
 
     /// Compatibility wrapper for older callers that still speak in
@@ -8170,9 +8222,9 @@ impl PyreJitState {
     }
 
     pub fn set_namespace(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (&mut *(frame_ptr as *mut pyre_interpreter::pyframe::PyFrame))
                 .set_w_globals(value as pyre_object::PyObjectRef);
@@ -11000,6 +11052,11 @@ impl JitState for PyreJitState {
         // pyre `concrete_locals` / `concrete_stack` mirror is filled at seed
         // and is not updated by `setarrayitem_vable`, so it lags the traced
         // body (e.g. `i` still the header value after `i = i + 1`).
+        // Portal interpret (`pypyjit_create_sym`) never fills
+        // `concrete_locals`. Inventing `PY_NULL` for those slots makes
+        // `restore_values` wipe function locals (`i`, `total`) after
+        // CloseLoop. Residuals already mutated the live PyFrame, so read
+        // it when the box and the seed mirror are both empty.
         let array_slots = live_arg_boxes.len().saturating_sub(num_scalars);
         for slot in 0..array_slots {
             let vable_idx = num_vable_scalars + slot;
@@ -11012,24 +11069,31 @@ impl JitState for PyreJitState {
                         .and_then(|opref| ctx.box_value(*opref))
                 })
                 .unwrap_or_else(|| {
-                    let concrete = if slot < sym.nlocals {
-                        sym.concrete_locals
-                            .get(slot)
-                            .copied()
-                            .unwrap_or(ConcreteValue::Ref(PY_NULL))
-                    } else {
-                        let stack_idx = slot - sym.nlocals;
-                        let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
-                        if stack_idx < live_stack {
-                            sym.concrete_stack
-                                .get(stack_idx)
+                    if !sym.concrete_locals.is_empty() {
+                        let concrete = if slot < sym.nlocals {
+                            sym.concrete_locals
+                                .get(slot)
                                 .copied()
                                 .unwrap_or(ConcreteValue::Ref(PY_NULL))
                         } else {
-                            ConcreteValue::Ref(PY_NULL)
-                        }
-                    };
-                    Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize))
+                            let stack_idx = slot - sym.nlocals;
+                            let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
+                            if stack_idx < live_stack {
+                                sym.concrete_stack
+                                    .get(stack_idx)
+                                    .copied()
+                                    .unwrap_or(ConcreteValue::Ref(PY_NULL))
+                            } else {
+                                ConcreteValue::Ref(PY_NULL)
+                            }
+                        };
+                        Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize))
+                    } else if frame_addr != 0 {
+                        let obj = concrete_stack_value(frame_addr, slot).unwrap_or(PY_NULL);
+                        Value::Ref(majit_ir::GcRef(obj as usize))
+                    } else {
+                        Value::Ref(majit_ir::GcRef(PY_NULL as usize))
+                    }
                 });
             values.push(value);
         }
@@ -11648,14 +11712,13 @@ impl JitState for PyreJitState {
                 // `MIFrame::ensure_execution_context`, which reads the thread's own
                 // context instead.
                 let (_, portal_ec_reg) = portal_red_regs_at(frame0.jitcode_index);
-                let bridge_execution_context = (portal_ec_reg != u16::MAX)
-                    .then(|| {
-                        bridge_registers_r
-                            .get(portal_ec_reg as usize)
-                            .copied()
-                            .unwrap_or(OpRef::NONE)
-                    })
-                    .unwrap_or(OpRef::NONE);
+                let bridge_execution_context = recover_bridge_execution_context(
+                    ctx,
+                    portal_ec_reg,
+                    &bridge_registers_r,
+                    fail_values,
+                    fail_types,
+                );
                 // Reconstruct the slot-indexed semantic register file
                 // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
                 // The decode just filled `bridge_registers_r` by abstract-register
@@ -12480,6 +12543,25 @@ impl JitState for PyreJitState {
         })
     }
 
+    fn jitcode_at_resume_index(
+        index: i32,
+    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+        if index < 0 {
+            return None;
+        }
+        let index = index as usize;
+        if let Some(portal) = crate::jitcode_runtime::portal_metainterp_jitcode()
+            && portal.try_index() == Some(index)
+        {
+            return Some(portal);
+        }
+        crate::jitcode_runtime::get_jitcode_by_index(index).map(|canonical| {
+            std::sync::Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
+                (*canonical).clone(),
+            ))
+        })
+    }
+
     /// pyjitpl.py `handle_guard_failure` → `_prepare_resume_from_failure` →
     /// `interpret()` from the rebuilt resume framestack (`resume.py`
     /// `rebuild_from_resumedata`, one MIFrame per jitcode header). Generated
@@ -12526,13 +12608,15 @@ impl JitState for PyreJitState {
             header_pc: outer_program_pc,
             redboxes: Vec::new(),
         };
-        Some(majit_metainterp::trace_jitcode_at_resume_framestack(
-            ctx,
-            &mut portal_sym,
-            frames,
-            outer_program_pc,
-            runtime,
-        ))
+        Some(
+            majit_metainterp::trace_jitcode_at_resume_framestack_allowing_residuals(
+                ctx,
+                &mut portal_sym,
+                frames,
+                outer_program_pc,
+                runtime,
+            ),
+        )
     }
 
     /// pyjitpl.py get_procedure_token: compute green key for a PC.

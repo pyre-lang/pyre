@@ -906,7 +906,11 @@ unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
 /// `%(key)s` spec can index it.
 unsafe fn has_getitem(obj: PyObjectRef) -> bool {
     match crate::typedef::r#type(obj) {
-        Some(tp) => crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__getitem__").is_some(),
+        Some(tp) => crate::baseobjspace::lookup_in_type(
+            tp.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
+        )
+        .is_some(),
         None => false,
     }
 }
@@ -1071,7 +1075,11 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
 /// True when `obj`'s type carries `name` above `object`'s default.
 unsafe fn has_dunder(obj: PyObjectRef, name: &str) -> bool {
     match crate::typedef::r#type(obj) {
-        Some(tp) => crate::baseobjspace::lookup_in_type(tp.as_ptr(), name).is_some(),
+        Some(tp) => crate::baseobjspace::lookup_in_type(
+            tp.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+        .is_some(),
         None => false,
     }
 }

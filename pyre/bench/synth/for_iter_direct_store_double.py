@@ -4,7 +4,6 @@
 # PyPy (whose oracle reports trace-too-long and segmenting aborts here).  Local
 # post-parity runs are 0.4-0.5x; the ceiling is twice the slowest, rounded up to
 # one decimal place.
-# pyre-check: spec-folds=store_attr_direct
 try:
     import pypyjit
 except ImportError:

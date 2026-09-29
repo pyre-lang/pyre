@@ -728,6 +728,17 @@ pub trait JitState: Sized {
         None
     }
 
+    /// Resolve a resume-section jitcode index the driver's
+    /// `MetaInterp.jitcodes` table does not hold.
+    ///
+    /// Portal traces stamp build-time portal indices onto every resume
+    /// section. Those live in the process-global build-time table, not
+    /// in `staticdata.jitcodes`, until a `#[jit_interp]` frontend
+    /// registers its dispatch JitCode. The default is "no other table".
+    fn jitcode_at_resume_index(_index: i32) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
+        None
+    }
+
     /// pyjitpl.py compile_loop parity: build final meta from
     /// the MergePoint that matched at close time, not from the trace start.
     ///

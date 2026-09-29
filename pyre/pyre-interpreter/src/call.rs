@@ -41,10 +41,12 @@ struct FrameLocalsRoot {
 }
 
 impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
+    /// Look-inside: the 2-word `{frame, registered}` return cannot be a
+    /// residual. The interior slot address stays inside the word-ABI
+    /// [`crate::pyframe::register_frame_locals_slot`] residual.
     fn new(frame: &PyFrame) -> Self {
         let frame = frame as *const PyFrame as *mut PyFrame;
-        let registered = unsafe { register_frame_locals_slot(frame) };
+        let registered = unsafe { crate::pyframe::register_frame_locals_slot(frame) };
         Self { frame, registered }
     }
 
@@ -56,23 +58,9 @@ impl FrameLocalsRoot {
 impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
         if self.registered {
-            unregister_frame_locals_slot(self.frame);
+            crate::pyframe::unregister_frame_locals_slot(self.frame);
         }
     }
-}
-
-#[majit_macros::dont_look_inside]
-unsafe fn register_frame_locals_slot(frame: *mut PyFrame) -> bool {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) }
-        as *mut pyre_object::gc_hook::GCREF;
-    unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
-}
-
-#[majit_macros::dont_look_inside]
-fn unregister_frame_locals_slot(frame: *mut PyFrame) {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) }
-        as *mut pyre_object::gc_hook::GCREF;
-    pyre_object::gc_hook::try_gc_remove_root(slot);
 }
 
 thread_local! {
@@ -2320,9 +2308,12 @@ fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
-    let Some(mut call_descr) =
-        (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__call__") })
-    else {
+    let Some(mut call_descr) = (unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__")),
+        )
+    }) else {
         return Ok(None);
     };
     let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, w_type.as_ptr())) }?
@@ -2345,9 +2336,12 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
-    let Some(mut call_descr) =
-        (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__call__") })
-    else {
+    let Some(mut call_descr) = (unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__")),
+        )
+    }) else {
         return Ok(None);
     };
     let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, w_type.as_ptr())) }?
@@ -2367,8 +2361,12 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
         return Ok(None);
     };
     let w_type = w_type.as_ptr();
-    let Some(mut call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
-    else {
+    let Some(mut call_fn) = (unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__")),
+        )
+    }) else {
         return Ok(None);
     };
     // `A.__call__ = A()` makes this edge feed itself, and the callers below
@@ -2458,7 +2456,89 @@ fn call_callable_with_mode(
         }
         return call_callable_with_mode(execution_context, func, &call_args, mode, profile_frame);
     }
+    // One-arg type call (`ValueError("v")`) is a word residual so the
+    // exception-bridge walk can construct the instance instead of
+    // residualising the slice-ABI generic dispatcher.
+    if unsafe { pyre_object::is_type(callable) } && args.len() == 1 {
+        let value = call_type_one_arg(execution_context, callable, args[0]);
+        if value.is_null() {
+            return Err(
+                take_call_error().unwrap_or_else(|| PyError::type_error("constructor failed"))
+            );
+        }
+        return Ok(value);
+    }
     call_non_function_callable_with_mode(execution_context, callable, args, mode, profile_frame)
+}
+
+/// Zero-arg CALL as two word values (`frame`, callable). Portal jitcode
+/// must not carry a `&[]` slice operand — that serializes as a non-GC
+/// `Array<*mut PyObject;0>` Ref and `ARRAYLEN_GC` faults on it.
+/// `descroperation.py get_and_call_function(w_descr, w_obj)` has no extra
+/// `*args_w` list at arity 0; this is that specialized graph.
+/// Errors go through [`set_call_error`]; a null return is the failure.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub extern "C" fn call_zero_arg_in_frame(
+    frame: *mut PyFrame,
+    callable: PyObjectRef,
+) -> PyObjectRef {
+    if frame.is_null() {
+        set_call_error(PyError::type_error("call failed"));
+        return pyre_object::PY_NULL;
+    }
+    match call_callable(unsafe { &mut *frame }, callable, &[]) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// One-arg CALL as three word values (`frame`, callable, arg). Portal
+/// interpret cannot rebuild a `&[T]` from residual boxes — that SIGBUS'd
+/// in `pin_roots` — so `opcode_call` nargs=1 residual-calls this instead.
+/// Errors go through [`set_call_error`]; a null return is the failure.
+///
+/// `extern "C"` plus `inline(never)`: a Rust `fn(&mut PyFrame, …)` was
+/// emitted as an extract-time code address (not a symbolic path hash),
+/// which SIGSEGV'd at runtime. The C ABI matches `cpa3` remapping.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub extern "C" fn call_one_arg_in_frame(
+    frame: *mut PyFrame,
+    callable: PyObjectRef,
+    arg: PyObjectRef,
+) -> PyObjectRef {
+    if frame.is_null() {
+        set_call_error(PyError::type_error("call failed"));
+        return pyre_object::PY_NULL;
+    }
+    match call_callable(unsafe { &mut *frame }, callable, std::slice::from_ref(&arg)) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// Word ABI for `Type(arg)`. The generic dispatcher takes a slice and
+/// returns `Result`, which cannot be a residual.
+#[majit_macros::dont_look_inside]
+pub fn call_type_one_arg(
+    execution_context: *const crate::PyExecutionContext,
+    w_type: PyObjectRef,
+    w_arg: PyObjectRef,
+) -> PyObjectRef {
+    match type_descr_call_with_mode(execution_context, w_type, &[w_arg], CallMode::Plain) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
 }
 
 #[inline(never)]
@@ -2786,7 +2866,12 @@ pub(crate) fn resolve_kwargs(
         // back to __new__ (e.g. immutable types, metaclasses).
         // PyPy: typeobject.py descr_call → Arguments._match_signature
         //   resolves against the winning __init__ or __new__.
-        let init_fn = unsafe { crate::baseobjspace::lookup_in_type(callable, "__init__") };
+        let init_fn = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                callable,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+            )
+        };
         if let Some(init_fn) = init_fn {
             if unsafe { crate::is_function(init_fn) } {
                 (init_fn, 1usize) // __init__(self, ...) → skip self
@@ -2798,9 +2883,12 @@ pub(crate) fn resolve_kwargs(
                     pyre_object::PY_NULL
                 };
                 let w_winner = calculate_metaclass(callable, bases_arg).unwrap_or(callable);
-                if let Some(new_fn) =
-                    unsafe { crate::baseobjspace::lookup_in_type(w_winner, "__new__") }
-                {
+                if let Some(new_fn) = unsafe {
+                    crate::baseobjspace::lookup_in_type(
+                        w_winner,
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+                    )
+                } {
                     let new_fn = unsafe { unwrap_static_new(new_fn) };
                     if unsafe { crate::is_function(new_fn) } {
                         (new_fn, 1usize)
@@ -4578,9 +4666,12 @@ fn call_with_kwargs_in_ctx_impl(
         let _ = pyre_object::gc_roots::pin_root(w_metaclass);
         let current_metaclass = || pyre_object::gc_roots::shadow_stack_get(metaclass_slot);
         // Step 1: __new__(cls, *args, **kwargs)
-        let instance = if let Some(new_fn) =
-            unsafe { crate::baseobjspace::lookup_in_type(current_metaclass(), "__new__") }
-        {
+        let instance = if let Some(new_fn) = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                current_metaclass(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            )
+        } {
             let new_fn = unsafe { unwrap_static_new(new_fn) };
             let mut new_args = Vec::with_capacity(1 + npos);
             // `lookup_in_type` interns its name and can collect; reload the
@@ -4612,9 +4703,12 @@ fn call_with_kwargs_in_ctx_impl(
         if let Some(w_insttype) = type_call_init_type(
             pyre_object::gc_roots::shadow_stack_get(instance_slot),
             current_type(),
-        ) && let Some(init_descr) =
-            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-        {
+        ) && let Some(init_descr) = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_insttype,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+            )
+        } {
             // typeobject.py `space.get_and_call_args`: exact
             // Function takes the instance explicitly; every other descriptor
             // binds itself and receives only the original constructor args.
@@ -5099,7 +5193,12 @@ fn type_call_vectorcall(
 /// `is_builtin_code`'s `is_function` set.  Read the carrier, not the
 /// public class.
 fn type_slot_accepts_keywords(w_type: PyObjectRef, name: &str) -> bool {
-    let Some(func) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }) else {
+    let Some(func) = (unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    }) else {
         return false;
     };
     if !unsafe { crate::function::is_function_carrier(func) } {
@@ -5296,9 +5395,12 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
         return PY_NULL;
     }
     // Step 1: __new__
-    let instance = if let Some(new_fn) =
-        unsafe { crate::baseobjspace::lookup_in_type(current_type(), "__new__") }
-    {
+    let instance = if let Some(new_fn) = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            current_type(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    } {
         let mut new_args = Vec::with_capacity(1 + args_len);
         new_args.push(current_type());
         extend_current_args(&mut new_args);
@@ -5315,9 +5417,12 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
     if let Some(w_insttype) = type_call_init_type(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
         current_type(),
-    ) && let Some(init_fn) =
-        unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-    {
+    ) && let Some(init_fn) = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_insttype,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+        )
+    } {
         let mut init_args = Vec::with_capacity(1 + args_len);
         init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
         extend_current_args(&mut init_args);
@@ -5641,7 +5746,12 @@ fn call_metaclass_with_kwargs(
         Vec::new()
     };
     // Find the metaclass __new__ method
-    let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass(), "__new__") };
+    let new_fn = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_metaclass(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    };
 
     let instance = if let Some(new_fn) = new_fn {
         let new_fn = unsafe { unwrap_static_new(new_fn) };
@@ -5728,9 +5838,12 @@ fn call_metaclass_with_kwargs(
     if let Some(w_insttype) = type_call_init_type(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
         w_metaclass(),
-    ) && let Some(init_fn) =
-        unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-    {
+    ) && let Some(init_fn) = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_insttype,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+        )
+    } {
         let is_user_fn = unsafe { crate::is_function(init_fn) }
             && unsafe {
                 !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)
@@ -7339,9 +7452,12 @@ fn type_descr_call_with_mode(
     // mro-without-object case) raises, otherwise the descriptor is bound via
     // `space.get(w_newdescr, space.w_None, w_type=self)` and called with
     // w_type as the first arg.
-    let Some(new_descr) =
-        (unsafe { crate::baseobjspace::lookup_in_type(current_type(), "__new__") })
-    else {
+    let Some(new_descr) = (unsafe {
+        crate::baseobjspace::lookup_in_type(
+            current_type(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    }) else {
         // typeobject.py:715 — `raise oefmt(space.w_TypeError,
         // "cannot create '%N' instances", self)`.
         let name = unsafe { pyre_object::w_type_get_name(current_type()) };
@@ -7380,8 +7496,12 @@ fn type_descr_call_with_mode(
     // Step 2: __init__ — only if __new__ returned an instance of w_type.
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
     if let Some(w_insttype) = type_call_init_type(current_instance(), current_type())
-        && let Some(init_descr) =
-            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+        && let Some(init_descr) = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_insttype,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+            )
+        }
     {
         // `get_and_call_args`: a slot wrapper is an interp2app Function there,
         // so it takes the instance explicitly like one.

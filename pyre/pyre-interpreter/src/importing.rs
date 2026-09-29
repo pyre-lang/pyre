@@ -6324,7 +6324,7 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
             if unsafe {
                 crate::baseobjspace::lookup_in_type(
                     pyre_object::gc_roots::shadow_stack_get(base + 1),
-                    "__spec__",
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__spec__")),
                 )
             }
             .is_some()
@@ -6379,7 +6379,7 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
             if unsafe {
                 crate::baseobjspace::lookup_in_type(
                     pyre_object::gc_roots::shadow_stack_get(spec_base + 1),
-                    "_initializing",
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("_initializing")),
                 )
             }
             .is_some()
@@ -6436,7 +6436,14 @@ pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
     }
     match dict_getitem_str_no_callback(dict, "__path__")? {
         None => {
-            if unsafe { crate::baseobjspace::lookup_in_type(w_type, "__path__") }.is_some() {
+            if unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    w_type,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__path__")),
+                )
+            }
+            .is_some()
+            {
                 None
             } else {
                 Some(false)
@@ -9170,7 +9177,11 @@ mod tests {
                 "a function is a non-data descriptor"
             );
             assert!(
-                crate::baseobjspace::lookup_in_type(spec_cls, "_initializing").is_some(),
+                crate::baseobjspace::lookup_in_type(
+                    spec_cls,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("_initializing"))
+                )
+                .is_some(),
                 "the type still exposes _initializing after the dict miss"
             );
         }

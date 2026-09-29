@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=50
-# pyre-check: spec-folds=builtin_getattr
 # pyre-check: trace-shape=main:absent=CallMayForceR
 # PyPy traces through builtin getattr for lone-surrogate names just as it does
 # for ordinary names.  The pyre fold keeps the WTF-8 name intact, virtualizes

@@ -1324,6 +1324,31 @@ mod tests {
     }
 
     #[test]
+    fn materialize_type_static_consts_overwrites_sentinel_with_live_int_type() {
+        use majit_jitcode::jitcode::TypeStaticConstDescriptor;
+
+        let jc = JitCode::new("test");
+        jc.set_body(JitCodeBody {
+            type_static_consts: vec![TypeStaticConstDescriptor {
+                constants_r_index: 0,
+                name: "pyobject::INT_TYPE".into(),
+            }],
+            constants_r: vec![
+                (majit_jitcode::codewriter::assembler::TYPE_STATIC_CONST_SENTINEL_BASE).into(),
+            ],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        materialize_type_static_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_eq!(
+            addr,
+            &pyre_object::INT_TYPE as *const _ as i64,
+            "sentinel must become the live INT_TYPE address"
+        );
+    }
+
+    #[test]
     fn materialize_unit_variant_consts_interns_one_cell_per_qualname() {
         let mut jcs = vec![
             jitcode_with_unit_variant_consts(vec![unit_variant_desc("JitAction::Return", 1)]),
@@ -2665,5 +2690,23 @@ mod tests {
             unbound.is_empty(),
             "type statics without a runtime address: {unbound:?}"
         );
+    }
+
+    #[test]
+    fn materialize_str_consts_unicode_object_slot_is_the_wrapper() {
+        let descs = vec![StrConstDescriptor {
+            constants_r_index: 0,
+            bytes: b"__add__".to_vec(),
+            precomputed_hash: 0,
+            as_unicode_object: true,
+        }];
+        let mut jcs = vec![jitcode_with_str_consts(descs)];
+        materialize_str_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        let wrapper =
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__add__"));
+        assert_eq!(addr, wrapper as i64);
+        let storage = unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) } as i64;
+        assert_ne!(addr, storage, "w_name is the wrapper, not the rstr payload");
     }
 }

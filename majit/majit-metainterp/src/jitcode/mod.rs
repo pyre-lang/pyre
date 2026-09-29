@@ -1198,6 +1198,32 @@ impl JitCode {
         }
         Ok(site)
     }
+
+    /// `pyjitpl.py MIFrame.make_result_of_lastop`: the dest register is
+    /// `ord(self.bytecode[self.pc-1])` and the bank is
+    /// `self.jitcode._resulttypes[self.pc]`.
+    ///
+    /// A caller suspended in a residual `CALL` (not `BC_INLINE_CALL`) still
+    /// records that pair. Resume uses it to wire the callee's return when
+    /// `inline_call_ending_at` cannot see an inline-call encoding.
+    pub fn result_slot_at_pc(&self, pc: usize) -> Option<(JitArgKind, usize)> {
+        let body = self.try_body()?;
+        let kind = body
+            .resulttypes
+            .as_ref()
+            .and_then(|types| types.get(&pc).copied())?;
+        let dest = *body.code.get(pc.checked_sub(1)?)?;
+        if dest == NO_RETURN_REG {
+            return None;
+        }
+        let kind = match kind {
+            'i' => JitArgKind::Int,
+            'r' => JitArgKind::Ref,
+            'f' => JitArgKind::Float,
+            _ => return None,
+        };
+        Some((kind, dest as usize))
+    }
 }
 
 /// Why [`JitCode::inline_resume_site_for`] declined a caller/callee pair.

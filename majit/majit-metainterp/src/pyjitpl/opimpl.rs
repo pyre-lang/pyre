@@ -745,6 +745,16 @@ where
             {
                 majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
             }
+            let shadow = match bytecode {
+                jitcode::insns::BC_SETFIELD_GC_R => {
+                    majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize))
+                }
+                jitcode::insns::BC_SETFIELD_GC_F => {
+                    majit_ir::Value::Float(f64::from_bits(concrete as u64))
+                }
+                _ => majit_ir::Value::Int(concrete),
+            };
+            ctx.sync_shadow_if_vable_heap_store(struct_ptr, offset, value_opref, shadow);
         }
         TraceAction::Continue
     }
@@ -5764,6 +5774,17 @@ where
             let is_loopinvariant =
                 effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
 
+            if let Some(action) = self.try_record_set_current_exception(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                effectinfo.runtime_helper,
+                &args,
+                &raw_r,
+            ) {
+                return action;
+            }
+
             // pyjitpl.py execute_varargs parity (plain
             // CALL_N / LOOPINVARIANT_N branch) and pyjitpl.py
             // (MAY_FORCE_N branch).  Both branches share the same
@@ -5863,6 +5884,26 @@ where
             // vrefs.
             if is_forces {
                 ctx.vrefs_after_residual_call();
+            }
+            // `frame_anchor_release` is the drop of a tracing-only
+            // shadow-stack slot. `interp_jit.py` `dispatch` has no
+            // counterpart; skip the `CallN` when the helper ran.
+            // `stack_check` is the same: compiled loops poll the
+            // breaker on the back-edge (`rstack.py`). Skip only
+            // when the helper did not publish an exception.
+            if let Some(spec) = crate::box_trace::void_skip_residual()
+                && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                && crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) == 0
+            {
+                if is_forces
+                    && matches!(
+                        self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                        TraceAction::Abort
+                    )
+                {
+                    return TraceAction::Abort;
+                }
+                return TraceAction::Continue;
             }
             // 3. record IR (`history.record` →
             //    `_record_helper_varargs`). pyjitpl.py
@@ -6174,12 +6215,44 @@ where
             {
                 return action;
             }
+            // `dont_look_inside_cannot_raise` residuals skip the
+            // may_force finalize. `dispatch_exception_handler`
+            // still `frame.push`es the caught exception, so the
+            // heap vsd moves while the vable shadow does not.
+            // Reload vsd/stack only — a full static reload
+            // clobbers last_instr (shadow newer than heap).
+            ctx.reload_vable_stack_if_heap_moved();
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
             // `is_forces` because the before-hook only stamps
             // TOKEN_TRACING_RESCALL in that branch).
             if is_forces {
                 ctx.vrefs_after_residual_call();
+            }
+            // `gc_interp::enabled` is `@elidable` (`rlib/jit.py`):
+            // the env read is cached. Record the traced constant
+            // instead of `CallI` so compiled loops do not keep the
+            // residual the frozen jitcode still emits.
+            // `ll_issubclass` is `@elidable_cannot_raise`
+            // (`rclass.py`); same fold. An elidable result is a
+            // constant only when every argument is one
+            // (`pyjitpl.py execute_varargs` pure path); a variable
+            // input keeps the recorded call below.
+            if let Some(spec) = crate::box_trace::elidable_int_residual()
+                && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                && args.iter().all(|arg| arg.is_constant())
+            {
+                let folded = ctx.const_int(concrete);
+                self.set_int_reg(ctx, dst, Some(folded), Some(concrete));
+                if is_forces
+                    && matches!(
+                        self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                        TraceAction::Abort
+                    )
+                {
+                    return TraceAction::Abort;
+                }
+                return TraceAction::Continue;
             }
             // pyjitpl.py do_residual_call plain branch:
             //     pure = effectinfo.check_is_elidable()
@@ -6273,13 +6346,18 @@ where
                     let frame = self.frames.current_mut();
                     eprintln!(
                         "[interpret] residual may_force jitcode={} last_op={} cursor={} \
-                         extraeffect={:?} can_raise={} next={:?}",
+                         extraeffect={:?} can_raise={} next={:?} fnaddr={:#x} classes={:?} \
+                         ret={} last_exc={:#x}",
                         frame.jitcode.name(),
                         frame.last_opcode_position,
                         frame.code_cursor,
                         effectinfo.extraeffect,
                         effectinfo.check_can_raise(false),
                         frame.jitcode.code.get(frame.code_cursor),
+                        concrete_ptr as usize,
+                        calldescr.arg_classes,
+                        concrete,
+                        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
                     );
                 }
                 let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -6483,6 +6561,25 @@ where
                 return TraceAction::Continue;
             }
 
+            if let Some(action) = self.try_record_load_global_exc_class(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                &raw_i,
+                dst,
+            ) {
+                return action;
+            }
+            if let Some(action) = self.try_record_get_current_exception(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                effectinfo.runtime_helper,
+                dst,
+            ) {
+                return action;
+            }
+
             // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_R branch parity:
             // clear_exception precedes vable_and_vrefs_before_residual_call
             // (vrefs walk + vinfo stamp; see void arm for full citation).
@@ -6521,12 +6618,62 @@ where
             {
                 return action;
             }
+            // `dont_look_inside_cannot_raise` residuals skip the
+            // may_force finalize. `dispatch_exception_handler`
+            // still `frame.push`es the caught exception, so the
+            // heap vsd moves while the vable shadow does not.
+            // Reload vsd/stack only — a full static reload
+            // clobbers last_instr (shadow newer than heap).
+            ctx.reload_vable_stack_if_heap_moved();
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
             // `is_forces` because the before-hook only stamps
             // TOKEN_TRACING_RESCALL in that branch).
             if is_forces {
                 ctx.vrefs_after_residual_call();
+            }
+            // interp_jit.py `PyFrame.dispatch` has no per-opcode
+            // `reload_top_root`. When the live result equals the
+            // argument, no collection moved it — record the
+            // identity instead of `CallR`.
+            if let Some(spec) = crate::box_trace::identity_ref_residual()
+                && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                && let Some(&raw_op) = args.first()
+            {
+                let arg_bits = raw_r.first().copied().unwrap_or(0);
+                if concrete == arg_bits {
+                    self.set_ref_reg(ctx, dst, Some(raw_op), Some(concrete));
+                    if is_forces
+                        && matches!(
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                            TraceAction::Abort
+                        )
+                    {
+                        return TraceAction::Abort;
+                    }
+                    return TraceAction::Continue;
+                }
+            }
+            // `frame_anchor_live` rereads the red frame. Reuse
+            // the standard virtualizable OpRef when the concrete
+            // equals that frame. The recorded push keeps the depth word so
+            // blackhole resume still has the depth.
+            if let Some(spec) = crate::box_trace::frame_anchor_live_residual()
+                && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                && let Some(vable) = ctx.standard_virtualizable_box()
+                && let Some(ptr) = ctx.standard_virtualizable_ptr()
+                && concrete == ptr as i64
+            {
+                self.set_ref_reg(ctx, dst, Some(vable), Some(concrete));
+                if is_forces
+                    && matches!(
+                        self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                        TraceAction::Abort
+                    )
+                {
+                    return TraceAction::Abort;
+                }
+                return TraceAction::Continue;
             }
             // pyjitpl.py do_residual_call plain branch —
             // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.

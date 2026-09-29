@@ -8,6 +8,7 @@
 
 use super::pyobject::{self, CPyObject, REFCNT_FROM_PYPY, REFCNT_IMMORTAL};
 use pyre_object::{PY_NULL, PyObjectRef};
+use rustpython_wtf8::Wtf8;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 
 /// `PyVarObject` — a `PyObject` with the variable-part length.
@@ -963,8 +964,13 @@ fn slot_method(
     };
     // The fill installs a slot only for a name the type has, so a miss here
     // is the type having lost it since.
-    unsafe { crate::baseobjspace::lookup_in_type(w_type, method) }
-        .ok_or_else(|| crate::PyError::type_error(format!("the type no longer defines {method}")))
+    unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(method)),
+        )
+    }
+    .ok_or_else(|| crate::PyError::type_error(format!("the type no longer defines {method}")))
 }
 
 /// `space.call_function(w_type.lookup(method), w_self, *arguments)`.
@@ -2154,7 +2160,15 @@ fn bound_or_shared(
 /// slots `w_type` answers for itself.
 fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
     let heaptype = unsafe { pyre_object::typeobject::w_type_is_heaptype(w_type) };
-    let defines = |method| unsafe { crate::baseobjspace::lookup_in_type(w_type, method) }.is_some();
+    let defines = |method| {
+        unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(method)),
+            )
+        }
+        .is_some()
+    };
     macro_rules! fill {
         ($table:ident) => {
             for (method, function, access) in $table {
@@ -5425,7 +5439,12 @@ fn stamp_objclass(w_type: PyObjectRef, tp: *mut CPyTypeObject) {
     }
     for name in names {
         let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
-        if let Some(descriptor) = unsafe { crate::baseobjspace::lookup_in_type(w_type, &name) } {
+        if let Some(descriptor) = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name.as_str())),
+            )
+        } {
             carrier_set(
                 descriptor,
                 OBJCLASS_KEY,
@@ -5731,8 +5750,17 @@ fn base_supplies_new(base: *mut CPyTypeObject) -> bool {
     !w_base.is_null()
         && !w_object.is_null()
         && !std::ptr::eq(w_base, w_object)
-        && unsafe { crate::baseobjspace::lookup_in_type(w_base, "__new__") }
-            != unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") }
+        && unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_base,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            )
+        } != unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_object,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            )
+        }
 }
 
 /// The layout a type readied over `w_base` gives its instances: the base's

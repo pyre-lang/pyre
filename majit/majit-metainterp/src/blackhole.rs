@@ -4652,6 +4652,62 @@ mod tests {
             bh.copy_data_from_miframe(&frame);
         }
 
+        /// `blackhole.py` `bhimpl_cast_ptr_to_int` / `bhimpl_cast_int_to_ptr`
+        /// are identity on the word. An even (aligned) pointer must round-trip;
+        /// pyre pointers are raw words, not lltype tagged immediates.
+        #[test]
+        fn convert_and_run_cast_ptr_int_is_identity_on_an_even_word() {
+            use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_translate::insns;
+
+            const PTR: i64 = 0x1000;
+            assert_eq!(PTR & 1, 0, "fixture: the word must be even");
+
+            let mut b = JitCodeBuilder::default();
+            b.record_cast_ptr_to_int(0, 0);
+            b.int_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.ref_regs[0] = Some(OpRef::const_ptr(GcRef(PTR as usize)));
+            let framestack = MIFrameStack::new(frame);
+
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            entries.insert("cast_ptr_to_int/r>i".to_string(), insns::BC_CAST_PTR_TO_INT);
+            entries.insert("int_return/i".to_string(), insns::BC_INT_RETURN);
+            builder.setup_insns(&entries);
+            wire_bhimpl_handlers(&mut builder);
+
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameInt(PTR)
+            );
+
+            let mut b = JitCodeBuilder::default();
+            b.record_cast_int_to_ptr(0, 0);
+            b.ref_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.int_regs[0] = Some(OpRef::const_int(PTR));
+            let framestack = MIFrameStack::new(frame);
+
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            entries.insert("cast_int_to_ptr/i>r".to_string(), insns::BC_CAST_INT_TO_PTR);
+            entries.insert("ref_return/r".to_string(), insns::BC_REF_RETURN);
+            builder.setup_insns(&entries);
+            wire_bhimpl_handlers(&mut builder);
+
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameRef(GcRef(PTR as usize))
+            );
+        }
+
         /// `BlackholeInterpreter._copy_data_from_miframe` reads each
         /// `registers_i[i].getint()`. For a ConstInt that means the inline
         /// `value`, never pyre's execution mirror.
@@ -5653,6 +5709,28 @@ mod tests {
                 "`conditional_call_ir_v/iiIRd` (byte {}) is unwired in the production builder",
                 insns::BC_CONDITIONAL_CALL_IR_V,
             );
+        }
+
+        /// `cast_ptr_to_int` / `cast_int_to_ptr` are ordinary
+        /// `pyjitpl.py` `opimpl_*` unaries. A guard-failure resume that
+        /// lands on either byte must hit the already-wired `bhimpl_*`
+        /// handlers, including on even (aligned) pointer words.
+        #[test]
+        fn production_bh_builder_wires_cast_ptr_int() {
+            use majit_jitcode::insns;
+            let builder =
+                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            for (opname, byte) in [
+                ("cast_ptr_to_int/r>i", insns::BC_CAST_PTR_TO_INT),
+                ("cast_int_to_ptr/i>r", insns::BC_CAST_INT_TO_PTR),
+            ] {
+                let slot = builder.dispatch_table[byte as usize];
+                assert_ne!(
+                    slot as usize, placeholder as usize,
+                    "`{opname}` (byte {byte}) is unwired in the production builder",
+                );
+            }
         }
 
         /// `complex` arithmetic reaches the three interior-field loads in
@@ -10497,6 +10575,20 @@ fn debug_assert_constant_slot_untouched(index: usize, num_regs: usize, who: &str
     }
 }
 
+/// Rewrite a `symbolic_fnaddr_for_path` hash the host published for
+/// blackhole-only execute. An address that stays unresolved is not a
+/// callable.
+fn require_callable_fnaddr(bh: &mut BlackholeInterpreter, func: i64) -> Result<i64, DispatchError> {
+    if is_callable_fnaddr(func) {
+        return Ok(func);
+    }
+    let resolved = crate::resolve_symbolic_residual_fnaddr(func);
+    if is_callable_fnaddr(resolved) {
+        return Ok(resolved);
+    }
+    Err(reject_unresolved_call(bh, func))
+}
+
 fn reject_unresolved_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchError {
     if crate::majit_log_enabled() {
         eprintln!(
@@ -10549,10 +10641,7 @@ fn handler_residual_call_irf_i(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10571,10 +10660,7 @@ fn handler_residual_call_irf_r(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10593,10 +10679,7 @@ fn handler_residual_call_irf_f(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10615,10 +10698,7 @@ fn handler_residual_call_irf_v(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10637,10 +10717,7 @@ fn handler_residual_call_ir_i(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_ir(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10659,10 +10736,7 @@ fn handler_residual_call_ir_r(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_ir(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10681,10 +10755,7 @@ fn handler_residual_call_ir_v(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_ir(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10702,10 +10773,7 @@ fn handler_residual_call_r_i(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10724,10 +10792,7 @@ fn handler_residual_call_r_r(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -10746,10 +10811,7 @@ fn handler_residual_call_r_v(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let mut lists = read_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
@@ -12826,20 +12888,17 @@ fn handler_debug_fatalerror(
         .collect();
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
-/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (the tagging arithmetic lives at the erase site, never here); the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `ll_assert` remains a translated runtime assertion.
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. Identity reinterpret of a
+/// pointer word as an int. Upstream's `ll_assert((i & 1) == 1)` is
+/// lltype tagged-immediate specific; pyre pointers are raw words.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
-/// before it is reinterpreted as a `GCREF`.
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity reinterpret of an
+/// int word as a pointer. Upstream's `ll_assert((i & 1) == 1)` is
+/// lltype tagged-immediate specific; pyre pointers are raw words.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 
@@ -12874,7 +12933,7 @@ fn handler_getfield_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
@@ -12886,7 +12945,7 @@ fn handler_getfield_vable_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
@@ -12898,7 +12957,7 @@ fn handler_getfield_vable_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
@@ -12912,7 +12971,7 @@ fn handler_setfield_vable_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_i[code[p + 1] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
@@ -12930,7 +12989,7 @@ fn handler_setfield_vable_i_imm(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = (code[p + 1] as u16 | ((code[p + 2] as u16) << 8)) as i64;
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 3);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
@@ -12943,7 +13002,7 @@ fn handler_setfield_vable_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_r[code[p + 1] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
@@ -12956,7 +13015,7 @@ fn handler_setfield_vable_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
@@ -12983,15 +13042,17 @@ fn handler_setfield_vable_f(
 /// release builds, since the alternative is silent unsafe deref of a
 /// null pointer.
 fn vable_clear_token_and_get_vinfo(
-    bh: &BlackholeInterpreter,
+    bh: &mut BlackholeInterpreter,
     vable: i64,
-) -> (&'static crate::virtualizable::VirtualizableInfo, i64) {
+) -> Result<(&'static crate::virtualizable::VirtualizableInfo, i64), DispatchError> {
     if bh.virtualizable_info.is_null() {
-        panic!(
-            "vable opcode requires `bh.virtualizable_info` to be set \
-             (RPython `BlackholeInterpreter.bhimpl_*field_vable_*` parity); \
-             a null pointer here is a contract bug, not a recoverable case"
-        );
+        // A helper body interpreted because its fnaddr is still symbolic
+        // can reach a vable opcode on a frame that never received the
+        // portal vinfo. Hand the continuation back to the interpreter
+        // rather than treat the missing handle as a process-fatal bug.
+        bh.aborted = true;
+        bh.abort_permanent_bail = true;
+        return Err(DispatchError::LeaveFrame);
     }
     let bh_vinfo = unsafe { &*bh.virtualizable_info };
     // blackhole.py `fielddescr.get_vinfo().clear_vable_token(struct)`.
@@ -13011,7 +13072,7 @@ fn vable_clear_token_and_get_vinfo(
         .unwrap_or(bh_vinfo);
     let vable =
         unsafe { crate::virtualizable::bh_clear_vable_token(clear_info, vable as *mut u8) } as i64;
-    (bh_vinfo, vable)
+    Ok((bh_vinfo, vable))
 }
 
 /// Decode the vable-array descr pair after the register operands and
@@ -13021,20 +13082,20 @@ fn vable_clear_token_and_get_vinfo(
 /// `bhimpl_arraylen_vable` all start
 /// `fielddescr.get_vinfo().clear_vable_token(vable)` then load the array
 /// through `cpu.bh_getfield_gc_r`.
-fn take_vable_array<'a>(
-    bh: &'a BlackholeInterpreter,
+fn take_vable_array(
+    bh: &mut BlackholeInterpreter,
     vable: i64,
     code: &[u8],
     descr_pos: usize,
-) -> (&'a crate::virtualizable::VableArrayInfo, usize, i64) {
-    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable);
+) -> Result<(&'static crate::virtualizable::VableArrayInfo, usize, i64), DispatchError> {
+    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable)?;
     let (_field_descr, array_idx, p) = read_descr_vable_array(bh, code, descr_pos);
     let (_array_descr, pos) = read_descr(bh, code, p);
     // Item access goes through `vable_read_array_item` /
     // `vable_write_array_item`, which follow `EmbeddedArray`'s container
     // pointer as well as a direct `Ptr(GcArray)`.
     let info = &vinfo.array_fields[array_idx];
-    (info, pos, vable)
+    Ok((info, pos, vable))
 }
 
 // Virtualizable array operations (`bhimpl_getarrayitem_vable_*`)
@@ -13045,7 +13106,7 @@ fn handler_getarrayitem_vable_i(
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2)?;
     bh.registers_i[code[p] as usize] =
         unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
     Ok(p + 1)
@@ -13058,7 +13119,7 @@ fn handler_getarrayitem_vable_r(
     let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2)?;
     let value =
         unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
@@ -13078,7 +13139,7 @@ fn handler_setarrayitem_vable_i(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3)?;
     unsafe {
         crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
     }
@@ -13093,7 +13154,7 @@ fn handler_setarrayitem_vable_r(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3)?;
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
         eprintln!(
             "[nbody-debug][bh-vable-set-r] position={} last_opcode_position={} index={} value={:#x}",
@@ -13111,7 +13172,7 @@ fn handler_arraylen_vable(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 1);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 1)?;
     bh.registers_i[code[p] as usize] =
         unsafe { crate::virtualizable::bhimpl_arraylen_vable(vable as *const u8, ainfo) as i64 };
     Ok(p + 1)
@@ -13133,7 +13194,7 @@ fn handler_arraybase_vable(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable);
+    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable)?;
     let (field_descr, p) = read_descr(bh, code, p + 1);
     let array_idx = field_descr.as_vable_array_index();
     let (_, p) = read_descr(bh, code, p);
@@ -13184,9 +13245,7 @@ fn handler_conditional_call_ir_v(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     if condition != 0 {
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
+        let func = require_callable_fnaddr(bh, func)?;
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
         bh.cpu()
@@ -13206,9 +13265,7 @@ fn handler_conditional_call_value_ir_i(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     if value == 0 {
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
+        let func = require_callable_fnaddr(bh, func)?;
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
         value = bh
@@ -13235,9 +13292,7 @@ fn handler_conditional_call_value_ir_r(
     let calldescr = calldescr_handle.get();
     let mut value = value_root.get().0 as i64;
     if value == 0 {
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
+        let func = require_callable_fnaddr(bh, func)?;
         bh.last_exc().set(0);
         let (ai, ar) = lists.banks();
         value = bh
@@ -13718,7 +13773,7 @@ fn handler_getarrayitem_vable_f(
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2)?;
     bh.registers_f[code[p] as usize] =
         unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
     Ok(p + 1)
@@ -13732,7 +13787,7 @@ fn handler_setarrayitem_vable_f(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_f[code[p + 2] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3)?;
     unsafe {
         crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
     }
@@ -13970,7 +14025,46 @@ fn reject_unresolved_inline_call(
         "inline jitcode[{jitcode_index}] fnaddr={fnaddr:#x}"
     ));
     bh.aborted = true;
+    bh.abort_permanent_bail = true;
     DispatchError::LeaveFrame
+}
+
+/// `front::mir` aliases `&FrameAnchor` to the depth word. A tracing-time
+/// slot index is always `< 0x1000`; a live frame pointer is not.
+fn is_stale_frame_anchor_word(word: i64) -> bool {
+    word > 0 && (word as u64) < 0x1000
+}
+
+fn is_frame_anchor_self_callee(name: &str) -> bool {
+    name == "push_anchored" || name == "push_on_self" || name == "frame_anchor_live"
+}
+
+/// Interpret folds `live` to the red vable (`FrameAnchorLiveResidual`).
+/// Resume still has the slot index. Replace that word with this
+/// blackhole level's virtualizable — the same red frame the parent
+/// `MIFrame` / `BlackholeInterpreter` is interpreting, not the portal
+/// TLS `CURRENT_FRAME`. An inlined callee has its own virtualizable.
+fn rewrite_stale_frame_anchor_self(callee: &mut BlackholeInterpreter, name: &str) {
+    if !is_frame_anchor_self_callee(name) {
+        return;
+    }
+    // Prefer this level's virtualizable (the inlined callee's own
+    // frame). Fall back to the TLS current frame only when this
+    // blackhole has no vable — libffi callbacks resume without one.
+    let frame = if callee.virtualizable_ptr != 0 {
+        callee.virtualizable_ptr
+    } else {
+        crate::bh_portal_frame()
+    };
+    if frame == 0 {
+        return;
+    }
+    if is_stale_frame_anchor_word(callee.registers_r[0]) {
+        callee.registers_r[0] = frame;
+    }
+    if is_stale_frame_anchor_word(callee.registers_i[0]) {
+        callee.registers_i[0] = frame;
+    }
 }
 
 /// Byte-interpret a canonical `inline_call_*` whose `fnaddr` is symbolic.
@@ -14026,6 +14120,7 @@ fn interpret_unresolved_inline_call(
             sub_jitcode.name,
         );
     }
+    let callee_name = sub_jitcode.name.clone();
     let mut callee = bh
         .inline_callee_scratch
         .take()
@@ -14047,6 +14142,12 @@ fn interpret_unresolved_inline_call(
             callee.registers_f[index] = value;
         }
     }
+    // `front::mir` aliases `&FrameAnchor` to the depth word. Interpret
+    // folds `live` to the red vable (`FrameAnchorLiveResidual`); resume
+    // still has the tracing-time slot. Replace that word with this
+    // level's virtualizable (`clone_context_from` copies the parent's).
+    rewrite_stale_frame_anchor_self(&mut callee, callee_name.as_str());
+
 
     let outcome = 'callee: {
         match callee.run() {

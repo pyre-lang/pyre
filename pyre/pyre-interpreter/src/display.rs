@@ -102,9 +102,10 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, method)) =
-            crate::baseobjspace::lookup_where_with_method_cache(w_type.as_ptr(), name)
-        else {
+        let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+            w_type.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        ) else {
             return Ok(None);
         };
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
@@ -646,8 +647,10 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, found)) = crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
-        else {
+        let Some((src, found)) = crate::baseobjspace::lookup_where_with_method_cache(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        ) else {
             return Ok(None);
         };
         // `object`'s inherited default is not a leaf override — fall through
@@ -753,9 +756,10 @@ pub(crate) unsafe fn type_metaclass_dunder_obj(
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, method)) =
-            crate::baseobjspace::lookup_where_with_method_cache(metaclass.as_ptr(), name)
-        else {
+        let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+            metaclass.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        ) else {
             return Ok(None);
         };
         if std::ptr::eq(src, crate::typedef::w_type())
@@ -800,9 +804,10 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, method)) =
-            crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
-        else {
+        let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        ) else {
             return Ok(None);
         };
         // `object`'s and `BaseException`'s registrations are the two the
@@ -857,9 +862,10 @@ unsafe fn module_user_dunder_obj(
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, method)) =
-            crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
-        else {
+        let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        ) else {
             return Ok(None);
         };
         if method.is_null()
@@ -979,9 +985,10 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 // resolves `__repr__` to `object` — fall through to the
                 // tuple formatting in that case rather than printing the
                 // generic `<object at ...>`.
-                if let Some((src, method)) =
-                    crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
-                    && !std::ptr::eq(src, crate::typedef::w_object())
+                if let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+                    w_class,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__repr__")),
+                ) && !std::ptr::eq(src, crate::typedef::w_object())
                     && !method.is_null()
                 {
                     // The walk above allocates: re-read the receiver so the
@@ -1345,8 +1352,10 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // path above.
             let w_class = (*obj()).w_class;
             if !w_class.is_null()
-                && let Some((src, method)) =
-                    crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
+                && let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+                    w_class,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__repr__")),
+                )
                 && !std::ptr::eq(src, crate::typedef::w_object())
                 && !method.is_null()
             {

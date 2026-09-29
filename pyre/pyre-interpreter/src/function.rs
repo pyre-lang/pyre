@@ -4279,9 +4279,12 @@ pub fn register_sys_exc_info_path(code: PyObjectRef, direct_fn: ExcInfoDirectFn)
     let _ = SYS_EXC_INFO_DIRECT_FN.set(direct_fn);
 }
 
+/// The slot is only compared by identity against a function's code and never
+/// dereferenced through, so the read is a plain `Relaxed` load of the
+/// space-wide attribute (`space._code_of_sys_exc_info`).
 #[inline]
 fn sys_exc_info_code() -> PyObjectRef {
-    SYS_EXC_INFO_CODE.load(std::sync::atomic::Ordering::Acquire)
+    SYS_EXC_INFO_CODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[inline]
@@ -4478,29 +4481,32 @@ pub fn funccall_valuestack(
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1
     {
+        let live = unsafe { &*caller.live() };
+        let w_obj = live.peekvalue(nargs - 1);
+        let mut args = live.make_arguments(nargs - 1, false, func);
         // Same live-variable set as the fixed-arity arm above, for the same
         // two reasons: `dropvalues()` retires the frame slots that root these
-        // values, and the native Vec is not a root walker target.
-        // `builtin_code_call` roots nothing of its own, so pin `code` first,
-        // then read the `[w_obj, ...rest]` window from the live frame and
-        // publish it in one `pin_roots`.
+        // values, and `args.arguments_w` is a native Vec no root walker updates.
+        // Pin `[code, w_obj, ...args]` before `dropvalues` (`framework.py
+        // push_roots`); `function.py funccall_valuestack` then calls
+        // `code.funcrun_obj(self, w_obj, args)`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.base();
         let _ = _roots.pin_root(code as PyObjectRef);
-        let mut args = unsafe { &*caller.live() }.make_arguments(nargs, false, func);
+        let _ = _roots.pin_root(w_obj);
         let _ = _roots.pin_roots(&args.arguments_w);
         unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+        let code_now = _roots.get(root_base);
+        let w_obj_now = _roots.get(root_base + 1);
         pyre_object::gc_roots::shadow_stack_copy_range_into_vec(
-            root_base + 1,
+            root_base + 2,
             &mut args.arguments_w,
         );
-        return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args.arguments_w) } {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        };
+        return crate::gateway::BuiltinCodePassThroughArguments1::funcrun_obj(
+            code_now,
+            w_obj_now,
+            args.arguments_w,
+        );
     }
 
     // function.py:201-203 — fallback: build Arguments via make_arguments
@@ -4615,14 +4621,9 @@ fn _flat_pycall(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py` `_flat_pycall` returns `new_frame.run(...)`.
+        // `call::eval_current_frame_raw` is that call (`dont_look_inside`).
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 
@@ -4716,14 +4717,8 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py` `_flat_pycall_defaults` returns `new_frame.run(...)`.
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 

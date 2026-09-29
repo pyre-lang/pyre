@@ -626,7 +626,11 @@ mod tests {
             }
             assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
 
-            crate::baseobjspace::object_delattr(obj, "x").unwrap();
+            crate::baseobjspace::object_delattr(
+                obj,
+                pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("x")),
+            )
+            .unwrap();
             assert!(crate::baseobjspace::getdictvalue_native(obj, "x").is_none());
             assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
         }

@@ -4,6 +4,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 const LOCATION_ATTRIBUTES: &[&str] = &["lineno", "col_offset", "end_lineno", "end_col_offset"];
 
@@ -356,13 +357,22 @@ fn call_type_with_raw_kwargs(
     if unsafe { pyre_object::w_instance_get_type(w_type) } != crate::typedef::w_type() {
         return None;
     }
-    let init_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") }?;
+    let init_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__"))) }?;
     if !is_ast_method_descriptor(init_descr, ast_init) {
         return None;
     }
-    let new_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }?;
-    let object_new =
-        unsafe { crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__new__") }?;
+    let new_descr = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    }?;
+    let object_new = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            crate::typedef::w_object(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    }?;
     if new_descr != object_new {
         return None;
     }

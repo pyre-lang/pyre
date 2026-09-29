@@ -44,6 +44,20 @@ pub trait SharedOpcodeHandler {
         callable: Self::Value,
         args: &[Self::Value],
     ) -> OpcodeResult<Self::Value>;
+    /// Zero-arg CALL as one word value so portal jitcode never records a
+    /// `&[]` slice operand. A default that writes `&[]` is the ARRAYLEN_GC
+    /// path on a non-GC empty array constant.
+    fn call_callable_zero(&mut self, callable: Self::Value) -> OpcodeResult<Self::Value>;
+    /// One-arg CALL as two word values so portal interpret never rebuilds
+    /// a `&[T]` residual and dereferences a symbolic pointer.
+    ///
+    /// No default: a default that writes `&[arg]` is what the translator
+    /// monomorphises for `opcode_call`, and that slice is the SIGBUS path.
+    fn call_callable_one(
+        &mut self,
+        callable: Self::Value,
+        arg: Self::Value,
+    ) -> OpcodeResult<Self::Value>;
     fn build_list(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
     /// pyopcode.py BUILD_LIST_FROM_ARG: size an empty list from `iter`'s
     /// length hint and return `(list, iter)` with `iter` reloaded after the
@@ -102,7 +116,7 @@ pub fn opcode_call<H: SharedOpcodeHandler + ?Sized>(
             let _null_or_self = handler.pop_value()?;
             let callable = handler.pop_value()?;
             let anchor = handler.anchor();
-            let result = handler.call_callable(callable, &[])?;
+            let result = handler.call_callable_zero(callable)?;
             H::push_anchored(&anchor, result)
         }
         1 => {
@@ -110,7 +124,7 @@ pub fn opcode_call<H: SharedOpcodeHandler + ?Sized>(
             let _null_or_self = handler.pop_value()?;
             let callable = handler.pop_value()?;
             let anchor = handler.anchor();
-            let result = handler.call_callable(callable, &[a0])?;
+            let result = handler.call_callable_one(callable, a0)?;
             H::push_anchored(&anchor, result)
         }
         2 => {

@@ -3522,6 +3522,32 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// `jitexc.DoneWithThisFrameRef.result` of a single-pass walk that
+    /// returned from its root frame: `MetaInterp.finishframe` raises it
+    /// after `compile_done_with_this_frame`, and `ll_portal_runner`
+    /// (warmspot.py) catches it and returns the value. Consumes the
+    /// `single_pass_finish` flag with its payload, so `None` means the walk
+    /// did not finish with a Ref result.
+    pub fn take_done_with_this_frame_ref(&mut self) -> Option<majit_ir::GcRef> {
+        let result = self.done_with_this_frame_ref();
+        self.meta.single_pass_finish = false;
+        self.meta.single_pass_finish_values = None;
+        result
+    }
+
+    /// Peek at [`Self::take_done_with_this_frame_ref`]'s answer without
+    /// consuming it. The value stays rooted in `single_pass_finish_values`
+    /// until the caller takes it.
+    pub fn done_with_this_frame_ref(&self) -> Option<majit_ir::GcRef> {
+        if !self.meta.single_pass_finish {
+            return None;
+        }
+        match self.meta.single_pass_finish_values.as_ref()?.first() {
+            Some(Value::Ref(r)) => Some(*r),
+            _ => None,
+        }
+    }
+
     /// Float FINISH result produced by a single-pass tracing walk.
     pub fn take_single_pass_finish_float(&mut self) -> Option<f64> {
         let values = self.meta.single_pass_finish_values.take()?;
@@ -4104,6 +4130,33 @@ impl<S: JitState> JitDriver<S> {
     ) {
         self.compile_trace_success = true;
         self.continue_running_normally_payload = values.map(|values| (values, restart_pc));
+    }
+
+    /// A `compile_loop` that gave up after taking the trace ctx leaves no
+    /// trace to continue, while the walk that reached this merge point has
+    /// already executed every residual call on the way. Upstream never
+    /// reaches this state: `compile.compile_loop` returns None with the
+    /// history intact and `reached_loop_header` keeps tracing, and the
+    /// eventual `SwitchToBlackhole(ABORT_BAD_LOOP)` runs the blackhole from
+    /// the current framestack (`run_blackhole_interp_to_cancel_tracing`),
+    /// which at a merge point ends in `ContinueRunningNormally` with the
+    /// live boxes. Neither path rewinds to the trace entry. Hand the
+    /// interpreter the walk's merge-point values the same way, so the
+    /// executed iteration is not replayed over the heap it already changed.
+    ///
+    /// A walk entered at a guard's resume position hands its end state over
+    /// through the `single_pass_outcome` staged at the top of the `CloseLoop`
+    /// arm, which `bridge_from_guard_resume_position` consumes; it has no
+    /// reader for this payload.
+    fn continue_after_drained_cancel(
+        &mut self,
+        values: Option<Vec<Value>>,
+        restart_pc: Option<usize>,
+    ) {
+        if self.bridge_entered_at_guard_resume {
+            return;
+        }
+        self.note_continue_running_normally(values, restart_pc);
     }
 
     pub fn compile_trace_success_pending(&self) -> bool {
@@ -4847,6 +4900,12 @@ impl<S: JitState> JitDriver<S> {
                                 // Early cancel keeps tracing. Post-take cancel
                                 // is finished in `compile_and_record_loop` and
                                 // stays Cancelled.
+                                if !self.meta.is_tracing() {
+                                    self.continue_after_drained_cancel(
+                                        continue_running_normally_values,
+                                        None,
+                                    );
+                                }
                             }
                             crate::CompileOutcome::Aborted => {
                                 self.meta.abort_trace(false);
@@ -5078,6 +5137,12 @@ impl<S: JitState> JitDriver<S> {
                                 // Early cancel keeps tracing. Post-take cancel
                                 // is finished in `compile_and_record_loop` and
                                 // stays Cancelled.
+                                if !self.meta.is_tracing() {
+                                    self.continue_after_drained_cancel(
+                                        continue_running_normally_values,
+                                        loop_header_pc,
+                                    );
+                                }
                             }
                             crate::CompileOutcome::Aborted => {
                                 self.meta.abort_trace(false);
@@ -6107,19 +6172,26 @@ impl<S: JitState> JitDriver<S> {
     /// therefore sited BEFORE the walk: once the walk has run, the tail has
     /// happened, and handing the same guard to the blackhole would apply it a
     /// second time.
-    fn bridge_from_guard_resume_position(
+    pub fn bridge_from_guard_resume_position(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         state: &mut S,
         env: &S::Env,
         raw_values: &[i64],
         target_pc: usize,
+        // `true` when no reader has applied the guard's pending fields yet
+        // (`compile.py handle_fail` on a `#[jit_interp]` machine). Portal
+        // `decode_and_restore_guard_failure` already wrote them, so that
+        // frontend passes `false`.
+        execute_replay: bool,
     ) -> Option<PortalResume> {
         use majit_ir::resumedata::RebuiltValue;
-        // Only a state whose machine IS a dispatch jitcode has a guard
-        // position to re-enter at; every other JitState resumes through its
-        // own frontend.
-        let dispatch = self.dispatch_jitcode().cloned()?;
+        // A `#[jit_interp]` machine names its dispatch jitcode and refuses a
+        // root frame that does not. The portal frontend has no dispatch
+        // registration; it still has resume sections and a
+        // `trace_from_guard_resume_position` walk, so skip only the
+        // dispatch-identity check.
+        let dispatch = self.dispatch_jitcode().cloned();
         // The cut below is OFF by default and upstream has no equivalent:
         // `compile.py ResumeGuardDescr.handle_fail` bridges whenever
         // `must_compile` fires, whatever the guard's deferred writes look
@@ -6164,7 +6236,15 @@ impl<S: JitState> JitDriver<S> {
         }
         // No blackhole runs before this entry, so its replay is the one that
         // owes the guard's deferred writes to the heap.
-        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc, true, &[]) {
+        if !self.start_bridge_tracing(
+            descr_arc,
+            state,
+            env,
+            raw_values,
+            target_pc,
+            execute_replay,
+            &[],
+        ) {
             return None;
         }
         // From here the trace session is LIVE, so a decline has to tear it
@@ -6199,29 +6279,33 @@ impl<S: JitState> JitDriver<S> {
             // code, and the walk decodes whatever byte is there. The root frame
             // is the one this driver re-enters at, so a root that names any
             // jitcode other than the dispatch one is a decline.
-            let dispatch_index = dispatch.try_index().ok_or(Decline::NoResumeState)?;
-            let root_index = usize::try_from(
-                resume
-                    .frames
-                    .first()
-                    .ok_or(Decline::NoResumeState)?
-                    .jitcode_index,
-            )
-            .map_err(|_| Decline::ForeignJitcode)?;
-            if root_index != dispatch_index {
-                // Unlike the pending-fields decline this one cannot be
-                // hoisted: the frame it reads only exists once
-                // `rebuild_from_resumedata` has run, which is inside the call
-                // this rung is downstream of. A guard declined here therefore
-                // has had its virtuals allocated and its stores applied once
-                // before the blackhole applies them again — the re-application
-                // is idempotent (the stream carries the values, so neither
-                // pass reads what the other wrote) and the first set of
-                // virtuals becomes garbage.
-                if crate::bridge_debug_enabled() {
-                    eprintln!("[bridgeB] DECLINE root frame does not name the dispatch jitcode");
+            if let Some(dispatch) = dispatch.as_ref() {
+                let dispatch_index = dispatch.try_index().ok_or(Decline::NoResumeState)?;
+                let root_index = usize::try_from(
+                    resume
+                        .frames
+                        .first()
+                        .ok_or(Decline::NoResumeState)?
+                        .jitcode_index,
+                )
+                .map_err(|_| Decline::ForeignJitcode)?;
+                if root_index != dispatch_index {
+                    // Unlike the pending-fields decline this one cannot be
+                    // hoisted: the frame it reads only exists once
+                    // `rebuild_from_resumedata` has run, which is inside the call
+                    // this rung is downstream of. A guard declined here therefore
+                    // has had its virtuals allocated and its stores applied once
+                    // before the blackhole applies them again — the re-application
+                    // is idempotent (the stream carries the values, so neither
+                    // pass reads what the other wrote) and the first set of
+                    // virtuals becomes garbage.
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] DECLINE root frame does not name the dispatch jitcode"
+                        );
+                    }
+                    return Err(Decline::ForeignJitcode);
                 }
-                return Err(Decline::ForeignJitcode);
             }
             // `resume.py _prepare_pendingfields` replays the guard's deferred
             // heap writes through `execute_and_record`, which applies them to
@@ -6258,9 +6342,19 @@ impl<S: JitState> JitDriver<S> {
             // `opencoder.py SnapshotIterator.__init__` reverses on the WRITER
             // side, so the sections are already caller-first and
             // `rebuild_from_resumedata` just appends them as it reads.
+            //
+            // Portal traces stamp the residual-call helper chain as extra
+            // sections. Those are not `BC_INLINE_CALL` frames, so the
+            // seeder cannot recover their result slots from that opcode;
+            // `result_slot_at_pc` recovers them the way
+            // `make_result_of_lastop` does (`_resulttypes[pc]` + last
+            // bytecode byte). Dropping the helpers would restart the
+            // innermost body at pc=0 and miss the registers the guard
+            // actually held.
+            let resume_frames: &[majit_ir::resumedata::RebuiltFrame] = &resume.frames;
             let mut sections: Vec<(std::sync::Arc<crate::jitcode::JitCode>, usize)> =
-                Vec::with_capacity(resume.frames.len());
-            for frame in &resume.frames {
+                Vec::with_capacity(resume_frames.len());
+            for frame in resume_frames {
                 let Some(index) = usize::try_from(frame.jitcode_index).ok() else {
                     if crate::bridge_debug_enabled() {
                         eprintln!(
@@ -6270,7 +6364,11 @@ impl<S: JitState> JitDriver<S> {
                     }
                     return Err(Decline::UnregisteredJitcode);
                 };
-                let Some(jitcode) = jitcodes.get(index) else {
+                let Some(jitcode) = jitcodes
+                    .get(index)
+                    .cloned()
+                    .or_else(|| S::jitcode_at_resume_index(frame.jitcode_index))
+                else {
                     if crate::bridge_debug_enabled() {
                         eprintln!(
                             "[bridgeB] DECLINE unregistered jitcode_index={}",
@@ -6280,7 +6378,7 @@ impl<S: JitState> JitDriver<S> {
                     return Err(Decline::UnregisteredJitcode);
                 };
                 let pc = usize::try_from(frame.pc).map_err(|_| Decline::NoResumeState)?;
-                sections.push((jitcode.clone(), pc));
+                sections.push((jitcode, pc));
             }
             // A frame below the top is suspended inside a `BC_INLINE_CALL`
             // whose operands say which callee it is waiting on and which of its
@@ -6296,17 +6394,37 @@ impl<S: JitState> JitDriver<S> {
                     call_sites.push(None);
                     continue;
                 };
-                call_sites.push(Some(jitcode.inline_resume_site_for(*pc, callee).map_err(
-                    |why| {
+                match jitcode.inline_resume_site_for(*pc, callee) {
+                    Ok(site) => call_sites.push(Some(site)),
+                    Err(crate::jitcode::InlineResumeSiteError::NoInlineCallSite)
+                        if dispatch.is_none() =>
+                    {
+                        // A `#[jit_interp]` machine suspends outer frames on
+                        // `BC_INLINE_CALL`. Portal traces also stamp helper
+                        // jitcodes (traceback, exception normalize) whose
+                        // caller pc is a residual CALL, not that opcode.
+                        // Declining here would drop every in-frame raise
+                        // bridge. Keep the section and leave the result slot
+                        // empty — those helpers are void or write through
+                        // the exception carrier.
+                        if crate::bridge_debug_enabled() {
+                            eprintln!(
+                                "[bridgeB] portal residual-call chain depth={depth} pc={pc} jc={:?}",
+                                jitcode.name()
+                            );
+                        }
+                        call_sites.push(None);
+                    }
+                    Err(why) => {
                         if crate::bridge_debug_enabled() {
                             eprintln!(
                                 "[bridgeB] DECLINE inline resume site at depth={depth} pc={pc} jc={:?}: {why:?}",
                                 jitcode.name()
                             );
                         }
-                        why
-                    },
-                )?));
+                        return Err(why.into());
+                    }
+                }
             }
             let allocator = self.blackhole_allocator.as_deref();
             let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;
@@ -6328,7 +6446,7 @@ impl<S: JitState> JitDriver<S> {
             };
             let mut frames = Vec::with_capacity(sections.len());
             for (depth, (jitcode, pc)) in sections.into_iter().enumerate() {
-                let values = &resume.frames[depth].values;
+                let values = &resume_frames[depth].values;
                 // Every frame visits its own liveness at its own position,
                 // which is what `ResumeDataBoxReader::consume_boxes` does per
                 // `f.get_current_position_info()`: `enumerate_vars` calls one
@@ -6541,11 +6659,22 @@ impl<S: JitState> JitDriver<S> {
                     }
                     eprintln!();
                 }
+                // Innermost is suspended in a guard, not a call. Every
+                // caller is sitting at the far side of its call, so
+                // `_resulttypes[pc]` names the dest even when the
+                // encoding is a residual CALL rather than BC_INLINE_CALL.
+                let result_slot = if depth + 1 < resume_frames.len() {
+                    call_sites[depth]
+                        .and_then(|site| site.result_slot())
+                        .or_else(|| jitcode.result_slot_at_pc(pc))
+                } else {
+                    None
+                };
                 frames.push(crate::jit_state::GuardResumeFrame {
                     jitcode,
                     pc,
                     regs,
-                    result_slot: call_sites[depth].and_then(|site| site.result_slot()),
+                    result_slot,
                     // The `descrs` slot the call that pushed THIS frame named —
                     // it lives on the caller's site, one level out.
                     sub_idx: depth
@@ -7840,6 +7969,9 @@ impl<S: JitState> JitDriver<S> {
                     env,
                     &raw_values,
                     target_pc,
+                    // Portal recovery already applied the guard's pending fields.
+                    // A `#[jit_interp]` machine has not (`compile.py handle_fail`).
+                    !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE,
                 )
             };
             if let Some(resume) = bridge_pc {
@@ -11527,6 +11659,7 @@ impl<S: JitState> JitDriver<S> {
                 .unwrap_or(self.index().unwrap_or(0)),
             green_key,
         );
+        let structured_entry_keys = self.meta.structured_entry_keys;
         // pyjitpl.py `rebuild_state_after_failure` ends with
         // `synchronize_virtualizable()` / `check_synchronized_virtualizable()`,
         // both of which read the LIVE virtualizable.  Resolve it here (the same
@@ -11561,6 +11694,7 @@ impl<S: JitState> JitDriver<S> {
         // can apply bridge-only behavior without overloading
         // `has_compiled_targets_fn` presence.
         ctx.is_bridge_trace = true;
+        ctx.green_key_prepends_pc = structured_entry_keys;
         // pyjitpl.py `_handle_guard_failure`:
         //
         //     self.seen_loop_header_for_jdindex = -1

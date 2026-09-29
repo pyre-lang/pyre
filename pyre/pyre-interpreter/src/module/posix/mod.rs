@@ -30,6 +30,7 @@ pub(crate) use interp_posix::reinit_fork_tables_after_fork;
 crate::pyre_module_init!(interp_posix_wasm);
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 /// `interp_posix.urandom`, which `_random.W_Random.seed` calls directly.
 #[cfg(not(target_arch = "wasm32"))]
@@ -156,8 +157,12 @@ pub(crate) fn fspath(
     let arg = pyre_object::gc_roots::pin_root(arg);
     let path_type = crate::typedef::r#type(arg);
     if let Some(pt) = path_type
-        && let Some(fspath_descr) =
-            unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
+        && let Some(fspath_descr) = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                pt.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__fspath__")),
+            )
+        }
     {
         let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(fspath_descr);

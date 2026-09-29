@@ -1331,6 +1331,12 @@ fn refuse_walk_local_ref_args(
     if !small_ref && !bridge_store && !pointer_index {
         return None;
     }
+    // `FrameAnchor::live` residualizes `&self` as the depth word in a Ref
+    // register (`frame_anchor_live_method_jit_abi`). A live slot index is
+    // also `<= 0x1000`; running the helper is what the residual exists for.
+    if crate::allow_small_ref_residual(func) {
+        return None;
+    }
     ctx.symbolic_residual_abort = true;
     if crate::is_bridge_walking() || ctx.is_bridge_trace {
         ctx.deterministic_bridge_abort = true;
@@ -1641,6 +1647,14 @@ pub struct JitCodeMachine<'mi, S, R> {
     last_mp_red_i: Vec<u8>,
     last_mp_red_r: Vec<u8>,
     last_mp_red_f: Vec<u8>,
+    /// Runaway-trace backstop counters (`run_to_end` explains the bounds).
+    /// `run_one_step` advances them once per executed instruction.
+    walk_steps: u64,
+    walk_steps_since_growth: u64,
+    walk_last_num_ops: usize,
+    /// Compare-folded `newbool` CallR. Replaced after `IntIsTrue` of
+    /// the live compare so JUMP_IF does not list it as a failarg.
+    pending_newbool: Option<(OpRef, i64, OpRef)>,
     marker: PhantomData<(S, R)>,
 }
 
@@ -1910,7 +1924,21 @@ where
                 /* after_residual_call */ true,
             );
             if materialized {
-                ctx.reload_tokenless_virtualizable_after_residual_call();
+                if let (Some(info), Some(ptr)) = (
+                    ctx.virtualizable_info().cloned(),
+                    ctx.standard_virtualizable_ptr(),
+                ) && ctx.vable_heap_static_diverged(&info, ptr as *const u8)
+                {
+                    // Residual wrote vsd/stack without forcing the token
+                    // (`dispatch_exception_handler`). Sync only those
+                    // slots — `load_fields_from_virtualizable` would
+                    // replace resume Virtuals with heap ConstPtrs and
+                    // fold immutable `intval` to the recording-time
+                    // counter (exception-bridge hang).
+                    ctx.reload_vable_stack_if_heap_moved();
+                } else {
+                    ctx.reload_tokenless_virtualizable_after_residual_call();
+                }
             }
             TraceAction::Continue
         }
@@ -2362,6 +2390,101 @@ where
     /// no-position sentinel the loop already breaks on.
     fn guest_pc_position(pc: i64) -> usize {
         usize::try_from(pc).unwrap_or(usize::MAX)
+    }
+
+    /// Second portal red is the ExecutionContext (`reds = ['frame', 'ec']`).
+    ///
+    /// `portal_red_refs` was removed (`1e3ebc359ec`); the next snapshot
+    /// reads `registers_r` the way `pyjitpl.py replace_active_box_in_frame`
+    /// does. Recover the live EC box from those registers / a concrete
+    /// match. With no EC red in reach the specializations decline: the
+    /// recording thread's EC as a `ConstPtr` would be shared by every
+    /// thread entering the compiled loop.
+    fn portal_ec_box(&self, ctx: &mut TraceCtx) -> Option<OpRef> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        let ec_ptr = (spec.current_ec_ptr)();
+        if ec_ptr == 0 {
+            return None;
+        }
+        for frame in &self.frames.frames {
+            for (i, slot) in frame.ref_regs.iter().enumerate() {
+                let Some(op) = *slot else {
+                    continue;
+                };
+                if let Some(majit_ir::Value::Ref(r)) = ctx.concrete_of_opref(op)
+                    && r.0 as i64 == ec_ptr
+                {
+                    return Some(op);
+                }
+            }
+        }
+        None
+    }
+
+    /// `pyopcode.py LOAD_GLOBAL` of a builtin exception class: pin the
+    /// module-dict version and keep the immortal type as `ConstPtr`.
+    fn try_record_load_global_exc_class(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        raw_i: &[i64],
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if !spec.matches_load_global(concrete_ptr) && !spec.matches_load_global(trace_ptr) {
+            return None;
+        }
+        let (boxed, ptr) = (spec.emit_load_global_exc)(ctx, raw_i)?;
+        self.set_ref_reg(ctx, dst, Some(boxed), Some(ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// FBW `GetCurrentException`: `GETFIELD_GC_R(ec, sys_exc_value)`.
+    fn try_record_get_current_exception(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        runtime_helper: majit_ir::RuntimeHelperKind,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if runtime_helper != majit_ir::RuntimeHelperKind::GetCurrentException
+            && !spec.matches_get_current_exception(concrete_ptr)
+            && !spec.matches_get_current_exception(trace_ptr)
+        {
+            return None;
+        }
+        let ec = self.portal_ec_box(ctx)?;
+        let (boxed, ptr) = (spec.emit_get_current_exception)(ctx, ec);
+        self.set_ref_reg(ctx, dst, Some(boxed), Some(ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// FBW `SetCurrentException`: `SETFIELD_GC(ec, exc, sys_exc_value)`.
+    fn try_record_set_current_exception(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        runtime_helper: majit_ir::RuntimeHelperKind,
+        args: &[OpRef],
+        raw_r: &[i64],
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if runtime_helper != majit_ir::RuntimeHelperKind::SetCurrentException
+            && !spec.matches_set_current_exception(concrete_ptr)
+            && !spec.matches_set_current_exception(trace_ptr)
+        {
+            return None;
+        }
+        if args.is_empty() || raw_r.is_empty() {
+            return None;
+        }
+        let ec = self.portal_ec_box(ctx)?;
+        (spec.emit_set_current_exception)(ctx, ec, args[0], raw_r[0]);
+        Some(TraceAction::Continue)
     }
 
     /// pyjitpl.py `MIFrame._create_segmented_trace_and_blackhole`,
@@ -2855,6 +2978,10 @@ where
             last_mp_red_i: Vec::new(),
             last_mp_red_r: Vec::new(),
             last_mp_red_f: Vec::new(),
+            walk_steps: 0,
+            walk_steps_since_growth: 0,
+            walk_last_num_ops: 0,
+            pending_newbool: None,
             marker: PhantomData,
         }
     }
@@ -3422,6 +3549,20 @@ where
             .outer_program_pc
             .unwrap_or_else(|| self.frames.current_mut().pc);
         sym.begin_portal_op(portal_pc);
+        // Safety backstop against a runaway trace-recording loop.  A
+        // jitcode-level cycle that re-steps without growing the recorded op
+        // list never trips `is_too_long` (which counts ops), so the
+        // metainterp can spin unbounded and exhaust CPU/memory.  Two bounds:
+        //   * `stall_window` — abort once this many consecutive steps pass
+        //     with no new op recorded (a real trace grows ops continuously;
+        //     a non-productive spin never does).  Catches the cycle early.
+        //   * `step_limit` — absolute cap for any other runaway.
+        // `MAJIT_STALL_WINDOW` / `MAJIT_STEP_LIMIT` override for diagnosis.
+        // `run_one_step` executes many instructions per call, so it counts
+        // them itself (`count_walk_step`).
+        self.walk_steps = 0;
+        self.walk_steps_since_growth = 0;
+        self.walk_last_num_ops = ctx.num_recorded_ops();
         while !self.frames.is_empty() {
             // Catch panics from BigInt overflow in runtime stack operations.
             // RPython doesn't have this issue (no BigInt); we abort the trace.
@@ -3438,11 +3579,8 @@ where
                         } else {
                             "<non-string panic payload>"
                         };
-                        eprintln!(
-                            "[jit] trace_jitcode panic while tracing pc={}: {}",
-                            self.frames.current_mut().pc,
-                            message
-                        );
+                        let pc = self.frames.frames.last().map(|f| f.pc).unwrap_or(0);
+                        eprintln!("[jit] trace_jitcode panic while tracing pc={pc}: {message}");
                     }
                     // The unwind left `code_cursor` inside the panicking
                     // instruction, so the frames name no resumable position.
@@ -3458,11 +3596,13 @@ where
                 {
                     // Every `Finish` return drains the framestack first.
                     eprintln!(
-                        "[interpret] run_to_end action={:?} ops={} framestack drained",
+                        "[interpret] run_to_end action={:?} steps={} ops={} framestack drained",
                         action,
+                        self.walk_steps,
                         ctx.num_recorded_ops(),
                     );
                 } else if crate::majit_log_enabled() || crate::tldbg_enabled() {
+                    let steps = self.walk_steps;
                     let fr = self.frames.current_mut();
                     let last_op = fr
                         .jitcode
@@ -3477,7 +3617,7 @@ where
                         _ => "",
                     };
                     eprintln!(
-                        "[interpret] run_to_end action={:?} ops={} cursor={} last_op=0x{last_op:02x} reason={why} jitcode={}",
+                        "[interpret] run_to_end action={:?} steps={steps} ops={} cursor={} last_op=0x{last_op:02x} reason={why} jitcode={}",
                         action,
                         ctx.num_recorded_ops(),
                         fr.code_cursor,
@@ -4136,10 +4276,11 @@ where
     /// a call or a return) or an instruction ends the trace. `live` and
     /// `goto` advance the position in the loop itself.
     ///
-    /// After each executed instruction the loop returns when the frame
-    /// changed or `TraceCtx::is_too_long` is set, so `run_to_end` can answer
-    /// the overflow the way `MetaInterp.blackhole_if_trace_too_long` does.
-    /// `optrace_step` only prints when opcode tracing is on.
+    /// Two exits sit inside the loop because the checks they answer run once
+    /// per instruction: the runaway backstop (`count_walk_step`) and the
+    /// trace-length overflow `run_to_end` answers, which is left to that
+    /// caller. A `goto` counts toward the backstop too, so a cycle of `live`
+    /// and `goto` alone still reaches it.
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
         // SAFETY: the guard is a local of this call and `ctx` is borrowed for
@@ -4161,12 +4302,16 @@ where
                         .peek_u16_at(pc + 1)
                         .expect("BC_JUMP target operand is truncated")
                         as usize;
-                    self.optrace_step();
+                    if let Some(action) = self.count_walk_step(ctx) {
+                        return action;
+                    }
                     continue;
                 }
                 _ => {}
             }
-            self.optrace_step();
+            if let Some(action) = self.count_walk_step(ctx) {
+                return action;
+            }
             let action = self.execute_one_instruction(ctx, sym, runtime);
             if !matches!(action, TraceAction::Continue)
                 || self.frames.len() != depth
@@ -4177,8 +4322,17 @@ where
         }
     }
 
-    /// Print the current opcode when `optrace_enabled`. Never aborts the walk.
-    fn optrace_step(&mut self) {
+    /// Advance the walk-step counters and print under opcode tracing.
+    /// Trace length is `TraceCtx::is_too_long` (`blackhole_if_trace_too_long`).
+    fn count_walk_step(&mut self, ctx: &TraceCtx) -> Option<TraceAction> {
+        self.walk_steps += 1;
+        let n = ctx.num_recorded_ops();
+        if n > self.walk_last_num_ops {
+            self.walk_last_num_ops = n;
+            self.walk_steps_since_growth = 0;
+        } else {
+            self.walk_steps_since_growth += 1;
+        }
         if crate::optrace_enabled() {
             let fr = self.frames.current_mut();
             let cur = fr.code_cursor;
@@ -4194,6 +4348,7 @@ where
                 name
             );
         }
+        None
     }
 
     /// One instruction of [`Self::run_one_step`]'s loop: pop a finished frame,
@@ -4550,8 +4705,13 @@ where
         let opref = frame.ref_regs[reg].expect("jitcode ref register was uninitialized");
         (
             opref,
-            ctx.box_bits(opref)
-                .expect("jitcode concrete ref register was uninitialized"),
+            ctx.box_bits(opref).unwrap_or_else(|| {
+                panic!(
+                    "jitcode concrete ref register {reg} was uninitialized (pc={} jitcode={})",
+                    frame.pc,
+                    frame.jitcode.name()
+                )
+            }),
         )
     }
 
@@ -5467,6 +5627,39 @@ where
     {
         return TraceAction::Abort;
     }
+    run_resume_framestack(ctx, sym, frames, outer_program_pc, runtime)
+}
+
+/// Same walk as [`trace_jitcode_at_resume_framestack`], without the
+/// whole-body symbolic-residual gate. The portal JitCode can reach
+/// unbound helpers (`fill_user_function_args`, …) that the loop
+/// interpret already residual-calls; the gate would refuse every
+/// portal guard resume before the walk starts.
+pub fn trace_jitcode_at_resume_framestack_allowing_residuals<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    frames: &[crate::jit_state::GuardResumeFrame],
+    outer_program_pc: usize,
+    runtime: &R,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    run_resume_framestack(ctx, sym, frames, outer_program_pc, runtime)
+}
+
+fn run_resume_framestack<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    frames: &[crate::jit_state::GuardResumeFrame],
+    outer_program_pc: usize,
+    runtime: &R,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
     let mut standalone = StandaloneFrameStack::new();
     for (depth, resume_frame) in frames.iter().enumerate() {
         let mut frame = standalone.frames.take_frame(
@@ -5501,6 +5694,21 @@ where
             // `resume.py consume_boxes` stores the box; the value was
             // attached at `load_box_from_cpu` (`GuardResumeFrame.regs` producer).
             debug_assert_box_holds(ctx, reg.opref, stamped);
+        }
+        // A register the guard did not keep live is absent from resume
+        // data. The first opcode after the guard can still read it as an
+        // INLINE_CALL arg (from_exc_object's completed body is one such
+        // site). Seed a null/zero so interpret does not panic; a later
+        // use of a truly-live missing box is a liveness bug to fix.
+        for r in 0..frame.ref_regs.len() {
+            if frame.ref_regs[r].is_none() {
+                frame.ref_regs[r] = Some(ctx.const_ref(0));
+            }
+        }
+        for r in 0..frame.int_regs.len() {
+            if frame.int_regs[r].is_none() {
+                frame.int_regs[r] = Some(ctx.const_int(0));
+            }
         }
         // The walker reads from `code_cursor`; `pc` is what a snapshot taken
         // inside this frame reports. `setup_resume_at_op` is both.
@@ -10496,6 +10704,46 @@ mod tests {
             &[(JitArgKind::Int, OpRef::input_arg_int(0), 7)],
         );
         assert!(recorded.contains(&OpCode::CastIntToFloat));
+    }
+
+    #[test]
+    fn cast_ptr_to_int_walks_and_folds_a_constant_ref() {
+        // Even (aligned) pointer: pyre pointers are raw words, so the
+        // walk must not require the lltype tagged-immediate odd-int bit.
+        const PTR: i64 = 0x1000;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, PTR);
+        builder.record_cast_ptr_to_int(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastPtrToInt));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_ptr_to_int(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), PTR)],
+        );
+        assert!(recorded.contains(&OpCode::CastPtrToInt));
+    }
+
+    #[test]
+    fn cast_int_to_ptr_walks_and_folds_a_constant_int() {
+        const PTR: i64 = 0x1000;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, PTR);
+        builder.record_cast_int_to_ptr(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastIntToPtr));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_int_to_ptr(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), PTR)],
+        );
+        assert!(recorded.contains(&OpCode::CastIntToPtr));
     }
 
     #[test]

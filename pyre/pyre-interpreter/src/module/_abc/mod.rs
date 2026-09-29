@@ -10,6 +10,7 @@
 //! `__subclasses__` walk, all recursively, on every single call.
 
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // `abc_invalidation_counter` (`app_abc.py`): bumped by every successful
@@ -195,7 +196,10 @@ fn type_error_names_the_installed_class() -> bool {
 fn simple_weak_set_contains_identity() -> (usize, usize, usize, usize) {
     const NONE: (usize, usize, usize, usize) = (0, 0, 0, 0);
     let Some(method) = (unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__")
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            simple_weak_set_type(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__contains__")),
+        )
     }) else {
         return NONE;
     };

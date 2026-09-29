@@ -144,6 +144,165 @@ pub fn trace_box_int(
     obj
 }
 
+/// Residual `Ref -> Ref` helpers that return the argument when no
+/// collection moved it (`reload_top_root`, `try_gc_current_object_address`).
+/// `interp_jit.py PyFrame.dispatch` has no per-opcode frame reload; record
+/// the identity instead of `CallR` when the live result equals the arg.
+#[derive(Clone, Default)]
+pub struct IdentityRefResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl IdentityRefResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static IDENTITY_REF_RESIDUAL: std::sync::OnceLock<IdentityRefResidual> = std::sync::OnceLock::new();
+
+pub fn register_identity_ref_residual(spec: IdentityRefResidual) {
+    let _ = IDENTITY_REF_RESIDUAL.set(spec);
+}
+
+pub fn identity_ref_residual() -> Option<&'static IdentityRefResidual> {
+    IDENTITY_REF_RESIDUAL.get()
+}
+
+/// Residual `() -> Int` helpers whose result is process-constant after
+/// first touch (`gc_interp::enabled`). `@elidable` (`rlib/jit.py`) folds
+/// the traced concrete; without a live LLBC extract the frozen jitcode
+/// still residualizes, so interpret records the constant instead of `CallI`.
+#[derive(Clone, Default)]
+pub struct ElidableIntResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl ElidableIntResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static ELIDABLE_INT_RESIDUAL: std::sync::OnceLock<ElidableIntResidual> = std::sync::OnceLock::new();
+
+pub fn register_elidable_int_residual(spec: ElidableIntResidual) {
+    let _ = ELIDABLE_INT_RESIDUAL.set(spec);
+}
+
+pub fn elidable_int_residual() -> Option<&'static ElidableIntResidual> {
+    ELIDABLE_INT_RESIDUAL.get()
+}
+
+/// Residual `() -> Void` helpers that are no-ops on the recorded
+/// trace when they succeed (`frame_anchor_release`, `stack_check`).
+/// `interp_jit.py` `dispatch` has neither; compiled loops poll the
+/// breaker on the back-edge instead.
+#[derive(Clone, Default)]
+pub struct VoidSkipResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl VoidSkipResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static VOID_SKIP_RESIDUAL: std::sync::OnceLock<VoidSkipResidual> = std::sync::OnceLock::new();
+
+pub fn register_void_skip_residual(spec: VoidSkipResidual) {
+    let _ = VOID_SKIP_RESIDUAL.set(spec);
+}
+
+pub fn void_skip_residual() -> Option<&'static VoidSkipResidual> {
+    VOID_SKIP_RESIDUAL.get()
+}
+
+/// Residual `Int -> Ref` helpers that return the standard virtualizable
+/// frame (`frame_anchor_live`). `interp_jit.py` has no shadow-stack
+/// slot; the frame is the loop's red input. Reuse that OpRef when the
+/// live concrete equals the vable pointer.
+#[derive(Clone, Default)]
+pub struct FrameAnchorLiveResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl FrameAnchorLiveResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static FRAME_ANCHOR_LIVE_RESIDUAL: std::sync::OnceLock<FrameAnchorLiveResidual> =
+    std::sync::OnceLock::new();
+
+pub fn register_frame_anchor_live_residual(spec: FrameAnchorLiveResidual) {
+    let _ = FRAME_ANCHOR_LIVE_RESIDUAL.set(spec);
+}
+
+pub fn frame_anchor_live_residual() -> Option<&'static FrameAnchorLiveResidual> {
+    FRAME_ANCHOR_LIVE_RESIDUAL.get()
+}
+
+/// Portal-interpret exception-state residuals: the EC `sys_exc_value`
+/// field ops and the builtin exception-class `LOAD_GLOBAL`.
+pub struct ExceptionTraceResidual {
+    /// Canonical exception class from a residual `LOAD_GLOBAL`.
+    /// `pyopcode.py LOAD_GLOBAL` looks inside the module-dict cell.
+    pub load_global_fnaddrs: Vec<i64>,
+    pub emit_load_global_exc:
+        fn(ctx: &mut crate::TraceCtx, raw_i: &[i64]) -> Option<(majit_ir::OpRef, i64)>,
+    /// `eval.rs get_current_exception` / `set_current_exception`.
+    /// FBW `try_walker_lower_exc_info_residual` emits EC field ops.
+    pub get_current_exception_fnaddrs: Vec<i64>,
+    pub set_current_exception_fnaddrs: Vec<i64>,
+    pub emit_get_current_exception:
+        fn(ctx: &mut crate::TraceCtx, ec: majit_ir::OpRef) -> (majit_ir::OpRef, i64),
+    pub emit_set_current_exception:
+        fn(ctx: &mut crate::TraceCtx, ec: majit_ir::OpRef, exc: majit_ir::OpRef, exc_ptr: i64),
+    /// Live `ExecutionContext` pointer (`interp_jit.py reds = ['frame', 'ec']`).
+    pub current_ec_ptr: fn() -> i64,
+}
+
+impl ExceptionTraceResidual {
+    pub fn matches_load_global(&self, fnaddr: i64) -> bool {
+        self.load_global_fnaddrs.contains(&fnaddr)
+    }
+
+    pub fn matches_get_current_exception(&self, fnaddr: i64) -> bool {
+        self.get_current_exception_fnaddrs.contains(&fnaddr)
+    }
+
+    pub fn matches_set_current_exception(&self, fnaddr: i64) -> bool {
+        self.set_current_exception_fnaddrs.contains(&fnaddr)
+    }
+}
+
+static EXCEPTION_TRACE_RESIDUAL: std::sync::OnceLock<ExceptionTraceResidual> =
+    std::sync::OnceLock::new();
+
+pub fn register_exception_trace_residual(spec: ExceptionTraceResidual) {
+    let _ = EXCEPTION_TRACE_RESIDUAL.set(spec);
+}
+
+pub fn exception_trace_residual() -> Option<&'static ExceptionTraceResidual> {
+    EXCEPTION_TRACE_RESIDUAL.get()
+}
+
+/// `compare_op_from_tag` 0..=5 → `IntLt`/`IntLe`/`IntGt`/`IntGe`/`IntEq`/`IntNe`.
+pub fn int_compare_op_kind(tag: i64) -> Option<majit_ir::OpCode> {
+    Some(match tag {
+        0 => majit_ir::OpCode::IntLt,
+        1 => majit_ir::OpCode::IntLe,
+        2 => majit_ir::OpCode::IntGt,
+        3 => majit_ir::OpCode::IntGe,
+        4 => majit_ir::OpCode::IntEq,
+        5 => majit_ir::OpCode::IntNe,
+        _ => return None,
+    })
+}
+
 /// Emit an overflow-checked binary int operation.
 ///
 /// Auto-generated: unbox a, unbox b, emit ovf op, guard no overflow, box result.

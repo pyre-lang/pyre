@@ -466,6 +466,11 @@ impl RootScope {
     }
 
     /// First slot owned by this root bracket.
+    ///
+    /// Residual like every other `RootScope` method: a jitcode holds the
+    /// guard as its `save_point` word (see `root_scope_base_jit_abi`), so an
+    /// inlined body reading `self.save_point` would dereference that word.
+    #[majit_macros::dont_look_inside_cannot_raise]
     #[inline]
     pub fn base(&self) -> usize {
         self.save_point
@@ -653,6 +658,142 @@ pub fn root_scope_close(scope: &RootScope) {
     // `truncate` is a no-op if `save_point >= len()`, which is
     // the steady-state case for an empty bracket.
     shadow_stack_cell_truncate(cell, scope.save_point);
+}
+
+// One-word residual-call ABI for the `RootScope` bracket.
+//
+// `front::mir` aliases an `Rvalue::Ref` / `Rvalue::RawPtr` over a bare local
+// to that local's own Variable without emitting an address-of, so every
+// `&self`, `&RootScope` and `*mut RootScope` a jitcode passes is the guard's
+// value — `save_point` — rather than a pointer to it.  The bridges below take
+// and return that word, so the whole bracket (open, pin, read-back, base,
+// set, close) agrees on one representation.  Each is a distinct function: the
+// fnaddr registry refuses two path spellings on one address.
+
+/// [`push_roots`]: the opened guard's `save_point`, handed out without a
+/// `Drop` — the jitcode's close is what rewinds it.
+pub extern "C" fn push_roots_jit_abi() -> usize {
+    std::mem::ManuallyDrop::new(push_roots()).save_point
+}
+
+/// [`root_scope_close`] over the guard word.
+pub extern "C" fn root_scope_close_jit_abi(save_point: usize) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    shadow_stack_cell_truncate(shadow_stack_cell(), save_point);
+}
+
+/// Charon's `RootScope::drop_in_place` glue over the guard word; the same
+/// rewind as [`root_scope_close_jit_abi`].
+pub extern "C" fn root_scope_drop_in_place_jit_abi(save_point: usize) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    shadow_stack_cell_truncate(shadow_stack_cell(), save_point);
+}
+
+/// [`RootScope::base`] over the guard word.
+pub extern "C" fn root_scope_base_jit_abi(save_point: usize) -> usize {
+    save_point
+}
+
+/// Rebuild the guard a `&self` bridge forwards to.  `ManuallyDrop` keeps the
+/// borrowed word from rewinding the stack when the bridge returns.
+fn root_scope_from_word(save_point: usize) -> std::mem::ManuallyDrop<RootScope> {
+    std::mem::ManuallyDrop::new(RootScope {
+        save_point,
+        _not_send: PhantomData,
+    })
+}
+
+/// [`RootScope::pin_root`] over the guard word.
+pub extern "C" fn root_scope_pin_root_jit_abi(save_point: usize, root: PyObjectRef) -> PyObjectRef {
+    root_scope_from_word(save_point).pin_root(root)
+}
+
+/// [`RootScope::get`] over the guard word.
+pub extern "C" fn root_scope_get_jit_abi(save_point: usize, index: usize) -> PyObjectRef {
+    root_scope_from_word(save_point).get(index)
+}
+
+/// [`RootScope::set`] over the guard word.
+pub extern "C" fn root_scope_set_jit_abi(save_point: usize, index: usize, root: PyObjectRef) {
+    root_scope_from_word(save_point).set(index, root)
+}
+
+/// [`RootScope::normalize`] over the guard word.
+pub extern "C" fn root_scope_normalize_jit_abi(save_point: usize, base: usize, len: usize) {
+    root_scope_from_word(save_point).normalize(base, len)
+}
+
+/// [`RootScope::normalize_moved`] over the guard word.
+pub extern "C" fn root_scope_normalize_moved_jit_abi(
+    save_point: usize,
+    base: usize,
+    len: usize,
+) -> usize {
+    usize::from(root_scope_from_word(save_point).normalize_moved(base, len))
+}
+
+// A `&[PyObjectRef]` argument reaches a jitcode as the GC array its
+// `Rvalue::Aggregate` built (`majit::object_ref_gcarray`: the length word at
+// offset 0, the ref items from the next word).  The residual passes that one
+// Ref; these bridges read the slice back out of it.
+
+/// View the items of a `majit::object_ref_gcarray` as a slice.
+///
+/// # Safety
+/// `array` must be a live `object_ref_gcarray`, and no collection may run
+/// while the returned slice is in use.
+unsafe fn object_ref_gcarray_items<'a>(array: *const usize) -> &'a [PyObjectRef] {
+    unsafe {
+        let len = *array;
+        std::slice::from_raw_parts(array.add(1) as *const PyObjectRef, len)
+    }
+}
+
+/// [`RootScope::publish`] over the guard word and the lowered slice array.
+pub extern "C" fn root_scope_publish_jit_abi(save_point: usize, roots: *const usize) -> usize {
+    root_scope_from_word(save_point).publish(unsafe { object_ref_gcarray_items(roots) })
+}
+
+/// [`RootScope::pin_roots`] over the guard word and the lowered slice array.
+pub extern "C" fn root_scope_pin_roots_jit_abi(save_point: usize, roots: *const usize) -> usize {
+    let scope = root_scope_from_word(save_point);
+    let items = unsafe { object_ref_gcarray_items(roots) };
+    let len = items.len();
+    let base = scope.publish(items);
+    scope.normalize(base, len);
+    base
+}
+
+/// Push one root on the cell `stack_slot` names; returns its index.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn publish_one_at(stack_slot: *const RootStack, root: PyObjectRef) -> usize {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    // SAFETY: caller hands the live thread cell a `RootScope` still owns.
+    unsafe {
+        let stack = &*stack_slot;
+        let index = stack.len();
+        *stack.incr_stack() = root;
+        index
+    }
+}
+
+/// Word-ABI residual for [`RootScope::get`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn get_at(stack_slot: *const RootStack, index: usize) -> PyObjectRef {
+    // SAFETY: same cell; `slot` bounds-checks `index`.
+    unsafe { *(*stack_slot).slot(index) }
+}
+
+/// Word-ABI residual for [`RootScope::normalize`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn normalize_at(stack_slot: *const RootStack, base: usize, len: usize) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    // SAFETY: `publish_one_at` claimed every index in this range.
+    let _ = normalize_published_run(unsafe { &*stack_slot }, base, len);
 }
 
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
@@ -1675,6 +1816,47 @@ mod tests {
     #[test]
     fn push_roots_returns_a_drop_guard() {
         let _roots = push_roots();
+    }
+
+    /// A jitcode holds the guard as its `save_point` word and passes that word
+    /// wherever the source borrows the guard, so open, pin, read-back, base
+    /// and close all have to agree on it.  A close that read the word as a
+    /// `&RootScope` dereferenced the depth.
+    #[test]
+    fn root_scope_word_bridges_agree_on_the_save_point() {
+        let before = shadow_stack_len();
+        let word = push_roots_jit_abi();
+        assert_eq!(word, before);
+        assert_eq!(root_scope_base_jit_abi(word), before);
+        let slot = shadow_stack_len();
+        let _ = root_scope_pin_root_jit_abi(word, dummy(0x1234));
+        assert_eq!(root_scope_get_jit_abi(word, slot), dummy(0x1234));
+        assert_eq!(shadow_stack_len(), before + 1);
+        root_scope_close_jit_abi(word);
+        assert_eq!(shadow_stack_len(), before);
+        let word = push_roots_jit_abi();
+        let _ = root_scope_pin_root_jit_abi(word, dummy(0x5678));
+        root_scope_drop_in_place_jit_abi(word);
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// A `&[PyObjectRef]` residual argument arrives as an
+    /// `object_ref_gcarray`: the length word, then the items.
+    #[test]
+    fn slice_bridges_read_the_lowered_gcarray() {
+        let before = shadow_stack_len();
+        let array: [usize; 3] = [2, dummy(0x10) as usize, dummy(0x20) as usize];
+        let word = push_roots_jit_abi();
+        let base = publish_roots_jit_abi(array.as_ptr() as *const crate::object_array::GcTypedArray)
+            as usize;
+        assert_eq!(base, before);
+        assert_eq!(root_scope_get_jit_abi(word, base), dummy(0x10));
+        assert_eq!(root_scope_get_jit_abi(word, base + 1), dummy(0x20));
+        let base = root_scope_publish_jit_abi(word, array.as_ptr());
+        assert_eq!(base, before + 2);
+        assert_eq!(shadow_stack_len(), before + 4);
+        root_scope_close_jit_abi(word);
+        assert_eq!(shadow_stack_len(), before);
     }
 
     /// `RootScope` carries only the saved top; the root-stack cell is

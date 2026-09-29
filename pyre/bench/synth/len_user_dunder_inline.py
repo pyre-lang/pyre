@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=len_user_dunder
 # pyre-check: trace-shape=hot_plain:absent=CallMayForceR
 # `len(obj)` whose receiver resolves `__len__` to a Python function.  Covers
 # the two receiver shapes `descroperation.py _len` dispatches a method for -- a

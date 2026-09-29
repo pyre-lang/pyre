@@ -2305,7 +2305,9 @@ pub struct FrameLocalsRoot {
 }
 
 impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
+    /// Look-inside: the 2-word `{frame, registered}` return cannot be a
+    /// residual. The interior slot address stays inside
+    /// [`register_frame_locals_slot`].
     pub fn new(frame_ptr: *mut PyFrame) -> Self {
         let registered = unsafe { register_frame_locals_slot(frame_ptr) };
         Self {
@@ -4885,10 +4887,23 @@ impl PyFrame {
         // Both writes below — the stack slot and the depth — have to land on
         // the live frame, so reload once and use it for both.
         let frame = self.live_mut();
-        frame.assert_stack_index(frame.valuestackdepth);
-        let idx = frame.valuestackdepth;
-        frame.set_locals_w(idx, value);
-        frame.valuestackdepth = idx + 1;
+        frame.push_on_self(value);
+    }
+
+    /// `pyframe.py pushvalue` — write the slot and the depth on `self`.
+    ///
+    /// [`push`] reloads through [`Self::live_mut`] first because it is the
+    /// post-allocation write and the caller's `&mut self` may name a
+    /// forwarded corpse. Callers that already hold the live frame —
+    /// [`crate::eval::FrameAnchor::live`] — write here so the tracer sees
+    /// the virtualizable stores instead of a `try_gc_current_object_address`
+    /// residual on the walk-local frame.
+    #[inline]
+    pub fn push_on_self(&mut self, value: PyObjectRef) {
+        self.assert_stack_index(self.valuestackdepth);
+        let idx = self.valuestackdepth;
+        self.set_locals_w(idx, value);
+        self.valuestackdepth = idx + 1;
     }
 
     /// Reads and writes through the caller's `&mut self`, without the
@@ -5447,7 +5462,7 @@ impl PyFrame {
 
     #[inline]
     pub fn failed_attr_after_stack_pop(&mut self) {
-        if !(1..=3).contains(&self.failed_attr_cleanup) {
+        if !matches!(self.failed_attr_cleanup, 1..=3) {
             return;
         }
         self.failed_attr_cleanup -= 1;

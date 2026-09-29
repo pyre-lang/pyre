@@ -7022,7 +7022,13 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
     // a sequence of pairs reaches the absent arm without an
     // AttributeError being built. Only a missing attribute reads as
     // absent (`PyObject_GetOptionalAttr`).
-    let w_keys_method = match crate::baseobjspace::getattr_str_impl(data(), "keys", true, true) {
+    let w_keys_method = match crate::baseobjspace::getattr_str_impl(
+        data(),
+        "keys",
+        true,
+        true,
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("keys")),
+    ) {
         Ok(value) if value.is_null() => None,
         Ok(value) => Some(value),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
@@ -7426,9 +7432,18 @@ pub(crate) fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
     // CPython v3.14.6 dict_merge compares the tp_iter slot (C source at tag v3.14.6), i.e. the
     // type's MRO entry, so a metaclass attribute named __iter__ does not count. space.lookup is
     // that MRO lookup.
-    let other_iter =
-        unsafe { crate::baseobjspace::lookup_in_type(other_type.as_ptr(), "__iter__") };
-    let dict_iter = unsafe { crate::baseobjspace::lookup_in_type(dict_type, "__iter__") };
+    let other_iter = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            other_type.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+        )
+    };
+    let dict_iter = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            dict_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+        )
+    };
     match (other_iter, dict_iter) {
         (Some(a), Some(b)) => std::ptr::eq(a, b),
         _ => false,

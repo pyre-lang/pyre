@@ -90,6 +90,31 @@ pub fn binary_value(
     // passes its own spelling — `&` for `a & b`, `&=` for `a &= b`.
     let symbol = operator_symbol(op);
     use crate::objspace::descroperation as desc;
+    let dunder = match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => Some(desc::BinopDunder::Add),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => Some(desc::BinopDunder::Sub),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => Some(desc::BinopDunder::Mul),
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
+            Some(desc::BinopDunder::FloorDiv)
+        }
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
+            Some(desc::BinopDunder::Mod)
+        }
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
+            Some(desc::BinopDunder::TrueDiv)
+        }
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => Some(desc::BinopDunder::LShift),
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => Some(desc::BinopDunder::RShift),
+        BinaryOperator::And | BinaryOperator::InplaceAnd => Some(desc::BinopDunder::And),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => Some(desc::BinopDunder::Or),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(desc::BinopDunder::Xor),
+        _ => None,
+    };
+    if let Some(dunder) = dunder
+        && let Some(w_res) = desc::try_binop_shortcut(a, b, dunder)?
+    {
+        return Ok(w_res);
+    }
     match op {
         BinaryOperator::Add | BinaryOperator::InplaceAdd => desc::add_impl(a, b, symbol),
         BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => desc::sub_impl(a, b, symbol),
@@ -104,10 +129,6 @@ pub fn binary_value(
             desc::truediv_impl(a, b, symbol)
         }
         BinaryOperator::Power => pow(a, b),
-        // PyPy `pyopcode.py:INPLACE_POWER` calls `space.inplace_pow`
-        // directly; unlike the generated `inplace_impl` family this operation
-        // has its own three-argument-aware dispatch in descroperation.py,
-        // and with it its own `**=` fallback.
         BinaryOperator::InplacePower => desc::inplace_pow(a, b),
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => desc::lshift_impl(a, b, symbol),
         BinaryOperator::MatrixMultiply | BinaryOperator::InplaceMatrixMultiply => {
@@ -115,8 +136,6 @@ pub fn binary_value(
         }
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => desc::rshift_impl(a, b, symbol),
         BinaryOperator::And | BinaryOperator::InplaceAnd => desc::and_impl(a, b, symbol),
-        // mappingproxy `__ior__` (read-only) raises TypeError, handled
-        // above by `try_inplace_special`; both fall through to `or_`.
         BinaryOperator::Or | BinaryOperator::InplaceOr => desc::or_impl(a, b, symbol),
         BinaryOperator::Xor | BinaryOperator::InplaceXor => desc::xor_impl(a, b, symbol),
         BinaryOperator::Subscr => getitem(a, b),
@@ -1692,6 +1711,7 @@ mod tests {
 
     #[test]
     fn test_binary_value_reuses_objspace_dispatch() {
+        crate::test_hooks::install_hash_hook();
         let result = binary_value(w_int_new(8), w_int_new(3), BinaryOperator::Subtract)
             .expect("binary dispatch should succeed");
         unsafe {

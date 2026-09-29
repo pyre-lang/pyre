@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
-# pyre-check: spec-folds=two_arg_super_call,load_attr_on_super
 # pyre-check: trace-shape=run:absent=CallMayForceR
 # `super(C, self)` bound to a name, then read — the spelling LOAD_SUPER_ATTR
 # does not cover, because the name binding splits the proxy construction and
