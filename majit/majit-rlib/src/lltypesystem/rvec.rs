@@ -232,10 +232,13 @@ pub fn ll_slice_buffer_free(items: usize) {
 // ── opaque buffer allocation ────────────────────────────────────────────
 
 fn vec_buf_layout(allocated: usize, itemsize: usize, align: usize) -> Layout {
-    allocated
-        .checked_mul(itemsize)
+    item_bytes(allocated, itemsize)
         .and_then(|size| Layout::from_size_align(size, align).ok())
         .unwrap_or_else(|| panic!("Vec capacity overflow"))
+}
+
+fn item_bytes(count: usize, itemsize: usize) -> Option<usize> {
+    count.checked_mul(itemsize)
 }
 
 /// A buffer for `allocated` items. An empty buffer is the dangling address
@@ -596,7 +599,8 @@ pub fn ll_slice_get_addr_i(items: usize, length: usize, index: usize) -> usize {
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
 pub fn ll_slice_buffer_new_i(length: usize) -> usize {
-    raw_malloc_varsize_char(length * ITEM_SIZE_I)
+    let size = item_bytes(length, ITEM_SIZE_I).expect("Vec capacity overflow");
+    raw_malloc_varsize_char(size)
 }
 
 /// `[item; length]` into the buffer at `items`.
@@ -981,7 +985,8 @@ pub fn ll_slice_get_addr_r(items: usize, length: usize, index: usize) -> usize {
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
 pub fn ll_slice_buffer_new_r(length: usize) -> usize {
-    raw_malloc_varsize_char(length * ITEM_SIZE_R)
+    let size = item_bytes(length, ITEM_SIZE_R).expect("Vec capacity overflow");
+    raw_malloc_varsize_char(size)
 }
 
 /// `[item; length]` into the buffer at `items`.
@@ -1318,7 +1323,8 @@ pub fn ll_slice_get_addr_f(items: usize, length: usize, index: usize) -> usize {
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
 pub fn ll_slice_buffer_new_f(length: usize) -> usize {
-    raw_malloc_varsize_char(length * ITEM_SIZE_F)
+    let size = item_bytes(length, ITEM_SIZE_F).expect("Vec capacity overflow");
+    raw_malloc_varsize_char(size)
 }
 
 /// `[item; length]` into the buffer at `items`.
@@ -1382,6 +1388,12 @@ mod tests {
         l.push(8 as *mut u8);
         assert_eq!(__majit_call_target_ll_vec_length_r(header), 1);
         ll_vec_free_r(l);
+    }
+
+    #[test]
+    #[should_panic(expected = "Vec capacity overflow")]
+    fn slice_buffer_new_rejects_a_wrapping_length() {
+        let _ = ll_slice_buffer_new_i(usize::MAX);
     }
 
     #[test]
