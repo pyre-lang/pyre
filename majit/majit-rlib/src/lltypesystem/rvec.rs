@@ -317,13 +317,11 @@ pub fn ll_vec_newlist_hint_i(lengthhint: usize) -> Vec<usize> {
     Vec::with_capacity(lengthhint)
 }
 
-/// `lltypesystem/rlist.py ll_newlist`: `length` slots, items not initialised.
-/// Callers fill every slot before the list is read.
+/// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is zero
+/// until the caller writes it, and `length` is already the list length.
 #[majit_macros::oopspec("newlist(length)")]
 pub fn ll_vec_newlist_i(length: usize) -> Vec<usize> {
-    let mut l = Vec::with_capacity(length);
-    unsafe { l.set_len(length) };
-    l
+    vec![0; length]
 }
 
 /// `rlist.py _ll_zero_or_null` for a word item.
@@ -331,8 +329,7 @@ fn ll_vec_zero_or_null_i(item: usize) -> bool {
     item == 0
 }
 
-/// `rgc.ll_arrayclear` of a freshly allocated word buffer. Raw `alloc` memory
-/// is not zero-filled (`malloc_zero_filled` is false).
+/// `rgc.ll_arrayclear`. Writes zero into each of the `count` slots.
 fn ll_vec_arrayclear_i(l: &mut Vec<usize>, count: usize) {
     let mut i = 0;
     while i < count {
@@ -655,12 +652,11 @@ pub fn ll_vec_newemptylist_r() -> Vec<*mut u8> {
     Vec::new()
 }
 
-/// `lltypesystem/rlist.py ll_newlist`: `length` slots, items not initialised.
+/// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is null
+/// until the caller writes it, and `length` is already the list length.
 #[majit_macros::oopspec("newlist(length)")]
 pub fn ll_vec_newlist_r(length: usize) -> Vec<*mut u8> {
-    let mut l = Vec::with_capacity(length);
-    unsafe { l.set_len(length) };
-    l
+    vec![std::ptr::null_mut(); length]
 }
 
 /// `rlist.py _ll_zero_or_null` for a pointer item.
@@ -668,10 +664,7 @@ fn ll_vec_zero_or_null_r(item: *mut u8) -> bool {
     item.is_null()
 }
 
-/// `rgc.ll_arrayclear`. Raw memory is not zero-filled. Upstream skips this
-/// for a `Ptr` item because `ll_newlist` already ran
-/// `zero_gc_pointers_inside`; this raw header does not, so null slots are
-/// cleared here too.
+/// `rgc.ll_arrayclear`. Writes null into each of the `count` slots.
 fn ll_vec_arrayclear_r(l: &mut Vec<*mut u8>, count: usize) {
     let mut i = 0;
     while i < count {
@@ -1044,12 +1037,11 @@ pub fn ll_vec_newemptylist_f() -> Vec<f64> {
     Vec::new()
 }
 
-/// `lltypesystem/rlist.py ll_newlist`: `length` slots, items not initialised.
+/// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is `0.0`
+/// until the caller writes it, and `length` is already the list length.
 #[majit_macros::oopspec("newlist(length)")]
 pub fn ll_vec_newlist_f(length: usize) -> Vec<f64> {
-    let mut l = Vec::with_capacity(length);
-    unsafe { l.set_len(length) };
-    l
+    vec![0.0; length]
 }
 
 /// `rlist.py _ll_zero_or_null`: a float is zero when its bits are `0.0`
@@ -1058,7 +1050,7 @@ fn ll_vec_zero_or_null_f(item: f64) -> bool {
     item.to_bits() == 0
 }
 
-/// `rgc.ll_arrayclear` of a freshly allocated float buffer.
+/// `rgc.ll_arrayclear`. Writes `0.0` into each of the `count` slots.
 fn ll_vec_arrayclear_f(l: &mut Vec<f64>, count: usize) {
     let mut i = 0;
     while i < count {
