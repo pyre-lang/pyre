@@ -7735,9 +7735,8 @@ fn set_jit_param_enable_opts_via_warmstate(value: &str) {
 /// sites, closing and compiling the drain loop. This remains opt-in with
 /// `PYRE_JD1=1`. `maybe_compile_and_run` skips only the cell that carries
 /// `JC_TRACING` for those greens (`warmstate.py`), so a jd1 session does
-/// not suppress jd0 compiled-loop entry. Starting a second MetaInterp
-/// while one session occupies `tracing` is still refused — pyre has one
-/// MetaInterp object. It also follows the
+/// not suppress jd0 compiled-loop entry. A nested attempt parks the outer
+/// MetaInterp fields (`warmstate.py` `bound_reached`). It also follows the
 /// master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) so "no JIT" means no
 /// jd1.
 ///
@@ -10180,8 +10179,9 @@ fn eval_with_jit_inner(
     //   return portal_ptr(*args)
     //
     // maybe_compile_and_run = try_function_entry_jit: checks for compiled
-    // code (dispatch) or threshold (start tracing). Internally guards on
-    // JC_TRACING (driver.is_tracing()) to avoid re-entry during tracing.
+    // code (dispatch) or threshold (start tracing). Only the cell with
+    // JC_TRACING returns early (`warmstate.py`); a nested attempt parks
+    // the outer MetaInterp.
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
@@ -11762,12 +11762,6 @@ fn maybe_compile_and_run(
             if !backedge_frame_may_trace(frame, loop_header_pc) {
                 return None;
             }
-            if driver
-                .meta_interp()
-                .is_tracing_key((frame.pycode as usize, loop_header_pc))
-            {
-                return None;
-            }
             bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
@@ -12753,6 +12747,38 @@ enum CompileOnceStart {
     FunctionEntry,
 }
 
+/// `warmstate.py` `bound_reached` constructs a fresh `MetaInterp` per
+/// attempt. pyre reuses one driver object; this guard parks the outer
+/// attempt's per-trace fields so the inner run cannot disturb them.
+struct NestedTraceGuard {
+    parked: bool,
+}
+
+impl NestedTraceGuard {
+    fn enter(driver: &mut JitDriver<PyreJitState>) -> Self {
+        if !driver.is_tracing() {
+            return Self { parked: false };
+        }
+        pyre_jit_trace::jitcode_dispatch::park_walk_tls();
+        pyre_jit_trace::trace::park_walk_end();
+        driver.park_nested_trace();
+        Self { parked: true }
+    }
+}
+
+impl Drop for NestedTraceGuard {
+    fn drop(&mut self) {
+        if !self.parked {
+            return;
+        }
+        let (driver, _) = driver_pair();
+        driver.restore_nested_trace();
+        driver.clear_tracing_heapcache_field(pyre_jit_trace::descr::pyframe_flags_descr().index());
+        pyre_jit_trace::trace::restore_walk_end();
+        pyre_jit_trace::jitcode_dispatch::restore_walk_tls();
+    }
+}
+
 /// RPython pyjitpl.py `_compile_and_run_once`.
 ///
 /// This is the single synchronous portal-trace walker for function-entry and
@@ -12769,6 +12795,10 @@ fn compile_and_run_once(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
+    // warmstate.py bound_reached: a nested MetaInterp run parks the outer
+    // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
+    // journals, driver sym). Walker sub-walks do not enter here.
+    let _nested = NestedTraceGuard::enter(driver);
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     majit_metainterp::mc_diag_bump(match start {
@@ -13093,10 +13123,7 @@ fn bound_reached(
         .set_last_instr_from_next_instr(loop_header_pc);
     let mut jit_state = build_jit_state(frame_root.frame(), info);
     // warmstate.py JC_TRACING
-    if driver
-        .meta_interp()
-        .is_tracing_key((frame_root.frame().pycode as usize, loop_header_pc))
-    {
+    if driver.cell_is_tracing(green_key) {
         return None;
     }
     // `warmstate.py maybe_compile_and_run` reads `procedure_token =
@@ -13104,14 +13131,13 @@ fn bound_reached(
     // object. Read it once here too: the decision below and the run further
     // down used to walk the cell chain separately for the same answer.
     let procedure_token = driver.runnable_procedure_token(green_key);
-    // `maybe_compile_and_run` only skips this cell's `JC_TRACING`. A different
-    // cell reaches here and, upstream, `bound_reached` builds a fresh
-    // `MetaInterp` for `compile_and_run_once` (`profiler.start_tracing`).
-    // This process shares one. `is_tracing` is false while
-    // `with_trace_ctx_and_framestack` parks the recorder, so decline on
-    // `trace_attempt_in_progress` instead of opening a second scope. A
-    // procedure token still runs (`EnterJitAssembler`).
-    if procedure_token.is_none() && !driver.trace_attempt_in_progress() {
+    // `maybe_compile_and_run` only skips this cell's `JC_TRACING`. A
+    // different cell reaches here and, upstream, `bound_reached` builds a
+    // fresh `MetaInterp` for `compile_and_run_once`. This process shares
+    // one; `NestedTraceGuard` parks the outer attempt inside
+    // `compile_and_run_once`. Declining on `trace_attempt_in_progress` here
+    // would block that nested start (`warmstate.py` `bound_reached`).
+    if procedure_token.is_none() {
         return compile_and_run_once(
             frame_root.frame(),
             green_key,
@@ -13316,10 +13342,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // Asking the door first read the token and its compiled meta for a cell
     // this then declines anyway, and ticked the counter for a call upstream
     // never counts.
-    if pair.0.meta_interp().is_tracing_key((
-        frame_root.frame().pycode as usize,
-        frame_root.frame().next_instr(),
-    )) {
+    if pair.0.cell_is_tracing(green_key) {
         return None;
     }
 
@@ -13504,12 +13527,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         );
     }
 
-    // Same shared-MetaInterp decline as `bound_reached`. The `RunCompiled`
-    // arm above already returned, so this only skips `compile_and_run_once`.
-    if driver.trace_attempt_in_progress() {
-        return None;
-    }
-
+    // Nested `compile_and_run_once` parks the outer attempt
+    // (`warmstate.py` `bound_reached` constructs a new MetaInterp). The
+    // `RunCompiled` arm above already returned; do not skip the start on
+    // `trace_attempt_in_progress` here — that flag is still true until
+    // `NestedTraceGuard` parks inside `compile_and_run_once`.
     // warmstate.py:467 jitcounter.tick(hash, increment_threshold). The
     // fast path above already fired the counter for this entry, so go
     // straight to bound_reached without re-ticking.

@@ -2128,15 +2128,40 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
         return None;
     }
     let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
-    for (color, &boxed) in parent.boxes.iter().enumerate() {
-        let Some(majit_ir::Value::Ref(gc)) = ctx.trace_ctx.concrete_of_opref(boxed) else {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[s2-build-decline] origin={origin} frame {index}: continuation \
-                     box {color} has no concrete Ref"
-                );
+    // `_copy_data_from_miframe` (`blackhole.py`) copies every live box the
+    // MIFrame holds. The only register that may still be empty is the
+    // pending call result `_setup_return_value_r` has not written
+    // (`pyjitpl.py` `MIFrame.make_result_of_lastop`): `INIT_RESULT_REG` on
+    // a `descr_call` tail, otherwise the inline-call dest
+    // `call_result_register` / `result_slot` names. Any other missing or
+    // `NO_CONCRETE` live ref declines the whole image.
+    let pending_result_color =
+        if crate::ctor_continuation::is_installed_level(parent.jitcode_index as i32) {
+            Some(crate::ctor_continuation::INIT_RESULT_REG as usize)
+        } else {
+            match super::call_result_register(parent.jitcode_index, resume_pc) {
+                super::CallResultRegister::Reg('r', color) => Some(color),
+                _ => match parent.result_slot {
+                    super::CallResultSlot::At(slot) => Some(slot),
+                    _ => None,
+                },
             }
-            return None;
+        };
+    for (color, &boxed) in parent.boxes.iter().enumerate() {
+        let gc = match ctx.trace_ctx.concrete_of_opref(boxed) {
+            Some(majit_ir::Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => gc,
+            _ => {
+                if pending_result_color == Some(color) {
+                    continue;
+                }
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[s2-build-decline] origin={origin} frame {index}: continuation \
+                         live ref color {color} is missing or NO_CONCRETE"
+                    );
+                }
+                return None;
+            }
         };
         if color >= miframe.ref_regs.len() {
             if fbw_debug_abort_enabled() {
@@ -5619,14 +5644,13 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     } else {
         None
     };
-    // A Python-level callee (e.g. a recursive `fib`) re-enters the
-    // interpreter (`eval_loop_jit` → `jit_merge_point`) while this walk still
-    // holds the driver in the tracing state.  Suspend re-entrant trace
-    // continuation for the duration of the concrete call so the callee runs as
-    // plain interpretation instead of starting a nested trace that would share
-    // and corrupt this walk's `TraceCtx` (flaky `libsystem_malloc` freelist
-    // abort during deep recursion).  Plain C-helper callees never re-enter, so
-    // the guard is a no-op for them.
+    // A Python-level callee re-enters the interpreter (`eval_loop_jit` →
+    // `jit_merge_point`) while this walk still holds the driver. Suspend
+    // re-entrant merge-point continuation so the callee's bytecodes are not
+    // recorded onto THIS walk's `TraceCtx`. The portal runner may still start
+    // a nested MetaInterp for a different green key (`warmstate.py`
+    // `bound_reached`); that attempt parks this ctx. Plain C-helper callees
+    // never re-enter, so the guard is a no-op for them.
     //
     // In RPython the tracing metainterp and the executing (blackhole /
     // compiled) interpreter are SEPARATE objects, so `do_residual_call`
@@ -12839,4 +12863,97 @@ pub(crate) fn dispatch_record_known_result_r_ir_v<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let first = read_ref_reg(code, op, 0, ctx)?;
     dispatch_record_known_result_ir(code, op, ctx, first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_ir::{GcRef, Type, Value};
+    use majit_metainterp::TraceCtx;
+
+    fn no_sub_jitcodes(_idx: usize) -> Option<SubJitCodeBody> {
+        None
+    }
+
+    fn build_from_parent(
+        parent: &InlineParentFrame,
+        tc: &mut TraceCtx,
+    ) -> Option<majit_metainterp::MIFrame> {
+        let pjc = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
+            .expect("codeless tail pyjitcode");
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let regs_r = RegisterBank::default();
+        let regs_i = RegisterBank::default();
+        let regs_f = RegisterBank::default();
+        let mut concrete_i = [];
+        let ctx: WalkContext<'_, '_, crate::state::PyreSym> = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+            inline_callee_consts: None,
+            fbw_mode: FbwWalkMode::default(),
+            session: &session,
+            registers_r: &regs_r,
+            registers_i: &regs_i,
+            registers_f: &regs_f,
+            concrete_registers_i: &mut concrete_i,
+            descr_refs: &[],
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            pending_guard_snapshot_error: None,
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        build_codeless_continuation_parent(&ctx, parent, &pjc, "test", 0)
+    }
+
+    /// A required live operand (the constructor instance) with no concrete
+    /// value is an incomplete image. `_copy_data_from_miframe` does not
+    /// invent one.
+    #[test]
+    fn codeless_continuation_declines_a_no_concrete_instance() {
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let instance = OpRef::input_arg_ref(0);
+        tc.set_opref_concrete(instance, Value::Ref(GcRef::NO_CONCRETE));
+        let parent = ctor_continuation_parent_frame(instance).expect("descr_call tail installs");
+        assert!(
+            build_from_parent(&parent, &mut tc).is_none(),
+            "a NO_CONCRETE instance must decline the whole image",
+        );
+    }
+
+    /// The pending `__init__` result is the one slot `_setup_return_value_r`
+    /// has not written yet. An empty `INIT_RESULT_REG` still yields an image,
+    /// with that register left unset.
+    #[test]
+    fn codeless_continuation_accepts_an_empty_init_result_reg() {
+        pyre_interpreter::module::thread::ensure_runtime_thread();
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let instance = OpRef::input_arg_ref(0);
+        let pending = OpRef::input_arg_ref(1);
+        let instance_ptr = pyre_object::w_none() as usize;
+        tc.set_opref_concrete(instance, Value::Ref(GcRef(instance_ptr)));
+        tc.set_opref_concrete(pending, Value::Ref(GcRef::NO_CONCRETE));
+        let mut parent =
+            ctor_continuation_parent_frame(instance).expect("descr_call tail installs");
+        parent.boxes[crate::ctor_continuation::INIT_RESULT_REG as usize] = pending;
+        let miframe = build_from_parent(&parent, &mut tc)
+            .expect("only INIT_RESULT_REG empty must still yield an image");
+        assert!(
+            miframe.ref_regs[crate::ctor_continuation::INIT_RESULT_REG as usize].is_none(),
+            "the pending call-result register stays unset",
+        );
+        let written = miframe.ref_regs[crate::ctor_continuation::INSTANCE_REG as usize]
+            .expect("the instance must be in the image");
+        assert_eq!(written.as_const_ptr(), Some(GcRef(instance_ptr)));
+    }
 }

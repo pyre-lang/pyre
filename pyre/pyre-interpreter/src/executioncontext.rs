@@ -278,6 +278,42 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
     FORCE_VREF_HOOK.store(f as *mut (), Ordering::Release);
 }
 
+/// Whether `frame` is already on `ec.topframeref` / `f_backref`.
+///
+/// Walks the raw chain slots: a tracing vref is compared both as itself and
+/// as its already-written `forced` referent. Forcing would collect, and this
+/// helper runs from a compiled residual in the middle of a live `read`.
+pub fn frame_is_on_chain(ec: &PyExecutionContext, frame: *mut PyFrame) -> bool {
+    let mut cur = ec.topframeref;
+    let mut hops = 0usize;
+    while !cur.is_null() && hops < 4096 {
+        let named = vref_referent(cur);
+        if std::ptr::eq(cur, frame) || std::ptr::eq(named, frame) {
+            return true;
+        }
+        if named.is_null() {
+            break;
+        }
+        let next = unsafe { (*named).f_backref };
+        if std::ptr::eq(next, cur) {
+            break;
+        }
+        cur = next;
+        hops += 1;
+    }
+    false
+}
+
+/// Residual `enter` for a compiled inlined call: skip when the frame is
+/// already on the chain so a reused virtual frame cannot close a cycle.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn enter_unless_on_chain(ec: *mut PyExecutionContext, frame: *mut PyFrame) -> i64 {
+    if !ec.is_null() && !frame.is_null() {
+        unsafe { (*ec).enter(frame) };
+    }
+    0
+}
+
 /// The frame a chain slot NAMES, read WITHOUT forcing —
 /// `virtualref.py force_virtual`'s trailing `return vref.forced`.
 ///
@@ -1215,7 +1251,7 @@ impl ExecutionContext {
         // `install_current_frame` refuses the same case. The structural fix
         // is moving the portal down to `dispatch`; until then this refusal
         // keeps the re-entry from making `f_backref` a self loop.
-        if std::ptr::eq(vref_referent(self.topframeref), frame) {
+        if frame_is_on_chain(self, frame) {
             return;
         }
         pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
@@ -1283,6 +1319,14 @@ impl ExecutionContext {
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         let mut trace_result = self.leaveframe_trace(frame, w_exitvalue);
         let frame = anchor.live();
+        // A skipped `enter` (the frame was already on the chain) must not
+        // restore `topframeref` from this frame's `f_backref`: a live callee
+        // is still the top, and that store would unlink it.
+        if !std::ptr::eq(self.topframeref, frame)
+            && !std::ptr::eq(vref_referent(self.topframeref), frame)
+        {
+            return trace_result;
+        }
         let frame_vref = self.topframeref;
         // At interp level a vref in the chain *is* the frame pointer, so the
         // slot `force_vref` is about to be handed goes stale across the force

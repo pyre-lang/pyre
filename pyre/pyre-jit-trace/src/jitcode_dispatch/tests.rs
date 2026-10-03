@@ -1978,6 +1978,9 @@ fn portal_may_force_records_the_callee_execution_context() {
         0,
         std::ptr::null(),
         false,
+        false,
+        None,
+        None,
     )
     .expect("portal may-force residual")
     .expect("portal runner is wired");
@@ -21650,6 +21653,50 @@ fn portal_vable_bookkeeping_anchor_accepts_registered_entry_marker_prefix() {
         5,
         |_| 28,
     ));
+}
+
+#[test]
+fn header_has_explicit_jit_merge_point_uses_static_jitcode_metadata() {
+    let marker = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("jit_merge_point must be registered");
+    let bytes = vec![
+        marker, 0, // jdindex
+        2, 7, 8, // gi
+        1, 9, // gr
+        0, // gf
+        0, // ri
+        2, 10, 11, // rr
+        0,  // rf
+    ];
+    let jc = majit_metainterp::jitcode::JitCode::new("has_jmp");
+    jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: bytes,
+        ..Default::default()
+    });
+    let mut pyjit =
+        crate::PyJitCode::from_core_degenerate(std::sync::Arc::new(jc), std::ptr::null(), false);
+    pyjit.metadata.merge_entry_by_green = vec![(10, 0), (40, 200)];
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 10)];
+
+    assert!(
+        super::header_has_explicit_jit_merge_point(&pyjit, 10),
+        "landing 0 is followed by jit_merge_point before the next merge_entry"
+    );
+    assert!(
+        !super::header_has_explicit_jit_merge_point(&pyjit, 40),
+        "a later green with no jit_merge_point at or after its landing is NO-JMP"
+    );
+    assert!(
+        !super::header_has_explicit_jit_merge_point(&pyjit, 99),
+        "a py_pc with no merge_entry_for is not HAS-JMP"
+    );
+
+    pyjit.metadata.merge_entry_by_green = vec![(10, 0), (40, 0)];
+    assert!(
+        !super::header_has_explicit_jit_merge_point(&pyjit, 10),
+        "a jit_merge_point at or after the next merge_entry_by_green is not this header's"
+    );
 }
 
 /// The operand-stack spill the walker emits ahead of an unwalkable opcode is

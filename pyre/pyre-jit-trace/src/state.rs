@@ -3104,6 +3104,7 @@ pub trait WalkSym {
     fn frame(&self) -> OpRef;
     fn execution_context(&self) -> OpRef;
     fn set_execution_context(&mut self, value: OpRef);
+    fn set_frame(&mut self, value: OpRef);
     fn registers_i(&self) -> &[OpRef];
     fn registers_i_mut(&mut self) -> &mut Vec<OpRef>;
     fn registers_r(&self) -> &crate::jitcode_dispatch::RegisterList;
@@ -3158,6 +3159,7 @@ pub trait WalkSym {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
         merge_point_registers_r: &[OpRef],
+        emit_future_condition: bool,
     ) -> Vec<OpRef>;
 }
 
@@ -3175,6 +3177,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn set_execution_context(&mut self, value: OpRef) {
         self.execution_context = value;
+    }
+
+    #[inline]
+    fn set_frame(&mut self, value: OpRef) {
+        self.frame = value;
     }
 
     #[inline]
@@ -3369,6 +3376,7 @@ impl WalkSym for PyreSym {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
         merge_point_registers_r: &[OpRef],
+        emit_future_condition: bool,
     ) -> Vec<OpRef> {
         let mut frame = MIFrame::from_sym(ctx, self, concrete_frame, orgpc, orgpc);
         frame.close_loop_args_at(
@@ -3376,6 +3384,7 @@ impl WalkSym for PyreSym {
             target_pc,
             header_marker_jit_pc,
             merge_point_registers_r,
+            emit_future_condition,
         )
     }
 }
@@ -8643,29 +8652,47 @@ fn reconstruct_inline_recipe(
     if frame.pc < 0 {
         decline!("NoSnapshotPc");
     }
-    // `descr_call`'s tail reconstructs no frame.  Its jitcode has no code
-    // object, so every check below would decline it, and the whole chain with
-    // it; but its JIT-visible body is only the discard of `__init__`'s result
-    // and `ref_return` of the instance, which the drain can carry out by
-    // substituting the box on the way out.  Decode that one box here.
+    // `descr_call`'s tail reconstructs no Python frame.  Its jitcode has no
+    // code object, so every check below would decline it, and the whole chain
+    // with it.  Two resume `-live-` forms (`ctor_continuation`):
+    //
+    // * `[instance]` is after `bh_check_init_returned_none`.
+    //   `W_TypeObject.descr_call` has already checked `w_result`, so the drain
+    //   substitutes the instance (`return w_newobject`).
+    // * `[instance, init_result]` is the post-return `CALL_ASSEMBLER` guard
+    //   (`INSTANCE_REG`, `INIT_RESULT_REG`).  `descr_call` still has to run
+    //   the `w_result` None check after `get_and_call_args`, then
+    //   `return w_newobject`.  Decode both refs into `registers_r` and leave
+    //   `return_substitute` empty so the drain walks the tail from `frame.pc`
+    //   (`bh_check_init_returned_none`, then `ref_return(INSTANCE_REG)`).
     if crate::ctor_continuation::is_installed_level(frame.jitcode_index) {
-        let [instance_value] = frame.values.as_slice() else {
-            decline!("CtorTailArity");
-        };
-        let (instance, _) = bridge_decode_box(
-            ctx,
-            instance_value,
-            Type::Ref,
-            rd_virtuals,
-            resume_data,
-            fail_values,
-            fail_types,
-            backend,
-            cache,
-        );
-        if instance.is_none() {
-            decline!("CtorTailBox");
+        match frame.values.as_slice() {
+            [_] | [_, _] => {}
+            _ => decline!("CtorTailArity"),
         }
+        let mut boxes = Vec::with_capacity(frame.values.len());
+        for value in &frame.values {
+            let (boxed, _) = bridge_decode_box(
+                ctx,
+                value,
+                Type::Ref,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
+            if boxed.is_none() {
+                decline!("CtorTailBox");
+            }
+            boxes.push(boxed);
+        }
+        let (registers_r, return_substitute) = if boxes.len() == 1 {
+            (Vec::new(), Some(boxes[0]))
+        } else {
+            (boxes, None)
+        };
         return Some(ReconstructRecipe {
             code_ptr: std::ptr::null(),
             jitcode_index: frame.jitcode_index,
@@ -8673,13 +8700,13 @@ fn reconstruct_inline_recipe(
             nlocals: 0,
             valuestackdepth: 0,
             registers_i: Vec::new(),
-            registers_r: Vec::new(),
+            registers_r,
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
             registers_r_color: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
-            return_substitute: Some(instance),
+            return_substitute,
             len_tail: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
@@ -16009,7 +16036,8 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[]));
+        let jump_args =
+            state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[], true));
 
         assert_eq!(jump_args.len(), 9);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
@@ -16121,7 +16149,8 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[]));
+        let jump_args =
+            state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[], true));
 
         assert_eq!(
             jump_args.len(),
@@ -16311,6 +16340,135 @@ mod tests {
             }
             other => panic!("void_return resume walk expected Finish, got {other:?}"),
         }
+    }
+
+    /// `bridge_decode_box` only consults the backend for virtuals; ctor-tail
+    /// reconstruction feeds `RebuiltValue::Box`, so this stub is never called.
+    struct CtorRecipeTestCpu;
+    impl majit_backend::Backend for CtorRecipeTestCpu {
+        fn compile_loop(
+            &mut self,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _token: &majit_backend::JitCellToken,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("CtorRecipeTestCpu::compile_loop")
+        }
+        fn compile_bridge(
+            &mut self,
+            _fail_descr: &dyn majit_ir::FailDescr,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _original_token: &majit_backend::JitCellToken,
+            _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("CtorRecipeTestCpu::compile_bridge")
+        }
+        fn execute_token(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            _args: &[majit_ir::Value],
+        ) -> majit_backend::DeadFrame {
+            unimplemented!("CtorRecipeTestCpu::execute_token")
+        }
+        fn get_latest_descr<'a>(
+            &self,
+            _frame: &'a majit_backend::DeadFrame,
+        ) -> &'a dyn majit_ir::FailDescr {
+            unimplemented!("CtorRecipeTestCpu::get_latest_descr")
+        }
+        fn get_latest_descr_arc(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+        ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+            unimplemented!("CtorRecipeTestCpu::get_latest_descr_arc")
+        }
+        fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+            unimplemented!("CtorRecipeTestCpu::get_int_value")
+        }
+        fn get_value_direct(&self, frame: &majit_backend::DeadFrame, slot: usize) -> i64 {
+            self.get_int_value(frame, slot)
+        }
+        fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+            unimplemented!("CtorRecipeTestCpu::get_float_value")
+        }
+        fn get_ref_value(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+            _index: usize,
+        ) -> majit_ir::GcRef {
+            unimplemented!("CtorRecipeTestCpu::get_ref_value")
+        }
+        fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+            unimplemented!("CtorRecipeTestCpu::invalidate_loop")
+        }
+    }
+
+    fn reconstruct_ctor_tail_recipe(
+        values: Vec<majit_ir::resumedata::RebuiltValue>,
+    ) -> ReconstructRecipe {
+        use majit_ir::resumedata::RebuiltFrame;
+
+        let jitcode_index =
+            crate::ctor_continuation::jitcode_index().expect("ctor tail jitcode must install");
+        let pc = crate::ctor_continuation::resume_pc().expect("ctor tail resume pc") as i32;
+        let n = values.len();
+        let fail_values: Vec<i64> = (0..n).map(|i| w_int_new((i as i64) + 1) as i64).collect();
+        let fail_types = vec![Type::Ref; n];
+        let frame = RebuiltFrame {
+            jitcode_index,
+            pc,
+            values,
+        };
+        let resume_data = majit_metainterp::ResumeDataResult {
+            frames: vec![frame.clone()],
+            virtualizable_boxes: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: None,
+            num_failargs: fail_values.len() as i32,
+            fail_arg_types: fail_types.clone(),
+        };
+        let mut ctx = TraceCtx::for_test_types(&fail_types);
+        let mut cache = BridgeVirtualCache::new(0, crate::descr::make_array_descr);
+        reconstruct_inline_recipe(
+            &mut ctx,
+            &frame,
+            None,
+            &resume_data,
+            &fail_values,
+            &fail_types,
+            &CtorRecipeTestCpu,
+            &mut cache,
+            false,
+            &[],
+        )
+        .expect("ctor tail reconstruction must produce a recipe")
+    }
+
+    /// One live register is the after-residual form (`return w_newobject`).
+    /// Two are the post-return `CALL_ASSEMBLER` guard: both refs stay in
+    /// `registers_r` so the drain can run `descr_call`'s None check.
+    #[test]
+    fn reconstruct_inline_recipe_ctor_tail_splits_one_and_two_register_forms() {
+        use crate::ctor_continuation::{INIT_RESULT_REG, INSTANCE_REG};
+        use majit_ir::resumedata::RebuiltValue;
+
+        let one = reconstruct_ctor_tail_recipe(vec![RebuiltValue::Box(0, Type::Ref)]);
+        assert_eq!(one.return_substitute, Some(OpRef::input_arg_ref(0)));
+
+        let two = reconstruct_ctor_tail_recipe(vec![
+            RebuiltValue::Box(0, Type::Ref),
+            RebuiltValue::Box(1, Type::Ref),
+        ]);
+        assert!(two.return_substitute.is_none());
+        assert_eq!(
+            two.registers_r.get(INSTANCE_REG as usize).copied(),
+            Some(OpRef::input_arg_ref(0)),
+        );
+        assert_eq!(
+            two.registers_r.get(INIT_RESULT_REG as usize).copied(),
+            Some(OpRef::input_arg_ref(1)),
+        );
     }
 }
 
