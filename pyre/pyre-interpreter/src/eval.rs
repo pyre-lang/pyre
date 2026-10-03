@@ -136,6 +136,13 @@ pub fn current_frame() -> *mut PyFrame {
     CURRENT_FRAME.with(|current| current.get())
 }
 
+fn frame_already_on_ec_chain(
+    ec: &crate::executioncontext::PyExecutionContext,
+    frame: *mut PyFrame,
+) -> bool {
+    crate::executioncontext::frame_is_on_chain(ec, frame)
+}
+
 pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     let previous = CURRENT_FRAME.with(|current| {
         let previous = current.get();
@@ -148,21 +155,17 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     // `ExecutionContext::enter` before installing TLS-only state, but
     // the JIT portal path enters through this helper directly.
     let ec = crate::call::getexecutioncontext() as *mut PyExecutionContext;
-    // `ExecutionContext::enter` refuses a frame that is already the top —
-    // relinking it would make `f_backref` name the frame itself, and
-    // `walk_pyframe_roots` follows `f_backref` with no cycle guard.  This door
-    // owes the same refusal, because the enter is no longer performed only
-    // here: `try_walker_call_assembler_self_recursive`
-    // (`pyre-jit-trace/src/jitcode_dispatch/inline_call.rs`) records it ahead
-    // of its CALL_ASSEMBLER, and the force and deopt legs can hand that same,
-    // already-entered frame to a portal helper.  Already entered means this
-    // guard owns neither the link nor its matching restore; the surrounding
-    // `ExecutionContext.enter`/`leave` scope owns both.
-    let enters_chain = !ec.is_null()
-        && !std::ptr::eq(
-            crate::executioncontext::vref_referent(unsafe { (*ec).topframeref }),
-            frame as *mut PyFrame,
-        );
+    // `ExecutionContext::enter` is once per activation. Relinking a frame
+    // that is already on the chain — as the top, or as an ancestor of the
+    // current top — would store the current top into `f_backref` and close a
+    // cycle. `walk_pyframe_roots` follows `f_backref` with no cycle guard.
+    // This door owes the same refusal: `try_walker_call_assembler_self_recursive`
+    // records enter ahead of CALL_ASSEMBLER, and a later portal helper can
+    // be handed that same already-entered frame while a callee is the top.
+    // Already entered means this guard owns neither the link nor its matching
+    // restore; the surrounding `ExecutionContext.enter`/`leave` scope owns both.
+    let enters_chain =
+        !ec.is_null() && !frame_already_on_ec_chain(unsafe { &*ec }, frame as *mut PyFrame);
     let previous_ec_top = if enters_chain {
         unsafe {
             let top = (*ec).topframeref;
@@ -2654,7 +2657,13 @@ pub(crate) fn eval_frame_plain_with_resume(
     // replace that thread-owned slot from a frame field; doing so lets a
     // collapsed/stale translated frame identity poison every subsequent
     // `space.getexecutioncontext()` lookup.
-    execution_context.enter(frame as *mut PyFrame);
+    // `ExecutionContext.enter` is once per activation. A portal helper or
+    // inlined walker may already have linked this frame; a second enter
+    // would store the current top into `f_backref` and close a cycle.
+    let already_entered = frame_already_on_ec_chain(execution_context, frame as *mut PyFrame);
+    if !already_entered {
+        execution_context.enter(frame as *mut PyFrame);
+    }
     // `call_trace` / `return_trace` / `leave` run application Python, so a
     // nursery-born frame moves under them.  The raw `frame` argument is the
     // abandoned copy after the first callback; the JIT portal re-reads through
@@ -2743,7 +2752,9 @@ pub(crate) fn eval_frame_plain_with_resume(
         }
         combined
     })();
-    let leave_result = {
+    let leave_result = if already_entered {
+        Ok(w_exitvalue)
+    } else {
         let roots = pyre_object::gc_roots::push_roots();
 
         match outer_result {
@@ -6676,6 +6687,40 @@ mod tests {
             unsafe { (*ec).topframeref },
             frame_ptr,
             "the outer enter/leave scope, not the TLS guard, owns the unlink",
+        );
+        unsafe { (*ec).topframeref = outer_top };
+    }
+
+    #[test]
+    fn test_install_current_frame_does_not_relink_an_ancestor() {
+        let _ = run_exec_frame("pass");
+        let mut caller = PyFrame::new(compile_exec("pass").expect("compile failed"));
+        let mut callee = PyFrame::new(compile_exec("pass").expect("compile failed"));
+        let caller_ptr = caller.as_mut_ptr();
+        let callee_ptr = callee.as_mut_ptr();
+        let ec = crate::call::getexecutioncontext() as *mut PyExecutionContext;
+        assert!(!ec.is_null(), "the runtime must own an execution context");
+        let outer_top = unsafe { (*ec).topframeref };
+
+        unsafe { (*ec).enter(caller_ptr) };
+        unsafe { (*ec).enter(callee_ptr) };
+        let caller_back = unsafe { (*caller_ptr).f_backref };
+        let callee_back = unsafe { (*callee_ptr).f_backref };
+        assert_eq!(callee_back, caller_ptr);
+
+        {
+            let _guard = install_current_frame(unsafe { &mut *caller_ptr });
+            assert_eq!(
+                unsafe { (*caller_ptr).f_backref },
+                caller_back,
+                "an ancestor already on the chain must not take the current top as f_backref",
+            );
+            assert_eq!(unsafe { (*callee_ptr).f_backref }, callee_back);
+        }
+        assert_eq!(
+            unsafe { (*ec).topframeref },
+            callee_ptr,
+            "the outer enter/leave scope still owns the callee as top",
         );
         unsafe { (*ec).topframeref = outer_top };
     }

@@ -121,8 +121,47 @@ thread_local! {
     static WALK_END_RESTART_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+/// Walk-end TLS stacked with a nested `compile_and_run_once`.
+pub struct ParkedWalkEnd {
+    commit_leg: u8,
+    propagated_exception: Option<pyre_interpreter::PyError>,
+    propagate_allowed: bool,
+    restart_pc: Option<usize>,
+}
+
+/// Take the outer walk-end TLS so the inner attempt starts clean.
+pub fn park_walk_end() {
+    let parked = ParkedWalkEnd {
+        commit_leg: WALK_END_COMMIT_LEG.with(|c| c.replace(0)),
+        propagated_exception: WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take()),
+        propagate_allowed: WALK_END_PROPAGATE_ALLOWED.with(|c| c.replace(false)),
+        restart_pc: WALK_END_RESTART_PC.with(|c| c.take()),
+    };
+    PARKED_WALK_END_STACK.with(|s| s.borrow_mut().push(parked));
+}
+
+/// Restore the outer walk-end TLS after the nested run.
+pub fn restore_walk_end() {
+    let Some(parked) = PARKED_WALK_END_STACK.with(|s| s.borrow_mut().pop()) else {
+        return;
+    };
+    WALK_END_COMMIT_LEG.with(|c| c.set(parked.commit_leg));
+    WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = parked.propagated_exception);
+    WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(parked.propagate_allowed));
+    WALK_END_RESTART_PC.with(|c| c.set(parked.restart_pc));
+}
+
 struct WalkEndRootArea {
     propagated_exception: *const std::cell::RefCell<Option<pyre_interpreter::PyError>>,
+}
+
+thread_local! {
+    /// Outer walk-end TLS stacked while a nested `compile_and_run_once` runs.
+    /// `park_walk_end` moves the propagated exception out of
+    /// `WALK_END_PROPAGATED_EXCEPTION`, so this stack is the collector-visible
+    /// owner until `restore_walk_end`.
+    static PARKED_WALK_END_STACK: std::cell::RefCell<Vec<ParkedWalkEnd>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The flush legs that can commit a walk's end state, in the order they are
@@ -341,6 +380,13 @@ pub unsafe fn walk_walk_end_roots_area(
     if let Some(err) = opt.as_mut() {
         err.walk_gc_refs(visitor);
     }
+    PARKED_WALK_END_STACK.with(|stack| {
+        for parked in stack.borrow_mut().iter_mut() {
+            if let Some(err) = parked.propagated_exception.as_mut() {
+                err.walk_gc_refs(visitor);
+            }
+        }
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -5201,6 +5247,8 @@ fn run_perfn_walk<Sym: WalkSym>(
             // `append_virtualizable_boxes`; `close_loop_args_at` rebuilds
             // it from the same `virtualizable_data_boxes` (plus GFC /
             // last_instr pin). The two constructions must agree.
+            // `reached_loop_header` already recorded GUARD_FUTURE_CONDITION
+            // before the compiled-target check. Reuse that guard.
             let rebuilt = sym.close_loop_args_at(
                 ctx,
                 cf_addr,
@@ -5208,6 +5256,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 Some(loop_header_pc),
                 *loop_header_marker_jit_pc,
                 merge_point_registers_r,
+                false,
             );
             if ctx.has_virtualizable_boxes() {
                 debug_assert_eq!(

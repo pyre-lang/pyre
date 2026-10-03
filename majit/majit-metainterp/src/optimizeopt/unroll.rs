@@ -5534,16 +5534,12 @@ fn assemble_peeled_trace_with_jump_args(
     full_label_args.extend(filtered_extra_label_args.iter().copied());
 
     // RPython compile.py parity: after the loop label, only the loop-header
-    // contract is live. When `splice_redirected_tail` glues a redirected
-    // tail onto the body, the spliced output may mention OpRefs whose
-    // defining op was removed (the section between the splice point and
-    // the original Jump). Carry such "body use-before-def" references
-    // through the label so the assembled body doesn't contain dangling
-    // references. With Phase 2's disjoint OpRef namespace, body op args
-    // are pre-resolved through ctx.get_box_replacement, so the carried
-    // OpRef can be appended directly to full_label_args — the JUMP's
-    // mapped_base_args path picks up the corresponding fresh value on the
-    // next iteration. The filter only needs to skip filtered_extra_jump_args.
+    // contract is live (`label_op` + `sb.used_boxes`). When
+    // `splice_redirected_tail` glues a redirected tail onto the body, the
+    // spliced output may mention OpRefs whose defining op was removed.
+    // Those become extra_before_label SameAs ops, not extra LABEL args:
+    // `_jump_to_existing_trace` JUMP extras are only the remapped
+    // `used_boxes`. The filter only needs to skip filtered_extra_jump_args.
     let mut carried_source_slots: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     // `label_set` tracks which OpRefs are already carried by the label so
@@ -5644,8 +5640,13 @@ fn assemble_peeled_trace_with_jump_args(
                     constants,
                     ctx,
                 );
-                full_label_args.push(arg);
-                appended_label_args.push(arg);
+                // unroll.py `finalize_short_preamble`:
+                //   label_op.initarglist(label_op.getarglist() + sb.used_boxes)
+                // A body use-before-def is extra_before_label (the SameAs
+                // above), not a LABEL slot. Publishing it on the LABEL
+                // without a used_boxes entry makes every bridge JUMP
+                // (`_jump_to_existing_trace` `args + extra`) one arg short
+                // of the compiled LABEL.
                 label_set.insert(arg);
             };
             for a in op.args_slice().iter() {
@@ -9584,34 +9585,32 @@ mod tests {
         );
 
         assert_eq!(combined[0].opcode, OpCode::Label);
+        // unroll.py `finalize_short_preamble`: LABEL is `label_op` plus
+        // `sb.used_boxes`. A body use-before-def is extra_before_label,
+        // not a LABEL slot.
         assert_eq!(
             combined[0]
                 .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), OpRef::int_op(64)]
+            &[OpRef::int_op(10)]
         );
-        assert_eq!(combined[1].opcode, OpCode::GuardTrue);
+        let body_start = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::GuardTrue)
+            .expect("GuardTrue");
+        assert_eq!(combined[body_start].opcode, OpCode::GuardTrue);
+        assert_eq!(combined[body_start].num_args(), 1);
         assert_eq!(
-            combined[1]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(64)]
-        );
-        assert_eq!(
-            combined[1]
+            combined[body_start]
                 .guard_fail_args()
                 .expect("guard fail args")
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(64)]
+                .len(),
+            1
         );
-        assert_eq!(combined[2].opcode, OpCode::IntAdd);
-        assert_ne!(combined[2].pos().get(), OpRef::int_op(64));
+        assert_eq!(combined[body_start + 1].opcode, OpCode::IntAdd);
+        assert_ne!(combined[body_start + 1].pos().get(), OpRef::int_op(64));
     }
 
     #[test]

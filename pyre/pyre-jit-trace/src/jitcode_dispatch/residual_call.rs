@@ -5390,14 +5390,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     } else {
         None
     };
-    // A Python-level callee (e.g. a recursive `fib`) re-enters the
-    // interpreter (`eval_loop_jit` → `jit_merge_point`) while this walk still
-    // holds the driver in the tracing state.  Suspend re-entrant trace
-    // continuation for the duration of the concrete call so the callee runs as
-    // plain interpretation instead of starting a nested trace that would share
-    // and corrupt this walk's `TraceCtx` (flaky `libsystem_malloc` freelist
-    // abort during deep recursion).  Plain C-helper callees never re-enter, so
-    // the guard is a no-op for them.
+    // A Python-level callee re-enters the interpreter (`eval_loop_jit` →
+    // `jit_merge_point`) while this walk still holds the driver. Suspend
+    // re-entrant merge-point continuation so the callee's bytecodes are not
+    // recorded onto THIS walk's `TraceCtx`. The portal runner may still start
+    // a nested MetaInterp for a different green key (`warmstate.py`
+    // `bound_reached`); that attempt parks this ctx. Plain C-helper callees
+    // never re-enter, so the guard is a no-op for them.
     //
     // In RPython the tracing metainterp and the executing (blackhole /
     // compiled) interpreter are SEPARATE objects, so `do_residual_call`
