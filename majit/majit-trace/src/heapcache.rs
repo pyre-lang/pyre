@@ -878,6 +878,17 @@ impl HeapCache {
         self.heap_cache.insert(field_index, entry);
     }
 
+    /// Drop the `CacheEntry` for one field descr.
+    ///
+    /// A concrete store whose box this walk does not hold still mutates the
+    /// object; the next getfield of that descr must load from the heap.
+    pub fn clear_field(&mut self, field_index: u32) {
+        if declines_unnumbered_field(field_index) {
+            return;
+        }
+        self.heap_cache.remove(&field_index);
+    }
+
     /// heapcache.py: invalidate_unescaped — clear cached values for
     /// escaped objects only. Unescaped (newly allocated) objects cannot
     /// be affected by external calls, so their caches are preserved.

@@ -9533,6 +9533,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             }
         }
     }
+    fbw_state::walk_parked_walk_tls_stack(visitor);
 }
 
 /// #73: classification of a Python opcode's effect on the walk-level

@@ -12525,41 +12525,31 @@ enum CompileOnceStart {
 /// attempt. pyre reuses one driver object; this guard parks the outer
 /// attempt's per-trace fields so the inner run cannot disturb them.
 struct NestedTraceGuard {
-    parked_tls: Option<pyre_jit_trace::jitcode_dispatch::ParkedWalkTls>,
-    parked_end: Option<pyre_jit_trace::trace::ParkedWalkEnd>,
+    parked: bool,
 }
 
 impl NestedTraceGuard {
     fn enter(driver: &mut JitDriver<PyreJitState>) -> Self {
         if !driver.is_tracing() {
-            return Self {
-                parked_tls: None,
-                parked_end: None,
-            };
+            return Self { parked: false };
         }
-        let parked_tls = pyre_jit_trace::jitcode_dispatch::park_walk_tls();
-        let parked_end = pyre_jit_trace::trace::park_walk_end();
+        pyre_jit_trace::jitcode_dispatch::park_walk_tls();
+        pyre_jit_trace::trace::park_walk_end();
         driver.park_nested_trace();
-        Self {
-            parked_tls: Some(parked_tls),
-            parked_end: Some(parked_end),
-        }
+        Self { parked: true }
     }
 }
 
 impl Drop for NestedTraceGuard {
     fn drop(&mut self) {
-        let Some(parked_tls) = self.parked_tls.take() else {
+        if !self.parked {
             return;
-        };
-        let parked_end = self
-            .parked_end
-            .take()
-            .expect("parked_end pairs with parked_tls");
+        }
         let (driver, _) = driver_pair();
         driver.restore_nested_trace();
-        pyre_jit_trace::trace::restore_walk_end(parked_end);
-        pyre_jit_trace::jitcode_dispatch::restore_walk_tls(parked_tls);
+        driver.clear_tracing_heapcache_field(pyre_jit_trace::descr::pyframe_flags_descr().index());
+        pyre_jit_trace::trace::restore_walk_end();
+        pyre_jit_trace::jitcode_dispatch::restore_walk_tls();
     }
 }
 

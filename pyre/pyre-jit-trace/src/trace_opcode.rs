@@ -2381,14 +2381,37 @@ impl MIFrame {
                 (locals_vec, stack_vec)
             };
             stack_vec.resize(target_stack_capacity, OpRef::NONE);
+            // pyjitpl.py `reached_loop_header`: JUMP args are
+            // `live_arg_boxes = reds + virtualizable_boxes[:-1]`.
+            // `PyreSym.vable_*` is a pyre-only cache
+            // (`mirror_vable_static_to_boxes`); RPython has only
+            // `metainterp.virtualizable_boxes`. A bridge seeds
+            // `s.vable_debugdata` as the compacted failarg
+            // `InputArgRef(1)` while an earlier merge point's
+            // `remove_consts_and_duplicates` rewrites the shadow to a
+            // SameAs/Const. Reading the cache then publishes that outer
+            // inputarg on the JUMP, a slot `original_boxes` (the shadow)
+            // never had, and `cut_trace_from` appends it as an extra
+            // start-LABEL input (`compile.py compile_loop`).
+            let vable_last_instr = ctx
+                .virtualizable_box_at(crate::virtualizable_spec::LAST_INSTR_VABLE_FIELD_INDEX)
+                .unwrap_or(s.vable_last_instr);
+            let vable_pycode = ctx
+                .virtualizable_box_at(crate::virtualizable_spec::PYCODE_VABLE_FIELD_INDEX)
+                .unwrap_or(s.vable_pycode);
+            let vable_vsd = ctx
+                .virtualizable_box_at(2)
+                .unwrap_or(s.vable_valuestackdepth);
+            let vable_debugdata = ctx
+                .virtualizable_box_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+                .unwrap_or(s.vable_debugdata);
             (
                 s.frame,
                 recovered_ec,
-                s.vable_last_instr,
-                s.vable_pycode,
-                ctx.virtualizable_box_at(2)
-                    .unwrap_or(s.vable_valuestackdepth),
-                s.vable_debugdata,
+                vable_last_instr,
+                vable_pycode,
+                vable_vsd,
+                vable_debugdata,
                 nlocals,
                 locals_vec,
                 stack_vec,

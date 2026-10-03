@@ -2002,6 +2002,16 @@ impl<S: JitState> JitDriver<S> {
         self.last_bridge_is_exception_guard = parked.last_bridge_is_exception_guard;
         self.bridge_attempt_declined = parked.bridge_attempt_declined;
     }
+
+    /// Drop a heapcache field on the restored outer walk.
+    ///
+    /// Nested interpreter execution can store through a box this walk does
+    /// not hold; the parked `CacheEntry` would then disagree with the heap.
+    pub fn clear_tracing_heapcache_field(&mut self, field_index: u32) {
+        if let Some(ctx) = self.meta.tracing.as_mut() {
+            ctx.heap_cache_mut().clear_field(field_index);
+        }
+    }
 }
 
 /// Per-entry scratch owned by [`JitDriver`]; see [`JitDriver::entry_scratch`].
@@ -6747,9 +6757,6 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> Option<Option<usize>> {
-        if self.cell_is_tracing(green_key_hash) {
-            return Some(None);
-        }
         // Cross-loop-cut decline and single-pass label handoff must stay
         // ahead of the counter (`back_edge_internal` cites why). Empty
         // tables are O(1) and allocation-free: check emptiness first so a
@@ -6836,9 +6843,6 @@ impl<S: JitState> JitDriver<S> {
         direct_live_values: Option<Vec<Value>>,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        if self.cell_is_tracing(green_key_hash) {
-            return None;
-        }
         // **Resolve once, then carry.** The parameter is a raw bucket hash;
         // from here down `green_key` names ONE cell, not a celltable bucket —
         // the decision below, the
@@ -6874,6 +6878,9 @@ impl<S: JitState> JitDriver<S> {
             Some(token) => (green_key_hash, Some(token)),
             None => self.resolved_entry_procedure_token(green_key_hash, structured_green_key),
         };
+        if self.cell_is_tracing(green_key) {
+            return None;
+        }
         // Single-pass label handoff must stay ahead of the counter so a
         // CloseLoop arm's pending LABEL entry is consumed on the next back
         // edge rather than ticking past it. The table is one `Option`; check
@@ -9912,9 +9919,6 @@ impl<S: JitState> JitDriver<S> {
         // and not the other. The next door's `take_back_edge_finish_*`
         // would then return that call's resultbox.
         self.clear_finish_latches();
-        if self.cell_is_tracing(green_key_hash) {
-            return FunctionEntryRunner::Run;
-        }
         // The raw fast path writes the word here instead of
         // `back_edge_finish_word`, so `execute_assembler`'s register return
         // shape stays intact (`Done(Option<usize>)` still fits one word).

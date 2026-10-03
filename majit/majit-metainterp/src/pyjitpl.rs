@@ -3707,7 +3707,15 @@ impl<M: Clone> MetaInterp<M> {
     /// drained its own `tracing` first (`compile_and_run_once` finishes or
     /// aborts before this returns).
     pub fn restore_attempt(&mut self) {
+        debug_assert!(
+            self.tracing.is_none()
+                && self.compile_tracing.is_none()
+                && self.active_trace_session.is_none()
+                && !self.profiler_tracing_active,
+            "restore_attempt: nested attempt did not drain its tracing state"
+        );
         let Some(parked) = self.parked_attempts.pop() else {
+            debug_assert!(false, "restore_attempt without a matching park_attempt");
             return;
         };
         self.tracing = parked.tracing;
@@ -4479,6 +4487,14 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         for parked in &mut self.parked_attempts {
+            if let Some(partial) = parked.partial_trace.as_mut() {
+                for op in partial.ops.iter_mut() {
+                    walk_op_const_ptr_refs(op, &mut visitor);
+                }
+            }
+            if let Some(exported_state) = parked.exported_state.as_mut() {
+                exported_state.walk_const_ptr_refs_mut(&mut visitor);
+            }
             Self::walk_attempt_trace_refs(
                 &mut parked.framestack,
                 &mut parked.last_exc_box,
