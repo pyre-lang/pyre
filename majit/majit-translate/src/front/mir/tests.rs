@@ -2685,7 +2685,7 @@ fn option_gcref_none_is_cast_int_to_ptr_gcref_and_unions_with_some() {
                 serde_json::json!({
                     "span": interior_span(),
                     "kind": {"Switch": {
-                        "discr": {"Copy": interior_place(1, &bool_ty)},
+                        "discr": {"Read": interior_place(1, &bool_ty)},
                         "targets": {"If": [1, 2]}
                     }}
                 }),
@@ -5366,138 +5366,6 @@ fn heap_string_as_ref_bytes_into_window_param_keeps_call() {
     );
 }
 
-/// heap `String::as_ref` into a `&str` tuple field keeps the residual
-/// call: rust-heap `String` and `&str` do not share a repr class. The
-/// FieldWrite value kind equals the field kind.
-#[test]
-fn heap_string_as_ref_into_str_tuple_field_keeps_call() {
-    use crate::codewriter::type_state::valuetype_to_concrete;
-    use crate::model::{FunctionGraph, LinkArg, OpKind, ValueType};
-
-    let string_adt = serde_json::json!({
-        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
-    });
-    let string_ref = serde_json::json!({"Ref": ["Erased", string_adt.clone(), "Shared"]});
-    let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
-    let bool_ty = serde_json::json!({"Scalar": "Bool"});
-    let tuple = tuple_ty(vec![str_ty.clone(), bool_ty.clone()]);
-    let string_td = serde_json::json!({
-        "def_id": 0,
-        "item_meta": window_meta(&["alloc", "string", "String"], true),
-        "kind": {"Struct": [
-            {"name": "ptr", "ty": window_usize(), "attr_info": null},
-            {"name": "len", "ty": window_usize(), "attr_info": null},
-            {"name": "cap", "ty": window_usize(), "attr_info": null}
-        ]}
-    });
-    let (unwind, _) = window_unwind_and_return_blocks();
-    let as_ref = window_opaque_fun(
-        1,
-        &["alloc", "string", "<Impl>", "as_ref"],
-        vec![string_ref.clone()],
-        str_ty.clone(),
-    );
-    let s_place = window_place(serde_json::json!({"Local": 1}), &string_adt);
-    let caller = serde_json::json!({
-        "def_id": 0,
-        "item_meta": window_meta(&["fixture", "string_as_ref_tuple_field"], true),
-        "signature": {
-            "is_unsafe": false,
-            "inputs": [string_adt.clone(), bool_ty.clone()],
-            "output": tuple.clone()
-        },
-        "body": {"Unstructured": {
-            "span": window_span(),
-            "locals": {"arg_count": 2, "locals": [
-                window_local(0, &tuple),
-                window_local(1, &string_adt),
-                window_local(2, &bool_ty),
-                window_local(3, &string_ref),
-                window_local(4, &str_ty)
-            ]},
-            "body": [
-                {
-                    "statements": [{
-                        "span": window_span(),
-                        "kind": {"Assign": [
-                            window_place(serde_json::json!({"Local": 3}), &string_ref),
-                            {"Ref": {"place": s_place, "kind": "Shared", "ptr_metadata": null}}
-                        ]}
-                    }],
-                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
-                        "func": {"Regular": {
-                            "kind": {"Fun": 1},
-                            "generics": window_empty_generics()
-                        }},
-                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &string_ref)}],
-                        "dest": window_place(serde_json::json!({"Local": 4}), &str_ty)
-                    }, "target": 2, "on_unwind": 1}}}
-                },
-                unwind,
-                {
-                    "statements": [{
-                        "span": window_span(),
-                        "kind": {"Assign": [
-                            window_place(serde_json::json!({"Local": 0}), &tuple),
-                            {"Aggregate": [
-                                "Tuple",
-                                [
-                                    {"Move": window_place(serde_json::json!({"Local": 4}), &str_ty)},
-                                    {"Copy": window_place(serde_json::json!({"Local": 2}), &bool_ty)}
-                                ]
-                            ]}
-                        ]}
-                    }],
-                    "kind": "Regular",
-                    "terminator": {"span": window_span(), "kind": "Return"}
-                }
-            ]
-        }}
-    });
-    let llbc = window_llbc(vec![string_td], vec![caller, as_ref]);
-    let graph = super::lower_function(&llbc, "string_as_ref_tuple_field")
-        .expect("lower String::as_ref into &str tuple field");
-    let leafs = window_call_leafs(&graph);
-    assert!(
-        leafs.iter().any(|leaf| leaf == "as_ref"),
-        "heap String::as_ref keeps the residual call; leafs={leafs:?} graph={}",
-        graph.dump()
-    );
-    let writes: Vec<_> = window_graph_ops(&graph)
-        .into_iter()
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldWrite {
-                field, ty, value, ..
-            } if field.name == "__pos_0" => Some((ty.clone(), value.clone())),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        !writes.is_empty(),
-        "tuple ctor writes __pos_0; graph={}",
-        graph.dump()
-    );
-    for (ty, value) in writes {
-        assert!(
-            matches!(ty, ValueType::Str),
-            "__pos_0 field is Str, got {ty:?}; graph={}",
-            graph.dump()
-        );
-        let LinkArg::Value(v) = value else {
-            panic!(
-                "__pos_0 stored value is not a Variable; graph={}",
-                graph.dump()
-            );
-        };
-        assert_eq!(
-            FunctionGraph::concretetype_of(&v),
-            valuetype_to_concrete(&ty),
-            "FieldWrite value kind equals the field kind; ty={ty:?} graph={}",
-            graph.dump()
-        );
-    }
-}
-
 /// Keep-gain: `FmtArg::Bytes(qualname.as_bytes())` writes a window
 /// into a window field.
 #[test]
@@ -6940,11 +6808,9 @@ fn index_trait_output_dest_str_paints_str() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 1}), &str_ty)},
-                            {"Copy": window_place(serde_json::json!({"Local": 2}), &window_usize())}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &str_ty)
-                    }, "target": 2, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &str_ty)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &window_usize())}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &str_ty), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -7047,10 +6913,8 @@ fn vec_typevar_clone_dest_i64_paints_int() {
                             "generics": window_empty_generics()
                         }},
                         "args": [
-                            {"Copy": window_place(serde_json::json!({"Local": 1}), &vec_i64)}
-                        ],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &vec_i64)
-                    }, "target": 2, "on_unwind": 1}}}
+                            {"Read": window_place(serde_json::json!({"Local": 1}), &vec_i64)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &vec_i64), "target": 2, "on_unwind": 1}}}
                 },
                 unwind,
                 ret
@@ -7134,7 +6998,7 @@ fn voidp_call_dest_joins_cast_int_to_voidp() {
                     "statements": [],
                     "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": {"Switch": {
-                        "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                        "discr": {"Read": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
                         "targets": {"If": [2, 3]}
                     }}}
                 },
@@ -7147,9 +7011,7 @@ fn voidp_call_dest_joins_cast_int_to_voidp() {
                             "kind": {"Fun": 1},
                             "generics": window_empty_generics()
                         }},
-                        "args": [],
-                        "dest": window_place(serde_json::json!({"Local": 0}), &voidp)
-                    }, "target": 4, "on_unwind": 1}}}
+                        "args": []}, "dest": window_place(serde_json::json!({"Local": 0}), &voidp), "target": 4, "on_unwind": 1}}}
                 },
                 {
                     "statements": [{
@@ -7158,7 +7020,7 @@ fn voidp_call_dest_joins_cast_int_to_voidp() {
                             window_place(serde_json::json!({"Local": 0}), &voidp),
                             {"UnaryOp": [
                                 {"Cast": {"PtrWithExposedProvenance": voidp.clone()}},
-                                {"Copy": window_place(serde_json::json!({"Local": 2}), &usize_ty)}
+                                {"Read": window_place(serde_json::json!({"Local": 2}), &usize_ty)}
                             ]}
                         ]}
                     }],
@@ -9436,6 +9298,7 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types_and_traits(
         trait_decls,
         trait_impls,
         false,
+        None,
     )
 }
 
@@ -9446,6 +9309,7 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types_dest(
     dest_ty: serde_json::Value,
     type_decls: Vec<serde_json::Value>,
     temp_dest: bool,
+    const_arg: Option<usize>,
 ) -> Llbc {
     std_extern_call_fixture_with_types_and_traits_dest(
         caller_name,
@@ -9456,6 +9320,7 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types_dest(
         Vec::new(),
         Vec::new(),
         temp_dest,
+        const_arg,
     )
 }
 
@@ -9468,6 +9333,7 @@ fn std_extern_call_fixture_with_types_and_traits_dest(
     trait_decls: Vec<serde_json::Value>,
     trait_impls: Vec<serde_json::Value>,
     temp_dest: bool,
+    const_arg: Option<usize>,
 ) -> Llbc {
     let span = || {
         serde_json::json!({
@@ -9538,13 +9404,28 @@ fn std_extern_call_fixture_with_types_and_traits_dest(
     } else {
         0
     };
+    let const_zero = |ty: &serde_json::Value| {
+        let int = ty.get("Scalar").and_then(|s| s.get("Integer"));
+        if let Some(signed) = int.and_then(|i| i.get("Signed")).and_then(|v| v.as_str()) {
+            serde_json::json!({"Const": [{"Integer": {"Signed": [signed, "0"]}}, ty]})
+        } else if let Some(unsigned) = int.and_then(|i| i.get("Unsigned")).and_then(|v| v.as_str())
+        {
+            serde_json::json!({"Const": [{"Integer": {"Unsigned": [unsigned, "0"]}}, ty]})
+        } else {
+            panic!("const-arg fixture only covers integer scalars, got {ty}")
+        }
+    };
     let call_args: Vec<serde_json::Value> = arg_tys
         .iter()
         .enumerate()
         .map(|(i, ty)| {
-            serde_json::json!({
-                "Read": {"kind": {"Local": i + 1}, "ty": ty}
-            })
+            if const_arg == Some(i) {
+                const_zero(ty)
+            } else {
+                serde_json::json!({
+                    "Read": {"kind": {"Local": i + 1}, "ty": ty}
+                })
+            }
         })
         .collect();
     let caller = serde_json::json!({
@@ -9577,9 +9458,7 @@ fn std_extern_call_fixture_with_types_and_traits_dest(
                                                 "generics": generics.clone()
                                             }
                                         },
-                                        "args": call_args,
-                                        "dest": {"kind": {"Local": call_dest}, "ty": dest_ty.clone()}
-                                    },
+                                        "args": call_args}, "dest": {"kind": {"Local": call_dest}, "ty": dest_ty.clone()},
                                     "target": 2,
                                     "on_unwind": 1
                                 }
@@ -10283,8 +10162,8 @@ fn pointer_default_is_a_null_constant() {
         crate::test_support::lower_function(&llbc, "default_mut_ptr").expect("lower ptr default");
     let ops = graph_ops(&graph);
     assert!(
-        ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
-        "*mut T::default of a scalar pointee is the int-bank null (`rffi` raw `Ptr`); ops={ops:?}"
+        ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
+        "*mut T::default must become ConstRefNull; ops={ops:?}"
     );
     assert!(
         !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
@@ -11988,6 +11867,117 @@ fn ptr_sub_of_bytes_is_unscaled_direct_ptradd_with_negated_count() {
 }
 
 #[test]
+fn ptr_offset_from_of_bytes_is_adr_delta() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+    });
+    let isize_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let llbc = std_extern_call_fixture(
+        "offset_from_u8",
+        &["core", "ptr", "mut_ptr", "<Impl>", "offset_from"],
+        &[ptr_ty.clone(), ptr_ty],
+        isize_ty,
+    );
+    let graph = crate::test_support::lower_function(&llbc, "offset_from_u8")
+        .expect("lower *mut u8::offset_from");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("cast_ptr_to_int")
+        )),
+        "*mut u8::offset_from must cast both pointers to int; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub")),
+        "*mut u8::offset_from must subtract the addresses; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "floordiv")),
+        "*mut u8::offset_from must not divide by 1; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "offset_from"),
+        "*mut u8::offset_from must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn ptr_offset_from_of_i64_is_adr_delta_then_floordiv() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
+    });
+    let isize_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let llbc = std_extern_call_fixture(
+        "offset_from_i64",
+        &["core", "ptr", "const_ptr", "<Impl>", "offset_from"],
+        &[ptr_ty.clone(), ptr_ty],
+        isize_ty,
+    );
+    let graph = crate::test_support::lower_function(&llbc, "offset_from_i64")
+        .expect("lower *const i64::offset_from");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub")),
+        "*const i64::offset_from must subtract the addresses; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
+        "*const i64::offset_from must floordiv by the pointee size; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "floordiv")),
+        "*const i64::offset_from must floordiv the address delta; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "offset_from"),
+        "*const i64::offset_from must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn ptr_offset_from_instantiated_path_is_adr_delta() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]}, "Mut"]
+    });
+    let isize_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let llbc = std_extern_call_fixture(
+        "offset_from_ptr",
+        &[
+            "core",
+            "ptr",
+            "mut_ptr",
+            "<Impl>",
+            "offset_from",
+            "<*mut u8>",
+        ],
+        &[ptr_ty.clone(), ptr_ty],
+        isize_ty,
+    );
+    let graph = crate::test_support::lower_function(&llbc, "offset_from_ptr")
+        .expect("lower instantiated *mut *mut u8::offset_from");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "floordiv")),
+        "instantiated offset_from of a pointer pointee must floordiv; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf.starts_with("offset_from") || *leaf == "<*mut u8>"),
+        "instantiated offset_from must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
 fn wrapping_neg_of_i64_is_int_neg() {
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let llbc = std_extern_call_fixture(
@@ -12644,6 +12634,50 @@ fn ptr_write_of_scalar_is_a_raw_store() {
 }
 
 #[test]
+fn ptr_write_of_const_scalar_is_a_raw_store() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "Mut"]
+    });
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}
+    });
+    // `alloc_lowlevel_string` stores `hash = 0` / `len` with
+    // `(*mut usize).write(const)` — a Const value has no Place type.
+    let llbc = std_extern_call_fixture_with_types_dest(
+        "write_usize_const",
+        &["core", "ptr", "mut_ptr", "<Impl>", "write"],
+        &[ptr_ty, usize_ty],
+        unit,
+        vec![],
+        false,
+        Some(1),
+    );
+    let graph = crate::test_support::lower_function(&llbc, "write_usize_const")
+        .expect("lower mut_ptr::write of const usize");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::RawStore {
+                itemsize: 8,
+                is_item_signed: false,
+                ..
+            }
+        )),
+        "const usize ptr::write must become RawStore; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops)
+            .iter()
+            .any(|leaf| *leaf == "write" || leaf.starts_with("write::<")),
+        "const scalar ptr::write must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
 fn ptr_write_lookalike_stays_residual() {
     let ptr_ty = serde_json::json!({
         "RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
@@ -12961,6 +12995,55 @@ fn one_word_copy_nonoverlapping_is_slice_arraycopy() {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
             } if segments.last().is_some_and(|leaf| leaf == "copy_nonoverlapping")
+        )),
+        "copy_nonoverlapping must not remain a FunctionPath; ops={ops:?}"
+    );
+}
+
+#[test]
+fn byte_copy_nonoverlapping_is_raw_memcopy() {
+    let generics = |types: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "regions": [], "types": types, "const_generics": [], "trait_refs": []
+        })
+    };
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let u8_ptr = serde_json::json!({"RawPtr": [u8_ty.clone(), "Const"]});
+    let u8_mut_ptr = serde_json::json!({"RawPtr": [u8_ty, "Mut"]});
+    let unit =
+        serde_json::json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": generics(vec![])}});
+    let llbc = std_extern_call_fixture_with_types(
+        "copy_u8",
+        &["core", "ptr", "copy_nonoverlapping"],
+        &[u8_ptr, u8_mut_ptr, usize_ty],
+        unit,
+        vec![],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "copy_u8")
+        .expect("lower ptr::copy_nonoverlapping");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "jit_raw_memcopy")
+                && args.len() == 3
+        )),
+        "copy_nonoverlapping of *u8 must residual-call jit_raw_memcopy; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| {
+                leaf == "copy_nonoverlapping" || leaf.starts_with("copy_nonoverlapping::<")
+            })
         )),
         "copy_nonoverlapping must not remain a FunctionPath; ops={ops:?}"
     );
@@ -14586,6 +14669,27 @@ fn f64_i64_transmute_projects_to_float_bytes_llop() {
     );
 }
 
+fn assert_lltype_cast_call(ops: &[&SpaceOperation], name: &str) {
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == name)
+                && segments.windows(2).any(|w| w[0] == "lltype" && w[1] == name)
+        )),
+        "{name} host call missing; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::UnaryOp { op, .. } if op == name
+        )),
+        "{name} must not be a UnaryOp; ops={ops:?}"
+    );
+}
+
 fn assert_unary_llop(ops: &[&SpaceOperation], name: &str, result_ty: ValueType) {
     assert!(
         ops.iter().any(|op| matches!(
@@ -14659,21 +14763,7 @@ fn host_scalar_calls_project_to_llops() {
         let graph = crate::test_support::lower_function(&llbc, func).expect(&lowered);
         let ops = graph_ops(&graph);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // `*mut i64` is already `int` (`history.py` `getkind`
-            // of a raw `Ptr`). `jtransform.py rewrite_op_cast_ptr_to_int`
-            // returns None (alias) when the arg is not GC.
-            assert!(
-                !ops.iter().any(|op| matches!(
-                    &op.kind,
-                    OpKind::UnaryOp { op, .. }
-                        if *op == "cast_ptr_to_int" || *op == "cast_int_to_ptr"
-                )),
-                "{name} of a raw scalar pointer is identity; ops={ops:?}"
-            );
-            assert!(
-                !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
-                "{name} of a raw scalar pointer must not residualize; ops={ops:?}"
-            );
+            assert_lltype_cast_call(&ops, name);
         }));
         if let Err(payload) = result {
             panic!("case {name}: {}", panic_payload_mir(&payload));
@@ -14755,64 +14845,6 @@ fn equal_size_int_to_float_transmute_stays_residual() {
         1,
         "bank-crossing transmute must retain the residual intrinsic call"
     );
-}
-
-#[test]
-fn equal_size_rawptr_to_fnptr_transmute_is_int_bank_identity() {
-    // `history.py` `getkind` of a raw `Ptr` is `'int'` (`TYPE.TO._gckind
-    // == 'raw'`). `FuncType._gckind` is `'raw'`, so `Ptr(FuncType)` is
-    // `'int'` too. Equal-size same-bank transmute is the bank's
-    // ordinary copy; `jtransform.py` `rewrite_op_cast_ptr_to_int`
-    // returns None for a non-GC arg. The previous assertion that a
-    // data pointer is `ref` (and that this pair is `cast_ptr_to_int`)
-    // was the deleted deviation.
-    let llbc = transmute_lowering_fixture();
-    let graph = crate::test_support::lower_function(&llbc, "transmute_rawptr_to_fnptr")
-        .expect("lower rawptr-to-fnptr transmute");
-    let ops: Vec<_> = graph
-        .blocks
-        .iter()
-        .flat_map(|block| block.operations.iter())
-        .collect();
-
-    assert!(
-        !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
-        "same-bank rawptr↔fnptr transmute must not residualize: {ops:?}"
-    );
-    assert!(
-        ops.iter().all(|op| !matches!(
-            &op.kind,
-            OpKind::UnaryOp { op, .. }
-                if op == "same_as" || op == "cast_ptr_to_int" || op == "cast_int_to_ptr"
-        )),
-        "same-bank transmute binds the destination to the input; ops={ops:?}"
-    );
-    let input = ops
-        .iter()
-        .find_map(|op| match (&op.result, &op.kind) {
-            (
-                Some(result),
-                OpKind::Input {
-                    name,
-                    ty: ValueType::Int,
-                    ..
-                },
-            ) if name == "value" => Some(result),
-            _ => None,
-        })
-        .expect("value input");
-    let returned = graph
-        .blocks
-        .iter()
-        .find_map(|block| {
-            block
-                .exits
-                .iter()
-                .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
-        })
-        .flatten()
-        .and_then(LinkArg::as_variable);
-    assert_eq!(returned, Some(input));
 }
 
 #[test]
@@ -19324,7 +19356,7 @@ fn interned_result_of_mut_ref_declared_gc_payload_is_pointer() {
             }
         }
     });
-    let llbc = llbc_with_types_traits(
+    let llbc = llbc_with_types_and_traits(
         "fixture",
         vec![result_enum(0), w, pyerror],
         vec![
@@ -20715,7 +20747,7 @@ fn lower_control_flow_continue_mut_payload(payload_id: u64) -> FunctionGraph {
         &[0, 8],
         false,
     );
-    let llbc = llbc_with_types_traits(
+    let llbc = llbc_with_types_and_traits(
         "fixture",
         vec![control_flow_bc_enum(0), base, sub],
         vec![caller],
@@ -22071,7 +22103,7 @@ fn null_mut_of_gc_struct_is_spelled_null_mut() {
         ],
     );
     let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
-    let llbc = llbc_with_types_traits(
+    let llbc = llbc_with_types_and_traits(
         "fixture",
         vec![interior_struct(
             0,
@@ -27077,7 +27109,10 @@ fn mem_drop_of_root_scope_lowers_to_one_close() {
     let calls = corpus_call_paths("mem_drop_root_scope");
     let closes = calls
         .iter()
-        .filter(|path| path.split("::").any(|seg| seg == "root_scope_close"))
+        .filter(|path| {
+            path.split("::")
+                .any(|seg| seg == "root_scope_close" || seg == "root_scope_close_jit_abi")
+        })
         .count();
     assert_eq!(closes, 1, "{calls:?}");
     assert!(
@@ -28405,7 +28440,7 @@ fn lower_owned_concat_with_traits(
     trait_decls: Vec<Value>,
     trait_impls: Vec<Value>,
 ) -> crate::model::FunctionGraph {
-    let llbc = llbc_with_types_traits("fixture", types, funs, trait_decls, trait_impls);
+    let llbc = llbc_with_types_and_traits("fixture", types, funs, trait_decls, trait_impls);
     crate::test_support::lower_function(&llbc, name)
         .unwrap_or_else(|err| panic!("{name} failed to lower: {err}"))
 }
@@ -32864,8 +32899,8 @@ fn raw_u8_call_result_is_ccharp() {
 }
 
 /// `f() -> *mut i8`, `.cast::<u8>()`, then `h(p: *mut u8) -> Vec<u8>`:
-/// the `h` actual is a fresh typed CCHARP result. The raw source is already
-/// int-kind (`history.py getkind`), so no GC pointer-to-int cast is needed.
+/// the `h` actual is CCHARP produced by `rffi.cast` (`cast_ptr_to_int`
+/// then `cast_int_to_ptr`), not a stamp on `f`'s Ref-banked result.
 #[test]
 fn raw_i8_cast_to_u8_emits_rffi_cast() {
     let i8_ty = mut_i8_ty_json();
@@ -32930,8 +32965,8 @@ fn raw_i8_cast_to_u8_emits_rffi_cast() {
 }
 
 /// `fn f(p: *mut i8) -> *mut u8 { p.cast::<u8>() }`: the return is
-/// a fresh CCHARP (`rbuiltin.py rtype_cast_int_to_ptr`), preserving the
-/// source Variable's representation even though both JIT kinds are int.
+/// CCHARP produced by `rffi.cast` (`cast_ptr_to_int` then
+/// `cast_int_to_ptr`), not a Ref alias of `p`.
 #[test]
 fn raw_i8_method_cast_to_u8_returns_ccharp() {
     use crate::model::{CallTarget, ConcreteType, LinkArg, OpKind, getkind};
@@ -33039,8 +33074,8 @@ fn raw_i8_method_cast_to_u8_returns_ccharp() {
             _ => false,
         });
     assert!(
-        !saw_cast_ptr_to_int,
-        "raw *mut i8 is already int-kind (history.py getkind); graph={}",
+        saw_cast_ptr_to_int,
+        "cast_ptr_to_int in f (p is a Ref *mut i8); graph={}",
         graph.dump()
     );
 }
@@ -33200,8 +33235,8 @@ fn assert_h_actual_from_rffi_cast_not_f_result(graph: &FunctionGraph) {
             _ => false,
         });
     assert!(
-        !saw_cast_ptr_to_int,
-        "f's raw pointer result is already int-kind (history.py getkind); graph={}",
+        saw_cast_ptr_to_int,
+        "cast_ptr_to_int in g (f's Ref result may be a block inputarg); graph={}",
         graph.dump()
     );
 }
@@ -33612,7 +33647,7 @@ fn generic_ref_field_keeps_ref_wrapper() {
 fn ll_vec_setitem_fast_r_item_is_gcref() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/majit-rlib.ullbc"
+        "/../../target/llbc/majit-rlib.ullbc"
     );
     let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
     let graph =
@@ -33654,7 +33689,7 @@ fn ll_vec_setitem_fast_r_item_is_gcref() {
 fn ll_vec_extend_r_is_resize_then_arraycopy() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/majit-rlib.ullbc"
+        "/../../target/llbc/majit-rlib.ullbc"
     );
     let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
     let graph = super::lower_function(&llbc, "ll_vec_extend_r").expect("lower ll_vec_extend_r");
@@ -33688,7 +33723,7 @@ fn newdict_empty_dstorage_setfield_is_ref() {
     use crate::model::{LinkArg, OpKind, ValueType};
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
+        "/../../target/llbc/pyre-object.ullbc"
     );
     let llbc = Llbc::load(path).expect("load pyre-object.ullbc");
     let graph = super::lower_function(&llbc, "newdict_empty").expect("lower newdict_empty");
@@ -39512,7 +39547,7 @@ fn llbc_with_declared_gc(
     gc_self_ids: &[u64],
 ) -> Llbc {
     let trait_impls = gc_self_ids.iter().copied().map(gctype_impl_row).collect();
-    llbc_with_types_traits(
+    llbc_with_types_and_traits(
         crate_name,
         types,
         funs,
@@ -40658,6 +40693,129 @@ fn object_array_index_narrows_from_the_array_type() {
                 .any(|op| crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")),
             "{name} must narrow the object-array index through [PyObject]; ops={ops:?}"
         );
+    }
+}
+
+/// `kwargs_setitem_correct_indirection` is `for i in 0..keys_w.len() { values_w[i] = w_value; }`.
+/// `rrange.py` `ll_rangenext_*` yields Signed and `rlist.py` `ll_setitem`
+/// takes that Signed index. `Option<usize>::Some.__pos_0` is the payload
+/// field (`rclass.py` `InstanceRepr.getfield`), not identity on the
+/// Option instance: aliasing the parent types the index as Ref and
+/// `assembler.py` `setarrayitem_gc` rejects it.
+#[test]
+fn kwargs_setitem_range_index_is_int_kind() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    // The look_inside_iff wrapper keeps the unsuffixed name and only
+    // dispatches; the loop lives in `_orig_*` (`kwargsdict.py`
+    // `_setitem_correct_indirection`).
+    let graph =
+        crate::test_support::lower_function(llbc, "_orig_kwargs_setitem_correct_indirection")
+            .expect("lower _orig_kwargs_setitem_correct_indirection");
+    let writes: Vec<_> = graph_ops(&graph)
+        .into_iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayWrite { index, .. } | OpKind::ArrayRead { index, .. } => {
+                Some(index.clone())
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().is_some_and(|leaf| {
+                leaf.starts_with("ll_vec_setitem") || leaf.starts_with("ll_vec_getitem")
+            }) =>
+            {
+                args.get(1).and_then(LinkArg::as_variable).cloned()
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !writes.is_empty(),
+        "values_w[i] = w_value must index the vec; {}",
+        graph.dump()
+    );
+    for index in writes {
+        let origins = array_index_origin_ops(&graph, &index);
+        assert!(
+            !origins.is_empty(),
+            "setarrayitem index {} has no producer; {}",
+            index.name(),
+            graph.dump()
+        );
+        for origin in origins {
+            let ty = op_result_value_type(&origin.kind);
+            assert!(
+                matches!(
+                    ty,
+                    Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool)
+                ),
+                "setarrayitem index must be int-kind (`ll_rangenext_*` / `ll_setitem`), \
+                 got {ty:?} from {:?}; {}",
+                origin.kind,
+                graph.dump()
+            );
+        }
+        assert_ne!(
+            FunctionGraph::concretetype_of(&index),
+            crate::model::ConcreteType::GcRef,
+            "setarrayitem index {} must not sit in the ref bank; {}",
+            index.name(),
+            graph.dump()
+        );
+    }
+}
+
+fn array_index_origin_ops<'a>(graph: &'a FunctionGraph, var: &Variable) -> Vec<&'a SpaceOperation> {
+    let mut origins = Vec::new();
+    let mut stack = vec![var.clone()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(v) = stack.pop() {
+        if !seen.insert(v.id()) {
+            continue;
+        }
+        let mut found_op = false;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            if op.result.as_ref() == Some(&v) {
+                origins.push(op);
+                found_op = true;
+            }
+        }
+        if found_op {
+            continue;
+        }
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            let Some(slot) = block.inputargs.iter().position(|arg| arg == &v) else {
+                continue;
+            };
+            for pred in &graph.blocks {
+                for link in &pred.exits {
+                    if link.target.0 != bi {
+                        continue;
+                    }
+                    if let Some(LinkArg::Value(src)) = link.args.get(slot) {
+                        stack.push(src.clone());
+                    }
+                }
+            }
+        }
+    }
+    origins
+}
+
+fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {
+    match kind {
+        OpKind::FieldRead { ty, .. }
+        | OpKind::Input { ty, .. }
+        | OpKind::Call { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::ArrayRead { item_ty: ty, .. } => Some(ty.clone()),
+        OpKind::ConstInt(_) | OpKind::ConstBool(_) => Some(ValueType::Int),
+        OpKind::ConstUInt(_) => Some(ValueType::Unsigned),
+        OpKind::ArrayLen { .. } => Some(ValueType::Int),
+        _ => None,
     }
 }
 

@@ -228,6 +228,7 @@ fn build() -> AllJitCodes {
                 jit_drivers: vec![crate::JitDriverSpec {
                     portal: crate::CallPath::from_segments(["eval", "eval_loop_jit"]),
                     portal_runner: None,
+                    portal_enter: None,
                     greens: vec![
                         "next_instr".to_string(),
                         "is_being_profiled".to_string(),

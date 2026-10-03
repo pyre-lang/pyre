@@ -2190,6 +2190,75 @@ impl<'a> Lowering<'a> {
         json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
     }
 
+    /// Word descr of an `Atomic*::load` result: the destination scalar, or
+    /// the atomic wrapper's inner value when dest is not a copy scalar.
+    pub(in crate::front::mir) fn atomic_load_word_descr(
+        &self,
+        dest_ty: &TyRef,
+        recv_ty: Option<&TyRef>,
+    ) -> Option<(ValueType, usize, bool)> {
+        self.raw_word_descr(dest_ty).or_else(|| {
+            recv_ty.and_then(|ty| {
+                let peeled = self
+                    .tyref_peel_ref_to_pointee(ty)
+                    .unwrap_or_else(|| ty.clone());
+                let item_ty = tyref_atomic_inner_value_type(
+                    &peeled,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )?;
+                let is_item_signed = matches!(item_ty, ValueType::Int);
+                let itemsize = match &item_ty {
+                    ValueType::Bool => 1,
+                    ValueType::Int | ValueType::Unsigned | ValueType::Ref(_) => {
+                        crate::layout::target_word_size()
+                    }
+                    _ => return None,
+                };
+                Some((item_ty, itemsize, is_item_signed))
+            })
+        })
+    }
+
+    /// `raw_load` of one word at `base+0`. Bool / int results bank as Signed
+    /// (`history.py` `getkind`).
+    pub(in crate::front::mir) fn emit_raw_word_load(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        base: Variable,
+        item_ty: ValueType,
+        itemsize: usize,
+        is_item_signed: bool,
+    ) -> Variable {
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let result_ct = match item_ty {
+            ValueType::Int | ValueType::Unsigned | ValueType::Bool => {
+                crate::model::ConcreteType::Signed
+            }
+            ValueType::Float | ValueType::SingleFloat => crate::model::ConcreteType::Float,
+            _ => crate::model::ConcreteType::Unknown,
+        };
+        let loaded = self.graph.alloc_value_var_with_type(result_ct);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::RawLoad {
+                base,
+                offset,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            },
+        });
+        loaded
+    }
+
     pub(in crate::front::mir) fn read_mem_slot(
         &mut self,
         mir_bb: usize,
@@ -3195,12 +3264,6 @@ impl<'a> Lowering<'a> {
             return false;
         }
         if !first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc)) {
-            return false;
-        }
-        // A rust-heap `String` (behind `&`) is a Vec-shaped header and
-        // does not share a repr class with `&str` Str. That `as_*` stays
-        // the residual call.
-        if first_arg_ty.is_some_and(|ty| tyref_is_rust_heap_string(ty, self.llbc)) {
             return false;
         }
         tyref_strips_to_str(dest_ty, self.llbc)
@@ -6121,6 +6184,29 @@ impl<'a> Lowering<'a> {
         json_ty_byte_size(pointee, self.llbc)
     }
 
+    /// `<*mut T>::offset_from` / `<*const T>::offset_from` when the pointee
+    /// has a known byte size, so `(ptr - origin) / size_of::<T>()` can be
+    /// `adr_delta` then int floordiv (`llmemory` address ops).
+    pub(in crate::front::mir) fn ptr_offset_from_pointee_size(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+    ) -> Option<i64> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        let path = fd.item_meta.name_path();
+        if !is_core_ptr_offset_from_path(path.as_str()) {
+            return None;
+        }
+        let pointee = first_arg_ty.and_then(|ty| {
+            tyref_peel_one_raw_ptr_node(ty, self.llbc)
+                .or_else(|| tyref_peel_one_ref_node(ty, self.llbc))
+        })?;
+        json_ty_byte_size(pointee, self.llbc)
+    }
+
     pub(in crate::front::mir) fn ptr_offset_is_sub(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -6212,7 +6298,10 @@ impl<'a> Lowering<'a> {
         if !is_core_ptr_write_path(fd.item_meta.name_path().as_str()) {
             return None;
         }
-        let ty = value_ty?;
+        // A Const value has no Place type (`operand_tyref` is place-only).
+        // `write(0)` in `alloc_lowlevel_string` is that shape; the FunDecl
+        // `write::<T>` value is `signature.inputs[1]`.
+        let ty = value_ty.or_else(|| fd.signature.inputs.get(1))?;
         if !tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
             return None;
         }
@@ -7534,14 +7623,7 @@ impl<'a> Lowering<'a> {
         let Some(ty) = ptr_ty else {
             return false;
         };
-        if flavor_raw_pointer_class_root(
-            ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            &self.raw_alloc_flavor_structs,
-        )
-        .is_some()
-        {
+        if flavor_raw_pointer_class_root(ty, self.llbc, &self.raw_alloc_flavor_structs).is_some() {
             return false;
         }
         if tyref_raw_ptr_to_classed_instance_spelling(ty, self.llbc).is_none() {

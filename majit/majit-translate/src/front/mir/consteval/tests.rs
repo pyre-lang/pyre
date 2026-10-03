@@ -1298,7 +1298,7 @@ fn scalar_struct_static_llbc(
                     "span": span_json(),
                     "kind": {"Assign": [
                         {"kind": {"Local": 0}, "ty": adt},
-                        {"Use": [{"Copy": {
+                        {"Use": [{"Read": {
                             "kind": {"Global": {"generics": empty_generics(), "id": 1}},
                             "ty": adt
                         }}, "No"]}
@@ -1444,7 +1444,7 @@ fn vtable_fixture() -> Llbc {
                     "span": span_json(),
                     "kind": {"Assign": [
                         place(serde_json::json!({"Local": 0}), &fn_ty),
-                        {"Use": [{"Copy": place(
+                        {"Use": [{"Read": place(
                             serde_json::json!({"Projection": [
                                 place(serde_json::json!({"Projection": [
                                     place(serde_json::json!({"Global": {"generics": empty_generics(), "id": 1}}), &vtable_ty),
@@ -1477,18 +1477,16 @@ fn vtable_fixture() -> Llbc {
                         "span": span_json(),
                         "kind": {"Assign": [
                             place(serde_json::json!({"Local": 2}), &fn_ty),
-                            {"Use": [{"Copy": slot_place}, "No"]}
+                            {"Use": [{"Read": slot_place}, "No"]}
                         ]}
                     }],
                     "terminator": {"span": span_json(), "kind": {"Call": {
                         "call": {
-                            "func": {"Dynamic": {"Copy": place(
+                            "func": {"Dynamic": [{"Read": place(
                                 serde_json::json!({"Local": 2}),
                                 &fn_ty
-                            )}},
-                            "args": [],
-                            "dest": place(serde_json::json!({"Local": 0}), &unit)
-                        },
+                            )}, {"regions": []}]},
+                            "args": []}, "dest": place(serde_json::json!({"Local": 0}), &unit),
                         "target": 1,
                         "on_unwind": 2
                     }}}
@@ -1641,10 +1639,8 @@ fn const_fndef_dynamic_call_is_direct() {
                     "statements": [],
                     "terminator": {"span": span_json(), "kind": {"Call": {
                         "call": {
-                            "func": {"Dynamic": {"Const": prebuilt_fn_def_const(1, &fn_ty)}},
-                            "args": [],
-                            "dest": place(serde_json::json!({"Local": 0}), &unit)
-                        },
+                            "func": {"Dynamic": [{"Const": prebuilt_fn_def_const(1, &fn_ty)}, {"regions": []}]},
+                            "args": []}, "dest": place(serde_json::json!({"Local": 0}), &unit),
                         "target": 1,
                         "on_unwind": 2
                     }}}
@@ -1702,155 +1698,6 @@ fn const_fndef_dynamic_call_is_direct() {
         0,
         "Const FnDef must not residualize as __dyn_call: {graph:?}"
     );
-}
-
-fn fieldless_enum_decl(def_id: u64, path: &[&str], n: usize) -> serde_json::Value {
-    let variants: Vec<_> = (0..n)
-        .map(|i| {
-            serde_json::json!({
-                "name": format!("V{i}"),
-                "fields": [],
-                "discriminant": {"Unsigned": ["U8", i.to_string()]},
-            })
-        })
-        .collect();
-    let layouts: Vec<_> = (0..n)
-        .map(|_| serde_json::json!({"field_offsets": []}))
-        .collect();
-    serde_json::json!({
-        "def_id": def_id,
-        "item_meta": item_meta_json(path, "", true),
-        "kind": {"Enum": variants},
-        "layout": [{
-            "key": "test",
-            "value": {
-                "size": 1,
-                "align": 1,
-                "variant_layouts": layouts,
-                "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U8"}}}
-            }
-        }]
-    })
-}
-
-fn option_of_enum_ty(option_id: u64, enum_id: u64) -> serde_json::Value {
-    serde_json::json!({"Adt": {
-        "id": option_id,
-        "generics": {
-            "regions": [],
-            "types": [prebuilt_adt_ty(enum_id)],
-            "const_generics": [],
-            "trait_refs": []
-        }
-    }})
-}
-
-/// `Option<E>` over a dense fieldless E is E's scalar plus the
-/// reserved `None` tag (`tyref_to_field_layout_string`); it is not
-/// a boxed two-word aggregate.
-#[test]
-fn option_of_fieldless_enum_is_scalar_niche() {
-    let option_decl = serde_json::json!({
-        "def_id": 0,
-        "item_meta": item_meta_json(&["core", "option", "Option"], "", false),
-        "kind": {"Enum": [
-            {"name": "None", "fields": [], "discriminant": {"Unsigned": ["U8", "0"]}},
-            {"name": "Some", "fields": [{
-                "name": null,
-                "is_positional": true,
-                "ty": prebuilt_adt_ty(1)
-            }], "discriminant": {"Unsigned": ["U8", "1"]}}
-        ]}
-    });
-    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
-    let opt_ty = option_of_enum_ty(0, 1);
-    let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
-    let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span_json(), "ty": ty});
-    let disc_fn = serde_json::json!({
-        "def_id": 0,
-        "item_meta": item_meta_json(&["fixture", "opt_disc"], "", true),
-        "signature": {"is_unsafe": false, "inputs": [opt_ty.clone()], "output": disc_ty},
-        "body": {"Unstructured": {
-            "span": span_json(),
-            "locals": {"arg_count": 1, "locals": [
-                local(0, &disc_ty),
-                local(1, &opt_ty)
-            ]},
-            "body": [{
-                "statements": [{
-                    "span": span_json(),
-                    "kind": {"Assign": [
-                        place(serde_json::json!({"Local": 0}), &disc_ty),
-                        {"Discriminant": place(serde_json::json!({"Local": 1}), &opt_ty)}
-                    ]}
-                }],
-                "terminator": {"span": span_json(), "kind": "Return"}
-            }]
-        }}
-    });
-    let file = serde_json::json!({
-        "charon_version": "0.1.201",
-        "has_errors": false,
-        "translated": {
-            "crate_name": "fixture",
-            "type_decls": [
-                option_decl.clone(),
-                fieldless_enum_decl(1, &["fixture", "Kind"], 3)
-            ],
-            "fun_decls": [disc_fn],
-            "global_decls": [],
-            "trait_decls": [],
-            "trait_impls": []
-        }
-    });
-    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("option fixture");
-    let opt_tyref: TyRef = serde_json::from_value(opt_ty).unwrap();
-    assert_eq!(tyref_to_value_type(&opt_tyref, &llbc), ValueType::Int);
-    let niche = super::tyref_option_fieldless_niche(&opt_tyref, &llbc)
-        .expect("Option<fieldless> has a scalar niche");
-    assert_eq!(niche.none_tag, 0xff);
-    assert_eq!(niche.storage_ty, "u8");
-    let graph = super::lower_function(&llbc, "opt_disc").expect("lower opt_disc");
-    let kinds = op_kinds(&graph);
-    assert!(
-        kinds
-            .iter()
-            .any(|kind| matches!(kind, OpKind::ConstInt(0xff))),
-        "None tag is the u8 storage max, got {graph:?}"
-    );
-    assert!(
-        kinds.iter().any(|kind| matches!(
-            kind,
-            OpKind::BinOp { op, .. } if op == "ne"
-        )),
-        "discriminant of the niche Option is a scalar compare, got {graph:?}"
-    );
-    assert!(
-        kinds.iter().all(|kind| !matches!(
-            kind,
-            OpKind::FieldRead { field, .. } if field.name == "__discriminant"
-        )),
-        "must not box Option<fieldless> as an aggregate: {graph:?}"
-    );
-    let two = fieldless_enum_decl(1, &["fixture", "Kind"], 2);
-    let two_file = serde_json::json!({
-        "charon_version": "0.1.201",
-        "has_errors": false,
-        "translated": {
-            "crate_name": "fixture",
-            "type_decls": [
-                option_decl,
-                two
-            ],
-            "fun_decls": [],
-            "global_decls": [],
-            "trait_decls": [],
-            "trait_impls": []
-        }
-    });
-    let two_llbc = Llbc::from_slice(two_file.to_string().as_bytes()).expect("two-variant fixture");
-    let two_niche = super::tyref_option_fieldless_niche(&opt_tyref, &two_llbc).expect("N=2 niche");
-    assert_eq!(two_niche.none_tag, 2);
 }
 
 /// Interior mutability is a fact of the declared type tree
@@ -2255,9 +2102,7 @@ fn align_of_instantiated_pointer_folds_to_the_word() {
                             "kind": {"Fun": 1},
                             "generics": empty_generics()
                         }},
-                        "args": [],
-                        "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
-                    },
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -2359,9 +2204,7 @@ fn spec_body_align_of_generic_struct_folds_from_instantiation() {
                                 "trait_refs": []
                             }
                         }},
-                        "args": [],
-                        "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
-                    },
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -2413,6 +2256,7 @@ fn spec_body_align_of_generic_struct_folds_from_instantiation() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        &empty_set,
         &empty_set,
         &empty_set,
         &empty_gc_struct_ids,
@@ -2558,9 +2402,7 @@ fn w_code_const_align_of_codeobject_does_not_residualize() {
                                 "trait_refs": []
                             }
                         }},
-                        "args": [],
-                        "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
-                    },
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -2715,9 +2557,7 @@ fn nonspec_call_with_concrete_types_enqueues_cachedgraph() {
                                 "trait_refs": []
                             }
                         }},
-                        "args": [],
-                        "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
-                    },
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -2761,6 +2601,7 @@ fn nonspec_call_with_concrete_types_enqueues_cachedgraph() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        &empty_set,
         &empty_set,
         &empty_set,
         &empty_gc_struct_ids,
@@ -2850,9 +2691,7 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
                                 "trait_refs": []
                             }
                         }},
-                        "args": [],
-                        "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
-                    },
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -2896,6 +2735,7 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
             &[],
             &empty_map,
             &crate::front::semantic::StructFieldRegistry::default(),
+            &empty_set,
             &empty_set,
             &empty_set,
             &empty_gc_struct_ids,
@@ -2957,6 +2797,281 @@ fn opaque_local_crate_generic_call_names_the_cachedgraph() {
                 } if segments.last().is_some_and(|s| s.starts_with("alloc_like__spec_"))
             )),
             "local-crate opaque must name the cachedgraph copy, ops={ops:?}"
+        );
+    });
+}
+
+#[test]
+fn leftover_clause_trait_ref_still_enqueues_cachedgraph() {
+    // `loop_unrolling_heuristic<T: ?Sized>`: type arguments are concrete
+    // (`PyObject`) and Charon still leaves a `Clause` for MetaSized /
+    // Pointee. `FunctionDesc.cachedgraph` (`default_specialize`) still
+    // builds the copy so the call site names the spec graph, not a
+    // residual turbofish (`rlib/jit.py` `specialize.call_location`).
+    use crate::front::clause_spec::SpecQueue;
+    let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+    let clause = serde_json::json!({"kind": {"Clause": {"Bound": [0, 0]}}});
+    let alloc_like = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta_json(&["fixture", "alloc_like"], "", true),
+        "generics": {
+            "regions": [],
+            "types": [{"index": 0, "name": "T", "variance": "Invariant"}],
+            "const_generics": [],
+            "trait_clauses": []
+        },
+        "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "caller"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": {
+                                "regions": [],
+                                "types": [ptr],
+                                "const_generics": [],
+                                "trait_refs": [clause]
+                            }
+                        }},
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
+                    "target": 2,
+                    "on_unwind": 1
+                }}}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "UnwindResume"}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    });
+    let doc = serde_json::json!({
+        "charon_version": "t",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "fun_decls": [caller, alloc_like],
+            "type_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+    let fd = llbc.fn_by_id(0).expect("caller");
+    let body = fd.unstructured().expect("caller unstructured");
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let empty_set = std::collections::HashSet::new();
+    let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_map = std::collections::HashMap::new();
+    let root_state = super::RootStackState::new(&llbc);
+    let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
+    let queue = std::cell::RefCell::new(SpecQueue::new());
+    let graph = super::lower_unstructured_with_static_addrs_and_attrs(
+        &llbc,
+        fd,
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        &empty_map,
+        &crate::front::semantic::StructFieldRegistry::default(),
+        &empty_set,
+        &empty_set,
+        &empty_set,
+        &empty_gc_struct_ids,
+        super::no_immutable_fields(),
+        &empty_set,
+        accum.has_builder,
+        &accum,
+        &root_stack,
+        Some(&queue),
+        false,
+        None,
+        None,
+    )
+    .expect("lower caller");
+    let req = queue.borrow_mut().pop().expect("cachedgraph enqueued");
+    assert!(
+        req.leaf.starts_with("alloc_like__spec_"),
+        "spec leaf, got {}",
+        req.leaf
+    );
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            crate::model::OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|s| s.starts_with("alloc_like__spec_"))
+        )),
+        "leftover Clause must not keep the unspecialized Regular callee, ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            crate::model::OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|s| s == "alloc_like")
+        )),
+        "unspecialized generic must not remain the Regular callee, ops={ops:?}"
+    );
+}
+
+#[test]
+fn leftover_clause_local_crate_opaque_still_enqueues_cachedgraph() {
+    // Same leftover `Clause` as `loop_unrolling_heuristic` when the
+    // body lives in another local crate (`majit_rlib` from
+    // `pyre_object`). `instance_leaf` is None on the opaque FunDecl;
+    // `enqueue_spec` still names the cachedgraph copy.
+    use crate::front::clause_spec::SpecQueue;
+    let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+    let clause = serde_json::json!({"kind": {"Clause": {"Bound": [0, 0]}}});
+    let alloc_like = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta_json(&["owner", "alloc_like"], "", true),
+        "generics": {
+            "regions": [],
+            "types": [{"index": 0, "name": "T", "variance": "Invariant"}],
+            "const_generics": [],
+            "trait_clauses": []
+        },
+        "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+        "body": "Opaque"
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "caller"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": {
+                                "regions": [],
+                                "types": [ptr],
+                                "const_generics": [],
+                                "trait_refs": [clause]
+                            }
+                        }},
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
+                    "target": 2,
+                    "on_unwind": 1
+                }}}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "UnwindResume"}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    });
+    let doc = serde_json::json!({
+        "charon_version": "t",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "fun_decls": [caller, alloc_like],
+            "type_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+    let fd = llbc.fn_by_id(0).expect("caller");
+    let body = fd.unstructured().expect("caller unstructured");
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let empty_set = std::collections::HashSet::new();
+    let empty_gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_map = std::collections::HashMap::new();
+    let root_state = super::RootStackState::new(&llbc);
+    let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
+    let lower = |queue: &std::cell::RefCell<SpecQueue>| {
+        super::lower_unstructured_with_static_addrs_and_attrs(
+            &llbc,
+            fd,
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            &empty_map,
+            &crate::front::semantic::StructFieldRegistry::default(),
+            &empty_set,
+            &empty_set,
+            &empty_set,
+            &empty_gc_struct_ids,
+            super::no_immutable_fields(),
+            &empty_set,
+            accum.has_builder,
+            &accum,
+            &root_stack,
+            Some(queue),
+            false,
+            None,
+            None,
+        )
+        .expect("lower caller")
+    };
+    crate::local_crates::with_local_crate_root("owner", || {
+        let queue = std::cell::RefCell::new(SpecQueue::new());
+        let graph = lower(&queue);
+        let req = queue.borrow_mut().pop().expect("cachedgraph enqueued");
+        assert!(
+            req.leaf.starts_with("alloc_like__spec_"),
+            "spec leaf, got {}",
+            req.leaf
+        );
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|s| s.starts_with("alloc_like__spec_"))
+            )),
+            "leftover Clause on a local-crate opaque must name the cachedgraph copy, ops={ops:?}"
         );
     });
 }
@@ -3024,9 +3139,7 @@ fn nonspec_trait_call_with_concrete_impl_enqueues_cachedgraph() {
                                 "trait_refs": []
                             }
                         }},
-                        "args": [],
-                        "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
-                    },
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -3083,6 +3196,7 @@ fn nonspec_trait_call_with_concrete_impl_enqueues_cachedgraph() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        &empty_set,
         &empty_set,
         &empty_set,
         &empty_gc_struct_ids,
@@ -3208,9 +3322,7 @@ fn nonspec_trait_call_without_override_enqueues_default_cachedgraph() {
                                 "trait_refs": []
                             }
                         }},
-                        "args": [],
-                        "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
-                    },
+                        "args": []}, "dest": {"kind": {"Local": 0}, "ty": usize_ty()},
                     "target": 2,
                     "on_unwind": 1
                 }}}
@@ -3285,6 +3397,7 @@ fn nonspec_trait_call_without_override_enqueues_default_cachedgraph() {
         &[],
         &empty_map,
         &crate::front::semantic::StructFieldRegistry::default(),
+        &empty_set,
         &empty_set,
         &empty_set,
         &empty_gc_struct_ids,

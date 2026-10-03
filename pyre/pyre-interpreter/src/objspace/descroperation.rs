@@ -2508,7 +2508,7 @@ unsafe fn sequence_repeat(seq: PyObjectRef, count: PyObjectRef) -> PyResult {
 }
 
 /// unicodeobject.py descr_mul
-pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
+pub unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     // Repeat at the WTF-8 byte level — a repetition of valid WTF-8 is valid
     // WTF-8 — so a surrogate-bearing string repeats without going through
     // `w_str_get_value`.
@@ -4282,7 +4282,7 @@ unsafe fn dunder_overridden(obj: PyObjectRef, dunder: &str, tp: PyObjectRef) -> 
 /// A fieldless enum is one word, so the gate stays bindable; the names are
 /// recovered inside the residual, where the lookups they feed already live.
 #[derive(Clone, Copy)]
-pub(crate) enum BinopDunder {
+pub enum BinopDunder {
     Add,
     Sub,
     Mul,
@@ -5988,7 +5988,7 @@ fn pinned_shadow_operand(base: usize, index: usize) -> PyObjectRef {
 
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-pub(crate) fn try_dispatch_binary_special(
+pub fn try_dispatch_binary_special(
     lhs: PyObjectRef,
     rhs: PyObjectRef,
     op: BinopDunder,
@@ -8830,6 +8830,7 @@ mod tests {
 
     #[test]
     fn test_int_overflow_and_long_add_keep_long() {
+        crate::test_hooks::install_hash_hook();
         unsafe {
             let add_ovf = add(w_int_new(i64::MAX), w_int_new(1)).unwrap();
             assert!(is_long(add_ovf));
@@ -8874,6 +8875,7 @@ mod tests {
 
     #[test]
     fn test_mixed_long_int_operations_match_rbigint_int_specializations() {
+        crate::test_hooks::install_hash_hook();
         // pypy/objspace/std/longobject.py:_make_generic_descr_binop routes
         // mixed W_LongObject/W_IntObject operations through rbigint.int_*.
         // Use a multi-digit value and both signs so this covers paths where
@@ -9342,6 +9344,7 @@ mod tests {
 
     #[test]
     fn test_long_truthiness_bitand_and_invert() {
+        crate::test_hooks::install_hash_hook();
         assert!(is_true(w_long_new(BigInt::from(i64::MAX) + BigInt::from(1))).unwrap());
         assert!(!is_true(w_long_new(BigInt::from(0))).unwrap());
         let anded = and_(
@@ -9366,6 +9369,7 @@ mod tests {
 
     #[test]
     fn test_numeric_divmod_computes_matching_pair_for_all_integer_shapes() {
+        crate::test_hooks::install_hash_hook();
         let big_positive = BigInt::one().lshift(190).unwrap().int_add(37);
         let big_negative = big_positive.neg();
         for (lhs, rhs) in [
@@ -9395,6 +9399,7 @@ mod tests {
 
     #[test]
     fn test_int_pow_and_lshift_overflow_to_long() {
+        crate::test_hooks::install_hash_hook();
         let result = pow(w_int_new(2), w_int_new(63)).unwrap();
         unsafe {
             // 2^63 overflows i64, should be long
@@ -9422,6 +9427,7 @@ mod tests {
 
     #[test]
     fn test_long_pow_negative_exponent_rejects_float_overflow() {
+        crate::test_hooks::install_hash_hook();
         let huge = BigInt::one().lshift(2000).unwrap();
         let error = pow(w_long_new(huge), w_int_new(-1)).unwrap_err();
         assert_eq!(error.kind, PyErrorKind::OverflowError);

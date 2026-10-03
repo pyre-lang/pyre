@@ -177,4 +177,13 @@ fn emit_llbc_extraction_placeholders() {
         "pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[];\n",
     )
     .unwrap();
+    std::fs::write(
+        format!("{out_dir}/generated_residual_shims.rs"),
+        "#[derive(Clone, Copy)]\n\
+         pub struct ResidualShimAddr(pub *const ());\n\
+         unsafe impl Sync for ResidualShimAddr {}\n\
+         unsafe impl Send for ResidualShimAddr {}\n\
+         pub static GENERATED_RESIDUAL_SHIMS: &[(&str, ResidualShimAddr)] = &[];\n",
+    )
+    .unwrap();
 }

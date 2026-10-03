@@ -69,7 +69,35 @@ pub(in crate::front::mir) fn is_core_ptr_sub_path(path: &str) -> bool {
     )
 }
 
+/// `<*mut T>::offset_from` / `<*const T>::offset_from`.
+///
+/// Charon `name_path` may keep the monomorph as a trailing Instantiated
+/// segment (`offset_from::<*mut T>`); residual FunctionPath / fnaddr keys
+/// use that spelling. Strip it the way [`is_core_ptr_write_path`] does.
+pub(in crate::front::mir) fn is_core_ptr_offset_from_path(path: &str) -> bool {
+    let path = match path.rsplit_once("::") {
+        Some((parent, last)) if last.starts_with('<') && last.ends_with('>') => parent,
+        _ => path,
+    };
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        [
+            "core",
+            "ptr",
+            "mut_ptr" | "const_ptr",
+            "<Impl>",
+            "offset_from"
+        ]
+    )
+}
+
 pub(in crate::front::mir) fn is_core_ptr_write_path(path: &str) -> bool {
+    // Charon `name_path` drops Instantiated (`write`); residual
+    // FunctionPath / fnaddr keys keep the monomorph (`write::<usize>`).
+    let path = match path.rsplit_once("::") {
+        Some((parent, last)) if last.starts_with('<') && last.ends_with('>') => parent,
+        _ => path,
+    };
     path == "core::ptr::write" || path == "core::ptr::mut_ptr::<Impl>::write"
 }
 
