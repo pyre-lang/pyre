@@ -1049,10 +1049,10 @@ pub fn ll_vec_newlist_f(length: usize) -> Vec<f64> {
     vec![0.0; length]
 }
 
-/// `rlist.py _ll_zero_or_null`: a float is zero when its bits are `0.0`
-/// (`not` of the widened number). `-0.0` has a different bit pattern.
+/// `rlist.py _ll_zero_or_null`: `not` of the widened number.
+/// Both `0.0` and `-0.0` are zero.
 fn ll_vec_zero_or_null_f(item: f64) -> bool {
-    item.to_bits() == 0
+    item == 0.0
 }
 
 /// `rgc.ll_arrayclear`. Writes `0.0` into each of the `count` slots.
@@ -1440,6 +1440,11 @@ mod tests {
         assert_eq!(ll_vec_alloc_and_set_f(0, 0.0), Vec::<f64>::new());
         assert_eq!(ll_vec_alloc_and_set_f(0, 1.5), Vec::<f64>::new());
         assert_eq!(ll_vec_alloc_and_set_f(3, 0.0), vec![0.0; 3]);
+        assert!(
+            ll_vec_alloc_and_set_f(2, -0.0)
+                .iter()
+                .all(|item| item.to_bits() == 0)
+        );
         assert_eq!(ll_vec_alloc_and_set_f(3, 1.5), vec![1.5; 3]);
         assert_eq!(ll_vec_alloc_and_clear_f(0), Vec::<f64>::new());
         assert_eq!(ll_vec_alloc_and_clear_f(3), vec![0.0; 3]);
