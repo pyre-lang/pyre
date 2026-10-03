@@ -275,6 +275,9 @@ pub unsafe fn residual_word_to_value<T>(word: i64) -> T {
 ///
 /// The inverse of [`residual_word_to_value`]. A value larger than a word is
 /// returned as a pointer to a leaked box — the `'r'` result of a `GcStruct`.
+/// Primitive integer and `bool` results use [`ResidualIntoI64`] (`self as i64`)
+/// instead: a zeroed word plus a byte copy zero-extends a narrow signed
+/// integer (`-1i32` becomes `4294967295`).
 #[inline]
 pub fn residual_value_to_word<T>(value: T) -> i64 {
     let size = core::mem::size_of::<T>();
@@ -1057,5 +1060,15 @@ mod impl_fnaddr_binding_tests {
             desc.impl_method_fnaddr_paths(),
             vec!["host_object::other::a::Foo::bar"]
         );
+    }
+}
+
+#[cfg(test)]
+mod residual_into_i64_tests {
+    use super::ResidualIntoI64;
+
+    #[test]
+    fn i32_minus_one_sign_extends_to_i64_minus_one() {
+        assert_eq!(<i32 as ResidualIntoI64>::into_residual_i64(-1), -1);
     }
 }

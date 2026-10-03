@@ -15,7 +15,7 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{FunDecl, TyRef, TypeDeclKind};
 use serde::{Deserialize, Serialize};
 
-use crate::codewriter::call::CallDescriptor;
+use crate::codewriter::call::{BoundFnAddr, CallDescriptor};
 use crate::front::clause_spec::decl_is_generic;
 use crate::parse::CallPath;
 
@@ -163,12 +163,7 @@ fn decl_is_method(fd: &FunDecl) -> bool {
     if fd.is_adt_constructor() {
         return true;
     }
-    if fd
-        .src
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|obj| obj.contains_key("TraitImpl"))
-    {
+    if fd.item_meta.trait_impl_id().is_some() {
         return true;
     }
     if fd.item_meta.has_impl_path_elem() {
@@ -278,10 +273,10 @@ fn alias_inner(body: &serde_json::Value) -> &serde_json::Value {
 }
 
 /// Collect residual shim targets from policy-declined residual calls.
-pub fn collect_residual_shim_targets(
+pub(crate) fn collect_residual_shim_targets(
     policy_declined: &HashSet<CallPath>,
     residual_call_descrs: &HashMap<CallPath, CallDescriptor>,
-    bound_fnaddrs: &HashMap<CallPath, i64>,
+    bound_fnaddrs: &HashMap<CallPath, BoundFnAddr>,
     catalog: &[LlbcFnCatalogEntry],
 ) -> Vec<ResidualShimTarget> {
     let mut by_path: HashMap<&str, &LlbcFnCatalogEntry> = HashMap::new();
@@ -397,15 +392,20 @@ fn lookup_catalog<'a>(
 /// UFCS `<Self as Trait>::method` for a trait-impl FunDecl, `Owner::method`
 /// for an inherent impl, otherwise `name_path`. The bool is whether that
 /// spelling is a Rust path the shim crate can name: an `Impl` path element
-/// that was not rewritten is not.
+/// that was not rewritten is not. The returned path is the Rust-source
+/// spelling ([`rust_source_callable_path`]); lookup keys stay on
+/// `name_path` / `lookup_path`.
 fn callable_rust_path(fd: &FunDecl, llbc: &Llbc) -> (String, bool) {
     if let Some(ufcs) = ufcs_callable_path(fd, llbc) {
-        return (ufcs, true);
+        return (rust_source_callable_path(&ufcs), true);
     }
     if let Some(inherent) = crate::front::mir::inherent_callable_rust_path(llbc, fd) {
-        return (inherent, true);
+        return (rust_source_callable_path(&inherent), true);
     }
-    (fd.item_meta.name_path(), !fd.item_meta.has_impl_path_elem())
+    (
+        rust_source_callable_path(&fd.item_meta.name_path()),
+        !fd.item_meta.has_impl_path_elem(),
+    )
 }
 
 fn ufcs_callable_path(fd: &FunDecl, llbc: &Llbc) -> Option<String> {
@@ -428,7 +428,12 @@ fn ufcs_callable_path(fd: &FunDecl, llbc: &Llbc) -> Option<String> {
     }
     let name_path = fd.item_meta.name_path();
     let leaf = name_path.rsplit("::").next()?;
-    Some(format!("<{self_path} as {trait_path}>::{leaf}"))
+    Some(format!(
+        "<{} as {}>::{}",
+        rust_source_callable_path(&self_path),
+        rust_source_callable_path(&trait_path),
+        rust_source_callable_path(leaf)
+    ))
 }
 
 /// Split a residual path into the FunDecl template and call-site type args.
@@ -518,10 +523,42 @@ fn residual_template_leaf(last: &str) -> String {
 
 fn instantiated_callable_path(callable: &str, generic_rust_args: &[String]) -> String {
     if generic_rust_args.is_empty() {
-        return callable.to_string();
+        return rust_source_callable_path(callable);
     }
     let template = split_instance_path(callable).0;
-    format!("{template}::<{}>", generic_rust_args.join(", "))
+    format!(
+        "{}::<{}>",
+        rust_source_callable_path(&template),
+        generic_rust_args
+            .iter()
+            .map(|ty| rust_source_callable_path(ty))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Spell `path` as compilable Rust source. Each `::` segment that is a
+/// keyword writable as a raw identifier becomes `r#kw`. `syn::parse_str::<syn::Ident>`
+/// accepts ordinary idents and already-raw `r#…` forms and rejects
+/// keywords; `crate` / `self` / `Self` / `super` / `_` cannot be raw and
+/// stay as written. Angle-bracket segments (`<Impl>`, `<Self as Trait>`,
+/// turbofish args) are left intact so UFCS / `::<Impl>` markers keep their
+/// syntax. Lookup keys keep the LLBC spelling.
+fn rust_source_callable_path(path: &str) -> String {
+    crate::model::split_qualified_path(path)
+        .into_iter()
+        .map(|seg| rust_source_ident(&seg))
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn rust_source_ident(seg: &str) -> String {
+    if syn::parse_str::<syn::Ident>(seg).is_ok() {
+        return seg.to_string();
+    }
+    syn::parse_str::<syn::Ident>(&format!("r#{seg}"))
+        .map(|ident| ident.to_string())
+        .unwrap_or_else(|_| seg.to_string())
 }
 
 /// Crate and module paths `pyre-jit-trace` can name, from its Cargo.toml
@@ -1087,16 +1124,20 @@ fn shim_body(target: &ResidualShimTarget) -> String {
         return lines;
     }
     if target.result_is_exc {
+        let packed = flatten_option_pointer_result(&invoke, &target.ret_rust_type);
         match target.result_type {
             'v' => lines.push_str(&format!(
-                "    ::majit_ir::helper_fnaddr::residual_result_void({invoke});\n"
+                "    ::majit_ir::helper_fnaddr::residual_result_void({packed});\n"
             )),
             'f' | 'L' => lines.push_str(&format!(
-                "    ::majit_ir::helper_fnaddr::residual_result_f64({invoke})\n"
+                "    ::majit_ir::helper_fnaddr::residual_result_f64({packed})\n"
             )),
-            _ => lines.push_str(&format!(
-                "    ::majit_ir::helper_fnaddr::residual_result_i64({invoke})\n"
-            )),
+            _ => {
+                let packed = map_residual_int_ok(packed, &target.ret_rust_type);
+                lines.push_str(&format!(
+                    "    ::majit_ir::helper_fnaddr::residual_result_i64({packed})\n"
+                ));
+            }
         }
         return lines;
     }
@@ -1156,7 +1197,65 @@ fn into_word_expr(rust_ty: &str, class: char, value: &str) -> String {
         'f' | 'L' => format!(
             "<{rust_ty} as ::majit_ir::helper_fnaddr::ResidualIntoF64>::into_residual_f64({value})"
         ),
-        _ => format!("::majit_ir::helper_fnaddr::residual_value_to_word({value})"),
+        _ => {
+            if is_residual_int_word_ty(rust_ty) {
+                residual_into_i64_expr(rust_ty, value)
+            } else if let Some(null) = option_pointer_none_null(rust_ty) {
+                format!(
+                    "::majit_ir::helper_fnaddr::residual_value_to_word({value}.unwrap_or({null}))"
+                )
+            } else {
+                format!("::majit_ir::helper_fnaddr::residual_value_to_word({value})")
+            }
+        }
+    }
+}
+
+/// Primitive integer / `bool` residual INT word.
+///
+/// `CallDescr.create_call_stub` (`descr.py`) returns
+/// `rffi.cast(lltype.Signed, res)`. `ResidualIntoI64` is `self as i64`.
+fn is_residual_int_word_ty(ty: &str) -> bool {
+    matches!(
+        ty.trim(),
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" | "bool"
+    )
+}
+
+fn residual_into_i64_expr(rust_ty: &str, value: &str) -> String {
+    format!("<{rust_ty} as ::majit_ir::helper_fnaddr::ResidualIntoI64>::into_residual_i64({value})")
+}
+
+fn map_residual_int_ok(packed: String, rust_ty: &str) -> String {
+    if is_residual_int_word_ty(rust_ty) {
+        format!(
+            "{packed}.map(|__ok| {})",
+            residual_into_i64_expr(rust_ty, "__ok")
+        )
+    } else {
+        packed
+    }
+}
+
+/// `Option<*mut T>` / `Option<PyObjectRef>` is two words (`PyObjectRef` is
+/// already a nullable `*mut`). The residual ABI is one `'r'` word, so None
+/// is the null pointer — the same packing `ResidualIntoI64 for Option<*mut T>`
+/// uses. `residual_value_to_word` would otherwise box the pair.
+fn option_pointer_none_null(ty: &str) -> Option<&'static str> {
+    let inner = ty.strip_prefix("Option<")?.strip_suffix('>')?.trim();
+    if inner.starts_with("*const ") {
+        return Some("::core::ptr::null()");
+    }
+    if inner.starts_with("*mut ") || is_object_pointer_item(inner) {
+        return Some("::core::ptr::null_mut()");
+    }
+    None
+}
+
+fn flatten_option_pointer_result(invoke: &str, ret_rust_type: &str) -> String {
+    match option_pointer_none_null(ret_rust_type) {
+        Some(null) => format!("{invoke}.map(|__opt| __opt.unwrap_or({null}))"),
+        None => invoke.to_string(),
     }
 }
 
@@ -1295,7 +1394,9 @@ fn shim_adt(
         let args = adt_type_args(adt, llbc, depth)?;
         return match args.as_slice() {
             [] => Some("()".to_string()),
-            [one] => Some(format!("({one},)")),
+            // The translated tuple is a GC struct pointer (`rtuple.py`); a
+            // one-word native tuple would pass its item, not that pointer.
+            [_one] => None,
             _ => Some(format!("({})", args.join(", "))),
         };
     }
@@ -1450,9 +1551,13 @@ fn rust_ty_convertible(ty: &str) -> bool {
         if inner.is_empty() {
             return true;
         }
-        return split_top_level_generic_args(inner)
-            .iter()
-            .all(|elem| rust_ty_convertible(elem));
+        let elems = split_top_level_generic_args(inner);
+        // `(T,)` is one native word, so the residual converter would pass
+        // the item instead of the TupleRepr GcStruct pointer (`rtuple.py`).
+        if elems.len() < 2 {
+            return false;
+        }
+        return elems.iter().all(|elem| rust_ty_convertible(elem));
     }
     if matches!(
         ty,
@@ -1647,7 +1752,12 @@ mod tests {
             impl_callable: true,
             nullable_str_enum_args: Vec::new(),
         }];
-        let targets = collect_residual_shim_targets(&declined, &descrs, &HashMap::new(), &catalog);
+        let targets = collect_residual_shim_targets(
+            &declined,
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].path, "pyre_object::function::w_method_new");
         assert_eq!(targets[0].arg_classes, "rrr");
@@ -1664,8 +1774,8 @@ mod tests {
             path.clone(),
             CallDescriptor::from_signature(&[Type::Ref], Type::Ref, EffectInfo::default()),
         );
-        let mut fnaddrs = HashMap::new();
-        fnaddrs.insert(path, 1);
+        let mut fnaddrs = HashMap::<CallPath, BoundFnAddr>::new();
+        fnaddrs.insert(path, BoundFnAddr { addr: 1, abi: "" });
         let catalog = vec![LlbcFnCatalogEntry {
             path: "pyre_object::function::w_method_new".into(),
             lookup_path: "pyre_object::function::w_method_new".into(),
@@ -1685,6 +1795,64 @@ mod tests {
         }];
         let targets = collect_residual_shim_targets(&declined, &descrs, &fnaddrs, &catalog);
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn collect_spells_a_keyword_leaf_as_a_raw_ident() {
+        let path = CallPath::from_segments(["pyre_interpreter", "error", "PyError", "async"]);
+        let mut declined = HashSet::new();
+        declined.insert(path.clone());
+        let mut descrs = HashMap::new();
+        descrs.insert(
+            path,
+            CallDescriptor::from_signature(
+                &[Type::Ref, Type::Ref],
+                Type::Int,
+                EffectInfo::default(),
+            ),
+        );
+        let catalog = vec![LlbcFnCatalogEntry {
+            path: "pyre_interpreter::error::PyError::async".into(),
+            lookup_path: "pyre_interpreter::error::PyError::async".into(),
+            callable_path: "pyre_interpreter::error::PyError::async".into(),
+            crate_name: "pyre_interpreter".into(),
+            public: true,
+            is_generic: false,
+            is_method: true,
+            is_unsafe: false,
+            arg_rust_types: Some(vec![
+                "&mut pyre_interpreter::error::PyError".into(),
+                "pyre_object::pyobject::PyObjectRef".into(),
+            ]),
+            ret_rust_type: Some(ShimReturn {
+                rust_type: "bool".into(),
+                is_exc: false,
+            }),
+            impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
+        }];
+        let targets = collect_residual_shim_targets(
+            &declined,
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
+        assert_eq!(targets.len(), 1);
+        assert!(
+            targets[0].path.ends_with("::async"),
+            "lookup key keeps the LLBC leaf: {}",
+            targets[0].path
+        );
+        assert!(
+            !targets[0].path.contains("r#async"),
+            "lookup key is unescaped: {}",
+            targets[0].path
+        );
+        let src = generate_residual_shim_source(&[&targets[0]]);
+        assert!(
+            src.contains("PyError::r#async("),
+            "shim calls the raw ident: {src}"
+        );
     }
 
     #[test]
@@ -1733,8 +1901,12 @@ mod tests {
             impl_callable: true,
             nullable_str_enum_args: Vec::new(),
         }];
-        let targets =
-            collect_residual_shim_targets(&HashSet::new(), &descrs, &HashMap::new(), &catalog);
+        let targets = collect_residual_shim_targets(
+            &HashSet::new(),
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
         assert_eq!(targets.len(), 1);
     }
 
@@ -1769,7 +1941,12 @@ mod tests {
             impl_callable: true,
             nullable_str_enum_args: Vec::new(),
         }];
-        let targets = collect_residual_shim_targets(&declined, &descrs, &HashMap::new(), &catalog);
+        let targets = collect_residual_shim_targets(
+            &declined,
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].unsupported_type);
         assert_eq!(targets[0].arg_classes, "rii");
@@ -1811,7 +1988,12 @@ mod tests {
             impl_callable: true,
             nullable_str_enum_args: Vec::new(),
         }];
-        let targets = collect_residual_shim_targets(&declined, &descrs, &HashMap::new(), &catalog);
+        let targets = collect_residual_shim_targets(
+            &declined,
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].unsupported_type);
         assert_eq!(targets[0].arg_classes, "rr");
@@ -1847,7 +2029,7 @@ mod tests {
     #[test]
     fn a_two_word_tuple_return_is_convertible() {
         assert!(rust_ty_convertible("(usize, u64)"));
-        assert!(rust_ty_convertible("(usize,)"));
+        assert!(!rust_ty_convertible("(usize,)"));
         assert!(rust_ty_convertible("()"));
     }
 
@@ -1892,7 +2074,12 @@ mod tests {
             impl_callable: true,
             nullable_str_enum_args: Vec::new(),
         }];
-        let targets = collect_residual_shim_targets(&declined, &descrs, &HashMap::new(), &catalog);
+        let targets = collect_residual_shim_targets(
+            &declined,
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].unsupported_type, "{:?}", targets[0]);
         assert_eq!(targets[0].ret_rust_type, "(usize, u64)");
@@ -1909,6 +2096,75 @@ mod tests {
             !src.contains("residual_value_to_word::<"),
             "tuple T is inferred from the callee: {src}"
         );
+    }
+
+    /// A one-element tuple is one native word; the translated caller expects
+    /// a TupleRepr GcStruct pointer (`rtuple.py`).
+    #[test]
+    fn collect_marks_a_one_element_tuple_unsupported() {
+        let result_path = CallPath::from_segments(["owner", "one_elem_tuple_result"]);
+        let arg_path = CallPath::from_segments(["owner", "one_elem_tuple_arg"]);
+        let mut declined = HashSet::new();
+        declined.insert(result_path.clone());
+        declined.insert(arg_path.clone());
+        let mut descrs = HashMap::new();
+        descrs.insert(
+            result_path.clone(),
+            CallDescriptor::from_signature(&[Type::Int], Type::Ref, EffectInfo::default()),
+        );
+        descrs.insert(
+            arg_path.clone(),
+            CallDescriptor::from_signature(&[Type::Ref], Type::Int, EffectInfo::default()),
+        );
+        let catalog = vec![
+            LlbcFnCatalogEntry {
+                path: "owner::one_elem_tuple_result".into(),
+                lookup_path: "owner::one_elem_tuple_result".into(),
+                callable_path: "owner::one_elem_tuple_result".into(),
+                crate_name: "owner".into(),
+                public: true,
+                is_generic: false,
+                is_method: false,
+                is_unsafe: false,
+                arg_rust_types: Some(vec!["usize".into()]),
+                ret_rust_type: Some(ShimReturn {
+                    rust_type: "(usize,)".into(),
+                    is_exc: false,
+                }),
+                impl_callable: true,
+                nullable_str_enum_args: Vec::new(),
+            },
+            LlbcFnCatalogEntry {
+                path: "owner::one_elem_tuple_arg".into(),
+                lookup_path: "owner::one_elem_tuple_arg".into(),
+                callable_path: "owner::one_elem_tuple_arg".into(),
+                crate_name: "owner".into(),
+                public: true,
+                is_generic: false,
+                is_method: false,
+                is_unsafe: false,
+                arg_rust_types: Some(vec!["(usize,)".into()]),
+                ret_rust_type: Some(ShimReturn {
+                    rust_type: "usize".into(),
+                    is_exc: false,
+                }),
+                impl_callable: true,
+                nullable_str_enum_args: Vec::new(),
+            },
+        ];
+        let targets = collect_residual_shim_targets(
+            &declined,
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        for target in &targets {
+            assert!(
+                target.unsupported_type,
+                "one-element tuple must be unsupported_type: {target:?}"
+            );
+        }
     }
 
     /// The shim crate names the function; rustc infers `&CodeObject` from
@@ -2024,6 +2280,67 @@ mod tests {
         target.result_is_exc = true;
         let src = generate_residual_shim_source(&[&target]);
         assert!(src.contains("residual_result_i64"));
+    }
+
+    #[test]
+    fn generate_sign_extends_narrow_integer_results() {
+        let mut target = sample_target();
+        target.result_type = 'i';
+        target.ret_rust_type = "i32".into();
+        let src = generate_residual_shim_source(&[&target]);
+        assert!(
+            src.contains(
+                "<i32 as ::majit_ir::helper_fnaddr::ResidualIntoI64>::into_residual_i64(__r)"
+            ),
+            "plain i32 result uses ResidualIntoI64: {src}"
+        );
+        assert!(
+            !src.contains("residual_value_to_word"),
+            "plain i32 result must not byte-copy into a zeroed word: {src}"
+        );
+
+        target.ret_rust_type = "i8".into();
+        target.result_is_exc = true;
+        let src = generate_residual_shim_source(&[&target]);
+        assert!(
+            src.contains(
+                "<i8 as ::majit_ir::helper_fnaddr::ResidualIntoI64>::into_residual_i64(__ok)"
+            ),
+            "Result<i8, _> Ok payload uses ResidualIntoI64: {src}"
+        );
+        assert!(
+            src.contains("residual_result_i64"),
+            "Result<i8, _> still goes through residual_result_i64: {src}"
+        );
+        assert!(
+            src.contains(".map(|__ok|"),
+            "Ok payload is mapped before residual_result_i64: {src}"
+        );
+    }
+
+    #[test]
+    fn generate_flattens_result_option_object_pointer_to_null_word() {
+        let mut target = sample_target();
+        target.path = "owner::returns_option_object_ptr".into();
+        target.rust_path = "owner::returns_option_object_ptr".into();
+        target.arg_classes = "rri".into();
+        target.arg_rust_types = vec![
+            "*mut pyre_object::pyobject::PyObject".into(),
+            "*mut pyre_object::pyobject::PyObject".into(),
+            "owner::FieldlessOp".into(),
+        ];
+        target.ret_rust_type = "Option<*mut pyre_object::pyobject::PyObject>".into();
+        target.result_is_exc = true;
+        let src = generate_residual_shim_source(&[&target]);
+        assert!(src.contains("residual_result_i64"), "{src}");
+        assert!(
+            src.contains(".map(|__opt| __opt.unwrap_or(::core::ptr::null_mut()))"),
+            "Option<*mut PyObject> Ok payload is one nullable word: {src}"
+        );
+        assert!(
+            !src.contains("residual_value_to_word"),
+            "the boxed two-word Option must not be the result word: {src}"
+        );
     }
 
     #[test]
@@ -2232,8 +2549,12 @@ mod tests {
             impl_callable: true,
             nullable_str_enum_args: Vec::new(),
         }];
-        let targets =
-            collect_residual_shim_targets(&HashSet::new(), &descrs, &HashMap::new(), &catalog);
+        let targets = collect_residual_shim_targets(
+            &HashSet::new(),
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].path, "pyframe::PyFrame::call_kw");
         assert!(targets[0].rust_path.contains(" as "));
@@ -2277,8 +2598,12 @@ mod tests {
             impl_callable: true,
             nullable_str_enum_args: Vec::new(),
         }];
-        let targets =
-            collect_residual_shim_targets(&HashSet::new(), &descrs, &HashMap::new(), &catalog);
+        let targets = collect_residual_shim_targets(
+            &HashSet::new(),
+            &descrs,
+            &HashMap::<CallPath, BoundFnAddr>::new(),
+            &catalog,
+        );
         assert_eq!(targets.len(), 1);
         assert_eq!(
             targets[0].generic_rust_args,
