@@ -128,8 +128,7 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// reads the declared name from the defining crate's harvest; `__pos_N`
     /// is only the missing-row fallback. `None` in unit tests that do not
     /// lower Opaque scalar fields.
-    pub(in crate::front::mir) struct_fields:
-        Option<&'a crate::front::semantic::StructFieldRegistry>,
+    pub(in crate::front::mir) struct_fields: Option<&'a crate::front::semantic::StructFieldRegistry>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     pub(in crate::front::mir) raw_alloc_flavor_structs: std::collections::HashSet<String>,
@@ -149,8 +148,7 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// that computed `struct_origins`, and borrowed for this lowering.
     pub(in crate::front::mir) tombstoned_leaves: &'a std::collections::HashSet<String>,
     /// Gc structs and enums for this lowering. Absence is Raw.
-    pub(in crate::front::mir) gc_struct_ids:
-        &'a std::collections::HashSet<majit_ir::descr::StructId>,
+    pub(in crate::front::mir) gc_struct_ids: &'a std::collections::HashSet<majit_ir::descr::StructId>,
     /// `_immutable_fields_` harvested once for this artefact.
     pub(in crate::front::mir) immutable_fields: &'a ImmutableFieldsTable,
     pub(in crate::front::mir) body: &'a Unstructured,
@@ -263,10 +261,8 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// (framestate Pass 2 / monotonic `edge_args`), because
     /// `rewrite_op_free` follows the header through those links and a
     /// Pass-1 leftover inputarg position does not match a live-in link.
-    pub(in crate::front::mir) pending_vec_frees:
-        Vec<(BlockId, Variable, majit_ir::rvec::VecItemKind)>,
-    pub(in crate::front::mir) block_entry_positional_aggregate_locals:
-        Vec<std::collections::HashMap<usize, String>>,
+    pub(in crate::front::mir) pending_vec_frees: Vec<(BlockId, Variable, majit_ir::rvec::VecItemKind)>,
+    pub(in crate::front::mir) block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     pub(in crate::front::mir) block_positional_seen: Vec<bit_set::BitSet>,
     pub(in crate::front::mir) block_positional_conflict: Vec<bit_set::BitSet>,
     pub(in crate::front::mir) block_entry_string_byte_view_locals: Vec<bit_set::BitSet>,
@@ -386,11 +382,15 @@ pub(in crate::front::mir) struct Lowering<'a> {
     pub(in crate::front::mir) atomic_ordering_locals: std::collections::HashMap<usize, String>,
     /// `FunctionDesc.cachedgraph` for this lowering. `None` outside the
     /// whole-program walk.
-    pub(in crate::front::mir) spec:
-        Option<&'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    pub(in crate::front::mir) spec: Option<&'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
     /// This body is a `cachedgraph` copy, so clause refs have been
     /// replaced and a `TraitImpl` call names the impl method.
     pub(in crate::front::mir) spec_body: bool,
+    /// Concrete `generics.types` / `const_generics` of this `cachedgraph`
+    /// copy. Empty outside a spec body. `size_align_const_from_tyexpr`
+    /// substitutes leftover depth-0 `TypeVar`s with these.
+    pub(in crate::front::mir) spec_types: &'a [serde_json::Value],
+    pub(in crate::front::mir) spec_const_generics: &'a [serde_json::Value],
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -495,8 +495,7 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// This cannot share `result_exc_call_results`: the Option combinator is
     /// not itself a translated scoped callee, so its `Result` shell must be
     /// removed together with the Option select.
-    pub(in crate::front::mir) option_ok_or_else_try_sites:
-        Vec<crate::front::result_exc::OptionOkOrElseTrySite>,
+    pub(in crate::front::mir) option_ok_or_else_try_sites: Vec<crate::front::result_exc::OptionOkOrElseTrySite>,
     /// Carrier `Result<T, PyError>` combinator sites (`unwrap_or` / `expect`
     /// / `unwrap`) fused by
     /// [`crate::front::result_exc::rewire_carrier_combinator_sites`] into the
@@ -531,8 +530,7 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// the signed checked-arith results above.  Type-owned closure/Result
     /// metadata is captured here so `front::checked_arith` can fuse that
     /// continuation into the `*_ovf` normal/overflow edges.
-    pub(in crate::front::mir) checked_arith_ok_or_else_sites:
-        Vec<crate::front::checked_arith::CheckedArithOkOrElseSite>,
+    pub(in crate::front::mir) checked_arith_ok_or_else_sites: Vec<crate::front::checked_arith::CheckedArithOkOrElseSite>,
     /// Unsigned `usize::checked_{add,mul}()` call sites (`Option<usize>`-
     /// typed) recorded for the native-overflow rewiring pass
     /// (`front::checked_arith_uint`) that runs after `front::checked_arith`,
@@ -540,8 +538,7 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// tests + a virtualized `Option`.  Kept separate from
     /// `checked_arith_call_results` because it needs the `Option`/`Some`
     /// owners + payload type resolved at the recording site.
-    pub(in crate::front::mir) checked_arith_uint_sites:
-        Vec<crate::front::checked_arith_uint::CheckedArithUintSite>,
+    pub(in crate::front::mir) checked_arith_uint_sites: Vec<crate::front::checked_arith_uint::CheckedArithUintSite>,
     pub(in crate::front::mir) tagged_pair_aggregate_sites: Vec<TaggedPairAggregateSite>,
     /// `Layout::from_size_align(size, const_align).ok()` call sites
     /// (`Option<Layout>`-typed) recorded for the native bound-check rewiring
@@ -549,14 +546,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `ok` residual pair with a `uint_lt` bound test + a virtualized nested
     /// `Option<Layout>` aggregate.  The `Option`/`Some`/`Layout` owners and the
     /// payload type are resolved here from the `.ok()` destination type.
-    pub(in crate::front::mir) from_size_align_sites:
-        Vec<crate::front::from_size_align::FromSizeAlignSite>,
-    pub(in crate::front::mir) from_size_align_expect_sites:
-        Vec<crate::front::from_size_align::FromSizeAlignExpectSite>,
+    pub(in crate::front::mir) from_size_align_sites: Vec<crate::front::from_size_align::FromSizeAlignSite>,
+    pub(in crate::front::mir) from_size_align_expect_sites: Vec<crate::front::from_size_align::FromSizeAlignExpectSite>,
     /// `Layout::from_size_align(size, align)` producers (`Result<Layout, _>`),
     /// rewritten independently of a following `.ok()` / `.expect()` combinator.
-    pub(in crate::front::mir) from_size_align_call_sites:
-        Vec<crate::front::from_size_align::FromSizeAlignCallSite>,
+    pub(in crate::front::mir) from_size_align_call_sites: Vec<crate::front::from_size_align::FromSizeAlignCallSite>,
     /// `Layout::size` / `Layout::align` field accessors on a virtualized Layout.
     pub(in crate::front::mir) layout_accessor_sites:
         Vec<crate::front::from_size_align::LayoutAccessorSite>,
@@ -574,8 +568,7 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `rutf8.check_ascii` rewrite (`first_non_ascii_char(s) < 0`) the
     /// `front::slice_ascii` post-pass applies after body lowering (see
     /// [`crate::front::slice_ascii::SliceIsAsciiSite`]).
-    pub(in crate::front::mir) slice_is_ascii_sites:
-        Vec<crate::front::slice_ascii::SliceIsAsciiSite>,
+    pub(in crate::front::mir) slice_is_ascii_sites: Vec<crate::front::slice_ascii::SliceIsAsciiSite>,
     /// Word-sized `{u64,usize}::saturating_mul(a, b)` call results recorded
     /// for the unsigned high-word clamp diamond `front::saturating_mul`
     /// synthesizes after body lowering.
@@ -583,13 +576,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `core::intrinsics::saturating_add` sites recorded for the clamp
     /// diamond `front::saturating_intrinsic` synthesizes after body
     /// lowering (same post-pass as `saturating_mul`).
-    pub(in crate::front::mir) saturating_add_sites:
-        Vec<crate::front::saturating_intrinsic::SaturatingAddSite>,
+    pub(in crate::front::mir) saturating_add_sites: Vec<crate::front::saturating_intrinsic::SaturatingAddSite>,
     /// `core::intrinsics::saturating_sub` sites recorded for the clamp
     /// diamond `front::saturating_intrinsic` synthesizes after body
     /// lowering (same post-pass as `saturating_mul`).
-    pub(in crate::front::mir) saturating_sub_sites:
-        Vec<crate::front::saturating_intrinsic::SaturatingSubSite>,
+    pub(in crate::front::mir) saturating_sub_sites: Vec<crate::front::saturating_intrinsic::SaturatingSubSite>,
     /// Exclusive int-`Range { start, end }` aggregates (`for _ in a..b`)
     /// and inclusive `RangeInclusive::new(a, b)` calls (`for _ in a..=b`)
     /// recorded for the `range()` / `range(a, b + 1)` + list-iter divert
@@ -600,13 +591,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `getslice(start, None)` rewrite. The slice-index consumer proves the
     /// bound is a `usize`, hence non-negative as required by RPython's
     /// `decompose_slice_args`.
-    pub(in crate::front::mir) slice_index_rangefrom_sites:
-        Vec<crate::front::slice_index::SliceIndexRangeFromSite>,
+    pub(in crate::front::mir) slice_index_rangefrom_sites: Vec<crate::front::slice_index::SliceIndexRangeFromSite>,
     /// RangeTo aggregates retained as candidates for the slice-index
     /// recognizer. The end's unsigned coloring is captured from MIR here,
     /// before the operand can become a block inputarg.
-    pub(in crate::front::mir) slice_index_rangeto_sites:
-        Vec<crate::front::slice_index::SliceIndexRangeToSite>,
+    pub(in crate::front::mir) slice_index_rangeto_sites: Vec<crate::front::slice_index::SliceIndexRangeToSite>,
     /// Full `Range { start, end }` aggregates retained for the orthodox
     /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
     /// `range_iter` candidate; both passes are consumer-gated.
@@ -1960,6 +1949,8 @@ impl<'a> Lowering<'a> {
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
             spec_body: false,
+            spec_types: &[],
+            spec_const_generics: &[],
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),

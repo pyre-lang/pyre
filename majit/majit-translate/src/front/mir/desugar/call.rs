@@ -4,6 +4,7 @@ use super::std_call::{AtomicClass, interior_deref_root_local, rewrite_interior_i
 use super::*;
 
 impl<'a> Lowering<'a> {
+
     pub(in crate::front::mir) fn lower_call(
         &mut self,
         mir_bb: usize,
@@ -903,37 +904,40 @@ impl<'a> Lowering<'a> {
                 // `try_gc_alloc_stable_raw(tid, size_of::<T>())`, and
                 // `Layout::from_size_align(_, align_of::<usize>())`).
                 // Removes the residual `<host std.mem.size_of>` /
-                // `align_of` call the rtyper cannot register.  Declines
-                // (falls through to the ordinary call path) for a pointer /
-                // tuple / unresolved layout.
+                // `align_of` call the rtyper cannot register. A thin
+                // pointer is one address word (`llmemory.sizeof(Address)`);
+                // a tuple or a struct whose Charon offsets did not resolve
+                // still folds from its field types.
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
                     let want_align = match fd.item_meta.name_path().as_str() {
-                        "core::mem::size_of" => Some(false),
-                        "core::mem::align_of" => Some(true),
+                        "core::mem::size_of" | "std::mem::size_of" => Some(false),
+                        "core::mem::align_of" | "std::mem::align_of" => Some(true),
                         _ => None,
                     };
                     if let Some(want_align) = want_align
-                        && let Some(ty) = reg
-                            .generics
-                            .get("types")
-                            .and_then(serde_json::Value::as_array)
-                            .and_then(|a| a.first())
-                        && let Some(size) = self.size_align_const_from_tyexpr(want_align, ty)
+                        && let Some(ty) = size_align_call_type_arg(fd, &reg.generics)
                     {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind: OpKind::ConstInt(size),
-                        });
-                        self.local_var[dest_local] = Some(LocalValue::One(res));
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
+                        if let Some(size) = self.size_align_const_from_tyexpr(want_align, ty) {
+                            let res = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(res.clone()),
+                                kind: OpKind::ConstInt(size),
+                            });
+                            self.local_var[dest_local] = Some(LocalValue::One(res));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        } else if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
+                            eprintln!(
+                                "[mir-frontend] size_align fold miss graph={} want_align={} ty={}",
+                                self.graph.name, want_align, ty
+                            );
+                        }
                     }
                 }
                 // `Layout::new::<T>()` is `size_of::<T>()` plus `align_of::<T>()`
@@ -1477,9 +1481,9 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `prebuilt_str_storage(&str)` / `prebuilt_wtf8_storage(&Wtf8)` is
-                // the name's prebuilt `STR` (`CONST_STR_CACHE`,
-                // `BaseLLStringRepr.convert_const`), which the operand already is.
+                // `prebuilt_str_storage(&str)` is the literal's prebuilt
+                // `STR` (`CONST_STR_CACHE`, `BaseLLStringRepr.convert_const`),
+                // which the `&str` operand already is.
                 if args.len() == 1 && self.is_prebuilt_str_storage_identity(&reg) {
                     self.alias_dest_to_arg0(dest_local, args[0].clone(), false);
                     let target_bb = self.block_id[target];
@@ -8966,6 +8970,15 @@ impl<'a> Lowering<'a> {
         self.spec_body = true;
     }
 
+    pub(in crate::front::mir) fn set_spec_instantiation(
+        &mut self,
+        types: &'a [serde_json::Value],
+        const_generics: &'a [serde_json::Value],
+    ) {
+        self.spec_types = types;
+        self.spec_const_generics = const_generics;
+    }
+
     /// Specialized path for a direct call whose type args are concrete,
     /// or whose `generics.trait_refs` name impls. The bare path is
     /// unchanged when the callee is not generic or the call still
@@ -9100,8 +9113,10 @@ impl<'a> Lowering<'a> {
     ///
     /// `description.py` `ClassDesc.lookup` / `MethodDesc`: rustc has
     /// already selected the impl, so the call is that impl's graph.
-    /// Specialization (`FunctionDesc.cachedgraph`) is only queued from
-    /// a spec body; a non-spec caller still names the impl method.
+    /// `specialize.py default_specialize` / `FunctionDesc.cachedgraph`:
+    /// a resolved impl method with concrete type arguments is its own
+    /// graph, including a call from a non-spec body. The trait-declaration
+    /// default body keeps generic `align_of::<GcEntries<K, V>>()` residual.
     pub(in crate::front::mir) fn specialized_trait_target(
         &self,
         payload: &serde_json::Value,
@@ -9117,13 +9132,11 @@ impl<'a> Lowering<'a> {
         if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
             return self.opaque_nullary_impl_target(fd);
         }
-        let path = fd.item_meta.name_path();
-        let leaf = path.rsplit("::").next().unwrap_or("fn");
-        if self.spec_body
-            && let Some(segments) = self.enqueue_spec(fd, &generics)
-        {
+        if let Some(segments) = self.enqueue_spec(fd, &generics) {
             return Some((segments, None));
         }
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or("fn");
         Some((spec_segments(self.llbc, fd, leaf), None))
     }
 
@@ -9152,11 +9165,7 @@ impl<'a> Lowering<'a> {
         Some((spec_segments(self.llbc, fd, leaf), None))
     }
 
-    pub(in crate::front::mir) fn enqueue_spec(
-        &self,
-        fd: &FunDecl,
-        generics: &serde_json::Value,
-    ) -> Option<Vec<String>> {
+    pub(in crate::front::mir) fn enqueue_spec(&self, fd: &FunDecl, generics: &serde_json::Value) -> Option<Vec<String>> {
         let spec = self.spec?;
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
@@ -9187,6 +9196,7 @@ impl<'a> Lowering<'a> {
         // arguments. A still-open `Clause` ref refuses (`None`).
         let trait_refs =
             crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
+
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
         let leaf = fd

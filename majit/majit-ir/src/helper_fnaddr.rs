@@ -91,6 +91,256 @@ pub trait ResidualError {
     fn publish_residual(self);
 }
 
+/// Rebuild a residual-call argument from one ABI int/ref word.
+///
+/// Macro trampolines and generated genc-analogue shims both call this so
+/// the word → Rust conversion lives in one place. `# Safety`: `word` is
+/// the bits the residual-call ABI passed for `Self`.
+pub trait ResidualFromI64: Sized {
+    unsafe fn from_residual_i64(word: i64) -> Self;
+}
+
+/// Rebuild a residual-call argument from one ABI float word.
+pub trait ResidualFromF64: Sized {
+    fn from_residual_f64(word: f64) -> Self;
+}
+
+/// Pack a residual-call result into one ABI int/ref word.
+pub trait ResidualIntoI64 {
+    fn into_residual_i64(self) -> i64;
+}
+
+/// Pack a residual-call result into one ABI float word.
+pub trait ResidualIntoF64 {
+    fn into_residual_f64(self) -> f64;
+}
+
+macro_rules! residual_int {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl ResidualFromI64 for $ty {
+                #[inline]
+                unsafe fn from_residual_i64(word: i64) -> Self {
+                    word as $ty
+                }
+            }
+            impl ResidualIntoI64 for $ty {
+                #[inline]
+                fn into_residual_i64(self) -> i64 {
+                    self as i64
+                }
+            }
+        )+
+    };
+}
+
+residual_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
+impl ResidualFromI64 for bool {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        word != 0
+    }
+}
+
+impl ResidualIntoI64 for bool {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        self as i64
+    }
+}
+
+impl ResidualFromI64 for f64 {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        f64::from_bits(word as u64)
+    }
+}
+
+impl ResidualIntoI64 for f64 {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        f64::to_bits(self) as i64
+    }
+}
+
+impl ResidualFromF64 for f64 {
+    #[inline]
+    fn from_residual_f64(word: f64) -> Self {
+        word
+    }
+}
+
+impl ResidualIntoF64 for f64 {
+    #[inline]
+    fn into_residual_f64(self) -> f64 {
+        self
+    }
+}
+
+impl ResidualIntoI64 for () {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        0
+    }
+}
+
+impl ResidualFromI64 for crate::value::GcRef {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        crate::value::GcRef(word as usize)
+    }
+}
+
+impl ResidualIntoI64 for crate::value::GcRef {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        self.0 as i64
+    }
+}
+
+impl<T> ResidualFromI64 for *mut T {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        word as usize as *mut T
+    }
+}
+
+impl<T> ResidualIntoI64 for *mut T {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        self as usize as i64
+    }
+}
+
+impl<T> ResidualFromI64 for *const T {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        word as usize as *const T
+    }
+}
+
+impl<T> ResidualIntoI64 for *const T {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        self as usize as i64
+    }
+}
+
+impl<'a, T: 'a> ResidualFromI64 for &'a T {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        unsafe { &*(word as usize as *const T) }
+    }
+}
+
+impl<T> ResidualIntoI64 for &T {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        self as *const T as usize as i64
+    }
+}
+
+impl<'a, T: 'a> ResidualFromI64 for &'a mut T {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        unsafe { &mut *(word as usize as *mut T) }
+    }
+}
+
+impl<T> ResidualIntoI64 for &mut T {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        self as *mut T as usize as i64
+    }
+}
+
+impl<T> ResidualIntoI64 for Option<*mut T> {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        match self {
+            Some(ptr) => ptr as usize as i64,
+            None => 0,
+        }
+    }
+}
+
+impl<T> ResidualFromI64 for Option<*mut T> {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        if word == 0 {
+            None
+        } else {
+            Some(word as usize as *mut T)
+        }
+    }
+}
+
+impl<T> ResidualIntoI64 for Option<*const T> {
+    #[inline]
+    fn into_residual_i64(self) -> i64 {
+        match self {
+            Some(ptr) => ptr as usize as i64,
+            None => 0,
+        }
+    }
+}
+
+impl<T> ResidualFromI64 for Option<*const T> {
+    #[inline]
+    unsafe fn from_residual_i64(word: i64) -> Self {
+        if word == 0 {
+            None
+        } else {
+            Some(word as usize as *const T)
+        }
+    }
+}
+
+/// `Result<T, E>` residual: publish `Err` through [`ResidualError`] and
+/// return the zero of the int/ref ABI word.
+#[inline]
+pub fn residual_result_i64<T, E>(result: Result<T, E>) -> i64
+where
+    T: ResidualIntoI64,
+    E: ResidualError,
+{
+    match result {
+        Ok(value) => value.into_residual_i64(),
+        Err(err) => {
+            ResidualError::publish_residual(err);
+            0
+        }
+    }
+}
+
+/// `Result<T, E>` residual whose Ok payload is a float ABI word.
+#[inline]
+pub fn residual_result_f64<T, E>(result: Result<T, E>) -> f64
+where
+    T: ResidualIntoF64,
+    E: ResidualError,
+{
+    match result {
+        Ok(value) => value.into_residual_f64(),
+        Err(err) => {
+            ResidualError::publish_residual(err);
+            0.0
+        }
+    }
+}
+
+/// `Result<(), E>` residual: publish `Err` and return.
+#[inline]
+pub fn residual_result_void<T, E>(result: Result<T, E>)
+where
+    E: ResidualError,
+{
+    if let Err(err) = result {
+        ResidualError::publish_residual(err);
+    }
+}
+
 /// Visit every registered trampoline, whichever population the target carries.
 pub fn for_each_helper_fnaddr(mut visit: impl FnMut(&HelperFnAddr)) {
     #[cfg(not(target_arch = "wasm32"))]

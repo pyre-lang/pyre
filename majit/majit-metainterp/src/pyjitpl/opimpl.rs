@@ -4722,6 +4722,9 @@ where
                     jdindex,
                     result_dst,
                     &green_values,
+                    &[],
+                    &[],
+                    &[],
                 ) {
                     TraceAction::Continue => {}
                     // Abort propagates (missing fresh-reds / target).
@@ -4972,6 +4975,22 @@ where
                     // `recover`.
                     ctx.walk_final_pc = mp_green_pc.map(Self::guest_pc_position);
                     ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
+                }
+                // pyjitpl.py `reached_loop_header`: before `compile_loop`,
+                // `get_procedure_token(greenboxes)` + `has_compiled_targets`
+                // records a JUMP into the loop that already owns this merge
+                // point (`compile_trace`). A root trace has no `bridge_info`,
+                // so the guard-origin block never runs; publishing the token
+                // key is what makes the driver take `compile_trace_from_interp`
+                // instead of `compile_loop`'s `ABORT_BAD_LOOP`.
+                if !ctx.is_bridge_trace
+                    && let Some(close_key) = ctx.close_green_key_hash()
+                    && ctx
+                        .has_compiled_targets_fn
+                        .as_ref()
+                        .is_some_and(|f| f(close_key))
+                {
+                    ctx.close_jump_into_key = Some(close_key);
                 }
                 // GUARD_FUTURE_CONDITION already emitted unconditionally at
                 // the reached_loop_header entry above (pyjitpl.py).

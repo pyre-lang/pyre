@@ -472,7 +472,7 @@ impl<'a> Lowering<'a> {
         ty: &serde_json::Value,
         field_name: &str,
     ) -> Option<usize> {
-        let body = tyexpr_body(self.llbc, ty)?;
+        let body = strip_ty_indirections(ty, self.llbc)?;
         if let Some(raw) = body.get("RawPtr").and_then(serde_json::Value::as_array) {
             return self.instantiated_elem_align_from_json(raw.first()?, field_name);
         }

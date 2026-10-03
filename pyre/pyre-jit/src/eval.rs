@@ -7197,6 +7197,12 @@ impl PyPyJitDriver {
         let next_instr = skip_caches(code, next_instr);
         let env = PyreEnv;
         let (driver, info) = driver_pair();
+        // This body runs only as a native warm entry (`jtransform` rewrites
+        // the traced call to `loop_header`). A residual that re-enters the
+        // interpreter while a trace is open must not start a second one.
+        if driver.is_tracing() {
+            return false;
+        }
         let loop_pycode = pycode as *const ();
         let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
         let green_key = driver.resolve_cell_key(green_key_hash, || {
@@ -7211,15 +7217,15 @@ impl PyPyJitDriver {
                 >= portal_metatrace_skip()
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            if let Some(result) = drive_portal_metatrace(
+            if drive_portal_metatrace(
                 driver,
                 info,
                 &env,
                 green_key,
                 next_instr,
                 frame as *mut PyFrame,
+                ec,
             ) {
-                set_pending_loop_exit(ec, result);
                 portal_diag_bump(1);
                 return true;
             }
@@ -8246,7 +8252,8 @@ fn drive_portal_metatrace(
     green_key: u64,
     loop_header_pc: usize,
     frame: *mut PyFrame,
-) -> Option<LoopResult> {
+    ec_pending: *const PyExecutionContext,
+) -> bool {
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
@@ -8254,7 +8261,7 @@ fn drive_portal_metatrace(
     // this key only. A live session on another key or driver may still
     // `bound_reached` a nested MetaInterp.
     if driver.cell_is_tracing(green_key) {
-        return None;
+        return false;
     }
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
@@ -8271,10 +8278,14 @@ fn drive_portal_metatrace(
         "iirrr",
         "portal metatracing requires the split eval portal"
     );
-    let header_pc = pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
-        .find(|op| op.opname == "jit_merge_point")
-        .expect("jd0 portal must contain its merge point")
-        .pc;
+    let mut header_pc = None;
+    for op in pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code) {
+        if op.opname == "jit_merge_point" {
+            header_pc = Some(op.pc);
+            break;
+        }
+    }
+    let header_pc = header_pc.expect("jd0 portal must contain its merge point");
     eprintln!(
         "[jd0-mt] portal jitcode name={} code_len={} entry=start pc=0 header_pc={}",
         canonical.name,
@@ -8294,7 +8305,7 @@ fn drive_portal_metatrace(
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
     driver.force_start_tracing(green_key, None, loop_header_pc, &mut jit_state, env);
     if !driver.is_tracing() {
-        return None;
+        return false;
     }
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     driver.arm_close_on_drop(starting_tracing_key);
@@ -8327,11 +8338,13 @@ fn drive_portal_metatrace(
     majit_gc::ensure_type_registry_closed();
     let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
     let depth = meta.framestack.len();
-    let top = meta.framestack.frames.last();
+    let (stop_jitcode, stop_cursor) = if let Some(top) = meta.framestack.frames.last() {
+        (top.jitcode.name(), top.code_cursor)
+    } else {
+        ("<empty>", 0)
+    };
     eprintln!(
-        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={} stop_cursor={}",
-        top.map_or("<empty>", |f| f.jitcode.name()),
-        top.map_or(0, |f| f.code_cursor)
+        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={stop_jitcode} stop_cursor={stop_cursor}"
     );
     let outcome = match action {
         TraceAction::Finish {
@@ -8376,17 +8389,26 @@ fn drive_portal_metatrace(
             if let Some(pc) = green_pc_position(args.green_int[0]) {
                 unsafe { &mut *resumed }.set_last_instr_from_next_instr(pc);
             }
-            Some(LoopResult::ContinueRunningNormally)
+            set_pending_loop_exit(ec_pending, LoopResult::ContinueRunningNormally);
+            true
         }
         JitException::DoneWithThisFrameRef(value) => {
-            Some(LoopResult::Done(Ok(value.0 as pyre_object::PyObjectRef)))
+            set_pending_loop_exit(
+                ec_pending,
+                LoopResult::Done(Ok(value.0 as pyre_object::PyObjectRef)),
+            );
+            true
         }
         JitException::ExitFrameWithExceptionRef(value) => {
             // The generated portal/blackhole has already unwound this frame's
             // exception handlers. Return its exception to the Python caller.
-            Some(LoopResult::Done(Err(unsafe {
-                pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
-            })))
+            set_pending_loop_exit(
+                ec_pending,
+                LoopResult::Done(Err(unsafe {
+                    pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
+                })),
+            );
+            true
         }
         other => panic!("incomplete portal blackhole continuation: {other:?}"),
     }
@@ -14020,6 +14042,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         &majit_ir::PYPYJIT_GREEN_TYPES,
     );
 
+    // One MetaInterp. A nested Python call that arrives while a trace is
+    // already running must not start its own (`compile_and_run_once` is
+    // may-force, so the outer trace would record `CallMayForce` and the
+    // callee would compile apart from the caller). Falling through runs
+    // the portal body, which the metainterp inlines.
+    if pair.0.is_tracing() {
+        return None;
+    }
     // `warmstate.py maybe_compile_and_run` tests `cell.flags & JC_TRACING` on
     // the cell the chain walk found (`function_entry_step` → AlreadyTracing,
     // no tick) and ticks every other greenkey. `is_tracing_key` also matches

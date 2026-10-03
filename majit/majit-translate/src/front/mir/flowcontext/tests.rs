@@ -208,6 +208,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             None,
             true,
             None,
+            None,
         )
         .unwrap_or_else(|err| panic!("lower substituted {name_path}: {err:?}"));
 

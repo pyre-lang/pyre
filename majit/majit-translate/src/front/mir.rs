@@ -457,6 +457,7 @@ pub(crate) fn absorb_semantic_program(
                 acc.exception_class_hints.push(hint);
             }
             acc.atomic_load_decls.extend(prog.atomic_load_decls);
+            acc.residual_fn_catalog.extend(prog.residual_fn_catalog);
         }
     }
 }
@@ -586,6 +587,12 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             &mut acc.enum_variant_by_discriminant,
             Some(&acc.struct_ids),
         );
+        if acc.residual_fn_catalog.is_empty() {
+            for llbc in llbcs {
+                acc.residual_fn_catalog
+                    .extend(crate::residual_shim::catalog_from_llbc(llbc));
+            }
+        }
     }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
@@ -605,6 +612,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
+            residual_fn_catalog: Vec::new(),
         }),
     )
 }
@@ -2396,6 +2404,7 @@ impl<'l> CrateLowering<'l> {
             Some(spec),
             false,
             None,
+            None,
         ) {
             Ok(g) => g,
             Err(error) => {
@@ -2512,6 +2521,8 @@ impl<'l> CrateLowering<'l> {
                 segments,
                 body,
                 fn_id: fd.def_id,
+                types: req.types,
+                const_generics: req.const_generics,
             }),
             header,
             dont_look_inside: dont_look_inside.contains(&policy_fn_path),
@@ -2624,6 +2635,7 @@ impl<'l> CrateLowering<'l> {
             Some(spec_queue),
             true,
             Some(spec.segments.join("::")),
+            Some((spec.types.as_slice(), spec.const_generics.as_slice())),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -2655,6 +2667,14 @@ pub(crate) struct SpecBody {
     segments: Vec<String>,
     body: majit_charon_reader::ullbc::Unstructured,
     fn_id: u64,
+    /// Call-site `generics.types` this copy was keyed on.
+    ///
+    /// `FunctionDesc.cachedgraph` is a separate graph whose annotations are
+    /// the concrete arguments (`specialize.py`). `size_align_const_from_tyexpr`
+    /// substitutes depth-0 `TypeVar`s in a leftover generic `size_of` /
+    /// `align_of` type argument with these, so `llmemory.sizeof` folds.
+    types: Vec<serde_json::Value>,
+    const_generics: Vec<serde_json::Value>,
 }
 
 impl DeclaredSpec {
@@ -2741,6 +2761,7 @@ impl CrateLoweringState {
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls,
+            residual_fn_catalog: Vec::new(),
         }
     }
 }
@@ -6159,6 +6180,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         None,
         false,
         None,
+        None,
     )
 }
 
@@ -6521,6 +6543,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
     spec_body: bool,
     graph_name: Option<String>,
+    spec_instantiation: Option<(&[serde_json::Value], &[serde_json::Value])>,
 ) -> Result<FunctionGraph, LowerError> {
     // A clause specialization's readable name (`RDict::new__spec_…`) is
     // known to the caller. The body is still the template `FunDecl`, so
@@ -7386,6 +7409,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.set_spec_body();
             }
         }
+        if let Some((types, consts)) = spec_instantiation {
+            lo.set_spec_instantiation(types, consts);
+        }
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -7445,6 +7471,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             lo.set_spec_body();
         }
     }
+    if let Some((types, consts)) = spec_instantiation {
+        lo.set_spec_instantiation(types, consts);
+    }
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -7489,6 +7518,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 if spec_body {
                     lo.set_spec_body();
                 }
+            }
+            if let Some((types, consts)) = spec_instantiation {
+                lo.set_spec_instantiation(types, consts);
             }
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;

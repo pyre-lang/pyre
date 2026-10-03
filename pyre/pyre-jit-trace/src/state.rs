@@ -5665,6 +5665,22 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     let Some(struct_ptr) = concrete_gc_ptr(ctx, obj) else {
         return None;
     };
+    quasi_immut_descr_for_struct(struct_ptr, descr, None)
+}
+
+/// `quasiimmut.py QuasiImmutDescr` for a concrete struct pointer.
+///
+/// The portal dispatcher records `record_quasiimmut_field` without a
+/// `TraceCtx` box, so it calls this with the live pointer. `constantfieldbox`
+/// is `None` until the caller has installed the watcher and re-read the field.
+pub fn quasi_immut_descr_for_struct(
+    struct_ptr: i64,
+    descr: &DescrRef,
+    constantfieldbox: Option<majit_ir::Value>,
+) -> Option<DescrRef> {
+    if struct_ptr == 0 || struct_ptr == usize::MAX as i64 {
+        return None;
+    }
     let index = descr.index();
     // The index decides which type `struct_ptr` is cast to, so an unrecognised
     // one must fail loudly rather than reinterpret a headerless map-node
@@ -5695,7 +5711,7 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
         descr.clone(),
         struct_ptr as u64,
         std::sync::Arc::new(RecordedQuasiImmut(qmut)),
-        None,
+        constantfieldbox,
     )))
 }
 

@@ -1155,6 +1155,948 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
     );
 }
 
+    fn size_align_probe_llbc(type_decls: serde_json::Value) -> Llbc {
+        let doc = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [],
+                "type_decls": type_decls,
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(doc.to_string().as_bytes()).expect("size-align fixture parses")
+    }
+
+    fn size_align_item_meta(leaf: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": [{"Ident": [leaf, 0]}],
+            "span": span_json(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    }
+
+    #[test]
+    fn size_align_of_thin_pointer_is_the_word() {
+        let llbc = size_align_probe_llbc(serde_json::json!([]));
+        let ty = serde_json::json!({"RawPtr": [usize_ty(), "Const"]});
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(super::size_align_of_tyexpr(&llbc, false, &ty), Some(word));
+        assert_eq!(super::size_align_of_tyexpr(&llbc, true, &ty), Some(word));
+    }
+
+    #[test]
+    fn size_align_of_pointer_to_tuple_is_the_word() {
+        // The previous pointer lane required `builtin` to be absent, so a
+        // pointer to a tuple declined. A thin pointer is one word
+        // (`llmemory.sizeof`).
+        let tuple = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {"types": [usize_ty(), usize_ty()]}
+        }});
+        let llbc = size_align_probe_llbc(serde_json::json!([]));
+        let ty = serde_json::json!({"RawPtr": [tuple, "Const"]});
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(super::size_align_of_tyexpr(&llbc, false, &ty), Some(word));
+        assert_eq!(super::size_align_of_tyexpr(&llbc, true, &ty), Some(word));
+    }
+
+    #[test]
+    fn align_of_tuple_is_max_of_field_aligns() {
+        let llbc = size_align_probe_llbc(serde_json::json!([{
+            "def_id": 0,
+            "item_meta": size_align_item_meta("Tuple"),
+            "kind": {"Struct": [
+                {"name": null, "is_positional": true, "ty": usize_ty()},
+                {"name": null, "is_positional": true, "ty": u32_ty()}
+            ]}
+        }]));
+        let ty = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {"types": [usize_ty(), u32_ty()]}
+        }});
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(super::size_align_of_tyexpr(&llbc, true, &ty), Some(word));
+        assert_eq!(
+            super::size_align_of_tyexpr(&llbc, false, &ty),
+            Some(word * 2)
+        );
+    }
+
+    #[test]
+    fn align_of_unresolved_struct_of_pointers_is_the_word() {
+        // Charon records no chosen layout. Alignment is still the max of
+        // the field types: a pointer is one word (`llmemory.sizeof`).
+        let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+        let llbc = size_align_probe_llbc(serde_json::json!([{
+            "def_id": 0,
+            "item_meta": size_align_item_meta("Foreign"),
+            "kind": {"Struct": [
+                {"name": "p", "ty": ptr}
+            ]}
+        }]));
+        let ty = serde_json::json!({"Adt": {"id": 0, "builtin": null, "generics": {"types": []}}});
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(super::size_align_of_tyexpr(&llbc, true, &ty), Some(word));
+        assert_eq!(super::size_align_of_tyexpr(&llbc, false, &ty), Some(word));
+    }
+
+    #[test]
+    fn align_of_generic_struct_instantiated_at_pointer_is_the_word() {
+        // `GcEntries<K, V>` is a generic decl; `align_of::<GcEntries<P, P>>()`
+        // names that decl with use-site args. Alignment is the max of the
+        // substituted fields (`llmemory.sizeof`).
+        let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+        let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+        let llbc = size_align_probe_llbc(serde_json::json!([{
+            "def_id": 0,
+            "item_meta": size_align_item_meta("GcEntries"),
+            "kind": {"Struct": [
+                {"name": "length", "ty": usize_ty()},
+                {"name": "key", "ty": tvar(0)},
+                {"name": "value", "ty": tvar(1)}
+            ]}
+        }]));
+        let ty = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": {
+                "types": [ptr.clone(), ptr],
+                "regions": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(super::size_align_of_tyexpr(&llbc, true, &ty), Some(word));
+    }
+
+    #[test]
+    fn align_of_generic_struct_with_zst_array_field_is_the_word() {
+        // `GcEntries<K, V> { length, items: [Entry<K, V>; 0] }`. The array
+        // length is a const, not a type; alignment is still the element
+        // alignment after substituting `K`/`V`.
+        let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+        let tvar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+        let entry = serde_json::json!({"Adt": {
+            "id": 1,
+            "builtin": null,
+            "generics": {
+                "types": [tvar(0), tvar(1)],
+                "regions": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let zst_array = serde_json::json!({"Array": [
+            entry,
+            [{"Integer": {"Unsigned": ["Usize", "0"]}}, usize_ty()],
+            null
+        ]});
+        let llbc = size_align_probe_llbc(serde_json::json!([
+            {
+                "def_id": 0,
+                "item_meta": size_align_item_meta("GcEntries"),
+                "kind": {"Struct": [
+                    {"name": "length", "ty": usize_ty()},
+                    {"name": "items", "ty": zst_array}
+                ]}
+            },
+            {
+                "def_id": 1,
+                "item_meta": size_align_item_meta("Entry"),
+                "kind": {"Struct": [
+                    {"name": "key", "ty": tvar(0)},
+                    {"name": "value", "ty": tvar(1)}
+                ]}
+            }
+        ]));
+        let ty = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": {
+                "types": [ptr.clone(), ptr],
+                "regions": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(super::size_align_of_tyexpr(&llbc, true, &ty), Some(word));
+    }
+
+    #[test]
+    fn align_of_instantiated_pointer_folds_to_the_word() {
+        use crate::model::{CallTarget, OpKind};
+        // A monomorphized `align_of::<T>()` stores `T` on the FunDecl
+        // Instantiated segment (`ItemMeta::instantiation`); the call
+        // site generics are empty.
+        let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Const"]});
+        let align_of = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["mem", 0]},
+                    {"Ident": ["align_of", 0]},
+                    {"Instantiated": {
+                        "params": [],
+                        "skip_binder": {
+                            "regions": [],
+                            "types": [ptr],
+                            "const_generics": [],
+                            "trait_refs": []
+                        }
+                    }}
+                ],
+                "span": span_json(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": "Opaque"
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "read_align"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [],
+                            "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
+                        },
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let doc = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [caller, align_of],
+                "type_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+        let graph = super::lower_function(&llbc, "read_align").expect("lower read_align");
+        let word = crate::layout::target_word_size() as i64;
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(n) if *n == word)),
+            "instantiated align_of of a pointer must fold to the word, ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().is_some_and(|s| s == "align_of")
+            )),
+            "align_of must not residualize, ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn spec_body_align_of_generic_struct_folds_from_instantiation() {
+        use crate::front::clause_spec::substituted_unstructured;
+        use crate::model::{CallTarget, OpKind};
+        // `alloc_entries<K, V>` calls `align_of::<GcEntries<K, V>>()`. A
+        // `cachedgraph` copy (`specialize.py`) is a separate graph whose
+        // types are concrete; the leftover TypeVars in that call must fold
+        // through `size_align_const_from_tyexpr`.
+        let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+        let tvar0 = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+        let wrapper_ty = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [tvar0],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let align_of = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["core", "mem", "align_of"], "", false),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": "Opaque"
+        });
+        let read_align = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "read_align"], "", true),
+            "generics": {
+                "regions": [],
+                "types": [{"index": 0, "name": "T", "variance": "Invariant"}],
+                "const_generics": [],
+                "trait_clauses": []
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": {
+                                    "regions": [],
+                                    "types": [wrapper_ty],
+                                    "const_generics": [],
+                                    "trait_refs": []
+                                }
+                            }},
+                            "args": [],
+                            "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
+                        },
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let doc = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [read_align, align_of],
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": size_align_item_meta("GcEntries"),
+                    "kind": {"Struct": [
+                        {"name": "length", "ty": usize_ty()},
+                        {"name": "key", "ty": {"TypeVar": {"Bound": [0, 0]}}}
+                    ]}
+                }],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+        let fd = llbc.fn_by_id(0).expect("read_align");
+        let types = [ptr];
+        let body = substituted_unstructured(fd, &llbc, &[], &types, &[])
+            .expect("substituted unstructured body");
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let empty_set = std::collections::HashSet::new();
+        let empty_map = std::collections::HashMap::new();
+        let root_state = super::RootStackState::new(&llbc);
+        let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
+        let empty_gc_struct_ids = std::collections::HashSet::new();
+        let graph = super::lower_unstructured_with_static_addrs_and_attrs(
+            &llbc,
+            fd,
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            &empty_map,
+            &crate::front::semantic::StructFieldRegistry::default(),
+            &empty_set,
+            &empty_set,
+            &empty_gc_struct_ids,
+            &super::ImmutableFieldsTable::new(),
+            &empty_set,
+            accum.has_builder,
+            &accum,
+            &root_stack,
+            None,
+            true,
+            None,
+            Some((types.as_slice(), [].as_slice())),
+        )
+        .expect("lower spec body");
+        let word = crate::layout::target_word_size() as i64;
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(n) if *n == word)),
+            "spec-body align_of::<GcEntries<ptr>>() must fold to the word, ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().is_some_and(|s| s == "align_of")
+            )),
+            "align_of must not residualize from a spec body, ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn align_of_codeobject_uses_the_layout_probe() {
+        // `w_code_const` calls `align_of::<CodeObject<ConstantData>>()`.
+        // Charon leaves that struct's `chosen` layout null and a field
+        // is `C::Name` (`TraitType`). The probe is `llmemory.sizeof`.
+        let llbc = size_align_probe_llbc(serde_json::json!([{
+            "def_id": 0,
+            "item_meta": item_meta_json(
+                &["rustpython_compiler_core", "bytecode", "CodeObject"],
+                "",
+                false
+            ),
+            "kind": {"Struct": [
+                {"name": "source_path", "ty": {"TraitType": [
+                    {
+                        "kind": {"Clause": {"Bound": [0, 0]}},
+                        "trait_decl_ref": {
+                            "regions": [],
+                            "skip_binder": {"id": 0, "generics": empty_generics()}
+                        }
+                    },
+                    0,
+                    empty_generics()
+                ]}}
+            ]}
+        }]));
+        let ty = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": empty_generics()
+        }});
+        let expected = crate::codeobject_layout::exact_layout_for("bytecode::CodeObject")
+            .and_then(|layout| layout.align)
+            .expect("host CodeObject layout");
+        assert_eq!(
+            super::size_align_of_tyexpr(&llbc, true, &ty),
+            Some(expected)
+        );
+        assert!(
+            super::size_align_of_tyexpr(&llbc, false, &ty).is_some(),
+            "size_of::<CodeObject>() must fold"
+        );
+    }
+
+    #[test]
+    fn size_of_empty_struct_is_zero() {
+        // `gc_alloc_storage_box::<Global>()`: `alloc::alloc::Global` is a
+        // ZST. Alignment 1, size 0 (`llmemory.sizeof`).
+        let llbc = size_align_probe_llbc(serde_json::json!([{
+            "def_id": 0,
+            "item_meta": size_align_item_meta("Global"),
+            "kind": {"Struct": []}
+        }]));
+        let ty = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": empty_generics()
+        }});
+        assert_eq!(super::size_align_of_tyexpr(&llbc, false, &ty), Some(0));
+        assert_eq!(super::size_align_of_tyexpr(&llbc, true, &ty), Some(1));
+    }
+
+    #[test]
+    fn w_code_const_align_of_codeobject_does_not_residualize() {
+        use crate::model::{CallTarget, OpKind};
+        // Real `w_code_const` shape: `align_of::<CodeObject<ConstantData>>()`,
+        // FunDecl still `core::mem::align_of`, T on the call generics.
+        let codeobject = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [{"Adt": {
+                    "id": 1,
+                    "builtin": null,
+                    "generics": empty_generics()
+                }}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let align_of = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["core", "mem", "align_of"], "", false),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": "Opaque"
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "w_code_const"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": {
+                                    "regions": [],
+                                    "types": [codeobject],
+                                    "const_generics": [],
+                                    "trait_refs": []
+                                }
+                            }},
+                            "args": [],
+                            "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
+                        },
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let doc = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [caller, align_of],
+                "type_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": item_meta_json(
+                            &["rustpython_compiler_core", "bytecode", "CodeObject"],
+                            "",
+                            false
+                        ),
+                        "kind": {"Struct": [
+                            {"name": "flags", "ty": usize_ty()}
+                        ]}
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": item_meta_json(
+                            &["rustpython_compiler_core", "bytecode", "ConstantData"],
+                            "",
+                            false
+                        ),
+                        "kind": {"Enum": []}
+                    }
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+        let graph = super::lower_function(&llbc, "w_code_const").expect("lower w_code_const");
+        let expected = crate::codeobject_layout::exact_layout_for("bytecode::CodeObject")
+            .and_then(|layout| layout.align)
+            .expect("host CodeObject layout") as i64;
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(n) if *n == expected)),
+            "w_code_const align_of::<CodeObject<_>>() must fold, ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().is_some_and(|s| s == "align_of")
+            )),
+            "align_of must not residualize from w_code_const, ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn size_align_of_struct_with_free_typevar_field_uses_owner_generics() {
+        // Charon type_decls spell a struct parameter as `TypeVar::Free`
+        // as well as `Bound[0, i]`. `llmemory.sizeof` of the instantiated
+        // Adt must still read `generics.types[i]`.
+        let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+        let ty = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [ptr],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let llbc = size_align_probe_llbc(serde_json::json!([{
+            "def_id": 0,
+            "item_meta": size_align_item_meta("GcEntries"),
+            "kind": {"Struct": [
+                {"name": "length", "ty": usize_ty()},
+                {"name": "key", "ty": {"TypeVar": {"Free": 0}}}
+            ]}
+        }]));
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(
+            super::size_align_of_tyexpr(&llbc, true, &ty),
+            Some(word),
+            "align_of::<GcEntries<ptr>>() with Free typevar must be the word"
+        );
+    }
+
+    #[test]
+    fn nonspec_call_with_concrete_types_enqueues_cachedgraph() {
+        // `dict_grow::<ObjectKey, …>` is an inherent generic: concrete
+        // type arguments, empty `trait_refs`. `default_specialize` still
+        // builds `FunctionDesc.cachedgraph`, so the call site names the
+        // spec copy and the generic body (with `align_of::<GcEntries<K,V>>`)
+        // is not the Regular candidate.
+        use crate::front::clause_spec::SpecQueue;
+        let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+        let alloc_like = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "alloc_like"], "", true),
+            "generics": {
+                "regions": [],
+                "types": [{"index": 0, "name": "T", "variance": "Invariant"}],
+                "const_generics": [],
+                "trait_clauses": []
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "caller"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": {
+                                    "regions": [],
+                                    "types": [ptr],
+                                    "const_generics": [],
+                                    "trait_refs": []
+                                }
+                            }},
+                            "args": [],
+                            "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
+                        },
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let doc = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [caller, alloc_like],
+                "type_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+        let fd = llbc.fn_by_id(0).expect("caller");
+        let body = fd.unstructured().expect("caller unstructured");
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let empty_set = std::collections::HashSet::new();
+        let empty_map = std::collections::HashMap::new();
+        let root_state = super::RootStackState::new(&llbc);
+        let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
+        let queue = std::cell::RefCell::new(SpecQueue::new());
+        let graph = super::lower_unstructured_with_static_addrs_and_attrs(
+            &llbc,
+            fd,
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            &empty_map,
+            &crate::front::semantic::StructFieldRegistry::default(),
+            &empty_set,
+            &empty_set,
+            &std::collections::HashSet::new(),
+            &super::ImmutableFieldsTable::new(),
+            &empty_set,
+            accum.has_builder,
+            &accum,
+            &root_stack,
+            Some(&queue),
+            false,
+            None,
+            None,
+        )
+        .expect("lower caller");
+        let req = queue.borrow_mut().pop().expect("cachedgraph enqueued");
+        assert!(
+            req.leaf.starts_with("alloc_like__spec_"),
+            "spec leaf, got {}",
+            req.leaf
+        );
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|s| s.starts_with("alloc_like__spec_"))
+            )),
+            "call site must name the cachedgraph copy, ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|s| s == "alloc_like")
+            )),
+            "unspecialized generic must not remain the Regular callee, ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn nonspec_trait_call_with_concrete_impl_enqueues_cachedgraph() {
+        // `unwrapped_add` is a Trait method whose impl is generic in K, V.
+        // A non-spec body that `CallKind::Trait`s a resolved `TraitImpl`
+        // must still `cachedgraph` (`default_specialize`), or BFS compiles
+        // the trait-declaration default body and residualizes
+        // `align_of::<GcEntries<K, V>>()`.
+        use crate::front::clause_spec::SpecQueue;
+        let ptr = serde_json::json!({"RawPtr": [u32_ty(), "Mut"]});
+        let insert = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "insert"], "", true),
+            "generics": {
+                "regions": [],
+                "types": [
+                    {"index": 0, "name": "K", "variance": "Invariant"},
+                    {"index": 1, "name": "V", "variance": "Invariant"}
+                ],
+                "const_generics": [],
+                "trait_clauses": []
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let impl_ref = serde_json::json!({
+            "kind": {"TraitImpl": {"id": 0, "generics": {
+                "regions": [],
+                "types": [ptr.clone(), ptr.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }}}
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "caller"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": usize_ty()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Trait": [impl_ref, 0, 1]},
+                                "generics": {
+                                    "regions": [],
+                                    "types": [],
+                                    "const_generics": [],
+                                    "trait_refs": []
+                                }
+                            }},
+                            "args": [],
+                            "dest": {"kind": {"Local": 0}, "ty": usize_ty()}
+                        },
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let doc = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [caller, insert],
+                "type_decls": [],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta_json(&["fixture", "Set"], "", true),
+                    "methods": [{"name": "insert"}]
+                }],
+                "trait_impls": [{
+                    "methods": [{"kind": {"TraitMethod": [0, 0]}, "skip_binder": {"id": 1}}],
+                    "impl_trait": {"id": 0, "generics": {
+                        "regions": [],
+                        "types": [{"RawPtr": [u32_ty(), "Mut"]}, {"RawPtr": [u32_ty(), "Mut"]}],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }},
+                    "implied_trait_refs": []
+                }]
+            }
+        });
+        let llbc = Llbc::from_slice(doc.to_string().as_bytes()).expect("fixture parses");
+        let fd = llbc.fn_by_id(0).expect("caller");
+        let body = fd.unstructured().expect("caller unstructured");
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let empty_set = std::collections::HashSet::new();
+        let empty_map = std::collections::HashMap::new();
+        let root_state = super::RootStackState::new(&llbc);
+        let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
+        let queue = std::cell::RefCell::new(SpecQueue::new());
+        let graph = super::lower_unstructured_with_static_addrs_and_attrs(
+            &llbc,
+            fd,
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            &empty_map,
+            &crate::front::semantic::StructFieldRegistry::default(),
+            &empty_set,
+            &empty_set,
+            &std::collections::HashSet::new(),
+            &super::ImmutableFieldsTable::new(),
+            &empty_set,
+            accum.has_builder,
+            &accum,
+            &root_stack,
+            Some(&queue),
+            false,
+            None,
+            None,
+        )
+        .expect("lower caller");
+        let req = queue.borrow_mut().pop().expect("cachedgraph enqueued");
+        assert!(
+            req.leaf.starts_with("insert__spec_"),
+            "spec leaf, got {}",
+            req.leaf
+        );
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|s| s.starts_with("insert__spec_"))
+            )),
+            "trait call site must name the cachedgraph copy, ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|s| s == "insert")
+            )),
+            "unspecialized trait default must not remain the callee, ops={ops:?}"
+        );
+    }
+
 #[test]
 fn discover_foldable_const_lits_harvests_composed_size_of_arith() {
     let chars_path = ["fixture", "LOWLEVEL_STRING_CHARS_OFFSET"];

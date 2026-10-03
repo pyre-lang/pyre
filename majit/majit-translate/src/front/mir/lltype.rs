@@ -9627,32 +9627,8 @@ pub(in crate::front::mir) fn json_ty_literal_byte_size(node: &serde_json::Value)
     }
 }
 
-pub(in crate::front::mir) fn json_ty_byte_size(
-    node: &serde_json::Value,
-    llbc: &Llbc,
-) -> Option<i64> {
-    let node = strip_ty_indirections(node, llbc)?;
-    if json_ty_is_thin_pointer_element(node, llbc) {
-        return Some(crate::layout::target_word_size() as i64);
-    }
-    if let Some(size) = json_ty_literal_byte_size(node) {
-        return Some(size);
-    }
-    let adt = inline_adt_def_id(node)?;
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let decl = llbc.type_by_id(adt)?;
-    // `layout_for_target` drops the whole layout when a field offset is
-    // still a deduplicated expression. `<*const T>::add` only needs the
-    // byte size (`size_align_for_target`).
-    if let Some(size) = decl
-        .layout_for_target(llbc, &target)
-        .and_then(|layout| layout.size)
-    {
-        return Some(size as i64);
-    }
-    decl.size_align_for_target(llbc, &target)?
-        .0
-        .map(|size| size as i64)
+pub(in crate::front::mir) fn json_ty_byte_size(node: &serde_json::Value, llbc: &Llbc) -> Option<i64> {
+    i64::try_from(size_align_of_tyexpr(llbc, false, node)?).ok()
 }
 
 pub(in crate::front::mir) fn json_ty_raw_store_descr(

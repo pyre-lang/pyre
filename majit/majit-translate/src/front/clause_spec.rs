@@ -55,6 +55,7 @@ impl SpecQueue {
         }
     }
 
+
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
         // `FunctionDesc.cachedgraph` keys one graph per specializer key
         // inside one desc. The leaf is that key's name; `fn_id` is the
@@ -686,7 +687,7 @@ fn subst_vars(
 
 /// Depth-0 `TypeVar` index: `{"TypeVar":{"Bound":[0, i]}}` or
 /// `{"TypeVar":{"Free": i}}`.
-fn type_var_index(v: &Value) -> Option<usize> {
+pub(crate) fn type_var_index(v: &Value) -> Option<usize> {
     type_var_index_at(v, 0)
 }
 

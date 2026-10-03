@@ -32,6 +32,11 @@ pub struct JitDriverSpec {
     /// to the runner classify as recursive in `CallControl.guess_call_kind`.
     #[serde(default)]
     pub portal_runner: Option<CallPath>,
+    /// Interpreter-side portal entry (`eval_current_frame_raw` inlines to
+    /// this). Same recursive identity as `portal_runner_ptr` after the
+    /// crate split; `rewrite_jit_merge_point` still calls `portal_runner`.
+    #[serde(default)]
+    pub portal_enter: Option<CallPath>,
     pub greens: Vec<String>,
     pub reds: Vec<String>,
     /// Optional operand-kind declarations parallel to `greens`.
@@ -226,6 +231,10 @@ pub struct ProgramPipelineResult {
     /// because there is one gccache in one process.
     #[serde(default)]
     pub ei_descr_mints: Vec<majit_ir::effectinfo::DescrMintEntry>,
+    /// Policy-declined residual callees that still need a callable address.
+    /// Consumed by `pyre-jit-trace/build.rs` to emit generated residual shims.
+    #[serde(default)]
+    pub residual_shim_targets: Vec<crate::residual_shim::ResidualShimTarget>,
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
@@ -278,6 +287,7 @@ mod tests {
             all_liveness: Vec::new(),
             callinfo_rows: Vec::new(),
             ei_descr_mints: Vec::new(),
+            residual_shim_targets: Vec::new(),
             total_blocks: 1,
             total_ops: 1,
             total_vable_rewrites: 0,
@@ -303,6 +313,7 @@ mod tests {
             jit_drivers: vec![JitDriverSpec {
                 portal: CallPath::from_segments(["engine", "mainloop"]),
                 portal_runner: None,
+                portal_enter: None,
                 greens: Vec::new(),
                 reds: Vec::new(),
                 green_kinds: Vec::new(),
