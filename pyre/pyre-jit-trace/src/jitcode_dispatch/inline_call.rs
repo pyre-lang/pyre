@@ -4528,6 +4528,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     is_being_profiled: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
     send_ex_generator: Option<OpRef>,
+    constructor_assembler_caller: Option<InlineParentFrame>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let _ = nlocals;
     let Some(recorded) = record_walker_loop_callee_portal_call(
@@ -4544,6 +4545,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         false,
         constructor_result,
         send_ex_generator,
+        constructor_assembler_caller,
     )?
     else {
         // Recorder preflight missed after the prologue ran. The sub-walk
@@ -4623,6 +4625,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     leave_callee_ec: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
     send_ex_generator: Option<OpRef>,
+    constructor_assembler_caller: Option<InlineParentFrame>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     // The bridge resume captures its after-call guards on the paused callers;
@@ -5048,7 +5051,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         },
         constructor_assembler: constructor_result
             .as_ref()
-            .map(|(instance, _)| (*instance, ca_result)),
+            .map(|(instance, _)| (*instance, ca_result, constructor_assembler_caller)),
         send_ex_assembler: send_ex_generator.map(|generator| (generator, ca_result)),
         ..Default::default()
     };
@@ -5062,7 +5065,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // `topframeref` — including when the snapshot aborts
     // (`GuardSnapshotVableUntyped`). The self-recursive fold uses the same
     // slot for `record_ec_leave_frame_chain`.
-    let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope);
+    let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope.clone());
     if leave_callee_ec {
         leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
     } else if portal_vref.is_some() {
@@ -5091,7 +5094,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     record_activation_release(ctx.trace_ctx, callee_ec, saved_depth, displaced_activation);
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     if exec_raised {
-        walker_record_guard_exception_scoped(ctx, pc, scope)?;
+        walker_record_guard_exception_scoped(ctx, pc, scope.clone())?;
         let exc = ctx
             .last_exc_value()
             .expect("exec_raised implies last_exc_value seeded by the Err branch");
@@ -5102,7 +5105,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         }));
     }
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
+    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope.clone())?;
 
     if record_init_none_check {
         // `W_TypeObject.descr_call` checks every successful `__init__`
@@ -5142,7 +5145,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             ctx.last_exc_value_concrete(),
             ConcreteValue::Ref(p) if !p.is_null()
         ) {
-            walker_record_guard_exception_scoped(ctx, pc, scope)?;
+            walker_record_guard_exception_scoped(ctx, pc, scope.clone())?;
             let exc_box = ctx
                 .last_exc_value()
                 .expect("guard_exception seeds last_exc_value");
@@ -11219,7 +11222,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `MetaInterp.newframe` owns the callee's frame and scratch allocations.
     // A declined inline discards them along with the callee body, so measure
     // its lifetime before emitting the frame rather than at body entry.
-    let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
+    let callee_entry_pos = ctx.trace_ctx.get_trace_position();
+    let callee_entry_trace_index = callee_entry_pos._index;
     // Each precondition below answers "can the multiframe seed serve this
     // callee".  A "no" declines the INLINE — `Ok(None)`, this function's own
     // did-not-inline answer, which every caller follows to the ordinary
@@ -11735,6 +11739,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         mut callee_outcome,
         callee_class_of_last_exc_is_const,
         mut operator_tail_caller,
+        mut constructor_assembler_caller,
         deferred_portal_leave,
     ) = {
         {
@@ -12391,7 +12396,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     })
                 })();
                 match payload {
-                    Ok(payload) => fbw_set_midbody_abort_resume(payload),
+                    Ok(payload) => {
+                        fbw_set_midbody_abort_resume(payload);
+                    }
                     Err(reason) => {
                         if fbw_debug_abort_enabled() {
                             eprintln!(
@@ -12409,10 +12416,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // level; a pre-call clone of `InlineParentFrame` is unrooted.
         let operator_tail_caller =
             operator_tail.and_then(|_| _inline_frame.rooted_immediate_caller());
+        // Constructor `CALL_ASSEMBLER` is recorded after this guard drops
+        // `__init__` (`opimpl_jit_merge_point` `finishframe`). Capture the
+        // same rooted caller the operator tail carries, so the assembler's
+        // after-call snapshot still numbers `framestack[-1]`.
+        let constructor_assembler_caller =
+            constructor_result.and_then(|_| _inline_frame.rooted_immediate_caller());
         (
             result,
             class_of_last_exc_is_const,
             operator_tail_caller,
+            constructor_assembler_caller,
             deferred_portal_leave,
         )
     };
@@ -12486,6 +12500,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if let Some(caller) = operator_tail_caller.as_mut() {
         super::resume_snapshot::refresh_paused_parent_concretes(ctx, caller);
     }
+    if let Some(caller) = constructor_assembler_caller.as_mut() {
+        super::resume_snapshot::refresh_paused_parent_concretes(ctx, caller);
+    }
     // RPython has one MetaInterp shared by every MIFrame.  The sub-walk uses
     // a copied FbwWalkMode only to satisfy Rust's nested borrow, so write the
     // MetaInterp-owned exception state back across the frame boundary.
@@ -12496,6 +12513,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             if fbw_inline_diag_enabled() {
                 eprintln!("[inline-abort] callee sub-walk err: {e:?}");
             }
+            // Header conversion already ran above via
+            // `loop_bearing_header_call_assembler` when the callee was
+            // seeded and the abort pc is a loop header. Remaining
+            // `LoopBearingCalleeInlineUnsupported` follows this path:
+            // `perform_call` keeps the callee frame, and loops are
+            // handled only at `opimpl_jit_merge_point`. Propagating
+            // here maps to `TraceAction::Abort` (`trace.rs`).
             // A seeded inline abort latches the live framestack in `walk`
             // and converts through `convert_and_run_from_pyjitpl`
             // (`blackhole.py`).  Returning the error is what lets that latch
@@ -13186,6 +13210,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 is_being_profiled,
                 constructor_result,
                 None,
+                constructor_assembler_caller,
             );
             record_deferred_portal_leave(deferred_portal_leave);
             emitted
@@ -19392,12 +19417,41 @@ fn walk_generator_resume<Sym: WalkSym>(
         let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
         let callee_green_key =
             crate::driver::make_green_key_typed(w_code, resume_py_pc, is_being_profiled);
+        let next_instr_box = ctx.trace_ctx.const_int(resume_py_pc as i64);
+        let profiled_box = ctx.trace_ctx.const_int(is_being_profiled as i64);
+        let pycode_box = ctx.trace_ctx.const_ref(w_code as i64);
+        let frame_bits = match ctx.trace_ctx.concrete_of_opref(frame_box) {
+            Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+            _ => 0,
+        };
+        let ec_bits = match ctx.trace_ctx.concrete_of_opref(ec_box) {
+            Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+            _ => 0,
+        };
+        let argboxes = [
+            (
+                majit_metainterp::JitArgKind::Int,
+                next_instr_box,
+                resume_py_pc as i64,
+            ),
+            (
+                majit_metainterp::JitArgKind::Int,
+                profiled_box,
+                is_being_profiled as i64,
+            ),
+            (majit_metainterp::JitArgKind::Ref, pycode_box, w_code as i64),
+            (majit_metainterp::JitArgKind::Ref, frame_box, frame_bits),
+            (majit_metainterp::JitArgKind::Ref, ec_box, ec_bits),
+        ];
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
                 callee_green_key.get_uhash(),
                 crate::driver::make_green_key_typed(w_code, resume_py_pc, is_being_profiled),
             ),
             None,
+            &argboxes,
+            ctx.walk_jitcode_index(),
+            op.next_pc,
         );
         if ctx.trace_ctx.is_too_long() {
             let ops = ctx.trace_ctx.num_recorded_ops();
@@ -19545,6 +19599,7 @@ fn walk_generator_resume<Sym: WalkSym>(
                 is_being_profiled,
                 None,
                 Some(iter_op),
+                None,
             );
             record_deferred_portal_leave(deferred_portal_leave);
             match emitted? {

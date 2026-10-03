@@ -8645,7 +8645,7 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// Call-scoped inputs for one guard-snapshot capture — the explicit-parameter
 /// port of `capture_resumedata`'s keyword arguments (pyjitpl.py),
 /// alongside the already-explicit `after_residual_call`.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GuardCaptureScope {
     /// Request that a residual call's after-call guard route its resume
     /// through the call's OWN post-call `catch_exception` instead of the
@@ -8697,13 +8697,21 @@ pub(crate) struct GuardCaptureScope {
     /// the innermost holding this box in its result slot.
     pub finished_callee_result: Option<OpRef>,
 
-    /// Constructor `CALL_ASSEMBLER`: the instance and `__init__`'s result.
-    /// Assembler `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` and the subsequent
-    /// None-check guards capture `descr_call`'s tail (`ctor_continuation`
-    /// assembler resume) above the callers, so a force or a later-succeeding
-    /// check still runs `bh_check_init_returned_none` and `ref_return` of
-    /// the instance (`W_TypeObject.descr_call` after `get_and_call_args`).
-    pub constructor_assembler: Option<(OpRef, OpRef)>,
+    /// Constructor `CALL_ASSEMBLER`: snapshot `descr_call`'s tail
+    /// (`ctor_continuation`) with `(instance, __init__ result, immediate
+    /// caller)` so deopt at `GUARD_NOT_FORCED` / the assembler's exception
+    /// guard resumes in `typeobject.py descr_call` with the Python caller
+    /// still numbered. Assembler `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`
+    /// and the subsequent None-check guards capture `descr_call`'s tail
+    /// (`ctor_continuation` assembler resume) above the callers, so a force
+    /// or a later-succeeding check still runs `bh_check_init_returned_none`
+    /// and `ref_return` of the instance (`W_TypeObject.descr_call` after
+    /// `get_and_call_args`). `pyjitpl.py` `opimpl_jit_merge_point`
+    /// `finishframe` pops `__init__`, then `do_recursive_call(assembler_call=True)`
+    /// records from `framestack[-1]`, the real caller. The caller is the
+    /// rooted `InlineParentFrame` taken before `InlineFrameGuard` drops,
+    /// matching the operator-tail path.
+    pub constructor_assembler: Option<(OpRef, OpRef, Option<InlineParentFrame>)>,
 
     /// Generator-resume `CALL_ASSEMBLER`: the iterator and the portal result.
     /// Assembler `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` capture `_send_ex`'s

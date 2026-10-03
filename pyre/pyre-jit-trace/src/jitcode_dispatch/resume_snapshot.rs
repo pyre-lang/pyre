@@ -419,8 +419,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
-    if let Some((instance, init_result)) = scope.constructor_assembler {
-        return walker_capture_constructor_assembler_guard(ctx, op_pc, instance, init_result);
+    if let Some((instance, init_result, caller)) = scope.constructor_assembler {
+        return walker_capture_constructor_assembler_guard(
+            ctx,
+            op_pc,
+            instance,
+            init_result,
+            caller,
+        );
     }
     if let Some((generator, pending)) = scope.send_ex_assembler {
         return walker_capture_send_ex_assembler_guard(ctx, op_pc, generator, pending);
@@ -509,7 +515,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 ctx,
                 op_pc,
                 after_residual_call,
-                scope,
+                scope.clone(),
                 parent_frames,
             )? {
                 NumberedHelperGuard::Frames(frames) => {
@@ -3517,10 +3523,11 @@ fn walker_capture_constructor_assembler_guard<Sym: WalkSym>(
     op_pc: usize,
     instance: OpRef,
     init_result: OpRef,
+    caller: Option<InlineParentFrame>,
 ) -> Result<(), DispatchError> {
     let tail = super::ctor_continuation_assembler_parent_frame(instance, init_result)
         .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
-    walker_capture_assembler_continuation_guard(ctx, op_pc, tail)
+    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, caller)
 }
 
 /// `generator.py GeneratorOrCoroutine._send_ex` after `_invoke_execute_frame`:
@@ -3543,7 +3550,7 @@ fn walker_capture_send_ex_assembler_guard<Sym: WalkSym>(
         Some(slot) => *slot = pending,
         None => return Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
-    walker_capture_assembler_continuation_guard(ctx, op_pc, tail)
+    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, None)
 }
 
 /// Paused callers, then a synthesised assembler-resume tail as the innermost
@@ -3554,6 +3561,7 @@ fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     tail: InlineParentFrame,
+    caller: Option<InlineParentFrame>,
 ) -> Result<(), DispatchError> {
     let mut parent_frames = {
         let session = ctx.session.borrow();
@@ -3563,13 +3571,23 @@ fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
             .flat_map(|frame| frame.parents.iter().cloned())
             .collect::<Vec<_>>()
     };
-    match compute_inline_caller_frame(ctx, op_pc) {
-        Ok(mut caller) => {
-            refresh_paused_parent_blackhole(&mut caller);
-            parent_frames.push(caller);
+    // `capture_resumedata` walks every `MetaInterp.framestack` entry.
+    // The constructor path passes the rooted `InlineParentFrame` taken
+    // before `InlineFrameGuard` dropped `__init__`; flattening `.parents`
+    // alone omits that current session frame. A walk without one still
+    // asks `compute_inline_caller_frame`.
+    if let Some(mut caller) = caller {
+        refresh_paused_parent_blackhole(&mut caller);
+        parent_frames.push(caller);
+    } else {
+        match compute_inline_caller_frame(ctx, op_pc) {
+            Ok(mut caller) => {
+                refresh_paused_parent_blackhole(&mut caller);
+                parent_frames.push(caller);
+            }
+            Err(_) if ctx.fbw_mode.snapshot_sym.is_null() => {}
+            Err(_) => return Err(DispatchError::callee_inline_unsupported(op_pc)),
         }
-        Err(_) if ctx.fbw_mode.snapshot_sym.is_null() => {}
-        Err(_) => return Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
     parent_frames.push(tail);
     walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
