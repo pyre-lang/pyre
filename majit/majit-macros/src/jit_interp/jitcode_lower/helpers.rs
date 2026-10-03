@@ -1153,14 +1153,16 @@ pub(super) fn word_result_addr_tokens(
 }
 
 /// [`word_result_addr_tokens`] for a target whose result kind is `kind`, and
-/// `None` for a kind that has no narrow result to widen: a ref result is a
-/// pointer, which already fills the register, and a void result is never read.
+/// `None` for a kind that has no result to spell as a word: a void result is
+/// never read (see [`word_void_addr_tokens`]). Int and ref both go through
+/// the shim so a `usize` / `&T` / pointer parameter is the descr word.
 pub(super) fn word_result_addr_for_kind(
     kind: BindingKind,
     func: &impl ToTokens,
     arg_kinds: &[BindingKind],
 ) -> Option<TokenStream> {
-    matches!(kind, BindingKind::Int).then(|| word_result_addr_tokens(func, arg_kinds))
+    matches!(kind, BindingKind::Int | BindingKind::Ref)
+        .then(|| word_result_addr_tokens(func, arg_kinds))
 }
 
 /// [`word_result_addr_tokens`] for a target the trace records with a `()`

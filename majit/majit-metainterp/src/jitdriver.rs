@@ -1814,7 +1814,11 @@ pub struct EntryPoint {
 /// PyPy names: JitDriver(greens=[...], reds=[...], is_recursive=True).
 pub struct JitDriver<S: JitState> {
     meta: MetaInterp<S::Meta>,
-    sym: Option<S::Sym>,
+    sym: Option<Box<S::Sym>>,
+    /// Driver-owned per-attempt fields stacked with
+    /// [`MetaInterp::park_attempt`]. `sym` is boxed so a merge_point
+    /// `&mut S::Sym` into the outer heap allocation stays valid.
+    parked_driver_traces: Vec<ParkedDriverTrace<S>>,
     /// pyjitpl.py reached_loop_header direct compile_trace parity.
     /// The frontend decides whether to call compile_trace(); the driver only
     /// consumes the successful result and switches back to compiled code.
@@ -1950,6 +1954,54 @@ pub struct JitDriver<S: JitState> {
     /// driver while the outer guard is still consuming these words, and that
     /// nested entry should still be able to reuse the ordinary entry buffers.
     exit_raw_scratch: Option<Vec<i64>>,
+}
+
+/// Driver half of a parked nested-trace attempt. Lives next to
+/// [`crate::pyjitpl::ParkedTraceAttempt`] on the MetaInterp.
+struct ParkedDriverTrace<S: JitState> {
+    sym: Option<Box<S::Sym>>,
+    compile_trace_success: bool,
+    continue_running_normally_payload: Option<(Vec<Value>, Option<usize>)>,
+    bridge_entered_at_guard_resume: bool,
+    resume_data_result: Option<crate::jit_state::ResumeDataResult>,
+    last_bridge_is_exception_guard: bool,
+    bridge_attempt_declined: bool,
+}
+
+impl<S: JitState> JitDriver<S> {
+    /// `warmstate.py` `bound_reached`: a nested `MetaInterp` run parks the
+    /// outer attempt so its history/framestack/sym stay intact.
+    pub fn park_nested_trace(&mut self) {
+        self.meta.park_attempt();
+        self.parked_driver_traces.push(ParkedDriverTrace {
+            sym: self.sym.take(),
+            compile_trace_success: std::mem::take(&mut self.compile_trace_success),
+            continue_running_normally_payload: self.continue_running_normally_payload.take(),
+            bridge_entered_at_guard_resume: std::mem::take(
+                &mut self.bridge_entered_at_guard_resume,
+            ),
+            resume_data_result: self.resume_data_result.take(),
+            last_bridge_is_exception_guard: std::mem::take(
+                &mut self.last_bridge_is_exception_guard,
+            ),
+            bridge_attempt_declined: std::mem::take(&mut self.bridge_attempt_declined),
+        });
+    }
+
+    /// Restore the outer attempt parked by [`Self::park_nested_trace`].
+    pub fn restore_nested_trace(&mut self) {
+        self.meta.restore_attempt();
+        let Some(parked) = self.parked_driver_traces.pop() else {
+            return;
+        };
+        self.sym = parked.sym;
+        self.compile_trace_success = parked.compile_trace_success;
+        self.continue_running_normally_payload = parked.continue_running_normally_payload;
+        self.bridge_entered_at_guard_resume = parked.bridge_entered_at_guard_resume;
+        self.resume_data_result = parked.resume_data_result;
+        self.last_bridge_is_exception_guard = parked.last_bridge_is_exception_guard;
+        self.bridge_attempt_declined = parked.bridge_attempt_declined;
+    }
 }
 
 /// Per-entry scratch owned by [`JitDriver`]; see [`JitDriver::entry_scratch`].
@@ -2228,6 +2280,7 @@ impl<S: JitState> JitDriver<S> {
         JitDriver {
             meta,
             sym: None,
+            parked_driver_traces: Vec::new(),
             compile_trace_success: false,
             continue_running_normally_payload: None,
             descriptor: None,
@@ -5917,8 +5970,9 @@ impl<S: JitState> JitDriver<S> {
         // eval_loop_jit calls jit_merge_point at each bytecode, so the
         // green_key changes per bytecode (includes pc). Use is_tracing()
         // (not is_tracing_key) to accept all bytecodes from the tracing
-        // portal. Nested function calls are prevented by JIT_TRACING
-        // flag in eval_loop_jit.
+        // portal. A residual callee's portal may start a nested MetaInterp
+        // after parking this attempt; `trace_continuation_suspended` stops
+        // this merge-point from recording the callee onto this TraceCtx.
         if self.meta.is_tracing() && !self.meta.trace_continuation_suspended() {
             // pyjitpl.py: record frame.pc for capture_resumedata.
             if let Some(ctx) = self.meta.trace_ctx() {
@@ -5959,7 +6013,7 @@ impl<S: JitState> JitDriver<S> {
         _env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<DetailedDriverRunOutcome> {
-        if self.meta.is_tracing() {
+        if self.cell_is_tracing(green_key) {
             return None;
         }
         let single_pass_dispatch_key =
@@ -6693,7 +6747,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> Option<Option<usize>> {
-        if self.meta.is_tracing() {
+        if self.cell_is_tracing(green_key_hash) {
             return Some(None);
         }
         // Cross-loop-cut decline and single-pass label handoff must stay
@@ -6782,7 +6836,7 @@ impl<S: JitState> JitDriver<S> {
         direct_live_values: Option<Vec<Value>>,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        if self.meta.is_tracing() {
+        if self.cell_is_tracing(green_key_hash) {
             return None;
         }
         // **Resolve once, then carry.** The parameter is a raw bucket hash;
@@ -8246,10 +8300,8 @@ impl<S: JitState> JitDriver<S> {
         // `run_compiled_detailed_*` runners carry the save/restore instead,
         // because a walk does reach those.  `initialize_virtualizable` seeds
         // the cell on the context this call is about to build.
-        debug_assert!(
-            !self.is_tracing(),
-            "force_start_tracing entered while a recording is live"
-        );
+        // Nested `compile_and_run_once` parks the outer attempt first
+        // (`warmstate.py` `bound_reached` constructs a new MetaInterp).
         if !self.sync_before(state, &meta, vable) {
             return;
         }
@@ -8276,7 +8328,7 @@ impl<S: JitState> JitDriver<S> {
             }
             let mut sym = S::create_sym(&meta, target_pc);
             state.initialize_sym(&mut sym, &meta);
-            self.sym = Some(sym);
+            self.sym = Some(Box::new(sym));
             self.meta.begin_trace_session(meta);
         }
     }
@@ -8289,9 +8341,6 @@ impl<S: JitState> JitDriver<S> {
     /// Bypasses counter.tick() inside maybe_compile, allowing decay_counters()
     /// to be called before tracing starts.
     pub fn bound_reached(&mut self, green_key: u64, target_pc: usize, state: &mut S, env: &S::Env) {
-        if self.meta.is_tracing() {
-            return;
-        }
         self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
@@ -8327,7 +8376,7 @@ impl<S: JitState> JitDriver<S> {
             }
             let mut sym = S::create_sym(&meta, target_pc);
             state.initialize_sym(&mut sym, &meta);
-            self.sym = Some(sym);
+            self.sym = Some(Box::new(sym));
             self.meta.begin_trace_session(meta);
         }
     }
@@ -8362,9 +8411,6 @@ impl<S: JitState> JitDriver<S> {
     /// `bound_reached` half and must not tick again.
     #[inline]
     pub fn back_edge_warmth(&mut self, green_key_hash: u64, state: &S) -> BackEdgeWarmth {
-        if self.meta.is_tracing() {
-            return BackEdgeWarmth::Full;
-        }
         if !self.meta.cut_compiled_keys.is_empty() {
             return BackEdgeWarmth::Full;
         }
@@ -8517,7 +8563,7 @@ impl<S: JitState> JitDriver<S> {
                 }
                 let mut sym = S::create_sym(&meta, target_pc);
                 state.initialize_sym(&mut sym, &meta);
-                self.sym = Some(sym);
+                self.sym = Some(Box::new(sym));
                 self.meta.begin_trace_session(meta);
                 true
             }
@@ -9866,7 +9912,7 @@ impl<S: JitState> JitDriver<S> {
         // and not the other. The next door's `take_back_edge_finish_*`
         // would then return that call's resultbox.
         self.clear_finish_latches();
-        if self.meta.is_tracing() {
+        if self.cell_is_tracing(green_key_hash) {
             return FunctionEntryRunner::Run;
         }
         // The raw fast path writes the word here instead of
@@ -11145,7 +11191,7 @@ impl<S: JitState> JitDriver<S> {
                  rather than missing"
             );
         }
-        self.sym = Some(sym);
+        self.sym = Some(Box::new(sym));
         // pyjitpl.py:2890 parity: bridge traces start at resume_pc, not at
         // function entry (pc=0). Set header_pc so init_symbolic correctly
         // detects this is NOT a function-entry trace.

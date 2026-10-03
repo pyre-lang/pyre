@@ -923,7 +923,7 @@ impl MIFrame {
         header_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
         self.with_ctx(|this, ctx| {
-            this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc, &[])
+            this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc, &[], true)
         })
     }
 
@@ -2074,6 +2074,7 @@ impl MIFrame {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
         merge_point_registers_r: &[OpRef],
+        emit_future_condition: bool,
     ) -> Vec<OpRef> {
         // The `--TICK--` poll now lives in JUMP_BACKWARD's jitcode
         // (`emit_jump_absolute_tick`: `raw_load_i` / `uint_ge` / `goto_if_not`
@@ -2589,14 +2590,16 @@ impl MIFrame {
         // whose flag is decoupled from any watcher, which can spuriously
         // exit a hot inner loop with no chance of re-tracing.
         //
-        // RPython parity: orgpc must be the loop header TARGET, not the
-        // JUMP_BACKWARD's PC. The patchguardop from this GuardFutureCondition
-        // provides the resume_position for all peeled body virtual state guards.
-        // If orgpc is wrong, all those guards resume at the wrong PC.
-        if let Some(pc) = target_pc {
-            self.orgpc = pc;
+        // orgpc is the loop header target, so this guard's resume is the
+        // header. `reached_loop_header` records GUARD_FUTURE_CONDITION once,
+        // before the compiled-target check; that close passes false and does
+        // not record the guard again.
+        if emit_future_condition {
+            if let Some(pc) = target_pc {
+                self.orgpc = pc;
+            }
+            self.generate_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
         }
-        self.generate_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
         // pyjitpl.py:2995 assert len(self.virtualref_boxes) == 0,
         //     "missing virtual_ref_finish()?"
         // Reached loop header must not have dangling virtualrefs — every

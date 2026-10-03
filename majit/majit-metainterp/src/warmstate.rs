@@ -791,9 +791,9 @@ pub enum FunctionEntryStep {
     /// A runnable procedure token was on the cell. Handed back so the door can
     /// enter it without resolving the cell a second time.
     RunCompiled(Arc<JitCellToken>),
-    /// The gate did not decline: start tracing. Either the counter fired or the
-    /// door never asked it (a trace is already running, or a `DONT_TRACE_HERE`
-    /// cell that has never seen a token is due its immediate retry).
+    /// The gate did not decline: start tracing. Either the counter fired or a
+    /// `DONT_TRACE_HERE` cell that has never seen a token is due its immediate
+    /// retry. A cell that already carries `JC_TRACING` answers [`NotHot`].
     Proceed,
     /// Keep interpreting.
     NotHot,
@@ -1987,7 +1987,7 @@ impl WarmEnterState {
     /// with no frontend meta there is no runnable loop to return early for.
     pub fn should_trace_function_entry(&mut self, cell_key: u64) -> bool {
         matches!(
-            self.function_entry_step(cell_key, None, || false, false),
+            self.function_entry_step(cell_key, None, || false),
             FunctionEntryStep::Proceed
         )
     }
@@ -2013,16 +2013,14 @@ impl WarmEnterState {
     /// exists. The metadata test is a closure because the cell/token half is
     /// the cheaper question and answers no for most ordinary calls.
     ///
-    /// `engine_is_tracing` is `MetaInterp::is_tracing` — one global Option, not
-    /// a per-cell flag. The door consulted it to skip the counter gate entirely
-    /// while a trace runs, and [`FunctionEntryStep::Proceed`] is that skip: it
-    /// says "the gate did not decline", not "the counter fired".
+    /// `warmstate.py maybe_compile_and_run`: only the cell whose own
+    /// `JC_TRACING` is set returns early. A live session on another key
+    /// ticks and may `bound_reached` a nested `MetaInterp`.
     pub fn function_entry_step(
         &mut self,
         cell_key: u64,
         green_key: Option<&GreenKey>,
         has_compiled_meta: impl FnOnce() -> bool,
-        engine_is_tracing: bool,
     ) -> FunctionEntryStep {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cell_by_key(cell_key) {
@@ -2034,9 +2032,6 @@ impl WarmEnterState {
             // it normally exactly as upstream does; never mix the callback
             // token with that displaced loop metadata and enter it as a loop.
             if cell.flags.get().contains(JcFlags::JC_TEMPORARY) {
-                if engine_is_tracing {
-                    return FunctionEntryStep::Proceed;
-                }
                 crate::mc_diag_bump(25);
                 return if self
                     .counter
@@ -2061,9 +2056,6 @@ impl WarmEnterState {
                     return FunctionEntryStep::NotHot;
                 }
                 return FunctionEntryStep::RunCompiled(token);
-            }
-            if engine_is_tracing {
-                return FunctionEntryStep::Proceed;
             }
             // Slot 23 is the total; 64/65 are its two terms, evaluated
             // independently rather than short-circuited so a cell that is both
@@ -2160,11 +2152,6 @@ impl WarmEnterState {
             if dead_token {
                 cleanup_dead_token_cell = true;
             }
-        }
-        // A cell the walk did not find takes the same skip the one it found
-        // takes above: while a trace runs the door never asked the counter.
-        if engine_is_tracing {
-            return FunctionEntryStep::Proceed;
         }
         if cleanup_dead_token_cell {
             // `WarmEnterState.maybe_compile_and_run` — function-entry warmup
@@ -4929,11 +4916,11 @@ mod tests {
 
         // Cold, no trace running: the counter gate, unchanged.
         assert!(matches!(
-            ws.function_entry_step(key, None, || false, false),
+            ws.function_entry_step(key, None, || false),
             FunctionEntryStep::NotHot
         ));
         assert!(matches!(
-            ws.function_entry_step(key, None, || false, false),
+            ws.function_entry_step(key, None, || false),
             FunctionEntryStep::Proceed
         ));
 
@@ -4943,32 +4930,36 @@ mod tests {
         attach_alive(&mut ws, key, token);
 
         assert!(matches!(
-            ws.function_entry_step(key, None, || true, false),
+            ws.function_entry_step(key, None, || true),
             FunctionEntryStep::RunCompiled(_)
         ));
         assert!(matches!(
-            ws.function_entry_step(key, None, || false, false),
+            ws.function_entry_step(key, None, || false),
             FunctionEntryStep::NotHot
         ));
     }
 
-    /// While a trace runs the door never reached the counter, and
-    /// [`FunctionEntryStep::Proceed`] is that skip rather than a counter hit:
-    /// the calls made during the trace must leave the key as cold as it was.
+    /// `warmstate.py maybe_compile_and_run`: only the cell with `JC_TRACING`
+    /// returns early. A sibling key still ticks toward `bound_reached`.
     #[test]
-    fn function_entry_step_does_not_tick_while_the_engine_is_tracing() {
-        let mut ws = WarmEnterState::new(2);
-        ws.set_function_threshold(2);
-        let key = 0xD012;
-
-        for _ in 0..8 {
-            assert!(matches!(
-                ws.function_entry_step(key, None, || false, true),
-                FunctionEntryStep::Proceed
-            ));
-        }
-        assert!(!ws.should_trace_function_entry(key));
-        assert!(ws.should_trace_function_entry(key));
+    fn function_entry_step_ticks_a_sibling_while_another_cell_is_tracing() {
+        let mut ws = WarmEnterState::new(1);
+        ws.set_function_threshold(1);
+        let tracing_key = 0xD011;
+        let sibling = 0xD012;
+        assert!(matches!(
+            ws.maybe_compile(tracing_key),
+            HotResult::StartTracing
+        ));
+        assert!(ws.get_cell(tracing_key).is_some_and(|c| c.is_tracing()));
+        assert!(matches!(
+            ws.function_entry_step(tracing_key, None, || false),
+            FunctionEntryStep::NotHot
+        ));
+        assert!(matches!(
+            ws.function_entry_step(sibling, None, || false),
+            FunctionEntryStep::Proceed
+        ));
     }
 
     #[test]
@@ -5728,12 +5719,12 @@ mod tests {
         let cell_key = ws.cell_key_for(&key).expect("fixture installed the cell");
 
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, false),
+            ws.function_entry_step(cell_key, Some(&key), || true),
             FunctionEntryStep::RunCompiled(_),
         ));
         ws.set_confirm_enter_jit(Some(refuse));
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, false),
+            ws.function_entry_step(cell_key, Some(&key), || true),
             FunctionEntryStep::NotHot,
         ));
     }

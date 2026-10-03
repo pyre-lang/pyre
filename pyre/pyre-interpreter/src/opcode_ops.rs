@@ -1410,12 +1410,10 @@ pub extern "C" fn jit_getattr(obj: PyObjectRef, name_ptr: *const u8, name_len: i
 }
 
 #[majit_macros::jit_may_force]
-pub extern "C" fn jit_setattr(
-    obj: PyObjectRef,
-    name_ptr: *const u8,
-    name_len: i64,
-    value: PyObjectRef,
-) -> i64 {
+pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64) -> i64 {
+    let obj = obj as usize as PyObjectRef;
+    let name_ptr = name_ptr as usize as *const u8;
+    let value = value as usize as PyObjectRef;
     let bytes = unsafe { std::slice::from_raw_parts(name_ptr, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1438,9 +1436,8 @@ pub extern "C" fn jit_setattr(
 /// `crate::execute_store_subscr` itself returns `Result<StepResult<_>,
 /// PyError>` whose fat-enum payload does not fit the residual_call's
 /// single-register Ref-result slot.
-#[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_execute_store_subscr(executor_ptr: *mut crate::pyframe::PyFrame) -> i64 {
-    let executor = unsafe { &mut *(executor_ptr) };
+pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
+    let executor = unsafe { &mut *(executor_ptr as usize as *mut crate::pyframe::PyFrame) };
     match crate::pyopcode::execute_store_subscr(executor) {
         Ok(_step_result) => 1,
         Err(mut err) => {
@@ -1497,20 +1494,24 @@ pub extern "C" fn bh_store_subscr_fn(
 /// [`pyre_object::typeobject::w_type_set_uses_object_setattr`]: its
 /// `bool` parameter does not match the integer arg slot a residual call
 /// supplies, so normalise it from `i64` here before forwarding.
-#[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_w_type_set_uses_object_setattr(obj: PyObjectRef, v: i64) {
+pub extern "C" fn bh_w_type_set_uses_object_setattr(obj: i64, v: i64) {
     unsafe {
-        pyre_object::typeobject::w_type_set_uses_object_setattr(obj, v != 0);
+        pyre_object::typeobject::w_type_set_uses_object_setattr(
+            obj as usize as PyObjectRef,
+            v != 0,
+        );
     }
 }
 
 /// C-ABI residual bridge for the `dont_look_inside`
 /// [`pyre_object::typeobject::w_type_set_uses_object_getattribute`], the
 /// [`bh_w_type_set_uses_object_setattr`] twin.
-#[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_w_type_set_uses_object_getattribute(obj: PyObjectRef, v: i64) {
+pub extern "C" fn bh_w_type_set_uses_object_getattribute(obj: i64, v: i64) {
     unsafe {
-        pyre_object::typeobject::w_type_set_uses_object_getattribute(obj, v != 0);
+        pyre_object::typeobject::w_type_set_uses_object_getattribute(
+            obj as usize as PyObjectRef,
+            v != 0,
+        );
     }
 }
 
@@ -1536,19 +1537,19 @@ pub extern "C" fn bh_lookup_exc_class_for_kind(kind_disc: i64) -> i64 {
 /// take it as `i64` here; its `kind` discriminant rides back as `i64`.
 ///
 /// `PyObjectRef` is `*mut PyObject`, which is four bytes on wasm32 and eight
-/// on the native targets. Spelling the parameter as the pointer would declare
-/// an `i32` argument there while the emitted `call_indirect` supplies a word,
-/// and the mismatch traps.
-pub extern "C" fn bh_w_exception_get_kind(evalue: PyObjectRef) -> i64 {
-    pyre_object::interp_exceptions::exc_kind_discriminant(evalue)
+/// on the native targets. The wasm32 entry takes the descr word (`i64`) and
+/// forwards the pointer; a raw pointer parameter would be `i32` while
+/// `call_indirect` supplies a word.
+pub extern "C" fn bh_w_exception_get_kind(evalue: i64) -> i64 {
+    pyre_object::interp_exceptions::exc_kind_discriminant(evalue as usize as PyObjectRef)
 }
 
 /// C-ABI residual bridge for `exception_object_matches_stop_iteration`: the
 /// caught exception value rides in through the integer arg slot, the
 /// [`bh_w_exception_get_kind`] twin; its boolean result rides back in the
 /// integer result slot.
-pub extern "C" fn bh_exception_object_matches_stop_iteration(evalue: PyObjectRef) -> i64 {
-    crate::error::exception_object_matches_stop_iteration(evalue) as i64
+pub extern "C" fn bh_exception_object_matches_stop_iteration(evalue: i64) -> i64 {
+    crate::error::exception_object_matches_stop_iteration(evalue as usize as PyObjectRef) as i64
 }
 
 #[cfg(test)]
