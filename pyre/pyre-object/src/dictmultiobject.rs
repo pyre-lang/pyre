@@ -281,8 +281,13 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
-    let hash = crate::dict_eq_hook::try_hash_w(obj)
-        .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
+    // A closure here is `FnOnce::call_once` with no lifted counterpart
+    // (same reason as `callback_free_dict_op`). Write the attempt at the
+    // call site: `hash_w` or the setup panic.
+    let hash = match crate::dict_eq_hook::try_hash_w(obj) {
+        Some(hash) => hash,
+        None => crate::dict_eq_hook::missing_hash_hook(),
+    };
     if crate::dict_eq_hook::take_hash_error() {
         // Infallible path: swallow the error and use structural hash.
         // Checked callers should use `object_key_for_checked` instead.
@@ -798,8 +803,10 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
-    let hash = crate::dict_eq_hook::try_hash_w(obj)
-        .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
+    let hash = match crate::dict_eq_hook::try_hash_w(obj) {
+        Some(hash) => hash,
+        None => crate::dict_eq_hook::missing_hash_hook(),
+    };
     if crate::dict_eq_hook::take_hash_error() {
         return Err(DictKeyError);
     }
@@ -6034,8 +6041,10 @@ pub unsafe fn w_dict_unicode_lookup_index(
 /// `w_key` must be a live exact `str`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_unicode_key_hash(w_key: *mut PyObject) -> i64 {
-    crate::dict_eq_hook::try_hash_w(w_key)
-        .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook())
+    match crate::dict_eq_hook::try_hash_w(w_key) {
+        Some(hash) => hash,
+        None => crate::dict_eq_hook::missing_hash_hook(),
+    }
 }
 
 /// `rordereddict.py ll_dict_getitem` — the value half of the lookup, read

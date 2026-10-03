@@ -168,7 +168,20 @@ fn runtime_static_addr_by_name(name: &str) -> Option<i64> {
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
-    RUNTIME_FNADDRS.get(path).copied()
+    if let Some(&addr) = RUNTIME_FNADDRS.get(path) {
+        return Some(addr);
+    }
+    generated_residual_shim_fnaddr(path)
+}
+
+fn generated_residual_shim_fnaddr(path: &str) -> Option<i64> {
+    static TABLE: LazyLock<HashMap<&'static str, i64>> = LazyLock::new(|| {
+        crate::generated_residual_shims::GENERATED_RESIDUAL_SHIMS
+            .iter()
+            .map(|(name, addr)| (*name, addr.0 as usize as i64))
+            .collect()
+    });
+    TABLE.get(path).copied()
 }
 
 static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
@@ -2696,6 +2709,14 @@ mod tests {
         assert!(
             unresolved_live.is_empty(),
             "tagged fnaddr path is null or not a published registry key: {unresolved_live:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_fnaddr_by_path_resolves_generated_w_method_new_shim() {
+        assert!(
+            runtime_fnaddr_by_path("pyre_object::function::w_method_new").is_some(),
+            "w_method_new must resolve through a generated residual shim"
         );
     }
 

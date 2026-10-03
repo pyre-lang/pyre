@@ -1934,6 +1934,13 @@ fn materialize_str_call_for_cranelift(
 
 /// Interpreter hooks for `MetaInterpStaticData.host`. One constructor
 /// replaces the former `register_*` / `set_*` scatter.
+fn make_portal_quasi_immut_descr(
+    struct_ptr: i64,
+    field: &majit_ir::DescrRef,
+) -> Option<majit_ir::DescrRef> {
+    pyre_jit_trace::state::quasi_immut_descr_for_struct(struct_ptr, field, None)
+}
+
 pub fn publish_pyre_host_hooks() {
     fn criticalcode_start_adapter() {
         pyre_interpreter::stack_check::pyre_stack_criticalcode_start();
@@ -1963,6 +1970,7 @@ pub fn publish_pyre_host_hooks() {
             pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path,
         ),
         assertion_error_typeptr: Some(assertion_error_typeptr_adapter),
+        make_quasi_immut_descr: Some(make_portal_quasi_immut_descr),
     });
 }
 

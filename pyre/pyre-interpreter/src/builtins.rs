@@ -27843,7 +27843,10 @@ fn try_complex_special_method(mut obj: PyObjectRef) -> Result<Option<(f64, f64)>
     let mut w_type = w_type_ref.as_ptr();
     let Some(mut w_complex) = (unsafe {
         pyre_object::with_roots!(obj, w_type => {
-            crate::baseobjspace::lookup_in_type(w_type, pyre_object::unicodeobject::box_str_constant(Wtf8::new("__complex__")))
+            crate::baseobjspace::lookup_in_type(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__complex__")),
+            )
         })
     }) else {
         return Ok(None);

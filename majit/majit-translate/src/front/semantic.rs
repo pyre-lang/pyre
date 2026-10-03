@@ -1021,6 +1021,8 @@ pub struct SemanticProgram {
     /// the body again. `populate_call_registry_from_call_graphs` reads it.
     pub atomic_load_decls:
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
+    /// Local FunDecls harvested for residual-call shims (genc analogue).
+    pub residual_fn_catalog: Vec<crate::residual_shim::LlbcFnCatalogEntry>,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so registration and

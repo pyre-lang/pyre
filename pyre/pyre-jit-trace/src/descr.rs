@@ -10803,6 +10803,7 @@ mod tests {
         );
     }
 
+
     use majit_ir::descr::ArrayFlag;
     use majit_jitcode::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
 

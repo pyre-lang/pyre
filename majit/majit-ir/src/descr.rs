@@ -10968,6 +10968,7 @@ mod tests {
         );
     }
 
+
     /// A struct-array descr and its interior field descrs point at each
     /// other (the "CYCLE, accepted" row of the Arc cycle audit at the top
     /// of this module), so a `Debug` that follows both edges never

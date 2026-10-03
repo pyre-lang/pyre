@@ -1663,6 +1663,9 @@ pub struct JitDriverStaticData {
     /// recursive portal entry.  It is deliberately distinct from both the
     /// split portal graph and the graph containing the original merge point.
     pub portal_runner: Option<CallPath>,
+    /// Interpreter-side portal entry inlined from `eval_current_frame_raw`.
+    /// `call.py jitdriver_sd_from_portal_runner_ptr` matches this too.
+    pub portal_enter: Option<CallPath>,
     /// `warmspot.py split_graph_and_record_jitdriver`: graph containing the
     /// marker before the split portal copy was made.
     pub jit_merge_point_in: CallPath,
@@ -3366,6 +3369,11 @@ pub struct CallControl {
     /// look_inside_graph` delegates to it). Captured because
     /// `BfsPolicyView` cannot hold the original trait object.
     bfs_look_inside_function: Box<dyn Fn(&FunctionGraph) -> bool>,
+    /// Callees `look_inside_graph` declined during `find_all_graphs`.
+    /// Residual calls to these still need a callable address (`getfunctionptr`).
+    policy_declined_callees: HashSet<CallPath>,
+    /// Calldescr recorded at `handle_residual_call` for each residual target.
+    residual_call_descrs: HashMap<CallPath, CallDescriptor>,
     /// `PipelineConfig::helper_graphs` — host-declared BFS seeds beside the
     /// portals (`call.py inline_calls_to`).
     helper_seed_graphs: Vec<CallPath>,
@@ -4238,6 +4246,25 @@ pub(crate) fn array_items_base(header_end: usize, elem_align: usize) -> usize {
     header_end.next_multiple_of(elem_align)
 }
 
+/// `funcptr is jd.portal_runner_ptr`: exact path, or the same GraphKey
+/// when both spellings name one registered funcobj.
+fn portal_runner_ptr_is(
+    graphs: &GraphStore,
+    path: &CallPath,
+    registered: Option<&CallPath>,
+) -> bool {
+    let Some(registered) = registered else {
+        return false;
+    };
+    if registered == path {
+        return true;
+    }
+    match (graphs.key_for(path), graphs.key_for(registered)) {
+        (Some(path_key), Some(registered_key)) => path_key == registered_key,
+        _ => false,
+    }
+}
+
 impl CallControl {
     /// RPython: `CallControl.__init__`.
     pub fn new() -> Self {
@@ -4250,6 +4277,8 @@ impl CallControl {
             candidate_graphs: HashSet::new(),
             bfs_policy_state: crate::policy::JitPolicyState::new(),
             bfs_look_inside_function: Box::new(|_| true),
+            policy_declined_callees: HashSet::new(),
+            residual_call_descrs: HashMap::new(),
             helper_seed_graphs: Vec::new(),
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
@@ -6375,6 +6404,7 @@ impl CallControl {
             red_types,
             portal_graph,
             portal_runner: None,
+            portal_enter: None,
             jit_merge_point_in,
             mainjitcode: None,
             index_of_virtualizable: -1,
@@ -6400,6 +6430,13 @@ impl CallControl {
     /// prevents graph identity from standing in for runner identity.
     pub fn set_jitdriver_portal_runner(&mut self, index: usize, runner: Option<CallPath>) {
         self.jitdrivers_sd[index].portal_runner = runner;
+    }
+
+    /// Interpreter-side portal entry (`eval_current_frame_raw` inlines to
+    /// this). `jitdriver_sd_from_portal_runner_ptr` matches it like
+    /// `portal_runner_ptr`, including GraphKey aliases of that funcobj.
+    pub fn set_jitdriver_portal_enter(&mut self, index: usize, enter: Option<CallPath>) {
+        self.jitdrivers_sd[index].portal_enter = enter;
     }
 
     /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
@@ -6648,13 +6685,18 @@ impl CallControl {
 
     /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
+    /// `funcptr is jd.portal_runner_ptr` is funcobj identity. Alias
+    /// spellings of one funcobj share a [`GraphKey`]; a path with no
+    /// registration still matches by exact [`CallPath`].
     pub fn jitdriver_sd_from_portal_runner_ptr(
         &self,
         path: &CallPath,
     ) -> Option<&JitDriverStaticData> {
-        self.jitdrivers_sd
-            .iter()
-            .find(|sd| sd.portal_runner.as_ref() == Some(path))
+        let graphs = &self.function_graphs;
+        self.jitdrivers_sd.iter().find(|sd| {
+            portal_runner_ptr_is(graphs, path, sd.portal_runner.as_ref())
+                || portal_runner_ptr_is(graphs, path, sd.portal_enter.as_ref())
+        })
     }
 
     /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
@@ -8082,6 +8124,7 @@ impl CallControl {
                                 "callee-policy-declined",
                                 format_args!("{callee_path} in {path}"),
                             );
+                            self.policy_declined_callees.insert(callee_path);
                         }
                     }
                 }
@@ -8093,6 +8136,25 @@ impl CallControl {
     /// Used only after `find_all_graphs()`.
     pub fn is_candidate(&self, path: &CallPath) -> bool {
         self.candidate_graphs.contains(path)
+    }
+
+    /// Record the calldescr `handle_residual_call` computed for `path`.
+    pub fn note_residual_call_descr(&mut self, path: CallPath, descriptor: CallDescriptor) {
+        self.residual_call_descrs.entry(path).or_insert(descriptor);
+    }
+
+    /// Residual shim targets: policy-declined residual callees with an LLBC
+    /// declaration and no bound fnaddr. genc `FunctionCodeGenerator` analogue.
+    pub fn residual_shim_targets(
+        &self,
+        catalog: &[crate::residual_shim::LlbcFnCatalogEntry],
+    ) -> Vec<crate::residual_shim::ResidualShimTarget> {
+        crate::residual_shim::collect_residual_shim_targets(
+            &self.policy_declined_callees,
+            &self.residual_call_descrs,
+            &self.function_fnaddrs,
+            catalog,
+        )
     }
 
     /// Size of the post-`find_all_graphs` candidate set — the graphs the
@@ -19362,7 +19424,11 @@ mod tests {
             ))),
             CallKind::Recursive
         );
-        for non_runner in [portal, original] {
+        for non_runner in [
+            portal,
+            original,
+            CallPath::from_segments(["call", "recursive_portal_enter"]),
+        ] {
             assert_ne!(
                 cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
                     non_runner.segments
@@ -19371,6 +19437,71 @@ mod tests {
                 "portal graph identities must not stand in for portal_runner_ptr"
             );
         }
+    }
+
+    #[test]
+    fn interpreter_portal_enter_classifies_as_recursive() {
+        // `eval_current_frame_raw` inlines to `recursive_portal_enter`.
+        // `guess_call_kind` answers `recursive` so the five portal words
+        // become `recursive_call`, not a residual of the `EvalFn` pointer
+        // (`call.py jitdriver_sd_from_portal_runner_ptr`).
+        let mut cc = CallControl::new();
+        let runner = CallPath::from_segments(["call_jit", "ll_portal_runner_shim"]);
+        cc.setup_jitdriver(
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+        );
+        cc.set_jitdriver_portal_runner(0, Some(runner));
+        cc.set_jitdriver_portal_enter(
+            0,
+            Some(CallPath::from_segments(["call", "recursive_portal_enter"])),
+        );
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path([
+                "call",
+                "recursive_portal_enter",
+            ]))),
+            CallKind::Recursive
+        );
+    }
+
+    #[test]
+    fn portal_enter_alias_spelling_classifies_as_recursive() {
+        // `unspecialized_fun_segments` emits the crate-prefixed FunctionPath;
+        // `free_function_alias_paths` registers both spellings on one
+        // GraphKey (`funcptr is jd.portal_runner_ptr`).
+        let mut cc = CallControl::new();
+        let runner = CallPath::from_segments(["call_jit", "ll_portal_runner_shim"]);
+        let enter = CallPath::from_segments(["call", "recursive_portal_enter"]);
+        let aliased =
+            CallPath::from_segments(["pyre_interpreter", "call", "recursive_portal_enter"]);
+        cc.setup_jitdriver(
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+        );
+        cc.set_jitdriver_portal_runner(0, Some(runner));
+        cc.set_jitdriver_portal_enter(0, Some(enter.clone()));
+        let graph = FunctionGraph::new("recursive_portal_enter");
+        cc.register_function_graph(enter, graph.clone());
+        cc.register_function_graph(aliased.clone(), graph);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path(aliased.segments))),
+            CallKind::Recursive
+        );
     }
 
     #[test]

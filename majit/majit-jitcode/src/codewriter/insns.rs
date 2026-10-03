@@ -82,14 +82,12 @@ pub const BC_NEW_WITH_VTABLE: u8 = 219;
 // depth-bounded branch inline-traces the callee (`should_inline_core`).  Bytes
 // continue the above-high-water sequence (223-226, above the `setfield_gc_i/rcd`
 // C-form byte 222) so existing serialised byte assignments are undisturbed.
-// These consts only DECLARE the intended byte
-// numbers; a byte is not actually reserved (`is_reserved_opcode_byte`) until its
-// key joins `extension_insns()`, and the blackhole handler is bound there.
-// That registration + the macro lowering + the `run_one_step` dispatch arm are
-// wired together (the registration may shift dynamic byte assignments, so it is
-// verified against the serialised JitCode artifacts at that point, not here).  The
-// `recursive_call_bytes_reserved_without_collision` test guards these chosen
-// numbers against the currently-reserved tables.
+// Each byte is registered in `wellknown_bh_insns()` under its own
+// `recursive_call_{i,r,f,v}` key (`blackhole.py` `bhimpl_recursive_call_*`),
+// which also reserves it via `is_reserved_opcode_byte`.  The
+// `recursive_call_bytes_reserved_without_collision` test checks that those
+// keys own 223-226 exclusively, that the four bytes stay distinct, and that
+// they remain above the prior high-water.
 pub const BC_RECURSIVE_CALL_INT: u8 = 223;
 pub const BC_RECURSIVE_CALL_REF: u8 = 224;
 pub const BC_RECURSIVE_CALL_FLOAT: u8 = 225;
@@ -863,6 +861,12 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("ref_return/r", BC_REF_RETURN);
     m.insert("float_return/f", BC_FLOAT_RETURN);
     m.insert("void_return/", BC_VOID_RETURN);
+    // blackhole.py `bhimpl_recursive_call_{i,r,f,v}` canonical keys.
+    // The translator assembler looks these up by the full argcode string.
+    m.insert("recursive_call_i/iIRFIRF>i", BC_RECURSIVE_CALL_INT);
+    m.insert("recursive_call_r/iIRFIRF>r", BC_RECURSIVE_CALL_REF);
+    m.insert("recursive_call_f/iIRFIRF>f", BC_RECURSIVE_CALL_FLOAT);
+    m.insert("recursive_call_v/iIRFIRF", BC_RECURSIVE_CALL_VOID);
 
     // `abort/` and `abort_permanent/` are pyre-only Rust adaptations and
     // live in `extension_insns()` — their byte values
@@ -1563,23 +1567,24 @@ mod tests {
 #[cfg(test)]
 mod recursive_call_byte_tests {
     use super::*;
+    use std::collections::HashMap;
 
-    /// The reserved `BC_RECURSIVE_CALL_*` bytes (223-226) must be mutually
+    /// The wired `BC_RECURSIVE_CALL_*` bytes (223-226) must be mutually
     /// distinct, sit above the prior high-water (`BC_NEW_WITH_VTABLE` = 219),
-    /// and not collide with any byte already registered in `wellknown_bh_insns`
-    /// or `extension_insns`.  Guards against the #199-class byte-collision
-    /// (BC_INT_BETWEEN vs BC_NEW) at the point the bytes are reserved, before
-    /// the recursive-call lowering/handlers are wired.
+    /// and each must be registered exactly under its own `recursive_call_*`
+    /// key and under no other key in `wellknown_bh_insns` ∪ `extension_insns`.
+    /// Guards against the #199-class byte-collision (BC_INT_BETWEEN vs BC_NEW)
+    /// after the recursive-call keys joined `wellknown_bh_insns()`.
     #[test]
     fn recursive_call_bytes_reserved_without_collision() {
         let reserved = [
-            BC_RECURSIVE_CALL_INT,
-            BC_RECURSIVE_CALL_REF,
-            BC_RECURSIVE_CALL_FLOAT,
-            BC_RECURSIVE_CALL_VOID,
+            (BC_RECURSIVE_CALL_INT, "recursive_call_i/iIRFIRF>i"),
+            (BC_RECURSIVE_CALL_REF, "recursive_call_r/iIRFIRF>r"),
+            (BC_RECURSIVE_CALL_FLOAT, "recursive_call_f/iIRFIRF>f"),
+            (BC_RECURSIVE_CALL_VOID, "recursive_call_v/iIRFIRF"),
         ];
 
-        let mut sorted: Vec<u8> = reserved.to_vec();
+        let mut sorted: Vec<u8> = reserved.iter().map(|(b, _)| *b).collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(
@@ -1588,7 +1593,7 @@ mod recursive_call_byte_tests {
             "recursive_call bytes must be mutually distinct"
         );
 
-        for b in reserved {
+        for (b, _) in reserved {
             assert!(
                 b > BC_NEW_WITH_VTABLE,
                 "recursive_call byte {b} must be above the prior high-water {}",
@@ -1596,16 +1601,34 @@ mod recursive_call_byte_tests {
             );
         }
 
-        let registered: Vec<u8> = wellknown_bh_insns()
-            .values()
-            .chain(extension_insns().values())
-            .copied()
+        let tables: Vec<(&str, u8)> = wellknown_bh_insns()
+            .into_iter()
+            .chain(extension_insns())
             .collect();
-        for b in reserved {
-            assert!(
-                !registered.contains(&b),
-                "recursive_call byte {b} collides with an already-registered insn"
+        for (byte, expected_key) in reserved {
+            let owners: Vec<&str> = tables
+                .iter()
+                .filter(|(_, b)| *b == byte)
+                .map(|(k, _)| *k)
+                .collect();
+            assert_eq!(
+                owners.as_slice(),
+                &[expected_key],
+                "recursive_call byte {byte} must be registered exactly under \
+                 {expected_key} and under no other key; got {owners:?}"
             );
+        }
+
+        let mut byte_to_key: HashMap<u8, &str> = HashMap::new();
+        for (key, byte) in &tables {
+            if let Some(prev) = byte_to_key.get(byte) {
+                assert_eq!(
+                    *prev, *key,
+                    "opcode byte {byte} maps to two distinct keys \
+                     {prev:?} and {key:?}; every key needs its own byte"
+                );
+            }
+            byte_to_key.insert(*byte, key);
         }
     }
 

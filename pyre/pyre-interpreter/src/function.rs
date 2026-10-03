@@ -1611,6 +1611,8 @@ pub unsafe fn getcode(obj: PyObjectRef) -> PyObjectRef {
                 return _get_immutable_code(obj);
             }
             // function.py `Function.getcode`: `jit.promote(self.code)`.
+            // Promote the pointer, not its address bits: a GuardValue on
+            // the integer is a baked immediate the collector cannot forward.
             return majit_metainterp::jit::promote((*func).code) as PyObjectRef;
         }
         // function.py `Function.getcode`: the untraced `return self.code`.

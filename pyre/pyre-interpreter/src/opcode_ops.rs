@@ -380,10 +380,7 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
             );
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::pin_roots(&items);
-            let live: Vec<PyObjectRef> = (0..items.len())
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
-                .collect();
-            return Ok(pyre_object::w_tuple_new(live));
+            return Ok(w_tuple_from_shadow(base, items.len()));
         }
     }
     Err(PyError::type_error("expected list for list_to_tuple"))
@@ -512,10 +509,7 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
         value_count += 1;
     }
     Ok(if all_match {
-        let values: Vec<PyObjectRef> = (0..value_count)
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
-            .collect();
-        pyre_object::w_tuple_new(values)
+        w_tuple_from_shadow(values_base, value_count)
     } else {
         pyre_object::w_none()
     })
@@ -674,8 +668,22 @@ pub fn match_class_value(
         }
     }
 
-    let values: Vec<PyObjectRef> = extracted.iter().map(|&slot| roots.get(slot)).collect();
-    Ok(pyre_object::w_tuple_new(values))
+    let packed = pyre_object::gc_roots::shadow_stack_len();
+    for &slot in &extracted {
+        let _ = pyre_object::gc_roots::pin_root(roots.get(slot));
+    }
+    Ok(w_tuple_from_shadow(packed, extracted.len()))
+}
+
+/// A traced `Vec<PyObjectRef>` is the raw header word. Building that `Vec`
+/// in the caller leaves the argument in the ref bank, so the tuple is
+/// assembled here from shadow-stack slots the caller already holds.
+#[majit_macros::dont_look_inside]
+fn w_tuple_from_shadow(base: usize, count: usize) -> PyObjectRef {
+    let values: Vec<PyObjectRef> = (0..count)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+        .collect();
+    pyre_object::w_tuple_new(values)
 }
 
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {

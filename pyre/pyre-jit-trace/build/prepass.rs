@@ -86,6 +86,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "symbolic_fnaddr_paths.bin",
     "static_pytype_bindings.bin",
     "static_ref_bindings.bin",
+    "generated_residual_shims.rs",
 ];
 
 /// Outputs carrying this build-script process's own addresses, by
@@ -1268,6 +1269,13 @@ fn real_main() {
                         "call_jit",
                         "ll_portal_runner_shim",
                     ])),
+                    // `eval_current_frame_raw` inlines to this; five args are
+                    // `portalfunc_ARGS`. `rewrite_jit_merge_point` still
+                    // calls `ll_portal_runner_shim`.
+                    portal_enter: Some(majit_translate::CallPath::from_segments([
+                        "call",
+                        "recursive_portal_enter",
+                    ])),
                     greens: pypyjit_driver_layout::PYPYJIT_GREEN_VARS
                         .iter()
                         .map(|(name, _)| (*name).to_string())
@@ -1306,6 +1314,7 @@ fn real_main() {
                         "eval",
                         "ll_unpackiterable_portal_runner_shim",
                     ])),
+                    portal_enter: None,
                     greens: vec!["greenkey".to_string()],
                     reds: vec![],
                     green_kinds: vec![majit_ir::Type::Ref],
@@ -1330,6 +1339,7 @@ fn real_main() {
                         "eval",
                         "ll_generatorentry_portal_runner_shim",
                     ])),
+                    portal_enter: None,
                     greens: vec!["pycode".to_string()],
                     reds: vec!["gen".to_string(), "w_arg".to_string()],
                     green_kinds: vec![majit_ir::Type::Ref],
@@ -2211,6 +2221,33 @@ fn real_main() {
             bincode::serialize(&ref_bindings_owned).unwrap(),
         )
         .unwrap();
+
+        let cargo_toml =
+            std::fs::read_to_string(format!("{manifest_dir}/Cargo.toml")).unwrap_or_default();
+        let enabled_features: std::collections::BTreeSet<String> = std::env::vars()
+            .filter_map(|(key, _)| {
+                key.strip_prefix("CARGO_FEATURE_")
+                    .map(|rest| rest.to_ascii_lowercase().replace('_', "-"))
+            })
+            .collect();
+        let nameability = majit_translate::residual_shim::Nameability::from_cargo_and_sources(
+            &cargo_toml,
+            &enabled_features,
+            &source_paths,
+        );
+        let (shim_source, shim_census) = majit_translate::residual_shim::emit_residual_shim_source(
+            &pipeline.residual_shim_targets,
+            &nameability,
+        );
+        std::fs::write(
+            format!("{out_dir}/generated_residual_shims.rs"),
+            &shim_source,
+        )
+        .unwrap();
+        eprintln!(
+            "[pyre-jit-trace build.rs] residual-shims: {}",
+            shim_census.line()
+        );
 
         // Report
         eprintln!(

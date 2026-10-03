@@ -11805,16 +11805,36 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // `handle_recursive_call` emits `recursive_call_v/iIRFIRF`, a key the
-    // assembler numbers dynamically; `handler_recursive_call_v` is wired
-    // below and no-ops until the key is in this map (`blackhole.py
-    // bhimpl_recursive_call_v`).
+    // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF`.
+    // The assembler pins those keys at `BC_RECURSIVE_CALL_*` via
+    // `wellknown_bh_insns`. `wire_handler` below no-ops until the key is
+    // in this map (`blackhole.py bhimpl_recursive_call_*`).
     for (key, byte) in dynamic_insns {
         debug_assert!(
             !insns.values().any(|&b| b == *byte),
             "dynamic insn {key} byte {byte} collides with a registered insn"
         );
         insns.insert((*key).to_string(), *byte);
+    }
+    for (key, byte) in [
+        (
+            "recursive_call_i/iIRFIRF>i",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_INT,
+        ),
+        (
+            "recursive_call_r/iIRFIRF>r",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_REF,
+        ),
+        (
+            "recursive_call_f/iIRFIRF>f",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_FLOAT,
+        ),
+        (
+            "recursive_call_v/iIRFIRF",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+        ),
+    ] {
+        insns.insert(key.to_string(), byte);
     }
     builder.setup_insns(&insns);
     // `setup_insns` already derives `op_live` and `op_catch_exception`
@@ -14127,6 +14147,22 @@ fn interpret_unresolved_inline_call(
         .unwrap_or_else(|| Box::new(BlackholeInterpreter::default()));
     callee.clone_context_from(bh);
     callee.setposition(sub_jitcode, 0);
+    // Working registers only. The constant pool sits at `num_regs_*` and
+    // `setposition` just copied it; wiping the whole bank zeroes fnaddrs.
+    // A register this body never writes must not keep the previous
+    // callee's argument.
+    let n_i = callee.jitcode.num_regs_i();
+    let n_r = callee.jitcode.num_regs_r();
+    let n_f = callee.jitcode.num_regs_f();
+    for reg in callee.registers_i.iter_mut().take(n_i) {
+        *reg = 0;
+    }
+    for reg in callee.registers_r.iter_mut().take(n_r) {
+        *reg = 0;
+    }
+    for reg in callee.registers_f.iter_mut().take(n_f) {
+        *reg = 0;
+    }
     for (index, &value) in args_i_owned.iter().enumerate() {
         if index < callee.registers_i.len() {
             callee.registers_i[index] = value;

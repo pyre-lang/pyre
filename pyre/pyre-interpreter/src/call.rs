@@ -462,7 +462,37 @@ pub fn current_eval_fn_addr() -> usize {
 /// `eval_with_jit` and the rewritten portal stub are in the closure. The
 /// result/exception split stays on the pending-error channel used by the
 /// other bare-`PyObjectRef` call boundaries.
+#[inline(always)]
 pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
+    clear_call_error();
+    // warmspot.py `rewrite_jit_merge_point`: callers of the original portal
+    // graph reach `direct_call(portal_runner, greens..., reds...)`, which
+    // `guess_call_kind` classifies as recursive. The five words are the jd0
+    // portal arguments (`next_instr`, `is_being_profiled`, `pycode`, `frame`,
+    // `ec`), same order as `jit_merge_point`. `frame` is the GCREF red
+    // (`interp_jit.py` `reds = ['frame', 'ec']`, `history.py getkind`),
+    // the same `&mut PyFrame` `jit_merge_point` and `EvalFn` take.
+    let next_instr = frame.next_instr() as i64;
+    let is_being_profiled = i64::from(frame.get_is_being_profiled());
+    let pycode = frame.pycode as PyObjectRef;
+    let ec = getexecutioncontext();
+    recursive_portal_enter(next_instr, is_being_profiled, pycode, frame, ec)
+}
+
+/// Direct call the codewriter classifies as the jd0 portal runner.
+///
+/// The traced form is `recursive_call`, not this body. The body is the
+/// interpreter entry: the registered eval function, same as the indirect
+/// hook this call replaced. `frame` is `&mut PyFrame` so the red is
+/// GCREF, matching `jit_merge_point` and `PYPYJIT_RED_VARS`.
+#[inline(never)]
+pub fn recursive_portal_enter(
+    _next_instr: i64,
+    _is_being_profiled: i64,
+    _pycode: PyObjectRef,
+    frame: &mut PyFrame,
+    _ec: *const crate::PyExecutionContext,
+) -> PyObjectRef {
     clear_call_error();
     match get_eval_fn()(frame, None) {
         Ok(value) => value,
@@ -1422,8 +1452,6 @@ pub fn call_user_function_resolved(
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
-    let eval_fn = get_eval_fn();
-
     let mut func_frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
@@ -1435,7 +1463,12 @@ pub fn call_user_function_resolved(
         )?);
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
-    eval_fn(&mut func_frame, None)
+    let result = eval_current_frame_raw(&mut func_frame);
+    if result.is_null() {
+        Err(take_call_error().expect("pending call error"))
+    } else {
+        Ok(result)
+    }
 }
 
 /// Invoke a builtin's function pointer for a positional-only call,
@@ -2707,8 +2740,8 @@ pub fn call_user_function(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let eval_fn = get_eval_fn();
-    call_user_function_with_eval(frame, callable, args, eval_fn)
+    let _ = frame;
+    call_user_function_with_ctx(getexecutioncontext(), callable, args)
 }
 
 /// Plain interpreter-only user-function call.
@@ -4588,7 +4621,12 @@ fn call_with_kwargs_in_ctx_impl(
             // install.  `Function.call_args` keeps the new frame as a GC
             // local; this ABI boundary is outside that transform.
             let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
-            return get_eval_fn()(&mut func_frame, None);
+            let result = eval_current_frame_raw(&mut func_frame);
+            return if result.is_null() {
+                Err(take_call_error().expect("pending call error"))
+            } else {
+                Ok(result)
+            };
         } // end user function branch
     } // end is_function
 
@@ -4905,9 +4943,17 @@ pub fn call_function_impl_result(
     // re-reads the nursery window and the foreign-mutator flag that the whole
     // set shares.  This is the `publish_roots` + `normalize_roots` shape
     // `pin_roots` documents for a set that does not sit in one slice.
-    let root_base = _roots.publish(&[callable]);
-    let _ = _roots.publish(args);
-    let roots_moved = _roots.normalize_moved(root_base, 1 + args.len());
+    // `publish(&[callable])` materializes a one-word buffer and stores the
+    // callable as an integer before that buffer is allocated. The allocation
+    // can collect, and the integer is not a root, so the slot then holds the
+    // pre-move address. `pin_root` takes the reference itself.
+    let _ = _roots.pin_root(callable);
+    let arg_len = args.len();
+    let args_at = _roots.publish(args);
+    let root_base = args_at - 1;
+    // `normalize_moved`'s bool is true whenever the nursery forwarded a
+    // slot. The callable is reloaded from its published slot on both arms.
+    let roots_moved = _roots.normalize_moved(root_base, 1 + arg_len);
 
     // A JIT prologue may have published an overflow before entering this
     // residual dispatcher, so preserve that pending exception.  Do not run a
@@ -5607,14 +5653,9 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
     // The callee root is installed and the caller root is not, for the reason
     // `call_user_function_with_ctx` records: no caller `PyFrame` exists here.
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
-    let result = frame.run_with_jit();
-    match result {
-        Ok(v) => v,
-        Err(e) => {
-            set_call_error(e);
-            PY_NULL
-        }
-    }
+    // Generators already returned through `frame_into_generator_for_function`.
+    // `PyFrame::run` is `execute_frame` here: the portal, not a second snapshot.
+    eval_current_frame_raw(&mut frame)
 }
 
 /// Invoke a user function with an already-resolved argument scope,
@@ -5660,13 +5701,9 @@ fn call_user_function_resolved_frameless(
     // `PyCode.funcrun` -> `PyFrame.run` one, so this takes the portal on the
     // terms the ordinary spelling above records.
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
-    match frame.run_with_jit() {
-        Ok(v) => v,
-        Err(e) => {
-            set_call_error(e);
-            PY_NULL
-        }
-    }
+    // Same portal as above: this function already returned when the code
+    // object is a generator or coroutine.
+    eval_current_frame_raw(&mut frame)
 }
 
 /// Call a metaclass with extra keyword arguments.

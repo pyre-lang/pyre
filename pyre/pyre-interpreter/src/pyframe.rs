@@ -5308,7 +5308,17 @@ impl PyFrame {
         if self._is_generator_or_coroutine() {
             self.initialize_as_generator()
         } else {
-            crate::call::get_eval_fn()(self, None)
+            // `Function.call_args` / `eval_current_frame_raw`: the five-word
+            // portal runner (`warmspot.py rewrite_jit_merge_point`), not the
+            // `EvalFn` pointer. A look-inside of `get_eval_fn()(self)` is an
+            // indirect call of that pointer through a word stub.
+            let result = crate::call::eval_current_frame_raw(self);
+            if result.is_null() {
+                Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| crate::PyError::value_error("call failed")))
+            } else {
+                Ok(result)
+            }
         }
     }
 

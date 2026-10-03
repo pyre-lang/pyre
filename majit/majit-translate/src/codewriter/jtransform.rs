@@ -11502,6 +11502,47 @@ impl<'a> Transformer<'a> {
         ])
     }
 
+    /// Stamp portal reds whose driver kind is GCREF (`history.py getkind`)
+    /// but whose rtyper cell is Address/Signed.
+    ///
+    /// `warmspot.py` `PORTALFUNC.ARGS` types the portal runner's reds; pyre's
+    /// `&mut PyFrame` parameter can still lower as Address. `lltype.cast_int_to_ptr`
+    /// produces a Ref box with the same bits so `make_three_lists` /
+    /// `setup_call` (`pyjitpl.py`) put the virtualizable in `registers_r`.
+    /// A no-op when the red is already `'r'`.
+    fn coerce_portal_reds_to_driver_kinds(
+        &mut self,
+        graph: &mut crate::model::FunctionGraph,
+        red_args: &[crate::flowspace::model::Variable],
+        red_kinds: &[majit_ir::Type],
+    ) -> (Vec<SpaceOperation>, Vec<crate::flowspace::model::Variable>) {
+        let mut ops = Vec::new();
+        let mut coerced = Vec::with_capacity(red_args.len());
+        for (i, var) in red_args.iter().enumerate() {
+            if red_kinds.get(i) == Some(&majit_ir::Type::Ref) && self.get_value_kind_var(var) == 'i'
+            {
+                let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+                self.stamp_value_kind(
+                    graph,
+                    Some(result.clone()),
+                    crate::codewriter::type_state::ConcreteType::GcRef,
+                );
+                ops.push(SpaceOperation {
+                    result: Some(result.clone()),
+                    kind: OpKind::UnaryOp {
+                        op: "cast_int_to_ptr".into(),
+                        operand: var.clone(),
+                        result_ty: ValueType::Ref(None),
+                    },
+                });
+                coerced.push(result);
+            } else {
+                coerced.push(var.clone());
+            }
+        }
+        (ops, coerced)
+    }
+
     /// RPython: `Transformer.handle_recursive_call(op)`.
     /// Recursive call back to the portal — emit `recursive_call_*`.
     ///
@@ -11522,12 +11563,12 @@ impl<'a> Transformer<'a> {
         //   reds = args[1+num_green_args:]
         //   recursive_call_{kind}(jd_index, G_I, G_R, G_F, R_I, R_R, R_F)
         let path = target_to_call_path(target);
-        let (jd_index, num_green_args) = self
+        let (jd_index, num_green_args, red_kinds) = self
             .callcontrol
             .as_ref()
             .and_then(|cc| cc.jitdriver_sd_from_portal_runner_ptr(&path))
-            .map(|sd| (sd.index, sd.greens.len()))
-            .unwrap_or((0, 0));
+            .map(|sd| (sd.index, sd.greens.len(), sd.red_kinds.clone()))
+            .unwrap_or((0, 0, Vec::new()));
 
         // RPython: skip funcptr (args[0]), split rest into green/red.
         // In our AST, args don't include funcptr, so split directly.
@@ -11543,7 +11584,9 @@ impl<'a> Transformer<'a> {
         };
         let (greens_i, greens_r, greens_f, green_classes) =
             self.make_three_lists_from_vars(green_args);
-        let (reds_i, reds_r, reds_f, red_classes) = self.make_three_lists_from_vars(red_args);
+        let (coerce_ops, coerced_reds) =
+            self.coerce_portal_reds_to_driver_kinds(graph, red_args, &red_kinds);
+        let (reds_i, reds_r, reds_f, red_classes) = self.make_three_lists_from_vars(&coerced_reds);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
 
@@ -11558,6 +11601,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py: promote_greens emits guard_value
         // for each non-void green arg before the recursive_call.
         let mut ops = self.promote_greens(graph, green_args);
+        ops.extend(coerce_ops);
 
         // RPython jtransform.py:532-533: recursive_call + -live-
         ops.push(SpaceOperation {
@@ -12580,6 +12624,11 @@ impl<'a> Transformer<'a> {
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
+        if let Some(cc) = self.callcontrol.as_mut()
+            && let Some(path) = cc.target_to_path(target)
+        {
+            cc.note_residual_call_descr(path, descriptor.clone());
+        }
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
         // jtransform.py: `handle_regular_indirect_call` passes
@@ -22179,6 +22228,194 @@ mod tests {
             RewriteResult::Keep => panic!("direct_ptradd must rewrite, got Keep"),
             RewriteResult::Identity(_) => panic!("direct_ptradd must rewrite, got Identity"),
         }
+    }
+
+    #[test]
+    fn recursive_call_casts_address_frame_red_to_gcref() {
+        // `interp_jit.py` `reds = ['frame']` is GCREF. A `*mut PyFrame`
+        // argument is Address/Signed; `handle_recursive_call` emits
+        // `cast_int_to_ptr` so `setup_call` (`pyjitpl.py`) writes it into
+        // `registers_r`.
+        let mut cc = crate::call::CallControl::new();
+        cc.setup_jitdriver(
+            majit_jitcode::parse::CallPath::from_segments(["eval", "eval_loop_jit"]),
+            Vec::new(),
+            vec!["frame".into()],
+            Vec::new(),
+            vec![majit_ir::Type::Ref],
+            false,
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+            majit_jitcode::parse::CallPath::from_segments(["eval", "eval_loop_jit"]),
+        );
+        cc.set_jitdriver_portal_enter(
+            0,
+            Some(majit_jitcode::parse::CallPath::from_segments([
+                "call",
+                "recursive_portal_enter",
+            ])),
+        );
+        let mut graph = FunctionGraph::new("recursive_portal_enter_frame");
+        let frame = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "frame".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::Signed);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["call", "recursive_portal_enter"]),
+                    args: crate::model::call_args(vec![frame.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["call", "recursive_portal_enter"]),
+                args: crate::model::call_args(vec![frame.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &CallTarget::function_path(["call", "recursive_portal_enter"]),
+            std::slice::from_ref(&frame),
+            &ValueType::Ref(None),
+            "recursive_portal_enter_frame",
+            &mut graph,
+        );
+        let ops = match rewritten {
+            RewriteResult::Replace(ops) => ops,
+            RewriteResult::Keep | RewriteResult::Identity(_) => {
+                panic!("expected Replace, got non-Replace recursive rewrite")
+            }
+        };
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_int_to_ptr" && operand == &frame
+            )),
+            "Address frame red must cast_int_to_ptr; ops={ops:?}"
+        );
+        let recursive = ops.iter().find_map(|op| match &op.kind {
+            OpKind::RecursiveCall { reds_i, reds_r, .. } => Some((reds_i.clone(), reds_r.clone())),
+            _ => None,
+        });
+        let (reds_i, reds_r) = recursive.expect("recursive_call must be emitted");
+        assert!(
+            reds_i.is_empty(),
+            "GCREF frame red must not stay in reds_i; reds_i={reds_i:?}"
+        );
+        assert_eq!(
+            reds_r.len(),
+            1,
+            "GCREF frame red must occupy reds_r; reds_r={reds_r:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_call_puts_gcref_frame_red_in_reds_r() {
+        // `interp_jit.py` `reds = ['frame']` is GCREF (`history.py getkind`).
+        // `handle_recursive_call` (`jtransform.py`) splits with
+        // `make_three_lists`; `setup_call` (`pyjitpl.py`) writes that Ref
+        // into `registers_r`, the bank `portal_frame_reg` reads.
+        let mut cc = crate::call::CallControl::new();
+        cc.setup_jitdriver(
+            majit_jitcode::parse::CallPath::from_segments(["eval", "eval_loop_jit"]),
+            Vec::new(),
+            vec!["frame".into()],
+            Vec::new(),
+            vec![majit_ir::Type::Ref],
+            false,
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+            majit_jitcode::parse::CallPath::from_segments(["eval", "eval_loop_jit"]),
+        );
+        cc.set_jitdriver_portal_enter(
+            0,
+            Some(majit_jitcode::parse::CallPath::from_segments([
+                "call",
+                "recursive_portal_enter",
+            ])),
+        );
+        let mut graph = FunctionGraph::new("recursive_portal_enter_frame");
+        let frame = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "frame".into(),
+                    ty: ValueType::Ref(Some("PyFrame".into())),
+                    class_root: Some("PyFrame".into()),
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["call", "recursive_portal_enter"]),
+                    args: crate::model::call_args(vec![frame.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["call", "recursive_portal_enter"]),
+                args: crate::model::call_args(vec![frame.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &CallTarget::function_path(["call", "recursive_portal_enter"]),
+            std::slice::from_ref(&frame),
+            &ValueType::Ref(None),
+            "recursive_portal_enter_frame",
+            &mut graph,
+        );
+        let ops = match rewritten {
+            RewriteResult::Replace(ops) => ops,
+            RewriteResult::Keep | RewriteResult::Identity(_) => {
+                panic!("expected Replace, got non-Replace recursive rewrite")
+            }
+        };
+        let recursive = ops.iter().find_map(|op| match &op.kind {
+            OpKind::RecursiveCall { reds_i, reds_r, .. } => Some((reds_i.clone(), reds_r.clone())),
+            _ => None,
+        });
+        let (reds_i, reds_r) = recursive.expect("recursive_call must be emitted");
+        assert!(
+            reds_i.is_empty(),
+            "GCREF frame red must not stay in reds_i; reds_i={reds_i:?}"
+        );
+        assert_eq!(
+            reds_r.len(),
+            1,
+            "GCREF frame red must occupy reds_r; reds_r={reds_r:?}"
+        );
     }
 
     #[test]

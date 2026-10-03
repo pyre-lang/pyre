@@ -2294,19 +2294,19 @@ pub unsafe fn class_descr_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, 
     if !unsafe { crate::baseobjspace::has_object_getattribute(w_type) } {
         return None;
     }
-    let Some(actual_class_descr) = (unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__class__")),
-        )
-    }) else {
+    let class_name =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__class__"));
+    // First lookup may allocate; pin the boxed name so the second lookup
+    // still sees it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let name_at = roots.pin_roots(&[class_name]);
+    let Some(actual_class_descr) =
+        (unsafe { crate::baseobjspace::lookup_in_type_where(w_type, roots.get(name_at)) })
+    else {
         return None;
     };
     let Some(object_class_descr) = (unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            crate::typedef::w_object(),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__class__")),
-        )
+        crate::baseobjspace::lookup_in_type_where(crate::typedef::w_object(), roots.get(name_at))
     }) else {
         return None;
     };

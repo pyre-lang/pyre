@@ -2107,10 +2107,23 @@ pub unsafe fn get_and_call_function(
                 crate::function::funccall_result(w_descr, &[w_obj, args_w[0], args_w[1], args_w[2]])
             }
             _ => {
+                // `Vec::with_capacity` allocates. A raw descriptor word is not a
+                // root, so a collection there forwards the object and leaves the
+                // register stale. `pin_root` writes the word onto the shadow stack
+                // before that allocation; `get` reads it back once the list exists.
+                // `w_obj` is pinned the same way. `args_w` is an existing slice, so
+                // `publish` copies it with no temporary array.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = _roots.base();
+                let _ = _roots.pin_root(w_descr);
+                let _ = _roots.pin_root(w_obj);
+                let args_at = _roots.publish(args_w);
                 let mut full = Vec::with_capacity(args_w.len() + 1);
-                full.push(w_obj);
-                full.extend_from_slice(args_w);
-                crate::function::funccall_result(w_descr, full.as_slice())
+                full.push(_roots.get(base + 1));
+                for i in 0..args_w.len() {
+                    full.push(_roots.get(args_at + i));
+                }
+                crate::function::funccall_result(_roots.get(base), full.as_slice())
             }
         };
     }

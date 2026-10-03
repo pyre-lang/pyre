@@ -3321,7 +3321,15 @@ pub struct HostHooks {
     pub get_current_qmut_instance: Option<crate::quasiimmut::GetCurrentQmutInstance>,
     pub symbolic_fnaddr_path_resolver: Option<SymbolicFnaddrPathResolver>,
     pub assertion_error_typeptr: Option<AssertionErrorTypeptr>,
+    /// Host builds the `QuasiImmutDescr` a portal `QUASIIMMUT_FIELD` records.
+    /// `None` skips the op: the following getfield stays a real load.
+    pub make_quasi_immut_descr: Option<MakeQuasiImmutDescr>,
 }
+
+/// Host builds the `QuasiImmutDescr` a portal `QUASIIMMUT_FIELD` records.
+/// The constant field value is filled after the watcher is installed.
+pub type MakeQuasiImmutDescr =
+    fn(struct_ptr: i64, field: &majit_ir::DescrRef) -> Option<majit_ir::DescrRef>;
 
 static HOST_HOOKS: parking_lot::Mutex<HostHooks> = parking_lot::const_mutex(HostHooks {
     stack_almost_full: None,
@@ -3335,6 +3343,7 @@ static HOST_HOOKS: parking_lot::Mutex<HostHooks> = parking_lot::const_mutex(Host
     get_current_qmut_instance: None,
     symbolic_fnaddr_path_resolver: None,
     assertion_error_typeptr: None,
+    make_quasi_immut_descr: None,
 });
 
 /// Published copy of [`MetaInterpStaticData::host`]. Readers that do
@@ -7593,6 +7602,10 @@ impl<M: Clone> MetaInterp<M> {
         let issubclass = self.issubclass;
         let pending_exc_box = self.last_exc_box;
         let pending_exc_value = self.last_exc_value;
+        let portals: Vec<Option<std::sync::Arc<crate::jitcode::JitCode>>> =
+            (0..self.staticdata.jitdrivers_sd.len())
+                .map(|index| self.mainjitcode_of(index).cloned())
+                .collect();
         let (action, last_exc_box, last_exc_value) = self
             .with_trace_ctx_and_framestack(
                 |ctx, framestack, resolve, target, decision, exec_i, exec_r, exec_f, exec_v| {
@@ -7605,7 +7618,8 @@ impl<M: Clone> MetaInterp<M> {
                         exec_r,
                         exec_f,
                         exec_v,
-                    );
+                    )
+                    .with_portals(portals);
                     let mut machine =
                         crate::pyjitpl::JitCodeMachine::with_framestack(framestack, &[], &[]);
                     machine.set_cpu(cpu);
@@ -17985,6 +17999,12 @@ impl<M: Clone> MetaInterp<M> {
             jct.retraced_count.get() & majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING != 0
         });
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, green_key, self.staticdata.clone());
+        // history.py `Const.value` is only on a box the trace already
+        // proved constant. The deadframe word is the runtime value of this
+        // one failure (`load_box_from_cpu`), not that proof. Seeding every
+        // live slot here makes `virtualstate` pin a GUARD_VALUE on a pointer
+        // that is a fresh object each iteration, so the bridge fails and the
+        // next failure compiles another one.
         if let Some(index) = source_jitdriver_index {
             let descriptor = self
                 .staticdata

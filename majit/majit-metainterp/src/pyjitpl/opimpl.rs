@@ -232,6 +232,8 @@ where
         table[jitcode::insns::BC_RECORD_EXACT_CLASS as usize] = Self::opimpl_record_exact_class;
         table[jitcode::insns::BC_RECORD_EXACT_VALUE_I as usize] = Self::opimpl_record_exact_value_i;
         table[jitcode::insns::BC_RECORD_EXACT_VALUE_R as usize] = Self::opimpl_record_exact_value_r;
+        table[jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD as usize] =
+            Self::opimpl_record_quasiimmut_field;
         table[jitcode::insns::BC_REF_GUARD_VALUE as usize] = Self::opimpl_ref_guard_value;
         table[jitcode::insns::BC_FLOAT_GUARD_VALUE as usize] = Self::opimpl_float_guard_value;
         table[jitcode::insns::BC_GUARD_CLASS as usize] = Self::opimpl_guard_class;
@@ -4621,6 +4623,9 @@ where
                     jdindex,
                     result_dst,
                     &green_values,
+                    &[],
+                    &[],
+                    &[],
                 ) {
                     TraceAction::Continue => {}
                     // Abort propagates (missing fresh-reds / target).
@@ -4870,6 +4875,22 @@ where
                     // `recover`.
                     ctx.walk_final_pc = mp_green_pc.map(Self::guest_pc_position);
                     ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
+                }
+                // pyjitpl.py `reached_loop_header`: before `compile_loop`,
+                // `get_procedure_token(greenboxes)` + `has_compiled_targets`
+                // records a JUMP into the loop that already owns this merge
+                // point (`compile_trace`). A root trace has no `bridge_info`,
+                // so the guard-origin block never runs; publishing the token
+                // key is what makes the driver take `compile_trace_from_interp`
+                // instead of `compile_loop`'s `ABORT_BAD_LOOP`.
+                if !ctx.is_bridge_trace
+                    && let Some(close_key) = ctx.close_green_key_hash()
+                    && ctx
+                        .has_compiled_targets_fn
+                        .as_ref()
+                        .is_some_and(|f| f(close_key))
+                {
+                    ctx.close_jump_into_key = Some(close_key);
                 }
                 // GUARD_FUTURE_CONDITION already emitted unconditionally at
                 // the reached_loop_header entry above (pyjitpl.py).
@@ -8979,6 +9000,72 @@ where
         }
         if invalid {
             return TraceAction::SwitchToBlackhole(crate::pyjitpl::SwitchToBlackhole::bad_loop());
+        }
+        TraceAction::Continue
+    }
+
+    // pyjitpl.py opimpl_record_quasiimmut_field. `rdd`: struct,
+    // field descr, unused mutate descr. No watcher skips the op so
+    // the following getfield stays a real load.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_record_quasiimmut_field(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let resume_pc = self.frames.current_mut().last_opcode_position;
+        let (struct_reg, field_idx) = {
+            let frame = self.frames.current_mut();
+            let struct_reg = frame.next_reg() as usize;
+            let field_idx = frame.next_u16() as usize;
+            let _mutate_idx = frame.next_u16();
+            (struct_reg, field_idx)
+        };
+        let fielddescr = {
+            let frame = self.frames.current_mut();
+            if let Some(descr) = frame.runtime_optimizer_descr(field_idx) {
+                descr
+            } else if let Some(bh) = frame.runtime_bh_descr(field_idx) {
+                field_descr_ref_from_bh(bh).1
+            } else {
+                ctx.symbolic_residual_abort = true;
+                return TraceAction::Abort;
+            }
+        };
+        let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
+        let field_key = heapcache_field_key(&fielddescr);
+        if field_key.is_some_and(|key| ctx.heap_cache().is_quasi_immut_known(key, struct_opref)) {
+            ctx.profiler()
+                .count_ops(OpCode::QuasiimmutField, crate::counters::HEAPCACHED_OPS);
+        } else if let Some(descr) = crate::pyjitpl::host_hooks()
+            .make_quasi_immut_descr
+            .and_then(|hook| hook(struct_ptr, &fielddescr))
+        {
+            if let Some(key) = field_key {
+                ctx.heap_cache_mut()
+                    .quasi_immut_now_known(key, struct_opref);
+            }
+            let _ = ctx.execute_and_record(
+                Some(self.cpu.as_ref()),
+                OpCode::QuasiimmutField,
+                Some(descr),
+                &[struct_opref],
+                None,
+                self.last_exception_value,
+            );
+            if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+                self.record_state_guard(
+                    ctx,
+                    sym,
+                    OpCode::GuardNotInvalidated,
+                    &[],
+                    resume_pc,
+                    false,
+                );
+            }
         }
         TraceAction::Continue
     }

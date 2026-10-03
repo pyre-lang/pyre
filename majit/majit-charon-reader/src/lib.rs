@@ -1335,6 +1335,35 @@ mod tests {
     }
 
     #[test]
+    fn size_align_survives_unresolved_field_offsets() {
+        // `layout_for_target` drops the whole layout when a field offset
+        // is still `chosen: null`. `size_of` / `align_of` only need the
+        // two words (`llmemory.sizeof`).
+        let doc = r#"{"charon_version":"t","has_errors":false,
+            "translated":{"crate_name":"c","fun_decls":[],"type_decls":[{
+                "def_id":0,
+                "item_meta":{"name":[{"Ident":["S",0]}],
+                    "span":{"data":{"file_id":0,"beg":{"line":1,"col":0},"end":{"line":1,"col":1}}},
+                    "source_text":null,
+                    "attr_info":{"attributes":[],"inline":null,"rename":null,"public":true},
+                    "is_local":true},
+                "kind":{"Struct":[]},
+                "layout":[{"key":"t","value":{
+                    "size":16,
+                    "align":8,
+                    "variant_layouts":[{"field_offsets":[{"chosen":null}]}]
+                }}]
+            }]}}"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        let decl = l.type_by_id(0).expect("decl");
+        assert!(decl.layout_for_target(&l, "t").is_none());
+        assert_eq!(
+            decl.size_align_for_target(&l, "t"),
+            Some((Some(16), Some(8)))
+        );
+    }
+
+    #[test]
     fn a_payload_free_type_kind_is_a_string_body() {
         // `!` hash-conses as `{"Value": [id, "Never"]}`; a monomorphized
         // `ControlFlow<Result<!, E>, T>` names it among its instance

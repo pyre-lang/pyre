@@ -4642,7 +4642,18 @@ impl<S: JitState> JitDriver<S> {
                         // retraces it to the same answer and no bridge is ever
                         // built. Resolve here so both doors read one cell.
                         let close_key = self.meta.trace_ctx().and_then(|ctx| ctx.close_green_key());
-                        let resolved_key = match &close_key {
+                        // `get_procedure_token(greenboxes)` matches the greens,
+                        // not a second hash of them. A portal loop is filed
+                        // under `make_green_key_typed` (and may be minted when
+                        // that hash's bucket is taken). Rebuilding the same
+                        // banks through `merge_point_green_key` prepends `pc`
+                        // again and misses the cell, so the guard retraces
+                        // forever. The banks recorded at compile time are the
+                        // ones `compiled_key_for_greens` inverts.
+                        let greens_key = close_greens
+                            .as_ref()
+                            .and_then(|greens| self.meta.compiled_key_for_greens(greens));
+                        let resolved_key = greens_key.or_else(|| match &close_key {
                             Some(key) => {
                                 let make_key = || key.clone();
                                 // compile.py / pyjitpl.py reached_loop_header
@@ -4655,7 +4666,7 @@ impl<S: JitState> JitDriver<S> {
                             }
                             // `ctx.green_key` is resolved at trace start.
                             None => self.current_trace_green_key(),
-                        };
+                        });
                         // The cell token a close resolves is `jump_op.getdescr()`
                         // upstream (unroll.py:196 `cell_token =
                         // jump_op.getdescr()`, :321-322 `jitcelltoken =
@@ -4990,12 +5001,29 @@ impl<S: JitState> JitDriver<S> {
                         let bridge_trace_id = bridge.trace_id;
                         let bridge_fail_index = bridge.fail_index;
                         let bridge_code_ptr = bridge.code_ptr;
-                        // pyjitpl.py: ptoken = self.get_procedure_token(greenboxes)
-                        // Use the TARGET loop header's green key, not the bridge origin.
-                        let target_key = loop_header_pc
-                            .map(|pc| crate::green_key_from_code_ptr(bridge_code_ptr, pc))
-                            .unwrap_or(bridge_key);
-                        let has_targets = self.meta.has_compiled_targets(target_key);
+                        // pyjitpl.py `get_procedure_token(greenboxes)`: the greens
+                        // of the merge point just reached. `compile_loop` files
+                        // the token under `resolve_cell_key` of that key. A
+                        // `green_key_from_code_ptr` door misses it, so
+                        // `has_compiled_targets` is false and the guard is never
+                        // bridged (`bridge_no_targets_close`). Host fixtures that
+                        // never set a typed close key keep the code-ptr fallback.
+                        let close_key = self.meta.trace_ctx().and_then(|ctx| ctx.close_green_key());
+                        let resolved_key = match &close_key {
+                            Some(key) => {
+                                let make_key = || key.clone();
+                                Some(self.meta.resolve_cell_key(
+                                    key.get_uhash(),
+                                    Some(&make_key as &dyn Fn() -> majit_ir::GreenKey),
+                                ))
+                            }
+                            None => loop_header_pc
+                                .map(|pc| crate::green_key_from_code_ptr(bridge_code_ptr, pc))
+                                .or(Some(bridge_key)),
+                        };
+                        let has_targets =
+                            resolved_key.is_some_and(|k| self.meta.has_compiled_targets(k));
+                        let target_key = resolved_key.unwrap_or(bridge_key);
                         if has_targets {
                             let continue_running_normally_values = {
                                 let trace_meta = self.meta.trace_meta().cloned();

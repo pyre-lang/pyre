@@ -3977,11 +3977,89 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// 3.14 `Objects/object.c:do_richcompare` tries `tp_richcompare` in both
 /// operand directions when the first call returns `NotImplemented`; pyre's
 /// Python 3.14 compatibility rule takes precedence here.
+/// Plain-function `__lt__` (and the other five) on `a`, or null when the
+/// pair needs the full MRO walk (no method, a descriptor, or reflected
+/// subclass priority). The caller traces the call.
+#[majit_macros::dont_look_inside]
+unsafe fn lookup_plain_compare_function(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: CompareOp,
+) -> PyObjectRef {
+    let dunder = match op {
+        CompareOp::Lt => "__lt__",
+        CompareOp::Le => "__le__",
+        CompareOp::Gt => "__gt__",
+        CompareOp::Ge => "__ge__",
+        CompareOp::Eq => "__eq__",
+        CompareOp::Ne => "__ne__",
+    };
+    let rdunder = reverse_dunder(dunder).unwrap_or(dunder);
+    let a_method = plain_compare_function(a, dunder);
+    if a_method.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    let b_method = plain_compare_function(b, rdunder);
+    let b_first = !b_method.is_null()
+        && match (crate::typedef::r#type(a), crate::typedef::r#type(b)) {
+            (Some(at), Some(bt)) => at != bt && issubtype_cached(bt.as_ptr(), at.as_ptr()),
+            _ => false,
+        };
+    if b_first {
+        pyre_object::PY_NULL
+    } else {
+        a_method
+    }
+}
+
+#[majit_macros::dont_look_inside]
+unsafe fn plain_compare_function(obj: PyObjectRef, name: &str) -> PyObjectRef {
+    let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+    let method = if is_instance(obj) {
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return pyre_object::PY_NULL;
+        };
+        lookup_in_type_where(w_type.as_ptr(), w_name)
+    } else {
+        crate::baseobjspace::subclass_special_override(obj, name).map(|(method, _)| method)
+    };
+    let Some(method) = method else {
+        return pyre_object::PY_NULL;
+    };
+    let direct = std::ptr::eq(
+        unsafe { (*method).ob_type },
+        &crate::function::FUNCTION_TYPE as *const _,
+    ) || std::ptr::eq(
+        unsafe { (*method).ob_type },
+        &crate::function::METHOD_DESCRIPTOR_TYPE as *const _,
+    );
+    if direct { method } else { pyre_object::PY_NULL }
+}
+
 #[majit_macros::dont_look_inside]
 unsafe fn try_compare_override(
     a: PyObjectRef,
     b: PyObjectRef,
     op: CompareOp,
+) -> Result<Option<PyObjectRef>, PyError> {
+    try_compare_override_inner(a, b, op, false)
+}
+
+#[majit_macros::dont_look_inside]
+unsafe fn try_compare_override_reflected(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: CompareOp,
+) -> Result<Option<PyObjectRef>, PyError> {
+    try_compare_override_inner(a, b, op, true)
+}
+
+#[majit_macros::dont_look_inside]
+unsafe fn try_compare_override_inner(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: CompareOp,
+    forward_done: bool,
 ) -> Result<Option<PyObjectRef>, PyError> {
     let dunder = match op {
         CompareOp::Lt => "__lt__",
@@ -4036,8 +4114,16 @@ unsafe fn try_compare_override(
     let ov_get = |i: usize| pyre_object::gc_roots::shadow_stack_get(ov_base + i);
     // `_make_comparison_impl` swaps the two values; swapping the *index*
     // keeps the pinned copies authoritative across a collection.
-    let (first, second) = if b_first { (1, 0) } else { (0, 1) };
-    for (recv_i, other_i) in [(first, second), (second, first)] {
+    // `forward_done`: the caller already ran the forward method, so only
+    // the reflected override remains.
+    let pairs: &[(usize, usize)] = if forward_done {
+        &[(1, 0)]
+    } else if b_first {
+        &[(1, 0), (0, 1)]
+    } else {
+        &[(0, 1), (1, 0)]
+    };
+    for &(recv_i, other_i) in pairs {
         let method = ov_get(recv_i * 2);
         if method.is_null() {
             continue;
@@ -5911,10 +5997,10 @@ pub(crate) unsafe fn lookup_type_special(
     crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp.as_ptr(), w_name))
 }
 
-/// Residual 3-word call: `get_and_call_function` takes a slice, which
-/// the walk cannot pass.  Rust builds the one-argument list here.
+/// Three-word call. Not `dont_look_inside`: the metainterp follows this
+/// into `get_and_call_function`, which is where a user `__add__` / `__lt__`
+/// records. The one-element slice is built here, not passed in by the walk.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn call_descr_obj_arg(
     w_impl: PyObjectRef,
     w_obj1: PyObjectRef,
@@ -7186,7 +7272,24 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
             let cmp_base = pyre_object::gc_roots::pin_roots(&[a, b]);
             let a_live = pyre_object::gc_roots::shadow_stack_get(cmp_base);
             let b_live = pyre_object::gc_roots::shadow_stack_get(cmp_base + 1);
-            if let Some(result) = try_compare_override(a_live, b_live, op)? {
+            let method = lookup_plain_compare_function(a_live, b_live, op);
+            if !method.is_null() {
+                let method_base = pyre_object::gc_roots::pin_roots(&[method]);
+                if let Some(result) = invoke_binop(
+                    pyre_object::gc_roots::shadow_stack_get(method_base),
+                    pyre_object::gc_roots::shadow_stack_get(cmp_base),
+                    pyre_object::gc_roots::shadow_stack_get(cmp_base + 1),
+                )? {
+                    return Ok(result);
+                }
+                if let Some(result) = try_compare_override_reflected(
+                    pyre_object::gc_roots::shadow_stack_get(cmp_base),
+                    pyre_object::gc_roots::shadow_stack_get(cmp_base + 1),
+                    op,
+                )? {
+                    return Ok(result);
+                }
+            } else if let Some(result) = try_compare_override(a_live, b_live, op)? {
                 return Ok(result);
             }
             a = pyre_object::gc_roots::shadow_stack_get(cmp_base);

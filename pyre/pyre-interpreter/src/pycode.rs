@@ -717,8 +717,8 @@ pub struct PyCode {
     /// (`pyopcode.py`) is `co_names_w[index]`.
     ///
     /// `PyCode.__init__` interns the whole list before the code object is
-    /// published. `getname_w` still compare-exchanges a null slot, for a
-    /// table built before this fill.
+    /// published (`new_interned_str`). `getname_w` still compare-exchanges a
+    /// null slot, for a table built before this fill.
     ///
     /// Slots hold `intern_str_value` results. The table is a
     /// `FixedObjectArray` (`GcArray(OBJECTPTR)`), the same shape as
@@ -3775,77 +3775,13 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     }
 }
 
-/// `pyopcode.py getname_w(index) -> self.getcode().co_names_w[index]`
-/// — the one wrapped name this code object holds at `idx`.
-///
-/// Realized on first demand with `new_interned_str`. The item word is a
-/// traced `FixedObjectArray` slot: publish with the barrier-then-CAS
-/// `co_consts_w` uses, and a thread that loses the race returns the winner.
-///
-/// Returns `PY_NULL` when the enclosing code or the slot cannot be resolved
-/// (test fixtures and gateway builtins carry no name table); callers fall back
-/// to wrapping the key themselves.
+/// `pyopcode.py getname_w(index) -> self.getcode().co_names_w[index]`.
 ///
 /// # Safety
-/// `w_code_obj` must point to a valid `PyCode`.
-#[majit_macros::dont_look_inside]
+/// `w_code_obj` must point to a `PyCode` whose `co_names_w` covers `idx`.
 pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
-    if w_code_obj.is_null() {
-        return pyre_object::pyobject::PY_NULL;
-    }
-    let table = unsafe { (*(w_code_obj as *const PyCode)).co_consts_w };
-    if idx >= unsafe { (*table).len() } {
-        return pyre_object::pyobject::PY_NULL;
-    }
-    let w_code = w_code_obj as *mut PyCode;
-    let slot_table = unsafe { &*(*w_code).co_names_w };
-    if idx >= slot_table.len() {
-        return pyre_object::pyobject::PY_NULL;
-    }
-    // PyPy's GIL serializes first access to its already-interned list. Pyre is
-    // free-threaded and realizes this slot lazily, so the item word is
-    // published with a compare-exchange. The collector forwards that word
-    // when it traces the `FixedObjectArray`.
-    let slot =
-        unsafe { slot_table.items_ptr().add(idx) as *const std::sync::atomic::AtomicPtr<PyObject> };
-    let existing = unsafe { (*slot).load(std::sync::atomic::Ordering::Acquire) };
-    if !existing.is_null() {
-        return existing;
-    }
-    // Guard `code_ptr` before dereferencing it — the same null/alignment check
-    // the lazy-cache initializers use.
-    let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
-    if unsafe { (*w_code).code_ptr.is_null() }
-        || (unsafe { (*w_code).code_ptr as i64 } & align_mask) != 0
-    {
-        return pyre_object::pyobject::PY_NULL;
-    }
-    let code = unsafe { &*((*w_code).code_ptr as *const crate::CodeObject) };
-    let Some(name) = code.names.get(idx) else {
-        return pyre_object::pyobject::PY_NULL;
-    };
-    // `pycode.py space.new_interned_str(aname)` — one canonical object
-    // per name value, not one per code object that names it. Pin the
-    // code object across the intern: the name array can move, and
-    // `name` itself lives in the non-GC code body.
-    let roots = pyre_object::gc_roots::push_roots();
-    let code_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_code_obj);
-    let realized = pyre_object::unicodeobject::intern_str_value(name);
-    let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot) as *mut PyCode;
-    let table = unsafe { (*w_code).co_names_w };
-    match unsafe {
-        (*table).compare_exchange_ref(
-            idx,
-            pyre_object::pyobject::PY_NULL,
-            realized,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-    } {
-        Ok(_) => realized,
-        Err(winner) => winner,
-    }
+    let table = unsafe { (*(w_code_obj as *const PyCode)).co_names_w };
+    unsafe { (&*table)[idx] }
 }
 
 /// Whether `idx` names a slot of `w_code_obj`'s `co_names_w`.

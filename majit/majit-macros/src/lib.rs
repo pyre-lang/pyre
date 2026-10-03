@@ -1312,33 +1312,32 @@ fn wrap_result_exc_call(
 ) -> Option<proc_macro2::TokenStream> {
     match return_kind {
         HelperCallKind::Void => Some(quote! {
-            match #inner {
-                ::core::result::Result::Ok(_) => {}
-                ::core::result::Result::Err(__majit_err) => {
-                    ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
-                }
-            }
+            ::majit_ir::helper_fnaddr::residual_result_void(#inner)
         }),
-        HelperCallKind::Float => Some(quote! {
-            match #inner {
-                ::core::result::Result::Ok(__majit_ok) => __majit_ok,
-                ::core::result::Result::Err(__majit_err) => {
-                    ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
-                    0.0
-                }
-            }
-        }),
-        HelperCallKind::Int | HelperCallKind::Ref => {
-            let converted = helper_return_to_i64(quote! { __majit_ok }, payload_ty)?;
+        HelperCallKind::Float => {
+            let _ = payload_ty;
             Some(quote! {
-                match #inner {
-                    ::core::result::Result::Ok(__majit_ok) => #converted,
-                    ::core::result::Result::Err(__majit_err) => {
-                        ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
-                        0
-                    }
-                }
+                ::majit_ir::helper_fnaddr::residual_result_f64(#inner)
             })
+        }
+        HelperCallKind::Int | HelperCallKind::Ref => {
+            if vec_one_word_item(payload_ty).is_some() {
+                let converted = helper_return_to_i64(quote! { __majit_ok }, payload_ty)?;
+                Some(quote! {
+                    match #inner {
+                        ::core::result::Result::Ok(__majit_ok) => #converted,
+                        ::core::result::Result::Err(__majit_err) => {
+                            ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
+                            0
+                        }
+                    }
+                })
+            } else {
+                let _ = helper_return_to_i64(quote! { __probe }, payload_ty)?;
+                Some(quote! {
+                    ::majit_ir::helper_fnaddr::residual_result_i64(#inner)
+                })
+            }
         }
         HelperCallKind::Unsupported => None,
     }
@@ -1648,32 +1647,31 @@ fn helper_return_to_i64(
             __majit_header as usize as i64
         }});
     }
-    if is_gc_ref_type(ty) {
-        return Some(quote! { (#value).0 as i64 });
-    }
-    if is_raw_pointer_type(ty) {
-        return Some(quote! { (#value) as usize as i64 });
-    }
-    // Same word as a plain `PyObjectRef` return: `Some(p)` is that pointer,
-    // `None` is the null word.
-    if nullable_pointer_option(ty) {
+    if is_gc_ref_type(ty)
+        || is_raw_pointer_type(ty)
+        || nullable_pointer_option(ty)
+        || primitive_type_ident(ty).is_some_and(|ident| {
+            matches!(
+                ident.to_string().as_str(),
+                "i8" | "i16"
+                    | "i32"
+                    | "i64"
+                    | "isize"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "usize"
+                    | "bool"
+                    | "f64"
+            )
+        })
+    {
         return Some(quote! {
-            match #value {
-                ::core::option::Option::Some(__majit_ptr) => (__majit_ptr as usize) as i64,
-                ::core::option::Option::None => 0,
-            }
+            <#ty as ::majit_ir::helper_fnaddr::ResidualIntoI64>::into_residual_i64(#value)
         });
     }
-    let ty_ident = primitive_type_ident(ty)?;
-    match ty_ident.to_string().as_str() {
-        "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "u64" | "usize" | "bool" => {
-            Some(quote! { (#value) as i64 })
-        }
-        "i64" => Some(quote! { #value }),
-        "isize" => Some(quote! { (#value) as i64 }),
-        "f64" => Some(quote! { f64::to_bits(#value) as i64 }),
-        _ => None,
-    }
+    None
 }
 
 fn is_word_enum_arg(ty: &Type, word_enums: &[Path]) -> bool {

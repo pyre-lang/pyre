@@ -1255,7 +1255,14 @@ fn report_symbolic_residual_call_target_once(func: i64, arg_classes: Option<&str
 /// converting the post-decode framestack would resume past the call and read
 /// whatever the result register held before. Refuse it the way an unbound
 /// residual target is refused, so the portal replays the source arm.
-fn refuse_unexecuted_recursive_call(ctx: &mut TraceCtx) -> TraceAction {
+fn refuse_unexecuted_recursive_call(ctx: &mut TraceCtx, why: &'static str) -> TraceAction {
+    if crate::bridge_debug_enabled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            eprintln!("[bridgeB] recursive call refused: {why}");
+        }
+    }
     ctx.symbolic_residual_abort = true;
     TraceAction::Abort
 }
@@ -1475,6 +1482,9 @@ pub struct ClosureRuntimeWithResolver<
     recursive_exec_ref: FExecR,
     recursive_exec_float: FExecF,
     recursive_exec_void: FExecV,
+    /// Per-driver portal body. Empty leaves `BC_RECURSIVE_CALL_*` unable to
+    /// inline, which aborts the trace.
+    portals: Vec<Option<std::sync::Arc<JitCode>>>,
 }
 
 impl<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
@@ -1500,7 +1510,13 @@ impl<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
             recursive_exec_ref,
             recursive_exec_float,
             recursive_exec_void,
+            portals: Vec::new(),
         }
+    }
+
+    pub fn with_portals(mut self, portals: Vec<Option<std::sync::Arc<JitCode>>>) -> Self {
+        self.portals = portals;
+        self
     }
 }
 
@@ -1588,6 +1604,10 @@ where
 
     fn is_main_portal(&self, _jd_index: usize) -> bool {
         true
+    }
+
+    fn portal_jitcode(&self, jd_index: usize) -> Option<std::sync::Arc<JitCode>> {
+        self.portals.get(jd_index)?.clone()
     }
 }
 
@@ -3840,6 +3860,9 @@ where
                 jd_index,
                 result_dst,
                 &green_values,
+                &reds_i,
+                &reds_r,
+                &reds_f,
             );
         }
         // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
@@ -3943,7 +3966,20 @@ where
         // (`warmspot.py` `jd.portal_runner_adr = adr_of(ll_portal_runner)`;
         // `eval.rs` wires one for jd0, which is why production has no such
         // hole), not a decision-routing change here.
-        refuse_unexecuted_recursive_call(ctx)
+        // Production jd0 has a portal runner, so the assembler token can be
+        // built. The live reds are the frame the call already named.
+        self.exec_recursive_call_assembler(
+            ctx,
+            sym,
+            runtime,
+            result_kind,
+            jd_index,
+            result_dst,
+            &green_values,
+            &reds_i,
+            &reds_r,
+            &reds_f,
+        )
     }
 
     /// pyjitpl.py `do_recursive_call(assembler_call=True)` for a
@@ -3976,6 +4012,9 @@ where
         jd_index: usize,
         result_dst: Option<usize>,
         green_values: &[i64],
+        reds_i: &[usize],
+        reds_r: &[usize],
+        reds_f: &[usize],
     ) -> TraceAction {
         // Validate the (result_kind, result_dst) pairing: the three typed
         // kinds carry a destination register, `Void` carries none.  Any
@@ -3985,7 +4024,7 @@ where
             | (Some(JitArgKind::Ref), Some(_))
             | (Some(JitArgKind::Float), Some(_))
             | (None, None) => {}
-            _ => return refuse_unexecuted_recursive_call(ctx),
+            _ => return refuse_unexecuted_recursive_call(ctx, "result kind mismatch"),
         }
 
         // The greens carry the portal green key (pyjitpl.py:3593-3599
@@ -4000,7 +4039,7 @@ where
         let (token_arc, _green_key) =
             match runtime.recursive_call_assembler_target(jd_index, green_values) {
                 Some(target) => target,
-                None => return refuse_unexecuted_recursive_call(ctx),
+                None => return refuse_unexecuted_recursive_call(ctx, "no assembler target"),
             };
 
         // Build the callee's red args.  A recursive portal call runs the
@@ -4014,80 +4053,119 @@ where
         // Ref) together with an owner box keeping
         // that state alive for the concrete `execute_recursive_assembler_int`
         // run.
-        let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
-            Some(pair) => pair,
-            None => return refuse_unexecuted_recursive_call(ctx),
-        };
-        let fresh_capacities = match sym.recursive_fresh_entry_vable_capacities() {
-            Some(capacities) => capacities,
-            None => return refuse_unexecuted_recursive_call(ctx),
-        };
-        let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
-            Some(targets) => targets,
-            None => return refuse_unexecuted_recursive_call(ctx),
-        };
-        // The trace-time fresh state stands in for the residual allocator's
-        // result (byte-identical by construction — both build a fresh state,
-        // scalars zeroed, the virt array at the captured capacity).  Held
-        // alive across the concrete leg; dropped at function exit (the
-        // compiled loop's recorded `CallN` free owns runtime deallocation).
-        let _fresh_owner = fresh_owner;
-        // The compiled caller loop cannot `New` a host state through the IR,
-        // so each virt-array `&state` red is recorded as a residual `CallR`
-        // to the macro-generated host allocator (the host analog of
-        // `gen_malloc_frame`, rewrite.py), paired with a residual `CallN`
-        // free after the call.  The allocator EI cannot raise (`Box::new`
-        // aborts on OOM, never raising a pyre exception), is non-elidable and
-        // non-loop-invariant (each call yields a distinct frame; eliding or
-        // hoisting would alias frames), and `can_collect = false` (a host
-        // `Box` allocation never triggers pyre's GC).
-        let fresh_call_ei = majit_ir::EffectInfo {
-            can_collect: false,
-            ..majit_ir::EffectInfo::new(
-                majit_ir::descr::ExtraEffect::CannotRaise,
-                majit_ir::descr::OopSpecIndex::None,
-            )
-        };
-        let mut args = Vec::with_capacity(fresh_values.len());
-        let mut red_values = Vec::with_capacity(fresh_values.len());
-        let mut arg_types = Vec::with_capacity(fresh_values.len());
-        let mut alloc_results: Vec<OpRef> = Vec::new();
-        let mut capacities = fresh_capacities.into_iter();
-        let mut idx = 0;
-        while idx < fresh_values.len() {
-            match fresh_values[idx] {
-                majit_ir::Value::Int(n) => {
-                    args.push(OpRef::const_int(n));
-                    red_values.push(majit_ir::Value::Int(n));
+        // A portal whose reds are already the live frame (pyframe, ec) cannot
+        // synthesize a zeroed host state. `do_recursive_call` passes those
+        // red boxes unchanged.
+        let synthesized = sym.recursive_fresh_entry_reds();
+        let (args, red_values, arg_types, alloc_results, fresh_call_ei, free_fp, _fresh_owner) =
+            if synthesized.is_none() {
+                let mut args = Vec::new();
+                let mut red_values = Vec::new();
+                let mut arg_types = Vec::new();
+                for &src in reds_i {
+                    let (op, bits) = self.read_int_reg(ctx, src);
+                    args.push(op);
+                    red_values.push(majit_ir::Value::Int(bits));
                     arg_types.push(majit_ir::Type::Int);
-                    idx += 1;
                 }
-                majit_ir::Value::Ref(_) => {
-                    // Allocation capacity is frame-construction metadata, not
-                    // an extra portal red (pyjitpl.py `do_recursive_call`).
-                    let cap = match capacities.next() {
-                        Some(cap) => cap,
-                        None => return refuse_unexecuted_recursive_call(ctx),
-                    };
-                    let cap_arg = OpRef::const_int(cap);
-                    let alloc_result = ctx.call_ref_typed_with_effect(
-                        alloc_fp,
-                        &[cap_arg],
-                        &[majit_ir::Type::Int],
-                        fresh_call_ei.clone(),
-                    );
-                    alloc_results.push(alloc_result);
-                    args.push(alloc_result);
-                    red_values.push(fresh_values[idx]);
+                for &src in reds_r {
+                    let (op, bits) = self.read_ref_reg(ctx, src);
+                    args.push(op);
+                    red_values.push(majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)));
                     arg_types.push(majit_ir::Type::Ref);
-                    idx += 1;
                 }
-                _ => return refuse_unexecuted_recursive_call(ctx),
-            }
-        }
-        if capacities.next().is_some() {
-            return refuse_unexecuted_recursive_call(ctx);
-        }
+                for &src in reds_f {
+                    let (op, bits) = self.read_float_reg(ctx, src);
+                    args.push(op);
+                    red_values.push(majit_ir::Value::Float(f64::from_bits(bits as u64)));
+                    arg_types.push(majit_ir::Type::Float);
+                }
+                let fresh_call_ei = majit_ir::EffectInfo {
+                    can_collect: false,
+                    ..majit_ir::EffectInfo::new(
+                        majit_ir::descr::ExtraEffect::CannotRaise,
+                        majit_ir::descr::OopSpecIndex::None,
+                    )
+                };
+                (
+                    args,
+                    red_values,
+                    arg_types,
+                    Vec::new(),
+                    fresh_call_ei,
+                    std::ptr::null(),
+                    Box::new(()) as Box<dyn std::any::Any>,
+                )
+            } else {
+                let (fresh_values, fresh_owner) = synthesized.unwrap();
+                let fresh_capacities = match sym.recursive_fresh_entry_vable_capacities() {
+                    Some(capacities) => capacities,
+                    None => return refuse_unexecuted_recursive_call(ctx, "no fresh capacities"),
+                };
+                let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
+                    Some(targets) => targets,
+                    None => return refuse_unexecuted_recursive_call(ctx, "no alloc targets"),
+                };
+                let fresh_call_ei = majit_ir::EffectInfo {
+                    can_collect: false,
+                    ..majit_ir::EffectInfo::new(
+                        majit_ir::descr::ExtraEffect::CannotRaise,
+                        majit_ir::descr::OopSpecIndex::None,
+                    )
+                };
+                let mut args = Vec::with_capacity(fresh_values.len());
+                let mut red_values = Vec::with_capacity(fresh_values.len());
+                let mut arg_types = Vec::with_capacity(fresh_values.len());
+                let mut alloc_results: Vec<OpRef> = Vec::new();
+                let mut capacities = fresh_capacities.into_iter();
+                let mut idx = 0;
+                while idx < fresh_values.len() {
+                    match fresh_values[idx] {
+                        majit_ir::Value::Int(n) => {
+                            args.push(OpRef::const_int(n));
+                            red_values.push(majit_ir::Value::Int(n));
+                            arg_types.push(majit_ir::Type::Int);
+                            idx += 1;
+                        }
+                        majit_ir::Value::Ref(_) => {
+                            let cap = match capacities.next() {
+                                Some(cap) => cap,
+                                None => {
+                                    return refuse_unexecuted_recursive_call(
+                                        ctx,
+                                        "capacity exhausted",
+                                    );
+                                }
+                            };
+                            let cap_arg = OpRef::const_int(cap);
+                            let alloc_result = ctx.call_ref_typed_with_effect(
+                                alloc_fp,
+                                &[cap_arg],
+                                &[majit_ir::Type::Int],
+                                fresh_call_ei.clone(),
+                            );
+                            alloc_results.push(alloc_result);
+                            args.push(alloc_result);
+                            red_values.push(fresh_values[idx]);
+                            arg_types.push(majit_ir::Type::Ref);
+                            idx += 1;
+                        }
+                        _ => return refuse_unexecuted_recursive_call(ctx, "bad fresh value"),
+                    }
+                }
+                if capacities.next().is_some() {
+                    return refuse_unexecuted_recursive_call(ctx, "extra capacity");
+                }
+                (
+                    args,
+                    red_values,
+                    arg_types,
+                    alloc_results,
+                    fresh_call_ei,
+                    free_fp,
+                    fresh_owner,
+                )
+            };
 
         // 8-step `do_residual_call(assembler_call=True)` protocol, mirroring
         // the `BC_CALL_ASSEMBLER_INT` arm in this file, except the
@@ -4131,7 +4209,9 @@ where
                 let concrete =
                     match runtime.execute_recursive_assembler_ref(&token_arc, &red_values) {
                         Some(value) => value,
-                        None => return TraceAction::Abort,
+                        None => {
+                            return refuse_unexecuted_recursive_call(ctx, "assembler ref none");
+                        }
                     };
                 ctx.vrefs_after_residual_call();
                 let traced = ctx.call_assembler_ref_arc_typed_with_value(

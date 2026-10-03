@@ -51,6 +51,7 @@ impl SpecQueue {
         }
     }
 
+
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
         // The leaf carries the hash of the rendered key, so a second request
         // under it is the same instantiation even when its JSON spells a type
@@ -572,7 +573,7 @@ fn subst_vars(
 
 /// Depth-0 `TypeVar` index: `{"TypeVar":{"Bound":[0, i]}}` or
 /// `{"TypeVar":{"Free": i}}`.
-fn type_var_index(v: &Value) -> Option<usize> {
+pub(crate) fn type_var_index(v: &Value) -> Option<usize> {
     let var = v.as_object()?.get("TypeVar")?;
     if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
         if bound.first()?.as_u64()? != 0 {
