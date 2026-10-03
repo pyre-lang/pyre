@@ -19,15 +19,12 @@ use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
 use crate::annotator::model::SomeObjectTrait;
-use crate::codewriter::jtransform::{
-    GraphTransformConfig, LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY,
-    VirtualizableFieldDescriptor,
-};
+use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph,
+    CallTarget, ConcreteType, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph,
     IndirectFamilyKey, InstanceFlags, LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
 };
 use crate::parse::{CallPath, GraphSpecialization};
@@ -5749,13 +5746,6 @@ fn is_known_by_value_struct(
     type_name: &str,
 ) -> bool {
     let type_name = type_name.trim();
-    // Inline `Vec<T>` / `String` headers are FLAG_STRUCT three-word
-    // values (`field_layout_is_inline_vec`; `alloc::string::String { vec:
-    // Vec<u8> }`). Classify them in `get_type_flag` instead of flattening
-    // a known-struct size.
-    if crate::vec_layout::field_layout_is_inline_vec(type_name) {
-        return false;
-    }
     // A by-value struct is spelled as a nominal path.  Every non-nominal
     // carrier opens with a sigil — `*mut`/`*const`, `&`/`&mut`, `[T]`/`[T; N]`,
     // `(A, B)`, `dyn`/`impl` — so reject on the leading token structurally
@@ -5769,21 +5759,12 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Rc<")
         || crate::vec_layout::field_layout_is_inline_vec(type_name)
         || type_name.starts_with("Option<")
+        || type_name == "String"
         || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
     {
         return false;
     }
-    if known_structs.contains(type_name)
-        || majit_ir::descr::positional_shape_id(type_name).is_some()
-    {
-        return true;
-    }
-    // `generic_owner_lookup`: registry and layout keys drop the argument
-    // list (`Raw<f64>` → `Raw`). A template field `Constants<??TypeVar#0>`
-    // is the known struct `Constants`.
-    let key = layout_struct_key(type_name);
-    key != type_name
-        && (known_structs.contains(key) || majit_ir::descr::positional_shape_id(key).is_some())
+    known_structs.contains(type_name) || majit_ir::descr::positional_shape_id(type_name).is_some()
 }
 
 /// Path before a generic argument list. `bookkeeper.rs` `generic_owner_lookup`.
@@ -5898,12 +5879,15 @@ impl StructLayout {
                 }
                 continue;
             }
-            let (flag, field_type, field_size) = field_metadata(
-                type_str,
-                known_structs,
-                known_struct_sizes,
-                raw_alloc_flavor_structs,
-            );
+            let (flag, field_type, field_size) =
+                quasi_immut_mutate_slot_layout(name, immutable_field_ranks).unwrap_or_else(|| {
+                    field_metadata(
+                        type_str,
+                        known_structs,
+                        known_struct_sizes,
+                        raw_alloc_flavor_structs,
+                    )
+                });
             let rank = immutable_field_ranks.get(name).copied();
             if field_type == majit_ir::value::Type::Void || field_size == 0 {
                 // `lltype.Void` still occupies a `_names` slot
@@ -6016,6 +6000,13 @@ impl StructLayout {
             if let Some(&offset) = exact_offsets.get(&fl.name) {
                 fl.offset = offset as usize;
             }
+            if let Some((flag, field_type, field_size)) =
+                quasi_immut_mutate_slot_layout(&fl.name, immutable_field_ranks)
+            {
+                fl.flag = flag;
+                fl.field_type = field_type;
+                fl.size = field_size;
+            }
         }
         let present: std::collections::HashSet<&str> =
             self.fields.iter().map(|f| f.name.as_str()).collect();
@@ -6031,12 +6022,15 @@ impl StructLayout {
             let Some(&offset) = exact_offsets.get(name) else {
                 continue;
             };
-            let (flag, field_type, field_size) = field_metadata(
-                type_str,
-                known_structs,
-                known_struct_sizes,
-                raw_alloc_flavor_structs,
-            );
+            let (flag, field_type, field_size) =
+                quasi_immut_mutate_slot_layout(name, immutable_field_ranks).unwrap_or_else(|| {
+                    field_metadata(
+                        type_str,
+                        known_structs,
+                        known_struct_sizes,
+                        raw_alloc_flavor_structs,
+                    )
+                });
             let rank = immutable_field_ranks.get(name).copied();
             let size = if field_type == majit_ir::value::Type::Void || field_size == 0 {
                 0
@@ -11513,6 +11507,54 @@ impl CallControl {
         self.declared_graph_result_type(&graph)
     }
 
+    /// Raw ADT / scalar returns have a coarse `ref` frontend token but an
+    /// int-bank `FUNC.RESULT`. Recover that declared repr for untyped call
+    /// sites too, including residual tokens other than the literal `"ref"`
+    /// (`i64`, `raw:<owner>`).
+    pub(crate) fn declared_raw_result_for_target(&self, target: &CallTarget) -> bool {
+        self.declared_result_type_for_target(target) == Some(Type::Int)
+    }
+
+    /// `call.py get_jitcode_calldescr` `FUNC.RESULT` kind for a direct
+    /// target. `None` when the graph has no `return_type` stamp
+    /// (`mir.rs` ordinary fns keep it empty so TyRef labels cannot
+    /// disagree with the CFG).
+    pub(crate) fn declared_return_kind_for_target(&self, target: &CallTarget) -> Option<char> {
+        let (path, _) = self.target_to_path_and_graph(target)?;
+        self.declared_return_kind(&path)
+    }
+
+    /// `flatten.py make_return` colour of a registered callee:
+    /// `getkind(returnblock.inputargs[0].concretetype)`. `None` when
+    /// the cell is still Unknown (isolated / pre-rtyper graphs).
+    pub(crate) fn cfg_result_kind_for_target(&self, target: &CallTarget) -> Option<char> {
+        let (_, graph) = self.target_to_path_and_graph(target)?;
+        let arg = graph.block(graph.returnblock).inputargs.first()?;
+        match FunctionGraph::concretetype_of(arg) {
+            ConcreteType::Signed => Some('i'),
+            ConcreteType::GcRef => Some('r'),
+            ConcreteType::Float => Some('f'),
+            ConcreteType::Void => Some('v'),
+            ConcreteType::Unknown => None,
+        }
+    }
+
+    /// CFG colour as `FUNC.RESULT` only when the graph has no declared
+    /// stamp (`func_result_kind` falls back to the returnblock). A
+    /// present declared type is `call.py getcalldescr` `FUNC.RESULT`;
+    /// `dont_look_inside` residuals can carry a Signed returnblock that
+    /// never went through finalize.
+    pub(crate) fn undeclared_cfg_result_kind_for_target(
+        &self,
+        target: &CallTarget,
+    ) -> Option<char> {
+        if self.declared_result_type_for_target(target).is_some() {
+            None
+        } else {
+            self.cfg_result_kind_for_target(target)
+        }
+    }
+
     /// `call.py getcalldescr` reads `FUNC.RESULT`, including the pointee's
     /// `_gckind`. A frontend `ref` token also needs its declared class root
     /// to distinguish a raw Struct pointer from a GC reference.
@@ -12501,6 +12543,7 @@ impl CallControl {
         self.function_fnaddrs
             .get(path)
             .copied()
+            .map(|bound| bound.addr)
             .unwrap_or_else(|| symbolic_fnaddr_for_path(path))
     }
 
@@ -12519,7 +12562,7 @@ impl CallControl {
     /// when the host published one, otherwise the symbolic hash, with the
     /// registry key the patcher rebinds by.
     pub fn fnaddr_binding_for_path(&self, path: &CallPath) -> FnAddrBinding {
-        match self.resolved_function_fnaddr(path) {
+        match self.concrete_fnaddr_binding(path) {
             Some((resolved, addr)) => self.bind_fnaddr(resolved, addr, false),
             None => self.bind_fnaddr(path.clone(), symbolic_fnaddr_for_path(path), true),
         }
@@ -15295,9 +15338,9 @@ pub struct FnAddrBinding {
 /// args/result, so `getcalldescr(op)` and the pointer cannot disagree.
 /// pyre compiles the trampoline separately, so the binding checks it.
 #[derive(Clone, Copy, Debug)]
-struct BoundFnAddr {
-    addr: i64,
-    abi: &'static str,
+pub(crate) struct BoundFnAddr {
+    pub(crate) addr: i64,
+    pub(crate) abi: &'static str,
 }
 
 impl Default for CallControl {
@@ -17338,6 +17381,26 @@ fn trace_field_ei_descr_mint(
     }
 }
 
+/// `rclass.py InstanceRepr._setup_repr` appends
+/// `('mutate_' + name, OBJECTPTR)` for each quasi-immutable field.
+/// A mutate slot holds a `QuasiImmut` instance (`quasiimmut.py`); the
+/// JIT fielddescr is a Ref field of the same STRUCT.
+fn quasi_immut_mutate_slot_layout(
+    name: &str,
+    immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
+) -> Option<(majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize)> {
+    let watched = name.strip_prefix("mutate_")?;
+    let rank = immutable_field_ranks.get(watched)?;
+    if !rank.is_quasi_immutable() {
+        return None;
+    }
+    Some((
+        majit_ir::descr::ArrayFlag::Pointer,
+        majit_ir::value::Type::Ref,
+        crate::layout::target_word_size(),
+    ))
+}
+
 /// RPython: `get_type_flag(TYPE)` (descr.py).
 ///
 /// Returns (ArrayFlag, IR type, size in bytes).
@@ -17893,7 +17956,6 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         })
         .any(|value| families.find_rep(value.clone()) == except_rep)
 }
-
 
 //
 // RPython equivalent: effect classification in `call.py::getcalldescr()`
@@ -20292,6 +20354,53 @@ mod tests {
         assert_eq!(by_value.fields[0].size, 200);
     }
 
+    /// `rclass.py InstanceRepr._setup_repr` seats `mutate_<name>` as
+    /// OBJECTPTR even when harvest spells `AtomicPtr<QuasiImmut>`.
+    #[test]
+    fn from_type_strings_classifies_quasi_mutate_slot_as_ref() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert(
+            "value".to_string(),
+            crate::model::ImmutableRank::QuasiImmutable,
+        );
+        let raw: HashSet<String> = ["QuasiImmut".to_string(), "QuasiImmutLock".to_string()]
+            .into_iter()
+            .collect();
+        let layout = StructLayout::from_type_strings(
+            &[
+                ("value".into(), "*mut PyObject".into()),
+                ("mutate_value".into(), "AtomicPtr<QuasiImmut>".into()),
+                (
+                    "mutate_value_lock".into(),
+                    "AtomicPtr<QuasiImmutLock>".into(),
+                ),
+            ],
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &ranks,
+            &raw,
+        );
+        let mutate = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "mutate_value")
+            .expect("mutate_value row");
+        assert_eq!(mutate.flag, ArrayFlag::Pointer);
+        assert_eq!(mutate.field_type, Type::Ref);
+        assert_eq!(mutate.size, crate::layout::target_word_size());
+        let lock = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "mutate_value_lock")
+            .expect("mutate_value_lock row");
+        assert_eq!(lock.flag, ArrayFlag::Unsigned);
+        assert_eq!(lock.field_type, Type::Int);
+    }
+
     /// `engine::Request.pattern_codes` is `&[u32]` (two words). Sequential
     /// layout then places `must_advance` at 41 for an 8-byte `string`.
     #[test]
@@ -20839,6 +20948,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );
@@ -21203,26 +21313,6 @@ mod tests {
         let (flag, ty, _) = get_type_flag("NotALinkedScalar", &HashSet::new());
         assert_eq!(flag, ArrayFlag::Pointer);
         assert_eq!(ty, majit_ir::value::Type::Ref);
-    }
-
-    /// A template field `Constants<??TypeVar#0>` is the known struct
-    /// `Constants` (`generic_owner_lookup`). `get_type_flag` of the
-    /// unresolved spelling would be FLAG_POINTER.
-    #[test]
-    fn field_metadata_generic_known_struct_is_flag_struct() {
-        let mut known = HashSet::new();
-        known.insert("Constants".to_string());
-        let mut sizes = HashMap::new();
-        sizes.insert("Constants".to_string(), 16);
-        let (flag, ty, size) =
-            field_metadata("Constants<??TypeVar#0>", &known, &sizes, &HashSet::new());
-        assert_eq!(flag, majit_ir::descr::ArrayFlag::Struct);
-        assert_eq!(ty, majit_ir::value::Type::Ref);
-        assert_eq!(size, 16);
-        let (box_flag, _, box_size) =
-            field_metadata("Box<[ConstantData]>", &known, &sizes, &HashSet::new());
-        assert_eq!(box_flag, majit_ir::descr::ArrayFlag::Pointer);
-        assert_eq!(box_size, crate::layout::target_word_size());
     }
 
     /// A by-value `String` field is the inline `Vec<u8>` header
@@ -26933,6 +27023,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descr.result_ir_type(), Type::Int);
 
@@ -27058,6 +27149,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descr.result_ir_type(), Type::Ref);
@@ -28971,6 +29063,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -28993,6 +29086,7 @@ mod tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(
                 descriptor.extra_info.extraeffect,
@@ -29014,6 +29108,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -29059,6 +29154,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             hook_descr.extra_info.extraeffect,
@@ -29072,6 +29168,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert!(
