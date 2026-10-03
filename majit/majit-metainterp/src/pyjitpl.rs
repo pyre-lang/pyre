@@ -30297,7 +30297,7 @@ mod tests {
                 header_pc: 0,
                 vable_ptr: A,
             });
-        meta.tracing = Some(trace_ctx);
+        meta.tracing = Some(Box::new(trace_ctx));
 
         meta.walk_active_trace_refs(|slot| {
             if slot.0 == A {
@@ -30727,6 +30727,140 @@ mod tests {
         assert_eq!(meta.compile_snapshot_refs.len(), 1);
         assert_eq!(meta.compile_snapshot_refs[0], (&raw mut opref) as usize);
         assert_eq!(majit_ir::const_ptr_table::resolve(index), live);
+    }
+
+    /// Nested `compile_and_run_once` parks the outer compile holders
+    /// (`warmstate.py bound_reached` builds a fresh MetaInterp). A
+    /// collection in that window must still forward parked snapshot
+    /// ConstPtr slots, the short-preamble producer, resume memos,
+    /// `compile_vable_root`, and `compile_live_op_roots`.
+    #[test]
+    fn parked_attempt_compile_holders_are_walked() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let snap_dead = GcRef(0x96E5_1100);
+        let snap_live = GcRef(0x96E5_2100);
+        let prod_dead = GcRef(0x96E5_3100);
+        let prod_live = GcRef(0x96E5_4100);
+        let memo_dead = GcRef(0x96E5_5100);
+        let memo_live = GcRef(0x96E5_6100);
+        let vable_dead = GcRef(0x96E5_7100);
+        let vable_live = GcRef(0x96E5_8100);
+        let op_dead = GcRef(0x96E5_9100);
+        let op_live = GcRef(0x96E5_A100);
+        let (mut snap_slot, snap_index, _snap_restore) = intern_const_ptr(snap_dead);
+        let (prod_const, prod_index, _prod_restore) = intern_const_ptr(prod_dead);
+        let (op_const, op_index, _op_restore) = intern_const_ptr(op_dead);
+
+        let memo = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::resume::ResumeDataLoopMemo::new(),
+        ));
+        memo.borrow_mut()
+            .getconst_ref(memo_dead.0 as i64)
+            .expect("pool the parked memo const");
+
+        let sb = crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
+            &[prod_const],
+            &[],
+            &[prod_const],
+        );
+        let tt = crate::history::TargetToken::new_loop(15);
+        let mut producer = Some(
+            crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder::new(
+                tt.as_jump_target_descr(),
+                &sb,
+            ),
+        );
+        let tokens: Vec<std::sync::Arc<crate::history::TargetToken>> = Vec::new();
+        let tokens_addr = (&raw const tokens) as usize;
+        let vable_index = 0xC0DE_u32;
+        let op = majit_ir::OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::GuardTrue,
+            &[majit_ir::operand::Operand::from_opref(op_const)],
+        ));
+        let ops = vec![op];
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.compile_snapshot_refs
+            .push((&raw mut snap_slot) as usize);
+        meta.compile_short_preamble_producer = Some((&raw mut producer) as usize);
+        meta.compile_resume_memos
+            .push(std::rc::Rc::downgrade(&memo));
+        meta.compile_target_tokens = Some(tokens_addr);
+        meta.compile_vable_index = Some(vable_index);
+        meta.compile_vable_root = vable_dead;
+        let _published = meta.compile_live_op_roots.publish_vec(&ops);
+
+        meta.park_attempt();
+        assert!(meta.compile_snapshot_refs.is_empty());
+        assert!(meta.compile_short_preamble_producer.is_none());
+        assert!(meta.compile_resume_memos.is_empty());
+        assert!(meta.compile_target_tokens.is_none());
+        assert!(meta.compile_vable_index.is_none());
+        assert!(meta.compile_vable_root.is_null());
+        assert!(meta.compile_live_op_roots.is_empty());
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut snap_seen = 0;
+        let mut vable_seen = 0;
+        let mut op_seen = 0;
+        meta.walk_compile_snapshot_refs(|slot| {
+            if slot.0 == snap_dead.0 {
+                slot.0 = snap_live.0;
+                snap_seen += 1;
+            }
+            if slot.0 == vable_dead.0 {
+                slot.0 = vable_live.0;
+                vable_seen += 1;
+            }
+            if slot.0 == op_dead.0 {
+                slot.0 = op_live.0;
+                op_seen += 1;
+            }
+        });
+        assert_eq!(snap_seen, 1, "parked compile_snapshot_refs was walked");
+        assert_eq!(vable_seen, 1, "parked compile_vable_root was walked");
+        assert!(op_seen >= 1, "parked compile_live_op_roots was walked");
+        assert_eq!(majit_ir::const_ptr_table::resolve(snap_index), snap_live);
+        assert_eq!(majit_ir::const_ptr_table::resolve(op_index), op_live);
+
+        let mut prod_seen = 0;
+        let mut memo_seen = 0;
+        meta.walk_rd_consts_refs(|slot| {
+            if slot.0 == prod_dead.0 {
+                slot.0 = prod_live.0;
+                prod_seen += 1;
+            }
+            if slot.0 == memo_dead.0 {
+                slot.0 = memo_live.0;
+                memo_seen += 1;
+            }
+        });
+        assert!(
+            prod_seen >= 1,
+            "parked compile_short_preamble_producer was walked"
+        );
+        assert!(memo_seen >= 1, "parked compile_resume_memos was walked");
+        assert_eq!(majit_ir::const_ptr_table::resolve(prod_index), prod_live);
+        // ResumeDataLoopMemo.getconst_ref appends Const::Ref(address)
+        // without intern. walk_rd_consts_refs writes that field, matching
+        // history.py ConstPtr.value / resume.py _newconst.
+        assert_eq!(
+            memo.borrow().consts()[0].getref_base(),
+            memo_live,
+            "walk_rd_consts_refs must write the memo Const::Ref field"
+        );
+
+        meta.restore_attempt();
+        assert_eq!(meta.compile_target_tokens, Some(tokens_addr));
+        assert_eq!(meta.compile_vable_index, Some(vable_index));
+        assert_eq!(meta.compile_vable_root, vable_live);
+        assert!(
+            !meta.compile_live_op_roots.is_empty(),
+            "restore_attempt puts the parked live-op roots back"
+        );
+        assert_eq!(majit_ir::const_ptr_table::resolve(op_index), op_live);
     }
 
     fn intern_const_ptr(addr: GcRef) -> (OpRef, u32, RestoreConstPtr) {

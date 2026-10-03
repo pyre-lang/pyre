@@ -11073,7 +11073,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `MetaInterp.newframe` owns the callee's frame and scratch allocations.
     // A declined inline discards them along with the callee body, so measure
     // its lifetime before emitting the frame rather than at body entry.
-    let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
+    let callee_entry_pos = ctx.trace_ctx.get_trace_position();
+    let callee_entry_trace_index = callee_entry_pos._index;
     // Each precondition below answers "can the multiframe seed serve this
     // callee".  A "no" declines the INLINE — `Ok(None)`, this function's own
     // did-not-inline answer, which every caller follows to the ordinary
@@ -11363,6 +11364,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // them above the paused-caller-frame gate lets its try-block decline use
     // the same Entry-carrier predicates as a zero-effect sub-walk abort.
     let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
+    let abort_latched_before_subwalk = super::residual_call::abort_blackhole_latched();
     let executed_effects_before = fbw_executed_effect_count();
     let is_top_inline = !ctx.fbw_mode.inline_subwalk;
     let abort_flush_call_jitcode_coord: Option<(u32, usize)> = if is_top_inline {
@@ -11585,6 +11587,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callee_class_of_last_exc_is_const,
         mut operator_tail_caller,
         deferred_portal_leave,
+        midbody_latched,
+        subwalk_nothing_applied,
     ) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -12015,6 +12019,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             _ => None,
         };
+        let mut midbody_latched = false;
         if let Some((abort_pc, abort_kind)) = midbody_abort {
             if is_top_inline && !unjournaled_before_subwalk {
                 crate::trace::fbw_diag::bump(crate::trace::fbw_diag::MIDBODY_LATCH);
@@ -12228,7 +12233,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     })
                 })();
                 match payload {
-                    Ok(payload) => fbw_set_midbody_abort_resume(payload),
+                    Ok(payload) => {
+                        fbw_set_midbody_abort_resume(payload);
+                        midbody_latched = true;
+                    }
                     Err(reason) => {
                         if fbw_debug_abort_enabled() {
                             eprintln!(
@@ -12246,11 +12254,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // level; a pre-call clone of `InlineParentFrame` is unrooted.
         let operator_tail_caller =
             operator_tail.and_then(|_| _inline_frame.rooted_immediate_caller());
+        let subwalk_nothing_applied = fbw_executed_effect_count() == executed_effects_before
+            && !unjournaled_before_subwalk
+            && !fbw_has_unjournaled_effect();
         (
             result,
             class_of_last_exc_is_const,
             operator_tail_caller,
             deferred_portal_leave,
+            midbody_latched,
+            subwalk_nothing_applied,
         )
     };
     // `executioncontext.py leave`, in execute_frame's `finally`. The
@@ -12332,6 +12345,40 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         Err(e) => {
             if fbw_inline_diag_enabled() {
                 eprintln!("[inline-abort] callee sub-walk err: {e:?}");
+            }
+            // `do_residual_or_indirect_call` (`pyjitpl.py`) residualizes a
+            // callee it cannot follow; the enclosing trace continues.
+            // A mid-body latch that rebuilt the callee still returns the
+            // error so `convert_and_run_from_pyjitpl` (`blackhole.py`)
+            // adopts it. An effect-free LBC whose rebuild did not latch
+            // has no such carrier: aborting here discarded the parent
+            // walk (the portal never reached its own `loop_header` /
+            // `reached_loop_header`) and the interpreter replay re-ran
+            // the CALL. `cut_declined_subwalk` removes the callee
+            // MIFrame, so the abort image this sub-walk latched from it
+            // is dropped too; otherwise `convert_and_run_from_pyjitpl`
+            // re-enters a callee whose CALL the parent executes as a
+            // residual.
+            if !midbody_latched
+                && subwalk_nothing_applied
+                && !abort_latched_before_subwalk
+                && matches!(
+                    e,
+                    DispatchError::LoopBearingCalleeInlineUnsupported {
+                        blackhole_required: false,
+                        ..
+                    }
+                )
+            {
+                // `opimpl_jit_merge_point` consumes the callee's
+                // `seen_loop_header_for_jdindex` before CALL_ASSEMBLER.
+                // Residualizing without that merge must not leave the
+                // stamp for the portal's next merge point.
+                ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+                let _ = ctx.trace_ctx.seen_loop_header_jit_pc.take();
+                super::residual_call::reset_single_frame_blackhole();
+                cut_declined_subwalk(ctx, callee_entry_pos);
+                return resolved_inline_decline(op.pc, line!());
             }
             // A seeded inline abort latches the live framestack in `walk`
             // and converts through `convert_and_run_from_pyjitpl`

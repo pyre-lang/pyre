@@ -9837,6 +9837,107 @@ mod tests {
     }
 
     #[test]
+    fn test_assemble_peeled_trace_carries_forwarded_alias_used_after_label() {
+        // preamble i3, make_equal_to(i3, i50), body IntAdd(i50),
+        // label_args=[i10]. compile.py `compile_loop` emits the
+        // invented-name SameAs and puts that box on the LABEL
+        // (`finalize_short_preamble` `used_boxes`).
+        let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    Operand::from_opref(OpRef::const_int(0)),
+                    Operand::from_opref(OpRef::const_int(1)),
+                ],
+            );
+            op.pos().set(OpRef::int_op(3));
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(
+                    OpCode::IntAdd,
+                    &[
+                        rooted_resop_operand(Type::Int, 50),
+                        Operand::from_opref(OpRef::const_int(1)),
+                    ],
+                );
+                op.pos().set(OpRef::int_op(4));
+                op
+            },
+            {
+                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 10)]);
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
+        ];
+        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
+            .iter()
+            .map(|op| majit_ir::OpRc::new(op.clone()))
+            .collect();
+        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
+            .iter()
+            .map(|op| majit_ir::OpRc::new(op.clone()))
+            .collect();
+        let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
+        let src = ctx.materialize_operand_at(OpRef::int_op(3));
+        let dst = ctx.materialize_operand_at(OpRef::int_op(50));
+        ctx.make_equal_to(&src, &dst);
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        let combined = assemble_peeled_trace_with_jump_args(
+            &p1_ops_rc,
+            &p2_ops_rc,
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[],
+            &[],
+            1,
+            0,
+            true,
+            &[],
+            &constants,
+            None,
+            Some(loop_descr),
+            &[],
+            &mut Vec::new(),
+            &mut ctx,
+        );
+
+        assert_assembled_loop_ssa_and_label_contract(&combined, &constants);
+
+        let label_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Label)
+            .expect("Label");
+        let label_args: Vec<_> = combined[label_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert!(label_args.contains(&OpRef::int_op(10)));
+        assert!(
+            label_args.contains(&OpRef::int_op(50)),
+            "forwarded alias must be a LABEL slot, got {label_args:?}"
+        );
+        let jump_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Jump)
+            .expect("Jump");
+        let jump_args: Vec<_> = combined[jump_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(jump_args.len(), label_args.len());
+        assert!(
+            jump_args.contains(&OpRef::int_op(50)),
+            "JUMP must carry the forwarded alias into the LABEL slot, got {jump_args:?}"
+        );
+    }
+
+    #[test]
     fn test_assemble_non_redirected_jump_matches_appended_label_arity() {
         // consider_arg appends a preamble-defined box used after the LABEL
         // (unroll.py finalize_short_preamble: label_op.initarglist(
