@@ -508,11 +508,12 @@ pub fn ll_vec_items_i(l: &mut Vec<usize>) -> usize {
     vec_header_word(vec_header_i(l), VEC_PTR_WORD)
 }
 
-/// `ll_extend` from the `(items, length)` slice: `_ll_resize_ge` to the
-/// summed length, then `ll_arraycopy` of the items.
+/// `ll_extend` from the `(items, length)` slice. `ovfcheck` on `len1 + len2`
+/// rejects a wrapping sum, then `_ll_resize_ge` and `ll_arraycopy`.
 pub fn ll_vec_extend_from_slice_i(l: &mut Vec<usize>, items: usize, length: usize) {
     let len1 = ll_vec_length_i(l);
-    ll_vec_resize_ge_i(l, len1 + length);
+    let newlen = len1.checked_add(length).expect("Vec capacity overflow");
+    ll_vec_resize_ge_i(l, newlen);
     ll_slice_arraycopy_i(items, ll_vec_items_i(l), 0, len1, length);
 }
 
@@ -527,11 +528,12 @@ pub fn ll_slice_arraycopy_i(
     dest_start: usize,
     length: usize,
 ) {
+    let nbytes = item_bytes(length, ITEM_SIZE_I).expect("Vec capacity overflow");
     unsafe {
         std::ptr::copy_nonoverlapping(
             slice_item_addr(source, source_start, ITEM_SIZE_I) as *const u8,
             slice_item_addr(dest, dest_start, ITEM_SIZE_I) as *mut u8,
-            length * ITEM_SIZE_I,
+            nbytes,
         );
     }
 }
@@ -852,11 +854,12 @@ pub fn ll_vec_items_r(l: &mut Vec<*mut u8>) -> usize {
     vec_header_word(vec_header_r(l), VEC_PTR_WORD)
 }
 
-/// `ll_extend` from the `(items, length)` slice: `_ll_resize_ge` to the
-/// summed length, then `ll_arraycopy` of the items.
+/// `ll_extend` from the `(items, length)` slice. `ovfcheck` on `len1 + len2`
+/// rejects a wrapping sum, then `_ll_resize_ge` and `ll_arraycopy`.
 pub fn ll_vec_extend_from_slice_r(l: &mut Vec<*mut u8>, items: usize, length: usize) {
     let len1 = ll_vec_length_r(l);
-    ll_vec_resize_ge_r(l, len1 + length);
+    let newlen = len1.checked_add(length).expect("Vec capacity overflow");
+    ll_vec_resize_ge_r(l, newlen);
     ll_slice_arraycopy_r(items, ll_vec_items_r(l), 0, len1, length);
 }
 
@@ -914,7 +917,7 @@ pub fn ll_slice_arraycopy_r(
         std::ptr::copy_nonoverlapping(
             slice_item_addr(source, source_start, ITEM_SIZE_R) as *const u8,
             slice_item_addr(dest, dest_start, ITEM_SIZE_R) as *mut u8,
-            length * ITEM_SIZE_R,
+            item_bytes(length, ITEM_SIZE_R).expect("Vec capacity overflow"),
         );
     }
 }
@@ -1232,11 +1235,12 @@ pub fn ll_vec_items_f(l: &mut Vec<f64>) -> usize {
     vec_header_word(vec_header_f(l), VEC_PTR_WORD)
 }
 
-/// `ll_extend` from the `(items, length)` slice: `_ll_resize_ge` to the
-/// summed length, then `ll_arraycopy` of the items.
+/// `ll_extend` from the `(items, length)` slice. `ovfcheck` on `len1 + len2`
+/// rejects a wrapping sum, then `_ll_resize_ge` and `ll_arraycopy`.
 pub fn ll_vec_extend_from_slice_f(l: &mut Vec<f64>, items: usize, length: usize) {
     let len1 = ll_vec_length_f(l);
-    ll_vec_resize_ge_f(l, len1 + length);
+    let newlen = len1.checked_add(length).expect("Vec capacity overflow");
+    ll_vec_resize_ge_f(l, newlen);
     ll_slice_arraycopy_f(items, ll_vec_items_f(l), 0, len1, length);
 }
 
@@ -1255,7 +1259,7 @@ pub fn ll_slice_arraycopy_f(
         std::ptr::copy_nonoverlapping(
             slice_item_addr(source, source_start, ITEM_SIZE_F) as *const u8,
             slice_item_addr(dest, dest_start, ITEM_SIZE_F) as *mut u8,
-            length * ITEM_SIZE_F,
+            item_bytes(length, ITEM_SIZE_F).expect("Vec capacity overflow"),
         );
     }
 }
@@ -1394,6 +1398,13 @@ mod tests {
     #[should_panic(expected = "Vec capacity overflow")]
     fn slice_buffer_new_rejects_a_wrapping_length() {
         let _ = ll_slice_buffer_new_i(usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "Vec capacity overflow")]
+    fn extend_from_slice_rejects_a_wrapping_length() {
+        let mut l = ll_vec_newlist_i(1);
+        ll_vec_extend_from_slice_i(&mut l, 0, usize::MAX);
     }
 
     #[test]
