@@ -12527,10 +12527,11 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// virtual, and `pyframe.py fast2locals` — `@jit.unroll_safe`, so
 /// `policy.py` looks inside it — traced through reading that virtual's
 /// fields.  Pyre's counterpart of the virtual is [`CalleeLocalsShadow`]: every
-/// visible fastlocal of this level is already an SSA value the walk holds, and
-/// `getarrayitem_vable_via_metainterp`'s strict fresh-frame fold is what
-/// answers the level's own `LOAD_FAST` from it.  Sourcing the expansion from
-/// the same map is therefore the same read the callee's own bytecode makes.
+/// visible fastlocal of this level is already an SSA value the walk holds
+/// (`setarrayitem_vable` re-seeds `opref` on every store, and
+/// `getarrayitem_vable` records `getarrayitem_gc` whose heapcache hit is
+/// that same box).  Sourcing the expansion from the same map is therefore
+/// the same read the callee's own bytecode makes.
 ///
 /// Emitted shape: `guard_value(callable)` when the name is not already a trace
 /// constant; `jit_locals_dict_new` (the `space.newdict(instance=True)` a fresh
@@ -12547,12 +12548,12 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// the portal arm, whose slots come out of a virtualizable array the compiled
 /// loop re-reads.
 ///
-/// A level whose frame the seed block materialised is NOT excluded.  The
-/// `frame_materialized` flag governs STORES — `folded_store_is_observable_local`
-/// demotes a `STORE_FAST` into a recorded `SETARRAYITEM_GC` so a frame reached
-/// later through a traceback, `f_locals` or `sys._getframe` sees the value —
-/// and that demoted store still re-seeds `opref`, so the shadow and the heap
-/// array hold the same value.  Reading is what this arm does, and it reads the
+/// A level whose frame the seed block materialised is NOT excluded.
+/// `_opimpl_setarrayitem_vable` records `SETARRAYITEM_GC` for a
+/// non-standard (inlined) frame so a force (`CALL_ASSEMBLER`, traceback,
+/// `f_locals`, `sys._getframe`) materialises the stored value, and that
+/// store still re-seeds `opref`, so the shadow and the heap array hold
+/// the same value.  Reading is what this arm does, and it reads the
 /// channel the level's own `LOAD_FAST` reads.
 ///
 /// Returns `None` (fall through to the generic residual, SAFE — exactly the

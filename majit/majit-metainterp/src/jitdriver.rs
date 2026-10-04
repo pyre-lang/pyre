@@ -1976,16 +1976,6 @@ impl<S: JitState> JitDriver<S> {
         self.last_bridge_is_exception_guard = parked.last_bridge_is_exception_guard;
         self.bridge_attempt_declined = parked.bridge_attempt_declined;
     }
-
-    /// Drop a heapcache field on the restored outer walk.
-    ///
-    /// Nested interpreter execution can store through a box this walk does
-    /// not hold; the parked `CacheEntry` would then disagree with the heap.
-    pub fn clear_tracing_heapcache_field(&mut self, field_index: u32) {
-        if let Some(ctx) = self.meta.tracing.as_mut() {
-            ctx.heap_cache_mut().clear_field(field_index);
-        }
-    }
 }
 
 /// Per-entry scratch owned by [`JitDriver`]; see [`JitDriver::entry_scratch`].

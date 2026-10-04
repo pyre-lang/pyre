@@ -575,11 +575,15 @@ fn null_vable_dead_array_tail(ctx: &mut TraceCtx, from: usize) {
 /// `pyjitpl.py` `capture_resumedata` saves `frame.pc` before rewriting it for
 /// the snapshot and restores it afterwards. The walker publishes those
 /// scalars into `virtualizable_boxes` because `build_snapshot_vable_vref_boxes`
-/// reads that shadow. The restore is boxes-only (`nosync`). `last_instr` is
-/// published boxes-only too, so its heap copy stays equal to the restored box
-/// (`check_synchronized_virtualizable`). `valuestackdepth` is published to the
-/// live frame as well: `close_loop_args_at` reads the concrete depth, which
-/// the walker otherwise never advances.
+/// reads that shadow. Each scalar is restored through the channel that
+/// published it, so the virtualizable stays equal to its boxes
+/// (`check_synchronized_virtualizable`). `last_instr` is published and
+/// restored boxes-only (`nosync`). `valuestackdepth` is published to the
+/// virtualizable as well, because `close_loop_args_at` reads the concrete
+/// depth, which the walker otherwise never advances. Its restore therefore
+/// goes through `_opimpl_setfield_vable` (`synchronize_virtualizable_at`);
+/// a boxes-only restore would leave the published depth on the
+/// virtualizable for the next shadow refresh to read back.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SavedVableResumeScalars {
     last_instr: Option<(OpRef, Value)>,
@@ -605,7 +609,7 @@ pub(crate) fn restore_vable_resume_scalars(ctx: &mut TraceCtx, saved: SavedVable
         mirror_vable_static_to_boxes_nosync(ctx, "last_instr", opref, concrete);
     }
     if let Some((opref, concrete)) = saved.valuestackdepth {
-        mirror_vable_static_to_boxes_nosync(ctx, "valuestackdepth", opref, concrete);
+        mirror_vable_static_to_boxes(ctx, "valuestackdepth", opref, concrete);
     }
 }
 
