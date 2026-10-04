@@ -9992,12 +9992,10 @@ fn eval_with_jit_inner(
     // bridge trace's symbolic state.
     //
     // Declines before `install_current_frame`, like every decline above it.
-    // Both that helper and `ExecutionContext::enter` link the frame into the
-    // `topframeref`/`f_backref` chain, and `execute_frame_plain` reaches
-    // `enter` through `eval_frame_plain_with_resume`.  Linking twice makes the
-    // second `enter` read the `topframeref` the first one just set to this
-    // same frame, so `f_backref` ends up naming the frame itself and
-    // `walk_pyframe_roots` — which has no cycle guard — never terminates.
+    // A resume-rebuilt frame never reaches this door: guard-failure resume,
+    // CALL_ASSEMBLER force, and the blackhole recursive portal call
+    // `continue_entered_frame` (`blackhole.py` `_resume_mainloop`,
+    // `resume_in_blackhole`, `bhimpl_jit_merge_point`).
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
@@ -10236,7 +10234,7 @@ fn portal_activation_bracketed(
 /// Called from handle_jitexception_in_portal (via portal_runner callback)
 /// when ContinueRunningNormally is raised at a recursive portal level.
 /// Extracts the red_ref values (frame locals as PyObjectRef pointers)
-/// and calls the portal function (eval_with_jit) with those values.
+/// and continues `portal_ptr` = `dispatch` with the pending `leave`.
 ///
 /// Returns Ok((return_type, value)) or Err(JitException) if the portal
 /// itself raises a JitException (warmspot.py loop back).
@@ -10322,7 +10320,10 @@ pub(crate) fn pyre_portal_runner(
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
     }
-    let result = portal_body_result(frame);
+    // Recursive-portal CRN (`blackhole.py` `_handle_jitexception_in_portal`):
+    // this level's enter already ran; `portal_ptr` is `dispatch` and
+    // `execute_frame`'s `finally: leave` still owes.
+    let result = continue_entered_frame(frame);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
@@ -10781,6 +10782,64 @@ pub(crate) fn portal_traced_activation_result(frame: &mut PyFrame) -> PyResult {
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame_tls_only(frame_root.frame());
     portal_activation_bracketed(&mut frame_root, None, None, PortalLeaveOwner::CompiledTrace)
+}
+
+/// `blackhole.py bhimpl_jit_merge_point` recursive-portal arm: `portal_ptr`
+/// after an already-open `execute_frame` enter.
+///
+/// Resume rebuilt the chain from the virtualrefs; `walker_ec_enter` recorded
+/// the enter.  Re-linking here (`install_current_frame`) stores the current
+/// top into this ancestor's `f_backref` and closes a cycle.  Blackhole does
+/// not replay the trace's `leave`, so this door still runs
+/// `ExecutionContext.leave` — `execute_frame`'s `finally` after `portal_ptr`
+/// returns.
+pub(crate) fn portal_blackhole_recursive_result(frame: &mut PyFrame) -> PyResult {
+    continue_entered_frame(frame)
+}
+
+/// Continue a frame whose `execute_frame` enter already ran.
+///
+/// `resume.py` `rebuild_from_resumedata` restores the chain from the
+/// virtualrefs; `blackhole.py` `_resume_mainloop` continues the portal /
+/// callee jitcode from the resume pc. `portal_ptr` is `PyFrame.dispatch`
+/// (`warmspot.py` `handle_jitexception` ContinueRunningNormally arm),
+/// inside the still-open enter/leave. Dispatch from the resume pc through
+/// `eval_loop_jit`, then `ExecutionContext.leave` — `execute_frame`'s
+/// `finally`. A JIT-less `eval_loop` would skip `jit_merge_point` and
+/// run `PUSH_EXC_INFO` against an unforced virtualizable stack.
+pub(crate) fn continue_entered_frame(frame: &mut PyFrame) -> PyResult {
+    let mut frame_root = FrameRoot::new(frame);
+    frame_root.frame().fix_array_ptrs();
+    let _frame_guard = pyre_interpreter::eval::install_current_frame_tls_only(frame_root.frame());
+    let ec = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
+    let mut w_exitvalue = w_none();
+    let mut outer_result = portal_body_result(frame_root.frame());
+    if let Ok(value) = &outer_result {
+        w_exitvalue = *value;
+    }
+    if ec.is_null() {
+        return outer_result;
+    }
+    let leave_result = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let err_slot = match &outer_result {
+            Err(err) => Some(err.pin_gc_refs(&roots)),
+            Ok(_) => None,
+        };
+        let left = unsafe {
+            (*ec).leave(
+                frame_root.frame() as *mut PyFrame,
+                w_exitvalue,
+                outer_result.is_err(),
+            )
+        };
+        if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
+            err.reload_gc_refs(&roots, base);
+        }
+        left
+    };
+    let live = leave_result?;
+    outer_result.map(|_| live)
 }
 
 /// warmspot.py ll_portal_runner:
@@ -12533,6 +12592,16 @@ impl NestedTraceGuard {
         if !driver.is_tracing() {
             return Self { parked: false };
         }
+        // `warmstate.py bound_reached` builds a fresh MetaInterp that reads
+        // the interpreter's real virtualizable. The outer walk's locals live
+        // in boxes / the tracing snapshot until a residual flush; write them
+        // onto the live frame before parking so the inner
+        // `compile_and_run_once` `extract_live` sees the values RPython's
+        // `synchronize_virtualizable` would already have stored
+        // (`virtualizable.py force_now`: values always correct during tracing).
+        if let Some(ctx) = driver.meta_interp_mut().trace_ctx() {
+            pyre_jit_trace::jitcode_dispatch::flush_live_virtualizable_before_nested_trace(ctx);
+        }
         pyre_jit_trace::jitcode_dispatch::park_walk_tls();
         pyre_jit_trace::trace::park_walk_end();
         driver.park_nested_trace();
@@ -12547,7 +12616,6 @@ impl Drop for NestedTraceGuard {
         }
         let (driver, _) = driver_pair();
         driver.restore_nested_trace();
-        driver.clear_tracing_heapcache_field(pyre_jit_trace::descr::pyframe_flags_descr().index());
         pyre_jit_trace::trace::restore_walk_end();
         pyre_jit_trace::jitcode_dispatch::restore_walk_tls();
     }

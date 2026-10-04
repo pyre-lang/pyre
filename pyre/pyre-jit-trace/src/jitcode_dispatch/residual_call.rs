@@ -2187,16 +2187,12 @@ impl Drop for InlineConcreteFrameGuard {
 /// level too shallow.  Scoped to the call itself so the walk's own frame
 /// bookkeeping outside it is untouched.
 ///
-/// The displaced caller is parked in `frame.f_backref` and nowhere else:
-/// `executioncontext.py enter` writes it there and `leave` reads it back off
-/// the frame it is leaving, so the guard needs no saved copy of its own.  That
-/// is also what keeps the value rooted — `f_backref` is a traced `Type::Ref`
-/// field, so a minor collection inside the residual forwards a nursery
-/// `JitVirtualRef` in place, where a raw copy in this struct would go stale.
-/// Parking it on the shared shadow stack instead, which this guard used to do,
-/// made its restore a LIFO slot the residual could not publish across: the
-/// scope is one residual call, so anything the callee pushed sat above the
-/// guard's own index and was truncated away when the guard exited.
+/// The displaced `topframeref` is parked on an owner root, not in
+/// `frame.f_backref`.  `walker_ec_enter` already stored the recorded
+/// caller vref on that field; rewriting it from the live chain is the
+/// `enter` that `force_from_resumedata` must not replay.  An owner root
+/// is forwarded in place across a collection inside the residual, and
+/// is not LIFO, so the residual can still publish across this scope.
 struct ResidualFrameChainGuard {
     ec: *mut pyre_interpreter::PyExecutionContext,
     /// A root, not a raw copy.  The callee frame an inline sub-walk executes
@@ -2212,9 +2208,9 @@ struct ResidualFrameChainGuard {
     frame_root: majit_gc::shadow_stack::OwnerRootGuard,
     previous_published: *mut pyre_interpreter::PyFrame,
     previous_shadow: Option<(super::WalkFrameState, u16)>,
-    /// Whether this guard performed the chain write, so `Drop` restores only
-    /// what it changed.  False when the chain already named `frame`.
-    entered: bool,
+    /// The `topframeref` this guard displaced, rooted so a collection inside
+    /// the residual forwards it.  `None` when the chain already named `frame`.
+    previous_top_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
     /// `executioncontext.py leave`'s `got_exception`: the frame's own
     /// execution ended in an exception.  Only a guard whose scope IS that
     /// execution sets it (the portal call's frame); a frame that merely runs
@@ -2253,21 +2249,25 @@ impl ResidualFrameChainGuard {
             pyre_interpreter::executioncontext::vref_referent(saved_topframeref),
             frame,
         );
-        if entered {
-            // Same barrier obligation as the inline-call push: `f_backref` is
-            // a traced `Type::Ref` field, `frame` can be old-generation, and
-            // `saved_topframeref` can name a young frame.
-            pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
-            majit_gc::bh_probe_note_store(
-                frame as usize,
-                crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
-                2,
-            );
+        // Publish the inlined callee as `topframeref` so a residual
+        // `sys._getframe` names it.  Do not write `f_backref`:
+        // `walker_ec_enter` already stored the recorded caller vref
+        // (`executioncontext.py enter`: `frame.f_backref = self.topframeref`
+        // at the inline push).  A residual that runs after a nested callee
+        // is top would otherwise relink this frame from the live chain —
+        // `force_from_resumedata` materialises that field from the guard,
+        // it does not call `enter` again (`virtualref.py force_virtual` /
+        // `compile.py ResumeGuardForcedDescr.force_now`).
+        let previous_top_root = if entered {
             unsafe {
-                (*frame).f_backref = saved_topframeref;
                 (*ec).topframeref = published as *mut pyre_interpreter::PyFrame;
             }
-        }
+            Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                majit_ir::GcRef(saved_topframeref as usize),
+            ))
+        } else {
+            None
+        };
         // Published whether or not this guard wrote the chain: `frame` is the
         // one a force inside the residual must redirect its escape onto
         // (`flush_active_frame_escape`), and the chain already naming it makes
@@ -2281,7 +2281,7 @@ impl ResidualFrameChainGuard {
             )),
             previous_published,
             previous_shadow,
-            entered,
+            previous_top_root,
             got_exception: std::cell::Cell::new(false),
         })
     }
@@ -2302,20 +2302,12 @@ impl ResidualFrameChainGuard {
 impl Drop for ResidualFrameChainGuard {
     fn drop(&mut self) {
         unsafe {
-            // `executioncontext.py leave`: move the raw caller vref back without
-            // forcing it, then, when the frame escaped, force the caller and
-            // mark it escaped too.  A frame handed to application code keeps a
-            // reference to its caller, so the caller must stay materialised;
-            // dropping that propagation would leave the escape recorded only on
-            // a frame the walk owns privately.
+            // Restore the displaced `topframeref` without touching `f_backref`:
+            // this guard never wrote that field (`walker_ec_enter` owns it).
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
             PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(self.previous_shadow.take()));
-            if self.entered {
-                // The value `enter` displaced, read back off the frame it was
-                // written to, so a collection during the residual forwarded it
-                // in place.  Only the `entered` path wrote `f_backref`, and
-                // only that path has anything to restore.
-                (*self.ec).topframeref = (*self.frame()).f_backref;
+            if let Some(previous_top) = self.previous_top_root.take() {
+                (*self.ec).topframeref = previous_top.get().0 as *mut pyre_interpreter::PyFrame;
             }
             let frame = self.frame();
             // `if frame.escaped or got_exception:` -- an exception leaves a
@@ -5228,6 +5220,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         root: owner_root_if_gc(live_frame),
         sym: ctx.fbw_mode.snapshot_sym as *mut Sym,
     };
+    // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL: "The values in
+    // the virtualizable are always correct during tracing." RPython keeps
+    // that true because `_opimpl_setarrayitem_vable` calls
+    // `synchronize_virtualizable` onto the real object. pyre traces a
+    // `snapshot_for_tracing` copy and `synchronize_virtualizable` writes
+    // that copy (`virtualizable_heap_ptr`), so a residual that runs Python
+    // — and, with nested tracing, `bound_reached` / `compile_and_run_once`
+    // for another green key — would `extract_live` from the interpreter
+    // frame and see the pre-walk locals. Write the boxes onto the live
+    // frame at the same moment `vable_and_vrefs_before_residual_call`
+    // arms the token.
+    flush_live_virtualizable_before_residual_call(ctx, live_frame_root.current(live_frame));
     // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
     // the outer walk's mirror and a sub-walk never advances it.
     let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
@@ -6420,6 +6424,56 @@ pub(crate) fn do_not_in_trace_call_result<Sym: WalkSym>(
             raising_exception: true,
         })),
     }
+}
+
+/// Write tracing boxes onto the live virtualizable before a residual that
+/// may run Python, or before a nested `compile_and_run_once`.
+///
+/// `virtualizable.py force_now` on `TOKEN_TRACING_RESCALL` assumes the
+/// real object already holds the boxes (`synchronize_virtualizable` after
+/// every `_opimpl_setarrayitem_vable`). pyre's walker steps a
+/// `snapshot_for_tracing` copy and points `virtualizable_heap_ptr` at that
+/// copy, so the live interpreter frame lags until this write.
+pub fn flush_live_virtualizable_before_nested_trace(ctx: &TraceCtx) {
+    let Some(frame) = ctx.standard_virtualizable_ptr() else {
+        return;
+    };
+    flush_known_locals_to_live_frame(ctx, frame);
+}
+
+fn flush_known_locals_to_live_frame(ctx: &TraceCtx, frame: usize) {
+    if frame == 0 {
+        return;
+    }
+    if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
+        fbw_note_locals_mirror_undo(frame, nlocals);
+    }
+    crate::state::flush_known_locals_region_to_frame(ctx, frame);
+}
+
+fn flush_live_virtualizable_before_residual_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    live_frame: usize,
+) {
+    flush_known_locals_to_live_frame(ctx.trace_ctx, live_frame);
+    let (callee_frame, frame_reg) = {
+        let state = ctx.frame_state.borrow();
+        match state.callee_shadow.as_ref() {
+            Some(shadow)
+                if shadow.concrete_frame != 0
+                    && shadow.concrete_frame != live_frame
+                    && shadow.fold_frame_reg != u16::MAX =>
+            {
+                (shadow.concrete_frame, shadow.fold_frame_reg)
+            }
+            _ => return,
+        }
+    };
+    let _ = super::flush_callee_locals_region(
+        &ctx.frame_state,
+        callee_frame as *mut pyre_interpreter::PyFrame,
+        frame_reg,
+    );
 }
 
 /// IR-recording portion of `pyjitpl.py

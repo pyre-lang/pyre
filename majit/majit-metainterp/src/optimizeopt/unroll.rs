@@ -5656,8 +5656,9 @@ fn assemble_peeled_trace_with_jump_args(
     let extra_label_start_idx = full_label_args.len();
     full_label_args.extend(filtered_extra_label_args.iter().copied());
 
-    // RPython compile.py parity: after the loop label, only the loop-header
-    // contract is live (`label_op` + `sb.used_boxes`). When
+    // RPython compile.py parity: after the loop label, the loop-header
+    // contract is `label_op` + `sb.used_boxes`. A preamble-defined box
+    // used after the LABEL is a used_box (see consider_arg below). When
     // `splice_redirected_tail` glues a redirected tail onto the body, the
     // spliced output may mention OpRefs whose defining op was removed.
     // Those become extra_before_label SameAs ops, not extra LABEL args:
@@ -5765,11 +5766,24 @@ fn assemble_peeled_trace_with_jump_args(
                 );
                 // unroll.py `finalize_short_preamble`:
                 //   label_op.initarglist(label_op.getarglist() + sb.used_boxes)
-                // A body use-before-def is extra_before_label (the SameAs
-                // above), not a LABEL slot. Publishing it on the LABEL
-                // without a used_boxes entry makes every bridge JUMP
-                // (`_jump_to_existing_trace` `args + extra`) one arg short
-                // of the compiled LABEL.
+                // A preamble-defined box used after the loop LABEL is a
+                // used_box. IntBound.make_guards extra guards at JUMP
+                // (unroll.py:406-409 / intutils.py make_guards, or
+                // vstring.py StrPtrInfo.make_guards) can mention it
+                // without the short-preamble builder having recorded it.
+                // `push_fallthrough_same_as` no-ops when `stream_defs`
+                // already contains the box, so the backend loc dies after
+                // the back edge unless the box is a LABEL/JUMP slot.
+                //
+                // A body use-before-def with no preamble producer stays
+                // extra_before_label (the SameAs above), not a LABEL slot:
+                // publishing that without a used_boxes entry makes every
+                // bridge JUMP (`_jump_to_existing_trace` `args + extra`)
+                // one arg short of the compiled LABEL.
+                if stream_defs.contains(&arg) {
+                    full_label_args.push(arg);
+                    appended_label_args.push(arg);
+                }
                 label_set.insert(arg);
             };
             for a in op.args_slice().iter() {
@@ -9653,6 +9667,93 @@ mod tests {
         );
         assert_eq!(combined[body_start + 1].opcode, OpCode::IntAdd);
         assert_ne!(combined[body_start + 1].pos().get(), OpRef::int_op(64));
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_carries_preamble_value_used_after_label() {
+        // Preamble defines v20. The body extra-guard at JUMP (ResumeAtPositionDescr
+        // from IntBound.make_guards / vstring.py StrPtrInfo.make_guards) uses v20
+        // after the loop LABEL. unroll.py finalize_short_preamble puts used_boxes
+        // on the LABEL; a preamble-defined box used after the LABEL is a used_box
+        // even when the short-preamble builder did not record it.
+        let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_resop_operand(Type::Int, 0),
+                    Operand::from_opref(OpRef::const_int(1)),
+                ],
+            );
+            op.pos().set(OpRef::int_op(20));
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(
+                    OpCode::IntGe,
+                    &[
+                        rooted_resop_operand(Type::Int, 20),
+                        Operand::from_opref(OpRef::const_int(1)),
+                    ],
+                );
+                op.pos().set(OpRef::int_op(30));
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 30)]);
+                op.setfailargs(vec![rooted_resop_operand(Type::Int, 10)].into());
+                op
+            },
+            {
+                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 10)]);
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
+        ];
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &majit_ir::ConstMap::default(),
+            None,
+            Some(loop_descr),
+        );
+
+        let label_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Label)
+            .expect("Label");
+        let label_args: Vec<_> = combined[label_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert!(label_args.contains(&OpRef::int_op(10)));
+        assert!(
+            label_args.contains(&OpRef::int_op(20)),
+            "preamble-defined body-used box must be a LABEL slot, got {label_args:?}"
+        );
+        let jump_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Jump)
+            .expect("Jump");
+        let jump_args: Vec<_> = combined[jump_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(jump_args.len(), label_args.len());
+        assert!(
+            jump_args.contains(&OpRef::int_op(20)),
+            "JUMP must carry the preamble box into the LABEL slot, got {jump_args:?}"
+        );
     }
 
     #[test]
