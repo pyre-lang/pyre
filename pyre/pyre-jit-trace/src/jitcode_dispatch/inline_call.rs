@@ -6302,24 +6302,14 @@ fn live_frame_chain_ptr(
 /// the optimizer keep the frame virtual: nothing reads the frame itself unless
 /// something forces it.
 ///
-/// Returns the vref's OpRef for the matching [`walker_ec_leave`], or
-/// `None` when the frame is already on the chain so enter is skipped.
+/// Returns the vref's OpRef for the matching [`walker_ec_leave`].
 fn walker_ec_enter(
     ctx: &mut TraceCtx,
     callee_frame: OpRef,
     callee_ec: OpRef,
     concrete_frame: *mut pyre_interpreter::PyFrame,
     concrete_ec: *mut pyre_interpreter::PyExecutionContext,
-) -> Option<OpRef> {
-    // `ExecutionContext.enter` is once per activation. Relinking a frame
-    // already on the chain stores the current top into `f_backref` and
-    // closes a cycle (`jit_seam_frame_chain_no_self_backref`).
-    if pyre_interpreter::executioncontext::frame_is_on_chain(
-        unsafe { &*concrete_ec },
-        concrete_frame,
-    ) {
-        return None;
-    }
+) -> OpRef {
     // `frame.f_backref = self.topframeref` — the caller's vref moves into the
     // callee, unforced.  `emit_new_pyframe_inline_with_params` leaves the slot
     // at its constructor default, so this is the store that links the chain.
@@ -6373,7 +6363,7 @@ fn walker_ec_enter(
         (*concrete_frame).f_backref = concrete_caller_topframeref;
         (*concrete_ec).topframeref = concrete_vref as *mut pyre_interpreter::PyFrame;
     }
-    Some(vref)
+    vref
 }
 
 /// The box this walk holds for the frame at `frame_ptr`: the virtual of a
@@ -6537,7 +6527,12 @@ pub(crate) fn walker_ec_leave(
                     );
                     ctx.heapcache_setfield_cached(f_back_box, flags_descr.index(), new_flags);
                 } else {
-                    ctx.heap_cache_mut().clear_field(flags_descr.index());
+                    // heapcache.py `clear_caches` for a write whose box this
+                    // walk does not hold: `invalidate_unescaped` on every
+                    // CacheEntry. A `heap_cache.remove` of the flags descr
+                    // (`clear_field`) is not an upstream method and drops
+                    // unescaped frames' flags too.
+                    ctx.heap_cache_mut().invalidate_caches_for_escaped();
                 }
                 (*f_back).mark_as_escaped();
             }
@@ -11184,24 +11179,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_callee_ec,
                 ca_concrete_frame,
                 concrete_ec,
-            )
-            .map(|_vref| {
-                // This inlined level is an activation `execute_frame` would have
-                // charged the recursion counter for.  Counting it at RUN time is
-                // what a recorded call would do, and that is exactly wrong here: a
-                // guard leaving this callee skips the recorded release the same
-                // way it skips the `ec.topframeref` restore below, and a loop that
-                // keeps running inside one portal activation never reaches the
-                // boundary that repairs it — the depth then climbs until an
-                // unrelated call raises `RecursionError`.
-                //
-                // So the level is counted at RECORD time instead, as a width the
-                // seam that does survive to run time — the `CALL_ASSEMBLER` fold,
-                // which runs once per fragment entry — charges in one go.  The
-                // guard makes the width balanced across every early return between
-                // here and the `leave`.
-                OpenInlineActivation::open(ctx.session)
-            })
+            );
+            // This inlined level is an activation `execute_frame` would have
+            // charged the recursion counter for.  Counting it at RUN time is
+            // what a recorded call would do, and that is exactly wrong here: a
+            // guard leaving this callee skips the recorded release the same
+            // way it skips the `ec.topframeref` restore below, and a loop that
+            // keeps running inside one portal activation never reaches the
+            // boundary that repairs it — the depth then climbs until an
+            // unrelated call raises `RecursionError`.
+            //
+            // So the level is counted at RECORD time instead, as a width the
+            // seam that does survive to run time — the `CALL_ASSEMBLER` fold,
+            // which runs once per fragment entry — charges in one go.  The
+            // guard makes the width balanced across every early return between
+            // here and the `leave`.
+            Some(OpenInlineActivation::open(ctx.session))
         }
     } else {
         None
@@ -11348,13 +11341,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // Seed the callee's per-slot concrete-locals shadow from the param
         // boxes.  Two distinct consumers, gated differently:
         //
-        // 1. Register-to-register fold (`!try_multiframe` only): a branchless
-        //    leaf inlined without a materialized virtual frame folds its own
-        //    `getarrayitem_vable_r` / `setarrayitem_vable_r` through the per-slot
-        //    OpRef shadow (`fold_frame_reg` + `set_opref`), so the callee's first
-        //    LOAD_FAST of a param folds to the arg OpRef instead of reading its
-        //    unseeded frame box.  A `try_multiframe` callee HAS a real virtual
-        //    frame, so this fold must stay off (its reads go through the frame).
+        // 1. Scalar setfield fold (`!try_multiframe` only): `fold_frame_reg`
+        //    lets `setfield_vable_*` elide `last_instr` / `valuestackdepth`
+        //    writes on a branchless leaf. Array LOAD_FAST / STORE_FAST do
+        //    not consult it — `_opimpl_getarrayitem_vable` /
+        //    `_opimpl_setarrayitem_vable` record `getfield_gc_r` +
+        //    `getarrayitem_gc` / `setarrayitem_gc` for a non-standard
+        //    (inlined) frame (`pyjitpl.py _nonstandard_virtualizable`), and
+        //    `heapcache.py getarrayitem` answers the next read.
         //
         // 2. Concrete-locals fallback (BOTH paths): the `getarrayitem_vable`
         //    read fallback and the `setarrayitem_vable` re-seed
@@ -11397,26 +11391,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 let mut state = sub_wc.frame_state.borrow_mut();
                 let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.fold_frame_reg = callee_portal_frame_reg;
-                // The fold's premise (`setarrayitem_vable_via_metainterp`) is
-                // that it writes away from an UNSEEDED portal frame — a pure
-                // SSA mirror with no heap array behind it.  The seed block
-                // above may have materialized a real callee `PyFrame`, whose
-                // `NewArrayClear` locals array is stored into only for the
-                // parameters and freevar cells; folding away the in-callee
-                // STORE_FASTs would leave every other local holding the
-                // zero-fill, and a frame reachable afterwards through a
-                // traceback, `f_locals` or `sys._getframe` reads them as
-                // unbound.  Record that here so the store handler demotes just
-                // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
-                // what `_opimpl_setarrayitem_vable` does for a
-                // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
-                // those stores also emits the promote guard in
-                // `vable_getfield_*` (`pyjitpl.py`), whose resume
-                // image must include the paused caller frame
-                // (`opencoder.py capture_resumedata`). Every admitted inline
-                // now carries one, so the remaining question is only whether
-                // the callee's own frame reds were seeded; an unseeded callee
-                // keeps folding.
+                // Scalar `setfield_vable_*` still elides `last_instr` /
+                // `valuestackdepth` on this register. Array STORE_FAST /
+                // LOAD_FAST go through `_opimpl_setarrayitem_vable` /
+                // `_opimpl_getarrayitem_vable` regardless: the inlined
+                // frame is `_nonstandard_virtualizable`, so those ops
+                // record `getfield_gc_r` + `setarrayitem_gc` /
+                // `getarrayitem_gc`. `frame_materialized` still marks that
+                // the seed built a real callee `PyFrame` whose resume image
+                // must include the paused caller (`opencoder.py
+                // capture_resumedata`).
                 shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
             for i in 0..seeded_locals {

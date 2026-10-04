@@ -606,8 +606,9 @@ pub struct InlineFrame {
     /// to each run.
     pub debug_merge_point_py_pc: Option<u32>,
     /// Paused levels sitting between this callee and the next one out,
-    /// OUTERMOST-FIRST; empty preserves the straight-line single-frame
-    /// collapse while retaining the callee level.
+    /// OUTERMOST-FIRST. Empty collapses this level to the caller's CALL
+    /// (`walker_inline_guard_resumes_in_callee`). Admitted Python inlines
+    /// record a parent (`pyjitpl.py` `perform_call` / `newframe`).
     ///
     /// Usually one — the caller paused at its CALL.  A constructor adds a
     /// second: `typeobject.py descr_call` runs between the caller and
@@ -14543,6 +14544,23 @@ fn cut_inlined_loop_backedge<Sym: WalkSym>(
         return Ok(None);
     };
     if !pyre_interpreter::code_pc_is_loop_header(w_code as pyre_object::PyObjectRef, header_py) {
+        return Ok(None);
+    }
+    // Flatten emits `Label(linkfalse)` after the true body (`flatten.py`
+    // `insert_exits`) and leftover TLabel trampolines at the end of the
+    // stream, next to the while-header `loop_header` + `goto`. Those
+    // trampolines are python-forward edges (`goto_if_not` false path to
+    // the drain prefix) encoded as jitcode-backward `goto`s. The floor
+    // table still names the adjacent JUMP_BACKWARD, so `site_py` looks
+    // like a loop back-edge. The jitcode target is the real destination:
+    // it must be the loop header, not the prefix `STORE_FAST` that still
+    // has to run. `opimpl_jit_merge_point` only CALL_ASSEMBLERs once the
+    // inlined prologue has reached that header.
+    let target_py =
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
+    let header_landing = diag::skip_python_trivia_forward(code, header_py);
+    let target_landing = diag::skip_python_trivia_forward(code, target_py);
+    if target_landing != header_landing && target_py != header_py {
         return Ok(None);
     }
     if !ctx.is_top_level {

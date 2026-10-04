@@ -1014,13 +1014,28 @@ fn own_frame_array_store_target<Sym: WalkSym>(
         .callee_shadow
         .as_ref()
         .map_or(0, |shadow| shadow.concrete_frame);
-    if frame == 0 {
-        return None;
+    if frame != 0 {
+        match ctx.trace_ctx.lookup_opref_concrete(vable) {
+            Some(Value::Ref(value)) if value.as_usize() == frame => return Some(frame),
+            _ => {}
+        }
     }
-    match ctx.trace_ctx.lookup_opref_concrete(vable) {
-        Some(Value::Ref(value)) if value.as_usize() == frame => Some(frame),
-        _ => None,
+    // Standard virtualizable: `_opimpl_setarrayitem_vable` +
+    // `synchronize_virtualizable` write the real object. pyre's
+    // `virtualizable_heap_ptr` names the `snapshot_for_tracing` copy
+    // (abort-safety), so the live interpreter frame would otherwise lag
+    // until a residual flush. Nested `compile_and_run_once` reads that
+    // live frame (`warmstate.py bound_reached`).
+    if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if !sym.is_null() {
+            let live = unsafe { (*sym).live_vable_frame_addr() };
+            if live != 0 {
+                return Some(live);
+            }
+        }
     }
+    None
 }
 
 pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
@@ -1369,48 +1384,14 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Strict fresh-frame fold: when this op reads the current inline level's
-    // own (unseeded) portal frame, resolve it register-to-register through the
-    // per-slot OpRef shadow and emit NO GC op — the `fresh_virtualizable` case
-    // (jtransform.py `is_virtualizable_getset` returns `False`).  The
-    // param-store seed dominates every read of a branchless leaf's own frame,
-    // so the slot is present; a genuinely-unbound read falls through to the
-    // `VableBoxNotSeeded` abort below (never the 16 GiB metainterp path).
-    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
-    if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
-        let index = read_int_reg(code, op, 1, ctx)?;
-        if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index) {
-            let result = ctx
-                .frame_state
-                .borrow()
-                .callee_shadow
-                .as_ref()
-                .and_then(|shadow| shadow.opref.get(&slot).copied());
-            if let Some(result) = result {
-                let dst = code[op.pc + 7] as usize;
-                let concrete = concrete_from_recorded_opref(ctx, result);
-                match dst_bank {
-                    'i' => write_int_reg(ctx, op.pc, dst, result, concrete)?,
-                    'r' => write_ref_reg(ctx, op.pc, dst, result, concrete)?,
-                    'f' => {
-                        let len = ctx.registers_f.len();
-                        let _ =
-                            ctx.registers_f
-                                .get(dst)
-                                .ok_or(DispatchError::RegisterOutOfRange {
-                                    pc: op.pc,
-                                    reg: dst,
-                                    len,
-                                    bank: "f",
-                                })?;
-                        ctx.registers_f.set(dst, result);
-                    }
-                    _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
-                }
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-        }
-    }
+    // An inlined callee frame is not the standard virtualizable
+    // (`pyjitpl.py _nonstandard_virtualizable`). `_opimpl_getarrayitem_vable`
+    // records `getfield_gc_r` + `getarrayitem_gc`; `heapcache.py getarrayitem`
+    // answers a later read of the same slot. A register-only
+    // `CalleeLocalsShadow` hit that emits no IR is a second copy of the
+    // local: `CALL_ASSEMBLER` then forces the virtual `NewArrayClear` array
+    // without the stored value. The shadow remains the concrete fallback
+    // below when the heapcache misses after a residual.
     let vable = read_ref_reg_raw(code, op, 0, ctx)?;
     // An unseeded walker Ref register holds `OpRef::None` (`raw() ==
     // u32::MAX`); feeding it into the metainterp vable path would resize
@@ -1599,31 +1580,6 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
 /// 1B r-reg(vable) + 1B i-reg(index) + 1B X-reg(value) + 2B
 /// fdescr(VableArray) + 2B adescr(Array). No dst byte.
 ///
-/// A folded store lands in a slot whose value survives the trace: the inline
-/// level materialized a real callee `PyFrame` and `slot` is in its LOCAL
-/// region.  Such a slot is readable after the call through a traceback,
-/// `f_locals` or `sys._getframe`, so the store must be recorded rather than
-/// mirrored.  Slots at or above `nlocals` are operand-stack cells, which no
-/// Python-level read can reach and which the resume snapshot reconstructs.
-fn folded_store_is_observable_local<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    slot: i64,
-) -> bool {
-    {
-        let state = ctx.frame_state.borrow();
-        let Some(shadow) = state.callee_shadow.as_ref() else {
-            return false;
-        };
-        if !shadow.frame_materialized {
-            return false;
-        }
-    }
-    let Some(nlocals) = active_frame_nlocals(ctx) else {
-        return false;
-    };
-    slot >= 0 && slot < nlocals
-}
-
 /// `CodeObject` of the frame a vable op names — the callee's inside an inline
 /// sub-walk that owns a [`CalleeLocalsShadow`], the outer portal frame's
 /// otherwise.
@@ -1700,88 +1656,13 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Strict fresh-frame fold (twin of `getarrayitem_vable_via_metainterp`): a
-    // write to the current inline level's own (unseeded) portal frame updates
-    // the per-slot OpRef + concrete shadow and emits NO SETARRAYITEM_GC.  Both
-    // local stores (`index < nlocals`) and operand-stack pushes (`index >=
-    // nlocals`) on the fresh frame are pure mirror writes here — the value
-    // lives in an SSA register; the vable array is folded away.
-    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
-    if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
-        let index = read_int_reg(code, op, 1, ctx)?;
-        if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index)
-            && !folded_store_is_observable_local(ctx, slot)
-        {
-            let value = match value_bank {
-                'i' => read_int_reg(code, op, 2, ctx)?,
-                'r' => read_ref_reg(code, op, 2, ctx)?,
-                'f' => read_float_reg(code, op, 2, ctx)?,
-                _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
-            };
-            let captured = vable_value_concrete(code, op, 2, ctx, value_bank, value)
-                .unwrap_or(majit_ir::Value::Void);
-            // `set_ref` can collect. Pin the captured GCREF first and store
-            // the live word (`store_reconstructed_callee_array_image`).
-            let store_root = VableStoreRoot::capture(captured);
-            let concrete = if value_bank == 'r' {
-                store_root.live(captured)
-            } else {
-                captured
-            };
-            // Stamp the box before the shadow copy, and before
-            // `store_live_frame_array_slot`. A non-standard vable falls
-            // through and publishes again after those collecting calls; the
-            // box already carries this word, so that arm re-reads the pin
-            // instead of putting the pre-call copy back.
-            stamp_real_ref_on_box(ctx.trace_ctx, value, concrete);
-            if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
-                shadow.set_opref(slot, value);
-                shadow.set_concrete(fold_frame_reg, slot, concrete);
-            }
-            // `locals_cells_stack_w` is a `FixedObjectArray` of boxed refs, so a
-            // folded store should only ever carry one.  `store_live_frame_array_slot`
-            // already ignores anything else, so this stays a debug assertion rather
-            // than a release panic on a path the corpus does not exercise.
-            debug_assert!(
-                matches!(concrete, majit_ir::Value::Ref(_) | majit_ir::Value::Void),
-                "folded locals_cells_stack_w store must carry a Ref-compatible value"
-            );
-            if matches!(concrete, majit_ir::Value::Ref(_)) {
-                // Drop the frame-state borrow before the store. `set_ref`
-                // can collect, and the collector walks this state.
-                let concrete_frame = ctx
-                    .frame_state
-                    .borrow()
-                    .callee_shadow
-                    .as_ref()
-                    .map(|shadow| shadow.concrete_frame);
-                if let Some(concrete_frame) = concrete_frame {
-                    if let Some(frame) = durable_resume_frame(ctx, concrete_frame) {
-                        fbw_arm_durable_frame_undo(frame);
-                        fbw_note_generator_stack_store(GeneratorStackStore {
-                            frame,
-                            slot: slot as usize,
-                            value,
-                        });
-                    }
-                    crate::state::store_live_frame_array_slot(
-                        concrete_frame,
-                        slot as usize,
-                        store_root.live(concrete),
-                    );
-                }
-            }
-            let vable = read_ref_reg_raw(code, op, 0, ctx)?;
-            // `_opimpl_setarrayitem_vable` records `SETARRAYITEM_GC` for every
-            // box that is not `virtualizable_boxes[-1]`. The strict fold is
-            // that standard arm (shadow only). An inlined callee frame is the
-            // other arm: keep the live write above and fall through so the
-            // same store is recorded on the array `getfield_gc` reads.
-            if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-        }
-    }
+    // An inlined callee frame is not the standard virtualizable
+    // (`pyjitpl.py _nonstandard_virtualizable`). `_opimpl_setarrayitem_vable`
+    // records `getfield_gc_r` + `setarrayitem_gc` for that box; OptVirtualize
+    // keeps the frame and array virtual so the store is free until a force
+    // (`CALL_ASSEMBLER`, `ResumeGuardForcedDescr`, escape) materialises it
+    // with the stored value. Eliding the store into `CalleeLocalsShadow`
+    // leaves the virtual `NewArrayClear` array holding NULL.
     let vable = read_ref_reg_raw(code, op, 0, ctx)?;
     // See `getarrayitem_vable_via_metainterp`: an unseeded `OpRef::None`
     // vable would resize the heapcache flag vector to 16 GiB; bail instead.
@@ -1903,6 +1784,9 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                 slot: index_value as usize,
                 value,
             });
+        }
+        if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
+            crate::jitcode_dispatch::fbw_note_locals_mirror_undo(frame, nlocals);
         }
         // Re-read after `vable_setarrayitem_checked`. The array store may
         // itself collect, so the shadow reads the pin again below.
@@ -2294,9 +2178,12 @@ mod callee_ref_owner_tests {
         assert_eq!(read.1, Some(Value::Int(42)));
     }
 
+    /// `_opimpl_setarrayitem_vable` standard arm: a store against
+    /// `virtualizable_boxes[-1]` writes `virtualizable_boxes[index] = valuebox`
+    /// and does not record `SETARRAYITEM_GC`. `set_virtualizable_entry_at`
+    /// stamps a real Ref onto that box before any later collecting call.
     #[test]
-    fn fold_setarrayitem_stamps_the_unstamped_box() {
-        let (_frame, frame_ptr) = one_local_frame();
+    fn standard_vable_setarrayitem_stamps_the_unstamped_box() {
         let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
         let info = install_portal(&mut tc);
         let standard = tc
@@ -2307,13 +2194,7 @@ mod callee_ref_owner_tests {
         assert_eq!(tc.concrete_of_opref(value), None);
         let none = Value::Ref(majit_ir::GcRef(pyre_object::w_none() as usize));
         let index = tc.const_int(0);
-        let shadow = CalleeLocalsShadow {
-            fold_frame_reg: 0,
-            concrete_frame: frame_ptr,
-            frame_box: standard,
-            frame_materialized: false,
-            ..Default::default()
-        };
+        let array_slot = info.num_static_extra_boxes;
         // `riXdd`: opcode, vable r0, index i1, value r2, fdescr 0, adescr 1.
         let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
         let op = DecodedOp {
@@ -2329,7 +2210,7 @@ mod callee_ref_owner_tests {
         concrete_r[2] = ConcreteValue::Ref(pyre_object::w_none());
         with_ctx(
             &mut tc,
-            Some(shadow),
+            None,
             &regs_r,
             &regs_i,
             concrete_r,
@@ -2338,14 +2219,22 @@ mod callee_ref_owner_tests {
                 let outcome =
                     setarrayitem_vable_via_metainterp(&code, &op, wc, 'r').map(|(out, _)| out);
                 assert_eq!(outcome, Ok(DispatchOutcome::Continue));
-                assert_eq!(shadow_slot(wc, 0), Some(none));
-                assert_eq!(shadow_op(wc, 0), Some(value));
+                assert_eq!(
+                    wc.trace_ctx.virtualizable_box_at(array_slot),
+                    Some(value),
+                    "standard arm stores valuebox into virtualizable_boxes[index]"
+                );
+                assert!(
+                    (0..wc.trace_ctx.opcode_at_len())
+                        .all(|i| wc.trace_ctx.opcode_at(i) != Some(OpCode::SetarrayitemGc)),
+                    "standard arm does not record SETARRAYITEM_GC"
+                );
             },
         );
         assert_eq!(
             tc.concrete_of_opref(value),
             Some(none),
-            "the fold arm stamps the box before set_concrete"
+            "the standard arm stamps the box before any collecting call"
         );
     }
 
