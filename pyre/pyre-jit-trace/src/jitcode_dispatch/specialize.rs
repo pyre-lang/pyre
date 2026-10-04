@@ -6941,6 +6941,16 @@ const UNWRAP_CELL_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "UNWRAP-CELL-SUBWALK",
 };
 
+/// `functional.py W_Range.descr_iter`. `space.int_w` of start/stop/step/length
+/// picks `W_IntRangeOneArgIterator` / `W_IntRangeStepOneIterator` /
+/// `W_IntRangeIterator`; overflow stays `W_LongRangeIterator`.
+const RANGE_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_range_iter",
+    commit_label: "range_iter_commit",
+    call_site_label: "range_iter_call_site",
+    decline_tag: "RANGE-ITER-SUBWALK",
+};
+
 /// Descend a generated cell helper (`write_cell` / `unwrap_cell`) the way
 /// [`try_walker_orthodox_descent`] enters `binary_value_from_tag`.  The
 /// IR comes from the helper's jitcode, not a hand-written getfield/setfield.
@@ -19184,14 +19194,13 @@ pub(crate) fn try_walker_orthodox_store_subscr<Sym: WalkSym>(
 
 /// Walker-native `GetIter` for an exact machine-word `range`.
 ///
-/// Emits the virtual `W_IntRangeIterator` allocation shape directly — the
-/// iterator PyPy's inlined `descr_iter` would trace — so a locally consumed
-/// iterator stays a removable virtual `New`.
+/// Records `W_Range.descr_iter` (`w_range_iter`) so a locally consumed
+/// iterator is the same virtual `New` PyPy traces.
 pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
-    _dst: usize,
+    dst: usize,
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
     if !ctx.is_authoritative_executor
@@ -19220,215 +19229,45 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         return Ok(Some(range_op));
     }
 
-    let (
-        concrete_start,
-        concrete_step,
-        concrete_length,
-        concrete_mul,
-        concrete_one_past,
-        concrete_promote_step,
-    ) = unsafe {
-        if !pyre_object::functional::is_w_range(range_obj)
-            || !pyre_object::functional::is_exact_w_range(range_obj)
-        {
-            return Ok(None);
-        }
-        let (start_obj, _stop_obj, step_obj) = pyre_object::functional::w_range_fields(range_obj);
-        let length_obj = pyre_object::functional::w_range_length(range_obj);
-        if !pyre_object::is_int(start_obj)
-            || pyre_object::is_bool(start_obj)
-            || !pyre_object::is_int(step_obj)
-            || pyre_object::is_bool(step_obj)
-            || !pyre_object::is_int(length_obj)
-            || pyre_object::is_bool(length_obj)
-        {
-            return Ok(None);
-        }
-        let Some((start, _stop, step)) = pyre_object::functional::w_range_fields_i64(range_obj)
-        else {
-            return Ok(None);
-        };
-        let Some(length) = pyre_object::functional::w_range_length_i64(range_obj) else {
-            return Ok(None);
-        };
-        let one_past_i128 = start as i128 + length as i128 * step as i128;
-        let Ok(one_past) = i64::try_from(one_past_i128) else {
-            return Ok(None);
-        };
-        let Some(mul) = length.checked_mul(step) else {
-            return Ok(None);
-        };
-        let Some(one_past_checked) = start.checked_add(mul) else {
-            return Ok(None);
-        };
-        debug_assert_eq!(one_past_checked, one_past);
-        (
-            start,
-            step,
-            length,
-            mul,
-            one_past,
-            pyre_object::functional::w_range_promote_step(range_obj),
-        )
+    // `W_Range.descr_iter` itself chooses the iterator shape; the class
+    // guard is the only admission (`typedef.acceptable_as_base_class = False`).
+    if unsafe { !pyre_object::functional::is_w_range(range_obj) } {
+        return Ok(None);
+    }
+
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &RANGE_ITER_DESCENT) else {
+        return Ok(None);
     };
 
+    let pre_guard = ctx.trace_ctx.get_trace_position();
     let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
     walker_guard_fold_class(ctx, op_pc, range_op, range_type_addr)?;
 
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-
-    let start_r = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        range_op,
-        crate::descr::range_start_descr(),
-    );
-    walker_guard_fold_class_if_unknown(ctx, op_pc, start_r, int_type_addr)?;
-    let start_i = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        start_r,
-        crate::descr::int_intval_descr(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(start_i, majit_ir::Value::Int(concrete_start));
-
-    let step_r = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        range_op,
-        crate::descr::range_step_descr(),
-    );
-    walker_guard_fold_class_if_unknown(ctx, op_pc, step_r, int_type_addr)?;
-    let step_i =
-        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, step_r, crate::descr::int_intval_descr());
-    ctx.trace_ctx
-        .set_opref_concrete(step_i, majit_ir::Value::Int(concrete_step));
-
-    let length_r = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        range_op,
-        crate::descr::range_length_descr(),
-    );
-    walker_guard_fold_class_if_unknown(ctx, op_pc, length_r, int_type_addr)?;
-    let length_i = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        length_r,
-        crate::descr::int_intval_descr(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(length_i, majit_ir::Value::Int(concrete_length));
-
-    let mul = ctx
-        .trace_ctx
-        .record_op(OpCode::IntMulOvf, &[length_i, step_i]);
-    ctx.trace_ctx
-        .set_opref_concrete(mul, majit_ir::Value::Int(concrete_mul));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
-
-    let one_past = ctx.trace_ctx.record_op(OpCode::IntAddOvf, &[start_i, mul]);
-    ctx.trace_ctx
-        .set_opref_concrete(one_past, majit_ir::Value::Int(concrete_one_past));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
-
-    // `descr_iter` reads `promote_step` to choose the iterator shape.  The
-    // field never changes after construction, so this read and its guard lift
-    // out of the loop, and fold away entirely when the range is a virtual
-    // `range(...)` allocation of this same trace.
-    let promote_step_i = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        range_op,
-        crate::descr::range_promote_step_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        promote_step_i,
-        majit_ir::Value::Int(concrete_promote_step as i64),
-    );
-    let promoted = ctx
-        .trace_ctx
-        .record_op(OpCode::IntIsTrue, &[promote_step_i]);
-    ctx.trace_ctx
-        .set_opref_concrete(promoted, majit_ir::Value::Int(concrete_promote_step as i64));
-    let promote_guard = if concrete_promote_step {
-        OpCode::GuardTrue
-    } else {
-        OpCode::GuardFalse
-    };
-    walker_emit_guard_with_snapshot(ctx, op_pc, promote_guard, &[promoted])?;
-
-    // A promoted step means `descr_new` saw no step argument, so the walk is
-    // `start, start+1, ... start+length`.  The one-argument shape additionally
-    // needs `start == 0`, which the guard below pins for the trace.
-    let one_arg = concrete_promote_step && concrete_start == 0;
-    if concrete_promote_step {
-        let zero = ctx.trace_ctx.const_int(0);
-        let starts_at_zero = ctx.trace_ctx.record_op(OpCode::IntEq, &[start_i, zero]);
-        ctx.trace_ctx
-            .set_opref_concrete(starts_at_zero, majit_ir::Value::Int(one_arg as i64));
-        let start_guard = if one_arg {
-            OpCode::GuardTrue
-        } else {
-            OpCode::GuardFalse
-        };
-        walker_emit_guard_with_snapshot(ctx, op_pc, start_guard, &[starts_at_zero])?;
+    let mut produced = None;
+    let outcome = run_prepared_orthodox_descent(
+        ctx,
+        op_pc,
+        prep,
+        &[],
+        &[(range_op, range_obj)],
+        &[],
+        dst,
+        dst_bank,
+        &RANGE_ITER_DESCENT,
+        Some(&mut produced),
+        false,
+    )?;
+    if !matches!(outcome, Some(DispatchOutcome::Continue)) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_guard);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
     }
-
-    let (size_descr, iter_type_addr) = if !concrete_promote_step {
-        (
-            crate::descr::w_range_iter_size_descr(),
-            &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64,
-        )
-    } else if one_arg {
-        (
-            crate::descr::w_range_iter_one_arg_size_descr(),
-            &pyre_object::functional::RANGE_ITER_ONE_ARG_TYPE as *const _ as i64,
-        )
-    } else {
-        (
-            crate::descr::w_range_iter_step_one_size_descr(),
-            &pyre_object::functional::RANGE_ITER_STEP_ONE_TYPE as *const _ as i64,
-        )
+    let Some(new) = produced else {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_guard);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
     };
-    let new = ctx
-        .trace_ctx
-        .record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
-    ctx.trace_ctx.heap_cache_mut().new_object(new);
-
-    // `stop` is `start + length` rather than the range's own stop: a promoted
-    // step is one, so the two agree over any non-empty span, and an empty or
-    // backwards span this way ends the walk on its first compare instead of
-    // carrying a bound below `start`.
-    let iter_fields: Vec<(majit_ir::DescrRef, OpRef)> = if !concrete_promote_step {
-        vec![
-            (crate::descr::range_iter_current_descr(), start_i),
-            (crate::descr::range_iter_remaining_descr(), length_i),
-            (crate::descr::range_iter_step_descr(), step_i),
-        ]
-    } else if one_arg {
-        vec![
-            (crate::descr::range_iter_one_arg_current_descr(), start_i),
-            (crate::descr::range_iter_one_arg_stop_descr(), one_past),
-        ]
-    } else {
-        vec![
-            (crate::descr::range_iter_step_one_current_descr(), start_i),
-            (crate::descr::range_iter_step_one_stop_descr(), one_past),
-            (crate::descr::range_iter_step_one_start_descr(), start_i),
-        ]
-    };
-    for (descr, value) in iter_fields {
-        let index = descr.index();
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::SetfieldGc, &[new, value], descr);
-        ctx.trace_ctx.heapcache_setfield_cached(new, index, value);
-    }
-
-    ctx.trace_ctx.heap_cache_mut().class_now_known(new);
-
-    let real_iter = unsafe { pyre_object::functional::w_range_iter(range_obj) };
-    ctx.trace_ctx.set_opref_concrete(
-        new,
-        majit_ir::Value::Ref(majit_ir::GcRef(real_iter as usize)),
-    );
     ctx.frame_state.borrow_mut().vstack_last_ref = new;
-
     Ok(Some(new))
 }
 

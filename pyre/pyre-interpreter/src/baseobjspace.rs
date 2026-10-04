@@ -4567,6 +4567,10 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
                 }
             })?;
             let (current, remaining, step) = pyre_object::w_range_iter_fields(w_iter);
+            // `rangeiter_setstate` clamps against `len >= 0`. A negative
+            // remaining (raw-stop empty promoted iterator) would panic
+            // `i64::clamp` because min > max.
+            let remaining = remaining.max(0);
             let skipped = state.clamp(0, remaining);
             let next = (current as i128 + skipped as i128 * step as i128) as i64;
             pyre_object::w_range_iter_set_cursor(w_iter, next, remaining - skipped);
