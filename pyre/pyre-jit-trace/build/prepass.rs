@@ -1166,6 +1166,13 @@ fn real_main() {
                     "intobject",
                     "format_int_decimal",
                 ]),
+                // `W_Range.descr_iter`. `space.iter` stays residual, so the
+                // descent looks the body up by this graph key.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_range_iter",
+                ]),
                 // Step-1 range `FOR_ITER` descends this body. `space.next`
                 // calls it, and that call stays residual, so the graph is
                 // seeded here for the path lookup.
