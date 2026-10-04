@@ -1662,6 +1662,19 @@ fn w_code_new_owned(
                 pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
             unsafe { (*table).set_ref(index, realized) };
         }
+    } else {
+        // `pycode.py self.co_consts_w = consts`: every PyCode has a table.
+        // A null/unaligned `code_ptr` (test fixtures, gateway builtins)
+        // gets an empty array so `getconstant_w` is the array read.
+        let table = unsafe { alloc_co_consts_array(0) };
+        let table_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(table as pyre_object::PyObjectRef);
+        publish_code_slot_store(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let owner = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut PyCode;
+        unsafe {
+            (*owner).co_consts_w =
+                pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
+        }
     }
     publish_code_slot_store(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     let owner = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut PyCode;

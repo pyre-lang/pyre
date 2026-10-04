@@ -2443,7 +2443,7 @@ fn constants_accessor_fun_decl_id(kind: &OpKind, leaf: &str) -> Option<u64> {
 /// Anchor compiler-core's exact
 /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
 /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
-/// (a `co_consts_w` field read on the promoted code); it must not
+/// (`self.getcode().co_consts_w[index]`); it must not
 /// FieldRead the compiler `Constants` wrapper.  `code_getdocstring`
 /// still projects that wrapper, through the translated `deref` body.
 ///

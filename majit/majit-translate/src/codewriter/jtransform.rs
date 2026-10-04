@@ -26655,7 +26655,7 @@ mod tests {
         );
         let ops = match rewritten {
             RewriteResult::Replace(ops) => ops,
-            RewriteResult::Keep | RewriteResult::Identity(_) => {
+            RewriteResult::Keep | RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
                 panic!("expected Replace, got non-Replace recursive rewrite")
             }
         };
@@ -26753,7 +26753,7 @@ mod tests {
         );
         let ops = match rewritten {
             RewriteResult::Replace(ops) => ops,
-            RewriteResult::Keep | RewriteResult::Identity(_) => {
+            RewriteResult::Keep | RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
                 panic!("expected Replace, got non-Replace recursive rewrite")
             }
         };

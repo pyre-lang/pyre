@@ -4176,7 +4176,7 @@ pub(in crate::front::mir) fn instantiated_field_size_align(
         return Some(sa);
     }
     let substituted = subst_type_args(llbc, ty, subst);
-    let body = tyexpr_body(llbc, &substituted)?;
+    let body = strip_ty_indirections(&substituted, llbc)?;
     if let Some(slot) = typevar_slot(body) {
         let repl = subst.get(slot)?;
         return instantiated_field_size_align(llbc, repl, &[], clauses, depth + 1);
@@ -4322,7 +4322,7 @@ pub(in crate::front::mir) fn subst_bind_projected_field(
         return subst;
     };
     let field_ty = tyref_json(&field.ty);
-    let Some(body) = tyexpr_body(llbc, &field_ty) else {
+    let Some(body) = strip_ty_indirections(&field_ty, llbc) else {
         return subst;
     };
     let Some(slot) = typevar_slot(body) else {
@@ -4333,7 +4333,7 @@ pub(in crate::front::mir) fn subst_bind_projected_field(
     }
     let slot_is_open = match subst.get(slot) {
         None => true,
-        Some(ty) => tyexpr_body(llbc, ty).is_some_and(|body| typevar_slot(body).is_some()),
+        Some(ty) => strip_ty_indirections(ty, llbc).is_some_and(|body| typevar_slot(body).is_some()),
     };
     if slot_is_open {
         if subst.len() <= slot {
