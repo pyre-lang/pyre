@@ -88646,9 +88646,9 @@ mod tests {
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
     /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
-    /// (a `co_consts_w` field read on the promoted code); it must not
-    /// project the compiler `Constants` wrapper.  `code_getdocstring`
-    /// still projects that wrapper for its slice view.
+    /// (`self.getcode().co_consts_w[index]`); it must not project the
+    /// compiler `Constants` wrapper.  `code_getdocstring` still projects
+    /// that wrapper for its slice view.
     ///
     /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
     /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,

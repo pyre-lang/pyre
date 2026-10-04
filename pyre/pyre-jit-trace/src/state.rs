@@ -6840,14 +6840,6 @@ impl PyreMeta {
     }
 }
 
-pub(crate) fn boxed_slot_i64_for_type(slot_type: Type, raw: i64) -> PyObjectRef {
-    match slot_type {
-        Type::Int => w_int_new(raw),
-        Type::Float => pyre_object::floatobject::w_float_new(f64::from_bits(raw as u64)),
-        Type::Ref | Type::Void => raw as PyObjectRef,
-    }
-}
-
 /// virtualizable.py `lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)`:
 /// pyre's `locals_cells_stack_w` array item type is GCREF, so every write to
 /// a frame slot must produce a boxed PyObjectRef regardless of the label's
@@ -8034,49 +8026,6 @@ impl PyreJitState {
         }
     }
 
-    fn restore_single_frame(&mut self, meta: &PyreMeta, values: &[i64]) {
-        let Some(&frame) = values.first() else {
-            return;
-        };
-        // The red `frame` word of resume data is a live `PyFrame`
-        // (`resume.py rebuild_from_resumedata`). Rebuilding onto anything
-        // else would resume with the pc, pycode, locals and stack missing.
-        assert!(
-            frame as usize >= 0x1000 && frame as usize % std::mem::align_of::<PyFrame>() == 0,
-            "resume data red frame word {frame:#x} is not a PyFrame"
-        );
-        self.frame = frame as usize;
-        if values.len() == 1 {
-            return;
-        }
-        if meta.has_virtualizable {
-            self.restore_virtualizable_i64(values);
-        } else {
-            let nlocals = self.local_count();
-            let stack_only = self.valuestackdepth().saturating_sub(nlocals);
-            let mut idx = 1;
-            for local_idx in 0..nlocals {
-                if idx < values.len() {
-                    let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
-                    let _ = self
-                        .set_local_at(local_idx, boxed_slot_i64_for_type(slot_type, values[idx]));
-                }
-                idx += 1;
-            }
-            for i in 0..stack_only {
-                if idx < values.len() {
-                    let slot_type = meta
-                        .slot_types
-                        .get(nlocals + i)
-                        .copied()
-                        .unwrap_or(Type::Ref);
-                    let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
-                }
-                idx += 1;
-            }
-        }
-    }
-
     pub fn local_at(&self, idx: usize) -> Option<PyObjectRef> {
         self.locals_cells_stack_array()
             .and_then(|arr| arr.as_slice().get(idx).copied())
@@ -8260,46 +8209,6 @@ impl PyreJitState {
                 .read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
                 .is_some()
             && self.locals_cells_stack_array().is_some()
-    }
-
-    /// virtualizable.py write_from_resume_data_partial parity.
-    ///
-    /// Restores virtualizable array slots from the fail_args layout:
-    ///   [frame, scalars..., active_locals..., active_stack...]
-    ///
-    /// interp_jit.py:25 declares locals_cells_stack_w as a single
-    /// virtualizable array with uniform ARRAYITEMTYPE = GCREF.
-    /// resume.py:1408 calls write_from_resume_data_partial which loops
-    /// over the array calling reader.load_next_value_of_type(GCREF),
-    /// i.e. reader.next_ref() — every slot is a GCREF pointer.
-    ///
-    /// The raw i64 values here are already PyObjectRef pointers from
-    /// the backend's Ref register bank. Write them directly without
-    /// per-slot type dispatch.
-    fn restore_virtualizable_i64(&mut self, values: &[i64]) {
-        let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, values);
-
-        // virtualizable.py:134-137:
-        //   for ARRAYITEMTYPE, fieldname in unroll_array_fields:
-        //       lst = getattr(virtualizable, fieldname)
-        //       for j in range(len(lst)):
-        //           lst[j] = reader.load_next_value_of_type(ARRAYITEMTYPE)
-        // ARRAYITEMTYPE is always GCREF for locals_cells_stack_w.
-        let nlocals = self.local_count();
-        for i in 0..nlocals {
-            if idx < values.len() {
-                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
-            }
-            idx += 1;
-        }
-
-        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
-        for i in 0..stack_only {
-            if idx < values.len() {
-                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
-            }
-            idx += 1;
-        }
     }
 
     fn import_virtualizable_state(&mut self, boxes: &[i64], array_lengths: &[usize]) -> bool {
@@ -12703,28 +12612,30 @@ impl JitState for PyreJitState {
         }
     }
 
+    fn restore_banked(&mut self, _meta: &Self::Meta, _int_values: &[i64], ref_values: &[i64]) {
+        // `resume.py decode_box` / `warmspot.py handle_jitexception`: CRN
+        // restores reds from the typed register banks. Portal reds are
+        // `frame` and `ec` (`interp_jit.py reds = ['frame', 'ec']`), both
+        // GCREF. Blackhole already wrote the virtualizable through
+        // `write_from_resume_data_partial`; int-bank words are not a second
+        // vable layout and must not be stored into `locals_cells_stack_w`.
+        // A ref-bank red is always the live frame (`rebuild_from_resumedata`);
+        // there is no null-pointer skip in `handle_jitexception`.
+        if let Some(&frame) = ref_values.first() {
+            self.frame = frame as usize;
+        }
+        if let Some(&ec) = ref_values.get(1) {
+            self.execution_context = ec as usize;
+        }
+    }
+
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
-        if values.is_empty() {
-            return;
-        }
-
-        // Multi-frame format: [num_frames, size_0, data_0..., size_1, data_1...]
-        // Detect: values[0] is a small number (1-10) = frame count
-        // Legacy: values[0] is a large pointer
-        let first = values[0];
-        if first >= 1 && first <= 10 && values.len() > 2 {
-            let _num_frames = first as usize;
-            let outer_size = values[1] as usize;
-            if outer_size > 0 && 2 + outer_size <= values.len() {
-                // Restore outermost frame only.
-                // Inner frame guard failure → interpreter re-executes callee call.
-                self.restore_single_frame(meta, &values[2..2 + outer_size]);
-                return;
-            }
-        }
-
-        // Legacy single-frame format
-        self.restore_single_frame(meta, values);
+        // Untyped fail_args are TAGBOX liveboxes (`resume.py decode_box`
+        // `assert box.type == kind`). There is no untyped fail_args restore
+        // in upstream: every guard failure resumes through typed `rd_numb`
+        // decoding. Do not sniff `values[0] in 1..=10` as a frame-count
+        // header or write those words into GCREF locals.
+        self.restore_banked(meta, values, &[]);
     }
 
     fn restore_values(&mut self, meta: &Self::Meta, values: &[Value]) {
@@ -14050,6 +13961,44 @@ mod tests {
 
         // The dead stack slot's color must never recover as that slot.
         assert_ne!(invert(stack_map[2]), Some(nlocals + 2));
+    }
+
+    /// `resume.py decode_box` never sniffs a TAGINT livebox as a frame-count
+    /// header. A previous restore path treated `values[0] in 1..=10` as
+    /// `num_frames` and then wrote the remaining words into
+    /// `locals_cells_stack_w` as GCREFs, so unboxed `1` became address 0x1.
+    #[test]
+    fn restore_does_not_treat_a_tagint_livebox_as_a_frame_count() {
+        use pyre_interpreter::pyframe::PyFrame;
+
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = PyFrame::new(code);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let marker = w_int_new(99);
+
+        let mut state = empty_state();
+        state.frame = frame_ptr;
+        assert!(state.set_local_at(0, marker));
+
+        // Would have been parsed as num_frames=1, outer_size=5, red frame=0.
+        let values = [1i64, 5, 0, 0, 0, 0, 0];
+        <PyreJitState as JitState>::restore(&mut state, &empty_meta(), &values);
+
+        assert_eq!(state.frame, frame_ptr);
+        let kept = state.local_at(0).expect("local 0 stays boxed");
+        assert_eq!(unsafe { w_int_get_value(kept) }, 99);
+
+        // Typed CRN restore reads the frame from the ref bank, not int words.
+        <PyreJitState as JitState>::restore_banked(
+            &mut state,
+            &empty_meta(),
+            &values,
+            &[frame_ptr as i64, 0],
+        );
+        assert_eq!(state.frame, frame_ptr);
+        let kept = state.local_at(0).expect("local 0 stays boxed after banked");
+        assert_eq!(unsafe { w_int_get_value(kept) }, 99);
     }
 
     fn empty_meta() -> PyreMeta {

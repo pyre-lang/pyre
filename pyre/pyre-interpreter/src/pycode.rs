@@ -562,7 +562,7 @@ pub const _alloc_flavor_CodeObject: &str = "raw";
 /// [`_immutable_fields_CodeObject`]. `source_path` stays mutable
 /// (`fix_code_filenames`).
 #[repr(C)]
-#[majit_macros::jit_immutable_fields("w_globals?", "code_ptr")]
+#[majit_macros::jit_immutable_fields("w_globals?", "code_ptr", "co_consts_w[*]")]
 pub struct PyCode {
     pub ob_header: PyObject,
     /// Permanently-live `CodeObject` address. Top-level bodies are owned via
@@ -1561,6 +1561,19 @@ fn w_code_new_owned(
                 (*owner).co_names_w =
                     pyre_object::gc_roots::shadow_stack_get(names_slot) as *mut FixedObjectArray;
             }
+        }
+    } else {
+        // `pycode.py self.co_consts_w = consts`: every PyCode has a table.
+        // A null/unaligned `code_ptr` (test fixtures, gateway builtins)
+        // gets an empty array so `getconstant_w` is the array read.
+        let table = unsafe { alloc_co_consts_array(0) };
+        let table_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(table as pyre_object::PyObjectRef);
+        publish_code_slot_store(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let owner = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut PyCode;
+        unsafe {
+            (*owner).co_consts_w =
+                pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
         }
     }
     pyre_object::gc_roots::shadow_stack_get(obj_slot)
@@ -5688,8 +5701,12 @@ mod tests {
     fn w_code_const_null_code_ptr_returns_py_null() {
         // A `PyCode` built from a null `code_ptr` must not be
         // dereferenced; the guard returns PY_NULL so the caller falls back to
-        // its own constant realization.
+        // its own constant realization. Construction still publishes an empty
+        // `co_consts_w` so `getconstant_w` is an array read.
         let w_code = w_code_new(std::ptr::null());
+        let table = unsafe { (*(w_code as *const PyCode)).co_consts_w };
+        assert!(!table.is_null());
+        assert_eq!(unsafe { (*table).len() }, 0);
         let result = unsafe { w_code_const(w_code, 0) };
         assert_eq!(result, pyre_object::pyobject::PY_NULL);
     }

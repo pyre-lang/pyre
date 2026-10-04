@@ -1673,9 +1673,6 @@ pub struct JitCodeMachine<'mi, S, R> {
     walk_steps: u64,
     walk_steps_since_growth: u64,
     walk_last_num_ops: usize,
-    /// Compare-folded `newbool` CallR. Replaced after `IntIsTrue` of
-    /// the live compare so JUMP_IF does not list it as a failarg.
-    pending_newbool: Option<(OpRef, i64, OpRef)>,
     marker: PhantomData<(S, R)>,
 }
 
@@ -3002,7 +2999,6 @@ where
             walk_steps: 0,
             walk_steps_since_growth: 0,
             walk_last_num_ops: 0,
-            pending_newbool: None,
             marker: PhantomData,
         }
     }

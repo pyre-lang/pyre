@@ -580,8 +580,8 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler<Value = PyObjectRef> {
     /// No default: a fallback that indexed `enclosing.constants` (the
     /// compiler `Constants(Box<[ConstantData]>)` wrapper) was walked as
     /// `getfield_gc_r Constants.__pos_0` and treated a `ConstIdx` integer
-    /// as a GCREF. `PyFrame` is the only implementor and reads the
-    /// runtime `co_consts_w` slot via `w_code_const`.
+    /// as a GCREF. `PyFrame` is the only implementor and reads
+    /// `self.pycode.co_consts_w[index]` directly.
     fn constant_at(
         &mut self,
         index: crate::bytecode::oparg::ConstIdx,
