@@ -11613,6 +11613,11 @@ pub struct CraneliftBackend {
     /// `materialize_loop` error after `write_pending_failure_recoveries`.
     #[cfg(test)]
     fail_after_pending_trampolines: bool,
+    /// Leave `New` / `NewWithVtable` in the stream so tests can compile the
+    /// residual lowering the GC rewrite would otherwise replace with
+    /// `CallMallocNursery`.
+    #[cfg(test)]
+    skip_gc_rewrite: bool,
 }
 
 impl Default for CraneliftBackend {
@@ -11818,6 +11823,8 @@ impl CraneliftBackend {
             last_body_clif: String::new(),
             #[cfg(test)]
             fail_after_pending_trampolines: false,
+            #[cfg(test)]
+            skip_gc_rewrite: false,
         }
     }
 
@@ -12077,6 +12084,11 @@ impl CraneliftBackend {
         // rewrite.py assemble_loop mutates the same ResOperation objects.
         normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(ops);
+        #[cfg(test)]
+        if self.skip_gc_rewrite {
+            let result: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+            return (result, vec![]);
+        }
         {
             let rewriter = self.gc_rewriter();
             // `RewriteState::const_int` emits fresh `ConstInt`s inline, so
@@ -14332,6 +14344,8 @@ impl CraneliftBackend {
                     | OpCode::CallMallocNursery
                     | OpCode::CallMallocNurseryVarsize
                     | OpCode::CallMallocNurseryVarsizeFrame
+                    | OpCode::New
+                    | OpCode::NewWithVtable
                     | OpCode::NewArray
                     | OpCode::NewArrayClear
                     | OpCode::Newstr
@@ -19977,7 +19991,18 @@ impl CraneliftBackend {
                         let align = majit_gc::header::MEMORY_ALIGNMENT;
                         let total = (total + align - 1) & !(align - 1);
                         let inline_addrs = gc_nursery_addrs.filter(|&(nf, nt)| nf != 0 && nt != 0);
-                        let result = if gc_max_nursery_object_size.is_some_and(|max| total < max)
+                        // `framework.py malloc_fast` is annotated
+                        // `s_False, s_False, s_False` (no destructor, no
+                        // old-style finalizer, no weakref). The bump stores
+                        // only the header type id, so it is taken only for
+                        // `MiniMarkGC::type_alloc_is_plain` — the same
+                        // predicate wasm `nursery_alloc_params` already
+                        // filters with.
+                        let is_plain =
+                            with_cranelift_gc(|gc| gc.type_alloc_is_plain(type_id as u32))
+                                .unwrap_or(false);
+                        let result = if is_plain
+                            && gc_max_nursery_object_size.is_some_and(|max| total < max)
                             && let Some((nf_addr, nt_addr)) = inline_addrs
                         {
                             let flags = MemFlagsData::trusted();
@@ -34640,7 +34665,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
 
-        let token = JitCellToken::new(1506);
+        let token = JitCellToken::new(1504);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         with_cranelift_gc_required(|gc| {
@@ -34667,6 +34692,77 @@ mod tests {
         assert!(
             tid_store_address_op(&clif, 0, "load"),
             "fast path must zero the header word at nursery free:\n{clif}"
+        );
+    }
+
+    static NEW_BUMP_DESTRUCTOR_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn new_bump_counting_destructor(_obj_addr: usize) {
+        NEW_BUMP_DESTRUCTOR_RUNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Residual `New` after a preamble `CallMallocNursery` reads `jf_ptr` in
+    /// the bump (`fast_args`, `spill_ref_roots`, `emit_push_gcmap`). The
+    /// LABEL's `br_table` loader is a second predecessor, so the preamble
+    /// merge's `jf_ptr` does not dominate. Refresh it the way
+    /// `CallMallocNursery` does (`needs_jf_ptr` / `get_pinned_reg`).
+    #[test]
+    fn new_after_preamble_malloc_refreshes_jf_ptr() {
+        let mut backend = make_gc_backend();
+        backend.skip_gc_rewrite = true;
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32)], 0),
+            mk_op(OpCode::Label, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(OpCode::New, &[], 1, make_size_descr(16, 0)),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(1517);
+        backend
+            .compile_loop(&inputargs, &ops, &token)
+            .expect("New after preamble CallMallocNursery must dominate jf_ptr");
+        let frame = backend.execute_token(&token, &[]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 0);
+    }
+
+    /// `framework.py malloc_fast` is annotated `s_False, s_False, s_False`
+    /// (no destructor / no old-style finalizer / no weakref).
+    /// `MiniMarkGC::type_alloc_is_plain` is that predicate; wasm
+    /// `nursery_alloc_params` already filters with it. The cranelift bump
+    /// only writes the header type id, so a non-plain type must stay on
+    /// the helper that runs `finish_nursery_object`.
+    #[test]
+    fn new_inline_bump_is_plain_types_only() {
+        NEW_BUMP_DESTRUCTOR_RUNS.store(0, Ordering::SeqCst);
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        let dtor_tid =
+            gc.register_type(TypeInfo::with_destructor(16, new_bump_counting_destructor));
+        let mut backend = backend_with_gc(gc);
+        backend.skip_gc_rewrite = true;
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op_with_descr(OpCode::New, &[], 0, make_size_descr(16, dtor_tid)),
+            mk_op(OpCode::Finish, &[], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(1518);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            !tid_store_address_op(&clif, dtor_tid as i64, "load"),
+            "non-plain New must not take the header-only bump:\n{clif}"
+        );
+        let _frame = backend.execute_token(&token, &[]);
+        with_cranelift_gc(|gc| gc.collect_nursery());
+        assert_eq!(
+            NEW_BUMP_DESTRUCTOR_RUNS.load(Ordering::SeqCst),
+            1,
+            "finish_nursery_object must queue the destructor"
         );
     }
 

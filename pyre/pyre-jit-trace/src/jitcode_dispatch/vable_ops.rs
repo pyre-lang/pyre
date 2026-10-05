@@ -916,6 +916,8 @@ fn own_frame_array_store_target<Sym: WalkSym>(
     if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
         let sym = ctx.fbw_mode.snapshot_sym;
         if !sym.is_null() {
+            // `TraceRoots` rewrites this cell across a minor
+            // (`virtualizable.py` the live virtualizable is a GC pointer).
             let live = unsafe { (*sym).live_vable_frame_addr() };
             if live != 0 {
                 return Some(live);

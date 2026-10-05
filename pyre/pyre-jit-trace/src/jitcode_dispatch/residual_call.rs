@@ -53,7 +53,8 @@ fn walker_published_fnaddr(paths: &[&'static str], raw: i64) -> i64 {
 static TAKE_LAST_EXEC_CTX_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
     walker_published_fnaddr(
         &["pyre_interpreter::call::take_last_exec_ctx"],
-        pyre_interpreter::call::take_last_exec_ctx as *const () as usize as i64,
+        pyre_interpreter::residual_word_addr!(fn 0, pyre_interpreter::call::take_last_exec_ctx)
+            as i64,
     )
 });
 
