@@ -102,6 +102,9 @@ pub fn vec_item_kind_for_spelling(item: &str, word: usize) -> Option<VecItemKind
     if item.ends_with("::GCREF") {
         return Some(VecItemKind::Ref);
     }
+    if item.contains(" dyn ") {
+        return None;
+    }
     (item.starts_with("*mut ") || item.starts_with("*const ")).then_some(VecItemKind::Ref)
 }
 
@@ -629,6 +632,8 @@ mod tests {
             "Box<Foo>",
             "Vec<usize>",
             "&Foo",
+            "*mut dyn AsyncActionOps",
+            "*const dyn Foo",
         ] {
             assert_eq!(vec_item_kind_for_spelling(other, 8), None, "{other}");
         }

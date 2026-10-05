@@ -1328,6 +1328,38 @@ impl LocalValue {
             LocalValue::SliceIter { index, .. } => index.clone(),
         }
     }
+
+    /// Every word this slot holds. A bounds fork forwards each one.
+    fn words(&self) -> Vec<crate::flowspace::model::Variable> {
+        match self {
+            LocalValue::One(var) | LocalValue::ItemAddr(var) => vec![var.clone()],
+            LocalValue::Pair(ptr, len) => vec![ptr.clone(), len.clone()],
+            LocalValue::SliceIter { items, index } => vec![items.clone(), index.clone()],
+        }
+    }
+
+    /// Replace words that `map` copied onto the in-bounds block.
+    fn remap_words(
+        &mut self,
+        map: &std::collections::HashMap<u64, crate::flowspace::model::Variable>,
+    ) {
+        let map_word = |var: &mut crate::flowspace::model::Variable| {
+            if let Some(copy) = map.get(&var.id()) {
+                *var = copy.clone();
+            }
+        };
+        match self {
+            LocalValue::One(var) | LocalValue::ItemAddr(var) => map_word(var),
+            LocalValue::Pair(ptr, len) => {
+                map_word(ptr);
+                map_word(len);
+            }
+            LocalValue::SliceIter { items, index } => {
+                map_word(items);
+                map_word(index);
+            }
+        }
+    }
 }
 
 fn link_words_of(row: &[Option<LocalValue>]) -> Vec<Option<crate::flowspace::model::Variable>> {
@@ -15670,7 +15702,100 @@ impl<'a> Lowering<'a> {
         index
     }
 
-    /// `seq[i]`: `ll_slice_getitem_fast`.
+    /// Split the current block on `cond`. The true arm is in bounds and
+    /// becomes `block_id[mir_bb]`; the false arm calls
+    /// `ll_slice_bounds_panic` and raises. Locals defined in the head, and
+    /// every `carry` word, are forwarded onto the true arm. Returns `carry`
+    /// as those forwarded copies.
+    fn fork_in_bounds(
+        &mut self,
+        mir_bb: usize,
+        cond: Variable,
+        carry: &[Variable],
+    ) -> Result<Vec<Variable>, LowerError> {
+        let head = self.block_id[mir_bb];
+        for word in carry {
+            if !self.graph.variable_defined_in_block(head, word) {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: slice bounds guard carries a word defined outside the block"
+                )));
+            }
+        }
+        let mut forwarded: Vec<Variable> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for slot in &self.local_var {
+            let Some(value) = slot else {
+                continue;
+            };
+            for word in value.words() {
+                if self.graph.variable_defined_in_block(head, &word) && seen.insert(word.id()) {
+                    forwarded.push(word);
+                }
+            }
+        }
+        for word in carry {
+            if seen.insert(word.id()) {
+                forwarded.push(word.clone());
+            }
+        }
+        let copies: Vec<Variable> = forwarded.iter().map(Variable::copy).collect();
+        let tail = self.graph.create_block();
+        for copy in &copies {
+            self.graph.push_inputarg_var(tail, copy.clone());
+        }
+        let remap: std::collections::HashMap<u64, Variable> = forwarded
+            .iter()
+            .zip(copies.iter())
+            .map(|(orig, copy)| (orig.id(), copy.clone()))
+            .collect();
+        for slot in &mut self.local_var {
+            if let Some(value) = slot {
+                value.remap_words(&remap);
+            }
+        }
+        let fail = self.graph.create_block();
+        self.graph.block_mut(fail).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path([
+                    "majit_rlib",
+                    "lltypesystem",
+                    "rvec",
+                    "ll_slice_bounds_panic",
+                ]),
+                args: crate::model::call_args(Vec::<Variable>::new()),
+                result_ty: ValueType::Void,
+            },
+        });
+        self.graph.set_raise_implicit(fail, "IndexError");
+        self.graph
+            .set_branch(head, cond, tail, forwarded, fail, Vec::new());
+        self.block_id[mir_bb] = tail;
+        Ok(carry
+            .iter()
+            .map(|word| {
+                remap
+                    .get(&word.id())
+                    .cloned()
+                    .expect("carried word was forwarded")
+            })
+            .collect())
+    }
+
+    /// `index < len`, then the in-bounds copies of `ptr` and `index`.
+    fn guard_item_index(
+        &mut self,
+        mir_bb: usize,
+        len: Variable,
+        ptr: Variable,
+        index: Variable,
+    ) -> Result<(Variable, Variable), LowerError> {
+        let in_bounds = self.emit_uint_binop(mir_bb, "lt", index.clone(), len);
+        let carried = self.fork_in_bounds(mir_bb, in_bounds, &[ptr, index])?;
+        Ok((carried[0].clone(), carried[1].clone()))
+    }
+
+    /// `seq[i]`: `ll_slice_getitem_fast` after `index < len`.
     fn pair_getitem(
         &mut self,
         mir_bb: usize,
@@ -15680,6 +15805,8 @@ impl<'a> Lowering<'a> {
     ) -> Result<Variable, LowerError> {
         let (ptr, kind) = self.item_seq_ptr(mir_bb, seq)?;
         let index = self.item_seq_index(mir_bb, seq, index_payload)?;
+        let len = self.item_seq_len(mir_bb, seq)?;
+        let (ptr, index) = self.guard_item_index(mir_bb, len, ptr, index)?;
         let helper_ty = Self::pair_helper_item_ty(kind);
         let item = self.emit_path_call(
             mir_bb,
@@ -16421,7 +16548,7 @@ impl<'a> Lowering<'a> {
             };
             let (ptr, len) = match (name.as_str(), vec_kind) {
                 _ if let Some((ptr, len, kind)) = array_receiver => {
-                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full)?
+                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
                 }
                 (
                     "alloc::vec::<Impl>::deref"
@@ -16434,7 +16561,7 @@ impl<'a> Lowering<'a> {
                     if args.len() == 2 =>
                 {
                     let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
-                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full)?
+                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
                 }
                 ("core::slice::<Impl>::get", _)
                     if args.len() == 2 && matches!(pair_lens.as_slice(), [(0, _)]) =>
@@ -16485,6 +16612,7 @@ impl<'a> Lowering<'a> {
                         len,
                         &args[1],
                         arg_is_range_full,
+                        true,
                     )?
                 }
                 (
@@ -16658,16 +16786,26 @@ impl<'a> Lowering<'a> {
                             "bb{mir_bb}: copy_from_slice without a source slice"
                         )));
                     };
-                    if !pair_lens.iter().any(|(at, _)| *at == 1) {
+                    let Some(src_len) = pair_lens
+                        .iter()
+                        .find(|(at, _)| *at == 1)
+                        .map(|(_, src_len)| src_len.clone())
+                    else {
                         return Err(LowerError::Schema(format!(
                             "bb{mir_bb}: copy_from_slice source is not a pair slice"
                         )));
-                    }
+                    };
+                    let same_len = self.emit_uint_binop(mir_bb, "eq", src_len, len.clone());
+                    let carried =
+                        self.fork_in_bounds(mir_bb, same_len, &[src_ptr, args[0].clone(), len])?;
+                    let src_ptr = carried[0].clone();
+                    let dest_ptr = carried[1].clone();
+                    let dst_len = carried[2].clone();
                     let zero = self.emit_const_uint(mir_bb, 0);
                     self.emit_path_call(
                         mir_bb,
                         majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::ArrayCopy, kind),
-                        vec![src_ptr, args[0].clone(), zero.clone(), zero, len],
+                        vec![src_ptr, dest_ptr, zero.clone(), zero, dst_len],
                         ValueType::Void,
                     )
                 }
@@ -16780,10 +16918,13 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// `&s[range]` over pair `(ptr, len)`: `(ptr + start, end - start)`.  The
-    /// range is the `Range` / `RangeFrom` / `RangeTo` aggregate this body
-    /// built; the bounds Rust checks are assertions, stripped like every
-    /// other.
+    /// `&s[range]` over pair `(ptr, len)`: `(ptr + start, end - start)`.
+    ///
+    /// `checked` panics when the range is outside the slice. `RangeFull` is
+    /// the whole slice. `RangeTo` panics when `end > len` and does not move
+    /// the pointer. `RangeFrom` panics when `start > len`. `Range` panics
+    /// when `start > end` or `end > len`. `start == end == len` is in bounds.
+    /// `slice.get` passes `checked = false` and selects a null pointer.
     fn pair_subslice(
         &mut self,
         mir_bb: usize,
@@ -16792,6 +16933,7 @@ impl<'a> Lowering<'a> {
         len: Variable,
         range: &Variable,
         range_is_full: bool,
+        checked: bool,
     ) -> Result<(Variable, Variable), LowerError> {
         if range_is_full {
             return Ok((ptr, len));
@@ -16807,7 +16949,7 @@ impl<'a> Lowering<'a> {
             .iter()
             .find(|site| site.range_result == *range)
         {
-            (Some(site.start.clone()), len)
+            (Some(site.start.clone()), len.clone())
         } else if let Some(site) = self
             .slice_index_rangeto_sites
             .iter()
@@ -16820,7 +16962,21 @@ impl<'a> Lowering<'a> {
             )));
         };
         let Some(start) = start else {
-            return Ok((ptr, end));
+            if !checked {
+                return Ok((ptr, end));
+            }
+            let in_bounds = self.emit_uint_binop(mir_bb, "le", end.clone(), len);
+            let carried = self.fork_in_bounds(mir_bb, in_bounds, &[ptr, end])?;
+            return Ok((carried[0].clone(), carried[1].clone()));
+        };
+        let (ptr, start, end) = if checked {
+            let start_le_end = self.emit_uint_binop(mir_bb, "le", start.clone(), end.clone());
+            let end_le_len = self.emit_uint_binop(mir_bb, "le", end.clone(), len);
+            let in_bounds = self.emit_uint_binop(mir_bb, "bitand", start_le_end, end_le_len);
+            let carried = self.fork_in_bounds(mir_bb, in_bounds, &[ptr, start, end])?;
+            (carried[0].clone(), carried[1].clone(), carried[2].clone())
+        } else {
+            (ptr, start, end)
         };
         let ptr = self.emit_path_call(
             mir_bb,
@@ -16828,19 +16984,7 @@ impl<'a> Lowering<'a> {
             vec![ptr, start.clone()],
             ValueType::Unsigned,
         );
-        let bb_id = self.block_id[mir_bb];
-        let len = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(len.clone()),
-            kind: OpKind::BinOp {
-                op: "sub".to_string(),
-                lhs: end,
-                rhs: start,
-                result_ty: ValueType::Unsigned,
-            },
-        });
+        let len = self.emit_uint_binop(mir_bb, "sub", end, start);
         Ok((ptr, len))
     }
 
@@ -16934,7 +17078,7 @@ impl<'a> Lowering<'a> {
         let end_le_len = self.emit_uint_binop(mir_bb, "le", end, len.clone());
         let in_bounds = self.emit_uint_binop(mir_bb, "bitand", start_le_end, end_le_len);
         let full = range_is_full || spelling == "RangeFull";
-        let (sub_ptr, sub_len) = self.pair_subslice(mir_bb, kind, ptr, len, range, full)?;
+        let (sub_ptr, sub_len) = self.pair_subslice(mir_bb, kind, ptr, len, range, full, false)?;
         let ptr = self.emit_uint_select(mir_bb, in_bounds.clone(), sub_ptr, zero.clone());
         let len = self.emit_uint_select(mir_bb, in_bounds, sub_len, zero);
         Ok((ptr, len))
@@ -21567,11 +21711,36 @@ impl<'a> Lowering<'a> {
                 target,
                 on_unwind,
             } => {
-                let _ = on_unwind;
                 // The destructor effect. The goto below is this terminator's
                 // edge; `core::mem::drop` emits the same effect and then its
-                // own call edge.
-                let _ = self.emit_place_drop(mir_bb, &place, Some(&fn_ptr))?;
+                // own call edge. A local `Vec` whose header this graph did
+                // not allocate is the glue call, when this block holds that
+                // header word. Freeing an unproven header would double-free
+                // it. A conditional drop whose header never reached this
+                // block, and a projection drop, keep the goto.
+                let handled = self.emit_place_drop(mir_bb, &place, Some(&fn_ptr))?;
+                let bound_vec_header = match &place.kind {
+                    PlaceKind::Local(local)
+                        if tyref_rust_vec_item_kind(&place.ty, self.llbc).is_some() =>
+                    {
+                        self.local_var
+                            .get(*local as usize)
+                            .and_then(|slot| slot.as_ref())
+                            .and_then(|value| value.one().ok())
+                            .is_some()
+                    }
+                    _ => false,
+                };
+                if !handled && bound_vec_header {
+                    return self.lower_drop_as_glue_call(
+                        mir_bb,
+                        place,
+                        fn_ptr,
+                        target as usize,
+                        on_unwind as usize,
+                    );
+                }
+                let _ = on_unwind;
                 let target_bb = self.block_id[target as usize];
                 let args = self.edge_args(mir_bb, target as usize)?;
                 self.graph.set_goto(bb_id, target_bb, args);
@@ -21746,7 +21915,6 @@ impl<'a> Lowering<'a> {
     }
 
     /// Lower a local `Drop` as the glue call named by its MIR terminator.
-    #[allow(dead_code)]
     fn lower_drop_as_glue_call(
         &mut self,
         mir_bb: usize,
