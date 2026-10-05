@@ -25,7 +25,7 @@ use std::rc::Rc;
 use majit_backend::Backend;
 use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
-use majit_ir::{Type, Value};
+use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::jit_env::{env_var, env_var_os};
 use majit_metainterp::warmstate::FunctionEntryStep;
@@ -7995,6 +7995,7 @@ static PORTAL_METATRACE_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 struct PortalMetatraceSym {
     header_pc: usize,
+    redboxes: Vec<(OpRef, Type)>,
 }
 
 impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
@@ -8004,6 +8005,26 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
 
     fn loop_header_pc(&self) -> usize {
         self.header_pc
+    }
+
+    fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+        // pyjitpl.py `opimpl_jit_merge_point` → `reached_loop_header(greenboxes, redboxes)`.
+        self.redboxes = redboxes.to_vec();
+    }
+
+    fn loop_carried_boxes(&self, vable_boxes: &[(OpRef, Type)]) -> Option<Vec<(OpRef, Type)>> {
+        // pyjitpl.py `reached_loop_header`:
+        //   live_arg_boxes = greenboxes + redboxes
+        //   live_arg_boxes += self.virtualizable_boxes
+        //   live_arg_boxes.pop()
+        // `compile_loop` slices greens (`original_boxes[num_green_args:]`),
+        // so the LABEL/JUMP are reds plus every virtualizable field except
+        // the trailing identity. Same list `collect_jump_args_with_boxes`
+        // builds for the close.
+        let mut boxes = self.redboxes.clone();
+        let n = vable_boxes.len().saturating_sub(1);
+        boxes.extend_from_slice(&vable_boxes[..n]);
+        if boxes.is_empty() { None } else { Some(boxes) }
     }
 }
 
@@ -8092,7 +8113,13 @@ fn drive_portal_metatrace(
     // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
     // at translation. Close before the portal walk reads it.
     majit_gc::ensure_type_registry_closed();
-    let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
+    let action = meta.interpret(
+        &mut PortalMetatraceSym {
+            header_pc,
+            redboxes: Vec::new(),
+        },
+        loop_header_pc,
+    );
     let depth = meta.framestack.len();
     let (stop_jitcode, stop_cursor) = if let Some(top) = meta.framestack.frames.last() {
         (top.jitcode.name(), top.code_cursor)
@@ -12966,6 +12993,7 @@ fn compile_and_run_once(
         |meta, _sym| {
             let mut portal_sym = PortalMetatraceSym {
                 header_pc: target_pc,
+                redboxes: Vec::new(),
             };
             if majit_metainterp::majit_log_enabled() {
                 let (name, cursor, first) = if meta.framestack.is_empty() {
@@ -15166,10 +15194,7 @@ pub(crate) fn decode_and_restore_guard_failure(
         // `locals_cells_stack_w` from the vable boxes, including slots
         // above `valuestackdepth`. A popped box can still hold a young
         // pointer; the type-9 walker traces every allocated slot, so
-        // leave those words NULL. The vsd-correction arm above already
-        // trimmed when it rewrote the depth; this covers the single-frame
-        // resume that keeps the restored vsd (`test_complex_newobj_ex`
-        // after a hot `Unpickler.load`).
+        // leave those words NULL.
         jit_state.clear_stack_above(jit_state.valuestackdepth());
         // Outermost-first `(w_code, py_pc, jitcode_index, jitcode_pc)` per
         // resumed section. The caller needs them to ask each frame's own

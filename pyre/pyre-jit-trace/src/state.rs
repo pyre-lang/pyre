@@ -11718,13 +11718,23 @@ impl JitState for PyreJitState {
                     // (non-empty `pcdep_color_slots`) falls to the else branch (per-slot
                     // inversion) instead of reading the color-indexed bank as if it were
                     // slot-indexed.
+                    //
+                    // virtualizable.py `read_boxes`: with no pcdep the jitcode
+                    // Ref colors are not Python local slots (a portal guard's
+                    // `-live-` list starts with the portal reds). Locals come
+                    // from the vable array; stack slots keep the color bank
+                    // and only take the vable image for NONE/null.
                     for (idx, slot) in bridge_registers_r
                         .iter_mut()
                         .enumerate()
                         .take(semantic_prefix_len)
                     {
                         let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v == 0);
-                        let want_vable = slot.is_none() || slot_is_null_const;
+                        let got_portal_red = idx < nlocals
+                            && !slot.is_none()
+                            && (*slot == bridge_execution_context
+                                || *slot == OpRef::input_arg_ref(0));
+                        let want_vable = got_portal_red || slot.is_none() || slot_is_null_const;
                         if want_vable {
                             if let Some(v) = vable_array_items.get(idx).copied() {
                                 if !v.is_none() {

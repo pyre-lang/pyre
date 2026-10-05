@@ -378,6 +378,7 @@ const BHIMPL_DEFAULT_OPNAMES: &[&str] = &[
     "int_is_true",
     "int_is_zero",
     "int_isconstant",
+    "int_isvirtual",
     "int_le",
     "int_lshift",
     "int_lt",
