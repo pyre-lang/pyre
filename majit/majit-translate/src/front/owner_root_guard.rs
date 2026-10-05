@@ -384,7 +384,7 @@ pub(super) fn residual_escape_census(llbc: &Llbc) -> Vec<(String, String)> {
             if !forward_blocks[bb_idx] {
                 continue;
             }
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             if let Some(callee) = residual_escape(&call, llbc, &dont_look_inside) {

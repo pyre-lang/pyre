@@ -760,7 +760,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                 continue;
             }
             for st in &bb.statements {
-                if let Ok(StmtKind::Assign(p, rv)) = st.stmt_kind()
+                if let Ok(StmtKind::Assign(p, rv)) = st.stmt_kind_ref()
                     && let Some(l) = root(&p)
                 {
                     if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rv
@@ -768,10 +768,10 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                     {
                         projected.insert(l, elem.label());
                     }
-                    defs.insert(l, rv);
+                    defs.insert(l, rv.clone());
                 }
             }
-            if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
                 && let Some(l) = root(&call.dest)
                 && let CallFunc::Regular(reg) = &call.func
                 && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
@@ -787,7 +787,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
             if !call_graph_walks_block(bb, forward[bb_idx]) {
                 continue;
             }
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             let CallFunc::Dynamic(op) = &call.func else {
@@ -957,7 +957,7 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
             if forward[bb_idx] && call_graph_flow_is_incomplete(llbc, bb) {
                 incomplete = true;
             }
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             match &call.func {
@@ -1011,11 +1011,13 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
                     let ty = match op {
                         majit_charon_reader::ullbc::Operand::Copy(p)
                         | majit_charon_reader::ullbc::Operand::Move(p) => match &p.ty {
-                            majit_charon_reader::ullbc::TyRef::Inline { value: (_, v) } => Some(v),
+                            majit_charon_reader::ullbc::TyRef::Inline { value: (_, v) } => {
+                                Some(v.as_ref())
+                            }
                             majit_charon_reader::ullbc::TyRef::Dedup { id } => llbc.dedup_body(*id),
-                            majit_charon_reader::ullbc::TyRef::Other(v) => Some(v),
+                            majit_charon_reader::ullbc::TyRef::Other(v) => Some(v.as_ref()),
                         },
-                        majit_charon_reader::ullbc::Operand::Const(v) => Some(v),
+                        majit_charon_reader::ullbc::Operand::Const(v) => Some(v.as_ref()),
                     };
                     note_opaque(ty, "Dynamic");
                 }
