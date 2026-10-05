@@ -21591,6 +21591,15 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok(self.emit_promoted_int_range_inclusive(mir_bb, lo, hi, &place_ty));
                 }
+                // rustc promotes a `NamedConst` use to an `AnonConst` whose
+                // initializer FunDecl copies the real global
+                // (`PromotedConst`). Fold through that wrapper so the
+                // NamedConst lanes below see `pypyjitdriver` rather than a
+                // nullary residual of `eval_loop_jit::promoted#N`
+                // (`getfunctionptr` / `handle_residual_call`).
+                if let Some(inner) = self.anon_const_copied_global(id) {
+                    return self.resolve_place(mir_bb, inner);
+                }
                 let segments = self.global_segments(mir_bb, id)?;
                 // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
                 // the `None` stored in PyPy's `locals_cells_stack_w` slots
@@ -22771,6 +22780,27 @@ impl<'a> Lowering<'a> {
             },
         });
         res
+    }
+
+    /// Inner `Place::Global` of an `AnonConst` whose initializer only copies
+    /// that global (`FunDecl::is_global_initializer` / PromotedConst).
+    fn anon_const_copied_global(&self, def_id: u64) -> Option<Place> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("AnonConst")
+        {
+            return None;
+        }
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        let inner = promoted_const_copied_global(&body)?;
+        if inner_global_id(&inner) == def_id {
+            return None;
+        }
+        Some(inner)
     }
 
     /// Fold a `NamedConst` global (Rust `const`) whose initializer is a
@@ -47869,7 +47899,6 @@ fn regular_call_is_panicking_abort(reg: &RegularCall, llbc: &Llbc) -> bool {
     let mut segs = path.split("::");
     matches!(segs.next(), Some("core") | Some("std")) && segs.next() == Some("panicking")
 }
-
 /// Charon `PathElem::Builtin(PromotedConst, N)` on a FunDecl.
 fn fundecl_is_promoted_const(fd: &FunDecl) -> bool {
     fd.item_meta.name.last().is_some_and(|seg| match seg {
