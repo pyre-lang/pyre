@@ -20595,6 +20595,18 @@ impl<'a> Lowering<'a> {
                     // `FatLen` (`ListRepr.rtype_len`). `tyref_is_fat_dyn`
                     // covers `Box<dyn T>` as well as one-level `&dyn T`.
                     let is_dyn = tyref_is_fat_dyn(&inner.ty, self.llbc);
+                    let slice_elem = tyref_slice_elem(&inner.ty, self.llbc);
+                    let is_string_byte_view = self
+                        .string_byte_view_locals
+                        .iter()
+                        .any(|&local| place_references_local(&inner, local));
+                    let array_type_id = slice_elem.and_then(|elem| {
+                        json_ty_is_objectptr(elem, self.llbc).then(|| {
+                            slice_array_type_id("*mut PyObject")
+                                .expect("object-pointer slice names the object gcarray")
+                        })
+                    });
+                    let is_slice = slice_elem.is_some();
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let part = if is_dyn {
@@ -20605,6 +20617,15 @@ impl<'a> Lowering<'a> {
                     if let Some(meta) = self.fat_component(bb_id, &base, part) {
                         return Ok(meta);
                     }
+                    if is_slice {
+                        return Ok(self.emit_slice_len(
+                            bb_id,
+                            &base,
+                            is_string_byte_view,
+                            array_type_id,
+                        ));
+                    }
+                    // dyn vtable case left to the vtable lowering.
                     return Ok(base);
                 }
                 if let ProjectionElem::Atom(name) = &elem
@@ -26956,33 +26977,12 @@ impl<'a> Lowering<'a> {
                     } else if let Some(len_var) = fat_len {
                         len_var
                     } else {
-                        // `.len()` of a declared virtualizable array is
-                        // `arraylen_vable`, which needs the field read unmarked.
-                        self.release_declared_vable_array_address(&args[0]);
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        let kind = if first_arg_is_string_byte_view {
-                            OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec!["__strlen".to_string()],
-                                    fun_decl_id: None,
-                                },
-                                args: crate::model::call_args(vec![args[0].clone()]),
-                                result_ty: ValueType::Int,
-                            }
-                        } else {
-                            OpKind::ArrayLen {
-                                base: args[0].clone(),
-                                array_type_id: self.slice_object_array_type_id(&reg),
-                                nolength: false,
-                            }
-                        };
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind,
-                        });
-                        res
+                        self.emit_slice_len(
+                            bb_id,
+                            &args[0],
+                            first_arg_is_string_byte_view,
+                            self.slice_object_array_type_id(&reg),
+                        )
                     };
                     self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
@@ -34420,6 +34420,43 @@ impl<'a> Lowering<'a> {
                 .any(|&local| place_references_local(place, local)),
             Operand::Const(_) => false,
         }
+    }
+
+    /// Length of a slice that is not a fat `Box<[T]>` field. A string-byte
+    /// view is `__strlen`; a declared virtualizable array is `arraylen_vable`
+    /// (the field read must be unmarked); every other slice is `ArrayLen`.
+    fn emit_slice_len(
+        &mut self,
+        bb_id: BlockId,
+        base: &Variable,
+        is_string_byte_view: bool,
+        array_type_id: Option<String>,
+    ) -> Variable {
+        self.release_declared_vable_array_address(base);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let kind = if is_string_byte_view {
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__strlen".to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![base.clone()]),
+                result_ty: ValueType::Int,
+            }
+        } else {
+            OpKind::ArrayLen {
+                base: base.clone(),
+                array_type_id,
+                nolength: false,
+            }
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind,
+        });
+        res
     }
 
     /// ARRAY identity of a `<[T]>::len` / `is_empty` receiver whose `T` is
@@ -70892,6 +70929,23 @@ fn tyref_object_pointer_slice_mutability<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> O
     .then_some(kind)
 }
 
+/// The element node of `[T]` behind `&` / `&mut` / `*const` / `*mut` / `Box`.
+/// `str` and `dyn Trait` have no `Slice` node, so they answer `None`.
+fn tyref_slice_elem<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = if let Some(pointee) = type_node_box_pointee(node, llbc) {
+        pointee
+    } else {
+        match (node.get("Ref"), node.get("RawPtr")) {
+            (Some(reference), _) => reference.as_array()?.get(1)?,
+            (None, Some(raw)) => raw.as_array()?.first()?,
+            (None, None) => return None,
+        }
+    };
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    pointee.get("Slice")?.as_array()?.first()
+}
+
 /// The item kind of a `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]` whose
 /// items are one word: a fat pointer, one level over a slice.  `&[u8]`, `&str` and a borrow of
 /// a fixed-length array answer `None`.
@@ -83377,6 +83431,74 @@ mod tests {
             !fat_lens.is_empty(),
             "the vtable word must be a FatMeta of slot\n{}",
             graph.dump()
+        );
+    }
+
+    /// Charon emits `PtrMetadata` for `.len()` on a place. A one-word
+    /// object-pointer slice parameter is the length-prefixed array, so the
+    /// metadata word is `ArrayLen` of that argument.
+    #[test]
+    fn ptr_metadata_of_a_slice_param_is_its_array_len() {
+        let object_ty = interior_adt(0);
+        let item = interior_raw_mut(object_ty);
+        let slice = serde_json::json!({"Slice": [item, null]});
+        let slice_ref = interior_shared(slice);
+        let usize_ty = interior_usize();
+        let arg_place = interior_place(1, &slice_ref);
+        let meta_place = serde_json::json!({
+            "kind": {"Projection": [arg_place, "PtrMetadata"]},
+            "ty": usize_ty
+        });
+        let caller = interior_caller(
+            "slice_ptrmeta",
+            1,
+            vec![slice_ref.clone()],
+            usize_ty.clone(),
+            vec![
+                interior_local(0, None, &usize_ty),
+                interior_local(1, Some("args"), &slice_ref),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &usize_ty),
+                    interior_use(meta_place),
+                )],
+                interior_return(),
+            )],
+        );
+        let object_decl = interior_struct(0, &["fixture", "PyObject"], &[], 0, &[], false);
+        let llbc = llbc_with_types("fixture", vec![object_decl], vec![caller]);
+        let graph = super::lower_function(&llbc, "slice_ptrmeta").expect("lower slice_ptrmeta");
+        let arg = graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .cloned()
+            .expect("slice param");
+        let lens: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::ArrayLen { base, .. } => Some(base.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lens,
+            vec![arg.clone()],
+            "PtrMetadata of a slice param must be ArrayLen of that param; ops={:?}",
+            graph_ops(&graph)
+        );
+        let returned = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.exits.iter())
+            .find(|link| link.target == graph.returnblock)
+            .and_then(|link| link.args.first());
+        assert!(
+            matches!(returned, Some(LinkArg::Value(value)) if *value != arg),
+            "PtrMetadata must not return the argument Variable; returned={returned:?} arg={arg:?}"
         );
     }
 
