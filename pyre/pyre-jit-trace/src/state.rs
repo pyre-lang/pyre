@@ -7426,7 +7426,7 @@ impl PyreSym {
             // an already-seeded `initialize_virtualizable` layout: that
             // length is the LABEL `inputarg_types`, and a shorter re-seed
             // made the walker JUMP one box short of it.
-            let mut array_len = concrete_frame_array_len(self.live_vable_frame_addr)
+            let mut array_len = concrete_frame_array_len(self.current_live_vable_frame())
                 .or_else(|| concrete_frame_array_len(concrete_frame))
                 .or_else(|| {
                     (!self.jitcode.is_null()).then(|| {

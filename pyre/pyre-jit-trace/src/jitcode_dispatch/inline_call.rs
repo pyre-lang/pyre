@@ -13246,7 +13246,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
             };
             let raw = crate::helpers::emit_trace_call_int_typed(
                 ctx.trace_ctx,
-                crate::helpers::jit_hash_normalize_digest as *const (),
+                pyre_interpreter::residual_word_addr!(1, crate::helpers::jit_hash_normalize_digest),
                 &[result],
                 &[majit_ir::Type::Ref],
             );
