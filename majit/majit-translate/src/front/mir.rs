@@ -2331,6 +2331,7 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
+            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
         );
         if result_exc_ok_is_unit(
             &fd.signature.output,
@@ -2562,6 +2563,7 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
+            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
         );
         // Local 0 is the return place. A clause-spec body is the FunDecl
         // with type arguments substituted, so that local is the instantiated
@@ -6328,11 +6330,13 @@ use self::views::*;
 
 pub(crate) use self::consteval::{
     attach_foldable_const_lits, discover_foldable_const_lits, discover_transparent_scalar_kinds,
-    harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
+    harvest_immutable_fields_from_immutable_statics, harvest_named_const_folds,
+    push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
     register_foldable_const_lits,
 };
 pub(crate) use self::desugar::callee::{
-    discover_eval_hook_graphs, release_declared_vable_array_address,
+    discover_eval_hook_graphs, inherent_callable_rust_path, registered_path_for_fun_decl,
+    release_declared_vable_array_address,
 };
 pub(crate) use self::desugar::rewire::{
     AggregateCtor, AggregateShape, emit_aggregate_value, is_core_clone_impls_clone_path,
@@ -6340,9 +6344,10 @@ pub(crate) use self::desugar::rewire::{
 };
 pub use self::gcroot::{
     PublishedStructBody, PublishedStructField, RootStackState, apply_published_structs,
-    erased_root_bracket_guards, fn_returns_owned_scope, harvest_published_structs,
-    harvest_root_stack_touching_paths, harvest_scope_owning_identities, mark_foreign_scope_owners,
-    scope_owner_identity,
+    erased_root_bracket_guards, fn_returns_owned_scope, function_touches_root_stack,
+    harvest_published_structs, harvest_root_stack_touching_paths, harvest_scope_owning_identities,
+    mark_foreign_scope_owners, pin_roots_published_locals, scope_owner_identity,
+    shadow_stack_erase_status,
 };
 pub(crate) use self::gcroot::{
     ROOT_SCOPE_CLOSE, RootStackAnalyzer, harvest_root_stack_touching_paths_with,
@@ -6355,11 +6360,11 @@ pub(crate) use self::lltype::{
     ThreadLocalRefLlop, adt_head_instantiation_suffix, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
-    fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_flattened_storage_leaf, is_rstr_str_layout_declaration, is_str_family_class_root,
-    is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
+    fixed_array_index_identity, fixed_array_lowers_to_gcarray, fixed_list_reader,
+    fnptr_indirect_enabled, host_rthread_threadlocalref_llop, is_flattened_storage_leaf,
+    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
     type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
     unichr_call,
 };
@@ -8025,11 +8030,10 @@ pub(crate) fn emit_rust_vec_drop_if_allocated(
     graph.block_mut(bb_id).operations.push(SpaceOperation {
         result: None,
         kind: OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: rust_vec_helper_segments(majit_ir::rvec::VecOp::Free, kind),
-                fun_decl_id: None,
-                specialization: crate::parse::GraphSpecialization::Regular,
-            },
+            target: CallTarget::function_path(rust_vec_helper_segments(
+                majit_ir::rvec::VecOp::Free,
+                kind,
+            )),
             args: crate::model::call_args(vec![header.clone()]),
             result_ty: ValueType::Void,
         },

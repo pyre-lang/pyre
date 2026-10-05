@@ -340,6 +340,36 @@ fn integer_cast_to_raw_scalar_stays_int() {
     });
 }
 
+/// `HashStateStorage.words` is `[usize; N]`. Charon spells that as a
+/// `Value`-wrapped `Array` whose item is interned `Deduplicated` usize.
+/// `history.py` `getkind` has no kind for a `FixedSizeArray` value; the
+/// fill of `[0; N]` (`lltype.FixedSizeArray` items) is that integer.
+/// A `Ref` field against an `Int` fill panics in
+/// `jtransform.py` `rewrite_op_setfield`.
+#[test]
+fn hashlib_copy_repeat_fill_matches_words_item_kind() {
+    let llbc = load_llbc(MODULE_LLBC);
+    let context = lower_context_for(llbc);
+    let graph = lower_fun_decl(&context, find_method(&llbc, "copy", "W_HashState"))
+        .expect("lower W_HashState::copy");
+    let word_writes: Vec<&ValueType> = ops(&graph)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, ty, .. } if field.name == "words" => Some(ty),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !word_writes.is_empty(),
+        "copy writes HashStateStorage.words"
+    );
+    assert!(
+        word_writes
+            .iter()
+            .all(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
+        "words is a scalar FixedSizeArray item, got {word_writes:?}"
+    );
+}
+
 #[test]
 fn sizehint_i64_cast_stays_gcarray_write() {
     let llbc = load_llbc(OBJECT_LLBC);

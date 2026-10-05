@@ -669,12 +669,13 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    residual_raw_addr: bool,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[]);
+    let len_shadow = pair_len_shadows_of(&graph.name, locals, llbc, &[], &[], &[]);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
     let ret_len_slot_local = ret_len_slot_index(locals, llbc, &len_shadow, n_slots);
     // Arguments become startblock inputargs in source order
@@ -770,6 +771,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             i == 1,
             tombstoned_leaves,
         );
+        if residual_raw_addr && let Some(kind) = pass_by_value_multiword_kind(&local.ty, llbc) {
+            ty = kind;
+        }
         // Same membership as [`gc_mut_ref_param_locals`], including the
         // residual exclusion: a cell parameter is the `MutRef<T>` the
         // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
@@ -1467,6 +1471,11 @@ impl<'a> Lowering<'a> {
                 i == 1,
                 tombstoned_leaves,
             );
+            if self_dont_look_inside
+                && let Some(kind) = pass_by_value_multiword_kind(&local.ty, llbc)
+            {
+                ty = kind;
+            }
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
             // `ClassDef`; only `Ref`-typed params consume it there.  A
@@ -1827,6 +1836,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![length]),
@@ -2291,6 +2301,58 @@ impl<'a> Lowering<'a> {
             .and_then(|value| value.one().ok())
             .is_some_and(|var| self.var_is_object_vec_header(&var))
     }
+
+    /// The `Vec` header a pair-slice local was derived from (`deref` /
+    /// `as_mut_slice`). Used to retarget `shadow_stack_copy_range` onto
+    /// `shadow_stack_copy_range_into_vec` when the dest is the pair view
+    /// (`rlist.py` `GcArray` write of the vec's item buffer).
+    pub(in crate::front::mir) fn vec_header_var_of_slice_local(&self, local: usize) -> Option<Variable> {
+        let mut cur = local;
+        let mut seen = bit_set::BitSet::new();
+        loop {
+            if !seen.insert(cur) {
+                return None;
+            }
+            let from_call = self.body.body.iter().find_map(|bb| {
+                let Ok(TermKind::Call { call, .. }) = bb.term(self.llbc) else {
+                    return None;
+                };
+                if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == cur) {
+                    return None;
+                }
+                let CallFunc::Regular(reg) = &call.func else {
+                    return None;
+                };
+                if !(is_rust_vec_slice_view_call(reg, self.llbc)
+                    || is_deref_call(reg, self.llbc)
+                    || vec_index_regular_unchecked_leaf(reg, self.llbc).is_some())
+                {
+                    return None;
+                }
+                tyref_rust_vec_item_kind(operand_tyref(call.args.first()?)?, self.llbc)?;
+                let vec_local = operand_local(call.args.first())?;
+                self.local_var
+                    .get(vec_local)?
+                    .as_ref()
+                    .map(LocalValue::link_word)
+            });
+            if from_call.is_some() {
+                return from_call;
+            }
+            cur = self.body.body.iter().find_map(|bb| {
+                bb.statements.iter().find_map(|stmt| {
+                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                        return None;
+                    };
+                    if place_base_local(place) != Some(cur) {
+                        return None;
+                    }
+                    assign_copy_source(rvalue)
+                })
+            })?;
+        }
+    }
+
 
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
     /// actually materialises in the model graph.  This EXCLUDES

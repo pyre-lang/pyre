@@ -798,6 +798,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: path.split("::").map(str::to_string).collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args),
@@ -961,6 +962,49 @@ impl<'a> Lowering<'a> {
             &self.raw_alloc_flavor_structs,
         );
         Some(self.retype_word(mir_bb, value, &from, &ValueType::Unsigned))
+    }
+
+    /// Expand a length-prefixed object GcArray to the `(items, length)`
+    /// pair a residual `(ptr, len)` helper takes (`rlist.py ll_extend` /
+    /// `build_list_from_refs_jit_abi`).
+    pub(in crate::front::mir) fn expand_object_gcarray_header_to_items_len(
+        &mut self,
+        mir_bb: usize,
+        gcarray: Variable,
+    ) -> (Variable, Variable) {
+        let bb_id = self.block_id[mir_bb];
+        let length = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(length.clone()),
+            kind: OpKind::ArrayLen {
+                base: gcarray.clone(),
+                array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
+            },
+        });
+        let items = self.items_block_item_address(
+            mir_bb,
+            gcarray,
+            &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
+        );
+        (items, length)
+    }
+
+    /// Expand a length-prefixed object GcArray argument of
+    /// `Vec::extend_from_slice` to the `(items, length)` pair
+    /// `ll_vec_extend_from_slice_*` takes (`rlist.py ll_extend`).
+    pub(in crate::front::mir) fn expand_object_gcarray_to_items_len(
+        &mut self,
+        mir_bb: usize,
+        args: Vec<Variable>,
+    ) -> Vec<Variable> {
+        let vec = args[0].clone();
+        let gcarray = args[1].clone();
+        let (items, length) = self.expand_object_gcarray_header_to_items_len(mir_bb, gcarray);
+        vec![vec, items, length]
     }
 
     /// The pair's item word type for a slice helper: the helpers take and
@@ -1331,6 +1375,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
@@ -1910,6 +1955,26 @@ impl<'a> Lowering<'a> {
             self.bind_initializer_result(mir_bb, dest_local, target, res)?;
             return Ok(true);
         }
+        // An immutable `static`'s accessor is the static's address, not a
+        // residual call to the static's symbolic path. Interior-mut
+        // (`Cell` / `UnsafeCell` / atomic) statics are not prebuilt
+        // values; they still have an address to load through.
+        if let Some(gid) = gid
+            && let Some(op) = self
+                .immutable_static_prebuilt_op(gid)
+                .or_else(|| self.immutable_static_addr_op(gid))
+        {
+            let bb_id = self.block_id[mir_bb];
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: op,
+            });
+            self.bind_initializer_result(mir_bb, dest_local, target, res)?;
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -2119,11 +2184,16 @@ impl<'a> Lowering<'a> {
 
     /// Whether a call is one [`Self::lower_pair_call`] lowers: it defines a
     /// pair slice, or it is a slice method that reads one.
-    pub(in crate::front::mir) fn is_pair_call(
-        &self,
-        call: &CallPayload,
-        dest_local: usize,
-    ) -> bool {
+    pub(in crate::front::mir) fn is_pair_call(&self, call: &CallPayload, dest_local: usize) -> bool {
+        // `Vec::reverse` is `as_mut_slice` then `<[T]>::reverse`. That
+        // dest is a pair-shaped `&mut [T]`, but the only consumer is
+        // reverse, which `rlist.py ll_reverse` wants on the vec header
+        // (`ll_vec_reverse`). Leave the dest for the identity-deref
+        // arm rather than binding a pair that reverse then reads as
+        // one word.
+        if rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local) {
+            return false;
+        }
         let dest_is_window_slot = self.len_shadow.get(dest_local).copied().flatten().is_some()
             && self
                 .body
@@ -2240,7 +2310,10 @@ impl<'a> Lowering<'a> {
                             })
                             .is_some_and(|ty| tyref_to_ast_string(&ty, self.llbc) == "usize")
                 }
-                _ => false,
+                other => {
+                    let segs: Vec<String> = other.split("::").map(str::to_string).collect();
+                    is_core_slice_reverse(&segs)
+                }
             }
         })
     }
@@ -2476,6 +2549,8 @@ impl<'a> Lowering<'a> {
                 _ => None,
             };
             let src_owner = args.first().and_then(|v| self.owner_for_window_source(v));
+            let name_segs: Vec<String> = path_segments_respecting_angles(&name);
+            let vec_index = matches!(rust_vec_std_leaf(&name_segs), Some("index" | "index_mut"));
             let (ptr, len) = match (name.as_str(), vec_kind) {
                 _ if let Some((ptr, len, kind)) = array_receiver => {
                     self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
@@ -2488,9 +2563,7 @@ impl<'a> Lowering<'a> {
                 (_, Some(kind)) if args.len() == 1 && rust_vec_slice_view(&name).is_some() => {
                     self.pair_of_vec(mir_bb, kind, args[0].clone())
                 }
-                ("alloc::vec::<Impl>::index" | "alloc::vec::<Impl>::index_mut", Some(kind))
-                    if args.len() == 2 =>
-                {
+                (_, Some(kind)) if vec_index && args.len() == 2 => {
                     let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
                     self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
                 }
@@ -3326,10 +3399,14 @@ impl<'a> Lowering<'a> {
                 let mut target = CallTarget::FunctionPath {
                     segments,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 };
                 if let Some(id) = fun_decl_id {
                     target = target.with_fun_decl_id(id);
+                    if let Some(fd) = self.llbc.fn_by_id(id) {
+                        target = self.attach_call_generics(target, fd, &reg.generics, None);
+                    }
                 }
                 target
             }
@@ -4078,9 +4155,10 @@ pub(in crate::front::mir) fn stamp_rust_vec_header(
     var.set_concretetype(Some(rust_vec_header_lltype(kind, spelling.as_deref())));
 }
 
-/// AST spelling of a one-word `alloc::vec::Vec<T>`, by value, behind a
-/// borrow, or behind a raw pointer. `None` when the items are not one word.
-pub(in crate::front::mir) fn tyref_one_word_vec_ast(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+/// The `alloc::vec::Vec` ADT node of `ty`, by value, behind a borrow, or
+/// behind a raw pointer. All three are the address of the raw
+/// `{ptr, len, cap}` header (`RustVecRepr`).
+pub(in crate::front::mir) fn tyref_rust_vec_adt_node<'a>(ty: &'a TyRef, llbc: &'a Llbc) -> Option<&'a serde_json::Value> {
     let mut node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     if let Some(pointee) = node
         .get("RawPtr")
@@ -4093,9 +4171,25 @@ pub(in crate::front::mir) fn tyref_one_word_vec_ast(ty: &TyRef, llbc: &Llbc) -> 
     if llbc.type_by_id(id)?.item_meta.name_path() != "alloc::vec::Vec" {
         return None;
     }
+    Some(node)
+}
+
+/// AST spelling of a one-word `alloc::vec::Vec<T>`, by value, behind a
+/// borrow, or behind a raw pointer. `None` when the items are not one word.
+pub(in crate::front::mir) fn tyref_one_word_vec_ast(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let node = tyref_rust_vec_adt_node(ty, llbc)?;
     let ast = charon_type_value_to_ast_string(node, llbc, 0);
     majit_ir::rvec::rust_vec_item_kind_for_spelling(&ast, crate::layout::target_word_size())?;
     Some(ast)
+}
+
+/// Whether `ty` is an `alloc::vec::Vec<T>` header — by value, behind a
+/// borrow, or behind a raw pointer — regardless of the item type T.
+/// The translator's value is that header address (`RustVecRepr`, kind
+/// `int`). Item kind ([`tyref_rust_vec_item_kind`]) only selects the
+/// `ll_vec_*` helper.
+pub(in crate::front::mir) fn tyref_is_rust_vec_header(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_rust_vec_adt_node(ty, llbc).is_some()
 }
 
 /// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,
@@ -4774,7 +4868,7 @@ pub(in crate::front::mir) fn pair_len_shadows(
     // those formals splices the key and harvests `equivalent` (`PartialEq::eq`).
     mark_dict_method_str_view_keys(graph_name, body, llbc, &mut str_views);
     (
-        pair_len_shadows_of(&body.locals, llbc, &views, &str_views, &list_views),
+        pair_len_shadows_of(graph_name, &body.locals, llbc, &views, &str_views, &list_views),
         str_views,
         list_views,
         list_view_fixed,
@@ -5329,10 +5423,7 @@ pub(in crate::front::mir) fn is_rdict_host_rewritten_call(reg: &RegularCall, llb
 /// Locals that hold the `{ptr, len}` view of an object-pointer `Vec`
 /// buffer: dest of a `Vec` method that yields `&mut [T]`, and dest of
 /// `iter_mut` over one of those slices.
-pub(in crate::front::mir) fn objectptr_pair_view_locals(
-    body: &Unstructured,
-    llbc: &Llbc,
-) -> Vec<bool> {
+pub(in crate::front::mir) fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     let n = body.locals.locals.len();
     let mut view = vec![false; n];
     // Whole-list `&mut vec` / `&mut vec[..]` is the header word, not a
@@ -5355,6 +5446,10 @@ pub(in crate::front::mir) fn objectptr_pair_view_locals(
         if tyref_rust_vec_item_kind(first_ty, llbc).is_some()
             && slice_ty_item_is_object_pointer(&call.dest.ty, llbc)
             && (ref_kind_is_mut(&call.dest.ty, llbc) || raw_ptr_kind_is_mut(&call.dest.ty, llbc))
+            // `Vec::reverse` is the only use: keep the dest a one-word
+            // alias of the header (`ll_vec_reverse`), not a pair view
+            // whose shadow is never bound.
+            && !rust_vec_deref_feeds_only_reverse(body, llbc, dest)
         {
             // A Range / RangeFrom / RangeTo subslice stays the aliasing view.
             let whole_list_mut = matches!(&call.func, CallFunc::Regular(reg)
@@ -5409,6 +5504,7 @@ pub(in crate::front::mir) fn objectptr_pair_view_locals(
 }
 
 pub(in crate::front::mir) fn pair_len_shadows_of(
+    name: &str,
     locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,
     view_locals: &[bool],
@@ -5418,7 +5514,7 @@ pub(in crate::front::mir) fn pair_len_shadows_of(
     let n_locals = locals.locals.len();
     let arg_count = locals.arg_count as usize;
     let mut next = n_locals;
-    locals
+    let mut shadows: Vec<Option<usize>> = locals
         .locals
         .iter()
         .enumerate()
@@ -5458,7 +5554,22 @@ pub(in crate::front::mir) fn pair_len_shadows_of(
                 next - 1
             })
         })
-        .collect()
+        .collect();
+    // Residual ABI is `(ptr, len)` (`build_*_from_refs_jit_abi` / `cpa2`).
+    // Callers expand the length-prefixed object GcArray to that pair;
+    // `FUNC.ARGS` has to name the same two ints or `getcalldescr` panics.
+    if path_is_build_refs_pair_abi(name) {
+        for (index, local) in locals.locals.iter().enumerate() {
+            if index == 0 || index > arg_count || shadows[index].is_some() {
+                continue;
+            }
+            if tyref_is_object_pointer_slice(&local.ty, llbc) {
+                shadows[index] = Some(next);
+                next += 1;
+            }
+        }
+    }
+    shadows
 }
 
 /// Extra SSA slot for a pair window's GC owner. Same locals as
@@ -5534,6 +5645,19 @@ pub(in crate::front::mir) fn tyref_raw_array_parts<'l>(
         .parse::<u64>()
         .ok()?;
     Some((&array[0], len))
+}
+
+/// `[T; N]` whose item is an int/uint/float register. `history.py getkind`
+/// has no kind for a `FixedSizeArray` value; the items are the registers.
+/// Length may be a const-generic, so this does not parse `N`.
+pub(in crate::front::mir) fn scalar_fixed_array_item(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let item = tyref_array_item(ty, llbc)?;
+    let item_ty = tyref_to_value_type(&item, llbc);
+    matches!(
+        item_ty,
+        ValueType::Int | ValueType::Unsigned | ValueType::Float
+    )
+    .then_some(item_ty)
 }
 
 /// Whether the JSON `place` is `a` or `*b` for a raw-array storage local `a`
@@ -6130,6 +6254,31 @@ fn path_segments_respecting_angles(path: &str) -> Vec<String> {
     out
 }
 
+/// `Vec::deref` / `deref_mut` / `as_slice` / `as_mut_slice`: the slice view
+/// of a one-word-item `Vec`. Both Charon impl spellings (`<Impl>` and `Vec`)
+/// and the crate-stripped residual path (`vec::Vec::…`).
+pub(in crate::front::mir) fn rust_vec_slice_view_leaf(segments: &[String]) -> Option<&str> {
+    match rust_vec_std_leaf(segments)? {
+        leaf @ ("deref" | "deref_mut" | "as_slice" | "as_mut_slice") => Some(leaf),
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn path_is_vec_slice_view(path: &str) -> bool {
+    rust_vec_slice_view(path).is_some()
+}
+
+pub(in crate::front::mir) fn path_is_vec_extend_from_slice(path: &str) -> bool {
+    rust_vec_std_leaf(&path_segments_respecting_angles(path)) == Some("extend_from_slice")
+}
+
+pub(in crate::front::mir) fn path_is_build_refs_pair_abi(path: &str) -> bool {
+    path.ends_with("::build_list_from_refs")
+        || path.ends_with("::build_tuple_from_refs")
+        || path == "build_list_from_refs"
+        || path == "build_tuple_from_refs"
+}
+
 /// `alloc::vec::from_elem`, the call `vec![item; count]` lowers to.
 pub(in crate::front::mir) fn is_alloc_vec_from_elem(segments: &[String]) -> bool {
     matches!(segments, [a, b, c] if a == "alloc" && b == "vec" && c == "from_elem")
@@ -6163,6 +6312,11 @@ pub(in crate::front::mir) fn rust_vec_std_call(
         ("as_ptr" | "as_mut_ptr", 1) => {
             Some((VecOp::Items, tyref_rust_vec_item_kind(first_arg_ty?, llbc)?))
         }
+        // `v.reverse()` — `rlist.py ll_reverse` / `ll_vec_reverse_*`.
+        ("reverse", 1) => Some((
+            VecOp::Reverse,
+            tyref_rust_vec_item_kind(first_arg_ty?, llbc)?,
+        )),
         _ => None,
     }
 }
@@ -6172,94 +6326,187 @@ pub(in crate::front::mir) fn is_core_slice_reverse(segments: &[String]) -> bool 
     matches!(segments, [a, b, c, d] if a == "core" && b == "slice" && c == "<Impl>" && d == "reverse")
 }
 
+/// The local a copy / reborrow `rvalue` reads, if it is only that.
+pub(in crate::front::mir) fn assign_copy_source(rvalue: &Rvalue) -> Option<usize> {
+    match rvalue {
+        Rvalue::Use(op, _) => operand_local(Some(op)),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place_base_local(place),
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn place_base_local(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Local(i) => Some(*i as usize),
+        PlaceKind::Projection(inner, _) => place_base_local(inner),
+        _ => None,
+    }
+}
+
 /// Item kind of the `Vec` of one-word items whose `deref` / `deref_mut`
-/// call defines MIR `local`.
+/// / `as_mut_slice` defines MIR `local`, walking copy / reborrow aliases.
 pub(in crate::front::mir) fn local_is_rust_vec_deref(
     body: &Unstructured,
     llbc: &Llbc,
     local: usize,
 ) -> Option<majit_ir::rvec::VecItemKind> {
     let forward_blocks = forward_reachable_mask(llbc, body);
-    body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
-        if !forward_blocks[bb_idx] {
+    let mut cur = local;
+    let mut seen = bit_set::BitSet::new();
+    loop {
+        if !seen.insert(cur) {
             return None;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
-            return None;
-        };
-        if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local) {
-            return None;
+        let from_call = body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
+            if !forward_blocks[bb_idx] {
+                return None;
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+                return None;
+            };
+            if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == cur) {
+                return None;
+            }
+            let CallFunc::Regular(reg) = &call.func else {
+                return None;
+            };
+            if !(is_rust_vec_slice_view_call(reg, llbc) || is_deref_call(reg, llbc)) {
+                return None;
+            }
+            tyref_rust_vec_item_kind(operand_tyref(call.args.first()?)?, llbc)
+        });
+        if from_call.is_some() {
+            return from_call;
         }
-        let CallFunc::Regular(reg) = &call.func else {
-            return None;
-        };
-        if !is_deref_call(reg, llbc) {
-            return None;
-        }
-        tyref_rust_vec_item_kind(operand_tyref(call.args.first()?)?, llbc)
-    })
+        cur = body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
+            if !forward_blocks[bb_idx] {
+                return None;
+            }
+            bb.statements.iter().find_map(|stmt| {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    return None;
+                };
+                if place_base_local(place) != Some(cur) {
+                    return None;
+                }
+                assign_copy_source(rvalue)
+            })
+        })?;
+    }
 }
 
-/// Whether every use of MIR `local`, the slice a `Vec` deref defines, is
-/// the receiver of a `<[T]>::reverse` call.
-pub(in crate::front::mir) fn rust_vec_deref_feeds_only_reverse(
-    body: &Unstructured,
-    llbc: &Llbc,
-    local: usize,
-) -> bool {
+pub(in crate::front::mir) fn is_rust_vec_slice_view_call(reg: &RegularCall, llbc: &Llbc) -> bool {
+    regular_call_name_path(reg, llbc)
+        .as_deref()
+        .is_some_and(path_is_vec_slice_view)
+}
+
+/// Whether every use of MIR `local`, the slice a `Vec` deref / `as_mut_slice`
+/// defines, is the receiver of a `<[T]>::reverse` call. `Vec::reverse` is
+/// `as_mut_slice` then `<[T]>::reverse`; rustc may copy or reborrow that
+/// temporary and `Drop` it after the call (`rlist.py ll_reverse`).
+pub(in crate::front::mir) fn rust_vec_deref_feeds_only_reverse(body: &Unstructured, llbc: &Llbc, local: usize) -> bool {
     let mut watched = bit_set::BitSet::new();
     watched.insert(local);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let Some(dest) = place_base_local(place) else {
+                    continue;
+                };
+                if watched.contains(dest) {
+                    continue;
+                }
+                if assign_copy_source(rvalue).is_some_and(|src| watched.contains(src)) {
+                    watched.insert(dest);
+                    grew = true;
+                }
+            }
+        }
+    }
     let mut reverses = 0;
     let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
-        if bb.statements.iter().any(|stmt| {
-            !matches!(
+        for stmt in &bb.statements {
+            if matches!(
                 stmt.stmt_kind_ref(),
                 Ok(StmtKind::StorageLive(_)
                     | StmtKind::StorageDead(_)
                     | StmtKind::PlaceMention(_)
                     | StmtKind::Borrowck(_))
-            ) && mentions_local(stmt.kind_value(), &watched)
-        }) {
-            return false;
+            ) {
+                continue;
+            }
+            if !mentions_local(stmt.kind_value(), &watched) {
+                continue;
+            }
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                return false;
+            };
+            let Some(dest) = place_base_local(place) else {
+                return false;
+            };
+            let Some(src) = assign_copy_source(rvalue) else {
+                return false;
+            };
+            if !watched.contains(src) || !watched.contains(dest) {
+                return false;
+            }
         }
         if !mentions_local(bb.terminator.kind_value(), &watched) {
             continue;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
-            return false;
-        };
-        let CallFunc::Regular(reg) = &call.func else {
-            return false;
-        };
-        if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local) {
-            if is_deref_call(reg, llbc) {
-                continue;
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Drop { place, .. }) => {
+                if place_base_local(place).is_none_or(|id| !watched.contains(id)) {
+                    return false;
+                }
             }
-            return false;
+            Ok(TermKind::Call { call, .. }) => {
+                let CallFunc::Regular(reg) = &call.func else {
+                    return false;
+                };
+                if matches!(call.dest.kind, PlaceKind::Local(i) if watched.contains(i as usize)) {
+                    if is_deref_call(reg, llbc) || is_rust_vec_slice_view_call(reg, llbc) {
+                        continue;
+                    }
+                    return false;
+                }
+                let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                    return false;
+                };
+                let Some(fd) = llbc.fn_by_id(*id) else {
+                    return false;
+                };
+                let segments: Vec<String> = fd
+                    .item_meta
+                    .name_path()
+                    .split("::")
+                    .map(str::to_string)
+                    .collect();
+                let arg_local =
+                    operand_local(call.args.first()).or_else(|| match call.args.first()? {
+                        Operand::Copy(place) | Operand::Move(place) => place_base_local(place),
+                        Operand::Const(_) => None,
+                    });
+                if !is_core_slice_reverse(&segments)
+                    || call.args.len() != 1
+                    || arg_local.is_none_or(|arg| !watched.contains(arg))
+                {
+                    return false;
+                }
+                reverses += 1;
+            }
+            _ => return false,
         }
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let segments: Vec<String> = fd
-            .item_meta
-            .name_path()
-            .split("::")
-            .map(str::to_string)
-            .collect();
-        if !is_core_slice_reverse(&segments)
-            || call.args.len() != 1
-            || operand_local(call.args.first()) != Some(local)
-        {
-            return false;
-        }
-        reverses += 1;
     }
     reverses > 0
 }

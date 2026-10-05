@@ -266,6 +266,10 @@ pub enum CallTarget {
         /// Caller's LLBC-local `FunDecl.def_id`. See [`Self::Method`].
         #[serde(skip, default)]
         fun_decl_id: Option<u64>,
+        /// Call-site LLBC `generics.types` as Rust paths. Residual shims
+        /// instantiate the monomorphic item; Regular calls ignore this.
+        #[serde(skip, default)]
+        generic_rust_args: Vec<String>,
         /// `specialize.py default_specialize` cache key this call names.
         /// `AccessDirect` is `(AccessDirect, None)`; `Regular` is every
         /// other graph. Copied onto [`crate::parse::CallPath`] when the
@@ -453,6 +457,7 @@ impl CallTarget {
         Self::FunctionPath {
             segments: segments.into_iter().map(Into::into).collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -462,6 +467,7 @@ impl CallTarget {
         Self::FunctionPath {
             segments: path.segments.clone(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: path.specialization,
         }
     }
@@ -479,6 +485,27 @@ impl CallTarget {
                 specialization: *specialization,
             }),
             _ => None,
+        }
+    }
+
+    /// Stamp the call-site generic type arguments spelled as Rust paths.
+    pub fn with_generic_rust_args(mut self, args: Vec<String>) -> Self {
+        if let CallTarget::FunctionPath {
+            generic_rust_args, ..
+        } = &mut self
+        {
+            *generic_rust_args = args;
+        }
+        self
+    }
+
+    /// Call-site generic type arguments. Empty when the callee is not generic.
+    pub fn generic_rust_args(&self) -> &[String] {
+        match self {
+            CallTarget::FunctionPath {
+                generic_rust_args, ..
+            } => generic_rust_args,
+            _ => &[],
         }
     }
 
@@ -2347,7 +2374,7 @@ impl LinkArg {
     pub fn into_variable(self) -> crate::flowspace::model::Variable {
         match self {
             Self::Value(var) => var,
-            Self::Const(_) => panic!("Call.args entry is a Constant; handle LinkArg::Const"),
+            Self::Const(c) => panic!("Call.args entry is a Constant; handle LinkArg::Const: {c:?}"),
         }
     }
 
@@ -12653,6 +12680,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![destination.clone(), carried[0].clone()]),
@@ -12753,6 +12781,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![destination.clone(), aggregate]),
@@ -12846,6 +12875,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![destination, joined[0].clone()]),
@@ -12889,6 +12919,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![destination.clone(), source.clone()]),
@@ -12994,6 +13025,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: vec!["core".into(), "ptr".into(), "write".into()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![destination.clone(), source.clone()]),
@@ -13277,6 +13309,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![destination, source]),
@@ -13355,6 +13388,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![destination.clone(), aggregate]),
@@ -13889,6 +13923,7 @@ mod tests {
                             "get_instantiate".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![instantiate_arg]),
@@ -14008,6 +14043,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -14161,6 +14197,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -14348,6 +14385,7 @@ mod tests {
                             "new_uninit".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
@@ -14362,6 +14400,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![uninit.clone(), agg.clone()]),
@@ -14376,6 +14415,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["boxed".into(), "Box".into(), "assume_init".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![uninit.clone()]),
@@ -14645,6 +14685,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["boxed".into(), "Box".into(), "new".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -14753,6 +14794,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -14822,6 +14864,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -14869,6 +14912,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
@@ -15091,6 +15135,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
@@ -15249,6 +15294,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
@@ -15383,6 +15429,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![gc_args[1].clone(), gc_args[0].clone()]),
@@ -15526,6 +15573,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
@@ -15841,6 +15889,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -16140,6 +16189,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
@@ -16523,6 +16573,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
@@ -16661,6 +16712,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
@@ -16867,6 +16919,7 @@ mod tests {
                             "get_instantiate".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![w_class_cast]),
@@ -16930,6 +16983,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -17074,6 +17128,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -17366,6 +17421,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -17490,6 +17546,7 @@ mod tests {
                             "malloc".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -17672,6 +17729,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -17781,6 +17839,7 @@ mod tests {
                             "empty".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
@@ -17865,6 +17924,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -17998,6 +18058,7 @@ mod tests {
                             "empty".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
@@ -18096,6 +18157,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![alloc_args[0].clone()]),
@@ -18244,6 +18306,7 @@ mod tests {
                                 "empty".into(),
                             ],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![]),
@@ -18329,6 +18392,7 @@ mod tests {
                                 "malloc_typed_managed".into(),
                             ],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![agg.clone()]),
@@ -18578,6 +18642,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -18821,6 +18886,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -19041,6 +19107,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -19156,6 +19223,7 @@ mod tests {
                             "empty".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
@@ -19235,6 +19303,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![nested.clone()]),
@@ -19253,6 +19322,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -19387,6 +19457,7 @@ mod tests {
                             "empty".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
@@ -19401,6 +19472,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![nested.clone()]),
@@ -19484,6 +19556,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -19620,6 +19693,7 @@ mod tests {
                             "empty".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
@@ -19737,6 +19811,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -19969,6 +20044,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -20158,6 +20234,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -20264,6 +20341,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
@@ -20565,6 +20643,7 @@ mod tests {
                                         .map(|s| (*s).to_string())
                                         .collect(),
                                         fun_decl_id: None,
+                                        generic_rust_args: Vec::new(),
                                         specialization: crate::parse::GraphSpecialization::Regular,
                                     },
                                     args: crate::model::call_args(vec![base]),
@@ -20610,6 +20689,7 @@ mod tests {
                                 .map(|s| (*s).to_string())
                                 .collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![agg]),
@@ -20846,6 +20926,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -20982,6 +21063,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![a.clone()]),
@@ -21120,6 +21202,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg]),
@@ -21207,6 +21290,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![nested.clone()]),
@@ -21290,6 +21374,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -21374,6 +21459,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_header".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header.clone()]),
@@ -21427,6 +21513,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -21524,6 +21611,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -21613,6 +21701,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![nested.clone()]),
@@ -21696,6 +21785,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
@@ -21898,6 +21988,7 @@ mod tests {
                     "get_instantiate".into(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg.clone()]),
@@ -22066,6 +22157,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["boxed".into(), "Box".into(), "new_uninit".into()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),

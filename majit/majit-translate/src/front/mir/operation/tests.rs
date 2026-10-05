@@ -5,33 +5,33 @@ use super::{
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
-#[test]
-fn int_cast_action_narrows_inside_the_64_bit_int_box() {
-    // `int_or_float_decode_int`: `value as u32 as i32 as i64`. With a
-    // 32-bit `usize` (wasm32) the first two steps still narrow inside
-    // the Int box.
-    assert_eq!(
-        super::int_cast_action(64, false, 32, true),
-        Some(super::IntCastAction::And(0xffff_ffff))
-    );
-    assert_eq!(
-        super::int_cast_action(32, true, 32, false),
-        Some(super::IntCastAction::SignExt(4))
-    );
-    assert_eq!(
-        super::int_cast_action(32, false, 64, false),
-        Some(super::IntCastAction::Alias)
-    );
-    assert_eq!(
-        super::int_cast_action(32, true, 64, false),
-        Some(super::IntCastAction::IntMask)
-    );
-    assert_eq!(
-        super::int_cast_action(64, false, 64, true),
-        Some(super::IntCastAction::RUint)
-    );
-    assert_eq!(super::int_cast_action(128, false, 64, false), None);
-}
+    #[test]
+    fn int_cast_action_narrows_inside_the_64_bit_int_box() {
+        // `int_or_float_decode_int`: `value as u32 as i32 as i64`. With a
+        // 32-bit `usize` (wasm32) the first two steps still narrow inside
+        // the Int box.
+        assert_eq!(
+            super::int_cast_action(64, false, 32, true),
+            Some(super::IntCastAction::And(0xffff_ffff))
+        );
+        assert_eq!(
+            super::int_cast_action(32, true, 32, false),
+            Some(super::IntCastAction::SignExt(4))
+        );
+        assert_eq!(
+            super::int_cast_action(32, false, 64, false),
+            Some(super::IntCastAction::Alias)
+        );
+        assert_eq!(
+            super::int_cast_action(32, true, 64, false),
+            Some(super::IntCastAction::IntMask)
+        );
+        assert_eq!(
+            super::int_cast_action(64, false, 64, true),
+            Some(super::IntCastAction::RUint)
+        );
+        assert_eq!(super::int_cast_action(128, false, 64, false), None);
+    }
 
 #[test]
 fn instance_roots_match_equates_leaf_and_qualified_spellings() {

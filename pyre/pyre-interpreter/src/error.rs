@@ -654,6 +654,7 @@ fn wtf8_from_message_str(ptr: pyre_object::gc_hook::GCREF) -> rustpython_wtf8::W
 /// parameter).
 #[majit_macros::dont_look_inside(word_enums(PyErrorKind))]
 fn make_pyerror(
+
     kind: PyErrorKind,
     message: &rustpython_wtf8::Wtf8,
     exc_object: pyre_object::PyObjectRef,

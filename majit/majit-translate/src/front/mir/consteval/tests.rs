@@ -1,13 +1,13 @@
 use super::{
     DecodedConst, bitflags_trait_empty_const, decode_literal, is_class_pytype_assoc_const,
-    primitive_float_const, scalar_to_const_value, static_key_segments,
+    primitive_float_const, scalar_to_const_value, static_key_segments, tyref_to_value_type,
 };
 
 use crate::flowspace::model::ConstValue;
 
-use crate::model::OpKind;
+use crate::model::{CallTarget, OpKind, ValueType};
 
-use majit_charon_reader::{Llbc, ullbc::NameSeg};
+use majit_charon_reader::{Llbc, ullbc::{NameSeg, TyRef}};
 
 use crate::front::mir::tests::{
     const_artifact, empty_generics, empty_llbc, fixture_llbc, init_fun, item_meta_json,
@@ -1072,6 +1072,731 @@ fn discover_foldable_const_lits_skips_non_unique_name_path() {
     );
 }
 
+    fn immutable_static_kind() -> serde_json::Value {
+        serde_json::json!({
+            "Static": {"is_mut": false, "is_safe": true, "is_thread_local": false}
+        })
+    }
+
+    fn prebuilt_fn_ptr_ty() -> serde_json::Value {
+        serde_json::json!({"FnPtr": {"inputs": [], "output": {"Tuple": []}}})
+    }
+
+    fn prebuilt_unit_ty() -> serde_json::Value {
+        serde_json::json!({"Tuple": []})
+    }
+
+    fn prebuilt_adt_ty(id: u64) -> serde_json::Value {
+        serde_json::json!({"Adt": {"id": id, "generics": empty_generics()}})
+    }
+
+    fn prebuilt_fn_def_const(fun_id: u64, ty: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!([{"FnDef": {"kind": {"Fun": fun_id}, "generics": empty_generics()}}, ty])
+    }
+
+    fn u8_field_struct(def_id: u64, path: &[&str], field: &str) -> serde_json::Value {
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "kind": {"Struct": [{
+                "name": field,
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "attr_info": field_attr
+            }]}
+        })
+    }
+
+    fn types_only_llbc(type_decls: Vec<serde_json::Value>) -> Llbc {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": type_decls,
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("type fixture")
+    }
+
+    fn scalar_struct_static_llbc(
+        type_path: &[&str],
+        static_path: &[&str],
+        reader_path: &[&str],
+    ) -> Llbc {
+        let adt = prebuilt_adt_ty(0);
+        let reader = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(reader_path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": adt},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": adt}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": adt},
+                            {"Use": [{"Copy": {
+                                "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                                "ty": adt
+                            }}, "No"]}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [u8_field_struct(0, type_path, "bits")],
+                "fun_decls": [reader],
+                "global_decls": [
+                    null,
+                    {
+                        "def_id": 1,
+                        "item_meta": item_meta_json(static_path, "", true),
+                        "global_kind": immutable_static_kind(),
+                        "ty": adt
+                    }
+                ],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("scalar static fixture")
+    }
+
+    fn leaf_fun(def_id: u64, path: &[&str]) -> serde_json::Value {
+        let ty = prebuilt_unit_ty();
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [{"statements": [], "terminator": {"span": span_json(), "kind": "Return"}}]
+            }}
+        })
+    }
+
+    fn vtable_static_init(
+        def_id: u64,
+        path: &[&str],
+        leaf_id: u64,
+        vtable_ty: &serde_json::Value,
+    ) -> serde_json::Value {
+        let fn_ty = prebuilt_fn_ptr_ty();
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": vtable_ty},
+            "src": {"GlobalInitializer": {"id": def_id}},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": vtable_ty},
+                    {"index": 1, "name": null, "span": span_json(), "ty": fn_ty}
+                ]},
+                "body": [{
+                    "statements": [
+                        {"span": span_json(), "kind": {"Assign": [
+                            {"kind": {"Local": 1}, "ty": fn_ty},
+                            {"Use": [{"Const": prebuilt_fn_def_const(leaf_id, &fn_ty)}, "No"]}
+                        ]}},
+                        {"span": span_json(), "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": vtable_ty},
+                            {"Aggregate": [
+                                {"Adt": [0, null]},
+                                [{"Move": {"kind": {"Local": 1}, "ty": fn_ty}}]
+                            ]}
+                        ]}}
+                    ],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn immutable_vtable_global(
+        def_id: u64,
+        path: &[&str],
+        init: u64,
+        vtable_ty: &serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "pub static TABLE: Vtable = Vtable { slot: leaf };", true),
+            "global_kind": immutable_static_kind(),
+            "ty": vtable_ty,
+            "value": {"Value": [0, [{"Call": [{"kind": {"Fun": init}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}, []]}, vtable_ty]]}
+        })
+    }
+
+    fn vtable_fixture() -> Llbc {
+        let vtable_ty = prebuilt_adt_ty(0);
+        let fn_ty = prebuilt_fn_ptr_ty();
+        let unit = prebuilt_unit_ty();
+        let vtable_ref = serde_json::json!({"Ref": ["Erased", vtable_ty.clone(), "Shared"]});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let vtable = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "Vtable"], "", true),
+            "kind": {"Struct": [{
+                "name": "slot",
+                "ty": fn_ty,
+                "attr_info": field_attr
+            }]}
+        });
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span_json(), "ty": ty});
+        let slot_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &vtable_ref),
+                    "Deref"
+                ]}), &vtable_ty),
+                {"Field": [null, 0]}
+            ]}),
+            &fn_ty,
+        );
+        let reader = reader_fun(&["fixture", "read_table"], 1);
+        let field_reader = serde_json::json!({
+            "def_id": 7,
+            "item_meta": item_meta_json(&["fixture", "read_slot"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": fn_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    local(0, &fn_ty)
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 0}), &fn_ty),
+                            {"Use": [{"Copy": place(
+                                serde_json::json!({"Projection": [
+                                    place(serde_json::json!({"Projection": [
+                                        place(serde_json::json!({"Global": {"generics": empty_generics(), "id": 1}}), &vtable_ty),
+                                        "Deref"
+                                    ]}), &vtable_ty),
+                                    {"Field": [null, 0]}
+                                ]}),
+                                &fn_ty
+                            )}, "No"]}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let caller = serde_json::json!({
+            "def_id": 8,
+            "item_meta": item_meta_json(&["fixture", "call_slot"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [vtable_ref.clone()], "output": unit},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &unit),
+                    local(1, &vtable_ref),
+                    local(2, &fn_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span_json(),
+                            "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 2}), &fn_ty),
+                                {"Use": [{"Copy": slot_place}, "No"]}
+                            ]}
+                        }],
+                        "terminator": {"span": span_json(), "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Copy": place(
+                                    serde_json::json!({"Local": 2}),
+                                    &fn_ty
+                                )}},
+                                "args": [],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 1,
+                            "on_unwind": 2
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [vtable],
+                "fun_decls": [
+                    reader,
+                    null,
+                    null,
+                    vtable_static_init(3, &["fixture", "TABLE_A", "init"], 4, &vtable_ty),
+                    leaf_fun(4, &["fixture", "leaf_a"]),
+                    vtable_static_init(5, &["fixture", "TABLE_B", "init"], 6, &vtable_ty),
+                    leaf_fun(6, &["fixture", "leaf_b"]),
+                    field_reader,
+                    caller
+                ],
+                "global_decls": [
+                    null,
+                    immutable_vtable_global(1, &["fixture", "TABLE_A"], 3, &vtable_ty),
+                    immutable_vtable_global(2, &["fixture", "TABLE_B"], 5, &vtable_ty)
+                ],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("vtable fixture parses")
+    }
+
+    fn op_kinds(graph: &crate::model::FunctionGraph) -> Vec<&OpKind> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| &op.kind)
+            .collect()
+    }
+
+    /// An immutable `static` Place::Global is the prebuilt constant
+    /// (`bookkeeper.py immutablevalue`), not a residual call to the
+    /// static's symbolic path.
+    #[test]
+    fn immutable_static_global_lowers_to_const_ref_addr() {
+        let llbc = vtable_fixture();
+        let graph = super::lower_function(&llbc, "read_table").expect("lower read_table");
+        let addrs: Vec<i64> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::ConstRefAddr(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, vec![super::immutable_static_sentinel_addr(1)]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "TABLE_A"),
+            0,
+            "immutable static must not residualize as FunctionPath: {graph:?}"
+        );
+    }
+
+    /// A field of that static folds to the initializer's `FnDef`
+    /// (`decoded_const_to_op` `__fn_const`).
+    #[test]
+    fn immutable_static_fnptr_field_folds_to_fn_const() {
+        let llbc = vtable_fixture();
+        let graph = super::lower_function(&llbc, "read_slot").expect("lower read_slot");
+        let fn_consts: Vec<&[String]> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::Call { target, .. } => crate::model::fn_const_segments(target),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fn_consts
+                .iter()
+                .any(|segments| segments.last().map(String::as_str) == Some("leaf_a")),
+            "expected __fn_const of leaf_a, got {graph:?}"
+        );
+    }
+
+    /// A call through a field of a type that only exists as immutable
+    /// statics is `indirect_call` with the initializer `FnDef`s as
+    /// `c_graphs` (`rpbc.py FunctionsPBCRepr` /
+    /// `jtransform.py handle_regular_indirect_call`).
+    #[test]
+    fn immutable_static_fnptr_call_carries_closed_family() {
+        let llbc = vtable_fixture();
+        let graph = super::lower_function(&llbc, "call_slot").expect("lower call_slot");
+        let families: Vec<Vec<String>> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::IndirectCall {
+                    graphs: Some(graphs),
+                    ..
+                } => Some(
+                    graphs
+                        .iter()
+                        .filter_map(|path| path.segments.last().cloned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(families.len(), 1, "one IndirectCall family: {graph:?}");
+        let mut leaves = families[0].clone();
+        leaves.sort();
+        assert_eq!(leaves, vec!["leaf_a".to_string(), "leaf_b".to_string()]);
+        let harvested = super::harvest_immutable_fields_from_immutable_statics(&llbc);
+        let slot = harvested
+            .get("Vtable")
+            .or_else(|| harvested.get("fixture::Vtable"));
+        assert_eq!(
+            slot.map(|fields| fields
+                .iter()
+                .map(|(name, rank)| (name.as_str(), *rank))
+                .collect::<Vec<_>>()),
+            Some(vec![("slot", crate::model::ImmutableRank::Immutable)]),
+            "harvested {harvested:?}"
+        );
+    }
+
+    /// A Const `FnDef` dynamic call is `direct_call`
+    /// (`jtransform.py handle_regular_indirect_call` when the funcbox
+    /// is Const).
+    #[test]
+    fn const_fndef_dynamic_call_is_direct() {
+        let fn_ty = prebuilt_fn_ptr_ty();
+        let unit = prebuilt_unit_ty();
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span_json(), "ty": ty});
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "call_const"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [local(0, &unit)]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Const": prebuilt_fn_def_const(1, &fn_ty)}},
+                                "args": [],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 1,
+                            "on_unwind": 2
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, leaf_fun(1, &["fixture", "leaf_direct"])],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("const FnDef fixture");
+        let graph = super::lower_function(&llbc, "call_const").expect("lower call_const");
+        let directs: Vec<_> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::FunctionPath {
+                            segments,
+                            fun_decl_id,
+                            ..
+                        },
+                    ..
+                } if segments.last().map(String::as_str) == Some("leaf_direct") => {
+                    Some(*fun_decl_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            directs,
+            vec![Some(1)],
+            "direct Call of the Const FnDef: {graph:?}"
+        );
+        assert_eq!(
+            op_kinds(&graph)
+                .iter()
+                .filter(|kind| matches!(
+                    kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("__dyn_call")
+                ))
+                .count(),
+            0,
+            "Const FnDef must not residualize as __dyn_call: {graph:?}"
+        );
+    }
+
+    fn fieldless_enum_decl(def_id: u64, path: &[&str], n: usize) -> serde_json::Value {
+        let variants: Vec<_> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("V{i}"),
+                    "fields": [],
+                    "discriminant": {"Unsigned": ["U8", i.to_string()]},
+                })
+            })
+            .collect();
+        let layouts: Vec<_> = (0..n)
+            .map(|_| serde_json::json!({"field_offsets": []}))
+            .collect();
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "kind": {"Enum": variants},
+            "layout": [{
+                "key": "test",
+                "value": {
+                    "size": 1,
+                    "align": 1,
+                    "variant_layouts": layouts,
+                    "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U8"}}}
+                }
+            }]
+        })
+    }
+
+    fn option_of_enum_ty(option_id: u64, enum_id: u64) -> serde_json::Value {
+        serde_json::json!({"Adt": {
+            "id": option_id,
+            "generics": {
+                "regions": [],
+                "types": [prebuilt_adt_ty(enum_id)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }})
+    }
+
+    /// `Option<E>` over a dense fieldless E is E's scalar plus the
+    /// reserved `None` tag (`tyref_to_field_layout_string`); it is not
+    /// a boxed two-word aggregate.
+    #[test]
+    fn option_of_fieldless_enum_is_scalar_niche() {
+        let option_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["core", "option", "Option"], "", false),
+            "kind": {"Enum": [
+                {"name": "None", "fields": [], "discriminant": {"Unsigned": ["U8", "0"]}},
+                {"name": "Some", "fields": [{
+                    "name": null,
+                    "is_positional": true,
+                    "ty": prebuilt_adt_ty(1)
+                }], "discriminant": {"Unsigned": ["U8", "1"]}}
+            ]}
+        });
+        let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+        let opt_ty = option_of_enum_ty(0, 1);
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span_json(), "ty": ty});
+        let disc_fn = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "opt_disc"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [opt_ty.clone()], "output": disc_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &disc_ty),
+                    local(1, &opt_ty)
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 0}), &disc_ty),
+                            {"Discriminant": place(serde_json::json!({"Local": 1}), &opt_ty)}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    option_decl.clone(),
+                    fieldless_enum_decl(1, &["fixture", "Kind"], 3)
+                ],
+                "fun_decls": [disc_fn],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("option fixture");
+        let opt_tyref: TyRef = serde_json::from_value(opt_ty).unwrap();
+        assert_eq!(tyref_to_value_type(&opt_tyref, &llbc), ValueType::Int);
+        let niche = super::tyref_option_fieldless_niche(&opt_tyref, &llbc)
+            .expect("Option<fieldless> has a scalar niche");
+        assert_eq!(niche.none_tag, 0xff);
+        assert_eq!(niche.storage_ty, "u8");
+        let graph = super::lower_function(&llbc, "opt_disc").expect("lower opt_disc");
+        let kinds = op_kinds(&graph);
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, OpKind::ConstInt(0xff))),
+            "None tag is the u8 storage max, got {graph:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                OpKind::BinOp { op, .. } if op == "ne"
+            )),
+            "discriminant of the niche Option is a scalar compare, got {graph:?}"
+        );
+        assert!(
+            kinds.iter().all(|kind| !matches!(
+                kind,
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+            )),
+            "must not box Option<fieldless> as an aggregate: {graph:?}"
+        );
+        let two = fieldless_enum_decl(1, &["fixture", "Kind"], 2);
+        let two_file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    option_decl,
+                    two
+                ],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let two_llbc =
+            Llbc::from_slice(two_file.to_string().as_bytes()).expect("two-variant fixture");
+        let two_niche =
+            super::tyref_option_fieldless_niche(&opt_tyref, &two_llbc).expect("N=2 niche");
+        assert_eq!(two_niche.none_tag, 2);
+    }
+
+    /// Interior mutability is a fact of the declared type tree
+    /// (`UnsafeCell` / `Cell` / `sync::atomic`), not of the static's
+    /// binding name. A struct of one integer with no cell in the tree
+    /// is a prebuilt table; the same layout under an atomic/cell path
+    /// is not.
+    #[test]
+    fn type_tree_interior_mutability_is_a_declared_fact() {
+        let atomic = types_only_llbc(vec![u8_field_struct(
+            0,
+            &["core", "sync", "atomic", "AtomicBool"],
+            "v",
+        )]);
+        assert!(super::type_has_interior_mutability(&atomic, 0));
+        assert!(!super::type_is_prebuilt_table(&atomic, 0));
+
+        let cell = types_only_llbc(vec![u8_field_struct(0, &["core", "cell", "Cell"], "value")]);
+        assert!(super::type_has_interior_mutability(&cell, 0));
+        assert!(!super::type_is_prebuilt_table(&cell, 0));
+
+        let unsafecell = u8_field_struct(0, &["core", "cell", "UnsafeCell"], "value");
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let flag = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "Flag"], "", true),
+            "kind": {"Struct": [{
+                "name": "v",
+                "ty": prebuilt_adt_ty(0),
+                "attr_info": field_attr
+            }]}
+        });
+        let nested = types_only_llbc(vec![unsafecell, flag]);
+        assert!(super::type_has_interior_mutability(&nested, 1));
+        assert!(!super::type_is_prebuilt_table(&nested, 1));
+
+        let mask = types_only_llbc(vec![u8_field_struct(0, &["fixture", "Mask"], "bits")]);
+        assert!(!super::type_has_interior_mutability(&mask, 0));
+        assert!(super::type_is_prebuilt_table(&mask, 0));
+    }
+
+    /// `static TABLE: AtomicBool` is not a prebuilt constant value, but
+    /// the binding still has an address to load through. A residual
+    /// FunctionPath of the static's symbolic path is not that address.
+    #[test]
+    fn atomic_static_named_table_is_read_through_its_address() {
+        let llbc = scalar_struct_static_llbc(
+            &["core", "sync", "atomic", "AtomicBool"],
+            &["fixture", "TABLE"],
+            &["fixture", "read_table"],
+        );
+        let graph = super::lower_function(&llbc, "read_table").expect("lower read_table");
+        let addrs: Vec<i64> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::ConstRefAddr(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, vec![super::immutable_static_sentinel_addr(1)]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "TABLE"),
+            0,
+            "interior-mut static must not residualize as FunctionPath: {graph:?}"
+        );
+    }
+
+    /// `static SYS_DEV_MODE: Mask` with no cell in the type tree is the
+    /// prebuilt integer table. The binding name is the one that panicked
+    /// when `AtomicBool` was folded; the type tree is what decides.
+    #[test]
+    fn integer_table_named_dev_mode_lowers_to_const_ref_addr() {
+        let llbc = scalar_struct_static_llbc(
+            &["fixture", "Mask"],
+            &["fixture", "SYS_DEV_MODE"],
+            &["fixture", "read_flag"],
+        );
+        let graph = super::lower_function(&llbc, "read_flag").expect("lower read_flag");
+        let addrs: Vec<i64> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::ConstRefAddr(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, vec![super::immutable_static_sentinel_addr(1)]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "SYS_DEV_MODE"),
+            0,
+            "prebuilt integer table must not residualize: {graph:?}"
+        );
+    }
+
 #[test]
 fn discover_foldable_const_lits_harvests_size_of_usize() {
     let path = ["fixture", "LOWLEVEL_STRING_LEN_OFFSET"];
@@ -1526,10 +2251,10 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
             .expect("substituted unstructured body");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
-        let empty_gc_struct_ids = std::collections::HashSet::new();
         let graph = super::lower_unstructured_with_static_addrs_and_attrs(
             &llbc,
             fd,
@@ -1871,6 +2596,7 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
         let body = fd.unstructured().expect("caller unstructured");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -1885,7 +2611,7 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
             &crate::front::semantic::StructFieldRegistry::default(),
             &empty_set,
             &empty_set,
-            &std::collections::HashSet::new(),
+            &empty_gc_struct_ids,
             super::no_immutable_fields(),
             &empty_set,
             accum.has_builder,
@@ -2003,6 +2729,7 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
         let body = fd.unstructured().expect("caller unstructured");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -2017,7 +2744,7 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
                 &crate::front::semantic::StructFieldRegistry::default(),
                 &empty_set,
                 &empty_set,
-                &std::collections::HashSet::new(),
+                &empty_gc_struct_ids,
                 super::no_immutable_fields(),
                 &empty_set,
                 accum.has_builder,
@@ -2187,6 +2914,7 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
         let body = fd.unstructured().expect("caller unstructured");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -2201,7 +2929,7 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
             &crate::front::semantic::StructFieldRegistry::default(),
             &empty_set,
             &empty_set,
-            &std::collections::HashSet::new(),
+            &empty_gc_struct_ids,
             super::no_immutable_fields(),
             &empty_set,
             accum.has_builder,
@@ -2386,6 +3114,7 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
         let body = fd.unstructured().expect("caller unstructured");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -2400,7 +3129,7 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
             &crate::front::semantic::StructFieldRegistry::default(),
             &empty_set,
             &empty_set,
-            &std::collections::HashSet::new(),
+            &empty_gc_struct_ids,
             super::no_immutable_fields(),
             &empty_set,
             accum.has_builder,

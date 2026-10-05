@@ -521,6 +521,45 @@ impl<'a> Lowering<'a> {
     /// that pointer names the spilled place. An `&mut i64` parameter
     /// is the word on both sides and is left alone. A byte pointer
     /// stays `Ref`.
+    /// A by-value multi-word argument is the address of its storage.
+    /// RPython never passes a struct by value: a GcStruct is a pointer
+    /// (`'r'`), a non-GC Struct is `Ptr` (`'i'`). Kind comes from
+    /// `GcType` / size, not the type's name.
+    pub(in crate::front::mir) fn pass_by_value_multiword_as_addr(
+        &mut self,
+        mir_bb: usize,
+        func: &CallFunc,
+        args: &mut [Variable],
+    ) {
+        let CallFunc::Regular(reg) = func else {
+            return;
+        };
+        let Some(id) = regular_call_fun_decl_id(&reg.kind) else {
+            return;
+        };
+        let Some(fd) = self.llbc.fn_by_id(id) else {
+            return;
+        };
+        // Regular callees keep the classed-instance Ref bank. Only a
+        // residual ABI (dont_look_inside / no body) passes a raw
+        // multi-word value as an address integer.
+        if !fun_decl_is_residual(fd, self.dont_look_inside) {
+            return;
+        }
+        let bb_id = self.block_id[mir_bb];
+        for (index, ty) in fd.signature.inputs.iter().enumerate() {
+            let Some(kind) = pass_by_value_multiword_kind(ty, self.llbc) else {
+                continue;
+            };
+            let Some(arg) = args.get_mut(index) else {
+                continue;
+            };
+            if matches!(kind, ValueType::Int) {
+                *arg = push_cast_ptr_to_int(&mut self.graph, bb_id, arg.clone());
+            }
+        }
+    }
+
     pub(in crate::front::mir) fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,
@@ -1840,14 +1879,41 @@ pub(in crate::front::mir) fn spill_substituted_fields(
 /// or a nested binder is [`None`]: the payload is still unknown.
 /// A `TypeVar` inside the looked-up argument is the caller's variable
 /// and is not replaced again.
-pub(in crate::front::mir) fn substitute_spill_typevars(
+pub(in crate::front::mir) fn substitute_spill_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
+    substitute_typevars(ty, owner, llbc, true)
+}
+
+/// Field-kind substitution: a nested TypeVar in the looked-up argument
+/// (Vec's allocator, a trait ref) does not make the argument unknown.
+/// A root TypeVar is still unknown. `RustVecRepr.lowleveltype` is a raw
+/// `Ptr`, so `Result<Vec<T>, E>::Ok.__pos_0` is `'int'` (`history.py`
+/// `getkind`) for every item type T.
+pub(in crate::front::mir) fn substitute_field_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
+    substitute_typevars(ty, owner, llbc, false)
+}
+
+pub(in crate::front::mir) fn substitute_typevars(
     ty: &TyRef,
     owner: &serde_json::Value,
     llbc: &Llbc,
+    nested_typevar_unknown: bool,
 ) -> Option<TyRef> {
     let node = tyref_node(ty, llbc)?;
-    let value = substitute_spill_value(node, owner, llbc, &mut Vec::new(), 0)?;
+    let value = substitute_spill_value(
+        node,
+        owner,
+        llbc,
+        &mut Vec::new(),
+        0,
+        nested_typevar_unknown,
+    )?;
     Some(TyRef::Other(value))
+}
+
+/// Whether `node` is a TypeVar after peeling `Deduplicated` / `Value`.
+/// Nested TypeVars (a Vec allocator, a trait ref) are not this.
+pub(in crate::front::mir) fn argument_root_is_typevar(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    strip_ty_indirections(node, llbc).is_none_or(|stripped| stripped.get("TypeVar").is_some())
 }
 
 /// `arg` was copied out of an aggregate's generic arguments, so it is
@@ -1897,6 +1963,7 @@ pub(in crate::front::mir) fn substitute_spill_value(
     llbc: &Llbc,
     dedup_stack: &mut Vec<u64>,
     depth: u32,
+    nested_typevar_unknown: bool,
 ) -> Option<serde_json::Value> {
     if depth > 32 {
         return None;
@@ -1907,7 +1974,14 @@ pub(in crate::front::mir) fn substitute_spill_value(
         }
         dedup_stack.push(id);
         let body = llbc.dedup_body(id)?;
-        let replaced = substitute_spill_value(body, owner, llbc, dedup_stack, depth + 1);
+        let replaced = substitute_spill_value(
+            body,
+            owner,
+            llbc,
+            dedup_stack,
+            depth + 1,
+            nested_typevar_unknown,
+        );
         dedup_stack.pop();
         return replaced;
     }
@@ -1922,7 +1996,11 @@ pub(in crate::front::mir) fn substitute_spill_value(
             .get("types")?
             .as_array()?
             .get(index as usize)?;
-        if spill_argument_carries_typevar(arg, llbc, &mut Vec::new(), 0) {
+        if nested_typevar_unknown {
+            if spill_argument_carries_typevar(arg, llbc, &mut Vec::new(), 0) {
+                return None;
+            }
+        } else if argument_root_is_typevar(arg, llbc) {
             return None;
         }
         return Some(arg.clone());
@@ -1936,6 +2014,7 @@ pub(in crate::front::mir) fn substitute_spill_value(
                 llbc,
                 dedup_stack,
                 depth + 1,
+                nested_typevar_unknown,
             )?);
         }
         return Some(serde_json::Value::Array(out));
@@ -1945,7 +2024,14 @@ pub(in crate::front::mir) fn substitute_spill_value(
         for (key, value) in obj {
             out.insert(
                 key.clone(),
-                substitute_spill_value(value, owner, llbc, dedup_stack, depth + 1)?,
+                substitute_spill_value(
+                    value,
+                    owner,
+                    llbc,
+                    dedup_stack,
+                    depth + 1,
+                    nested_typevar_unknown,
+                )?,
             );
         }
         return Some(serde_json::Value::Object(out));

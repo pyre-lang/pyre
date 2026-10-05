@@ -1,8 +1,9 @@
 use super::{
     adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
     is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
-    json_ty_scalar_element_spelling, no_tombstoned_leaves, raw_field_address_value_type,
-    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    json_ty_scalar_element_spelling, no_tombstoned_leaves, positional_aggregate_field_rows,
+    raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env,
+    tyref_aggregate_field_value_type, tyref_array_suffix,
     tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_gcref_spelling,
     tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
@@ -4061,6 +4062,76 @@ fn positional_call_result_recovers_its_exact_tuple_repr_owner() {
     assert_eq!(tyref_positional_aggregate_root(&scalar, &llbc), None);
 }
 
+    #[test]
+    fn positional_tuple_field_rows_take_kind_from_dest_ty() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let pair = TyRef::Other(serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {"types": [i64_ty.clone(), i64_ty]}
+            }
+        }));
+        let rows = positional_aggregate_field_rows(&pair, 2, &llbc);
+        assert_eq!(
+            rows.iter()
+                .map(|(name, spelling, ty)| {
+                    (
+                        name.as_str(),
+                        spelling.as_str(),
+                        ty.as_ref().map(|t| tyref_to_value_type(t, &llbc)),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("__pos_0", "i64", Some(ValueType::Int)),
+                ("__pos_1", "i64", Some(ValueType::Int)),
+            ]
+        );
+    }
+
+    #[test]
+    fn positional_tuple_raw_ptr_fields_take_int_kind_from_getkind() {
+        // `mapdict::<Impl>::slots` returns `(*mut usize, *mut *mut ItemsBlock)`.
+        // `history.py` `getkind` of a raw `Ptr` is `'int'`.
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let raw_usize = serde_json::json!({"RawPtr": [usize_ty, "Mut"]});
+        let items = serde_json::json!({"Adt": {"id": 1, "generics": {"types": []}}});
+        let raw_items = serde_json::json!({"RawPtr": [items, "Mut"]});
+        let raw_slot = serde_json::json!({"RawPtr": [raw_items, "Mut"]});
+        let pair = TyRef::Other(serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {"types": [raw_usize.clone(), raw_slot.clone()]}
+            }
+        }));
+        let rows = positional_aggregate_field_rows(&pair, 2, &llbc);
+        assert_eq!(
+            rows.iter()
+                .map(|(name, spelling, ty)| {
+                    (
+                        name.as_str(),
+                        ty.as_ref()
+                            .map(|t| tyref_aggregate_field_value_type(t, &llbc, spelling)),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("__pos_0", Some(ValueType::Int)),
+                ("__pos_1", Some(ValueType::Int)),
+            ]
+        );
+        let byte = TyRef::Other(serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+        }));
+        assert_eq!(
+            tyref_aggregate_field_value_type(&byte, &llbc, ""),
+            ValueType::Ref(None),
+            "*mut u8 stays the GC-erasure Ref"
+        );
+    }
+
 #[test]
 fn bodyless_trait_method_on_a_trait_object_uses_indirect_dispatch() {
     let method = serde_json::json!({
@@ -4889,7 +4960,7 @@ fn first_call_binding(graph: &crate::model::FunctionGraph) -> (Option<u64>, Vec<
             CallTarget::FunctionPath {
                 segments,
                 fun_decl_id,
-                ..
+            ..
             } => (*fun_decl_id, segments.clone()),
             other => panic!("expected a FunDecl call, got {other:?}"),
         };
@@ -5752,221 +5823,221 @@ fn pyerror_deref_impl(target_dedup: u64, target_adt: u64) -> serde_json::Value {
     )
 }
 
-/// A transparent GC-ref wrapper keeps its own class. The handle intern's
-/// as a subclass of `Deref::Target`; the payload row stays a pointer to
-/// that target.
-#[test]
-fn transparent_gc_handle_keeps_the_wrapper_class() {
-    let decls = pointer_handle_decls();
-    let blanket = serde_json::json!({
-        "impl_trait": {
-            "id": 1,
-            "generics": {"types": [{"TypeVar": {"Bound": [0, 0]}}]}
-        },
-        "types": [{
-            "kind": {"TraitType": [1, 0]},
-            "skip_binder": {"value": adt_body(4)}
-        }]
-    });
-    let (llbc, ty) = load_handle(
-        decls.clone(),
-        serde_json::json!([null, blanket, pyerror_deref_impl(23, 2)]),
-        3,
-    );
-    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
-    assert_eq!(
-        super::tyref_to_value_type(&ty, &llbc),
-        ValueType::Ref(Some("PyError".into()))
-    );
-    assert_handle_class(&llbc, &ty, Some("PyError"));
-    // The payload row is one pointer to the Deref target. A bare
-    // `PyErrorObject` would be laid out as the whole object.
-    assert_eq!(
-        super::tyref_to_field_layout_string(
-            &ty,
-            &llbc,
-            &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
-        ),
-        "*mut PyErrorObject"
-    );
-    // A captured `&PyError` keeps the handle class, not the payload
-    // pointer `transparent_handle_field_spelling` would paint after
-    // peeling `&`.
-    let shared = serde_json::from_value::<TyRef>(serde_json::json!({
-        "Value": [9104, {"Ref": ["Erased", adt_body(3), "Shared"]}]
-    }))
-    .expect("shared-borrow TyRef parses");
-    assert_eq!(
-        super::tyref_to_field_layout_string(
-            &shared,
-            &llbc,
-            &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
-        ),
-        "&PyError"
-    );
-    let ptr = serde_json::from_value::<TyRef>(serde_json::json!({
-        "Value": [9103, {"RawPtr": [adt_body(3), "Mut"]}]
-    }))
-    .expect("pointer TyRef parses");
-    assert_eq!(
-        super::enum_payload_instance_class_root(&ptr, &llbc, no_tombstoned_leaves()).as_deref(),
-        Some("PyError")
-    );
-    assert_eq!(
-        super::tyref_to_field_layout_string(
-            &ptr,
-            &llbc,
-            &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
-        ),
-        "*mut PyErrorObject"
-    );
+    /// A transparent GC-ref wrapper keeps its own class. The handle intern's
+    /// as a subclass of `Deref::Target`; the payload row stays a pointer to
+    /// that target.
+    #[test]
+    fn transparent_gc_handle_keeps_the_wrapper_class() {
+        let decls = pointer_handle_decls();
+        let blanket = serde_json::json!({
+            "impl_trait": {
+                "id": 1,
+                "generics": {"types": [{"TypeVar": {"Bound": [0, 0]}}]}
+            },
+            "types": [{
+                "kind": {"TraitType": [1, 0]},
+                "skip_binder": {"value": adt_body(4)}
+            }]
+        });
+        let (llbc, ty) = load_handle(
+            decls.clone(),
+            serde_json::json!([null, blanket, pyerror_deref_impl(23, 2)]),
+            3,
+        );
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("PyError".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("PyError"));
+        // The payload row is one pointer to the Deref target. A bare
+        // `PyErrorObject` would be laid out as the whole object.
+        assert_eq!(
+            super::tyref_to_field_layout_string(
+                &ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
+            "*mut PyErrorObject"
+        );
+        // A captured `&PyError` keeps the handle class, not the payload
+        // pointer `transparent_handle_field_spelling` would paint after
+        // peeling `&`.
+        let shared = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9104, {"Ref": ["Erased", adt_body(3), "Shared"]}]
+        }))
+        .expect("shared-borrow TyRef parses");
+        assert_eq!(
+            super::tyref_to_field_layout_string(
+                &shared,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
+            "&PyError"
+        );
+        let ptr = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9103, {"RawPtr": [adt_body(3), "Mut"]}]
+        }))
+        .expect("pointer TyRef parses");
+        assert_eq!(
+            super::enum_payload_instance_class_root(&ptr, &llbc, no_tombstoned_leaves()).as_deref(),
+            Some("PyError")
+        );
+        assert_eq!(
+            super::tyref_to_field_layout_string(
+                &ptr,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
+            "*mut PyErrorObject"
+        );
 
-    let same_class = paint_handle(
-        decls.clone(),
-        serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(25, 2)]),
-        3,
-    );
-    assert_eq!(same_class, ValueType::Ref(Some("PyError".into())));
+        let same_class = paint_handle(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(25, 2)]),
+            3,
+        );
+        assert_eq!(same_class, ValueType::Ref(Some("PyError".into())));
 
-    let (llbc, ty) = load_handle(decls.clone(), serde_json::json!([null]), 3);
-    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
-    assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
-    assert_handle_class(&llbc, &ty, Some("PyError"));
-    assert_eq!(
-        super::tyref_to_field_layout_string(
-            &ty,
-            &llbc,
-            &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
-        ),
-        "PyError"
-    );
+        let (llbc, ty) = load_handle(decls.clone(), serde_json::json!([null]), 3);
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
+        assert_handle_class(&llbc, &ty, Some("PyError"));
+        assert_eq!(
+            super::tyref_to_field_layout_string(
+                &ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
+            "PyError"
+        );
 
-    let mut scalar_decls = decls.clone();
-    scalar_decls[2] = (
-        3,
-        struct_decl(3, ident_path(&["fixture", "Word"]), i64_field(), true),
-    );
-    let (llbc, ty) = load_handle(
-        scalar_decls,
-        serde_json::json!([pyerror_deref_impl(23, 2)]),
-        3,
-    );
-    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
-    assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
-    assert_handle_class(&llbc, &ty, Some("Word"));
-    assert_eq!(
-        super::tyref_to_field_layout_string(
-            &ty,
-            &llbc,
-            &gc_struct_ids,
-            &std::collections::HashSet::<String>::new()
-        ),
-        "i64"
-    );
+        let mut scalar_decls = decls.clone();
+        scalar_decls[2] = (
+            3,
+            struct_decl(3, ident_path(&["fixture", "Word"]), i64_field(), true),
+        );
+        let (llbc, ty) = load_handle(
+            scalar_decls,
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+        );
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
+        assert_handle_class(&llbc, &ty, Some("Word"));
+        assert_eq!(
+            super::tyref_to_field_layout_string(
+                &ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
+            "isize"
+        );
 
-    let split = paint_handle(
-        decls.clone(),
-        serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(24, 4)]),
-        3,
-    );
-    assert_eq!(split, ValueType::Ref(None));
+        let split = paint_handle(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(24, 4)]),
+            3,
+        );
+        assert_eq!(split, ValueType::Ref(None));
 
-    let ambiguous = deref_impl(
-        1,
-        serde_json::json!({"Deduplicated": 22}),
-        vec![
-            serde_json::json!({"Deduplicated": 23}),
-            serde_json::json!({"Deduplicated": 24}),
-        ],
-        vec![
-            serde_json::json!({"Value": [22, adt_body(3)]}),
-            serde_json::json!({"Value": [23, adt_body(2)]}),
-            serde_json::json!({"Value": [24, adt_body(4)]}),
-        ],
-    );
-    assert_eq!(
-        paint_handle(decls.clone(), serde_json::json!([ambiguous]), 3),
-        ValueType::Ref(None)
-    );
-
-    let vec_target = serde_json::json!({
-        "Adt": {
-            "id": 5,
-            "generics": {"types": [{"Scalar": {"Integer": {"Signed": "I64"}}}]}
-        }
-    });
-    let no_class = deref_impl(
-        1,
-        serde_json::json!({"Deduplicated": 22}),
-        vec![serde_json::json!({"Deduplicated": 26})],
-        vec![
-            serde_json::json!({"Value": [22, adt_body(3)]}),
-            serde_json::json!({"Value": [26, vec_target]}),
-        ],
-    );
-    assert_eq!(
-        paint_handle(decls, serde_json::json!([no_class]), 3),
-        ValueType::Ref(None)
-    );
-
-    let mut copy_name = ident_path(&["fixture", "Handle"]);
-    copy_name
-        .as_array_mut()
-        .expect("path")
-        .push(serde_json::json!({
-            "Instantiated": {"skip_binder": {"types": [{"Scalar": "Bool"}]}}
-        }));
-    let mut other_copy = ident_path(&["fixture", "Handle"]);
-    other_copy
-        .as_array_mut()
-        .expect("path")
-        .push(serde_json::json!({
-            "Instantiated": {"skip_binder": {"types": [
-                {"Scalar": {"Integer": {"Signed": "I64"}}}
-            ]}}
-        }));
-    let copies = vec![
-        (
+        let ambiguous = deref_impl(
             1,
-            struct_decl(
+            serde_json::json!({"Deduplicated": 22}),
+            vec![
+                serde_json::json!({"Deduplicated": 23}),
+                serde_json::json!({"Deduplicated": 24}),
+            ],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(3)]}),
+                serde_json::json!({"Value": [23, adt_body(2)]}),
+                serde_json::json!({"Value": [24, adt_body(4)]}),
+            ],
+        );
+        assert_eq!(
+            paint_handle(decls.clone(), serde_json::json!([ambiguous]), 3),
+            ValueType::Ref(None)
+        );
+
+        let vec_target = serde_json::json!({
+            "Adt": {
+                "id": 5,
+                "generics": {"types": [{"Scalar": {"Integer": {"Signed": "I64"}}}]}
+            }
+        });
+        let no_class = deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![serde_json::json!({"Deduplicated": 26})],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(3)]}),
+                serde_json::json!({"Value": [26, vec_target]}),
+            ],
+        );
+        assert_eq!(
+            paint_handle(decls, serde_json::json!([no_class]), 3),
+            ValueType::Ref(None)
+        );
+
+        let mut copy_name = ident_path(&["fixture", "Handle"]);
+        copy_name
+            .as_array_mut()
+            .expect("path")
+            .push(serde_json::json!({
+                "Instantiated": {"skip_binder": {"types": [{"Scalar": "Bool"}]}}
+            }));
+        let mut other_copy = ident_path(&["fixture", "Handle"]);
+        other_copy
+            .as_array_mut()
+            .expect("path")
+            .push(serde_json::json!({
+                "Instantiated": {"skip_binder": {"types": [
+                    {"Scalar": {"Integer": {"Signed": "I64"}}}
+                ]}}
+            }));
+        let copies = vec![
+            (
                 1,
-                ident_path(&["fixture", "PyObject"]),
-                empty_fields(),
-                false,
+                struct_decl(
+                    1,
+                    ident_path(&["fixture", "PyObject"]),
+                    empty_fields(),
+                    false,
+                ),
             ),
-        ),
-        (
-            2,
-            struct_decl(
+            (
                 2,
-                ident_path(&["fixture", "PyErrorObject"]),
-                empty_fields(),
-                false,
+                struct_decl(
+                    2,
+                    ident_path(&["fixture", "PyErrorObject"]),
+                    empty_fields(),
+                    false,
+                ),
             ),
-        ),
-        (6, struct_decl(6, copy_name, raw_ptr_field(1), true)),
-        (7, struct_decl(7, other_copy, raw_ptr_field(1), true)),
-    ];
-    let copy_impl = deref_impl(
-        1,
-        serde_json::json!({"Deduplicated": 22}),
-        vec![serde_json::json!({"Deduplicated": 23})],
-        vec![
-            serde_json::json!({"Value": [22, adt_body(6)]}),
-            serde_json::json!({"Value": [23, adt_body(2)]}),
-        ],
-    );
-    let (llbc, ty) = load_handle(copies, serde_json::json!([copy_impl]), 7);
-    assert_eq!(
-        super::tyref_to_value_type(&ty, &llbc),
-        ValueType::Ref(Some("Handle".into()))
-    );
-    assert_handle_class(&llbc, &ty, Some("Handle"));
-}
+            (6, struct_decl(6, copy_name, raw_ptr_field(1), true)),
+            (7, struct_decl(7, other_copy, raw_ptr_field(1), true)),
+        ];
+        let copy_impl = deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![serde_json::json!({"Deduplicated": 23})],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(6)]}),
+                serde_json::json!({"Value": [23, adt_body(2)]}),
+            ],
+        );
+        let (llbc, ty) = load_handle(copies, serde_json::json!([copy_impl]), 7);
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("Handle".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("Handle"));
+    }
 
 /// A by-value store of a `#[repr(transparent)]` GC handle into an
 /// enum-variant payload is one `setfield` of the container field
@@ -6368,6 +6439,96 @@ fn load_handle_with_width(
     .expect("query TyRef parses");
     (llbc, ty)
 }
+
+    /// RootScope is a class instance (`Ref`) even when Charon records
+    /// `repr.transparent` over its `usize` save_point. The peel and
+    /// `tyref_is_raw_struct_value` share `gc_root_scope_type_path`
+    /// (`rtyper` `getrepr` → `lowleveltype`; `getkind`).
+    #[test]
+    fn root_scope_is_ref_even_when_layout_is_transparent_usize() {
+        let decls = vec![(
+            1,
+            struct_decl(
+                1,
+                ident_path(&["pyre_object", "gc_roots", "RootScope"]),
+                serde_json::json!([{
+                    "name": "save_point",
+                    "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                    "attr_info": null
+                }]),
+                true,
+            ),
+        )];
+        let (llbc, ty) = load_handle(decls, serde_json::json!([]), 1);
+        assert!(
+            matches!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)),
+            "RootScope getkind is ref; peel must not yield the save_point word"
+        );
+        let word = vec![(
+            1,
+            struct_decl(1, ident_path(&["fixture", "Word"]), i64_field(), true),
+        )];
+        let (llbc, ty) = load_handle(word, serde_json::json!([]), 1);
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
+    }
+
+    /// A container that stores a RootScope is an instance (`Ref`). The
+    /// guard is not raw storage, so `RootedItems { scope, base, len }`
+    /// does not inherit Int (`rtyper` `getrepr` → `lowleveltype`;
+    /// `getkind`).
+    #[test]
+    fn rooted_items_containing_root_scope_is_ref() {
+        let decls = vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["pyre_object", "gc_roots", "RootScope"]),
+                    serde_json::json!([{
+                        "name": "save_point",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                        "attr_info": null
+                    }]),
+                    false,
+                ),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["pyre_object", "gc_roots", "RootedItems"]),
+                    serde_json::json!([
+                        {
+                            "name": "scope",
+                            "ty": {"Adt": {"id": 1, "generics": {"types": []}}},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "base",
+                            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "len",
+                            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                            "attr_info": null
+                        }
+                    ]),
+                    false,
+                ),
+            ),
+        ];
+        let (llbc, scope) = load_handle(decls.clone(), serde_json::json!([]), 1);
+        assert!(
+            matches!(super::tyref_to_value_type(&scope, &llbc), ValueType::Ref(_)),
+            "RootScope getkind is ref"
+        );
+        let (llbc, items) = load_handle(decls, serde_json::json!([]), 2);
+        assert!(
+            matches!(super::tyref_to_value_type(&items, &llbc), ValueType::Ref(_)),
+            "RootedItems stores a RootScope instance; getkind is ref"
+        );
+    }
 
 /// An external `repr(transparent)` handle is `Opaque`. The wrapper
 /// keeps its own class; the payload row is a pointer to `Deref::Target`.

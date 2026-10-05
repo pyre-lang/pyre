@@ -374,6 +374,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: is_ascii_segments(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![slice]),

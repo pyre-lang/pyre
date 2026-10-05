@@ -95,6 +95,28 @@ impl<'a> Lowering<'a> {
         Some(inner)
     }
 
+    /// Fold an `AnonConst` whose initializer is pure constant construction
+    /// (`_1 = const C; _0 = &_1`, a fieldless-enum `Aggregate`, a literal).
+    pub(in crate::front::mir) fn anon_const_literal_op(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("AnonConst")
+        {
+            return None;
+        }
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        if let Some(value) = promoted_const_copied_const(&body)
+            && let Ok(decoded) = decode_constant(self.llbc, &value)
+        {
+            return Some(decoded_const_to_op(decoded));
+        }
+        const_eval_init_body(self.llbc, &body)
+    }
+
     /// Fold a `NamedConst` global (Rust `const`) whose initializer is a
     /// single literal assignment to its `ConstInt` / `ConstBool` /
     /// `ConstFloat` value.  `None` for statics (`global_kind` ≠
@@ -415,6 +437,66 @@ impl<'a> Lowering<'a> {
         for (key, addr) in self.static_addrs.refs {
             if static_key_matches(&full, &stripped, key) {
                 return Some(OpKind::ConstRefAddr(*addr));
+            }
+        }
+        None
+    }
+
+    /// An immutable `static` is a prebuilt constant
+    /// (`bookkeeper.py immutablevalue`). Host-registered addresses
+    /// already won via [`Self::static_addr_op`]; this lane is the
+    /// identity of the declaration itself, never a residual
+    /// `FunctionPath` of the static's symbolic path.
+    pub(in crate::front::mir) fn immutable_static_prebuilt_op(&self, def_id: u64) -> Option<OpKind> {
+        let g = self.llbc.global_by_id(def_id)?;
+        if !immutable_static_is_prebuilt_table(self.llbc, g) {
+            return None;
+        }
+        Some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(def_id)))
+    }
+
+    /// Address of an immutable `static`, including interior-mut
+    /// `Cell` / `UnsafeCell` / atomic bindings. The value is not a
+    /// prebuilt constant (`immutable_static_is_prebuilt_table`); the
+    /// address is still the place to load or store through.
+    pub(in crate::front::mir) fn immutable_static_addr_op(&self, def_id: u64) -> Option<OpKind> {
+        let g = self.llbc.global_by_id(def_id)?;
+        if !global_is_immutable_static(g) {
+            return None;
+        }
+        Some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(def_id)))
+    }
+
+    /// Peel `Deref` projections to an immutable `static` Global.
+    pub(in crate::front::mir) fn place_peels_to_immutable_static_id(&self, place: &Place) -> Option<u64> {
+        self.place_peels_to_any_immutable_static(place)
+            .filter(|&id| {
+                self.llbc
+                    .global_by_id(id)
+                    .is_some_and(|g| immutable_static_is_prebuilt_table(self.llbc, g))
+            })
+    }
+
+    /// Peel `Deref` projections to any immutable `static`, including
+    /// interior-mut `Cell` / `UnsafeCell` / atomic bindings. The value
+    /// is not a prebuilt constant; the address is still the place.
+    pub(in crate::front::mir) fn place_peels_to_any_immutable_static(&self, place: &Place) -> Option<u64> {
+        let mut current = place;
+        for _ in 0..8 {
+            match &current.kind {
+                PlaceKind::Global { id, .. } => {
+                    let g = self.llbc.global_by_id(*id)?;
+                    return global_is_immutable_static(g).then_some(*id);
+                }
+                PlaceKind::Projection(inner, ProjectionElem::Atom(s)) if s == "Deref" => {
+                    current = inner;
+                }
+                PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                    if v.as_str() == Some("Deref") =>
+                {
+                    current = inner;
+                }
+                _ => return None,
             }
         }
         None
@@ -827,10 +909,646 @@ pub(crate) fn attached_foldable_lit(llbc: &Llbc, def_id: u64) -> Option<OpKind> 
 }
 
 pub(in crate::front::mir) fn global_is_thread_local(g: &GlobalDecl) -> bool {
-    g.rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        == Some("ThreadLocal")
+    let Some(kind) = g.rest.get("global_kind") else {
+        return false;
+    };
+    if kind.as_str() == Some("ThreadLocal") {
+        return true;
+    }
+    kind.get("Static")
+        .and_then(|st| st.get("is_thread_local"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+/// An immutable `static` binding: Charon's `Static { is_mut: false }`,
+/// not TLS, not a `static mut` source spelling. The interpreter never
+/// assigns the binding after init, so a read is a prebuilt constant
+/// (`bookkeeper.py immutablevalue`).
+pub(in crate::front::mir) fn global_is_immutable_static(g: &GlobalDecl) -> bool {
+    g.is_immutable_static() && !global_source_text_is_static_mut(g)
+}
+
+/// An immutable `static` whose type is a prebuilt table: every field is
+/// a fnptr / `Option<fnptr>` / integer / fieldless enum /
+/// `Option<fieldless enum>`, and the type tree has no interior
+/// mutability (`UnsafeCell` / `Cell` / `sync::atomic`). `INT_BINOP_SHORTCUTS`
+/// is this shape (`bookkeeper.py immutablevalue`). A `static AtomicBool`
+/// is still `Static { is_mut: false }` in Charon, so the binding is not
+/// the fact; the declared type is.
+pub(in crate::front::mir) fn immutable_static_is_prebuilt_table(llbc: &Llbc, g: &GlobalDecl) -> bool {
+    if !global_is_immutable_static(g) {
+        return false;
+    }
+    if global_tyref(g).is_some_and(|ty| tyref_has_interior_mutability(&ty, llbc)) {
+        return false;
+    }
+    let Some(type_id) = global_decl_adt_id(llbc, g) else {
+        return false;
+    };
+    type_is_prebuilt_table(llbc, type_id)
+}
+
+pub(in crate::front::mir) fn type_is_prebuilt_table(llbc: &Llbc, type_id: u64) -> bool {
+    if type_has_interior_mutability(llbc, type_id) {
+        return false;
+    }
+    let Some(td) = llbc.type_by_id(type_id) else {
+        return false;
+    };
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return false;
+    };
+    !fields.is_empty()
+        && fields
+            .iter()
+            .all(|field| field_ty_is_prebuilt_immutable(&field.ty, llbc))
+}
+
+pub(in crate::front::mir) fn projection_elem_is_deref(elem: &ProjectionElem) -> bool {
+    matches!(elem, ProjectionElem::Atom(s) if s == "Deref")
+        || matches!(elem, ProjectionElem::Tagged(v) if v.as_str() == Some("Deref"))
+}
+
+/// Non-null sentinel for an immutable `static` that has no host-registered
+/// address. Distinct from [`JITDRIVER_NAMEDCONST_SENTINEL_ADDR`]. The
+/// identity is the global's `def_id`; a later `HostStaticAddrs.refs` row
+/// still wins via [`Lowering::static_addr_op`].
+pub(in crate::front::mir) fn immutable_static_sentinel_addr(def_id: u64) -> i64 {
+    0x0700_0000_0000 + (def_id as i64 + 1) * 16
+}
+
+/// Fold a struct-field read of an immutable static to the initializer
+/// value of that field. Function-pointer slots become `__fn_const`
+/// (`decoded_const_to_op`); `Option<fn>` `None` is the null function
+/// pointer (`ConstInt(0)`). Anything the initializer does not name as a
+/// translation-time constant stays a pure getfield of the prebuilt.
+pub(in crate::front::mir) fn fold_immutable_static_field(llbc: &Llbc, def_id: u64, field_idx: usize) -> Option<OpKind> {
+    let fields = immutable_static_struct_fields(llbc, def_id)?;
+    fields.into_iter().nth(field_idx).flatten()
+}
+
+pub(in crate::front::mir) fn immutable_static_struct_fields(llbc: &Llbc, def_id: u64) -> Option<Vec<Option<OpKind>>> {
+    immutable_static_init_tables(llbc, def_id).map(|(fields, _)| fields)
+}
+
+pub(in crate::front::mir) fn immutable_static_field_fun_id(llbc: &Llbc, def_id: u64, field_idx: usize) -> Option<u64> {
+    let (_, funs) = immutable_static_init_tables(llbc, def_id)?;
+    funs.into_iter().nth(field_idx).flatten()
+}
+
+pub(in crate::front::mir) fn immutable_static_init_tables(
+    llbc: &Llbc,
+    def_id: u64,
+) -> Option<(Vec<Option<OpKind>>, Vec<Option<u64>>)> {
+    let g = llbc.global_by_id(def_id)?;
+    if !immutable_static_is_prebuilt_table(llbc, g) {
+        return None;
+    }
+    let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    let mut locals: std::collections::HashMap<u64, OpKind> = std::collections::HashMap::new();
+    let mut local_funs: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut struct_fields: Option<Vec<Option<OpKind>>> = None;
+    let mut struct_funs: Option<Vec<Option<u64>>> = None;
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dst) = place.kind else {
+                continue;
+            };
+            if let Some(fun_id) = eval_static_init_fun_id(llbc, &rvalue, &local_funs) {
+                local_funs.insert(dst, fun_id);
+            }
+            if let Rvalue::Aggregate(kind, operands) = &rvalue
+                && aggregate_kind_is_struct(kind)
+            {
+                struct_fields = Some(
+                    operands
+                        .iter()
+                        .map(|operand| eval_static_init_operand(llbc, operand, &locals))
+                        .collect(),
+                );
+                struct_funs = Some(
+                    operands
+                        .iter()
+                        .map(|operand| eval_static_init_operand_fun_id(llbc, operand, &local_funs))
+                        .collect(),
+                );
+            }
+            if let Some(op) = eval_static_init_rvalue(llbc, &rvalue, &locals) {
+                locals.insert(dst, op);
+            }
+        }
+    }
+    Some((struct_fields?, struct_funs.unwrap_or_default()))
+}
+
+pub(in crate::front::mir) fn aggregate_adt_parts(kind: &serde_json::Value) -> Option<(u64, Option<u64>)> {
+    let adt = kind.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = head
+        .as_u64()
+        .or_else(|| head.get("id").and_then(serde_json::Value::as_u64))?;
+    let variant = match adt.get(1) {
+        Some(v) if v.is_null() => None,
+        Some(v) => v.as_u64(),
+        None => None,
+    };
+    Some((type_id, variant))
+}
+
+pub(in crate::front::mir) fn type_decl_is_option(llbc: &Llbc, type_id: u64) -> bool {
+    llbc.type_by_id(type_id)
+        .is_some_and(|td| td.item_meta.name_path() == "core::option::Option")
+}
+
+pub(in crate::front::mir) fn aggregate_kind_is_struct(kind: &serde_json::Value) -> bool {
+    matches!(aggregate_adt_parts(kind), Some((_, None)))
+}
+
+pub(in crate::front::mir) fn eval_static_init_rvalue(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    locals: &std::collections::HashMap<u64, OpKind>,
+) -> Option<OpKind> {
+    match rvalue {
+        Rvalue::Use(operand, _) | Rvalue::Cast(_, operand, _) | Rvalue::UnaryOp(_, operand) => {
+            eval_static_init_operand(llbc, operand, locals)
+        }
+        Rvalue::Aggregate(kind, operands) => {
+            if let Some((type_id, variant)) = aggregate_adt_parts(kind)
+                && type_decl_is_option(llbc, type_id)
+            {
+                return match (variant, operands.len()) {
+                    (Some(0), 0) => Some(OpKind::ConstInt(0)),
+                    (Some(1), 1) => eval_static_init_operand(llbc, &operands[0], locals),
+                    _ => None,
+                };
+            }
+            None
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => match &place.kind {
+            PlaceKind::Local(id) => locals.get(id).cloned(),
+            PlaceKind::Global { id, .. } => eval_prebuilt_static_ref(llbc, *id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn eval_prebuilt_static_ref(llbc: &Llbc, id: u64) -> Option<OpKind> {
+    let g = llbc.global_by_id(id)?;
+    immutable_static_is_prebuilt_table(llbc, g)
+        .then_some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(id)))
+}
+
+pub(in crate::front::mir) fn eval_static_init_operand(
+    llbc: &Llbc,
+    operand: &Operand,
+    locals: &std::collections::HashMap<u64, OpKind>,
+) -> Option<OpKind> {
+    match operand {
+        Operand::Const(value) => {
+            if let Some(fun_id) = const_fn_def_regular_id(llbc, value)
+                && let Some(fd) = llbc.fn_by_id(fun_id)
+            {
+                let path = registered_path_for_fun_decl(llbc, fd);
+                return Some(decoded_const_to_op(DecodedConst::FnPath(path.segments)));
+            }
+            decode_constant(llbc, value).ok().map(decoded_const_to_op)
+        }
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(id) => locals.get(id).cloned(),
+            PlaceKind::Global { id, .. } => eval_prebuilt_static_ref(llbc, *id),
+            _ => None,
+        },
+    }
+}
+
+pub(in crate::front::mir) fn eval_static_init_fun_id(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    local_funs: &std::collections::HashMap<u64, u64>,
+) -> Option<u64> {
+    match rvalue {
+        Rvalue::Use(operand, _) | Rvalue::Cast(_, operand, _) | Rvalue::UnaryOp(_, operand) => {
+            eval_static_init_operand_fun_id(llbc, operand, local_funs)
+        }
+        Rvalue::Aggregate(kind, operands) => {
+            if let Some((type_id, variant)) = aggregate_adt_parts(kind)
+                && type_decl_is_option(llbc, type_id)
+                && variant == Some(1)
+                && operands.len() == 1
+            {
+                return eval_static_init_operand_fun_id(llbc, &operands[0], local_funs);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn eval_static_init_operand_fun_id(
+    llbc: &Llbc,
+    operand: &Operand,
+    local_funs: &std::collections::HashMap<u64, u64>,
+) -> Option<u64> {
+    match operand {
+        Operand::Const(value) => const_fn_def_regular_id(llbc, value),
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(id) => local_funs.get(id).copied(),
+            _ => None,
+        },
+    }
+}
+
+/// `FnDef` stored in an immutable static field this operand names.
+pub(in crate::front::mir) fn folded_fun_id_from_immutable_static(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<u64> {
+    let (gid, field_idx) = operand_immutable_static_field(llbc, body, operand, 0)?;
+    immutable_static_field_fun_id(llbc, gid, field_idx)
+}
+
+/// Closed PBC family for a call through a field of a type that only
+/// exists as immutable statics: every `FnDef` those initializers store.
+pub(in crate::front::mir) fn closed_fnptr_graphs_for(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<Vec<crate::parse::CallPath>> {
+    let type_id = operand_fnptr_table_adt(llbc, body, operand, 0)?;
+    let mut graphs = Vec::new();
+    for g in llbc.iter_global_decls() {
+        if !immutable_static_is_prebuilt_table(llbc, g) {
+            continue;
+        }
+        if global_decl_adt_id(llbc, g) != Some(type_id) {
+            continue;
+        }
+        let Some((_, funs)) = immutable_static_init_tables(llbc, g.def_id) else {
+            continue;
+        };
+        for fun_id in funs.into_iter().flatten() {
+            let Some(fd) = llbc.fn_by_id(fun_id) else {
+                continue;
+            };
+            let path = registered_path_for_fun_decl(llbc, fd);
+            if !graphs.contains(&path) {
+                graphs.push(path);
+            }
+        }
+    }
+    (!graphs.is_empty()).then_some(graphs)
+}
+
+pub(in crate::front::mir) fn global_tyref(g: &GlobalDecl) -> Option<TyRef> {
+    serde_json::from_value(g.rest.get("ty")?.clone()).ok()
+}
+
+pub(in crate::front::mir) fn global_decl_adt_id(llbc: &Llbc, g: &GlobalDecl) -> Option<u64> {
+    let tyref = global_tyref(g)?;
+    let node = tyref_node(&tyref, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    adt_node_def_id(node)
+}
+
+pub(in crate::front::mir) fn operand_immutable_static_field(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+    depth: usize,
+) -> Option<(u64, usize)> {
+    if depth > 8 {
+        return None;
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    place_immutable_static_field(llbc, body, place, depth)
+}
+
+pub(in crate::front::mir) fn place_global_id(place: &Place) -> Option<u64> {
+    match &place.kind {
+        PlaceKind::Global { id, .. } => Some(*id),
+        PlaceKind::Projection(inner, elem) if projection_elem_is_deref(elem) => {
+            place_global_id(inner)
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn place_immutable_static_field(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+    depth: usize,
+) -> Option<(u64, usize)> {
+    if depth > 8 {
+        return None;
+    }
+    match &place.kind {
+        PlaceKind::Projection(inner, elem) => {
+            if projection_elem_is_deref(elem) {
+                return place_immutable_static_field(llbc, body, inner, depth + 1);
+            }
+            if let Some(payload) = elem.field_payload() {
+                let (_, field_idx) = indexed_field_parts(payload)?;
+                if let Some(gid) = place_global_id(inner) {
+                    let g = llbc.global_by_id(gid)?;
+                    return immutable_static_is_prebuilt_table(llbc, g).then_some((gid, field_idx));
+                }
+                // Option payload field: peel to the Option place.
+                if let Some(head) = tyref_node(&inner.ty, llbc)
+                    .and_then(|n| strip_ty_wrappers(n, llbc))
+                    .and_then(adt_node_def_id)
+                    && type_decl_is_option(llbc, head)
+                {
+                    return place_immutable_static_field(llbc, body, inner, depth + 1);
+                }
+            }
+            None
+        }
+        PlaceKind::Local(index) => {
+            let assigned = local_assigned_operand(body, *index)?;
+            operand_immutable_static_field(llbc, body, &assigned, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn operand_fnptr_table_adt(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+    depth: usize,
+) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    place_fnptr_table_adt(llbc, body, place, depth)
+}
+
+pub(in crate::front::mir) fn place_fnptr_table_adt(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+    depth: usize,
+) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    match &place.kind {
+        PlaceKind::Projection(inner, elem) => {
+            if projection_elem_is_deref(elem) {
+                return place_fnptr_table_adt(llbc, body, inner, depth + 1);
+            }
+            if elem.field_payload().is_some() {
+                if let Some(head) = tyref_node(&inner.ty, llbc)
+                    .and_then(|n| strip_ty_wrappers(n, llbc))
+                    .and_then(adt_node_def_id)
+                {
+                    if type_decl_is_option(llbc, head) {
+                        return place_fnptr_table_adt(llbc, body, inner, depth + 1);
+                    }
+                    if immutable_static_exists_for_adt(llbc, head) {
+                        return Some(head);
+                    }
+                }
+            }
+            None
+        }
+        PlaceKind::Global { id, .. } => {
+            let g = llbc.global_by_id(*id)?;
+            if !immutable_static_is_prebuilt_table(llbc, g) {
+                return None;
+            }
+            global_decl_adt_id(llbc, g)
+        }
+        PlaceKind::Local(index) => {
+            let assigned = local_assigned_operand(body, *index)?;
+            operand_fnptr_table_adt(llbc, body, &assigned, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::front::mir) fn immutable_static_exists_for_adt(llbc: &Llbc, type_id: u64) -> bool {
+    type_is_prebuilt_table(llbc, type_id)
+        && llbc.iter_global_decls().any(|g| {
+            immutable_static_is_prebuilt_table(llbc, g)
+                && global_decl_adt_id(llbc, g) == Some(type_id)
+        })
+}
+
+pub(in crate::front::mir) fn local_assigned_operand(body: &Unstructured, local: u64) -> Option<Operand> {
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            if !matches!(&place.kind, PlaceKind::Local(dst) if *dst == local) {
+                continue;
+            }
+            return match rvalue {
+                Rvalue::Use(operand, _)
+                | Rvalue::Cast(_, operand, _)
+                | Rvalue::UnaryOp(_, operand) => Some(operand.clone()),
+                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                    Some(Operand::Copy(place.clone()))
+                }
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Fields of a type that only materialises as immutable statics, and whose
+/// every field is a prebuilt scalar (fnptr / `Option<fnptr>` / integer /
+/// fieldless enum / `Option<fieldless enum>`), are class-level
+/// `_immutable_fields_` (`rclass.py _parse_field_list`). A type tree that
+/// contains `UnsafeCell` / `Cell` / `sync::atomic` is interior-mutable and
+/// stays off this harvest.
+pub(crate) fn harvest_immutable_fields_from_immutable_statics(
+    llbc: &Llbc,
+) -> std::collections::HashMap<String, Vec<(String, crate::model::ImmutableRank)>> {
+    let mut out = std::collections::HashMap::new();
+    for g in llbc.iter_global_decls() {
+        if !immutable_static_is_prebuilt_table(llbc, g) {
+            continue;
+        }
+        let Some(type_id) = global_decl_adt_id(llbc, g) else {
+            continue;
+        };
+        let Some(td) = llbc.type_by_id(type_id) else {
+            continue;
+        };
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
+        let entries: Vec<(String, crate::model::ImmutableRank)> = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let name = field
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(index));
+                (name, crate::model::ImmutableRank::Immutable)
+            })
+            .collect();
+        let path = td.item_meta.name_path();
+        let stripped = strip_crate_prefix(&path);
+        let leaf = stripped
+            .rsplit("::")
+            .next()
+            .unwrap_or(stripped.as_str())
+            .to_string();
+        out.entry(leaf).or_insert_with(|| entries.clone());
+        out.entry(stripped).or_insert(entries);
+    }
+    out
+}
+
+pub(in crate::front::mir) fn field_ty_is_prebuilt_immutable(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_option_payload_is_fn_ptr(ty, llbc) || tyref_option_fieldless_niche(ty, llbc).is_some()
+    {
+        return true;
+    }
+    if tyref_fieldless_enum_def(ty, llbc).is_some() {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if type_node_is_fn_ptr(node, llbc) {
+        return true;
+    }
+    node.get("Scalar")
+        .is_some_and(|scalar| scalar_value_type(scalar).is_some())
+}
+
+/// Declared interior mutability of a type: `UnsafeCell`, `Cell`, or a
+/// `sync::atomic` struct appears in the type tree. The static's binding
+/// name is not consulted.
+pub(in crate::front::mir) fn tyref_has_interior_mutability(ty: &TyRef, llbc: &Llbc) -> bool {
+    let mut seen = Vec::new();
+    tyref_node(ty, llbc)
+        .is_some_and(|node| type_node_has_interior_mutability(node, llbc, &mut seen))
+}
+
+pub(in crate::front::mir) fn type_has_interior_mutability(llbc: &Llbc, type_id: u64) -> bool {
+    let mut seen = Vec::new();
+    type_id_has_interior_mutability(llbc, type_id, &mut seen)
+}
+
+pub(in crate::front::mir) fn type_node_has_interior_mutability(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    seen: &mut Vec<u64>,
+) -> bool {
+    if seen.len() > 64 {
+        return false;
+    }
+    let Some(node) = strip_ty_wrappers(node, llbc) else {
+        return false;
+    };
+    let Some(obj) = node.as_object() else {
+        return false;
+    };
+    if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Array").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Slice").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Tuple").and_then(serde_json::Value::as_array) {
+        return arr
+            .iter()
+            .any(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(adt) = obj.get("Adt") {
+        if let Some(types) = adt
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            && types
+                .iter()
+                .any(|inner| type_node_has_interior_mutability(inner, llbc, seen))
+        {
+            return true;
+        }
+        if let Some(id) = adt_node_def_id(node) {
+            return type_id_has_interior_mutability(llbc, id, seen);
+        }
+    }
+    false
+}
+
+pub(in crate::front::mir) fn type_id_has_interior_mutability(llbc: &Llbc, type_id: u64, seen: &mut Vec<u64>) -> bool {
+    if seen.contains(&type_id) {
+        return false;
+    }
+    seen.push(type_id);
+    let Some(td) = llbc.type_by_id(type_id) else {
+        return false;
+    };
+    if adt_path_is_interior_mut_constructor(&td.item_meta.name_path(), &td.kind) {
+        return true;
+    }
+    match &td.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
+            .iter()
+            .any(|field| tyref_node_interior_mut(&field.ty, llbc, seen)),
+        TypeDeclKind::Enum(variants) => variants.iter().any(|variant| {
+            variant
+                .fields
+                .iter()
+                .any(|field| tyref_node_interior_mut(&field.ty, llbc, seen))
+        }),
+        TypeDeclKind::Alias(aliased) => type_node_has_interior_mutability(aliased, llbc, seen),
+        TypeDeclKind::Opaque | TypeDeclKind::Unknown => false,
+    }
+}
+
+pub(in crate::front::mir) fn tyref_node_interior_mut(ty: &TyRef, llbc: &Llbc, seen: &mut Vec<u64>) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| type_node_has_interior_mutability(node, llbc, seen))
+}
+
+/// Type constructors that *are* interior mutability, identified by the
+/// declaration path. `AtomicBool` is a struct in `sync::atomic`;
+/// `Ordering` in the same module is a fieldless enum and is not.
+pub(in crate::front::mir) fn adt_path_is_interior_mut_constructor(path: &str, kind: &TypeDeclKind) -> bool {
+    if path == "core::cell::UnsafeCell" || path.ends_with("::UnsafeCell") {
+        return true;
+    }
+    if path == "core::cell::Cell" || path == "std::cell::Cell" || path.ends_with("::cell::Cell") {
+        return true;
+    }
+    if path.contains("::sync::atomic::") {
+        return matches!(
+            kind,
+            TypeDeclKind::Struct(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown
+        );
+    }
+    false
 }
 
 pub(in crate::front::mir) fn global_source_text_is_static_mut(g: &GlobalDecl) -> bool {
@@ -1325,6 +2043,7 @@ pub(in crate::front::mir) fn encoding_name_const(segments: &[String]) -> Option<
         target: CallTarget::FunctionPath {
             segments: vec!["__str_const".to_string(), text.to_string()],
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![]),
@@ -1421,6 +2140,59 @@ pub(in crate::front::mir) enum DecodedConst {
     FnPath(Vec<String>),
 }
 
+/// The op `build_rvalue` emits for an `Operand::Const`. A PromotedConst
+/// body that copies that constant and returns a borrow of it folds to
+/// the same op (`flowspace` `Constant`). A Unicode scalar in a const
+/// initializer is the code-point int (`getkind` of UniChar); the rvalue
+/// path emits `unichr` in [`Lowering::emit_decoded_const`].
+pub(in crate::front::mir) fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
+    match decoded {
+        DecodedConst::Int(n) => OpKind::ConstInt(n),
+        DecodedConst::UInt(n) => OpKind::ConstUInt(n),
+        DecodedConst::Int128(n) => OpKind::ConstInt128(n),
+        DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
+        DecodedConst::Bool(b) => OpKind::ConstBool(b),
+        DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
+        DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
+        DecodedConst::UniChar(code) => OpKind::ConstInt(i64::from(code)),
+        // String / byte-string constants — no ConstStr opkind exists;
+        // synthesise a 0-arg `Call` whose path encodes the literal text
+        // so the IR stays stable. A `&str` / `&[u8]` literal lowers to
+        // `Ptr(STR)` (getkind `r`). The `__str_const` path is never
+        // registered: the flowspace adapter pre-folds it to
+        // `Constant('text')` (`flowspace_adapter.rs::is_str_const_define`).
+        DecodedConst::Str(s) => OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), s],
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(None),
+        },
+        // A function item used as a *value* rather than called. Upstream
+        // materialises `Constant(funcptr)` of lltype `Ptr(FuncType)`
+        // (`rtyper.getcallable`); `FuncType._gckind` is `raw`, so
+        // `getkind` maps that pointer to `int`.
+        DecodedConst::FnPath(segments) => {
+            let mut synthetic = Vec::with_capacity(segments.len() + 1);
+            synthetic.push(crate::model::FN_CONST_HEAD.to_string());
+            synthetic.extend(segments);
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: synthetic,
+                    fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Int,
+            }
+        }
+    }
+}
+
 /// Literal value tracked by [`const_eval_init_body`].
 #[derive(Clone, Copy)]
 pub(in crate::front::mir) enum ConstLit {
@@ -1438,8 +2210,10 @@ pub(in crate::front::mir) enum ConstLit {
     /// `Field[Tuple 2, 0|1]` projections.
     Checked(i64, bool),
     CheckedUInt(u64, bool),
-    /// Fieldless enum discriminant. Not a folded constant by itself:
-    /// `bitflagset`'s `from_element` shifts by this value (`element as u8`).
+    /// Fieldless enum discriminant. Intermediate for `bitflagset`'s
+    /// `from_element` (`element as u8`). As a const's result it is the
+    /// by-value fieldless-enum constant: `tyref_to_value_type` colors
+    /// that type `Int`, and the constructor folds to `ConstInt`.
     EnumDisc(u64),
     /// `1 << disc` from an opaque `from_element`. `bits` reads the word back.
     BitflagBits(u64),
@@ -1765,31 +2539,7 @@ pub(in crate::front::mir) fn decoded_named_const_on_llbc(
 }
 
 pub(in crate::front::mir) fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
-    match decoded_named_const_on_llbc(llbc, def_id)? {
-        DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
-        DecodedConst::UInt(n) => Some(OpKind::ConstUInt(n)),
-        DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
-        DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
-        DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
-        DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
-        DecodedConst::UniChar(code) => Some(OpKind::ConstInt(i64::from(code))),
-        // A `const NAME: &str = "..."` global reads as a named-const
-        // fold, not a static address; without this arm the read falls
-        // through to a residual `FunctionPath` Call on the const path
-        // (`ATTR_W_OBJ_WEAK` etc.) the registry cannot bind.  Emit the
-        // same synthetic `__str_const` the `build_rvalue` const path
-        // uses (result kind `Ref` — a `&str` literal is `Ptr(STR)`).
-        DecodedConst::Str(s) => Some(OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec!["__str_const".to_string(), s],
-                fun_decl_id: None,
-                specialization: crate::parse::GraphSpecialization::Regular,
-            },
-            args: crate::model::call_args(vec![]),
-            result_ty: ValueType::Ref(None),
-        }),
-        _ => None,
-    }
+    Some(decoded_const_to_op(decoded_named_const_on_llbc(llbc, def_id)?))
 }
 
 /// Discriminant of a fieldless enum variant aggregate.
@@ -3300,6 +4050,19 @@ pub(in crate::front::mir) fn align_up(offset: u64, align: u64) -> Option<u64> {
     } else {
         offset.checked_add(align - rem)
     }
+}
+
+pub(in crate::front::mir) fn tyexpr_body<'a>(
+    llbc: &'a Llbc,
+    ty: &'a serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    if let Some(arr) = ty.get("Value").and_then(serde_json::Value::as_array) {
+        return arr.get(1);
+    }
+    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_body(id);
+    }
+    Some(ty)
 }
 
 pub(in crate::front::mir) fn primitive_size_align(

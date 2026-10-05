@@ -385,6 +385,7 @@ fn rewire_one_slice_index_site(
                     target: CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice, start.clone(), end.clone()]),
@@ -422,6 +423,7 @@ fn rewire_one_slice_index_site(
                     target: CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice, start.clone()]),
@@ -993,6 +995,7 @@ mod tests {
                 "index".into(),
             ],
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
@@ -1018,6 +1021,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(repeat_args),
@@ -1183,6 +1187,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
@@ -1198,6 +1203,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
@@ -1251,6 +1257,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["vec".into(), "Vec".into(), "push".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![site_args[0].clone(), fill]),
@@ -1366,6 +1373,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["vec".into(), "Vec".into(), "push".into()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![base.clone()]),
@@ -1433,6 +1441,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["util".into(), "get".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![receiver.clone(), receiver]),
@@ -1510,6 +1519,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
@@ -1525,6 +1535,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![fill, count]),
@@ -1737,6 +1748,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![fill, count]),
@@ -1932,6 +1944,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".into(), "opaque".into(), "mutator".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![owner]),
@@ -2727,6 +2740,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["vec".into(), "Vec".into(), "index".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice, range.clone()]),

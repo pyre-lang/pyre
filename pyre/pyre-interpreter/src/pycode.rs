@@ -1274,60 +1274,6 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     w_code_new_owned(code_ptr, hidden_applevel, 0, &[], true)
 }
 
-/// `Ptr(GcArray(W_Root))` layout for `co_names_w`.
-///
-/// The items are `intern_str_value` results, which never move, so the block
-/// is a code-object table outside the collector and needs no walking.
-fn alloc_co_table(items: &[PyObjectRef]) -> *mut pyre_object::FixedObjectArray {
-    let len = items.len();
-    let payload = pyre_object::object_array::FIXED_ARRAY_ITEMS_OFFSET
-        + len * std::mem::size_of::<PyObjectRef>();
-    let layout = std::alloc::Layout::from_size_align(
-        payload,
-        std::mem::align_of::<pyre_object::FixedObjectArray>(),
-    )
-    .expect("co table layout");
-    let mem = unsafe { std::alloc::alloc(layout) };
-    if mem.is_null() {
-        std::alloc::handle_alloc_error(layout);
-    }
-    unsafe {
-        let block = mem as *mut pyre_object::FixedObjectArray;
-        (*block).len = len;
-        if len > 0 {
-            std::ptr::copy_nonoverlapping(items.as_ptr(), (*block).items_mut_ptr(), len);
-        }
-        block
-    }
-}
-
-/// Release the `std::alloc` block from [`alloc_co_table`].
-unsafe fn release_co_table(arr: *mut pyre_object::FixedObjectArray) {
-    if arr.is_null() {
-        return;
-    }
-    let len = unsafe { (*arr).len };
-    let payload = pyre_object::object_array::FIXED_ARRAY_ITEMS_OFFSET
-        + len * std::mem::size_of::<PyObjectRef>();
-    let layout = std::alloc::Layout::from_size_align(
-        payload,
-        std::mem::align_of::<pyre_object::FixedObjectArray>(),
-    )
-    .expect("co table layout");
-    unsafe { std::alloc::dealloc(arr as *mut u8, layout) };
-}
-
-/// Store a finished `co_names_w` array into `slot`.
-///
-/// The table lives outside the collector and its items are immortal, so the
-/// store needs no write barrier.
-unsafe fn replace_co_table(slot: *mut *mut pyre_object::FixedObjectArray, items: &[PyObjectRef]) {
-    let arr = alloc_co_table(items);
-    let old = unsafe { *slot };
-    unsafe { *slot = arr };
-    unsafe { release_co_table(old) };
-}
-
 /// [`w_code_new_with_hidden_applevel`] naming the `box_code_object` allocation
 /// the body belongs to, so the wrapper can be counted against it.
 ///
@@ -1661,19 +1607,6 @@ fn w_code_new_owned(
             let table =
                 pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
             unsafe { (*table).set_ref(index, realized) };
-        }
-    } else {
-        // `pycode.py self.co_consts_w = consts`: every PyCode has a table.
-        // A null/unaligned `code_ptr` (test fixtures, gateway builtins)
-        // gets an empty array so `getconstant_w` is the array read.
-        let table = unsafe { alloc_co_consts_array(0) };
-        let table_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(table as pyre_object::PyObjectRef);
-        publish_code_slot_store(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-        let owner = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut PyCode;
-        unsafe {
-            (*owner).co_consts_w =
-                pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
         }
     }
     publish_code_slot_store(pyre_object::gc_roots::shadow_stack_get(obj_slot));

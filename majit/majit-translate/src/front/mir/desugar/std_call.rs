@@ -693,6 +693,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![sum]),
@@ -970,6 +971,7 @@ impl<'a> Lowering<'a> {
                                         crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                     ],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: Vec::new(),
@@ -1151,6 +1153,7 @@ impl<'a> Lowering<'a> {
             None => CallTarget::FunctionPath {
                 segments,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
         };
@@ -1741,11 +1744,18 @@ impl<'a> Lowering<'a> {
             owner_id,
             ty,
         } = &span.kind;
+        let value = self.coerce_gcref_null_store(
+            bb_id,
+            owner,
+            name,
+            Some(ty),
+            crate::model::LinkArg::Value(value),
+        );
         let kind = OpKind::FieldWrite {
             base: base.clone(),
             field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
                 .with_owner_id(Some(*owner_id)),
-            value: crate::model::LinkArg::Value(value),
+            value,
             ty: ty.clone(),
         };
         self.graph
@@ -3053,6 +3063,7 @@ impl<'a> Lowering<'a> {
                         crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header.clone()]),
@@ -3068,6 +3079,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header]),
@@ -3079,11 +3091,7 @@ impl<'a> Lowering<'a> {
 
     /// Items address of a resizable byte list
     /// (`rgc.nonmoving_raw_ptr_for_resizable_list`). Result is CCHARP.
-    pub(in crate::front::mir) fn emit_list_items_ccharp(
-        &mut self,
-        mir_bb: usize,
-        list: Variable,
-    ) -> Variable {
+    pub(in crate::front::mir) fn emit_list_items_ccharp(&mut self, mir_bb: usize, list: Variable) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
         let data = self
             .graph
@@ -3098,6 +3106,7 @@ impl<'a> Lowering<'a> {
                             .to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![list]),
@@ -3163,6 +3172,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![list]),
@@ -3372,12 +3382,7 @@ impl<'a> Lowering<'a> {
     /// `registered_path_for_fun_decl` / `spec_segments` spelling). Attach the
     /// FunDecl id when this artefact loaded it. The result is the list, not
     /// `STR`.
-    pub(in crate::front::mir) fn emit_charpsize2str_list(
-        &mut self,
-        mir_bb: usize,
-        ptr: Variable,
-        len: Variable,
-    ) -> Variable {
+    pub(in crate::front::mir) fn emit_charpsize2str_list(&mut self, mir_bb: usize, ptr: Variable, len: Variable) -> Variable {
         let dest = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
@@ -3395,6 +3400,7 @@ impl<'a> Lowering<'a> {
         let mut target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         if let Some(fun_decl_id) = fun_decl_id {
@@ -4324,6 +4330,7 @@ impl<'a> Lowering<'a> {
         let target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         }
         .with_fun_decl_id(fun_decl_id);
@@ -6919,6 +6926,40 @@ impl<'a> Lowering<'a> {
             .is_some_and(|(owner, leaf)| leaf_is_word(&leaf) && owner_is_cell(&owner))
     }
 
+    /// `Cell::get(&self) -> T`: load of the inner word.
+    pub(in crate::front::mir) fn is_cell_word_get(&self, reg: &RegularCall) -> bool {
+        self.is_std_cell_word_method(reg, "get")
+    }
+
+    /// `Cell::set(&self, val)`: store of the inner word.
+    pub(in crate::front::mir) fn is_cell_word_set(&self, reg: &RegularCall) -> bool {
+        self.is_std_cell_word_method(reg, "set")
+    }
+
+    pub(in crate::front::mir) fn is_std_cell_word_method(&self, reg: &RegularCall, leaf: &str) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let owner_is_cell = |owner: &str| {
+            owner == "cell::Cell"
+                || owner == "core::cell::Cell"
+                || owner == "std::cell::Cell"
+                || owner.ends_with("::cell::Cell")
+        };
+        let path = fd.item_meta.name_path();
+        if let Some((owner, path_leaf)) = path.rsplit_once("::")
+            && path_leaf == leaf
+            && owner_is_cell(owner)
+        {
+            return true;
+        }
+        impl_method_owner_for_fundecl(self.llbc, fd)
+            .is_some_and(|(owner, path_leaf)| path_leaf == leaf && owner_is_cell(&owner))
+    }
+
     /// `<[T]>::as_ptr` — the data-pointer projection of a slice receiver.  In
     /// the erased value-model a `&[T]` collapses to a single GC array pointer
     /// (its length is read from the array header by `ArrayLen`, not a companion
@@ -7487,6 +7528,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "intrinsics".into(), leaf.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![lhs, rhs]),
@@ -7706,6 +7748,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["longlong2float".to_string(), leaf.to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![operand]),
@@ -7804,10 +7847,7 @@ impl<'a> Lowering<'a> {
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
-    pub(in crate::front::mir) fn blanket_into_devirt(
-        &self,
-        reg: &RegularCall,
-    ) -> Option<IntoDevirt> {
+    pub(in crate::front::mir) fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
         if !self.callee_is_blanket_into(reg) {
             return None;
         }
@@ -7858,7 +7898,10 @@ impl<'a> Lowering<'a> {
             let path = crate::parse::CallPath::from_segments(trait_impl_identity_path(
                 &owner, &identity, &method,
             ));
-            return Some(IntoDevirt::Target(path.segments));
+            return Some(IntoDevirt::Target {
+                segments: path.segments,
+                fun_decl_id: fn_id,
+            });
         }
         None
     }
@@ -8181,6 +8224,36 @@ impl<'a> Lowering<'a> {
             return Some(arg.clone());
         }
         None
+    }
+
+    /// An Opaque TypeDecl with exactly one type argument (std `Cell<T>`):
+    /// the payload is that argument. RPython has no Cell — the field *is*
+    /// the value. Used only when `is_identity_wrapper_target` already
+    /// selected the call, so a one-parameter Opaque such as `Box<T>` does
+    /// not grow a synthetic field.
+    pub(in crate::front::mir) fn opaque_one_type_param_payload_layout(&self, ty: &TyRef) -> Option<Vec<(String, ValueType)>> {
+        let peeled = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| ty.clone());
+        let id = self.tyref_adt_def_id(&peeled)?;
+        let td = self.llbc.type_by_id(id)?;
+        if !matches!(td.kind, TypeDeclKind::Opaque) {
+            return None;
+        }
+        let payload = self.tyref_adt_type_arg(&peeled, 0)?;
+        if self.tyref_adt_type_arg(&peeled, 1).is_some() {
+            return None;
+        }
+        Some(vec![(
+            "value".into(),
+            tyref_to_value_type_with(
+                &payload,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
+        )])
     }
 }
 

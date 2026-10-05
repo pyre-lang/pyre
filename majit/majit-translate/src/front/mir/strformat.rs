@@ -592,11 +592,7 @@ pub(in crate::front::mir) fn unichr_as_utf8_text(code: i64) -> Option<String> {
 /// constant lowering uses (see [`Lowering::emit_constant`]); the flowspace
 /// adapter pre-folds it to the upstream string `Constant` and types it as
 /// a String.
-pub(in crate::front::mir) fn emit_str_const(
-    graph: &mut FunctionGraph,
-    bb_id: BlockId,
-    text: &str,
-) -> Variable {
+pub(in crate::front::mir) fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Variable {
     use crate::model::{CallTarget, OpKind, ValueType};
     let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
     stamp_as_rstr_str(&var);
@@ -606,6 +602,7 @@ pub(in crate::front::mir) fn emit_str_const(
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), text.to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),
@@ -817,6 +814,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text.to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
@@ -954,6 +952,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "0123456789abcdef".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),
@@ -1049,6 +1048,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[0].clone()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
@@ -1068,6 +1068,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[1].clone()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
@@ -1857,12 +1858,7 @@ pub(in crate::front::mir) fn collapse_const_fmt(graph: &mut FunctionGraph) -> us
                 .map(|o| &o.kind)
             {
                 Some(OpKind::Call {
-                    target:
-                        CallTarget::FunctionPath {
-                            segments: pseg,
-                            fun_decl_id: None,
-                            specialization: crate::parse::GraphSpecialization::Regular,
-                        },
+                    target: CallTarget::FunctionPath { segments: pseg, .. },
                     args: pargs,
                     ..
                 }) if pargs.is_empty() && pseg.len() == 2 && pseg[0] == "__str_const" => {
@@ -1881,6 +1877,7 @@ pub(in crate::front::mir) fn collapse_const_fmt(graph: &mut FunctionGraph) -> us
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),

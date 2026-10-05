@@ -953,6 +953,45 @@ pub(in crate::front::mir) fn pointer_elem_pointee_is_gc(
     )
 }
 
+/// `history.py` `getkind`: a raw `Ptr` whose `TO` is itself a `Ptr` /
+/// `Ref` is the address of a slot (`rffi.CArray` of GCREF / Unsigned),
+/// hence `'int'`. A GC ADT pointer (`*mut PyObject`) and a byte pointer
+/// (`*mut u8`) stay off this arm so [`tyref_to_value_type_with`] keeps
+/// `Ref`.
+pub(in crate::front::mir) fn tyref_raw_ptr_points_at_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(mut pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
+        return false;
+    };
+    for _ in 0..24 {
+        let Some(obj) = pointee.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            let Some(next) = llbc.dedup_body(id) else {
+                return false;
+            };
+            pointee = next;
+            continue;
+        }
+        if let Some([_, body]) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+        {
+            pointee = body;
+            continue;
+        }
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            pointee = &arr[1];
+            continue;
+        }
+        return obj.contains_key("RawPtr") || obj.contains_key("Ref");
+    }
+    false
+}
+
 /// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
 ///
 /// References return `None`. Their flow value stays the address;
@@ -2170,6 +2209,14 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
     ) {
         return false;
     }
+    // Same predicate `tyref_is_raw_struct_value` uses: RootScope is a
+    // class instance, so a field of that type is not a raw word. A
+    // container (`RootedItems`) that stores the guard would otherwise
+    // inherit Int and stamp FUNC.RESULT `i` while its `new` CFG
+    // constructs the instance (`r`).
+    if gc_root_scope_type_path(&td.item_meta.name_path()) {
+        return false;
+    }
     let carrier = llbc.exception_carrier();
     if !carrier.is_empty() && td.item_meta.name_path() == carrier {
         return false;
@@ -2238,6 +2285,36 @@ pub(in crate::front::mir) fn tyref_is_raw_value(
         no_immutable_fields(),
         &mut Vec::new(),
     )
+}
+
+/// A by-value raw struct (`Fmt`, `Position`): the translator's value is
+/// that struct's address (`history.py` `getkind` of a raw `Ptr` is
+/// `'int'`). Enums stay out: a payload `Option` is still a tagged
+/// instance even when every payload word is raw.
+///
+/// The root-bracket guard is a class instance (`Ref`) even though its
+/// fields are raw words: dependents see it as `TypeDeclKind::Opaque`
+/// (`Ref`), and `pin_root` / `publish` dispatch on that instance. A
+/// defining-crate `Int` token against an opaque `Ref` dest is the
+/// `getcalldescr` `RESULT != FUNC.RESULT` wall on `push_roots`.
+pub(in crate::front::mir) fn tyref_is_raw_struct_value(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    if one_level_pointer_pointee(node, llbc).is_some() {
+        return false;
+    }
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    llbc.type_by_id(def_id).is_some_and(|td| {
+        matches!(td.kind, TypeDeclKind::Struct(_))
+            && !gc_root_scope_type_path(&td.item_meta.name_path())
+    }) && declared_raw_adt_node(node, llbc, gc_struct_ids, no_immutable_fields()).is_some()
 }
 
 pub(in crate::front::mir) fn field_ty_is_raw_word(
@@ -2624,9 +2701,17 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if type_node_is_fn_ptr(value, llbc) {
         return ValueType::Int;
     }
-    // A `Vec` of one-word items is the address of its raw `{ptr, len, cap}`
-    // header (`RustVecRepr`, kind `int`), not a GC reference.
-    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+    // A `Vec<T>` is the address of its raw `{ptr, len, cap}` header
+    // (`RustVecRepr`, kind `int`), for every item type T, not a GC
+    // reference. Item kind selects the `ll_vec_*` helper; the header
+    // word itself is always `int` (`history.py` `getkind`).
+    if tyref_is_rust_vec_header(ty, llbc) {
+        return ValueType::Int;
+    }
+    // A by-value raw struct is that struct's address (`history.py`
+    // `getkind` of a raw `Ptr` is `int`), not a GC instance. Item
+    // helpers stay one-word; this is the header word itself.
+    if tyref_is_raw_struct_value(ty, llbc, gc_struct_ids) {
         return ValueType::Int;
     }
     // A densely numbered fieldless enum gives `Option<E>` a scalar niche
@@ -3620,16 +3705,13 @@ pub(in crate::front::mir) struct FieldlessOptionNiche {
 /// Physical scalar representation of `Option<E>` when `E` is a densely
 /// numbered fieldless enum.
 ///
-/// rustc uses E's first invalid scalar as the `None` niche, while every valid
-/// E value is `Some(E)`.  Charon does not serialize a separate layout for a
-/// generic `core::option::Option<T>` declaration, but it does serialize E's
-/// exact tag width and discriminants.  Restricting this projection to the
-/// dense `0..N` shape makes the inferred niche unique and rejects enums with
-/// explicit gaps, negative tags, or a full scalar range.
-pub(in crate::front::mir) fn tyref_option_fieldless_niche(
-    ty: &TyRef,
-    llbc: &Llbc,
-) -> Option<FieldlessOptionNiche> {
+/// rustc stores `Some(e)` as `e` and reserves one invalid scalar for `None`
+/// ([`fieldless_option_none_tag`]).  Charon does not serialize a separate
+/// layout for a generic `core::option::Option<T>` declaration, but it does
+/// serialize E's exact tag width and discriminants.  Restricting this
+/// projection to the dense `0..N` shape makes the inferred niche unique and
+/// rejects enums with explicit gaps, negative tags, or a full scalar range.
+pub(in crate::front::mir) fn tyref_option_fieldless_niche(ty: &TyRef, llbc: &Llbc) -> Option<FieldlessOptionNiche> {
     if !crate::front::result_exc::tyref_is_option(ty, llbc) {
         return None;
     }
@@ -3664,8 +3746,7 @@ pub(in crate::front::mir) fn tyref_option_fieldless_niche(
 
 /// The value the compiler reserved for `None` in an `Option<E>` over a
 /// fieldless enum with `variants` densely numbered variants stored in
-/// `storage_ty` — `None` when this layer cannot know it, which is every
-/// case today.
+/// `storage_ty`.
 ///
 /// MEASURED, and the measurement refutes `variants` itself as the tag. On
 /// this toolchain a dense fieldless enum in a `u8` puts `None` at `2` with
@@ -3683,10 +3764,7 @@ pub(in crate::front::mir) fn tyref_option_fieldless_niche(
 /// off either. Rust does not specify the placement, so it is not derivable
 /// by rule. Declining here leaves every `Option<fieldless enum>` on the
 /// ordinary aggregate lowering.
-pub(in crate::front::mir) fn fieldless_option_none_tag(
-    _variants: usize,
-    _storage_ty: &str,
-) -> Option<i64> {
+pub(in crate::front::mir) fn fieldless_option_none_tag(_variants: usize, _storage_ty: &str) -> Option<i64> {
     None
 }
 
@@ -3861,6 +3939,7 @@ pub(crate) fn unichr_call(arg: Variable) -> OpKind {
         target: CallTarget::FunctionPath {
             segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![arg]),
@@ -4592,15 +4671,25 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     {
         return inner;
     }
-    // Matching [`tyref_to_value_type`]: a `Vec` of one-word items is the
-    // address of its raw `{ptr, len, cap}` header (`RustVecRepr`, kind
-    // `int`). Layout and the register bank keep that Int. FORCE does not
+    // Matching [`tyref_to_value_type`]: a `Vec<T>` is the address of its
+    // raw `{ptr, len, cap}` header (`RustVecRepr`, kind `int`) for every
+    // item type. Layout and the register bank keep that Int. FORCE does not
     // seed the field (`register_struct_fields` skips a Vec layout row) so
     // `project_struct_rows` installs `SomeRustVec` from the `*mut Vec<…>`
     // annotation spelling. An Integer FORCE made `len` of the field
     // `'int' has no length`.
-    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+    if tyref_is_rust_vec_header(ty, llbc) {
         return ValueType::Int;
+    }
+    // Matching [`tyref_to_value_type`]: a by-value raw struct is the
+    // address of that struct (`history.py` `getkind` `'int'`).
+    if tyref_is_raw_struct_value(ty, llbc, gc_struct_ids) {
+        return ValueType::Int;
+    }
+    // Inlined `[T; N]` of a scalar: Repeat's fill is that item
+    // (`lltype.FixedSizeArray` has no `getkind` as a value).
+    if let Some(item_ty) = scalar_fixed_array_item(ty, llbc) {
+        return item_ty;
     }
     // `rutf8.py` `Utf8StringBuilder._s` is a `StringBuilder` instance
     // attribute: seed it `SomeStringBuilder`, matching the value site.
@@ -6428,6 +6517,14 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(id)?;
+    // Same predicate `tyref_is_raw_struct_value` uses: RootScope is a
+    // class instance (`Ref`), not the word its one non-ZST field stores.
+    // Peeling it to `usize` stamps FUNC.RESULT `i` while the CFG
+    // constructs the instance (`r`). One lowleveltype per type
+    // (`rtyper` `getrepr` → `lowleveltype`; `getkind`).
+    if gc_root_scope_type_path(&decl.item_meta.name_path()) {
+        return None;
+    }
     // A foreign `Opaque` decl keeps `repr.transparent: false`: the defining
     // crate is outside the extraction set, so the layout does not record the
     // wrapper. The linked kind is that missing field.
@@ -10333,11 +10430,16 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
             .map(|arg| tyref_to_ast_string(&arg, llbc))
             .unwrap_or_else(|| "*mut PyObject".to_string());
     }
-    // A `Vec` of one-word items is the header address (`RustVecRepr`,
-    // kind `int`): one pointer-sized word, not the 24-byte inline Vec.
-    // Spelling the Vec ADT here registers a `FLAG_STRUCT` row whose
+    // A `Vec<T>` is the header address (`RustVecRepr`, kind `int`): one
+    // pointer-sized word, not the 24-byte inline Vec, for every item
+    // type. Spelling the Vec ADT here registers a `FLAG_STRUCT` row whose
     // size disagrees with the Int publish.
-    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+    if tyref_is_rust_vec_header(ty, llbc) {
+        return "isize".to_string();
+    }
+    // A by-value raw struct is one pointer-sized word, not an inline
+    // FLAG_STRUCT row whose size disagrees with the Int publish.
+    if tyref_is_raw_struct_value(ty, llbc, gc_struct_ids) {
         return "isize".to_string();
     }
     // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
@@ -10355,6 +10457,11 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     let Some(decl) = llbc.type_by_id(id) else {
         return tyref_to_ast_string(ty, llbc);
     };
+    // Same predicate as `tyref_is_raw_struct_value` / the value-type
+    // peel: RootScope is the instance, not its `usize` save_point.
+    if gc_root_scope_type_path(&decl.item_meta.name_path()) {
+        return tyref_to_ast_string(ty, llbc);
+    }
     if !decl.is_repr_transparent() {
         return tyref_to_ast_string(ty, llbc);
     }
@@ -10363,7 +10470,13 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
         && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
         && let Some(field) = fields.get(index)
         && !matches!(
-            tyref_to_value_type(&field.ty, llbc),
+            tyref_to_value_type_with(
+                &field.ty,
+                llbc,
+                no_tombstoned_leaves(),
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ),
             ValueType::Ref(_)
                 | ValueType::Str
                 | ValueType::StringBuilder
@@ -10549,6 +10662,27 @@ pub fn slice_array_type_id(spelling: &str) -> Option<String> {
         return Some(format!("[{element}]"));
     }
     slice_element_spelling(normalized).map(|_| normalized.to_string())
+}
+
+/// Identity and `nolength` of a fixed `Array<ITEM;N>`
+/// (`slice_array_type_id`'s fixed-array path).
+///
+/// `rewrite_op_direct_call` lowers the ctor to `do_fixed_newlist` /
+/// `do_fixed_newlist_clear` when `nolength` is false. `fold_unit_variant_ctors`
+/// uses the same answer so a length-prefixed `Array<ITEM;0>` stays a ctor
+/// and a headerless one keeps the interned singleton.
+pub(crate) fn fixed_list_reader(item: &str) -> Option<(String, bool)> {
+    let id = slice_array_type_id(&format!("[{item};0]"))?;
+    let nolength = crate::front::typestr::nolength_from_array_type_id(Some(id.as_str()));
+    Some((id, nolength))
+}
+
+/// An `Array<ITEM;N>` whose `&[ITEM]` reader is a length-prefixed GcArray.
+pub(crate) fn fixed_array_lowers_to_gcarray(name: &str) -> bool {
+    let Some((item, _)) = shaped_array_parts(name) else {
+        return false;
+    };
+    matches!(fixed_list_reader(item), Some((_, false)))
 }
 
 /// `local[i]` versus `(*p)[i]`. A deref's type is the pointee, so the
@@ -11150,8 +11284,11 @@ pub(in crate::front::mir) enum IntoDevirt {
     /// is a `T -> T` identity conversion.
     Identity,
     /// A concrete `impl From<T> for U` was selected; the segments are
-    /// its `from` function's path.
-    Target(Vec<String>),
+    /// its `from` function's path and `fun_decl_id` is that FunDecl.
+    Target {
+        segments: Vec<String>,
+        fun_decl_id: u64,
+    },
 }
 
 /// Render a Charon `DynTrait` body to `dyn <trait-leaf>`.  Falls back to
@@ -11659,6 +11796,71 @@ pub(in crate::front::mir) fn tyref_tuple_arity(ty: &TyRef, llbc: &Llbc) -> usize
         n += 1;
     }
     n
+}
+
+/// Register kind of one aggregate field (`history.py` `getkind` of the
+/// field lltype). A raw `Ptr` whose `TO._gckind` is `raw` is `'int'`:
+/// `*mut usize` is the address word, `*mut *mut T` is a slot address.
+/// A byte pointer and a GC ADT pointer stay `Ref`.
+pub(in crate::front::mir) fn tyref_aggregate_field_value_type(ty: &TyRef, llbc: &Llbc, spelling: &str) -> ValueType {
+    if let Some(raw) = raw_scalar_address_value_type(ty, llbc) {
+        return raw;
+    }
+    if tyref_raw_ptr_points_at_pointer(ty, llbc) {
+        return ValueType::Int;
+    }
+    match tyref_to_value_type(ty, llbc) {
+        ValueType::Ref(None) => tuple_field_value_type(spelling),
+        kind => kind,
+    }
+}
+
+/// Positional `__pos_N` rows of a non-Adt aggregate, typed from `dest_ty`.
+///
+/// `resolve_aggregate_adt` returns `None` for `Tuple` / `Array` / `Closure`
+/// (no user `TypeDecl`). The constructor suffix already comes from
+/// `dest_ty`; the field kinds must too, or `tuple_field_value_type` of an
+/// empty spelling answers `Ref` and a host integer is rewritten to
+/// `CONST_NULL` (`history.py`).
+pub(in crate::front::mir) fn positional_aggregate_field_rows(
+    dest_ty: &TyRef,
+    n_operands: usize,
+    llbc: &Llbc,
+) -> Vec<(String, String, Option<TyRef>)> {
+    (0..n_operands)
+        .map(|i| {
+            let ty =
+                tyref_tuple_element(dest_ty, i, llbc).or_else(|| tyref_array_item(dest_ty, llbc));
+            let spelling = ty
+                .as_ref()
+                .map(|t| tyref_to_ast_string(t, llbc))
+                .unwrap_or_default();
+            (format!("__pos_{i}"), spelling, ty)
+        })
+        .collect()
+}
+
+/// Item type of a fixed-size array `ty` (`{"Array":[item,len,…]}`).
+pub(in crate::front::mir) fn tyref_array_item(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    // Charon wraps the array (and interned items) in `Value` / `Deduplicated`.
+    // `strip_ty_indirections` peels those so a field spelled
+    // `{"Value":[id, {"Array":[{"Deduplicated": item}, len, null]}]}`
+    // is the same `[T; N]` as an inline `Array` node.
+    let value = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let mut element = value.get("Array")?.as_array()?.first()?;
+    loop {
+        let stripped = strip_ty_indirections(element, llbc)?;
+        if let Some([_, body]) = stripped
+            .as_object()
+            .and_then(|obj| obj.get("HashConsedValue"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+        {
+            element = body;
+            continue;
+        }
+        return Some(TyRef::Other(stripped.clone()));
+    }
 }
 
 /// Element `idx` of a tuple type `ty`, read off its `generics.types`.

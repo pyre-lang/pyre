@@ -135,37 +135,76 @@ fn w_bytes_data_local_stays_str_view_for_rdict_get() {
     );
 }
 
-#[test]
-fn rust_vec_std_leaf_accepts_both_callee_spellings() {
-    let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    for p in [
-        path(&["alloc", "vec", "<Impl>", "new"]),
-        path(&["alloc", "vec", "Vec", "new"]),
-        path(&["vec", "Vec", "new"]),
-    ] {
-        assert_eq!(super::rust_vec_std_leaf(&p), Some("new"), "{p:?}");
+    #[test]
+    fn rust_vec_std_leaf_accepts_both_callee_spellings() {
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for p in [
+            path(&["alloc", "vec", "<Impl>", "new"]),
+            path(&["alloc", "vec", "Vec", "new"]),
+            path(&["vec", "Vec", "new"]),
+        ] {
+            assert_eq!(super::rust_vec_std_leaf(&p), Some("new"), "{p:?}");
+        }
+        assert_eq!(
+            super::rust_vec_std_leaf(&path(&["vec", "Vec", "try_reserve_exact"])),
+            Some("try_reserve_exact")
+        );
+        for p in [
+            path(&["alloc", "boxed", "<Impl>", "new"]),
+            path(&["vec", "VecDeque", "new"]),
+            path(&["new"]),
+        ] {
+            assert_eq!(super::rust_vec_std_leaf(&p), None, "{p:?}");
+        }
+        for (p, leaf) in [
+            (path(&["alloc", "vec", "<Impl>", "deref_mut"]), "deref_mut"),
+            (path(&["alloc", "vec", "Vec", "deref_mut"]), "deref_mut"),
+            (path(&["vec", "Vec", "deref_mut"]), "deref_mut"),
+            (
+                path(&["alloc", "vec", "<Impl>", "as_mut_slice"]),
+                "as_mut_slice",
+            ),
+            (path(&["vec", "Vec", "as_slice"]), "as_slice"),
+        ] {
+            assert_eq!(super::rust_vec_slice_view_leaf(&p), Some(leaf), "{p:?}");
+        }
+        for p in [
+            path(&["alloc", "vec", "<Impl>", "extend_from_slice"]),
+            path(&["alloc", "vec", "Vec", "extend_from_slice"]),
+            path(&["vec", "Vec", "extend_from_slice"]),
+        ] {
+            assert_eq!(
+                super::rust_vec_std_leaf(&p),
+                Some("extend_from_slice"),
+                "{p:?}"
+            );
+            assert!(super::path_is_vec_extend_from_slice(&p.join("::")), "{p:?}");
+        }
+        assert!(super::path_is_vec_slice_view("vec::Vec::deref_mut"));
+        assert!(!super::path_is_vec_slice_view("vec::Vec::push"));
+        assert!(super::path_is_vec_extend_from_slice(
+            "alloc::vec::<Impl>::extend_from_slice"
+        ));
+        assert!(!super::path_is_vec_extend_from_slice("vec::Vec::extend"));
+        assert!(super::path_is_build_refs_pair_abi(
+            "pyre_interpreter::runtime_ops::build_list_from_refs"
+        ));
+        assert!(super::path_is_build_refs_pair_abi(
+            "pyre_interpreter::build_tuple_from_refs"
+        ));
+        assert!(!super::path_is_build_refs_pair_abi(
+            "pyre_interpreter::runtime_ops::build_map_from_refs"
+        ));
+        assert_eq!(
+            super::rust_vec_std_leaf(&path(&[
+                "vec",
+                "Vec",
+                "<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>",
+                "deref",
+            ])),
+            Some("deref")
+        );
     }
-    assert_eq!(
-        super::rust_vec_std_leaf(&path(&["vec", "Vec", "try_reserve_exact"])),
-        Some("try_reserve_exact")
-    );
-    for p in [
-        path(&["alloc", "boxed", "<Impl>", "new"]),
-        path(&["vec", "VecDeque", "new"]),
-        path(&["new"]),
-    ] {
-        assert_eq!(super::rust_vec_std_leaf(&p), None, "{p:?}");
-    }
-    assert_eq!(
-        super::rust_vec_std_leaf(&path(&[
-            "vec",
-            "Vec",
-            "<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>",
-            "deref",
-        ])),
-        Some("deref")
-    );
-}
 
 #[test]
 fn rust_vec_slice_view_accepts_inherent_and_trait_impl_spellings() {

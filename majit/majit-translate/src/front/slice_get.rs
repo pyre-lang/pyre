@@ -555,6 +555,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "slice".into(), "<Impl>".into(), leaf.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args),
@@ -1013,11 +1014,13 @@ mod tests {
         let impl_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "<Impl>", "ok"]),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         let owner_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "Result", "ok"]),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         let option_ok = CallTarget::Method {
@@ -1030,6 +1033,7 @@ mod tests {
         let unrelated = CallTarget::FunctionPath {
             segments: segs(&["core", "option", "<Impl>", "ok"]),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         assert!(is_result_ok_call_target(&method));

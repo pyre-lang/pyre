@@ -332,7 +332,7 @@ impl<'a> Lowering<'a> {
         // alongside the resolved Variables so call intercepts can
         // consult per-local lowering state
         // (`const_discriminant_locals`).
-        let arg_locals: Vec<Option<usize>> = call
+        let mut arg_locals: Vec<Option<usize>> = call
             .args
             .iter()
             .map(|op| match op {
@@ -595,6 +595,7 @@ impl<'a> Lowering<'a> {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
         let resolved_call_args = args.clone();
+        self.pass_by_value_multiword_as_addr(mir_bb, &call.func, &mut args);
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
         let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
@@ -633,13 +634,42 @@ impl<'a> Lowering<'a> {
         // `lower_fun_decl_with_static_addrs`), so caller and callee agree on
         // whether a given callee is scoped.
         let mut callee_name_path: Option<String> = None;
+        // `build_list_from_refs` / `build_tuple_from_refs` residual ABI is
+        // the `(ptr, len)` pair (`build_list_from_refs_jit_abi`). The
+        // graph's `&[PyObjectRef]` is the length-prefixed GcArray; expand
+        // it the same way `Vec::extend_from_slice` splices `ll_extend`.
+        if let CallFunc::Regular(reg) = &call.func
+            && regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(path_is_build_refs_pair_abi)
+            && pair_lens.is_empty()
+            && args.len() == 1
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_object_pointer_slice(ty, self.llbc))
+        {
+            let (items, length) =
+                self.expand_object_gcarray_header_to_items_len(mir_bb, args[0].clone());
+            args = vec![items, length];
+        }
         // `v.extend_from_slice(s)` on a `Vec` of one-word items is
-        // `ll_extend` from the pair.
+        // `ll_extend` from the pair (`rlist.py ll_extend` /
+        // `rrustvec.rs` `VecOp::ExtendFromSlice`). An object-pointer
+        // `&[PyObjectRef]` is the length-prefixed GcArray, not a pair:
+        // expand to `(items = header + ITEMS_BLOCK_ITEMS_OFFSET,
+        // length = arraylen_gc)` so the helper sees the same three
+        // words a pair splice would.
         let vec_extend_kind = match &call.func {
             CallFunc::Regular(reg)
-                if matches!(pair_lens.as_slice(), [(1, _)])
-                    && regular_call_name_path(reg, self.llbc).as_deref()
-                        == Some("alloc::vec::<Impl>::extend_from_slice") =>
+                if regular_call_name_path(reg, self.llbc)
+                    .as_deref()
+                    .is_some_and(path_is_vec_extend_from_slice)
+                    && (matches!(pair_lens.as_slice(), [(1, _)])
+                        || (pair_lens.is_empty()
+                            && args.len() == 2
+                            && second_arg_ty.as_ref().is_some_and(|ty| {
+                                tyref_is_object_pointer_slice(ty, self.llbc)
+                            }))) =>
             {
                 first_arg_ty
                     .as_ref()
@@ -737,7 +767,11 @@ impl<'a> Lowering<'a> {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
                 if let Some(kind) = vec_extend_kind =>
             {
-                let args = splice_pair_lens(args, pair_lens);
+                let args = if matches!(pair_lens.as_slice(), [(1, _)]) {
+                    splice_pair_lens(args, pair_lens)
+                } else {
+                    self.expand_object_gcarray_to_items_len(mir_bb, args)
+                };
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: majit_ir::rvec::vec_helper_path(
@@ -748,6 +782,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args),
@@ -767,6 +802,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args),
@@ -1360,11 +1396,12 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+
                 // `<String>::deref` / `<Vec<T>>::deref` (+ `deref_mut`) —
-                // identity in the lifted value model (String/&str and
-                // Vec/&[T] share one repr), so alias the destination to
-                // the receiver instead of emitting a `deref` method call
-                // the rtyper cannot route on the classdef-less receiver.
+                // identity in the lifted value model (String/&str share one
+                // repr), so alias the destination to the receiver instead of
+                // emitting a `deref` method call the rtyper cannot route on
+                // the classdef-less receiver.
                 //
                 // A `Vec` of one-word items is the address of its raw
                 // `{ptr, len, cap}` header, not a list. Aliasing that header
@@ -1996,6 +2033,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
@@ -2438,6 +2476,7 @@ impl<'a> Lowering<'a> {
                                         kind,
                                     ),
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![
@@ -2576,6 +2615,7 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::LL_ARRAYMOVE.to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![
@@ -2840,6 +2880,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
@@ -3160,6 +3201,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec![marker.to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(args.clone()),
@@ -3209,6 +3251,7 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: if builder_ctor_leaf == Some("with_capacity") {
@@ -3245,6 +3288,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__majit_stringbuilder_append".to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![res.clone(), args[0].clone()]),
@@ -3334,6 +3378,7 @@ impl<'a> Lowering<'a> {
                                             .to_string(),
                                     ],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![acc_val, piece_val]),
@@ -3694,7 +3739,28 @@ impl<'a> Lowering<'a> {
                         // `from_ptr` identity of a non-borrow leaves the
                         // field *address*; loading that word is `raw_load`.
                         if let Some((item_ty, itemsize, is_item_signed)) =
-                            self.raw_word_descr(&call.dest.ty)
+                            self.raw_word_descr(&call.dest.ty).or_else(|| {
+                                first_arg_ty.as_ref().and_then(|ty| {
+                                    let peeled = self
+                                        .tyref_peel_ref_to_pointee(ty)
+                                        .unwrap_or_else(|| ty.clone());
+                                    let item_ty = tyref_atomic_inner_value_type(
+                                        &peeled,
+                                        self.llbc,
+                                        self.gc_struct_ids,
+                                        &self.raw_alloc_flavor_structs,
+                                    )?;
+                                    let is_item_signed = matches!(item_ty, ValueType::Int);
+                                    let itemsize = match &item_ty {
+                                        ValueType::Bool => 1,
+                                        ValueType::Int
+                                        | ValueType::Unsigned
+                                        | ValueType::Ref(_) => crate::layout::target_word_size(),
+                                        _ => return None,
+                                    };
+                                    Some((item_ty, itemsize, is_item_signed))
+                                })
+                            })
                         {
                             let offset = self
                                 .graph
@@ -4020,6 +4086,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["ll_math".to_string(), leaf.to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(args.iter().cloned()),
@@ -4338,6 +4405,7 @@ impl<'a> Lowering<'a> {
                                     "float2longlong".to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -4386,6 +4454,7 @@ impl<'a> Lowering<'a> {
                                     "float2longlong".to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -4467,6 +4536,7 @@ impl<'a> Lowering<'a> {
                                     "iter".to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![recv]),
@@ -4494,6 +4564,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -4528,6 +4599,7 @@ impl<'a> Lowering<'a> {
                                         .to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -4557,6 +4629,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -4670,6 +4743,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
@@ -4680,6 +4754,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__len".to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
@@ -4757,6 +4832,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
@@ -4767,6 +4843,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__len".to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
@@ -4995,6 +5072,7 @@ impl<'a> Lowering<'a> {
                                     kind,
                                 ),
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5047,6 +5125,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -5166,12 +5245,22 @@ impl<'a> Lowering<'a> {
                 // below.
                 //
                 // `Vec<PyObjectRef>::as_slice` is [`Self::try_lower_object_vec_whole_list_view`].
+                // Any other `Vec<T>` is the raw header address; its slice is
+                // not that word (`history.py` `getkind` of the header is
+                // `int`, of `&[u8]` is `ref`).
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
-                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    let rust_vec_header = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_rust_vec_header(ty, self.llbc));
+                    if !rust_vec_header
+                        || rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local)
+                    {
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `<[T]>::as_ptr` — the slice's data pointer is the receiver
                 // value in the erased array-pointer model.  Alias the result to
@@ -5268,6 +5357,49 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // `Cell<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`.
+                // `set` is a store of that inner word (`setfield` on the
+                // owning struct). Scalar `get` is the field-place rewrite
+                // above.
+                if args.len() == 2 && self.is_cell_word_set(&reg) {
+                    let payload_ty = first_arg_ty.as_ref().and_then(|ty| {
+                        let peeled = self
+                            .tyref_peel_ref_to_pointee(ty)
+                            .unwrap_or_else(|| ty.clone());
+                        self.tyref_adt_type_arg(&peeled, 0)
+                    });
+                    if let Some(value_ty) = second_arg_ty
+                        .as_ref()
+                        .or(second_const_arg_ty.as_ref())
+                        .or(payload_ty.as_ref())
+                    {
+                        let ty = tyref_to_value_type_with(
+                            value_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        );
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: None,
+                            kind: OpKind::FieldWrite {
+                                base: args[0].clone(),
+                                field: FieldDescriptor::new(
+                                    "value",
+                                    Some("core::cell::Cell".into()),
+                                ),
+                                value: args[1].clone().into(),
+                                ty,
+                            },
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
+
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -5563,39 +5695,148 @@ impl<'a> Lowering<'a> {
                     None => (segments, method_hint),
                 };
                 // `v.reverse()` reaches `<[T]>::reverse` through
-                // `Vec::deref_mut`, which aliases the slice to the `Vec`
-                // header; that is `ll_reverse` on the list.
-                let (segments, method_hint) = match arg_locals
-                    .first()
-                    .copied()
-                    .flatten()
-                    .filter(|_| args.len() == 1 && is_core_slice_reverse(&original_segments))
-                    .and_then(|local| local_is_rust_vec_deref(self.body, self.llbc, local))
-                {
-                    Some(kind) => (
-                        rust_vec_helper_segments(majit_ir::rvec::VecOp::Reverse, kind),
-                        None,
-                    ),
-                    None => (segments, method_hint),
-                };
+                // `Vec::deref_mut` / `as_mut_slice`. A one-word-item Vec
+                // aliases the slice to the header (`ll_vec_reverse`). An
+                // object-pointer slice is the length-prefixed array, and
+                // `rtype_method_reverse` (`rlist.py`) wants the FunctionPath
+                // `flowspace_adapter` rewrites to `getattr(recv, "reverse")`.
+                // Leaving Charon's impl `Method` on `[T]` residualizes
+                // `core::slice::<Impl>::reverse` — `[T]` has no classdef.
+                let (segments, method_hint) =
+                    if args.len() == 1 && is_core_slice_reverse(&original_segments) {
+                        match arg_locals
+                            .first()
+                            .copied()
+                            .flatten()
+                            .and_then(|local| local_is_rust_vec_deref(self.body, self.llbc, local))
+                        {
+                            Some(kind) => (
+                                rust_vec_helper_segments(majit_ir::rvec::VecOp::Reverse, kind),
+                                None,
+                            ),
+                            None => (original_segments.clone(), None),
+                        }
+                    } else {
+                        (segments, method_hint)
+                    };
                 // `&mut vec[..]` of `Vec<PyObjectRef>` is the header address.
                 // Write the shadow-stack range into that vec. The codewriter
                 // sends the call back when that argument is not a signed word.
+                // Method `RootScope::pin_roots(&self, slice)` is two Ref
+                // words (scope, GcArray). The bound helper is the 3-word
+                // pair ABI `root_scope_pin_roots_jit_abi`. Free `pin_roots`
+                // takes the same length-prefixed GcArray (`pin_roots_jit_abi`,
+                // `rlist.py` `GcArray(OBJECTPTR)`).
                 let (segments, method_hint) = if args.len() == 2
-                    && fmt_path_ends_with(
-                        &original_segments,
-                        &["gc_roots", "shadow_stack_copy_range"],
-                    )
-                    && self.var_is_object_vec_header(&args[1])
+                    && original_segments.last().map(String::as_str) == Some("pin_roots")
+                    && original_segments.iter().any(|s| s == "gc_roots")
                 {
+                    args.remove(0);
+                    arg_locals.remove(0);
                     (
                         vec![
                             "pyre_object".to_string(),
                             "gc_roots".to_string(),
-                            "shadow_stack_copy_range_into_vec".to_string(),
+                            "pin_roots".to_string(),
                         ],
                         None,
                     )
+                } else {
+                    (segments, method_hint)
+                };
+                // Method `RootScope::publish(&self, slice)` is the same
+                // two-Ref graph / 3-word pair split (`root_scope_publish_jit_abi`).
+                // `get_and_call_function` publishes then normalizes; a pair
+                // helper with the GcArray in rdi and leftover `len` in rdx
+                // copies the length word as slot 0 (`pair_items`). Free
+                // `publish_roots` takes the length-prefixed GcArray
+                // (`publish_roots_jit_abi`).
+                let (segments, method_hint) = if original_segments.last().map(String::as_str)
+                    == Some("publish")
+                    && original_segments.iter().any(|s| s == "gc_roots")
+                {
+                    if args.len() == 2 {
+                        args.remove(0);
+                        arg_locals.remove(0);
+                    }
+                    if args.len() == 1 {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "publish_roots".to_string(),
+                            ],
+                            None,
+                        )
+                    } else {
+                        (segments, method_hint)
+                    }
+                } else {
+                    (segments, method_hint)
+                };
+                let (segments, method_hint) = if args.len() == 2
+                    && fmt_path_ends_with(
+                        &original_segments,
+                        &["gc_roots", "shadow_stack_copy_range"],
+                    ) {
+                    let into_vec = || {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "shadow_stack_copy_range_into_vec".to_string(),
+                            ],
+                            None,
+                        )
+                    };
+                    let dest_local = arg_locals.get(1).copied().flatten().or_else(|| {
+                        match arg_operands.get(1)? {
+                            Operand::Copy(place) | Operand::Move(place) => place_base_local(place),
+                            Operand::Const(_) => None,
+                        }
+                    });
+                    let dest_is_object_pair = pair_lens.iter().any(|(at, _)| *at == 1)
+                        || dest_local.is_some_and(|local| {
+                            matches!(
+                                self.local_var.get(local).and_then(|slot| slot.as_ref()),
+                                Some(LocalValue::Pair(_, _, _))
+                            ) && self.body.locals.locals.get(local).is_some_and(|loc| {
+                                slice_ty_item_is_object_pointer(&loc.ty, self.llbc)
+                            })
+                        });
+                    if self.var_is_object_vec_header(&args[1]) {
+                        into_vec()
+                    } else if let Some(local) = dest_local {
+                        let vec_var = self.vec_header_var_of_slice_local(local).or_else(|| {
+                            let loc = self.body.locals.locals.get(local)?;
+                            if !tyref_is_object_pointer_rust_vec(&loc.ty, self.llbc) {
+                                return None;
+                            }
+                            self.local_var
+                                .get(local)?
+                                .as_ref()
+                                .map(LocalValue::link_word)
+                        });
+                        if let Some(vec_var) = vec_var {
+                            args[1] = vec_var;
+                            pair_lens.retain(|(at, _)| *at != 1);
+                            into_vec()
+                        } else if dest_is_object_pair {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: shadow_stack_copy_range dest is an object-pointer \
+                                 pair slice with no Vec header"
+                            )));
+                        } else {
+                            (segments, method_hint)
+                        }
+                    } else if dest_is_object_pair {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: shadow_stack_copy_range dest is an object-pointer \
+                             pair slice with no Vec header"
+                        )));
+                    } else {
+                        (segments, method_hint)
+                    }
                 } else {
                     (segments, method_hint)
                 };
@@ -5840,6 +6081,7 @@ impl<'a> Lowering<'a> {
                                     "jit_bigint_from_i64".to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![cst]),
@@ -5947,6 +6189,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -6196,6 +6439,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                                 specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -6384,6 +6628,7 @@ impl<'a> Lowering<'a> {
                         CallTarget::FunctionPath {
                             segments: path,
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         }
                     } else if args.len() == 1
@@ -6392,6 +6637,7 @@ impl<'a> Lowering<'a> {
                         CallTarget::FunctionPath {
                             segments: vec![marker.to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         }
                     } else {
@@ -6426,6 +6672,22 @@ impl<'a> Lowering<'a> {
                         }
                         let same_callee =
                             segments == original_segments && method_hint == original_method_hint;
+                        // The FunctionPath names a FunDecl when it still
+                        // carries that decl's id. A later rewrite
+                        // (`ll_vec_*`, pin_roots, …) drops it. Blanket
+                        // `Into` already resolved a different `from` id
+                        // inside `call_target_segments`.
+                        let path_fun_decl_id = if !same_callee {
+                            None
+                        } else if let Some(IntoDevirt::Target {
+                            fun_decl_id: from_id,
+                            ..
+                        }) = self.blanket_into_devirt(&reg)
+                        {
+                            Some(from_id)
+                        } else {
+                            fun_decl_id
+                        };
                         match method_hint {
                             Some((owner_root, leaf, _)) if !args.is_empty() => {
                                 // Method is this FunDecl: stamp its registered
@@ -6484,13 +6746,35 @@ impl<'a> Lowering<'a> {
                                     });
                                     args[0] = narrowed;
                                 }
+                                let names_fun_decl = fun_decl_id.is_some_and(|id| {
+                                    function_path_names_fun_decl(path_fun_decl_id, id)
+                                });
                                 let mut target = CallTarget::FunctionPath {
                                     segments,
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 };
-                                if same_callee && let Some(id) = fun_decl_id {
+                                if let Some(id) = path_fun_decl_id {
                                     target = target.with_fun_decl_id(id);
+                                }
+                                // A rewritten std `Vec` helper (`ll_vec_*`) is
+                                // monomorphic; the original FunDecl's type
+                                // arguments must not ride along as turbofish
+                                // (`ll_vec_newlist_hint_r::<PyObject>`), or
+                                // the oopspec / fnaddr lookup misses. Stamp
+                                // generics only when the path still names
+                                // that FunDecl.
+                                if names_fun_decl
+                                    && let Some(id) = fun_decl_id
+                                    && let Some(fd) = self.llbc.fn_by_id(id)
+                                {
+                                    target = self.attach_call_generics(
+                                        target,
+                                        fd,
+                                        &reg.generics,
+                                        first_arg_ty.as_ref(),
+                                    );
                                 }
                                 target
                             }
@@ -6571,6 +6855,9 @@ impl<'a> Lowering<'a> {
                 let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
+                let const_fn_id = operand_fundef(self.llbc, &dyn_operand);
+                let closed_fnptr_graphs =
+                    closed_fnptr_graphs_for(self.llbc, self.body, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
                 // `*const ()`: the call casts the slot to the method's fn-ptr
                 // type into a temporary and calls the temporary.  The slot
@@ -6629,6 +6916,21 @@ impl<'a> Lowering<'a> {
                             result_ty,
                         }
                     }
+                } else if let Some(fun_id) = const_fn_id.or_else(|| {
+                    folded_fun_id_from_immutable_static(self.llbc, self.body, &dyn_operand)
+                }) && let Some(fd) = self.llbc.fn_by_id(fun_id)
+                {
+                    // A Const `FnDef` (or a field of an immutable static
+                    // that folded to one) is `direct_call`.
+                    // `jtransform.py handle_regular_indirect_call` inlines
+                    // the same target when the funcbox is Const; naming
+                    // the FunDecl here lets `find_all_graphs` enter it.
+                    let path = registered_path_for_fun_decl(self.llbc, fd);
+                    OpKind::Call {
+                        target: CallTarget::function_path(path.segments).with_fun_decl_id(fun_id),
+                        args: crate::model::call_args(args),
+                        result_ty,
+                    }
                 } else if let Some(graphs) = eval_hook_graphs {
                     // `register_eval_override`'s function and the `FnDef`
                     // cast to that parameter's type are one prebuilt
@@ -6639,6 +6941,23 @@ impl<'a> Lowering<'a> {
                     // funcptr is `portal_runner_ptr`; this pointer is not,
                     // so `rewrite_op_indirect_call` takes
                     // `handle_regular_indirect_call` or `handle_residual_call`.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        graphs: Some(graphs),
+                        family_key: None,
+                        result_ty,
+                    }
+                } else if let Some(graphs) = closed_fnptr_graphs {
+                    // `FunctionsPBCRepr` / `SmallFunctionSetPBCRepr`:
+                    // the funcptr was loaded from a field of a type that
+                    // only exists as immutable statics, so the family is
+                    // the FnDefs those initializers stored.
+                    // `handle_regular_indirect_call` records them as
+                    // `indirectcalltargets`; `pyjitpl.py
+                    // do_residual_or_indirect_call` inlines a Const
+                    // funcbox via `bytecode_for_address`.
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
                     OpKind::IndirectCall {
                         funcptr,
@@ -6673,6 +6992,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__dyn_call".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(full_args),
@@ -6747,6 +7067,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -6807,6 +7128,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -6847,6 +7169,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -6891,6 +7214,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7041,6 +7365,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7084,6 +7409,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7130,6 +7456,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7162,6 +7489,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7194,6 +7522,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7309,6 +7638,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7386,6 +7716,7 @@ impl<'a> Lowering<'a> {
                     target: CallTarget::FunctionPath {
                         segments: residual,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: args.clone(),
@@ -7421,6 +7752,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7447,6 +7779,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7482,6 +7815,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -7552,6 +7886,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: args.clone(),
@@ -8011,19 +8346,33 @@ impl<'a> Lowering<'a> {
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
         });
-        let identity_layout = if matches!(
+        let identity_layout_ty = if matches!(
             &op_kind,
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
             } if segments.last().is_some_and(|leaf| leaf == "new")
         ) {
-            self.adt_struct_fields(&call.dest.ty)
+            Some(&call.dest.ty)
         } else {
-            first_arg_ty
-                .as_ref()
-                .and_then(|ty| self.adt_struct_fields(ty))
+            first_arg_ty.as_ref()
         };
+        let identity_layout = identity_layout_ty.and_then(|ty| {
+            self.adt_struct_fields(ty).or_else(|| {
+                let OpKind::Call { target, .. } = &op_kind else {
+                    return None;
+                };
+                if !crate::front::std_identity::is_identity_wrapper_target(
+                    target,
+                    identity_recv.as_deref(),
+                    identity_dest.as_deref(),
+                    false,
+                ) {
+                    return None;
+                }
+                self.opaque_one_type_param_payload_layout(ty)
+            })
+        });
         // Only a thin `Box<T>` is one pointer word. `Box<[T]>`, `Box<str>` and
         // `Box<dyn Trait>` carry a metadata word that a `same_as` would drop.
         let receiver_is_thin_box = first_arg_ty.as_ref().is_some_and(|ty| {
@@ -8129,21 +8478,8 @@ impl<'a> Lowering<'a> {
         // validates the producer/consumer CFG adjacency; this site only keeps
         // the closure and Result type ownership that is unavailable after MIR
         // lowering.
-        if let OpKind::Call {
-            target:
-                CallTarget::Method {
-                    name,
-                    receiver_root,
-                    ..
-                },
-            args,
-            ..
-        } = &op_kind
-            && name == "ok_or_else"
-            && receiver_root.as_deref().is_some_and(|root| {
-                majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(root))
-                    == "Option"
-            })
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && call_target_leaf_is(target, "ok_or_else")
             && args.len() == 2
             && let Some(closure_arg) = args.get(1).and_then(|arg| arg.as_variable()).cloned()
             && let Some(site) = self.recognize_checked_arith_ok_or_else_site(
@@ -9169,11 +9505,69 @@ impl<'a> Lowering<'a> {
         Some((spec_segments(self.llbc, fd, leaf), None))
     }
 
+    /// Depth-0 `TypeVar`s in a nested call's `generics` are this
+    /// `cachedgraph` copy's type arguments. Substitute them before
+    /// `concrete_type_args` / `call_site_generic_rust_args` so a call
+    /// `pop_n::<H>` inside `opcode_build_list::<PyFrame>` carries `PyFrame`.
+    pub(in crate::front::mir) fn instantiate_call_generics(&self, generics: &serde_json::Value) -> serde_json::Value {
+        let mut g = generics.clone();
+        if self.spec_body && !(self.spec_types.is_empty() && self.spec_const_generics.is_empty()) {
+            crate::front::clause_spec::substitute_type_vars(
+                &mut g,
+                self.llbc,
+                self.spec_types,
+                self.spec_const_generics,
+            );
+        }
+        g
+    }
+
+    pub(in crate::front::mir) fn attach_call_generics(
+        &self,
+        target: CallTarget,
+        fd: &FunDecl,
+        generics: &serde_json::Value,
+        fallback_arg_ty: Option<&TyRef>,
+    ) -> CallTarget {
+        let generics = self.instantiate_call_generics(generics);
+        let target = attach_call_generic_instance(target, fd, &generics, self.llbc);
+        if !target.generic_rust_args().is_empty() {
+            return target;
+        }
+        match self.generic_args_from_arg_ty(fd, fallback_arg_ty) {
+            Some(args) => target.with_generic_rust_args(args),
+            None => target,
+        }
+    }
+
+    /// When the call's `generics.types` are still TypeVars, the first
+    /// argument's (peeled) type is the instantiation of a single type
+    /// parameter (`pop_n::<H>(&mut H, ...)`).
+    pub(in crate::front::mir) fn generic_args_from_arg_ty(&self, fd: &FunDecl, ty: Option<&TyRef>) -> Option<Vec<String>> {
+        let n_types = fd.generics.as_ref()?.get("types")?.as_array()?.len();
+        if n_types != 1 {
+            return None;
+        }
+        let ty = ty?;
+        let peeled = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| ty.clone());
+        let value = tyref_to_spec_json(&peeled);
+        let name = crate::front::clause_spec::spec_type_name(&value, self.llbc, 0, false);
+        if name.is_empty() || name.starts_with('?') || name.starts_with('v') {
+            return None;
+        }
+        Some(vec![name])
+    }
+
+
     pub(in crate::front::mir) fn enqueue_spec(&self, fd: &FunDecl, generics: &serde_json::Value) -> Option<Vec<String>> {
         let spec = self.spec?;
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
         }
+        let generics_owned = self.instantiate_call_generics(generics);
+        let generics = &generics_owned;
         // Only a body this LLBC extracted can be copied here. An opaque
         // foreign or std declaration keeps its bare path. A bodyless
         // local-crate generic is the copy that crate's own LLBC carries
@@ -9339,7 +9733,8 @@ impl<'a> Lowering<'a> {
                     // is generic-trait shaped and never lifts.  (The
                     // reflexive `Identity` outcome is intercepted at
                     // `lower_call` before reaching here.)
-                    if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
+                    if let Some(IntoDevirt::Target { segments, .. }) = self.blanket_into_devirt(reg)
+                    {
                         return (segments, None);
                     }
                     if let Some(segments) =

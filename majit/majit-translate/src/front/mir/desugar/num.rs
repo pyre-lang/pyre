@@ -52,6 +52,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "cmp".into(), leaf.clone()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args.iter().cloned()),
@@ -998,6 +999,7 @@ impl<'a> Lowering<'a> {
                         "jit_bigint_toint".to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![arg]),
@@ -1092,6 +1094,7 @@ impl<'a> Lowering<'a> {
                         "wtf8_key_is_utf8".to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![arg.clone()]),
@@ -1322,6 +1325,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![receiver.clone(), divisor.clone()]),
@@ -1362,6 +1366,7 @@ impl<'a> Lowering<'a> {
                     window: false,
                     raw_u8: false,
                     str_value: false,
+                    ty: ValueType::Ref(Some("RBigInt".to_string())),
                 })
                 .collect(),
         };
@@ -1481,6 +1486,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![arg]),

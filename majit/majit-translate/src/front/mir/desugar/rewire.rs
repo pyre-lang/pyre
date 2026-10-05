@@ -359,6 +359,11 @@ pub(in crate::front::mir) struct AggregateField {
     /// rust-heap header; `jtransform` copies it when this write's type is
     /// `Str` and the operand is `{cap, ptr, len}`.
     pub(in crate::front::mir) str_value: bool,
+    /// Register kind of this operand (`tuple_field_value_type` of the
+    /// field spelling). `rewrite_op_setfield` and
+    /// `coerce_gcref_null_store` take the kind from the field
+    /// (`history.py` `CONST_NULL` vs `CONST_0`), not from a host `0`.
+    pub(in crate::front::mir) ty: ValueType,
 }
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
@@ -558,7 +563,7 @@ fn ctor_ccharp_field_store(
     };
     Ok((
         stored,
-        positional_ctor_field_value_type(&ctor.result_owner, &field.name),
+        positional_ctor_field_value_type(&ctor.result_owner, &field.name, field.ty.clone()),
     ))
 }
 
@@ -591,6 +596,7 @@ fn ctor_field_is_raw_u8(ctor: &AggregateCtor, field: &AggregateField) -> bool {
 pub(in crate::front::mir) fn positional_ctor_field_value_type(
     result_owner: &str,
     field_name: &str,
+    fallback: ValueType,
 ) -> ValueType {
     crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
         result_owner,
@@ -602,7 +608,7 @@ pub(in crate::front::mir) fn positional_ctor_field_value_type(
                     .find(|(name, _)| name == field_name)
                     .map(|(_, vt)| vt)
             })
-            .unwrap_or(ValueType::Ref(None)),
+            .unwrap_or(fallback),
     )
 }
 

@@ -7444,12 +7444,8 @@ pub fn getattr_str_impl(
     // Reload at each use: a live `obj` local across collecting helpers is an
     // unbracketed `PyObjectRef`. The caller opened the bracket; pin into it.
     let getattr_miss = |call_getattr: bool, suppress: bool| {
-        object_getattr_miss_str(
-            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            name,
-            call_getattr,
-            suppress,
-        )
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        object_getattr_miss_str(obj, name, call_getattr, suppress)
     };
 
     if name == "__dict__"

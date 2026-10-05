@@ -4014,12 +4014,11 @@ unsafe fn lookup_plain_compare_function(
 
 #[majit_macros::dont_look_inside]
 unsafe fn plain_compare_function(obj: PyObjectRef, name: &str) -> PyObjectRef {
-    let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
     let method = if is_instance(obj) {
         let Some(w_type) = crate::typedef::r#type(obj) else {
             return pyre_object::PY_NULL;
         };
-        lookup_in_type_where(w_type.as_ptr(), w_name)
+        lookup_in_type_where(w_type.as_ptr(), name)
     } else {
         crate::baseobjspace::subclass_special_override(obj, name).map(|(method, _)| method)
     };

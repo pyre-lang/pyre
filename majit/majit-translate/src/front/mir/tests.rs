@@ -3375,7 +3375,7 @@ fn window_param_to_vec_is_charpsize2str() {
                         CallTarget::FunctionPath {
                             segments,
                             fun_decl_id,
-                            ..
+                        ..
                         },
                     args,
                     ..
@@ -25021,6 +25021,7 @@ fn decompose_valuefmt_lowers_string_accumulator_push_and_take() {
             crate::front::iter_next::is_iterator_next_target(&CallTarget::FunctionPath {
                 segments: (*segments).clone(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             })
         })
@@ -27798,6 +27799,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             window: false,
             raw_u8: false,
             str_value: false,
+            ty: ValueType::Int,
         }],
     })
 }
@@ -27846,33 +27848,35 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             window: false,
             raw_u8: false,
             str_value: false,
+            ty: ValueType::Int,
         }],
     })
 }
 
-pub(in crate::front::mir) fn push_fn_const(
-    graph: &mut FunctionGraph,
-    block: crate::model::BlockId,
-    path: &[&str],
-) -> Variable {
-    let mut segments = vec![crate::model::FN_CONST_HEAD.to_string()];
-    segments.extend(path.iter().map(|s| s.to_string()));
-    graph
-        .push_op_var(
-            block,
-            OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments,
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
+    pub(in crate::front::mir) fn push_fn_const(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        path: &[&str],
+    ) -> Variable {
+        let mut segments = vec![crate::model::FN_CONST_HEAD.to_string()];
+        segments.extend(path.iter().map(|s| s.to_string()));
+        graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
                 },
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Int,
-            },
-            true,
-        )
-        .unwrap()
-}
+                true,
+            )
+            .unwrap()
+    }
 
 #[test]
 fn desugar_mix_result_question_mark_lowers_to_result_switch() {

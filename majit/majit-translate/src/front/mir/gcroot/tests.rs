@@ -552,101 +552,103 @@ fn rust_vec_drop_maybe_initialised_declines_without_free() {
     );
 }
 
-#[test]
-fn root_scope_drop_is_classified_and_live() {
-    use bit_set::BitSet;
-    use majit_charon_reader::ullbc::Unstructured;
-    assert!(super::gc_root_scope_drop_glue_path(
-        "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
-    ));
-    assert!(!super::gc_root_scope_drop_glue_path(
-        "alloc::vec::Vec::<Impl>::drop_in_place"
-    ));
-    assert!(super::frame_anchor_drop_glue_path(
-        "pyre_interpreter::eval::FrameAnchor::<Impl>::drop_in_place"
-    ));
-    assert!(super::frame_anchor_drop_glue_path(
-        "eval::FrameAnchor::drop"
-    ));
-    assert!(!super::frame_anchor_drop_glue_path(
-        "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
-    ));
-    let release = crate::model::OpKind::Call {
-        target: crate::model::CallTarget::FunctionPath {
-            segments: vec![
-                "pyre_interpreter".to_string(),
-                "eval".to_string(),
-                "frame_anchor_release".to_string(),
-            ],
-            fun_decl_id: None,
-            specialization: crate::parse::GraphSpecialization::Regular,
-        },
-        args: Vec::new(),
-        result_ty: crate::model::ValueType::Void,
-    };
-    assert!(super::is_frame_anchor_release_call(&release));
-    assert!(super::is_shadow_stack_bracket_close(&release));
-    assert!(!super::is_root_scope_drop_glue_call(&release));
-
-    // `_1` is written in bb0 and read only by bb1's Drop.
-    let span = || {
-        serde_json::json!({
-            "data": {
-                "file_id": 0,
-                "beg": {"line": 0, "col": 0},
-                "end": {"line": 0, "col": 0}
+    #[test]
+    fn root_scope_drop_is_classified_and_live() {
+        use bit_set::BitSet;
+        use majit_charon_reader::ullbc::Unstructured;
+        assert!(super::gc_root_scope_drop_glue_path(
+            "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
+        ));
+        assert!(!super::gc_root_scope_drop_glue_path(
+            "alloc::vec::Vec::<Impl>::drop_in_place"
+        ));
+        assert!(super::frame_anchor_drop_glue_path(
+            "pyre_interpreter::eval::FrameAnchor::<Impl>::drop_in_place"
+        ));
+        assert!(super::frame_anchor_drop_glue_path(
+            "eval::FrameAnchor::drop"
+        ));
+        assert!(!super::frame_anchor_drop_glue_path(
+            "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
+        ));
+        let release = crate::model::OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath {
+                segments: vec![
+                    "pyre_interpreter".to_string(),
+                    "eval".to_string(),
+                    "frame_anchor_release".to_string(),
+                ],
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
-            "generated_from_span": null
-        })
-    };
-    let ty = || serde_json::json!({"Deduplicated": 0});
-    let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
-    let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
-    let bb0 = serde_json::json!({
-        "statements": [stmt(serde_json::json!({
-            "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
-        }))],
-        "kind": "Regular",
-        "terminator": {"kind": {"Goto": {"target": 1}}}
-    });
-    let bb1 = serde_json::json!({
-        "statements": [],
-        "kind": "Regular",
-        "terminator": {"kind": {"Drop": {
-            "place": place_local(1),
-            "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
-            "target": 2,
-            "on_unwind": 2
-        }}}
-    });
-    let bb2 = serde_json::json!({
-        "statements": [],
-        "kind": "Regular",
-        "terminator": {"kind": "Return"}
-    });
-    let body_json = serde_json::json!({
-        "span": span(),
-        "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
-        "body": [bb0, bb1, bb2]
-    });
-    let body: Unstructured =
-        serde_json::from_value(body_json).expect("fixture Unstructured parses");
+            args: Vec::new(),
+            result_ty: crate::model::ValueType::Void,
+        };
+        assert!(super::is_frame_anchor_release_call(&release));
+        assert!(super::is_shadow_stack_bracket_close(&release));
+        assert!(!super::is_root_scope_drop_glue_call(&release));
 
-    let erased = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &BitSet::new());
-    assert!(
-        !erased[1].contains(1),
-        "an erased drop reads nothing, so the guard is not live-in at bb1"
-    );
+        // `_1` is written in bb0 and read only by bb1's Drop.
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 0, "col": 0},
+                    "end": {"line": 0, "col": 0}
+                },
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let bb0 = serde_json::json!({
+            "statements": [stmt(serde_json::json!({
+                "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
+            }))],
+            "kind": "Regular",
+            "terminator": {"kind": {"Goto": {"target": 1}}}
+        });
+        let bb1 = serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"kind": {"Drop": {
+                "place": place_local(1),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": 2,
+                "on_unwind": 2
+            }}}
+        });
+        let bb2 = serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"kind": "Return"}
+        });
+        let body_json = serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
+            "body": [bb0, bb1, bb2]
+        });
+        let body: Unstructured =
+            serde_json::from_value(body_json).expect("fixture Unstructured parses");
 
-    let mut as_call = BitSet::new();
-    as_call.insert(1);
-    let lowered = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &as_call);
-    assert!(
-        lowered[1].contains(1),
-        "a drop lowered as its glue call reads the guard, so it is live-in at bb1"
-    );
-}
+        let erased = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &BitSet::new());
+        assert!(
+            !erased[1].contains(1),
+            "an erased drop reads nothing, so the guard is not live-in at bb1"
+        );
+
+        let mut as_call = BitSet::new();
+        as_call.insert(1);
+        let lowered = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &as_call);
+        assert!(
+            lowered[1].contains(1),
+            "a drop lowered as its glue call reads the guard, so it is live-in at bb1"
+        );
+    }
 
 #[test]
 fn a_move_operand_typed_unlike_the_local_is_not_a_move_of_it() {
@@ -1301,84 +1303,85 @@ fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
     );
 }
 
-#[test]
-fn root_bracket_erasure_answers_a_pin_roots_run() {
-    use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
-    // The `with_roots!(a, b => callee(a))` shape:
-    //
-    //   bb0: _3 = push_roots()                                  -> bb1
-    //   bb1: _19 = copy _1; _20 = copy _2; _6 = [move _19, move _20];
-    //        _7 = &_6; _8 = &(*_7); _9 = move _8 as &[_] (Unsize);
-    //        _4 = &_3; _5 = pin_roots(_4, move _9)               -> bb2
-    //   bb2: _10 = callee(_1)                                   -> bb3
-    //   bb3: _11 = &_3; _12 = copy _5; _13 = get(_11, _12)       -> bb4
-    //   bb4: _14 = &_3; _15 = AddChecked(copy _5, 1); assert    -> bb5
-    //   bb5: _16 = move _15.0; _17 = get(_14, move _16)          -> bb6
-    //   bb6: drop(_3)                                           -> bb7
-    //   bb7: return
-    let span = || {
-        serde_json::json!({
-            "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
-            "generated_from_span": null
-        })
-    };
-    let ty = || serde_json::json!({"Deduplicated": 0});
-    let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
-    let mv = |i: u64| serde_json::json!({"Move": place(i)});
-    let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
-    let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
-    let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
-    let assign = |dest: u64, rvalue: serde_json::Value| {
-        stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
-    };
-    let borrow_place = |dest: u64, src: serde_json::Value| {
-        assign(
-            dest,
-            serde_json::json!({"Ref": {"place": src, "kind": "Shared", "ptr_metadata": null}}),
-        )
-    };
-    let borrow = |dest: u64, src: u64| borrow_place(dest, place(src));
-    let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
-        serde_json::json!({"Call": {
-            "call": {
-                "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
-            "target": target,
-            "on_unwind": 99
-        }})
-    };
-    let drop_guard = |local: u64, target: u64| {
-        serde_json::json!({"Drop": {
-            "place": place(local),
-            "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
-            "target": target,
-            "on_unwind": 99
-        }})
-    };
-    let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
-    let name_of = |reg: &RegularCall| -> Option<String> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return None;
+    #[test]
+    fn root_bracket_erasure_answers_a_pin_roots_run() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // The `with_roots!(a, b => callee(a))` shape:
+        //
+        //   bb0: _3 = push_roots()                                  -> bb1
+        //   bb1: _19 = copy _1; _20 = copy _2; _6 = [move _19, move _20];
+        //        _7 = &_6; _8 = &(*_7); _9 = move _8 as &[_] (Unsize);
+        //        _4 = &_3; _5 = pin_roots(_4, move _9)               -> bb2
+        //   bb2: _10 = callee(_1)                                   -> bb3
+        //   bb3: _11 = &_3; _12 = copy _5; _13 = get(_11, _12)       -> bb4
+        //   bb4: _14 = &_3; _15 = AddChecked(copy _5, 1); assert    -> bb5
+        //   bb5: _16 = move _15.0; _17 = get(_14, move _16)          -> bb6
+        //   bb6: drop(_3)                                           -> bb7
+        //   bb7: return
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
         };
-        Some(
-            match id {
-                1 => "pyre_object::gc_roots::push_roots",
-                3 => "pyre_object::gc_roots::{impl RootScope}::pin_roots",
-                4 => "pyre_object::gc_roots::{impl RootScope}::get",
-                6 => "pyre_object::gc_roots::pin_roots",
-                7 => "pyre_object::gc_roots::shadow_stack_get",
-                _ => "pyre_object::listobject::ll_list_obj_resize_ge",
-            }
-            .to_string(),
-        )
-    };
-    let touches = |_: &RegularCall| false;
-    let body_of = |elements: Vec<serde_json::Value>| -> Unstructured {
-        serde_json::from_value(serde_json::json!({
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let mv = |i: u64| serde_json::json!({"Move": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow_place = |dest: u64, src: serde_json::Value| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": src, "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let borrow = |dest: u64, src: u64| borrow_place(dest, place(src));
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    3 => "pyre_object::gc_roots::{impl RootScope}::pin_roots",
+                    4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    6 => "pyre_object::gc_roots::pin_roots",
+                    7 => "pyre_object::gc_roots::shadow_stack_get",
+                    _ => "pyre_object::listobject::ll_list_obj_resize_ge",
+                }
+                .to_string(),
+            )
+        };
+        let touches = |_: &RegularCall| false;
+        let body_of = |elements: Vec<serde_json::Value>| -> Unstructured {
+            serde_json::from_value(serde_json::json!({
                 "span": span(),
                 "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
                 "body": [
@@ -1424,121 +1427,154 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
                 ],
             }))
             .expect("fixture Unstructured parses")
-    };
+        };
 
-    let run = body_of(vec![mv(19), mv(20)]);
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &run,
-        &super::MovedOutLocals::with_set(&run, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(plan.scopes.contains(3), "a pin_roots run must be erased");
+        let run = body_of(vec![mv(19), mv(20)]);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &run,
+            &super::MovedOutLocals::with_set(&run, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(plan.scopes.contains(3), "a pin_roots run must be erased");
 
-    assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
-    assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
-    for temp in [6, 7, 8, 9] {
-        assert_eq!(plan.pin_temps.get(&temp), Some(&3), "argument temp _{temp}");
+        assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+        assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
+        for temp in [6, 7, 8, 9] {
+            assert_eq!(plan.pin_temps.get(&temp), Some(&3), "argument temp _{temp}");
+        }
+        for base in [5, 12] {
+            assert_eq!(plan.base_results.get(&base), Some(&3), "base _{base}");
+        }
+
+        // An element that is not a plain local leaves nothing to answer with.
+        let constant = body_of(vec![mv(19), usize_lit(0)]);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &constant,
+            &super::MovedOutLocals::with_set(&constant, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "a constant element keeps the bracket"
+        );
+
+        // `with_roots!` pins the `mut` locals themselves and writes each
+        // `get` back into its own local: bb3 `_1 = get(..)`, bb5 `_2 = get(..)`.
+        // The restores are the only definitions inside the bracket, so every
+        // read there still sees the pinned value.
+        let mut restored = body_of(vec![copy(1), copy(2)]);
+        restored.body[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
+        restored.body[5].set_terminator_kind(call(4, vec![copy(14), mv(16)], 2, 6));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &restored,
+            &super::MovedOutLocals::with_set(&restored, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "a restore into the pinned local must still be erased"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
+        assert_eq!(plan.get_sites, vec![(3usize, 1usize), (5usize, 2usize)]);
+
+        // Any other write to a pinned local inside the bracket changes what a
+        // later `get` would be answered with.
+        let mut clobbered = body_of(vec![copy(1), copy(2)]);
+        clobbered.body[2].set_terminator_kind(call(5, vec![copy(1)], 1, 3));
+        clobbered.body[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &clobbered,
+            &super::MovedOutLocals::with_set(&clobbered, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "a non-get write to a pinned local keeps the bracket"
+        );
+
+        // The free spelling: `let _r = push_roots(); let b = pin_roots(&[..]);
+        // shadow_stack_get(b + k)` pins onto and reads from the one bracket
+        // open around it.
+        let mut free = body_of(vec![mv(19), mv(20)]);
+        free.body[1].statements.pop();
+        free.body[1].set_terminator_kind(call(6, vec![mv(9)], 5, 2));
+        free.body[3].statements.remove(0);
+        free.body[3].set_terminator_kind(call(7, vec![copy(12)], 13, 4));
+        free.body[4].statements.remove(0);
+        free.body[5].set_terminator_kind(call(7, vec![mv(16)], 17, 6));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &free,
+            &super::MovedOutLocals::with_set(&free, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "a free pin_roots run must be erased"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+        assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
+        for bb in [1, 3, 5] {
+            assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
+        }
+
+        // Charon records `&[T; N] as &[T]` as `Rvalue::Cast` (`pin_src`), and
+        // rustc may copy that temporary. The walk must still name the array.
+        let stmt_of = |value: serde_json::Value| -> majit_charon_reader::ullbc::Statement {
+            serde_json::from_value(value).expect("statement JSON")
+        };
+        let mut cast_unsize = body_of(vec![mv(19), mv(20)]);
+        cast_unsize.body[1].statements[5] = stmt_of(assign(
+            9,
+            serde_json::json!({"Cast": [
+                {"Unsize": [ty(), ty(), {"Length": usize_lit(2)}]},
+                mv(8),
+                ty()
+            ]}),
+        ));
+        cast_unsize.body[1].statements.push(stmt_of(assign(
+            18,
+            serde_json::json!({"Use": [copy(9), "No"]}),
+        )));
+        cast_unsize.body[1].set_terminator_kind(call(3, vec![copy(4), mv(18)], 5, 2));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &cast_unsize,
+            &super::MovedOutLocals::with_set(&cast_unsize, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "a Cast Unsize of the array, copied, must still be erased"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+        assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
+
+        // A read of a slot some other guard's pin filled is not this one's.
+        let mut stray = body_of(vec![mv(19), mv(20)]);
+        stray.body[3].set_terminator_kind(call(7, vec![copy(13)], 18, 4));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &stray,
+            &super::MovedOutLocals::with_set(&stray, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "a free read at a slot this pass cannot name keeps the bracket"
+        );
     }
-    for base in [5, 12] {
-        assert_eq!(plan.base_results.get(&base), Some(&3), "base _{base}");
-    }
-
-    // An element that is not a plain local leaves nothing to answer with.
-    let constant = body_of(vec![mv(19), usize_lit(0)]);
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &constant,
-        &super::MovedOutLocals::with_set(&constant, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        !plan.scopes.contains(3),
-        "a constant element keeps the bracket"
-    );
-
-    // `with_roots!` pins the `mut` locals themselves and writes each
-    // `get` back into its own local: bb3 `_1 = get(..)`, bb5 `_2 = get(..)`.
-    // The restores are the only definitions inside the bracket, so every
-    // read there still sees the pinned value.
-    let mut restored = body_of(vec![copy(1), copy(2)]);
-    restored.body[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
-    restored.body[5].set_terminator_kind(call(4, vec![copy(14), mv(16)], 2, 6));
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &restored,
-        &super::MovedOutLocals::with_set(&restored, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        plan.scopes.contains(3),
-        "a restore into the pinned local must still be erased"
-    );
-    assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
-    assert_eq!(plan.get_sites, vec![(3usize, 1usize), (5usize, 2usize)]);
-
-    // Any other write to a pinned local inside the bracket changes what a
-    // later `get` would be answered with.
-    let mut clobbered = body_of(vec![copy(1), copy(2)]);
-    clobbered.body[2].set_terminator_kind(call(5, vec![copy(1)], 1, 3));
-    clobbered.body[3].set_terminator_kind(call(4, vec![copy(11), copy(12)], 1, 4));
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &clobbered,
-        &super::MovedOutLocals::with_set(&clobbered, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        !plan.scopes.contains(3),
-        "a non-get write to a pinned local keeps the bracket"
-    );
-
-    // The free spelling: `let _r = push_roots(); let b = pin_roots(&[..]);
-    // shadow_stack_get(b + k)` pins onto and reads from the one bracket
-    // open around it.
-    let mut free = body_of(vec![mv(19), mv(20)]);
-    free.body[1].statements.pop();
-    free.body[1].set_terminator_kind(call(6, vec![mv(9)], 5, 2));
-    free.body[3].statements.remove(0);
-    free.body[3].set_terminator_kind(call(7, vec![copy(12)], 13, 4));
-    free.body[4].statements.remove(0);
-    free.body[5].set_terminator_kind(call(7, vec![mv(16)], 17, 6));
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &free,
-        &super::MovedOutLocals::with_set(&free, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        plan.scopes.contains(3),
-        "a free pin_roots run must be erased"
-    );
-    assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
-    assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
-    for bb in [1, 3, 5] {
-        assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
-    }
-
-    // A read of a slot some other guard's pin filled is not this one's.
-    let mut stray = body_of(vec![mv(19), mv(20)]);
-    stray.body[3].set_terminator_kind(call(7, vec![copy(13)], 18, 4));
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &stray,
-        &super::MovedOutLocals::with_set(&stray, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        !plan.scopes.contains(3),
-        "a free read at a slot this pass cannot name keeps the bracket"
-    );
-}
 
 #[test]
 fn root_bracket_erasure_answers_a_later_pin_roots_dest() {
@@ -1995,266 +2031,269 @@ fn root_bracket_erasure_answers_an_incoming_elem_pin() {
     }
 }
 
-#[test]
-fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
-    use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
-    // The `w_list_append_inner` Object-arm shape:
-    //
-    //   bb0: _3 = push_roots()                       -> bb1
-    //   bb1: _4 = &_3; _5 = base(_4)                 -> bb2
-    //   bb2: _6 = &_3; _7 = pin_root(_6, _1)         -> bb3
-    //   bb3: _8 = &_3; _9 = pin_root(_8, _2)         -> bb4
-    //   bb4: _10 = resize_ge(_1)                     -> bb5
-    //   bb5: _11 = &_3; _12 = copy _5; _13 = get(_11, _12)   -> bb6
-    //   bb6: _14 = &_3; _15 = copy _5;
-    //        _16 = AddChecked(copy _15, 1); assert(!_16.1)   -> bb7
-    //   bb7: _17 = move _16.0; _18 = get(_14, move _17)      -> bb8
-    //   bb8: drop(_3)                                -> bb9
-    //   bb9: return
-    let span = || {
-        serde_json::json!({
-            "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
-            "generated_from_span": null
-        })
-    };
-    let ty = || serde_json::json!({"Deduplicated": 0});
-    let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-    let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
-    let copy = |i: u64| serde_json::json!({"Copy": place(i)});
-    let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
-    let local = |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
-    let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
-    let assign = |dest: u64, rvalue: serde_json::Value| {
-        stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
-    };
-    let borrow = |dest: u64, src: u64| {
-        assign(
-            dest,
-            serde_json::json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
-        )
-    };
-    let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
-        serde_json::json!({"Call": {
-            "call": {
-                "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
-                "args": args,
-                "dest": place(dest)
-            },
-            "target": target,
-            "on_unwind": 99
-        }})
-    };
-    let overflow_check = |sum: u64, lhs: u64, target: u64| {
-        serde_json::json!({"Assert": {
-            "assert": {
-                "cond": {"Move": field(sum, 1)},
-                "expected": false,
-                "check_kind": {"Overflow": [{"Add": "Wrap"}, {"Move": place(lhs)}, usize_lit(1)]}
-            },
-            "target": target,
-            "on_unwind": 99
-        }})
-    };
-    let drop_guard = |local: u64, target: u64| {
-        serde_json::json!({"Drop": {
-            "place": place(local),
-            "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
-            "target": target,
-            "on_unwind": 99
-        }})
-    };
-    let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
-    let name_of = |reg: &RegularCall| -> Option<String> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return None;
+    #[test]
+    fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // The `w_list_append_inner` Object-arm shape:
+        //
+        //   bb0: _3 = push_roots()                       -> bb1
+        //   bb1: _4 = &_3; _5 = base(_4)                 -> bb2
+        //   bb2: _6 = &_3; _7 = pin_root(_6, _1)         -> bb3
+        //   bb3: _8 = &_3; _9 = pin_root(_8, _2)         -> bb4
+        //   bb4: _10 = resize_ge(_1)                     -> bb5
+        //   bb5: _11 = &_3; _12 = copy _5; _13 = get(_11, _12)   -> bb6
+        //   bb6: _14 = &_3; _15 = copy _5;
+        //        _16 = AddChecked(copy _15, 1); assert(!_16.1)   -> bb7
+        //   bb7: _17 = move _16.0; _18 = get(_14, move _17)      -> bb8
+        //   bb8: drop(_3)                                -> bb9
+        //   bb9: return
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
         };
-        Some(
-            match id {
-                1 => "pyre_object::gc_roots::push_roots",
-                2 => "pyre_object::gc_roots::{impl RootScope}::base",
-                3 => "pyre_object::gc_roots::{impl RootScope}::pin_root",
-                4 => "pyre_object::gc_roots::{impl RootScope}::get",
-                _ => "pyre_object::listobject::ll_list_obj_resize_ge",
-            }
-            .to_string(),
-        )
-    };
-    let touches = |_: &RegularCall| false;
-    let blocks = |second_pin: serde_json::Value, pin2_block: Vec<serde_json::Value>| {
-        let mut blocks = vec![
-            block(vec![], call(1, vec![], 3, 1)),
-            block(vec![borrow(4, 3)], call(2, vec![copy(4)], 5, 2)),
-            block(vec![borrow(6, 3)], call(3, vec![copy(6), copy(1)], 7, 3)),
-            second_pin,
-            block(vec![], call(5, vec![copy(1)], 10, 5)),
-            block(
-                vec![
-                    borrow(11, 3),
-                    assign(12, serde_json::json!({"Use": [copy(5), "No"]})),
-                ],
-                call(4, vec![copy(11), copy(12)], 13, 6),
-            ),
-            block(
-                vec![
-                    borrow(14, 3),
-                    assign(15, serde_json::json!({"Use": [copy(5), "No"]})),
-                    assign(
-                        16,
-                        serde_json::json!({"BinaryOp": ["AddChecked", copy(15), usize_lit(1)]}),
-                    ),
-                ],
-                overflow_check(16, 15, 7),
-            ),
-            block(
-                vec![assign(
-                    17,
-                    serde_json::json!({"Use": [{"Move": field(16, 0)}, "No"]}),
-                )],
-                call(
-                    4,
-                    vec![copy(14), serde_json::json!({"Move": place(17)})],
-                    18,
-                    8,
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow = |dest: u64, src: u64| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let overflow_check = |sum: u64, lhs: u64, target: u64| {
+            serde_json::json!({"Assert": {
+                "assert": {
+                    "cond": {"Move": field(sum, 1)},
+                    "expected": false,
+                    "check_kind": {"Overflow": [{"Add": "Wrap"}, {"Move": place(lhs)}, usize_lit(1)]}
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    2 => "pyre_object::gc_roots::{impl RootScope}::base",
+                    3 => "pyre_object::gc_roots::{impl RootScope}::pin_root",
+                    4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    _ => "pyre_object::listobject::ll_list_obj_resize_ge",
+                }
+                .to_string(),
+            )
+        };
+        let touches = |_: &RegularCall| false;
+        let blocks = |second_pin: serde_json::Value, pin2_block: Vec<serde_json::Value>| {
+            let mut blocks = vec![
+                block(vec![], call(1, vec![], 3, 1)),
+                block(vec![borrow(4, 3)], call(2, vec![copy(4)], 5, 2)),
+                block(vec![borrow(6, 3)], call(3, vec![copy(6), copy(1)], 7, 3)),
+                second_pin,
+                block(vec![], call(5, vec![copy(1)], 10, 5)),
+                block(
+                    vec![
+                        borrow(11, 3),
+                        assign(12, serde_json::json!({"Use": [copy(5), "No"]})),
+                    ],
+                    call(4, vec![copy(11), copy(12)], 13, 6),
                 ),
-            ),
-            block(vec![], drop_guard(3, 9)),
-            block(vec![], serde_json::json!("Return")),
-        ];
-        blocks.extend(pin2_block);
-        blocks
-    };
-    let body_of = |blocks: Vec<serde_json::Value>| -> Unstructured {
-        serde_json::from_value(serde_json::json!({
-            "span": span(),
-            "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
-            "body": blocks,
-        }))
-        .expect("fixture Unstructured parses")
-    };
-    let second_pin = || block(vec![borrow(8, 3)], call(3, vec![copy(8), copy(2)], 9, 4));
+                block(
+                    vec![
+                        borrow(14, 3),
+                        assign(15, serde_json::json!({"Use": [copy(5), "No"]})),
+                        assign(
+                            16,
+                            serde_json::json!({"BinaryOp": ["AddChecked", copy(15), usize_lit(1)]}),
+                        ),
+                    ],
+                    overflow_check(16, 15, 7),
+                ),
+                block(
+                    vec![assign(
+                        17,
+                        serde_json::json!({"Use": [{"Move": field(16, 0)}, "No"]}),
+                    )],
+                    call(
+                        4,
+                        vec![copy(14), serde_json::json!({"Move": place(17)})],
+                        18,
+                        8,
+                    ),
+                ),
+                block(vec![], drop_guard(3, 9)),
+                block(vec![], serde_json::json!("Return")),
+            ];
+            blocks.extend(pin2_block);
+            blocks
+        };
+        let body_of = |blocks: Vec<serde_json::Value>| -> Unstructured {
+            serde_json::from_value(serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+                "body": blocks,
+            }))
+            .expect("fixture Unstructured parses")
+        };
+        let second_pin = || block(vec![borrow(8, 3)], call(3, vec![copy(8), copy(2)], 9, 4));
 
-    let two_pins = body_of(blocks(second_pin(), vec![]));
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &two_pins,
-        &super::MovedOutLocals::with_set(&two_pins, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(plan.scopes.contains(3), "both pins run once, in one order");
-    assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
-    assert_eq!(plan.get_sites, vec![(5usize, 1usize), (7usize, 2usize)]);
-    for temp in [16, 17] {
-        assert_eq!(
-            plan.slot_temps.get(&temp),
-            Some(&3),
-            "`base + 1` temp _{temp}"
+        let two_pins = body_of(blocks(second_pin(), vec![]));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &two_pins,
+            &super::MovedOutLocals::with_set(&two_pins, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(plan.scopes.contains(3), "both pins run once, in one order");
+        assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
+        assert_eq!(plan.get_sites, vec![(5usize, 1usize), (7usize, 2usize)]);
+        for temp in [16, 17] {
+            assert_eq!(
+                plan.slot_temps.get(&temp),
+                Some(&3),
+                "`base + 1` temp _{temp}"
+            );
+        }
+        for base in [5, 12, 15] {
+            assert_eq!(
+                plan.base_results.get(&base),
+                Some(&3),
+                "`base()` copy _{base}"
+            );
+        }
+
+        // The artefact's opener unwinds to the body's `UnwindResume`.  That
+        // edge runs only when opening fails, so it is not inside the bracket.
+        let mut unwinding = body_of(blocks(second_pin(), vec![]));
+        let resume = unwinding.body.len();
+        unwinding.body.push(
+            serde_json::from_value(block(vec![], serde_json::json!("UnwindResume"))).unwrap(),
+        );
+        let mut kind = unwinding.body[0].terminator.kind_value().clone();
+        kind["Call"]["on_unwind"] = serde_json::json!(resume);
+        unwinding.body[0].set_terminator_kind(kind);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &unwinding,
+            &super::MovedOutLocals::with_set(&unwinding, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "the opener's own unwind edge must not keep the bracket"
+        );
+
+        // A call inside the bracket unwinds to that same `UnwindResume`
+        // once cleanup blocks are stripped. `on_unwind` is the panic-cleanup
+        // chain the lowering drops (`lower_call`); Python exceptions ride
+        // the success edge as `Result`. Visiting the terminator itself is
+        // also a known stack no-op, so a balanced normal path stays erased.
+        let mut inner_unwinding = body_of(blocks(second_pin(), vec![]));
+        let resume = inner_unwinding.body.len();
+        inner_unwinding.body.push(
+            serde_json::from_value(block(vec![], serde_json::json!("UnwindResume"))).unwrap(),
+        );
+        let mut kind = inner_unwinding.body[4].terminator.kind_value().clone();
+        kind["Call"]["on_unwind"] = serde_json::json!(resume);
+        inner_unwinding.body[4].set_terminator_kind(kind);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &inner_unwinding,
+            &super::MovedOutLocals::with_set(&inner_unwinding, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "a call's stripped unwind must not keep the bracket"
+        );
+
+        // With one pin, `base + 1` names a slot nothing in this bracket
+        // filled.
+        let one_pin = body_of(blocks(
+            block(vec![], serde_json::json!({"Goto": {"target": 4}})),
+            vec![],
+        ));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &one_pin,
+            &super::MovedOutLocals::with_set(&one_pin, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "a read past the last pin must keep its bracket"
+        );
+
+        // The second pin on only one path: `base + 1` holds it on that path
+        // alone, so the read cannot be answered by its value.
+        let branch = block(
+            vec![],
+            serde_json::json!({"Switch": {"discr": copy(1), "targets": {"If": [10, 4]}}}),
+        );
+        let maybe_pinned = body_of(blocks(branch, vec![second_pin()]));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &maybe_pinned,
+            &super::MovedOutLocals::with_set(&maybe_pinned, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "a pin that does not run on every path keeps its bracket"
+        );
+
+        // The resize is the one call that may collect.  Unproved, it keeps the
+        // bracket.
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &two_pins,
+            &super::MovedOutLocals::with_set(&two_pins, bit_set::BitSet::new()),
+            name_of,
+            |reg: &RegularCall| matches!(&reg.kind, CallKind::Fun(FunId::Regular { id: 5 })),
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "a callee that may change the root stack keeps the bracket"
         );
     }
-    for base in [5, 12, 15] {
-        assert_eq!(
-            plan.base_results.get(&base),
-            Some(&3),
-            "`base()` copy _{base}"
-        );
-    }
-
-    // The artefact's opener unwinds to the body's `UnwindResume`.  That
-    // edge runs only when opening fails, so it is not inside the bracket.
-    let mut unwinding = body_of(blocks(second_pin(), vec![]));
-    let resume = unwinding.body.len();
-    unwinding
-        .body
-        .push(serde_json::from_value(block(vec![], serde_json::json!("UnwindResume"))).unwrap());
-    let mut kind = unwinding.body[0].terminator.kind_value().clone();
-    kind["Call"]["on_unwind"] = serde_json::json!(resume);
-    unwinding.body[0].set_terminator_kind(kind);
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &unwinding,
-        &super::MovedOutLocals::with_set(&unwinding, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        plan.scopes.contains(3),
-        "the opener's own unwind edge must not keep the bracket"
-    );
-
-    // A call inside the bracket unwinds to that same `UnwindResume`
-    // once cleanup blocks are stripped. Visiting it must not refuse
-    // a bracket whose normal path is still balanced.
-    let mut inner_unwinding = body_of(blocks(second_pin(), vec![]));
-    let resume = inner_unwinding.body.len();
-    inner_unwinding
-        .body
-        .push(serde_json::from_value(block(vec![], serde_json::json!("UnwindResume"))).unwrap());
-    let mut kind = inner_unwinding.body[4].terminator.kind_value().clone();
-    kind["Call"]["on_unwind"] = serde_json::json!(resume);
-    inner_unwinding.body[4].set_terminator_kind(kind);
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &inner_unwinding,
-        &super::MovedOutLocals::with_set(&inner_unwinding, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        plan.scopes.contains(3),
-        "a call's stripped unwind must not keep the bracket"
-    );
-
-    // With one pin, `base + 1` names a slot nothing in this bracket
-    // filled.
-    let one_pin = body_of(blocks(
-        block(vec![], serde_json::json!({"Goto": {"target": 4}})),
-        vec![],
-    ));
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &one_pin,
-        &super::MovedOutLocals::with_set(&one_pin, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        !plan.scopes.contains(3),
-        "a read past the last pin must keep its bracket"
-    );
-
-    // The second pin on only one path: `base + 1` holds it on that path
-    // alone, so the read cannot be answered by its value.
-    let branch = block(
-        vec![],
-        serde_json::json!({"Switch": {"discr": copy(1), "targets": {"If": [10, 4]}}}),
-    );
-    let maybe_pinned = body_of(blocks(branch, vec![second_pin()]));
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &maybe_pinned,
-        &super::MovedOutLocals::with_set(&maybe_pinned, bit_set::BitSet::new()),
-        name_of,
-        touches,
-    );
-    assert!(
-        !plan.scopes.contains(3),
-        "a pin that does not run on every path keeps its bracket"
-    );
-
-    // The resize is the one call that may collect.  Unproved, it keeps the
-    // bracket.
-    let plan = super::analyze_root_brackets_with(
-        &fixture_llbc(),
-        &two_pins,
-        &super::MovedOutLocals::with_set(&two_pins, bit_set::BitSet::new()),
-        name_of,
-        |reg: &RegularCall| matches!(&reg.kind, CallKind::Fun(FunId::Regular { id: 5 })),
-    );
-    assert!(
-        !plan.scopes.contains(3),
-        "a callee that may change the root stack keeps the bracket"
-    );
-}
 
 #[test]
 fn root_stack_analysis_charges_free_pin_callees_to_the_bracket_around_them() {

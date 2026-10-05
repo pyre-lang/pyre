@@ -4871,14 +4871,16 @@ impl<S: JitState> JitDriver<S> {
                         // `get_procedure_token(greenboxes)` matches the greens,
                         // not a second hash of them. A portal loop is filed
                         // under `make_green_key_typed` (and may be minted when
-                        // that hash's bucket is taken). Rebuilding the same
-                        // banks through `merge_point_green_key` prepends `pc`
-                        // again and misses the cell, so the guard retraces
-                        // forever. The banks recorded at compile time are the
-                        // ones `compiled_key_for_greens` inverts.
-                        let greens_key = close_greens
-                            .as_ref()
-                            .and_then(|greens| self.meta.compiled_key_for_greens(greens));
+                        // that hash's bucket is taken). The banks recorded at
+                        // compile time are the ones `compiled_key_for_greens`
+                        // inverts.
+                        let greens_key = close_greens.as_ref().and_then(|greens| {
+                            self.meta.compiled_key_for_greens(&(
+                                greens.0.clone(),
+                                greens.1.clone(),
+                                greens.2.clone(),
+                            ))
+                        });
                         let resolved_key = greens_key.or_else(|| match &close_key {
                             Some(key) => {
                                 let make_key = || key.clone();

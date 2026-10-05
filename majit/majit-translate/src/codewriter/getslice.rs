@@ -762,6 +762,7 @@ fn emit_ll_arraycopy_call(
             target: CallTarget::FunctionPath {
                 segments: vec!["ll_arraycopy".into()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![l1, new_list.clone(), start, dest_start, newlength]),
@@ -960,6 +961,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular
                 },
                 args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
@@ -1013,6 +1015,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_range".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular
                 },
                 args: crate::model::call_args(vec![
@@ -1162,6 +1165,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
@@ -1188,6 +1192,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![Variable::new()]),
@@ -1201,6 +1206,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular
                 },
                 args: crate::model::call_args(vec![Variable::new()]),
@@ -1232,6 +1238,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_range".into(), suffix],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![items, Variable::new(), Variable::new()]),
@@ -1269,6 +1276,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![items, Variable::new()]),
