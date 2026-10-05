@@ -11270,7 +11270,8 @@ fn walker_unbox_long<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
     let obj_concrete = walker_concrete_ref_object(ctx, obj);
-    let fits_fn = pyre_object::longobject::jit_w_long_fits_int as *const ();
+    let fits_fn =
+        pyre_interpreter::residual_word_addr!(1, pyre_object::longobject::jit_w_long_fits_int);
     let fits = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallI,
         fits_fn,
@@ -11285,7 +11286,8 @@ fn walker_unbox_long<Sym: WalkSym>(
             .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
     }
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[fits])?;
-    let toint_fn = pyre_object::longobject::jit_w_long_toint as *const ();
+    let toint_fn =
+        pyre_interpreter::residual_word_addr!(1, pyre_object::longobject::jit_w_long_toint);
     let raw = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallI,
         toint_fn,
