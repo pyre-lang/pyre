@@ -7234,6 +7234,15 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok(self.emit_promoted_int_range_inclusive(mir_bb, lo, hi, &place_ty));
                 }
+                // rustc promotes a `NamedConst` use to an `AnonConst` whose
+                // initializer FunDecl copies the real global
+                // (`PromotedConst`). Fold through that wrapper so the
+                // NamedConst lanes below see `pypyjitdriver` rather than a
+                // nullary residual of `eval_loop_jit::promoted#N`
+                // (`getfunctionptr` / `handle_residual_call`).
+                if let Some(inner) = self.anon_const_copied_global(id) {
+                    return self.resolve_place(mir_bb, inner);
+                }
                 let segments = self.global_segments(mir_bb, id)?;
                 // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
                 // the `None` stored in PyPy's `locals_cells_stack_w` slots

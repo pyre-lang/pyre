@@ -2779,7 +2779,6 @@ pub(in crate::front::mir) fn regular_call_is_panicking_abort(
     let mut segs = path.split("::");
     matches!(segs.next(), Some("core") | Some("std")) && segs.next() == Some("panicking")
 }
-
 /// Charon `PathElem::Builtin(PromotedConst, N)` on a FunDecl.
 pub(in crate::front::mir) fn fundecl_is_promoted_const(fd: &FunDecl) -> bool {
     fd.item_meta.name.last().is_some_and(|seg| match seg {

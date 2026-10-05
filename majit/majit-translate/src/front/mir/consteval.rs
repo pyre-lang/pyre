@@ -74,6 +74,27 @@ impl<'a> Lowering<'a> {
         res
     }
 
+    /// Inner `Place::Global` of an `AnonConst` whose initializer only copies
+    /// that global (`FunDecl::is_global_initializer` / PromotedConst).
+    pub(in crate::front::mir) fn anon_const_copied_global(&self, def_id: u64) -> Option<Place> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("AnonConst")
+        {
+            return None;
+        }
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        let inner = promoted_const_copied_global(&body)?;
+        if inner_global_id(&inner) == def_id {
+            return None;
+        }
+        Some(inner)
+    }
+
     /// Fold a `NamedConst` global (Rust `const`) whose initializer is a
     /// single literal assignment to its `ConstInt` / `ConstBool` /
     /// `ConstFloat` value.  `None` for statics (`global_kind` ≠

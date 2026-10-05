@@ -9107,7 +9107,9 @@ impl<'a> Lowering<'a> {
     }
 
     /// Impl method named by a `TraitImpl` trait ref, specialized when that
-    /// impl's own clauses are concrete. A `Clause` ref returns `None` so
+    /// impl's own clauses are concrete. A method the impl does not override
+    /// uses the trait's provided default, specialized at that `Self`
+    /// (`trait_default_method`). A `Clause` ref returns `None` so
     /// the call keeps the trait-declaration path, unless the receiver
     /// type is a known ADT ([`trait_method_on_known_receiver`]).
     ///
@@ -9115,13 +9117,15 @@ impl<'a> Lowering<'a> {
     /// already selected the impl, so the call is that impl's graph.
     /// `specialize.py default_specialize` / `FunctionDesc.cachedgraph`:
     /// a resolved impl method with concrete type arguments is its own
-    /// graph, including a call from a non-spec body. The trait-declaration
-    /// default body keeps generic `align_of::<GcEntries<K, V>>()` residual.
+    /// graph, including a call from a non-spec body. An inherited default
+    /// is the same: one graph per `Self`, so `opcode_build_list::<H>`
+    /// inside `OpcodeStepExecutor::build_list` sees a concrete `H`.
     pub(in crate::front::mir) fn specialized_trait_target(
         &self,
         payload: &serde_json::Value,
     ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
-        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
+        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)
+            .or_else(|| crate::front::clause_spec::trait_default_method(payload, self.llbc))?;
         let fd = self.llbc.fn_by_id(fn_id)?;
         // No unstructured body: keep the ordinary `CallKind::Trait` route.
         // A spec path for this method would name a graph nobody registers.
@@ -9170,9 +9174,17 @@ impl<'a> Lowering<'a> {
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
         }
-        // Only a body this LLBC extracted can be copied. An opaque
-        // declaration (a foreign crate's or std's) keeps its bare path.
-        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+        // Only a body this LLBC extracted can be copied here. An opaque
+        // foreign or std declaration keeps its bare path. A bodyless
+        // local-crate generic is the copy that crate's own LLBC carries
+        // (`instance_leaf`): name the spec path so `graphs_from` finds
+        // it, and enqueue so the owning crate can `cachedgraph` it.
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd)
+            && !fd.item_meta.name.first().is_some_and(|seg| {
+                matches!(seg, NameSeg::Ident { ident: (root, _) }
+                    if crate::local_crates::is_local_crate_root(root))
+            })
+        {
             return None;
         }
         // A builtin is not a `FunctionDesc` (`BUILTIN_ANALYZERS`); it gets no specialized graph.
@@ -9210,6 +9222,7 @@ impl<'a> Lowering<'a> {
         spec.borrow_mut()
             .enqueue(crate::front::clause_spec::SpecRequest {
                 fn_id: fd.def_id,
+                fn_path: fd.item_meta.name_path(),
                 leaf: leaf.clone(),
                 trait_refs,
                 types,

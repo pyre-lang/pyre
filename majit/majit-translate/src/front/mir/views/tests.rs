@@ -3,10 +3,10 @@ use crate::model::{CallTarget, LinkArg, OpKind};
 use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 use crate::front::mir::tests::{
-    fixture_item_meta, graph_ops, ident_path, std_extern_call_fixture_with_types,
-    window_call_leafs, window_empty_generics, window_graph_ops, window_llbc, window_local,
-    window_meta, window_opaque_fun, window_place, window_shared_slice, window_span,
-    window_unwind_and_return_blocks, window_usize,
+    fixture_item_meta, graph_ops, ident_path, llbc_with_trait_impls,
+    std_extern_call_fixture_with_types, window_call_leafs, window_empty_generics, window_graph_ops,
+    window_llbc, window_local, window_meta, window_opaque_fun, window_place, window_shared_slice,
+    window_span, window_unwind_and_return_blocks, window_usize,
 };
 
 /// `k = w_bytes_data(key); entries.get(k)` keeps `k` as one `Ptr(STR)`
@@ -536,96 +536,129 @@ fn fat_box_len_and_index_keep_the_field_read() {
     );
 }
 
-/// The Sized gate: a shared reference to a fat pointee (`&[T]`, spelled
-/// `{"Ref":[_, {"Slice": elem}, "Shared"]}`) has no ADT def-id, so
-/// `type_node_shared_ref_pointee` + `adt_node_def_id` must NOT accept it;
-/// while a shared ref to a nominal `{"Adt": {"id": N}}` pointee
-/// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
-/// (`llbc_with_trait_impls` in this file), no real corpus.
-/// A one-word-item `&[T]` / `&mut [T]` is a pair slice; a byte slice, a
-/// borrowed array, a double borrow and a bare slice are not.
-#[test]
-fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
-    use majit_ir::rvec::VecItemKind;
-    let file = serde_json::json!({
-        "charon_version": "0.1.201",
-        "has_errors": false,
-        "translated": {
-            "crate_name": "fixture",
-            "type_decls": [{
-                "def_id": 0,
-                "item_meta": fixture_item_meta(ident_path(&["PyObject"])),
-                "kind": {"Struct": []}
-            }],
-            "fun_decls": [], "global_decls": [],
-            "trait_decls": [], "trait_impls": [],
-        }
-    });
-    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-    let usize_ty = serde_json::json!({ "Scalar": { "Integer": { "Unsigned": "Usize" } } });
-    let objptr = serde_json::json!({
-        "RawPtr": [{"Adt": {"id": 0, "generics": {"types": []}}}, "Mut"]
-    });
-    let kind =
-        |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
-    assert_eq!(
-        kind(serde_json::json!({ "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] })),
-        Some(VecItemKind::Int)
-    );
-    assert_eq!(
-        kind(
-            serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Float": "F64" } }, null] }, "Mut"] })
-        ),
-        Some(VecItemKind::Float)
-    );
-    assert_eq!(
-        kind(
-            serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"] })
-        ),
-        None
-    );
-    assert_eq!(
-        kind(
-            serde_json::json!({ "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"] })
-        ),
-        None
-    );
-    assert_eq!(
-        kind(
-            serde_json::json!({ "Ref": ["'_", { "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] }, "Shared"] })
-        ),
-        None
-    );
-    assert_eq!(kind(serde_json::json!({ "Slice": [usize_ty, null] })), None);
-    assert_eq!(super::spelling_pair_field_kind("[PyObjectRef]"), None);
-    assert_eq!(super::spelling_pair_field_kind("[*mut PyObject]"), None);
-    assert_eq!(
-        super::spelling_pair_field_kind("[*const pyre_object::PyObject]"),
-        None
-    );
-    assert_eq!(
-        super::spelling_pair_field_kind("[*mut u8]"),
-        Some(VecItemKind::Ref)
-    );
-    assert!(super::gcref_item_spelling("GCREF"));
-    assert!(super::gcref_item_spelling("majit_gc::GCREF"));
-    assert!(!super::gcref_item_spelling("*mut u8"));
-    assert_eq!(
-        super::spelling_pair_field_kind("[usize]"),
-        Some(VecItemKind::Int)
-    );
-    assert_eq!(
-        kind(serde_json::json!({
-            "Ref": ["'_", { "Slice": [objptr.clone(), null] }, "Mut"]
-        })),
-        Some(VecItemKind::Ref),
-        "object-pointer &mut [T] is the {{ptr, len}} view"
-    );
-    assert_eq!(
-        kind(serde_json::json!({
-            "Ref": ["'_", { "Slice": [objptr, null] }, "Shared"]
-        })),
-        None,
-        "object-pointer &[T] stays the length-prefixed object array"
-    );
-}
+    /// The Sized gate: a shared reference to a fat pointee (`&[T]`, spelled
+    /// `{"Ref":[_, {"Slice": elem}, "Shared"]}`) has no ADT def-id, so
+    /// `type_node_shared_ref_pointee` + `adt_node_def_id` must NOT accept it;
+    /// while a shared ref to a nominal `{"Adt": {"id": N}}` pointee
+    /// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
+    /// (`llbc_with_trait_impls` in this file), no real corpus.
+    /// A one-word-item `&[T]` / `&mut [T]` is a pair slice; a byte slice, a
+    /// borrowed array, a double borrow and a bare slice are not.
+    #[test]
+    fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
+        use majit_ir::rvec::VecItemKind;
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": fixture_item_meta(ident_path(&["PyObject"])),
+                    "kind": {"Struct": []}
+                }],
+                "fun_decls": [], "global_decls": [],
+                "trait_decls": [], "trait_impls": [],
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let usize_ty = serde_json::json!({ "Scalar": { "Integer": { "Unsigned": "Usize" } } });
+        let objptr = serde_json::json!({
+            "RawPtr": [{"Adt": {"id": 0, "generics": {"types": []}}}, "Mut"]
+        });
+        let kind =
+            |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] })
+            ),
+            Some(VecItemKind::Int)
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Float": "F64" } }, null] }, "Mut"] })
+            ),
+            Some(VecItemKind::Float)
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"] })
+            ),
+            None
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"] })
+            ),
+            None
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] }, "Shared"] })
+            ),
+            None
+        );
+        assert_eq!(kind(serde_json::json!({ "Slice": [usize_ty, null] })), None);
+        assert_eq!(super::spelling_pair_field_kind("[PyObjectRef]"), None);
+        assert_eq!(super::spelling_pair_field_kind("[*mut PyObject]"), None);
+        assert_eq!(
+            super::spelling_pair_field_kind("[*const pyre_object::PyObject]"),
+            None
+        );
+        assert_eq!(
+            super::spelling_pair_field_kind("[*mut u8]"),
+            Some(VecItemKind::Ref)
+        );
+        assert!(super::gcref_item_spelling("GCREF"));
+        assert!(super::gcref_item_spelling("majit_gc::GCREF"));
+        assert!(!super::gcref_item_spelling("*mut u8"));
+        assert_eq!(
+            super::spelling_pair_field_kind("[usize]"),
+            Some(VecItemKind::Int)
+        );
+        assert_eq!(
+            kind(serde_json::json!({
+                "Ref": ["'_", { "Slice": [objptr.clone(), null] }, "Mut"]
+            })),
+            Some(VecItemKind::Ref),
+            "object-pointer &mut [T] is the {{ptr, len}} view"
+        );
+        assert_eq!(
+            kind(serde_json::json!({
+                "Ref": ["'_", { "Slice": [objptr, null] }, "Shared"]
+            })),
+            None,
+            "object-pointer &[T] stays the length-prefixed object array"
+        );
+        // A slice of a Copy associated type is the same `{ptr, len}` fat
+        // pointer. Unique-impl resolution spells a raw pointer; an
+        // unresolved projection is still one word.
+        let ptr = serde_json::json!({"RawPtr": [usize_ty.clone(), "Mut"]});
+        let binding = serde_json::json!({
+            "kind": {"TraitType": [0, 0]},
+            "skip_binder": {"value": ptr}
+        });
+        let row = serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": []}},
+            "types": [binding],
+            "implied_trait_refs": []
+        });
+        let unique = llbc_with_trait_impls(serde_json::json!([row.clone()]));
+        let projection = serde_json::json!({
+            "TraitType": [
+                {"kind": {"Clause": {"Bound": [0, 0]}}, "trait_decl_ref": {"skip_binder": {"id": 0}}},
+                0,
+                {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+            ]
+        });
+        let slice_of = |item: serde_json::Value| serde_json::json!({ "Ref": ["'_", { "Slice": [item, null] }, "Shared"] });
+        assert_eq!(
+            super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection.clone())), &unique),
+            Some(VecItemKind::Ref)
+        );
+        let ambiguous = llbc_with_trait_impls(serde_json::json!([row.clone(), row]));
+        assert_eq!(
+            super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection)), &ambiguous),
+            Some(VecItemKind::Ref)
+        );
+    }

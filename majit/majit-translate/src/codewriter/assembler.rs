@@ -9473,6 +9473,7 @@ mod tests {
             "ref_isconstant/r",
             "float_isconstant/f",
             "ref_isvirtual/r",
+            "int_isvirtual/i",
         ] {
             assert!(
                 crate::insns::insn_byte_opt(key).is_none(),

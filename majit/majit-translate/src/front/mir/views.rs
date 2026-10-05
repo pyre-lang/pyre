@@ -4387,6 +4387,12 @@ pub(in crate::front::mir) fn slice_item_node_is_object_pointer(
 /// is an address in the slice but the referent's value everywhere else in
 /// the value model, so it is never an item of the pair.  An object pointer
 /// is the length-prefixed object array ([`object_pointer_item_spelling`]).
+///
+/// A Rust slice is the `{ptr, len}` fat pointer itself, including when
+/// the item is still a `TraitType` / `TypeVar` (a Copy associated type
+/// or a type parameter occupies one word). A unique-impl projection
+/// that spells a one-word type keeps that kind; an unresolved
+/// projection is a word in the `Ref` bank.
 pub(in crate::front::mir) fn pair_item_kind_of_node(
     item: &serde_json::Value,
     llbc: &Llbc,
@@ -4401,10 +4407,15 @@ pub(in crate::front::mir) fn pair_item_kind_of_node(
     if object_pointer_item_spelling(&spelling) {
         return None;
     }
-    majit_ir::rvec::rust_slice_item_kind_for_spelling(
+    if let Some(kind) = majit_ir::rvec::rust_slice_item_kind_for_spelling(
         &format!("[{spelling}]"),
         crate::layout::target_word_size(),
-    )
+    ) {
+        return Some(kind);
+    }
+    let node = strip_ty_indirections(item, llbc)?;
+    (node.get("TraitType").is_some() || node.get("TypeVar").is_some())
+        .then_some(majit_ir::rvec::VecItemKind::Ref)
 }
 
 /// One-word item kind of `*const T` / `*mut T` for `copy_nonoverlapping`.
