@@ -1267,8 +1267,8 @@ fn span_ref_json(span: &SpanRef) -> Value {
 fn ty_ref_json(ty: &TyRef) -> Value {
     match ty {
         TyRef::Dedup { id } => json!({ "Deduplicated": id }),
-        TyRef::Inline { value: (id, v) } => json!({ "Value": [*id, v] }),
-        TyRef::Other(v) => v.clone(),
+        TyRef::Inline { value: (id, v) } => json!({ "Value": [*id, &**v] }),
+        TyRef::Other(v) => (*v.0).clone(),
     }
 }
 

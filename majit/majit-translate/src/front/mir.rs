@@ -113,8 +113,8 @@ use majit_charon_reader::{
     Llbc,
     ullbc::{
         BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FieldDecl, FunDecl, FunId,
-        GlobalDecl, NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue,
-        StmtKind, SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
+        GlobalDecl, JsonVal, NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall,
+        Rvalue, StmtKind, SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
         const_fn_def_regular_id,
     },
 };
@@ -1226,6 +1226,117 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         None,
         no_tombstoned_leaves(),
     )
+}
+
+/// Sorted unique MIR-local indices for one block.
+///
+/// Same reasoning as [`PackedLocalRow`]: a dense `BitSet` row is sized by
+/// the body's local count (or by the highest inserted index), and one row
+/// per block makes the table `blocks * locals`. A live-in handful is a
+/// handful of `u32`s.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LocalSet {
+    ids: Vec<u32>,
+}
+
+impl LocalSet {
+    fn new() -> Self {
+        Self { ids: Vec::new() }
+    }
+
+    fn contains(&self, local: usize) -> bool {
+        let Ok(id) = u32::try_from(local) else {
+            return false;
+        };
+        self.ids.binary_search(&id).is_ok()
+    }
+
+    fn insert(&mut self, local: usize) {
+        let Ok(id) = u32::try_from(local) else {
+            return;
+        };
+        if let Err(i) = self.ids.binary_search(&id) {
+            self.ids.insert(i, id);
+        }
+    }
+
+    fn remove(&mut self, local: usize) {
+        let Ok(id) = u32::try_from(local) else {
+            return;
+        };
+        if let Ok(i) = self.ids.binary_search(&id) {
+            self.ids.remove(i);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ids.clear();
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.ids.iter().map(|&id| id as usize)
+    }
+
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+        for local in iter {
+            self.insert(local);
+        }
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        if other.ids.is_empty() {
+            return;
+        }
+        if self.ids.is_empty() {
+            self.ids = other.ids.clone();
+            return;
+        }
+        let mut merged = Vec::with_capacity(self.ids.len() + other.ids.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < self.ids.len() && j < other.ids.len() {
+            match self.ids[i].cmp(&other.ids[j]) {
+                std::cmp::Ordering::Less => {
+                    merged.push(self.ids[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    merged.push(other.ids[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    merged.push(self.ids[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        merged.extend_from_slice(&self.ids[i..]);
+        merged.extend_from_slice(&other.ids[j..]);
+        self.ids = merged;
+    }
+
+    fn difference_with(&mut self, other: &Self) {
+        if other.ids.is_empty() || self.ids.is_empty() {
+            return;
+        }
+        let mut kept = Vec::with_capacity(self.ids.len());
+        let mut j = 0usize;
+        for &id in &self.ids {
+            while j < other.ids.len() && other.ids[j] < id {
+                j += 1;
+            }
+            if j < other.ids.len() && other.ids[j] == id {
+                j += 1;
+                continue;
+            }
+            kept.push(id);
+        }
+        self.ids = kept;
+    }
+}
+
+fn empty_block_local_sets(n_blocks: usize) -> Vec<LocalSet> {
+    vec![LocalSet::new(); n_blocks]
 }
 
 /// One block's slot-indexed `Option<Variable>` row, stored by bound slot.
@@ -8224,14 +8335,14 @@ fn successor_blocks(
 /// is filled. The generic `SwitchInt` path still filters the panic default
 /// link, so an over-included panic block just becomes a lowered block with
 /// no incoming link.
-fn switch_int_niche_emits_default(llbc: &Llbc, arms: &[(serde_json::Value, u64)]) -> bool {
+fn switch_int_niche_emits_default(llbc: &Llbc, arms: &[(JsonVal, u64)]) -> bool {
     if arms.len() == 1 && arms[0].0.get("Ref").is_some() {
         return true;
     }
     niche_option_switch_missing_01_arm(llbc, arms)
 }
 
-fn niche_option_switch_missing_01_arm(llbc: &Llbc, arms: &[(serde_json::Value, u64)]) -> bool {
+fn niche_option_switch_missing_01_arm(llbc: &Llbc, arms: &[(JsonVal, u64)]) -> bool {
     let mut has0 = false;
     let mut has1 = false;
     for (scalar, _) in arms {
@@ -8555,7 +8666,7 @@ struct Lowering<'a> {
     /// MIR locals that are live when entering each block. Non-entry
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
-    block_live_in: Vec<bit_set::BitSet>,
+    block_live_in: Vec<LocalSet>,
     /// MIR locals this body moves out of.  A root-bracket guard among them is
     /// dropped under an initialisation flag the artefact does not carry, so
     /// its bracket is left open rather than closed on a path that may not own
@@ -8588,11 +8699,11 @@ struct Lowering<'a> {
     /// Pass-1 leftover inputarg position does not match a live-in link.
     pending_vec_frees: Vec<(BlockId, Variable, majit_ir::rvec::VecItemKind)>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
-    block_positional_seen: Vec<bit_set::BitSet>,
-    block_positional_conflict: Vec<bit_set::BitSet>,
-    block_entry_string_byte_view_locals: Vec<bit_set::BitSet>,
-    block_byte_view_seen: Vec<bit_set::BitSet>,
-    block_byte_view_conflict: Vec<bit_set::BitSet>,
+    block_positional_seen: Vec<LocalSet>,
+    block_positional_conflict: Vec<LocalSet>,
+    block_entry_string_byte_view_locals: Vec<LocalSet>,
+    block_byte_view_seen: Vec<LocalSet>,
+    block_byte_view_conflict: Vec<LocalSet>,
     /// Maps each MIR local whose current binding was produced by a
     /// positional [`Rvalue::Aggregate`] (tuple / array / closure — any
     /// kind for which [`Lowering::resolve_aggregate_adt`] returns
@@ -9554,7 +9665,7 @@ impl<'a> Lowering<'a> {
         // Panic-abort blocks stay in the fixpoint above so their uses still
         // flow into the switch that targets them. Only the lowered closure
         // keeps a row.
-        let block_live_in: Vec<bit_set::BitSet> = block_live_in
+        let block_live_in: Vec<LocalSet> = block_live_in
             .into_iter()
             .enumerate()
             .filter(|(mir_bb, _)| lowered.get(*mir_bb).copied().unwrap_or(false))
@@ -9649,14 +9760,11 @@ impl<'a> Lowering<'a> {
             input_copied_from: std::collections::HashMap::new(),
             object_vec_headers: std::collections::HashSet::new(),
             block_entry_positional_aggregate_locals,
-            block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
-            block_positional_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
-            block_entry_string_byte_view_locals: vec![
-                bit_set::BitSet::with_capacity(n_locals);
-                nrows
-            ],
-            block_byte_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
-            block_byte_view_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
+            block_positional_seen: empty_block_local_sets(nrows),
+            block_positional_conflict: empty_block_local_sets(nrows),
+            block_entry_string_byte_view_locals: empty_block_local_sets(nrows),
+            block_byte_view_seen: empty_block_local_sets(nrows),
+            block_byte_view_conflict: empty_block_local_sets(nrows),
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(llbc, body),
             builder_mode: false,
@@ -10489,13 +10597,17 @@ impl<'a> Lowering<'a> {
 
         // 1. Statements -> SpaceOperations on the corresponding block.
         for (s_idx, st) in bb.statements.iter().enumerate() {
-            let kind = st.stmt_kind().map_err(LowerError::Schema)?;
-            self.lower_statement(mir_bb, s_idx, kind)?;
+            let kind = st
+                .stmt_kind_ref()
+                .map_err(|e| LowerError::Schema(e.to_string()))?;
+            self.lower_statement(mir_bb, s_idx, kind.clone())?;
         }
 
         // 2. Terminator -> block exits (close the block).
-        let term = bb.term(self.llbc).map_err(LowerError::Schema)?;
-        self.lower_terminator(mir_bb, term)
+        let term = bb
+            .term_ref(self.llbc)
+            .map_err(|e| LowerError::Schema(e.to_string()))?;
+        self.lower_terminator(mir_bb, term.clone())
     }
 
     // Statements
@@ -12563,8 +12675,8 @@ impl<'a> Lowering<'a> {
             let Some(arg_node) = tyref_peel_one_ref_node(passed, self.llbc) else {
                 continue;
             };
-            let param_pointee = TyRef::Other(param_node.clone());
-            let arg_pointee = TyRef::Other(arg_node.clone());
+            let param_pointee = TyRef::Other(param_node.clone().into());
+            let arg_pointee = TyRef::Other(arg_node.clone().into());
             let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(&param_pointee)
             else {
                 continue;
@@ -13008,7 +13120,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(id) = dest.kind else {
@@ -13063,7 +13175,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 if !matches!(dest.kind, PlaceKind::Projection(..)) {
@@ -13214,7 +13326,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(id) = dest.kind else {
@@ -13240,7 +13352,7 @@ impl<'a> Lowering<'a> {
         self.body.body.iter().enumerate().any(|(bb_idx, block)| {
             self.forward_reached[bb_idx]
                 && block.statements.iter().any(|stmt| {
-                    let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind() else {
+                    let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind_ref() else {
                         return false;
                     };
                     matches!(dest.kind, PlaceKind::Projection(..))
@@ -13268,7 +13380,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 if let PlaceKind::Local(id) = dest.kind {
@@ -13432,7 +13544,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(index) = dest.kind else {
@@ -13578,7 +13690,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(index) = dest.kind else {
@@ -16663,7 +16775,7 @@ impl<'a> Lowering<'a> {
         let item_ty = tyref_raw_array_parts(&self.body.locals.locals[storage].ty, self.llbc)
             .map(|(item, _)| {
                 tyref_to_value_type_with(
-                    &TyRef::Other(item.clone()),
+                    &TyRef::Other(item.clone().into()),
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
@@ -23366,7 +23478,8 @@ impl<'a> Lowering<'a> {
                     "types": [],
                     "const_generics": [],
                     "trait_refs": []
-                }),
+                })
+                .into(),
             }),
             args: vec![Operand::Move(Place {
                 kind: PlaceKind::Local(dest_local as u64),
@@ -35960,7 +36073,7 @@ impl<'a> Lowering<'a> {
             .get("types")?
             .get(0)?;
         Some(tyref_enum_payload_value_type(
-            &TyRef::Other(inner.clone()),
+            &TyRef::Other(inner.clone().into()),
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
@@ -36111,7 +36224,7 @@ impl<'a> Lowering<'a> {
         let stripped = strip_ty_wrappers(payload, self.llbc)?;
         let rendered = charon_type_value_to_ast_string(stripped, self.llbc, 0);
         let payload_ty = tyref_enum_payload_value_type(
-            &TyRef::Other(payload.clone()),
+            &TyRef::Other(payload.clone().into()),
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
@@ -37025,17 +37138,20 @@ impl<'a> Lowering<'a> {
     fn option_dest_with_payload(&self, dest_ty: &TyRef, payload: &TyRef) -> Option<TyRef> {
         let def_id = self.tyref_adt_def_id(dest_ty)?;
         let payload_node = tyref_node(payload, self.llbc)?.clone();
-        Some(TyRef::Other(serde_json::json!({
-            "Adt": {
-                "id": def_id,
-                "generics": {
-                    "regions": [],
-                    "types": [payload_node],
-                    "const_generics": [],
-                    "trait_refs": []
+        Some(TyRef::Other(
+            serde_json::json!({
+                "Adt": {
+                    "id": def_id,
+                    "generics": {
+                        "regions": [],
+                        "types": [payload_node],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
                 }
-            }
-        })))
+            })
+            .into(),
+        ))
     }
 
     /// When the dest place dropped its generics, rebuild the dest type
@@ -38513,7 +38629,7 @@ impl<'a> Lowering<'a> {
         match payload_path.as_deref() {
             Some("core::ptr::non_null::NonNull") => true,
             Some("alloc::vec::Vec") => {
-                tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_none()
+                tyref_rust_vec_item_kind(&TyRef::Other(payload.clone().into()), self.llbc).is_none()
             }
             _ => false,
         }
@@ -41378,7 +41494,7 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         bb_id: BlockId,
         discr_var: Variable,
-        arms: Vec<(serde_json::Value, u64)>,
+        arms: Vec<(majit_charon_reader::ullbc::JsonVal, u64)>,
         default: u64,
     ) -> Result<(), LowerError> {
         let mut some_bb: Option<u64> = None;
@@ -44217,7 +44333,7 @@ fn explicit_drop_guard_local(
     let (cur, _) = mem_drop_moved_place(call, name_of)?;
     let mut cur = cur as usize;
     for stmt in bb.statements.iter().rev() {
-        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
             continue;
         };
         if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
@@ -44275,7 +44391,7 @@ fn explicit_drop_is_the_only_move(
                 return false;
             }
             let Some(src) = bb.statements.iter().rev().find_map(|stmt| {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     return None;
                 };
                 if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
@@ -44333,7 +44449,7 @@ fn explicit_drop_temp_of_owned_guard(
             }
             steps -= 1;
             let Some(src) = bb.statements.iter().rev().find_map(|stmt| {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     return None;
                 };
                 if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
@@ -44404,17 +44520,20 @@ fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
 
 /// The `()` type expected by drop glue.
 fn unit_tyref() -> TyRef {
-    TyRef::Other(serde_json::json!({
-        "Adt": {
-            "id": 0, "builtin": "Tuple",
-            "generics": {
-                "regions": [],
-                "types": [],
-                "const_generics": [],
-                "trait_refs": []
+    TyRef::Other(
+        serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
             }
-        }
-    }))
+        })
+        .into(),
+    )
 }
 /// Root-stack operations whose PyObjectRef return is the physical spelling
 /// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
@@ -45164,7 +45283,7 @@ fn struct_pointee_array_type_id(
     if decl.published_struct_copy || !matches!(decl.kind, TypeDeclKind::Struct(_)) {
         return None;
     }
-    if tyref_transparent_nonzst_field(&TyRef::Other(pointee.clone()), llbc).is_some() {
+    if tyref_transparent_nonzst_field(&TyRef::Other(pointee.clone().into()), llbc).is_some() {
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
@@ -45633,49 +45752,77 @@ fn struct_field_ptr_add_trace(
     })
 }
 
-fn block_has_struct_field_value_use(llbc: &Llbc, bb: &BasicBlock, dest: usize) -> bool {
-    let mut fields = 0usize;
-    let mut other = 0usize;
+/// Locals `d` for which this block has a `(*d).field` value use.
+fn struct_field_value_dests_in_block(llbc: &Llbc, bb: &BasicBlock, dests: &mut bit_set::BitSet) {
     for stmt in &bb.statements {
         match stmt.stmt_kind_ref() {
             Ok(StmtKind::Assign(place, rvalue)) => {
-                scan_rvalue_struct_field(rvalue, dest, &mut fields, &mut other);
-                if place_is_immediate_struct_field_of(place, dest) {
-                    fields += 1;
-                }
+                collect_struct_field_dests_from_rvalue(&rvalue, dests);
+                collect_struct_field_dest_from_place(&place, dests);
             }
             Ok(StmtKind::Assert(assert)) => {
-                bump_struct_field_use(
-                    operand_struct_field_use(&assert.cond, dest),
-                    &mut fields,
-                    &mut other,
-                );
+                collect_struct_field_dest_from_operand(&assert.cond, dests);
             }
             _ => {}
         }
     }
     match bb.term_ref(llbc) {
-        Ok(TermKind::Switch { discr, .. }) => bump_struct_field_use(
-            operand_struct_field_use(discr, dest),
-            &mut fields,
-            &mut other,
-        ),
+        Ok(TermKind::Switch { discr, .. }) => collect_struct_field_dest_from_operand(&discr, dests),
         Ok(TermKind::Call { call, .. }) => {
             if let CallFunc::Dynamic(op) = &call.func {
-                bump_struct_field_use(operand_struct_field_use(op, dest), &mut fields, &mut other);
+                collect_struct_field_dest_from_operand(op, dests);
             }
             for arg in &call.args {
-                bump_struct_field_use(operand_struct_field_use(arg, dest), &mut fields, &mut other);
+                collect_struct_field_dest_from_operand(arg, dests);
             }
         }
-        Ok(TermKind::Assert { assert, .. }) => bump_struct_field_use(
-            operand_struct_field_use(&assert.cond, dest),
-            &mut fields,
-            &mut other,
-        ),
+        Ok(TermKind::Assert { assert, .. }) => {
+            collect_struct_field_dest_from_operand(&assert.cond, dests)
+        }
         _ => {}
     }
-    fields > 0
+}
+
+fn collect_struct_field_dest_from_place(place: &Place, dests: &mut bit_set::BitSet) {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return;
+    };
+    if let Some(dest) = struct_field_deref_local(inner, elem) {
+        dests.insert(dest);
+    }
+}
+
+fn collect_struct_field_dest_from_operand(op: &Operand, dests: &mut bit_set::BitSet) {
+    let (Operand::Copy(place) | Operand::Move(place)) = op else {
+        return;
+    };
+    collect_struct_field_dest_from_place(place, dests);
+}
+
+fn collect_struct_field_dests_from_rvalue(rvalue: &Rvalue, dests: &mut bit_set::BitSet) {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::ShallowInitBox(op, _) => collect_struct_field_dest_from_operand(op, dests),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            collect_struct_field_dest_from_operand(lhs, dests);
+            collect_struct_field_dest_from_operand(rhs, dests);
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                collect_struct_field_dest_from_operand(op, dests);
+            }
+        }
+        // Address-of, length, and discriminant are not value field uses.
+        Rvalue::Ref { .. }
+        | Rvalue::RawPtr { .. }
+        | Rvalue::Len(_)
+        | Rvalue::Discriminant(_)
+        | Rvalue::NullaryOp(_, _)
+        | Rvalue::Unknown => {}
+    }
 }
 
 /// `index_mut` result used only as the element: one deref load, one deref
@@ -46448,7 +46595,7 @@ fn body_returns_owned_scope(
     let guards: bit_set::BitSet = body
         .body
         .iter()
-        .filter_map(|bb| match bb.term(llbc) {
+        .filter_map(|bb| match bb.term_ref(llbc) {
             Ok(TermKind::Call { call, .. }) => match (&call.func, &call.dest.kind) {
                 (CallFunc::Regular(reg), PlaceKind::Local(dest))
                     if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
@@ -46476,7 +46623,7 @@ fn body_returns_owned_scope(
             }
             for stmt in &bb.statements {
                 if let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src), _))) =
-                    stmt.stmt_kind()
+                    stmt.stmt_kind_ref()
                     && let (PlaceKind::Local(dest), PlaceKind::Local(from)) =
                         (&place.kind, &src.kind)
                     && guards.contains(*from as usize)
@@ -46496,7 +46643,7 @@ fn body_returns_owned_scope(
             continue;
         }
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref() else {
                 continue;
             };
             let PlaceKind::Local(dest) = place.kind else {
@@ -46849,7 +46996,7 @@ fn root_pin_value_is_stable_in_bracket(
         return true;
     }
     let watched: bit_set::BitSet = std::iter::once(local).collect();
-    let get_dest = |bb: usize| match body.body[bb].term(llbc) {
+    let get_dest = |bb: usize| match body.body[bb].term_ref(llbc) {
         Ok(TermKind::Call { call, .. }) => match call.dest.kind {
             PlaceKind::Local(dest) => Some(dest as usize),
             _ => None,
@@ -46864,7 +47011,7 @@ fn root_pin_value_is_stable_in_bracket(
         }
         let in_region = region.contains(bb_idx);
         for stmt in &bb.statements {
-            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() {
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref() {
                 if matches!(value, Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
                     && mentions_local(stmt.kind_value(), &watched)
                 {
@@ -47063,11 +47210,11 @@ fn pin_roots_slice_values(
             .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
             .flat_map(|(_, bb)| bb.statements.iter())
             .find_map(|stmt| {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, value))
                     if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
                 {
-                    Some(value)
+                    Some(value.clone())
                 }
                 _ => None,
             }
@@ -47496,7 +47643,7 @@ fn classify_root_slot_getter_body(
             continue;
         }
         for stmt in &bb.statements {
-            match stmt.stmt_kind().ok()? {
+            match stmt.stmt_kind_ref().ok()? {
                 StmtKind::StorageLive(_)
                 | StmtKind::StorageDead(_)
                 | StmtKind::Borrowck(_)
@@ -47851,10 +47998,10 @@ fn single_statement_rvalue(
             continue;
         }
         for stmt in &bb.statements {
-            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind()
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref()
                 && matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local)
             {
-                return Some(value);
+                return Some(value.clone());
             }
         }
     }
@@ -48177,7 +48324,7 @@ fn record_root_slot_getter_reads(
         if !index.forward_blocks[bb_idx] {
             continue;
         }
-        let Ok(term) = bb.term(llbc) else {
+        let Ok(term) = bb.term_ref(llbc) else {
             continue;
         };
         let TermKind::Call { call, .. } = term else {
@@ -48186,7 +48333,7 @@ fn record_root_slot_getter_reads(
         if let PlaceKind::Local(dest) = call.dest.kind {
             call_dests.insert(dest as usize);
         }
-        calls.push((bb_idx, call));
+        calls.push((bb_idx, call.clone()));
     }
     let index = RootGetterIndex {
         call_dests: &call_dests,
@@ -48426,7 +48573,7 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
                 remap_portable_type_ids(&mut ty, llbc, &exact, &stripped_unique);
                 majit_charon_reader::ullbc::FieldDecl {
                     name: field.name.clone(),
-                    ty: TyRef::Other(ty),
+                    ty: TyRef::Other(ty.into()),
                     attr_info: None,
                 }
             })
@@ -51187,7 +51334,7 @@ fn elaborate_explicit_root_closes(
         if !forward_blocks[bb_idx] {
             continue;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {
@@ -51209,7 +51356,7 @@ fn elaborate_explicit_root_closes(
         let mut temps = Vec::new();
         let mut moves = Vec::new();
         for (i, stmt) in bb.statements.iter().enumerate().rev() {
-            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
             };
             if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
@@ -51245,7 +51392,7 @@ fn elaborate_explicit_root_closes(
         if !forward_blocks[bb_idx] {
             continue;
         }
-        if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
             && let CallFunc::Regular(reg) = &call.func
             && name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
             && let PlaceKind::Local(dest) = call.dest.kind
@@ -51255,7 +51402,7 @@ fn elaborate_explicit_root_closes(
     }
     let move_counts = local_move_counts(body, llbc);
     let drop_of = |bb: &majit_charon_reader::ullbc::BasicBlock| -> Option<usize> {
-        match bb.term(llbc) {
+        match bb.term_ref(llbc) {
             Ok(TermKind::Drop { place, .. }) => match place.kind {
                 PlaceKind::Local(l) => Some(l as usize),
                 _ => None,
@@ -51299,7 +51446,7 @@ fn elaborate_explicit_root_closes(
             let stmt_hit = bb.statements.iter().enumerate().any(|(i, stmt)| {
                 !chain.is_some_and(|c| c.moves.contains(&i))
                     && !matches!(
-                        stmt.stmt_kind(),
+                        stmt.stmt_kind_ref(),
                         Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_))
                     )
                     && mentions_local(stmt.kind_value(), &private)
@@ -51325,7 +51472,7 @@ fn elaborate_explicit_root_closes(
                 if !forward_blocks[bb_idx] {
                     return None;
                 }
-                match bb.term(llbc) {
+                match bb.term_ref(llbc) {
                     Ok(TermKind::Drop { place, fn_ptr, .. })
                         if matches!(place.kind, PlaceKind::Local(l) if l as usize == guard || temps.contains(l as usize))
                             && name_of(&fn_ptr)
@@ -51384,7 +51531,7 @@ fn elaborate_explicit_root_closes(
         for c in &mine {
             let Ok(TermKind::Call {
                 target, on_unwind, ..
-            }) = body.body[c.bb].term(llbc)
+            }) = body.body[c.bb].term_ref(llbc)
             else {
                 continue;
             };
@@ -51400,7 +51547,7 @@ fn elaborate_explicit_root_closes(
                 continue;
             }
             let is_dead = dead.contains(&bb_idx) || drop_of(bb).is_some_and(|l| temps.contains(l));
-            if is_dead && let Ok(TermKind::Drop { target, .. }) = bb.term(llbc) {
+            if is_dead && let Ok(TermKind::Drop { target, .. }) = bb.term_ref(llbc) {
                 rewrites.push((bb_idx, serde_json::json!({"Goto": {"target": target}})));
             }
         }
@@ -51738,8 +51885,13 @@ fn compute_interior_field_extra_live(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<Vec<usize>> {
-    let mut extra = vec![Vec::new(); body.body.len()];
+    let n_blocks = body.body.len();
+    let n_locals = body.locals.locals.len();
     let forward_blocks = forward_reachable_mask(llbc, body);
+    // dest local → (header, index) for each `ptr::add` this pass rewrites.
+    // Indexed by MIR local so the use scan is one pass over the body, not a
+    // (add × block) product (`graphanalyze.py` walks each op once).
+    let mut dest_of: Vec<Option<(usize, usize)>> = vec![None; n_locals];
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -51753,13 +51905,17 @@ fn compute_interior_field_extra_live(
         let PlaceKind::Local(dest) = call.dest.kind else {
             continue;
         };
+        let dest = dest as usize;
+        if dest >= n_locals {
+            continue;
+        }
         let Some(traced) = struct_field_ptr_add_trace(
             reg,
             call.args.len(),
             operand_local(call.args.first()),
             call.args.first().and_then(operand_tyref),
             operand_local(call.args.get(1)),
-            dest as usize,
+            dest,
             body,
             llbc,
             tombstoned,
@@ -51770,14 +51926,25 @@ fn compute_interior_field_extra_live(
             TracedPtrAddHeader::EntriesItem { local } => local,
             TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,
         };
-        for (use_idx, use_bb) in body.body.iter().enumerate() {
-            if !forward_blocks[use_idx] {
+        dest_of[dest] = Some((header_local, traced.index_local));
+    }
+    if dest_of.iter().all(Option::is_none) {
+        return vec![Vec::new(); n_blocks];
+    }
+    let mut extra = vec![Vec::new(); n_blocks];
+    let mut seen = bit_set::BitSet::new();
+    for (use_idx, use_bb) in body.body.iter().enumerate() {
+        if !forward_blocks[use_idx] {
+            continue;
+        }
+        seen.make_empty();
+        struct_field_value_dests_in_block(llbc, use_bb, &mut seen);
+        for dest in seen.iter() {
+            let Some((header, index)) = dest_of.get(dest).copied().flatten() else {
                 continue;
-            }
-            if block_has_struct_field_value_use(llbc, use_bb, dest as usize) {
-                extra[use_idx].push(header_local);
-                extra[use_idx].push(traced.index_local);
-            }
+            };
+            extra[use_idx].push(header);
+            extra[use_idx].push(index);
         }
     }
     extra
@@ -51788,25 +51955,14 @@ fn compute_mir_liveness(
     body: &Unstructured,
     extra_live: &[Vec<usize>],
     glue_call_drops: &bit_set::BitSet,
-) -> Vec<bit_set::BitSet> {
-    use bit_set::BitSet;
-
+) -> Vec<LocalSet> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
     // Same closure as whole-body scans: a panic-abort default still
     // contributes uses, and an `on_unwind` cleanup block does not.
     let forward = forward_reachable_mask(llbc, body);
-    let mut uses = Vec::with_capacity(n_blocks);
-    let mut defs = Vec::with_capacity(n_blocks);
-    for bb_idx in 0..n_blocks {
-        if forward[bb_idx] {
-            uses.push(BitSet::with_capacity(n_locals));
-            defs.push(BitSet::with_capacity(n_locals));
-        } else {
-            uses.push(BitSet::new());
-            defs.push(BitSet::new());
-        }
-    }
+    let mut uses = empty_block_local_sets(n_blocks);
+    let mut defs = empty_block_local_sets(n_blocks);
     let mut succs = vec![Vec::<usize>::new(); n_blocks];
     let mut preds = vec![Vec::<usize>::new(); n_blocks];
 
@@ -51900,27 +52056,24 @@ fn compute_mir_liveness(
         }
     }
 
-    let mut live_in = Vec::with_capacity(n_blocks);
-    for bb_idx in 0..n_blocks {
-        if forward[bb_idx] {
-            live_in.push(BitSet::with_capacity(n_locals));
-        } else {
-            live_in.push(BitSet::new());
-        }
-    }
+    let mut live_in = empty_block_local_sets(n_blocks);
     let mut worklist: std::collections::VecDeque<usize> =
         (0..n_blocks).rev().filter(|&bb| forward[bb]).collect();
     let mut in_worklist = forward.clone();
+    // One scratch row: `liveness.py` `compute_liveness` reuses the
+    // bitvector it unions into. Cloning a fresh `BitSet` per worklist
+    // pop is `O(blocks × locals × iterations)` retained churn.
+    let mut new_in = LocalSet::new();
     while let Some(bb_idx) = worklist.pop_front() {
         in_worklist[bb_idx] = false;
-        let mut new_in = BitSet::with_capacity(n_locals);
+        new_in.clear();
         for &succ in &succs[bb_idx] {
             new_in.union_with(&live_in[succ]);
         }
         new_in.difference_with(&defs[bb_idx]);
         new_in.union_with(&uses[bb_idx]);
         if new_in != live_in[bb_idx] {
-            live_in[bb_idx] = new_in;
+            live_in[bb_idx].clone_from(&new_in);
             for &pred in &preds[bb_idx] {
                 if !in_worklist[pred] {
                     worklist.push_back(pred);
@@ -51947,12 +52100,7 @@ fn push_successor(
     }
 }
 
-fn mark_call_uses(
-    call: &CallPayload,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_call_uses(call: &CallPayload, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     if let CallFunc::Dynamic(op) = &call.func {
         mark_operand_use(op, uses, defs, n_locals);
     }
@@ -51961,12 +52109,7 @@ fn mark_call_uses(
     }
 }
 
-fn mark_rvalue_uses(
-    rvalue: &Rvalue,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_rvalue_uses(rvalue: &Rvalue, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     match rvalue {
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
@@ -51990,24 +52133,14 @@ fn mark_rvalue_uses(
     }
 }
 
-fn mark_operand_use(
-    op: &Operand,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_operand_use(op: &Operand, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     match op {
         Operand::Copy(place) | Operand::Move(place) => mark_place_use(place, uses, defs, n_locals),
         Operand::Const(_) => {}
     }
 }
 
-fn mark_place_use(
-    place: &Place,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_place_use(place: &Place, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     match &place.kind {
         PlaceKind::Local(i) => mark_local_use(*i as usize, uses, defs, n_locals),
         PlaceKind::Projection(inner, elem) => {
@@ -52018,12 +52151,7 @@ fn mark_place_use(
     }
 }
 
-fn mark_place_write(
-    place: &Place,
-    uses: &mut bit_set::BitSet,
-    defs: &mut bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_place_write(place: &Place, uses: &mut LocalSet, defs: &mut LocalSet, n_locals: usize) {
     match &place.kind {
         PlaceKind::Local(i) => mark_local_def(*i as usize, defs, n_locals),
         PlaceKind::Projection(inner, elem) => {
@@ -52046,8 +52174,8 @@ fn mark_place_write(
 /// loop header.  `from_end` is ignored, matching `index_offset_var`.
 fn mark_projection_index_offset_use(
     elem: &ProjectionElem,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
+    uses: &mut LocalSet,
+    defs: &LocalSet,
     n_locals: usize,
 ) {
     let ProjectionElem::Tagged(v) = elem else {
@@ -52066,19 +52194,14 @@ fn mark_projection_index_offset_use(
     }
 }
 
-fn mark_local_use(
-    local_idx: usize,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_local_use(local_idx: usize, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     if local_idx >= n_locals || defs.contains(local_idx) {
         return;
     }
     uses.insert(local_idx);
 }
 
-fn mark_local_def(local_idx: usize, defs: &mut bit_set::BitSet, n_locals: usize) {
+fn mark_local_def(local_idx: usize, defs: &mut LocalSet, n_locals: usize) {
     if local_idx < n_locals {
         defs.insert(local_idx);
     }
@@ -52773,7 +52896,7 @@ fn spill_substituted_fields(
 fn substitute_spill_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
     let node = tyref_node(ty, llbc)?;
     let value = substitute_spill_value(node, owner, llbc, &mut Vec::new(), 0)?;
-    Some(TyRef::Other(value))
+    Some(TyRef::Other(value.into()))
 }
 
 /// `arg` was copied out of an aggregate's generic arguments, so it is
@@ -53183,7 +53306,7 @@ fn unstructured_address_escape(
             }
             let mut depths = incoming[index].clone();
             for stmt in &block.statements {
-                match stmt.stmt_kind() {
+                match stmt.stmt_kind_ref() {
                     Ok(StmtKind::Assign(place, rvalue)) => {
                         let value = rvalue_address(&rvalue, &depths, llbc);
                         record_stored_address(
@@ -53213,7 +53336,7 @@ fn unstructured_address_escape(
                     Ok(StmtKind::Unknown) | Err(_) => escapes = true,
                 }
             }
-            match block.term(llbc) {
+            match block.term_ref(llbc) {
                 Ok(TermKind::Call {
                     call,
                     target,
@@ -53270,7 +53393,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        target,
+                        *target,
                         &depths,
                         &mut escapes,
                     );
@@ -53278,7 +53401,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        on_unwind,
+                        *on_unwind,
                         &depths,
                         &mut escapes,
                     );
@@ -53310,7 +53433,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        target,
+                        *target,
                         &depths,
                         &mut escapes,
                     );
@@ -53318,7 +53441,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        on_unwind,
+                        *on_unwind,
                         &depths,
                         &mut escapes,
                     );
@@ -53329,11 +53452,10 @@ fn unstructured_address_escape(
                         escapes = true;
                     }
                     let successors: Vec<u64> = match targets {
-                        SwitchTargets::If(then_bb, else_bb) => vec![then_bb, else_bb],
+                        SwitchTargets::If(then_bb, else_bb) => vec![*then_bb, *else_bb],
                         SwitchTargets::SwitchInt(_, arms, default) => {
-                            let mut successors: Vec<u64> =
-                                arms.into_iter().map(|(_, bb)| bb).collect();
-                            successors.push(default);
+                            let mut successors: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
+                            successors.push(*default);
                             successors
                         }
                     };
@@ -53353,7 +53475,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        target,
+                        *target,
                         &depths,
                         &mut escapes,
                     );
@@ -53371,7 +53493,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        target,
+                        *target,
                         &depths,
                         &mut escapes,
                     );
@@ -53379,7 +53501,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        on_unwind,
+                        *on_unwind,
                         &depths,
                         &mut escapes,
                     );
@@ -57814,7 +57936,7 @@ fn declared_raw_adt_node<'a>(
     if gc_struct_ids.contains(&sid) {
         return None;
     }
-    if tyref_is_zero_sized(&TyRef::Other(node.clone()), llbc) {
+    if tyref_is_zero_sized(&TyRef::Other(node.clone().into()), llbc) {
         return None;
     }
     // A raw struct's fields are addresses and scalars. A GC pointer field
@@ -58314,7 +58436,12 @@ fn tyref_deref_value_type_with(
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return ValueType::Ref(None);
     };
-    tyref_to_value_type_with(&TyRef::Other(node.clone()), llbc, tombstoned, gc_struct_ids)
+    tyref_to_value_type_with(
+        &TyRef::Other(node.clone().into()),
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+    )
 }
 
 /// Register-bank kind of an ADT field read.
@@ -58403,7 +58530,10 @@ fn tyref_is_closure_env(ty: &TyRef, llbc: &Llbc) -> bool {
 
 fn tyref_shared_borrow_primitive_value(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     let pointee = tyref_shared_borrow_primitive_pointee(ty, llbc)?;
-    Some(tyref_to_value_type(&TyRef::Other(pointee), llbc))
+    Some(tyref_to_value_type(
+        &TyRef::Other(pointee.clone().into()),
+        llbc,
+    ))
 }
 
 /// Register-bank kind of an enum variant's payload — `Option<T>`,
@@ -58436,16 +58566,24 @@ fn tyref_enum_payload_value_type(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> ValueType {
     if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
-        return tyref_to_value_type_with(&TyRef::Other(pointee), llbc, tombstoned, gc_struct_ids);
+        return tyref_to_value_type_with(
+            &TyRef::Other(pointee.clone().into()),
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+        );
     }
     // A payload slot read straight out of `generics.types` may still carry
     // the `Value` / `Deduplicated` wrappers. [`tyref_to_value_type_with`]
     // follows those itself; stripping here keeps the node the peel above
     // already resolved.
     match tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) {
-        Some(node) => {
-            tyref_to_value_type_with(&TyRef::Other(node.clone()), llbc, tombstoned, gc_struct_ids)
-        }
+        Some(node) => tyref_to_value_type_with(
+            &TyRef::Other(node.clone().into()),
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+        ),
         None => ValueType::Ref(None),
     }
 }
@@ -58512,7 +58650,7 @@ fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return false;
     };
-    let peeled = TyRef::Other(node.clone());
+    let peeled = TyRef::Other(node.clone().into());
     if tyref_keeps_callable_identity(&peeled, llbc) {
         return false;
     }
@@ -60285,7 +60423,7 @@ fn nominal_adt_class_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let tyref = TyRef::Other(ty.clone());
+    let tyref = TyRef::Other(ty.clone().into());
     let node = strip_ty_wrappers(tyref_node(&tyref, llbc)?, llbc)?.clone();
     if let Some(root) = adt_node_class_root_leaf(&node, llbc, tombstoned) {
         return Some(root);
@@ -60446,7 +60584,7 @@ fn transparent_deref_target_class(
 /// `TyRef` of a named ADT declaration, for Deref-target / handle-field
 /// lookups that already have the `TypeDecl` in hand.
 fn type_decl_adt_tyref(def_id: u64) -> TyRef {
-    TyRef::Other(serde_json::json!({"Adt": {"id": def_id, "generics": {"types": []}}}))
+    TyRef::Other(serde_json::json!({"Adt": {"id": def_id, "generics": {"types": []}}}).into())
 }
 
 /// Field-row spelling of a transparent GC handle, or of a raw pointer to one.
@@ -60467,7 +60605,7 @@ fn transparent_handle_field_spelling(
     }
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.as_object()?.get("RawPtr")?.as_array()?.first()?;
-    let pointee_ty = TyRef::Other(pointee.clone());
+    let pointee_ty = TyRef::Other(pointee.clone().into());
     let root = transparent_deref_target_class(&pointee_ty, llbc, tombstoned, gc_struct_ids)?;
     Some(format!("*mut {root}"))
 }
@@ -61293,7 +61431,7 @@ fn raw_ptr_typed_items_element(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, St
         return None;
     }
     let pointee = strip_ty_indirections(pointee, llbc)?;
-    let item_ty = tyref_to_value_type(&TyRef::Other(pointee.clone()), llbc);
+    let item_ty = tyref_to_value_type(&TyRef::Other(pointee.clone().into()), llbc);
     Some((item_ty, format!("[{spelling}]")))
 }
 
@@ -62336,14 +62474,14 @@ fn map_collect_payload_value_type(item_ty: &TyRef, llbc: &Llbc, adds_reference: 
         return tyref_to_value_type(item_ty, llbc);
     }
     let node = match item_ty {
-        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v.clone(),
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => (*v.0).clone(),
         TyRef::Dedup { id } => llbc
             .dedup_body(*id)
             .cloned()
-            .unwrap_or(serde_json::Value::Null),
+            .unwrap_or(serde_json::Value::Null.into()),
     };
     let borrowed = serde_json::json!({"Ref": ["Erased", node, "Shared"]});
-    tyref_to_value_type(&TyRef::Other(borrowed), llbc)
+    tyref_to_value_type(&TyRef::Other(borrowed.into()), llbc)
 }
 
 fn iterator_adds_a_reference(path: &str) -> bool {
@@ -62608,7 +62746,10 @@ fn tyref_checked_binop_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> 
         return None;
     }
     let value_ty = strip_ty_wrappers(&types[0], llbc)?;
-    Some(tyref_to_value_type(&TyRef::Other(value_ty.clone()), llbc))
+    Some(tyref_to_value_type(
+        &TyRef::Other(value_ty.clone().into()),
+        llbc,
+    ))
 }
 
 /// True when `ty` is Charon's unit type `()`.
@@ -62815,8 +62956,8 @@ fn json_ty_is_objectptr(node: &serde_json::Value, llbc: &Llbc) -> bool {
 /// mislabelling a field.
 fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
     let body = match ty {
-        TyRef::Inline { value: (_, v) } => Some(v),
-        TyRef::Other(v) => Some(v),
+        TyRef::Inline { value: (_, v) } => Some(v.as_ref()),
+        TyRef::Other(v) => Some(v.as_ref()),
         TyRef::Dedup { id } => llbc.dedup_body(*id),
     };
     match body {
@@ -63736,7 +63877,7 @@ fn render_adt_payload_type_args(
                     if rendered == "Global" || rendered == "RandomState" {
                         return None;
                     }
-                    let ty = TyRef::Other(t.clone());
+                    let ty = TyRef::Other(t.clone().into());
                     Some(
                         transparent_handle_field_spelling(
                             &ty,
@@ -63918,7 +64059,7 @@ fn tyref_tuple_element(ty: &TyRef, idx: usize, llbc: &Llbc) -> Option<TyRef> {
             break;
         }
     }
-    Some(TyRef::Other(element.clone()))
+    Some(TyRef::Other(element.clone().into()))
 }
 
 /// The `Tuple<A,B>` shape of a non-unit tuple behind `ty`'s `Ref` layers —
@@ -63926,7 +64067,7 @@ fn tyref_tuple_element(ty: &TyRef, idx: usize, llbc: &Llbc) -> Option<TyRef> {
 /// tuple) — or `None` for any other type.
 fn tyref_shaped_tuple_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
-    let suffix = tyref_tuple_suffix(&TyRef::Other(node.clone()), llbc);
+    let suffix = tyref_tuple_suffix(&TyRef::Other(node.clone().into()), llbc);
     (!suffix.is_empty()).then(|| format!("Tuple{suffix}"))
 }
 
@@ -64085,7 +64226,7 @@ fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
     });
     // 3. return tyref_tuple_suffix of the wrapper — the same renderer the read
     //    side routes through, so the `&`-stripped leaf matches by construction.
-    tyref_tuple_suffix(&TyRef::Other(wrapper), llbc)
+    tyref_tuple_suffix(&TyRef::Other(wrapper.into()), llbc)
 }
 
 /// The closure-argument tuple spelling for an already projected enum payload.
@@ -64094,7 +64235,7 @@ fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
 /// identical on the two sides.
 fn payload_tuple_suffix(payload: &TyRef, llbc: &Llbc) -> String {
     let node = match payload {
-        TyRef::Inline { value: (_, value) } | TyRef::Other(value) => value.clone(),
+        TyRef::Inline { value: (_, value) } | TyRef::Other(value) => (*value.0).clone(),
         TyRef::Dedup { id } => match llbc.dedup_body(*id) {
             Some(value) => value.clone(),
             None => return String::new(),
@@ -64106,7 +64247,7 @@ fn payload_tuple_suffix(payload: &TyRef, llbc: &Llbc) -> String {
             "generics": { "types": [node] }
         }
     });
-    tyref_tuple_suffix(&TyRef::Other(wrapper), llbc)
+    tyref_tuple_suffix(&TyRef::Other(wrapper.into()), llbc)
 }
 
 /// Preserve a reference payload's concrete class across a synthesized enum
@@ -64514,7 +64655,7 @@ fn scalar_inherent_method_path(
     // fun-decl id, so `install_gc_mut_ref_call` could not wrap `&mut
     // self`, and `&self` would miss MethodDesc.func_args.
     if gc_ref_pointer(
-        &TyRef::Other(node.clone()),
+        &TyRef::Other(node.clone().into()),
         llbc,
         tombstoned,
         gc_struct_ids,
@@ -65518,7 +65659,7 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
             continue;
         }
         for st in &blk.statements {
-            let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
                 continue;
             };
             let is_local0 = matches!(place.kind, PlaceKind::Local(0));
@@ -67151,7 +67292,7 @@ fn tyref_json(ty: &TyRef) -> serde_json::Value {
     match ty {
         TyRef::Dedup { id } => serde_json::json!({"Deduplicated": id}),
         TyRef::Inline { value: (id, body) } => serde_json::json!({"Value": [id, body]}),
-        TyRef::Other(v) => v.clone(),
+        TyRef::Other(v) => (*v.0).clone(),
     }
 }
 
@@ -70830,7 +70971,7 @@ fn tyref_pair_field_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecI
         .or_else(|| {
             let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
             let referent = node.get("Ref")?.as_array()?.get(1)?;
-            tyref_pair_slice_item_kind(&TyRef::Other(referent.clone()), llbc)
+            tyref_pair_slice_item_kind(&TyRef::Other(referent.clone().into()), llbc)
         })
         .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
         // A struct field of `&mut [PyObjectRef]` stays the one-word object
@@ -71097,7 +71238,7 @@ fn iter_mut_item_is_object_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
 fn ref_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.get("Ref")?.as_array()?.get(1)?;
-    Some(TyRef::Other(pointee.clone()))
+    Some(TyRef::Other(pointee.clone().into()))
 }
 
 fn tyref_ref_pointee_value_type(
@@ -71109,7 +71250,7 @@ fn tyref_ref_pointee_value_type(
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.get("Ref")?.as_array()?.get(1)?;
     Some(tyref_to_value_type_with(
-        &TyRef::Other(pointee.clone()),
+        &TyRef::Other(pointee.clone().into()),
         llbc,
         tombstoned,
         gc_struct_ids,
@@ -71150,7 +71291,7 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
                 continue;
             }
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(dest) = place.kind else {
@@ -71189,7 +71330,7 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
         if !forward_blocks[bb_idx] {
             continue;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let PlaceKind::Local(dest) = call.dest.kind else {
@@ -71249,7 +71390,7 @@ fn item_addr_locals(
                 continue;
             }
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(dest) = place.kind else {
@@ -71286,7 +71427,7 @@ fn item_addr_locals(
                     changed = true;
                 }
             }
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             let PlaceKind::Local(dest) = call.dest.kind else {
@@ -71348,7 +71489,7 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     // `{ptr, len}` pair. `iter_mut` of that dest still walks the buffer.
     let mut whole_list_mut_dest = vec![false; n];
     for bb in &body.body {
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let PlaceKind::Local(dest) = call.dest.kind else {
@@ -71380,7 +71521,7 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     while changed {
         changed = false;
         for bb in &body.body {
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             let PlaceKind::Local(dest) = call.dest.kind else {
@@ -71661,7 +71802,7 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
             .flat_map(|(_, bb)| {
                 bb.statements
                     .iter()
-                    .filter_map(|stmt| match stmt.stmt_kind() {
+                    .filter_map(|stmt| match stmt.stmt_kind_ref() {
                         Ok(StmtKind::Assign(place, rvalue)) => match place.kind {
                             PlaceKind::Local(dest) => Some((dest as usize, place, rvalue)),
                             _ => None,
@@ -71768,37 +71909,37 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
                     .kind_value()
                     .get("Assign")
                     .and_then(|assign| assign.get(1));
-                let allowed = match stmt.stmt_kind() {
+                let allowed = match stmt.stmt_kind_ref() {
                     Ok(
                         StmtKind::StorageLive(_)
                         | StmtKind::StorageDead(_)
                         | StmtKind::PlaceMention(_)
                         | StmtKind::Borrowck(_),
                     ) => true,
-                    Ok(StmtKind::Assign(place, rvalue)) => match (place.kind, &rvalue) {
+                    Ok(StmtKind::Assign(place, rvalue)) => match (&place.kind, rvalue) {
                         (PlaceKind::Local(dest), Rvalue::Aggregate(agg, _))
-                            if dest as usize == storage && aggregate_ctor_name(agg) == "Array" =>
+                            if *dest as usize == storage && aggregate_ctor_name(agg) == "Array" =>
                         {
                             !rvalue_json.is_some_and(|rv| {
                                 mentions_local_outside_raw_array_items(rv, &wanted, &roles)
                             })
                         }
                         (PlaceKind::Local(dest), Rvalue::Repeat(..))
-                            if dest as usize == storage =>
+                            if *dest as usize == storage =>
                         {
                             !rvalue_json.is_some_and(|rv| {
                                 mentions_local_outside_raw_array_items(rv, &wanted, &roles)
                             })
                         }
                         (PlaceKind::Local(dest), Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
-                            if roles[dest as usize] == Some(RawArrayRole::Borrow(storage)) =>
+                            if roles[*dest as usize] == Some(RawArrayRole::Borrow(storage)) =>
                         {
                             true
                         }
                         (
                             PlaceKind::Local(dest),
                             Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _),
-                        ) if roles[dest as usize] == Some(RawArrayRole::Borrow(storage))
+                        ) if roles[*dest as usize] == Some(RawArrayRole::Borrow(storage))
                             && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage))) =>
                         {
                             true
@@ -71809,7 +71950,7 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
                         ) if cast_kind_is_unsize(op)
                             && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage)))
                             && tyref_pair_slice_item_kind(
-                                &body.locals.locals[dest as usize].ty,
+                                &body.locals.locals[*dest as usize].ty,
                                 llbc,
                             ) == Some(kind) =>
                         {
@@ -71822,7 +71963,7 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
                         ) if (cast_kind_is_unsize(op) || op.get("Unsize").is_some())
                             && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage)))
                             && tyref_pair_slice_item_kind(
-                                &body.locals.locals[dest as usize].ty,
+                                &body.locals.locals[*dest as usize].ty,
                                 llbc,
                             ) == Some(kind) =>
                         {
@@ -72058,7 +72199,7 @@ fn local_is_rust_vec_deref(
         if !forward_blocks[bb_idx] {
             return None;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             return None;
         };
         if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local) {
@@ -72087,7 +72228,7 @@ fn rust_vec_deref_feeds_only_reverse(body: &Unstructured, llbc: &Llbc, local: us
         }
         if bb.statements.iter().any(|stmt| {
             !matches!(
-                stmt.stmt_kind(),
+                stmt.stmt_kind_ref(),
                 Ok(StmtKind::StorageLive(_)
                     | StmtKind::StorageDead(_)
                     | StmtKind::PlaceMention(_)
@@ -74851,12 +74992,15 @@ mod tests {
             }
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-        let pointee = TyRef::Other(serde_json::json!({"Deduplicated": 7}));
+        let pointee = TyRef::Other(serde_json::json!({"Deduplicated": 7}).into());
         assert_eq!(tyref_to_value_type(&pointee, &llbc), ValueType::Int);
         assert_eq!(tyref_to_attr_value_type(&pointee, &llbc), ValueType::Int);
-        let borrowed = TyRef::Other(serde_json::json!({
-            "Ref": ["Erased", {"Deduplicated": 7}, "Shared"]
-        }));
+        let borrowed = TyRef::Other(
+            serde_json::json!({
+                "Ref": ["Erased", {"Deduplicated": 7}, "Shared"]
+            })
+            .into(),
+        );
         assert_eq!(
             tyref_to_value_type(&borrowed, &llbc),
             ValueType::Ref(None),
@@ -77061,15 +77205,18 @@ mod tests {
     #[test]
     fn fn_ptr_value_type_is_int_and_input_class_root_is_fn() {
         let llbc = fixture_llbc();
-        let ty = TyRef::Other(serde_json::json!({
-            "FnPtr": {
-                "skip_binder": {
-                    "inputs": [{"Slice": [{"Adt": {"id": 0}}]}],
-                    "output": {"Scalar": {"Integer": {"Signed": "I64"}}},
-                    "is_unsafe": false
+        let ty = TyRef::Other(
+            serde_json::json!({
+                "FnPtr": {
+                    "skip_binder": {
+                        "inputs": [{"Slice": [{"Adt": {"id": 0}}]}],
+                        "output": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                        "is_unsafe": false
+                    }
                 }
-            }
-        }));
+            })
+            .into(),
+        );
         assert_eq!(
             tyref_to_value_type(&ty, &llbc),
             ValueType::Int,
@@ -77133,15 +77280,18 @@ mod tests {
             }
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-        let ty = TyRef::Other(serde_json::json!({
-            "FnPtr": {
-                "skip_binder": {
-                    "inputs": [],
-                    "output": {"Scalar": {"Integer": {"Signed": "I64"}}},
-                    "is_unsafe": false
+        let ty = TyRef::Other(
+            serde_json::json!({
+                "FnPtr": {
+                    "skip_binder": {
+                        "inputs": [],
+                        "output": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                        "is_unsafe": false
+                    }
                 }
-            }
-        }));
+            })
+            .into(),
+        );
 
         assert_eq!(
             tyref_to_value_type(&ty, &llbc),
@@ -77175,23 +77325,29 @@ mod tests {
         });
         let owner = format!(
             "Tuple{}",
-            tyref_tuple_suffix(&TyRef::Other(tuple.clone()), &llbc)
+            tyref_tuple_suffix(&TyRef::Other(tuple.clone().into()), &llbc)
         );
         assert!(majit_ir::descr::is_shaped_tuple_name(&owner), "{owner}");
         // By value (a closure's args tuple) and behind a borrow (the read
         // place of `(*p).N` is the deref'd tuple) both name the read owner.
-        let by_value = TyRef::Other(tuple.clone());
-        let borrowed = TyRef::Other(serde_json::json!({ "Ref": ["Erased", tuple, "Shared"] }));
+        let by_value = TyRef::Other(tuple.clone().into());
+        let borrowed =
+            TyRef::Other(serde_json::json!({ "Ref": ["Erased", tuple, "Shared"] }).into());
         assert_eq!(
             tyref_shaped_tuple_root(&by_value, &llbc),
             Some(owner.clone())
         );
         assert_eq!(tyref_shaped_tuple_root(&borrowed, &llbc), Some(owner));
-        let unit = TyRef::Other(serde_json::json!({
-            "Adt": { "id": 0, "builtin": "Tuple", "generics": { "types": [] } }
-        }));
+        let unit = TyRef::Other(
+            serde_json::json!({
+                "Adt": { "id": 0, "builtin": "Tuple", "generics": { "types": [] } }
+            })
+            .into(),
+        );
         assert_eq!(tyref_shaped_tuple_root(&unit, &llbc), None);
-        let int = TyRef::Other(serde_json::json!({ "Scalar": { "Integer": { "Signed": "I64" } } }));
+        let int = TyRef::Other(
+            serde_json::json!({ "Scalar": { "Integer": { "Signed": "I64" } } }).into(),
+        );
         assert_eq!(tyref_shaped_tuple_root(&int, &llbc), None);
     }
 
@@ -78803,7 +78959,7 @@ mod tests {
         use majit_charon_reader::ullbc::{Place, PlaceKind, ProjectionElem};
 
         fn ty() -> TyRef {
-            TyRef::Other(serde_json::Value::Null)
+            TyRef::Other(serde_json::Value::Null.into())
         }
         fn place(kind: PlaceKind) -> Place {
             Place { kind, ty: ty() }
@@ -78811,7 +78967,7 @@ mod tests {
         fn field(inner: Place, name: &str) -> Place {
             place(PlaceKind::Projection(
                 Box::new(inner),
-                ProjectionElem::Tagged(serde_json::json!({ "Field": name })),
+                ProjectionElem::Tagged(serde_json::json!({ "Field": name }).into()),
             ))
         }
         fn deref(inner: Place) -> Place {
@@ -78856,31 +79012,40 @@ mod tests {
             false,
         );
         let (llbc, _) = load_handle(vec![(2, object_decl)], serde_json::json!([]), 2);
-        let items = TyRef::Other(serde_json::json!({
-            "RawPtr": [
-                {"RawPtr": [
-                    {"Adt": {"id": 2, "generics": {"types": []}}},
+        let items = TyRef::Other(
+            serde_json::json!({
+                "RawPtr": [
+                    {"RawPtr": [
+                        {"Adt": {"id": 2, "generics": {"types": []}}},
+                        "Mut"
+                    ]},
                     "Mut"
-                ]},
-                "Mut"
-            ]
-        }));
+                ]
+            })
+            .into(),
+        );
         assert_eq!(
             object_ref_items_list_root(&items, &llbc).as_deref(),
             Some("[PyObject]")
         );
         assert_eq!(super::list_spelling_item("[PyObject]"), Some("PyObject"));
         assert_eq!(super::list_spelling_item("[PyObject; 0]"), None);
-        let scalar = TyRef::Other(serde_json::json!({
-            "RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
-        }));
+        let scalar = TyRef::Other(
+            serde_json::json!({
+                "RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
+            })
+            .into(),
+        );
         assert_eq!(object_ref_items_list_root(&scalar, &llbc), None);
-        let header = TyRef::Other(serde_json::json!({
-            "RawPtr": [
-                {"Adt": {"id": 2, "generics": {"types": []}}},
-                "Mut"
-            ]
-        }));
+        let header = TyRef::Other(
+            serde_json::json!({
+                "RawPtr": [
+                    {"Adt": {"id": 2, "generics": {"types": []}}},
+                    "Mut"
+                ]
+            })
+            .into(),
+        );
         assert_eq!(
             object_ref_items_list_root(&header, &llbc),
             None,
@@ -78905,16 +79070,22 @@ mod tests {
                 "Mut"
             ]
         });
-        let slice = TyRef::Other(serde_json::json!({
-            "Ref": ["_", {"Slice": [objptr.clone(), null]}, "Shared"]
-        }));
+        let slice = TyRef::Other(
+            serde_json::json!({
+                "Ref": ["_", {"Slice": [objptr.clone(), null]}, "Shared"]
+            })
+            .into(),
+        );
         assert_eq!(
             object_pointer_slice_list_root(&slice, &llbc).as_deref(),
             Some("[PyObject]")
         );
-        let raw = TyRef::Other(serde_json::json!({
-            "RawPtr": [{"Slice": [objptr, null]}, "Const"]
-        }));
+        let raw = TyRef::Other(
+            serde_json::json!({
+                "RawPtr": [{"Slice": [objptr, null]}, "Const"]
+            })
+            .into(),
+        );
         assert_eq!(
             object_pointer_slice_list_root(&raw, &llbc).as_deref(),
             Some("[PyObject]")
@@ -82597,12 +82768,18 @@ mod tests {
     #[test]
     fn field_layout_keeps_reference_repr_instead_of_embedding_the_referent() {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
-        let shared = super::TyRef::Other(serde_json::json!({
-            "Ref": ["_", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]
-        }));
-        let mutable = super::TyRef::Other(serde_json::json!({
-            "Ref": ["_", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
-        }));
+        let shared = super::TyRef::Other(
+            serde_json::json!({
+                "Ref": ["_", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]
+            })
+            .into(),
+        );
+        let mutable = super::TyRef::Other(
+            serde_json::json!({
+                "Ref": ["_", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
+            })
+            .into(),
+        );
         let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
 
         assert_eq!(
@@ -82634,7 +82811,7 @@ mod tests {
         assert!(!borrow(builtin("Str", serde_json::json!([]))));
         assert!(!borrow(serde_json::json!({"DynTrait": {}})));
 
-        let slice_adt = TyRef::Other(builtin("Slice", serde_json::json!([u8_ty])));
+        let slice_adt = TyRef::Other(builtin("Slice", serde_json::json!([u8_ty])).into());
         let spelling = super::tyref_to_ast_string(&slice_adt, &llbc);
         assert_eq!(spelling, "[u8]");
         assert!(majit_ir::descr::is_list_container_spelling(&spelling));
@@ -82652,7 +82829,7 @@ mod tests {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
         let dyn_trait = serde_json::json!({"DynTrait": {}});
         let shared = |pointee: serde_json::Value| {
-            super::TyRef::Other(serde_json::json!({"Ref": ["_", pointee, "Shared"]}))
+            super::TyRef::Other(serde_json::json!({"Ref": ["_", pointee, "Shared"]}).into())
         };
         let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
         assert!(super::tyref_is_dyn_pointer(
@@ -82682,20 +82859,23 @@ mod tests {
             "regions": [], "types": [], "const_generics": [], "trait_refs": []
         });
         let boxed = |pointee: serde_json::Value| {
-            super::TyRef::Other(serde_json::json!({
-                "Adt": {
-                    "id": 0, "builtin": "Box",
-                    "generics": {
-                        "regions": [],
-                        "types": [pointee],
-                        "const_generics": [],
-                        "trait_refs": []
+            super::TyRef::Other(
+                serde_json::json!({
+                    "Adt": {
+                        "id": 0, "builtin": "Box",
+                        "generics": {
+                            "regions": [],
+                            "types": [pointee],
+                            "const_generics": [],
+                            "trait_refs": []
+                        }
                     }
-                }
-            }))
+                })
+                .into(),
+            )
         };
         let shared = |pointee: serde_json::Value| {
-            super::TyRef::Other(serde_json::json!({"Ref": ["_", pointee, "Shared"]}))
+            super::TyRef::Other(serde_json::json!({"Ref": ["_", pointee, "Shared"]}).into())
         };
         let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
         let slice = serde_json::json!({"Slice": [u8_ty, null]});
@@ -82853,7 +83033,7 @@ mod tests {
                 {"Integer": {"Unsigned": ["Usize", len]}},
                 {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
             ]);
-            TyRef::Other(serde_json::json!({ "Array": [item, len, null] }))
+            TyRef::Other(serde_json::json!({ "Array": [item, len, null] }).into())
         };
         let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let bool_ty = serde_json::json!({"Scalar": "Bool"});
@@ -82871,14 +83051,17 @@ mod tests {
     fn positional_call_result_recovers_its_exact_tuple_repr_owner() {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
         let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
-        let pair = TyRef::Other(serde_json::json!({
-            "Adt": {
-                "id": 0, "builtin": "Tuple",
-                "generics": {"types": [usize_ty.clone(), usize_ty]}
-            }
-        }));
+        let pair = TyRef::Other(
+            serde_json::json!({
+                "Adt": {
+                    "id": 0, "builtin": "Tuple",
+                    "generics": {"types": [usize_ty.clone(), usize_ty]}
+                }
+            })
+            .into(),
+        );
         let scalar =
-            TyRef::Other(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}));
+            TyRef::Other(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}).into());
 
         assert_eq!(
             tyref_positional_aggregate_root(&pair, &llbc).as_deref(),
@@ -88905,7 +89088,7 @@ mod tests {
             "global_kind": global_kind,
             "ty": u32_ty(),
             "value": {"Value": [0, [{"Call": [{"kind": {"Fun": init}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}, []]}, u32_ty()]]}
-        })
+        }).into()
     }
 
     fn reader_fun(path: &[&str], global_id: u64) -> serde_json::Value {
@@ -90342,7 +90525,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
+        let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}).into());
         let payload = serde_json::json!([null, 0]);
         let (owner_root, field_name, _, _, _) = lowering
             .resolve_adt_field(&base, &payload)
@@ -90888,7 +91071,7 @@ mod tests {
         let graph = super::lower_function(&llbc, "u8_as_usize").expect("lower *mut u8 as usize");
         assert_cast_ptr_to_int_then_r_uint(&graph, "*mut u8 as usize");
         assert!(!tyref_is_ptr_to_int_cast_origin(
-            &TyRef::Other(mut_u8_ty_json()),
+            &TyRef::Other(mut_u8_ty_json().into()),
             &llbc
         ));
     }
@@ -90914,54 +91097,60 @@ mod tests {
             Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
         };
         let vec_ty = vec_usize_ty_json();
-        let fn_ptr = TyRef::Other(serde_json::json!({
-            "FnPtr": {
-                "skip_binder": {
-                    "inputs": [],
-                    "output": {
-                        "Adt": {
-                            "id": 0,
-                            "builtin": "Tuple",
-                            "generics": {"types": []}
-                        }
-                    },
-                    "is_unsafe": false
+        let fn_ptr = TyRef::Other(
+            serde_json::json!({
+                "FnPtr": {
+                    "skip_binder": {
+                        "inputs": [],
+                        "output": {
+                            "Adt": {
+                                "id": 0,
+                                "builtin": "Tuple",
+                                "generics": {"types": []}
+                            }
+                        },
+                        "is_unsafe": false
+                    }
                 }
-            }
-        }));
+            })
+            .into(),
+        );
         assert!(tyref_is_ptr_to_int_cast_origin(&fn_ptr, &llbc));
         assert!(tyref_ptr_pointee_is_vec(
-            &TyRef::Other(serde_json::json!({"Ref": ["_", vec_ty.clone(), "Mut"]})),
+            &TyRef::Other(serde_json::json!({"Ref": ["_", vec_ty.clone(), "Mut"]}).into()),
             &llbc
         ));
         assert!(tyref_ptr_pointee_is_vec(
-            &TyRef::Other(serde_json::json!({"RawPtr": [vec_ty.clone(), "Mut"]})),
+            &TyRef::Other(serde_json::json!({"RawPtr": [vec_ty.clone(), "Mut"]}).into()),
             &llbc
         ));
         assert!(tyref_is_ptr_to_int_cast_origin(
-            &TyRef::Other(serde_json::json!({"RawPtr": [vec_ty.clone(), "Mut"]})),
+            &TyRef::Other(serde_json::json!({"RawPtr": [vec_ty.clone(), "Mut"]}).into()),
             &llbc
         ));
         assert!(!tyref_ptr_pointee_is_vec(
-            &TyRef::Other(vec_ty.clone()),
+            &TyRef::Other(vec_ty.clone().into()),
             &llbc
         ));
         assert!(!tyref_is_ptr_to_int_cast_origin(
-            &TyRef::Other(vec_ty),
+            &TyRef::Other(vec_ty.into()),
             &llbc
         ));
         assert!(!tyref_is_ptr_to_int_cast_origin(
-            &TyRef::Other(mut_u8_ty_json()),
+            &TyRef::Other(mut_u8_ty_json().into()),
             &llbc
         ));
         assert!(!tyref_is_ptr_to_int_cast_origin(
-            &TyRef::Other(serde_json::json!({
-                "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "Mut"]
-            })),
+            &TyRef::Other(
+                serde_json::json!({
+                    "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "Mut"]
+                })
+                .into(),
+            ),
             &llbc
         ));
         assert!(!tyref_is_ptr_to_int_cast_origin(
-            &TyRef::Other(usize_ty()),
+            &TyRef::Other(usize_ty().into()),
             &llbc
         ));
     }
@@ -90974,7 +91163,7 @@ mod tests {
     fn raw_byte_ptr_recognizes_only_the_byte_pointee() {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
         let ptr_to = |pointee: serde_json::Value| {
-            TyRef::Other(serde_json::json!({ "RawPtr": [pointee, "Mut"] }))
+            TyRef::Other(serde_json::json!({ "RawPtr": [pointee, "Mut"] }).into())
         };
         for pointee in ["U8", "I8"] {
             assert!(
@@ -90995,7 +91184,7 @@ mod tests {
         ));
         // A bare `u8` (no pointer around it) is not an address either.
         assert!(!tyref_is_raw_byte_ptr(
-            &TyRef::Other(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})),
+            &TyRef::Other(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}}).into()),
             &llbc
         ));
     }
@@ -91058,9 +91247,12 @@ mod tests {
         let pointee = serde_json::json!({
             "Adt": {"id": 1, "generics": {"types": []}}
         });
-        let storage_ptr = TyRef::Other(serde_json::json!({
-            "RawPtr": [pointee, "Mut"]
-        }));
+        let storage_ptr = TyRef::Other(
+            serde_json::json!({
+                "RawPtr": [pointee, "Mut"]
+            })
+            .into(),
+        );
 
         assert_eq!(
             super::tyref_to_attr_value_type(&storage_ptr, &llbc),
@@ -91073,14 +91265,17 @@ mod tests {
             "the owning storage pointer must remain the same RPython string at return and phi sites"
         );
         assert_eq!(
-            super::tyref_to_value_type(&TyRef::Other(pointee.clone()), &llbc),
+            super::tyref_to_value_type(&TyRef::Other(pointee.clone().into()), &llbc),
             ValueType::Str,
             "a bare Wtf8Buf value is the same RPython string representation"
         );
 
-        let generic_message = TyRef::Other(serde_json::json!({
-            "TypeVar": {"Bound": [0, 0]}
-        }));
+        let generic_message = TyRef::Other(
+            serde_json::json!({
+                "TypeVar": {"Bound": [0, 0]}
+            })
+            .into(),
+        );
         let generics = serde_json::json!({
             "trait_clauses": [{
                 "trait_": {"skip_binder": {
@@ -91407,14 +91602,17 @@ mod tests {
     #[test]
     fn tyref_enum_instantiation_suffix_unwraps_value_wrapper() {
         let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
-        let wrapped = TyRef::Other(serde_json::json!({
-            "Value": [99, option_adt_node(0, option_int_arg(true))]
-        }));
+        let wrapped = TyRef::Other(
+            serde_json::json!({
+                "Value": [99, option_adt_node(0, option_int_arg(true))]
+            })
+            .into(),
+        );
         assert_eq!(
             super::tyref_enum_instantiation_suffix(&wrapped, &llbc),
             "<i64>"
         );
-        let bare_id = TyRef::Other(serde_json::json!({"Adt": {"id": 0}}));
+        let bare_id = TyRef::Other(serde_json::json!({"Adt": {"id": 0}}).into());
         assert_eq!(
             super::tyref_enum_instantiation_suffix(&bare_id, &llbc),
             "",
@@ -91454,9 +91652,12 @@ mod tests {
         .unwrap();
         let kind = serde_json::json!({"Adt": [0, 1]});
         let dest = |signed: bool| {
-            TyRef::Other(serde_json::json!({
-                "Value": [7, option_adt_node(0, option_int_arg(signed))]
-            }))
+            TyRef::Other(
+                serde_json::json!({
+                    "Value": [7, option_adt_node(0, option_int_arg(signed))]
+                })
+                .into(),
+            )
         };
         let owner_tail = |signed: bool| {
             let (path, leaf, _, _, _, _) = lowering
@@ -91489,9 +91690,12 @@ mod tests {
         // template `Option` (`bookkeeper.py` `getuniqueclassdef(cls)`).
         let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
         let dest = |signed: bool| {
-            TyRef::Other(serde_json::json!({
-                "Value": [7, option_adt_node(0, option_int_arg(signed))]
-            }))
+            TyRef::Other(
+                serde_json::json!({
+                    "Value": [7, option_adt_node(0, option_int_arg(signed))]
+                })
+                .into(),
+            )
         };
         let usize_ty = super::tyref_to_value_type(&dest(false), &llbc);
         let i64_ty = super::tyref_to_value_type(&dest(true), &llbc);
@@ -91599,7 +91803,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
+        let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}).into());
         let payload = serde_json::json!([null, 0]);
         let (owner_root, field_name, _, _, _) = lowering
             .resolve_adt_field(&base, &payload)
@@ -91672,7 +91876,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let base = TyRef::Other(serde_json::json!({"Adt": {"id": 1, "builtin": null}}));
+        let base = TyRef::Other(serde_json::json!({"Adt": {"id": 1, "builtin": null}}).into());
         let payload = serde_json::json!([null, 0]);
         let (owner_root, _, _, _, _) = lowering
             .resolve_adt_field(&base, &payload)
@@ -91807,7 +92011,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
+        let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}).into());
         let payload = serde_json::json!([null, 0]);
         let (owner_a, field_a, _, id_a, _) = lowering_a
             .resolve_adt_field(&base, &payload)
@@ -95337,10 +95541,10 @@ mod tests {
         let llbc = llbc_with_types("pyre_object", vec![], funs);
         let name_of = |reg: &RegularCall| super::regular_call_name_path(reg, &llbc);
         let drop_place = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb]
-            .term(&llbc)
+            .term_ref(&llbc)
         {
             Ok(TermKind::Drop { place, target, .. }) => match place.kind {
-                PlaceKind::Local(l) => Some((l, target)),
+                PlaceKind::Local(l) => Some((l, *target)),
                 _ => None,
             },
             _ => None,
@@ -95354,7 +95558,10 @@ mod tests {
             1,
             "the move into the call stays"
         );
-        assert!(matches!(u.body[2].term(&llbc), Ok(TermKind::Call { .. })));
+        assert!(matches!(
+            u.body[2].term_ref(&llbc),
+            Ok(TermKind::Call { .. })
+        ));
         assert_eq!(drop_place(&u, 3), Some((2, 7)));
         assert_eq!(drop_place(&u, 6), Some((4, 4)));
         assert_eq!(drop_place(&u, 4), Some((2, 5)));
@@ -95367,7 +95574,10 @@ mod tests {
             1,
             "a guard closed on one arm is left"
         );
-        assert!(matches!(u.body[2].term(&llbc), Ok(TermKind::Call { .. })));
+        assert!(matches!(
+            u.body[2].term_ref(&llbc),
+            Ok(TermKind::Call { .. })
+        ));
         assert_eq!(drop_place(&u, 3), Some((2, 4)));
 
         // The bracket closes every pin `operands` makes, so its caller sees
@@ -97745,7 +97955,7 @@ mod tests {
                 "type_decls": [],
                 "fun_decls": [
                     decl(0, "traced", body.clone()),
-                    decl(1, "opaque", serde_json::Value::Null),
+                    decl(1, "opaque", serde_json::Value::Null.into()),
                     decl(2, "marked", body)
                 ],
                 "global_decls": [],
@@ -99388,8 +99598,9 @@ mod tests {
         let objptr = serde_json::json!({
             "RawPtr": [{"Adt": {"id": 0, "generics": {"types": []}}}, "Mut"]
         });
-        let kind =
-            |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
+        let kind = |node: serde_json::Value| {
+            super::tyref_pair_slice_item_kind(&TyRef::Other(node.into()), &llbc)
+        };
         assert_eq!(
             kind(
                 serde_json::json!({ "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] })
@@ -105475,7 +105686,7 @@ mod tests {
     }
 
     fn interior_stmt(kind: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({"kind": kind, "span": interior_span()})
+        serde_json::json!({"kind": kind, "span": interior_span()}).into()
     }
 
     fn interior_copy(place: serde_json::Value) -> serde_json::Value {
@@ -107482,7 +107693,7 @@ mod tests {
                 .iter()
                 .find(|row| row.name.as_deref() == Some(field))
                 .and_then(|row| match &row.ty {
-                    TyRef::Other(value) => Some(value),
+                    TyRef::Other(value) => Some(value.as_ref()),
                     _ => None,
                 }),
             _ => None,

@@ -474,12 +474,12 @@ fn subst_tyref(ty: &TyRef, llbc: &Llbc, types: &[Value], const_generics: &[Value
     let mut value = match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => {
-            serde_json::json!({ "Value": [id, body] })
+            serde_json::json!({ "Value": [id, &**body] })
         }
-        TyRef::Other(body) => body.clone(),
+        TyRef::Other(body) => (*body.0).clone(),
     };
     substitute_type_vars(&mut value, llbc, types, const_generics);
-    serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value))
+    serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value.into()))
 }
 
 fn subst_vars(
