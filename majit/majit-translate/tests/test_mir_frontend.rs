@@ -452,6 +452,7 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
 
     let mut field_reads: Vec<(String, Option<String>)> = Vec::new();
     let mut field_writes: Vec<(String, Option<String>)> = Vec::new();
+    let mut field_write_tys: Vec<majit_translate::model::ValueType> = Vec::new();
     let mut ctor_count = 0usize;
     for b in &graph.blocks {
         for op in &b.operations {
@@ -459,8 +460,9 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
                 OpKind::FieldRead { field, .. } => {
                     field_reads.push((field.name.clone(), field.owner_root.clone()));
                 }
-                OpKind::FieldWrite { field, .. } => {
+                OpKind::FieldWrite { field, ty, .. } => {
                     field_writes.push((field.name.clone(), field.owner_root.clone()));
+                    field_write_tys.push(ty.clone());
                 }
                 OpKind::Call {
                     target: CallTarget::SyntheticTransparentCtor { .. },
@@ -485,6 +487,14 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
             ("__pos_1".to_string(), Some("Tuple<i64,i64>".to_string())),
         ],
         "tuple construction must emit a __pos_0 / __pos_1 FieldWrite chain"
+    );
+    assert_eq!(
+        field_write_tys,
+        vec![
+            majit_translate::model::ValueType::Int,
+            majit_translate::model::ValueType::Int
+        ],
+        "tuple i64 items are Signed (`history.py` getkind), not the empty-spelling Ref fallback"
     );
 
     // Exactly the two genuine tuple reads become FieldReads. The three

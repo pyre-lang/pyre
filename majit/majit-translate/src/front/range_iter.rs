@@ -505,6 +505,7 @@ pub(crate) fn range_builtin_call(
             target: CallTarget::FunctionPath {
                 segments: vec![crate::runtime_names::shims::RANGE.to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![start, end]),
             result_ty: ValueType::Ref(None),
@@ -522,6 +523,7 @@ pub(crate) fn slice_iter_call(result: Variable, container: Variable) -> SpaceOpe
             target: CallTarget::FunctionPath {
                 segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![container]),
             result_ty: ValueType::Ref(None),

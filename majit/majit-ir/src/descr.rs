@@ -567,6 +567,7 @@ pub fn size_descr_same_struct_layout(
     cached_offsets == incoming
 }
 
+
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
 /// `module_path` before hashing.  PyPy/RPython has no notion of a crate
 /// boundary — `lltype.Struct` identity is keyed on the Python module

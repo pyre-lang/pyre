@@ -2893,6 +2893,7 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // records the byte and a guard-failure resume panics here.
     // `build_inline_call_only_bh_builder` registers the four raw-array keys
     // at their canonical `BC_*` bytes.
+
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",

@@ -4740,8 +4740,8 @@ where
             // vocabulary — which is `Box.same_constant` per Const type
             // (ConstInt/ConstFloat bitwise, ConstPtr pointer identity),
             // exactly what plain slot-grouped `Vec` equality performs.
-            // The reference is NOT `green_key_values` (the
-            // back-edge/can_enter_jit key carries a different arity) nor
+            // The reference is NOT `green_key_values` (that is the hashed
+            // form of the same declared greens) nor
             // `current_merge_points[0].green_boxes` (InputArg placeholders,
             // no Const → an always-empty filter that would decline every
             // close and hang).

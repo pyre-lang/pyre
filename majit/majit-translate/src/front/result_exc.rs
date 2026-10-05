@@ -1167,9 +1167,9 @@ fn producer_is_some_shell(graph: &FunctionGraph, var: &Variable, result_owner: &
 }
 
 /// `Result<i64, …>` / `Result<bool, …>` / `Result<f64, …>`: the `Ok`
-/// payload is a machine scalar. A `Vec` of one-word items is the same
-/// bank (`RustVecRepr`, kind `int`): the header address, not a GC
-/// aggregate. Other spellings stay shells.
+/// payload is a machine scalar. A `Vec<T>` is the same bank
+/// (`RustVecRepr`, kind `int`): the header address, not a GC aggregate,
+/// for every item type T. Other spellings stay shells.
 fn result_spelling_ok_is_scalar(spelling: &str) -> bool {
     let Some(args) = generic_args_body(spelling) else {
         return false;
@@ -1177,9 +1177,7 @@ fn result_spelling_ok_is_scalar(spelling: &str) -> bool {
     let Some(ok) = split_top_level_args(args).into_iter().next() else {
         return false;
     };
-    if majit_ir::rvec::rust_vec_item_kind_for_spelling(ok, crate::layout::target_word_size())
-        .is_some()
-    {
+    if majit_ir::rvec::vec_item_spelling(ok).is_some() {
         return true;
     }
     matches!(
@@ -3152,6 +3150,7 @@ pub(crate) fn apply_foreign_from_residuals(
                     target: CallTarget::FunctionPath {
                         segments: conv.segments.clone(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args,
                     result_ty: ValueType::Ref(None),
@@ -11709,6 +11708,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
                     .map(str::to_string)
                     .to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             };
         }
         // The constructor's result variable now holds the exception object.
@@ -11844,6 +11844,7 @@ fn fuse_same_block_kind_ctor_raise(graph: &mut FunctionGraph) {
                     .map(str::to_string)
                     .to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             };
         }
         let payload = graph.blocks[bi].operations[ctor_idx]
@@ -11945,6 +11946,7 @@ mod static_result_shell_tests {
         assert!(result_spelling_ok_is_scalar(
             "Result<alloc::vec::Vec<*mut u8>, E>"
         ));
+        assert!(result_spelling_ok_is_scalar("Result<Vec<u8>, PyError>"));
         assert!(!result_spelling_ok_is_scalar(
             "Result<PyObjectRef, PyError>"
         ));

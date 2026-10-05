@@ -1225,6 +1225,34 @@ fn real_main() {
                     "boolobject",
                     "w_bool_from",
                 ]),
+                // `_float_math1` / `_float_math2` name the unboxed math
+                // leaves (`descroperation.rs`). `complex_abs` is their
+                // look-inside caller, but `builtin_abs_complex` is
+                // `dont_look_inside`, so `call.py find_all_graphs` never
+                // scans the hub. Seed it the way that walk seeds
+                // `inline_calls_to` helpers the codewriter residualizes.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    "_float_math1",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    "_float_math2",
+                ]),
+                // `w_list_getitem` and `list_iter_getitem_locked` are
+                // `dont_look_inside`; the walker descends
+                // `w_list_getitem_inner` by name (`list_getitem_jitcode`).
+                // A declined callee is not scanned, so seed the inner
+                // like `list_iter_descr_next`.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "listobject",
+                    "w_list_getitem_inner",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.

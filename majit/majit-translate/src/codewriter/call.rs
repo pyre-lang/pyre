@@ -4571,9 +4571,21 @@ impl CallControl {
             .iter()
             .map(|row| (row.name.clone(), row.ty.clone()))
             .collect();
+        // A `MutRef<T>` cell is one GC-pointer field (`mut_ref_cell_root_of`
+        // already required `T` to be a thin GC ref). Passing the cell's
+        // pointee through `known_struct_names` treats a handle ADT as a
+        // nested by-value struct, `from_type_strings` then clears the
+        // field list, and `struct_ctor_alloc_owner` refuses the `New`
+        // rewrite — leaving the synthetic ctor as an unbound residual.
+        let empty_structs = HashSet::new();
+        let known_structs = if mut_ref {
+            &empty_structs
+        } else {
+            &self.known_struct_names
+        };
         let layout = std::rc::Rc::new(StructLayout::from_type_strings(
             &pairs,
-            &self.known_struct_names,
+            known_structs,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -9257,6 +9269,18 @@ impl CallControl {
             path: symbolic_fnaddr_path_for_target(target),
             symbolic: true,
         }
+    }
+
+    /// RPython `call.py` uses `getfunctionptr(graph)` to obtain the
+    /// integer funcptr identity for a call site. majit prefers a host-bound
+    /// trace-call address when one has been registered for the resolved
+    /// `CallPath`; otherwise it falls back to the stable symbolic address
+    /// shim for source-only analysis.
+    pub fn fnaddr_for_path(&self, path: &CallPath) -> i64 {
+        self.function_fnaddrs
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| symbolic_fnaddr_for_path(path))
     }
 
     /// RPython `call.py` uses `getfunctionptr(graph)` to obtain the
@@ -18306,6 +18330,26 @@ mod tests {
     /// at 8, and addressing it at 4 strides the whole array one half-word
     /// early — every read then returns two packed 32-bit halves. A pointer
     /// item, being word-wide, stays at the word.
+    #[test]
+    fn mut_ref_cell_layout_keeps_the_pointer_field() {
+        // A handle ADT in `known_struct_names` must not clear the cell's
+        // one pointer field (`from_type_strings` nested-struct rule).
+        let mut cc = CallControl::new();
+        cc.known_struct_names
+            .insert("pyre_interpreter::error::PyError".into());
+        cc.known_struct_names.insert("PyError".into());
+        let layout = cc
+            .struct_layout_for("MutRef<PyError>")
+            .expect("MutRef cell has a spelling layout");
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].name, "value");
+        assert!(layout.fields[0].size > 0);
+        let layout_path = cc
+            .struct_layout_for("MutRef<pyre_interpreter::error::PyError>")
+            .expect("qualified MutRef cell has a spelling layout");
+        assert_eq!(layout_path.fields.len(), 1);
+    }
+
     #[test]
     fn array_items_base_rounds_up_to_the_element_alignment() {
         let cc = CallControl::new();

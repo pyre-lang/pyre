@@ -382,9 +382,9 @@ pub struct TraceCtx {
     /// later visit's greens to decline closing when a scalar green differs
     /// from the header.  `None` until captured;
     /// bridges never populate it (they close through the compiled-loop
-    /// registry).  This is the merge-point green vocabulary — distinct from
-    /// `green_key_values`, the back-edge/can_enter_jit key, which carries a
-    /// different arity and cannot be compared against a merge point directly.
+    /// registry).  This is the merge-point green vocabulary — the same
+    /// declared-green tuple `green_key_values` hashes (`pyjitpl.py`
+    /// `original_boxes[:num_green_args]`).
     pub(crate) header_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// pyjitpl.py:3005 `greenboxes` at the merge point the trace actually
     /// closed on, in the same `(ints, refs, floats)` slot grouping as

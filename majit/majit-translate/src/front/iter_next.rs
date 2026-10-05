@@ -1678,6 +1678,7 @@ fn rewire_one_next_site(
             target: CallTarget::FunctionPath {
                 segments: next_op_segments(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![match &enumerate_site {
                 Some(site) => site.renamed(&iter_arg),
@@ -1751,6 +1752,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: container_segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -1765,6 +1767,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![container]),
                     result_ty: ValueType::Ref(None),
@@ -1841,6 +1844,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
     }
 
@@ -1866,6 +1870,7 @@ mod tests {
                             "make".to_string(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -1880,6 +1885,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![container]),
                     result_ty: ValueType::Ref(None),
@@ -1995,6 +2001,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
     }
 
@@ -2014,6 +2021,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -2028,6 +2036,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![s]),
                     result_ty: ValueType::Ref(None),
@@ -2204,6 +2213,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -2218,6 +2228,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![s]),
                     result_ty: ValueType::Ref(None),

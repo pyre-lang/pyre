@@ -334,6 +334,11 @@ fn build_semantic_program_via_active_frontend(
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
+                // Explicit `#[jit_immutable_fields]` already won via
+                // `or_insert` above (`rclass.py _parse_field_list`).
+                for (k, v) in front::mir::harvest_immutable_fields_from_immutable_statics(&llbc) {
+                    immutable_fields.entry(k).or_insert(v);
+                }
                 for path in front::mir::discover_eval_hook_graphs(&llbc) {
                     if !eval_hook_graphs.contains(&path) {
                         eval_hook_graphs.push(path);

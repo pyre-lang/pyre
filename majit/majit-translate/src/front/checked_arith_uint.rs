@@ -864,6 +864,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
     }
 

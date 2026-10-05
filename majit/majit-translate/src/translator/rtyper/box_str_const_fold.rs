@@ -158,6 +158,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), payload.to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(None),
@@ -169,6 +170,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![arg]),
             result_ty: ValueType::Ref(None),
@@ -185,6 +187,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: vec![LinkArg::from(value)],
             result_ty: ValueType::Ref(None),
@@ -275,6 +278,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: vec![LinkArg::from(crate::flowspace::model::ConstValue::None)],
             result_ty: ValueType::Ref(None),

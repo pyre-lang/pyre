@@ -594,6 +594,7 @@ mod tests {
                             "plus_one".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Int,

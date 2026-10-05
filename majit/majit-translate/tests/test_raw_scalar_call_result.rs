@@ -64,7 +64,7 @@ use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
 use majit_translate::{
     ErrorCarrierSpec, HostStaticAddrs,
-    front::mir::{lower_fun_decl, lower_function, lower_function_with_static_addrs},
+    front::mir::{LowerContext, lower_fun_decl, lower_function, lower_function_with_static_addrs},
     model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
 };
 use serde_json::{Value, json};
@@ -341,6 +341,40 @@ fn integer_cast_to_raw_scalar_stays_int() {
     )
     .expect("lower HashStateStorage::as_mut_ptr");
     assert_returned_call(&widened, "as_ptr");
+}
+
+/// `HashStateStorage.words` is `[usize; N]`. Charon spells that as a
+/// `Value`-wrapped `Array` whose item is interned `Deduplicated` usize.
+/// `history.py` `getkind` has no kind for a `FixedSizeArray` value; the
+/// fill of `[0; N]` (`lltype.FixedSizeArray` items) is that integer.
+/// A `Ref` field against an `Int` fill panics in
+/// `jtransform.py` `rewrite_op_setfield`.
+#[test]
+fn hashlib_copy_repeat_fill_matches_words_item_kind() {
+    let llbc = Llbc::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-module.ullbc"
+    ))
+    .expect("pyre-module.ullbc is already extracted");
+    let context = LowerContext::new(&llbc);
+    let graph = lower_fun_decl(&context, find_method(&llbc, "copy", "W_HashState"))
+        .expect("lower W_HashState::copy");
+    let word_writes: Vec<&ValueType> = ops(&graph)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, ty, .. } if field.name == "words" => Some(ty),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !word_writes.is_empty(),
+        "copy writes HashStateStorage.words"
+    );
+    assert!(
+        word_writes
+            .iter()
+            .all(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
+        "words is a scalar FixedSizeArray item, got {word_writes:?}"
+    );
 }
 
 #[test]

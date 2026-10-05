@@ -607,16 +607,15 @@ pub unsafe fn walk_enrolled_code_roots(
         // managed string (`objspace.py newfilename`); `importing.py
         // update_code_filenames` may replace it. Trace and forward the slot.
         visitor(&mut *(&mut code.w_filename as *mut PyObjectRef as *mut majit_ir::GcRef));
-        // `PyCode.co_consts_w` is a GCREF to a `GcArray(OBJECTPTR)` whose
-        // own trace names the items. An item store barriers the array
-        // (`FixedObjectArray::set_ref`), so an old array holding a young
-        // item is in the remembered set.
+        // `PyCode.co_consts_w` and `co_names_w` are GCREFs to a
+        // `GcArray(OBJECTPTR)` whose own trace names the items
+        // (`pycode.py _immutable_fields_ co_consts_w[*]` / `co_names_w[*]`).
+        // An item store barriers the array (`FixedObjectArray::set_ref`), so
+        // an old array holding a young item is in the remembered set.
         visitor(
             &mut *(&mut code.co_consts_w as *mut *mut pyre_object::FixedObjectArray
                 as *mut majit_ir::GcRef),
         );
-        // `pycode.py _immutable_fields_ co_names_w[*]`. The array's own
-        // trace names the interned strings.
         visitor(
             &mut *(&mut code.co_names_w as *mut *mut pyre_object::FixedObjectArray
                 as *mut majit_ir::GcRef),

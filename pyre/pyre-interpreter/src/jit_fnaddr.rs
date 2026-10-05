@@ -8317,7 +8317,7 @@ mod tests {
                 compare_slot = true;
             }
             if row.path == "pyre_interpreter::call::call_non_function_callable_with_mode"
-                && row.arity == 6
+                && row.arity == 5
             {
                 call_mode = true;
             }
@@ -8328,7 +8328,7 @@ mod tests {
         );
         assert!(
             call_mode,
-            "call_non_function_callable_with_mode must be registered at arity 6"
+            "call_non_function_callable_with_mode must be registered at arity 5"
         );
     }
 

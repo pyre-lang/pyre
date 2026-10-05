@@ -84,7 +84,7 @@ pub trait SharedOpcodeHandler {
 
 /// `pyframe.py popvalues` is `@jit.unroll_safe`; the count is an opcode argument.
 #[majit_macros::unroll_safe]
-fn pop_n<H: SharedOpcodeHandler + ?Sized>(
+pub fn pop_n<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     count: usize,
 ) -> OpcodeResult<Vec<H::Value>> {

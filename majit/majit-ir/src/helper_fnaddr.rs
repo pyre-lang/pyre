@@ -100,6 +100,65 @@ pub trait ResidualFromI64: Sized {
     unsafe fn from_residual_i64(word: i64) -> Self;
 }
 
+/// Rebuild any residual-call argument from one ABI word.
+///
+/// A value that fits in a machine word is the word's bits — a pointer
+/// newtype, a fieldless enum, a `Cell<i64>` payload. A larger value sits
+/// behind the pointer the `'r'` word carries, the representation genc uses
+/// for a `GcStruct` argument (`getfunctionptr` / `handle_residual_call`).
+///
+/// `# Safety`: `word` is the residual-call ABI bits for `T`.
+#[inline]
+pub unsafe fn residual_word_to_value<T>(word: i64) -> T {
+    let size = core::mem::size_of::<T>();
+    if size == 0 {
+        return unsafe { core::mem::zeroed() };
+    }
+    if size <= core::mem::size_of::<i64>()
+        && core::mem::align_of::<T>() <= core::mem::align_of::<i64>()
+    {
+        let mut tmp = core::mem::MaybeUninit::<T>::uninit();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &word as *const i64 as *const u8,
+                tmp.as_mut_ptr() as *mut u8,
+                size,
+            );
+            tmp.assume_init()
+        }
+    } else {
+        unsafe { core::ptr::read(word as usize as *const T) }
+    }
+}
+
+/// Pack a residual-call result into one ABI int/ref word.
+///
+/// The inverse of [`residual_word_to_value`]. A value larger than a word is
+/// returned as a pointer to a leaked box — the `'r'` result of a `GcStruct`.
+#[inline]
+pub fn residual_value_to_word<T>(value: T) -> i64 {
+    let size = core::mem::size_of::<T>();
+    if size == 0 {
+        return 0;
+    }
+    if size <= core::mem::size_of::<i64>()
+        && core::mem::align_of::<T>() <= core::mem::align_of::<i64>()
+    {
+        let mut word = 0i64;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &value as *const T as *const u8,
+                &mut word as *mut i64 as *mut u8,
+                size,
+            );
+        }
+        core::mem::forget(value);
+        word
+    } else {
+        Box::into_raw(Box::new(value)) as usize as i64
+    }
+}
+
 /// Rebuild a residual-call argument from one ABI float word.
 pub trait ResidualFromF64: Sized {
     fn from_residual_f64(word: f64) -> Self;
@@ -302,11 +361,10 @@ impl<T> ResidualFromI64 for Option<*const T> {
 #[inline]
 pub fn residual_result_i64<T, E>(result: Result<T, E>) -> i64
 where
-    T: ResidualIntoI64,
     E: ResidualError,
 {
     match result {
-        Ok(value) => value.into_residual_i64(),
+        Ok(value) => residual_value_to_word(value),
         Err(err) => {
             ResidualError::publish_residual(err);
             0

@@ -2051,6 +2051,24 @@ fn unpack_stamp(stamp: u32) -> Option<crate::value::Value> {
     }
 }
 
+fn release_stamp(stamp: u32) {
+    if stamp & 3 == STAMP_WIDE {
+        crate::operand::release_wide(stamp >> 2);
+    }
+}
+
+/// `Op::clone` / `copy_and_change` mint a fresh wide id so each
+/// `DescrSlot` uniquely owns its `pack_stamp` token. Sharing the
+/// packed word would double-release on drop.
+fn clone_stamp(stamp: u32) -> u32 {
+    match stamp {
+        STAMP_UNSET | STAMP_VOID => stamp,
+        s if s & 3 == STAMP_INT => s,
+        s if s & 3 == STAMP_WIDE => pack_stamp(crate::operand::wide_value((s >> 2) as u64)),
+        other => panic!("corrupt Op.stamp {other}"),
+    }
+}
+
 /// Temporary arg/fail-arg list. Eight inline `Operand`s keep JUMP and
 /// guard fail-args on the regex `and`/`or` leaf off the 64 B
 /// `SmallVec` grow. `Op` itself still stores two inline plus the 32 B
@@ -2798,6 +2816,10 @@ impl DescrSlot {
     }
 
     fn set_stamp_word(&self, stamp: u32) {
+        let old = self.stamp_word();
+        if old != stamp {
+            release_stamp(old);
+        }
         let w = self.word();
         if is_stamp_box(w) {
             let p = tagged_ptr(w) as *mut ThinStamp;
@@ -3032,6 +3054,7 @@ impl Clone for DescrSlot {
 impl Drop for DescrSlot {
     fn drop(&mut self) {
         let w = self.word();
+        release_stamp(self.stamp_word());
         unsafe {
             *self.word.get() = 0;
         }
@@ -3250,7 +3273,7 @@ impl Clone for Op {
         let stamp = self.descr.stamp_word();
         let descr = DescrSlot::from_parts(self.descr.borrow(), self.descr.extra_clone_box());
         if stamp != 0 {
-            descr.set_stamp_word(stamp);
+            descr.set_stamp_word(clone_stamp(stamp));
         }
         let (args, arg_len) = ArgSlot::new(self.args.clone_vec(self.arg_len_value()));
         let op = Op {
@@ -3549,7 +3572,7 @@ impl Op {
         let stamp = self.descr.stamp_word();
         let descr = DescrSlot::from_parts(new_descr, self.descr.extra_clone_box());
         if stamp != 0 {
-            descr.set_stamp_word(stamp);
+            descr.set_stamp_word(clone_stamp(stamp));
         }
         let (args, new_len) = ArgSlot::new(new_args);
         let newop = Op {
@@ -6018,6 +6041,54 @@ mod tests {
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(42)));
         op.set_value(crate::value::Value::Int(-7));
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(-7)));
+    }
+
+    #[test]
+    fn wide_stamp_ids_recycle_when_ops_drop() {
+        let start = crate::operand::wide_high_water();
+        {
+            let ops: Vec<_> = (0..100)
+                .map(|i| {
+                    let op = Op::new(OpCode::IntAdd, &[]);
+                    op.set_value(crate::value::Value::Float(i as f64 + 0.5));
+                    op
+                })
+                .collect();
+            drop(ops);
+        }
+        {
+            let ops: Vec<_> = (0..100)
+                .map(|i| {
+                    let op = Op::new(OpCode::IntAdd, &[]);
+                    op.set_value(crate::value::Value::Float(i as f64 + 0.25));
+                    op
+                })
+                .collect();
+            let grown = crate::operand::wide_high_water() - start;
+            assert!(
+                grown <= 100,
+                "second wave reused released stamp ids, grown={grown}"
+            );
+            for (i, op) in ops.iter().enumerate() {
+                assert_eq!(
+                    op.get_value(),
+                    Some(crate::value::Value::Float(i as f64 + 0.25))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cloned_wide_stamp_survives_drop_of_the_original() {
+        let op = Op::new(OpCode::IntAdd, &[]);
+        op.set_value(crate::value::Value::Float(3.25));
+        let cloned = op.clone();
+        let changed = op.copy_and_change(OpCode::IntAdd, None, None);
+        assert_eq!(cloned.get_value(), Some(crate::value::Value::Float(3.25)));
+        assert_eq!(changed.get_value(), Some(crate::value::Value::Float(3.25)));
+        drop(op);
+        assert_eq!(cloned.get_value(), Some(crate::value::Value::Float(3.25)));
+        assert_eq!(changed.get_value(), Some(crate::value::Value::Float(3.25)));
     }
 
     #[test]

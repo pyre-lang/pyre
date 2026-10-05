@@ -2015,6 +2015,7 @@ impl<'l> CrateLowering<'l> {
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
             ),
+            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
         );
         if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
@@ -2221,6 +2222,7 @@ impl<'l> CrateLowering<'l> {
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
             ),
+            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
         );
         if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
@@ -9368,12 +9370,13 @@ fn pygraph_initial_block(
     gc_mut_ref_params: &std::collections::HashSet<usize>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
+    residual_raw_addr: bool,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc, &[]);
+    let len_shadow = pair_len_shadows_of(&graph.name, locals, llbc, &[]);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
     let ret_len_slot_local = len_shadow.first().copied().flatten().map(|_| n_slots);
     // Arguments become startblock inputargs in source order
@@ -9463,6 +9466,9 @@ fn pygraph_initial_block(
             i == 1,
             tombstoned_leaves,
         );
+        if residual_raw_addr && let Some(kind) = pass_by_value_multiword_kind(&local.ty, llbc) {
+            ty = kind;
+        }
         // Same membership as [`gc_mut_ref_param_locals`], including the
         // residual exclusion: a cell parameter is the `MutRef<T>` the
         // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
@@ -9631,7 +9637,7 @@ impl<'a> Lowering<'a> {
         );
         let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
-        let len_shadow = pair_len_shadows(body, llbc);
+        let len_shadow = pair_len_shadows(&graph.name, body, llbc);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
         let item_addr = item_addr_locals(body, llbc, &slice_next_iter);
@@ -9720,6 +9726,11 @@ impl<'a> Lowering<'a> {
                 i == 1,
                 tombstoned_leaves,
             );
+            if self_dont_look_inside
+                && let Some(kind) = pass_by_value_multiword_kind(&local.ty, llbc)
+            {
+                ty = kind;
+            }
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
             // `ClassDef`; only `Ref`-typed params consume it there.  A
@@ -10013,6 +10024,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![length]),
                         result_ty: ValueType::Unsigned,
@@ -10401,6 +10413,58 @@ impl<'a> Lowering<'a> {
             .and_then(|value| value.one().ok())
             .is_some_and(|var| self.var_is_object_vec_header(&var))
     }
+
+    /// The `Vec` header a pair-slice local was derived from (`deref` /
+    /// `as_mut_slice`). Used to retarget `shadow_stack_copy_range` onto
+    /// `shadow_stack_copy_range_into_vec` when the dest is the pair view
+    /// (`rlist.py` `GcArray` write of the vec's item buffer).
+    fn vec_header_var_of_slice_local(&self, local: usize) -> Option<Variable> {
+        let mut cur = local;
+        let mut seen = bit_set::BitSet::new();
+        loop {
+            if !seen.insert(cur) {
+                return None;
+            }
+            let from_call = self.body.body.iter().find_map(|bb| {
+                let Ok(TermKind::Call { call, .. }) = bb.term(self.llbc) else {
+                    return None;
+                };
+                if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == cur) {
+                    return None;
+                }
+                let CallFunc::Regular(reg) = &call.func else {
+                    return None;
+                };
+                if !(is_rust_vec_slice_view_call(reg, self.llbc)
+                    || is_deref_call(reg, self.llbc)
+                    || vec_index_regular_unchecked_leaf(reg, self.llbc).is_some())
+                {
+                    return None;
+                }
+                tyref_rust_vec_item_kind(operand_tyref(call.args.first()?)?, self.llbc)?;
+                let vec_local = operand_local(call.args.first())?;
+                self.local_var
+                    .get(vec_local)?
+                    .as_ref()
+                    .map(LocalValue::link_word)
+            });
+            if from_call.is_some() {
+                return from_call;
+            }
+            cur = self.body.body.iter().find_map(|bb| {
+                bb.statements.iter().find_map(|stmt| {
+                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                        return None;
+                    };
+                    if place_base_local(place) != Some(cur) {
+                        return None;
+                    }
+                    assign_copy_source(rvalue)
+                })
+            })?;
+        }
+    }
+
 
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
     /// actually materialises in the model graph.  This EXCLUDES
@@ -11530,6 +11594,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__string_byte_getitem".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
                 result_ty: ValueType::Int,
@@ -12120,6 +12185,37 @@ impl<'a> Lowering<'a> {
                         arr = self.emit_string_array_items_read(bb_id, arr, owner);
                     }
                     if let Some(kind) = alias.rust_vec {
+                        // Call.args are Variables (`emit_constant` /
+                        // `resolve_operand`). `field_write_inline_const`
+                        // keeps a pooled int on `setarrayitem` as
+                        // `LinkArg::Const`; this helper is a Call, so
+                        // materialise first (`rlist.py` `ll_setitem`).
+                        let item_ty = tyref_to_value_type_with(
+                            dest_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        );
+                        let value_var = match &value {
+                            LinkArg::Value(var) => var.clone(),
+                            LinkArg::Const(_) => {
+                                let op =
+                                    link_arg_as_alias_op(&value, &item_ty).ok_or_else(|| {
+                                        LowerError::Unsupported(format!(
+                                            "bb{mir_bb}: Vec setitem constant is not a pooled \
+                                             int, bool, or float"
+                                        ))
+                                    })?;
+                                let var = self
+                                    .graph
+                                    .alloc_value_var_with_type(concretetype_for_field(&item_ty));
+                                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                    result: Some(var.clone()),
+                                    kind: op,
+                                });
+                                var
+                            }
+                        };
                         let op = OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: rust_vec_helper_segments(
@@ -12127,8 +12223,9 @@ impl<'a> Lowering<'a> {
                                     kind,
                                 ),
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
-                            args: vec![LinkArg::from(arr), LinkArg::from(idx), value.clone()],
+                            args: crate::model::call_args(vec![arr, idx, value_var]),
                             result_ty: ValueType::Void,
                         };
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -12423,11 +12520,15 @@ impl<'a> Lowering<'a> {
                                 crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
                                     &owner_root,
                                     &field_name,
-                                    tyref_to_value_type_with(
-                                        dest_ty,
-                                        self.llbc,
-                                        self.tombstoned_leaves,
-                                        self.gc_struct_ids,
+                                    scalar_fixed_array_item(dest_ty, self.llbc).unwrap_or_else(
+                                        || {
+                                            tyref_to_value_type_with(
+                                                dest_ty,
+                                                self.llbc,
+                                                self.tombstoned_leaves,
+                                                self.gc_struct_ids,
+                                            )
+                                        },
                                     ),
                                 );
                             if let Some(dest) = interior_dest
@@ -12489,9 +12590,13 @@ impl<'a> Lowering<'a> {
                             }
                         }
                     };
-                    if let Some(owner) = field.owner_root.as_deref() {
-                        value = self.coerce_gcref_null_store(bb_id, owner, &field.name, value);
-                    }
+                    value = self.coerce_gcref_null_store(
+                        bb_id,
+                        field.owner_root.as_deref().unwrap_or(""),
+                        &field.name,
+                        Some(&ty),
+                        value,
+                    );
                     value =
                         self.coerce_signed_int_store(bb_id, &ty, Some(field.name.as_str()), value);
                     OpKind::FieldWrite {
@@ -13048,6 +13153,45 @@ impl<'a> Lowering<'a> {
     /// that pointer names the spilled place. An `&mut i64` parameter
     /// is the word on both sides and is left alone. A byte pointer
     /// stays `Ref`.
+    /// A by-value multi-word argument is the address of its storage.
+    /// RPython never passes a struct by value: a GcStruct is a pointer
+    /// (`'r'`), a non-GC Struct is `Ptr` (`'i'`). Kind comes from
+    /// `GcType` / size, not the type's name.
+    fn pass_by_value_multiword_as_addr(
+        &mut self,
+        mir_bb: usize,
+        func: &CallFunc,
+        args: &mut [Variable],
+    ) {
+        let CallFunc::Regular(reg) = func else {
+            return;
+        };
+        let Some(id) = regular_call_fun_decl_id(&reg.kind) else {
+            return;
+        };
+        let Some(fd) = self.llbc.fn_by_id(id) else {
+            return;
+        };
+        // Regular callees keep the classed-instance Ref bank. Only a
+        // residual ABI (dont_look_inside / no body) passes a raw
+        // multi-word value as an address integer.
+        if !fun_decl_is_residual(fd, self.dont_look_inside) {
+            return;
+        }
+        let bb_id = self.block_id[mir_bb];
+        for (index, ty) in fd.signature.inputs.iter().enumerate() {
+            let Some(kind) = pass_by_value_multiword_kind(ty, self.llbc) else {
+                continue;
+            };
+            let Some(arg) = args.get_mut(index) else {
+                continue;
+            };
+            if matches!(kind, ValueType::Int) {
+                *arg = push_cast_ptr_to_int(&mut self.graph, bb_id, arg.clone());
+            }
+        }
+    }
+
     fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,
@@ -14131,19 +14275,22 @@ impl<'a> Lowering<'a> {
     /// producer initially has pointer annotation.  A pointer to an RPython
     /// array is the same boundary: `rutf8.UTF8_INDEX_STORAGE` is a `GcArray`,
     /// while Rust carries the exact owner as `*mut Vec<Utf8LocElem>`.  The
-    /// `_setup_repr_llfields` types the virtualizable token as GCREF.
-    /// A host `0` is `ConstPtr(NULL)`, not an int store into that field.
+    /// `_setup_repr_llfields` types the virtualizable token as GCREF, and a
+    /// `Ref` / `Str` field is the same kind. A host `0` is `ConstPtr(NULL)`
+    /// (`history.py` `CONST_NULL`), not `CONST_0`.
     fn coerce_gcref_null_store(
         &mut self,
         bb_id: BlockId,
         owner: &str,
         field_name: &str,
+        field_ty: Option<&ValueType>,
         value: LinkArg,
     ) -> LinkArg {
         use crate::translator::rtyper::lltypesystem::lltype;
         let is_gcref = crate::virtualizable_decl::virtualizable_llfield_type(owner, field_name)
             .is_some_and(|ty| ty == *lltype::GCREF);
-        if !is_gcref || !crate::model::link_arg_is_int_zero(&self.graph, &value) {
+        let is_ref = field_ty.is_some_and(|ty| matches!(ty, ValueType::Ref(_) | ValueType::Str));
+        if !(is_gcref || is_ref) || !crate::model::link_arg_is_int_zero(&self.graph, &value) {
             return value;
         }
         match self.graph.push_op_var(bb_id, OpKind::ConstRefNull, true) {
@@ -14755,6 +14902,7 @@ impl<'a> Lowering<'a> {
                                             .map(str::to_string)
                                             .collect(),
                                         fun_decl_id: None,
+                                        generic_rust_args: Vec::new(),
                                     },
                                     args: crate::model::call_args(vec![arg]),
                                     result_ty: ValueType::Unsigned,
@@ -14835,6 +14983,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Int,
@@ -14864,6 +15013,7 @@ impl<'a> Lowering<'a> {
                                         .map(str::to_string)
                                         .collect(),
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Int,
@@ -14948,6 +15098,7 @@ impl<'a> Lowering<'a> {
                                         .map(str::to_string)
                                         .collect(),
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Unsigned,
@@ -15233,6 +15384,13 @@ impl<'a> Lowering<'a> {
             // `Repeat` carries one fill value and a count, not per-slot
             // `__pos_N` writes.
             Rvalue::Repeat(elem, _ty, count, _) => {
+                // `[fill; N]` into an inlined `FixedSizeArray` of scalars:
+                // the fill is the stored word. `rlist.py` `alloc_and_set`
+                // is the resizable twin and stays `__array_repeat` below.
+                if scalar_fixed_array_item(dest_ty, self.llbc).is_some() {
+                    let fill = self.resolve_operand(mir_bb, elem)?;
+                    return Ok((None, fill));
+                }
                 let arg = self.resolve_operand(mir_bb, elem)?;
                 let res = self
                     .graph
@@ -15246,6 +15404,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__array_repeat".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(None),
@@ -15436,6 +15595,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec![len_leaf.to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![base]),
                         result_ty: ValueType::Int,
@@ -15565,6 +15725,7 @@ impl<'a> Lowering<'a> {
                                 bb_id,
                                 &ctor.result_owner,
                                 &field.name,
+                                Some(&field.ty),
                                 LinkArg::Value(arg.clone()),
                             );
                             if let Some(value) = coerced.as_variable() {
@@ -15883,11 +16044,12 @@ impl<'a> Lowering<'a> {
                 }
                 // `Option<E>` where `E` is a densely numbered fieldless enum
                 // is also a one-word niche value.  Rust stores `Some(e)` as
-                // `e` and reserves the first value after E's dense range for
-                // `None`; there is no aggregate whose `__discriminant` can be
-                // read.  Keep the physical scalar in the graph and turn the
-                // source-level discriminant into the same boolean shape as
-                // the nullable-pointer Option above (`Some` = scalar != niche).
+                // `e` and reserves one invalid scalar for `None`
+                // ([`fieldless_option_none_tag`]); there is no aggregate
+                // whose `__discriminant` can be read.  Keep the physical
+                // scalar in the graph and turn the source-level discriminant
+                // into the same boolean shape as the nullable-pointer Option
+                // above (`Some` = scalar != niche).
                 if let Some(niche) = tyref_option_fieldless_niche(&place.ty, self.llbc) {
                     let base = self.resolve_place(mir_bb, place)?;
                     let bb_id = self.emit_bb(mir_bb);
@@ -16612,6 +16774,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: path.split("::").map(str::to_string).collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(args),
                 result_ty,
@@ -16747,6 +16910,48 @@ impl<'a> Lowering<'a> {
         let from =
             tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids);
         Some(self.retype_word(mir_bb, value, &from, &ValueType::Unsigned))
+    }
+
+    /// Expand a length-prefixed object GcArray to the `(items, length)`
+    /// pair a residual `(ptr, len)` helper takes (`rlist.py ll_extend` /
+    /// `build_list_from_refs_jit_abi`).
+    fn expand_object_gcarray_header_to_items_len(
+        &mut self,
+        mir_bb: usize,
+        gcarray: Variable,
+    ) -> (Variable, Variable) {
+        let bb_id = self.block_id[mir_bb];
+        let length = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(length.clone()),
+            kind: OpKind::ArrayLen {
+                base: gcarray.clone(),
+                array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                nolength: false,
+            },
+        });
+        let items = self.items_block_item_address(
+            mir_bb,
+            gcarray,
+            &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
+        );
+        (items, length)
+    }
+
+    /// Expand a length-prefixed object GcArray argument of
+    /// `Vec::extend_from_slice` to the `(items, length)` pair
+    /// `ll_vec_extend_from_slice_*` takes (`rlist.py ll_extend`).
+    fn expand_object_gcarray_to_items_len(
+        &mut self,
+        mir_bb: usize,
+        args: Vec<Variable>,
+    ) -> Vec<Variable> {
+        let vec = args[0].clone();
+        let gcarray = args[1].clone();
+        let (items, length) = self.expand_object_gcarray_header_to_items_len(mir_bb, gcarray);
+        vec![vec, items, length]
     }
 
     /// The pair's item word type for a slice helper: the helpers take and
@@ -17106,6 +17311,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Void,
@@ -17542,6 +17748,26 @@ impl<'a> Lowering<'a> {
             self.bind_initializer_result(mir_bb, dest_local, target, res)?;
             return Ok(true);
         }
+        // An immutable `static`'s accessor is the static's address, not a
+        // residual call to the static's symbolic path. Interior-mut
+        // (`Cell` / `UnsafeCell` / atomic) statics are not prebuilt
+        // values; they still have an address to load through.
+        if let Some(gid) = gid
+            && let Some(op) = self
+                .immutable_static_prebuilt_op(gid)
+                .or_else(|| self.immutable_static_addr_op(gid))
+        {
+            let bb_id = self.block_id[mir_bb];
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: op,
+            });
+            self.bind_initializer_result(mir_bb, dest_local, target, res)?;
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -17751,6 +17977,15 @@ impl<'a> Lowering<'a> {
     /// Whether a call is one [`Self::lower_pair_call`] lowers: it defines a
     /// pair slice, or it is a slice method that reads one.
     fn is_pair_call(&self, call: &CallPayload, dest_local: usize) -> bool {
+        // `Vec::reverse` is `as_mut_slice` then `<[T]>::reverse`. That
+        // dest is a pair-shaped `&mut [T]`, but the only consumer is
+        // reverse, which `rlist.py ll_reverse` wants on the vec header
+        // (`ll_vec_reverse`). Leave the dest for the identity-deref
+        // arm rather than binding a pair that reverse then reads as
+        // one word.
+        if rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local) {
+            return false;
+        }
         // A length slot means this dest is a pair in this frame only when
         // its MIR type is a pair slice, an option of one, or a slice
         // iterator. `IterMut::next` writes `Option<&mut T>`, which is an
@@ -17828,7 +18063,10 @@ impl<'a> Lowering<'a> {
                             .or_else(|| const_operand_tyref(op, self.llbc))
                     })
                     .is_some_and(|ty| tyref_to_ast_string(&ty, self.llbc) == "usize"),
-                _ => false,
+                other => {
+                    let segs: Vec<String> = other.split("::").map(str::to_string).collect();
+                    is_core_slice_reverse(&segs)
+                }
             })
     }
 
@@ -17985,20 +18223,17 @@ impl<'a> Lowering<'a> {
                 ) if args.len() == 2 => self.raw_array_unsize_source(mir_bb, place),
                 _ => None,
             };
+            let name_segs: Vec<String> = name.split("::").map(str::to_string).collect();
+            let vec_view = rust_vec_slice_view_leaf(&name_segs);
+            let vec_index = matches!(rust_vec_std_leaf(&name_segs), Some("index" | "index_mut"));
             let (ptr, len) = match (name.as_str(), vec_kind) {
                 _ if let Some((ptr, len, kind)) = array_receiver => {
                     self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
                 }
-                (
-                    "alloc::vec::<Impl>::deref"
-                    | "alloc::vec::<Impl>::deref_mut"
-                    | "alloc::vec::<Impl>::as_slice"
-                    | "alloc::vec::<Impl>::as_mut_slice",
-                    Some(kind),
-                ) if args.len() == 1 => self.pair_of_vec(mir_bb, kind, args[0].clone()),
-                ("alloc::vec::<Impl>::index" | "alloc::vec::<Impl>::index_mut", Some(kind))
-                    if args.len() == 2 =>
-                {
+                (_, Some(kind)) if vec_view.is_some() && args.len() == 1 => {
+                    self.pair_of_vec(mir_bb, kind, args[0].clone())
+                }
+                (_, Some(kind)) if vec_index && args.len() == 2 => {
                     let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
                     self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
                 }
@@ -18695,9 +18930,13 @@ impl<'a> Lowering<'a> {
                 let mut target = CallTarget::FunctionPath {
                     segments,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 };
                 if let Some(id) = fun_decl_id {
                     target = target.with_fun_decl_id(id);
+                    if let Some(fd) = self.llbc.fn_by_id(id) {
+                        target = self.attach_call_generics(target, fd, &reg.generics, None);
+                    }
                 }
                 target
             }
@@ -18752,6 +18991,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![builder]),
                 result_ty: ValueType::Ref(None),
@@ -18796,6 +19036,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![piece.clone()]),
                 result_ty: ValueType::Str,
@@ -19068,6 +19309,7 @@ impl<'a> Lowering<'a> {
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![arg.clone()]),
             result_ty: ValueType::Int,
@@ -19115,6 +19357,7 @@ impl<'a> Lowering<'a> {
                     .map(str::to_string)
                     .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![signed]),
             result_ty: ValueType::Unsigned,
@@ -19418,70 +19661,7 @@ impl<'a> Lowering<'a> {
             });
             return Ok(var);
         }
-        let op = match decode_constant(self.llbc, value)? {
-            DecodedConst::Int(n) => OpKind::ConstInt(n),
-            DecodedConst::UInt(n) => OpKind::ConstUInt(n),
-            DecodedConst::Int128(n) => OpKind::ConstInt128(n),
-            DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
-            DecodedConst::Bool(b) => OpKind::ConstBool(b),
-            DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
-            DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
-            // String / byte-string constants — no
-            // ConstStr opkind exists; synthesise a 0-arg `Call` whose
-            // path encodes the literal text so the IR stays stable.
-            DecodedConst::Str(s) => OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["__str_const".to_string(), s],
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![]),
-                // A `&str` / `&[u8]` literal lowers to `Ptr(STR)` (getkind
-                // `r`), so the synthetic call's result kind is a Ref, not an
-                // Int.  The `__str_const` path is never registered: on the
-                // trace pipeline the call residualises, and the flowspace
-                // adapter pre-folds it to the upstream `Constant('text')`
-                // shape (`flowspace_adapter.rs::is_str_const_define`).
-                result_ty: ValueType::Ref(None),
-            },
-            // A function item used as a *value* rather than called; its value
-            // is the function's address.  The define takes a synthetic head
-            // for the same reason the `Str` arm above does: the path never
-            // matches a registered graph, so the define is not mistaken for a
-            // real 0-arg call to the function it names.  Both of
-            // `getcalldescr`'s checks (`call.py`) run off the resolved callee
-            // graph, and both reject this shape without the head — the
-            // argument-kind comparison against the define's empty list
-            // (`cycle_reduce_method`, one `Ref` parameter), and
-            // `RESULT == FUNC.RESULT` for a 0-parameter callee carrying a
-            // result token (`w_dict_new`, `dont_look_inside`, threaded through
-            // `Option::unwrap_or_else`).  The callee's own segments stay in
-            // the tail so the referenced function is still recoverable.
-            //
-            // Upstream materialises the address as `Constant(funcptr)` of
-            // lltype `Ptr(FuncType)` (`rtyper.getcallable`, and
-            // `sub_helper_funcptr_constant` for the sub-helper twins).
-            // `FuncType._gckind` is `raw`, so `getkind` maps that pointer to
-            // `int`, not to `ref` — the `Int` slot here IS that mapping rather
-            // than a departure from it, and re-stamping it `Ref` would be the
-            // deviation.  majit materialises a funcptr as its integer address
-            // everywhere else as well (`jtransform.rs direct_funcptr_value`
-            // emits `ConstFnAddr`, which the assembler encodes through the
-            // `'i'` argcode), and the flowspace fold gives the define a
-            // `Signed` legacy slot to match.
-            DecodedConst::FnPath(segments) => {
-                let mut synthetic = Vec::with_capacity(segments.len() + 1);
-                synthetic.push(crate::model::FN_CONST_HEAD.to_string());
-                synthetic.extend(segments);
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: synthetic,
-                        fun_decl_id: None,
-                    },
-                    args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Int,
-                }
-            }
-        };
+        let op = decoded_const_to_op(decode_constant(self.llbc, value)?);
         let var = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -20279,10 +20459,18 @@ impl<'a> Lowering<'a> {
     /// An erased `OwnerRootGuard` is that one reference. Borrowing the
     /// option to match on it reads the word `new` stored; marking the
     /// read as an address would hand the consumer the slot instead.
+    ///
+    /// A fieldless enum is the same scalar case: `tyref_to_value_type`
+    /// colors it `Int`, and `Rvalue::Ref` is identity
+    /// (`tyref_is_borrowed_fieldless_enum_free`). Marking `&(*p).kind`
+    /// as an address would hand PartialEq the slot instead of the tag.
     fn place_borrow_takes_address(&self, place: &Place) -> bool {
         if owner_root_guard::tyref_is_guard(&place.ty, self.llbc)
             || owner_root_guard::tyref_is_option_of_guard(&place.ty, self.llbc)
         {
+            return false;
+        }
+        if self.tyref_is_fieldless_enum(&place.ty) {
             return false;
         }
         Self::place_ref_is_address_of(place)
@@ -20852,6 +21040,22 @@ impl<'a> Lowering<'a> {
                         });
                         return Ok(res);
                     }
+                    let immutable_static_id = self.place_peels_to_immutable_static_id(&inner);
+                    if let Some(gid) = immutable_static_id
+                        && let Some((_, field_idx)) = indexed_field_parts(field_payload)
+                        && let Some(op) = fold_immutable_static_field(self.llbc, gid, field_idx)
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        let bb_id = self.block_id[mir_bb];
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: op,
+                        });
+                        return Ok(res);
+                    }
+                    let field_pure = immutable_static_id.is_some();
                     let owner_declared_gc =
                         container_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
                     let base = self.resolve_place(mir_bb, *inner)?;
@@ -20954,7 +21158,7 @@ impl<'a> Lowering<'a> {
                             base,
                             field,
                             ty,
-                            pure: false,
+                            pure: field_pure,
                         },
                     });
                     if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
@@ -21079,6 +21283,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![base, idx_var]),
                             result_ty: if copied_bytes {
@@ -21600,6 +21805,21 @@ impl<'a> Lowering<'a> {
                 if let Some(inner) = self.anon_const_copied_global(id) {
                     return self.resolve_place(mir_bb, inner);
                 }
+                // rustc promotes a `&str` (or other by-value literal) to
+                // an `AnonConst` whose initializer copies the constant
+                // and returns a borrow (`promoted_const#N`). Fold to the
+                // same op `build_rvalue` emits for that literal.
+                if let Some(const_op) = self.anon_const_literal_op(id) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let bb_id = self.block_id[mir_bb];
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: const_op,
+                    });
+                    return Ok(res);
+                }
                 let segments = self.global_segments(mir_bb, id)?;
                 // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
                 // the `None` stored in PyPy's `locals_cells_stack_w` slots
@@ -21753,7 +21973,9 @@ impl<'a> Lowering<'a> {
                     .or_else(|| code_flags_const(&segments))
                     .or_else(|| encoding_name_const(&segments))
                     .or_else(|| gc_ref_null_const(&segments))
-                    .or_else(|| bitflags_trait_empty_const(&segments));
+                    .or_else(|| bitflags_trait_empty_const(&segments))
+                    .or_else(|| self.immutable_static_prebuilt_op(id))
+                    .or_else(|| self.immutable_static_addr_op(id));
                 // No lane produced a value for this static.  The synthetic
                 // nullary call below targets the static's own path, which is
                 // not a function, so the failure only becomes visible two
@@ -22088,9 +22310,13 @@ impl<'a> Lowering<'a> {
                         aggregate_ctor_name(kind),
                         tyref_positional_aggregate_suffix(dest_ty, self.llbc)
                     );
-                    let positional = (0..n_operands)
-                        .map(|i| (format!("__pos_{i}"), String::new(), None))
-                        .collect();
+                    // `getkind` comes from the field lltype (`history.py`).
+                    // Empty spellings made every positional item `Ref`
+                    // (`tuple_field_value_type`), so an `(i64, i64)` store
+                    // of `1` became `CONST_NULL` in `rewrite_op_setfield`
+                    // and the minted null had no register class.
+                    let positional =
+                        positional_aggregate_field_rows(dest_ty, n_operands, self.llbc);
                     // Not an Adt at all, so there is no struct decl to
                     // stand behind an allocation rewrite.
                     (Vec::new(), leaf, positional, None, false, None)
@@ -22142,6 +22368,24 @@ impl<'a> Lowering<'a> {
                     .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
                     .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
                 let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
+                // The field's TyRef is the kind source (`history.getkind`):
+                // a fieldless enum is `Int`. The rendered spelling is the
+                // kind source for primitives (`i64` → `Int`) when the
+                // TyRef still carries a wrapper `tyref_to_value_type`
+                // does not peel. `tuple_field_value_type` of an unknown
+                // name is `Ref`, so `Ok(CallableKind::Builtin)`
+                // (discriminant 0) would become `CONST_NULL` from the
+                // spelling alone.
+                let ty = match declared_ty {
+                    Some(declared) => {
+                        if let Some(item_ty) = scalar_fixed_array_item(declared, self.llbc) {
+                            item_ty
+                        } else {
+                            tyref_aggregate_field_value_type(declared, self.llbc, &field_ty)
+                        }
+                    }
+                    None => tuple_field_value_type(&field_ty),
+                };
                 AggregateField {
                     name,
                     // `_names_without_voids()` (`lltype.py`) /
@@ -22155,6 +22399,7 @@ impl<'a> Lowering<'a> {
                     .1 == majit_ir::value::Type::Void
                         || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc)),
                     narrow_root: self.typed_ref_field_narrow_root(declared_ty),
+                    ty,
                 }
             })
             .collect();
@@ -22203,6 +22448,55 @@ impl<'a> Lowering<'a> {
         let kind = serde_json::json!({ "Adt": [head, variant_idx, null] });
         self.aggregate_shape(&kind, &dest, fd.signature.inputs.len())
             .ok()
+    }
+
+    /// A generic ADT field is a `TypeVar` on the template (`Result::Ok`'s
+    /// payload is `T`). Substitute from the destination place first: it is
+    /// the instantiated ADT (`Result<Vec<*mut PyObject>, PyError>`). The
+    /// aggregate head is a bare `type_id`, or a `TypeDeclRef` whose
+    /// `generics` are still the template TypeVars
+    /// (`type_decl_ref_generics` falls back to `item_meta.instantiation()`).
+    /// Left as `TypeVar`, `tuple_field_value_type` answers `Ref` while a
+    /// `Vec<T>` is the raw header (`RustVecRepr.lowleveltype` is
+    /// `Ptr(Struct(raw) "RustVec")`, `history.py` `getkind` `'int'`).
+    fn instantiate_adt_field_ty(
+        &self,
+        field_ty: &TyRef,
+        head: &serde_json::Value,
+        dest_ty: Option<&TyRef>,
+    ) -> TyRef {
+        let peel_substituted = |substituted: TyRef| -> TyRef {
+            // Generic arguments keep `Deduplicated` / `Value` wrappers.
+            // `tyref_to_value_type` and `tyref_fieldless_enum_def` read the
+            // inner `Adt` / `Scalar` node, so peel those wrappers and leave
+            // a `Ref` in place (`strip_ty_indirections`).
+            match tyref_node(&substituted, self.llbc)
+                .and_then(|node| strip_ty_indirections(node, self.llbc))
+            {
+                Some(node) => TyRef::Other(node.clone()),
+                None => substituted,
+            }
+        };
+        let try_owner = |owner: serde_json::Value| -> Option<TyRef> {
+            substitute_field_typevars(field_ty, &owner, self.llbc).map(peel_substituted)
+        };
+        if let Some(node) = dest_ty
+            .and_then(|ty| tyref_node(ty, self.llbc))
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+        {
+            let adt = node.get("Adt").unwrap_or(node);
+            if adt.is_object() {
+                if let Some(ty) = try_owner(serde_json::json!({ "Adt": adt })) {
+                    return ty;
+                }
+            }
+        }
+        if head.is_object() {
+            if let Some(ty) = try_owner(serde_json::json!({ "Adt": head })) {
+                return ty;
+            }
+        }
+        clone_tyref(field_ty)
     }
 
     fn resolve_aggregate_adt(
@@ -22260,17 +22554,18 @@ impl<'a> Lowering<'a> {
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
+                        let ty = self.instantiate_adt_field_ty(&f.ty, head, dest_ty);
                         let field_ty = if inst_args.is_empty() {
-                            tyref_to_ast_string(&f.ty, self.llbc)
+                            tyref_to_ast_string(&ty, self.llbc)
                         } else {
-                            substitute_field_type(&f.ty, &inst_args, self.llbc, self.gc_struct_ids)
+                            substitute_field_type(&ty, &inst_args, self.llbc, self.gc_struct_ids)
                         };
                         (
                             f.name.clone().unwrap_or_else(|| {
                                 majit_charon_reader::ullbc::positional_field_name(i)
                             }),
                             field_ty,
-                            Some(clone_tyref(&f.ty)),
+                            Some(ty),
                         )
                     })
                     .collect();
@@ -22333,12 +22628,13 @@ impl<'a> Lowering<'a> {
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
+                        let ty = self.instantiate_adt_field_ty(&f.ty, head, dest_ty);
                         (
                             f.name.clone().unwrap_or_else(|| {
                                 majit_charon_reader::ullbc::positional_field_name(i)
                             }),
-                            tyref_to_ast_string(&f.ty, self.llbc),
-                            Some(clone_tyref(&f.ty)),
+                            tyref_to_ast_string(&ty, self.llbc),
+                            Some(ty),
                         )
                     })
                     .collect();
@@ -22803,6 +23099,28 @@ impl<'a> Lowering<'a> {
         Some(inner)
     }
 
+    /// Fold an `AnonConst` whose initializer is pure constant construction
+    /// (`_1 = const C; _0 = &_1`, a fieldless-enum `Aggregate`, a literal).
+    fn anon_const_literal_op(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("AnonConst")
+        {
+            return None;
+        }
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        if let Some(value) = promoted_const_copied_const(&body)
+            && let Ok(decoded) = decode_constant(self.llbc, &value)
+        {
+            return Some(decoded_const_to_op(decoded));
+        }
+        const_eval_init_body(self.llbc, &body)
+    }
+
     /// Fold a `NamedConst` global (Rust `const`) whose initializer is a
     /// single literal assignment to its `ConstInt` / `ConstBool` /
     /// `ConstFloat` value.  `None` for statics (`global_kind` ≠
@@ -23067,6 +23385,66 @@ impl<'a> Lowering<'a> {
         for (key, addr) in self.static_addrs.refs {
             if static_key_matches(&full, &stripped, key) {
                 return Some(OpKind::ConstRefAddr(*addr));
+            }
+        }
+        None
+    }
+
+    /// An immutable `static` is a prebuilt constant
+    /// (`bookkeeper.py immutablevalue`). Host-registered addresses
+    /// already won via [`Self::static_addr_op`]; this lane is the
+    /// identity of the declaration itself, never a residual
+    /// `FunctionPath` of the static's symbolic path.
+    fn immutable_static_prebuilt_op(&self, def_id: u64) -> Option<OpKind> {
+        let g = self.llbc.global_by_id(def_id)?;
+        if !immutable_static_is_prebuilt_table(self.llbc, g) {
+            return None;
+        }
+        Some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(def_id)))
+    }
+
+    /// Address of an immutable `static`, including interior-mut
+    /// `Cell` / `UnsafeCell` / atomic bindings. The value is not a
+    /// prebuilt constant (`immutable_static_is_prebuilt_table`); the
+    /// address is still the place to load or store through.
+    fn immutable_static_addr_op(&self, def_id: u64) -> Option<OpKind> {
+        let g = self.llbc.global_by_id(def_id)?;
+        if !global_is_immutable_static(g) {
+            return None;
+        }
+        Some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(def_id)))
+    }
+
+    /// Peel `Deref` projections to an immutable `static` Global.
+    fn place_peels_to_immutable_static_id(&self, place: &Place) -> Option<u64> {
+        self.place_peels_to_any_immutable_static(place)
+            .filter(|&id| {
+                self.llbc
+                    .global_by_id(id)
+                    .is_some_and(|g| immutable_static_is_prebuilt_table(self.llbc, g))
+            })
+    }
+
+    /// Peel `Deref` projections to any immutable `static`, including
+    /// interior-mut `Cell` / `UnsafeCell` / atomic bindings. The value
+    /// is not a prebuilt constant; the address is still the place.
+    fn place_peels_to_any_immutable_static(&self, place: &Place) -> Option<u64> {
+        let mut current = place;
+        for _ in 0..8 {
+            match &current.kind {
+                PlaceKind::Global { id, .. } => {
+                    let g = self.llbc.global_by_id(*id)?;
+                    return global_is_immutable_static(g).then_some(*id);
+                }
+                PlaceKind::Projection(inner, ProjectionElem::Atom(s)) if s == "Deref" => {
+                    current = inner;
+                }
+                PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                    if v.as_str() == Some("Deref") =>
+                {
+                    current = inner;
+                }
+                _ => return None,
             }
         }
         None
@@ -23902,7 +24280,12 @@ impl<'a> Lowering<'a> {
                 }
                 None
             }
-            "base" | "pin_roots" | "shadow_stack_len" if receiver_scope.is_some() => None,
+            "base" | "pin_roots" | "shadow_stack_len" | "publish" | "publish_roots"
+            | "normalize" | "normalize_roots"
+                if receiver_scope.is_some() =>
+            {
+                None
+            }
             "shadow_stack_copy_range" | "shadow_stack_copy_range_into_vec"
                 if receiver_scope.is_some() =>
             {
@@ -24602,7 +24985,7 @@ impl<'a> Lowering<'a> {
         // alongside the resolved Variables so call intercepts can
         // consult per-local lowering state
         // (`const_discriminant_locals`).
-        let arg_locals: Vec<Option<usize>> = call
+        let mut arg_locals: Vec<Option<usize>> = call
             .args
             .iter()
             .map(|op| match op {
@@ -24769,6 +25152,7 @@ impl<'a> Lowering<'a> {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
         let resolved_call_args = args.clone();
+        self.pass_by_value_multiword_as_addr(mir_bb, &call.func, &mut args);
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
         let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
@@ -24791,13 +25175,42 @@ impl<'a> Lowering<'a> {
         // `lower_fun_decl_with_static_addrs`), so caller and callee agree on
         // whether a given callee is scoped.
         let mut callee_name_path: Option<String> = None;
+        // `build_list_from_refs` / `build_tuple_from_refs` residual ABI is
+        // the `(ptr, len)` pair (`build_list_from_refs_jit_abi`). The
+        // graph's `&[PyObjectRef]` is the length-prefixed GcArray; expand
+        // it the same way `Vec::extend_from_slice` splices `ll_extend`.
+        if let CallFunc::Regular(reg) = &call.func
+            && regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(path_is_build_refs_pair_abi)
+            && pair_lens.is_empty()
+            && args.len() == 1
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_object_pointer_slice(ty, self.llbc))
+        {
+            let (items, length) =
+                self.expand_object_gcarray_header_to_items_len(mir_bb, args[0].clone());
+            args = vec![items, length];
+        }
         // `v.extend_from_slice(s)` on a `Vec` of one-word items is
-        // `ll_extend` from the pair.
+        // `ll_extend` from the pair (`rlist.py ll_extend` /
+        // `rrustvec.rs` `VecOp::ExtendFromSlice`). An object-pointer
+        // `&[PyObjectRef]` is the length-prefixed GcArray, not a pair:
+        // expand to `(items = header + ITEMS_BLOCK_ITEMS_OFFSET,
+        // length = arraylen_gc)` so the helper sees the same three
+        // words a pair splice would.
         let vec_extend_kind = match &call.func {
             CallFunc::Regular(reg)
-                if matches!(pair_lens.as_slice(), [(1, _)])
-                    && regular_call_name_path(reg, self.llbc).as_deref()
-                        == Some("alloc::vec::<Impl>::extend_from_slice") =>
+                if regular_call_name_path(reg, self.llbc)
+                    .as_deref()
+                    .is_some_and(path_is_vec_extend_from_slice)
+                    && (matches!(pair_lens.as_slice(), [(1, _)])
+                        || (pair_lens.is_empty()
+                            && args.len() == 2
+                            && second_arg_ty.as_ref().is_some_and(|ty| {
+                                tyref_is_object_pointer_slice(ty, self.llbc)
+                            }))) =>
             {
                 first_arg_ty
                     .as_ref()
@@ -24835,7 +25248,11 @@ impl<'a> Lowering<'a> {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
                 if let Some(kind) = vec_extend_kind =>
             {
-                let args = splice_pair_lens(args, pair_lens);
+                let args = if matches!(pair_lens.as_slice(), [(1, _)]) {
+                    splice_pair_lens(args, pair_lens)
+                } else {
+                    self.expand_object_gcarray_to_items_len(mir_bb, args)
+                };
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: majit_ir::rvec::vec_helper_path(
@@ -24846,6 +25263,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(args),
                     result_ty: ValueType::Void,
@@ -24864,6 +25282,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(args),
                     result_ty: ValueType::Void,
@@ -25377,24 +25796,23 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+
                 // `<String>::deref` / `<Vec<T>>::deref` (+ `deref_mut`) —
-                // identity in the lifted value model (String/&str and
-                // Vec/&[T] share one repr), so alias the destination to
-                // the receiver instead of emitting a `deref` method call
-                // the rtyper cannot route on the classdef-less receiver.
+                // identity in the lifted value model (String/&str share one
+                // repr), so alias the destination to the receiver instead of
+                // emitting a `deref` method call the rtyper cannot route on
+                // the classdef-less receiver.
                 //
-                // A `Vec` of one-word items is the address of its raw
-                // `{ptr, len, cap}` header, not a list, so its slice is not
-                // the receiver.  Only `<[T]>::reverse` consumes the alias,
-                // which the call arm retargets to `ll_vec_reverse`; any other
-                // slice use would read the header words as items, so that
-                // deref keeps the residual `deref` call, which the annotator
-                // rejects on the `SomeRustVec` receiver.
+                // A `Vec<T>` is the address of its raw `{ptr, len, cap}`
+                // header (`RustVecRepr`, kind `int`), not a list, so its
+                // slice is not the receiver.  Only `<[T]>::reverse` consumes
+                // the alias, which the call arm retargets to `ll_vec_reverse`;
+                // any other slice use would read the header words as items.
                 if args.len() == 1
                     && self.is_container_identity_deref(&reg)
                     && (first_arg_ty
                         .as_ref()
-                        .is_none_or(|ty| tyref_rust_vec_item_kind(ty, self.llbc).is_none())
+                        .is_none_or(|ty| !tyref_is_rust_vec_header(ty, self.llbc))
                         || rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local))
                 {
                     if should_copy_u8_list_to_str(&call.dest.ty, first_arg_ty.as_ref(), self.llbc) {
@@ -26092,6 +26510,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
                             // `ord` returns RPython Signed. The byte-copy
@@ -26513,6 +26932,7 @@ impl<'a> Lowering<'a> {
                                     kind,
                                 ),
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![
                                 array_base.clone(),
@@ -26675,6 +27095,7 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::LL_ARRAYMOVE.to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![
                                 array,
@@ -26923,6 +27344,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
                             result_ty: ValueType::Int,
@@ -27220,6 +27642,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec![marker.to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(args.clone()),
                             result_ty,
@@ -27268,6 +27691,7 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: if builder_ctor_leaf == Some("with_capacity") {
                                 crate::model::call_args(args.clone())
@@ -27302,6 +27726,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__majit_stringbuilder_append".to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 },
                                 args: crate::model::call_args(vec![res.clone(), args[0].clone()]),
                                 result_ty: ValueType::Void,
@@ -27390,6 +27815,7 @@ impl<'a> Lowering<'a> {
                                             .to_string(),
                                     ],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 },
                                 args: crate::model::call_args(vec![acc_val, piece_val]),
                                 result_ty: ValueType::Void,
@@ -27595,15 +28021,43 @@ impl<'a> Lowering<'a> {
                             .and_then(|local| self.atomic_ref_place.get(&local))
                             .map(clone_place);
                         if let Some(referent) = referent {
-                            let value = self.resolve_place(mir_bb, referent)?;
-                            self.local_var[dest_local] = Some(LocalValue::One(value));
-                            let target_bb = self.block_id[target];
-                            let link_args = self.edge_args(mir_bb, target)?;
-                            self.graph.set_goto(bb_id, target_bb, link_args);
-                            return Ok(());
+                            // A field place already aliases the inner
+                            // scalar (`STR.hash`). An immutable static's
+                            // place is the binding's address
+                            // (`immutable_static_addr_op`); loading that
+                            // word is `raw_load`, not aliasing the
+                            // pointer onto the dest bank.
+                            if self
+                                .place_peels_to_any_immutable_static(&referent)
+                                .is_none()
+                            {
+                                let value = self.resolve_place(mir_bb, referent)?;
+                                self.local_var[dest_local] = Some(LocalValue::One(value));
+                                let target_bb = self.block_id[target];
+                                let link_args = self.edge_args(mir_bb, target)?;
+                                self.graph.set_goto(bb_id, target_bb, link_args);
+                                return Ok(());
+                            }
                         }
                         if let Some((item_ty, itemsize, is_item_signed)) =
-                            self.raw_word_descr(&call.dest.ty)
+                            self.raw_word_descr(&call.dest.ty).or_else(|| {
+                                first_arg_ty.as_ref().and_then(|ty| {
+                                    let peeled = self
+                                        .tyref_peel_ref_to_pointee(ty)
+                                        .unwrap_or_else(|| ty.clone());
+                                    let item_ty =
+                                        tyref_atomic_inner_value_type(&peeled, self.llbc)?;
+                                    let is_item_signed = matches!(item_ty, ValueType::Int);
+                                    let itemsize = match &item_ty {
+                                        ValueType::Bool => 1,
+                                        ValueType::Int
+                                        | ValueType::Unsigned
+                                        | ValueType::Ref(_) => crate::layout::target_word_size(),
+                                        _ => return None,
+                                    };
+                                    Some((item_ty, itemsize, is_item_signed))
+                                })
+                            })
                         {
                             let offset = self
                                 .graph
@@ -27919,6 +28373,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["ll_math".to_string(), leaf.to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(args.iter().cloned()),
                             result_ty: ValueType::Float,
@@ -28190,6 +28645,7 @@ impl<'a> Lowering<'a> {
                                     "float2longlong".to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -28237,6 +28693,7 @@ impl<'a> Lowering<'a> {
                                     "float2longlong".to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -28290,6 +28747,7 @@ impl<'a> Lowering<'a> {
                                     "iter".to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Ref(None),
@@ -28316,6 +28774,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Ref(None),
@@ -28348,6 +28807,7 @@ impl<'a> Lowering<'a> {
                                         .to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -28488,6 +28948,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
                                 result_ty: ValueType::Int,
@@ -28563,6 +29024,7 @@ impl<'a> Lowering<'a> {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
                                 result_ty: ValueType::Int,
@@ -28781,6 +29243,7 @@ impl<'a> Lowering<'a> {
                                     kind,
                                 ),
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -28832,6 +29295,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -28949,6 +29413,9 @@ impl<'a> Lowering<'a> {
                 // below.
                 //
                 // `Vec<PyObjectRef>::as_slice` is [`Self::try_lower_object_vec_whole_list_view`].
+                // Any other `Vec<T>` is the raw header address; its slice is
+                // not that word (`history.py` `getkind` of the header is
+                // `int`, of `&[u8]` is `ref`).
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
                     if should_copy_u8_list_to_str(&call.dest.ty, first_arg_ty.as_ref(), self.llbc) {
                         let dest = self.emit_ll_join_chars(bb_id, args[0].clone());
@@ -28956,13 +29423,23 @@ impl<'a> Lowering<'a> {
                         if !self.string_byte_view_locals.contains(&dest_local) {
                             self.string_byte_view_locals.push(dest_local);
                         }
-                    } else {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
                     }
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    let rust_vec_header = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_rust_vec_header(ty, self.llbc));
+                    if !rust_vec_header
+                        || rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local)
+                    {
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `<[T]>::as_ptr` — the slice's data pointer is the receiver
                 // value in the erased array-pointer model.  Alias the result to
@@ -29005,6 +29482,71 @@ impl<'a> Lowering<'a> {
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
+                }
+                // `Cell<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`.
+                // `get` / `set` are a load / store of that inner word
+                // (`getfield` / `setfield` on the owning struct).
+                if args.len() == 1 && self.is_cell_word_get(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let ty = tyref_to_value_type_with(
+                        &call.dest.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                    );
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base: args[0].clone(),
+                            field: FieldDescriptor::new("value", Some("core::cell::Cell".into())),
+                            ty,
+                            pure: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() == 2 && self.is_cell_word_set(&reg) {
+                    let payload_ty = first_arg_ty.as_ref().and_then(|ty| {
+                        let peeled = self
+                            .tyref_peel_ref_to_pointee(ty)
+                            .unwrap_or_else(|| ty.clone());
+                        self.tyref_adt_type_arg(&peeled, 0)
+                    });
+                    if let Some(value_ty) = second_arg_ty
+                        .as_ref()
+                        .or(second_const_arg_ty.as_ref())
+                        .or(payload_ty.as_ref())
+                    {
+                        let ty = tyref_to_value_type_with(
+                            value_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        );
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: None,
+                            kind: OpKind::FieldWrite {
+                                base: args[0].clone(),
+                                field: FieldDescriptor::new(
+                                    "value",
+                                    Some("core::cell::Cell".into()),
+                                ),
+                                value: args[1].clone().into(),
+                                ty,
+                            },
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
@@ -29266,39 +29808,148 @@ impl<'a> Lowering<'a> {
                     None => (segments, method_hint),
                 };
                 // `v.reverse()` reaches `<[T]>::reverse` through
-                // `Vec::deref_mut`, which aliases the slice to the `Vec`
-                // header; that is `ll_reverse` on the list.
-                let (segments, method_hint) = match arg_locals
-                    .first()
-                    .copied()
-                    .flatten()
-                    .filter(|_| args.len() == 1 && is_core_slice_reverse(&original_segments))
-                    .and_then(|local| local_is_rust_vec_deref(self.body, self.llbc, local))
-                {
-                    Some(kind) => (
-                        rust_vec_helper_segments(majit_ir::rvec::VecOp::Reverse, kind),
-                        None,
-                    ),
-                    None => (segments, method_hint),
-                };
+                // `Vec::deref_mut` / `as_mut_slice`. A one-word-item Vec
+                // aliases the slice to the header (`ll_vec_reverse`). An
+                // object-pointer slice is the length-prefixed array, and
+                // `rtype_method_reverse` (`rlist.py`) wants the FunctionPath
+                // `flowspace_adapter` rewrites to `getattr(recv, "reverse")`.
+                // Leaving Charon's impl `Method` on `[T]` residualizes
+                // `core::slice::<Impl>::reverse` — `[T]` has no classdef.
+                let (segments, method_hint) =
+                    if args.len() == 1 && is_core_slice_reverse(&original_segments) {
+                        match arg_locals
+                            .first()
+                            .copied()
+                            .flatten()
+                            .and_then(|local| local_is_rust_vec_deref(self.body, self.llbc, local))
+                        {
+                            Some(kind) => (
+                                rust_vec_helper_segments(majit_ir::rvec::VecOp::Reverse, kind),
+                                None,
+                            ),
+                            None => (original_segments.clone(), None),
+                        }
+                    } else {
+                        (segments, method_hint)
+                    };
                 // `&mut vec[..]` of `Vec<PyObjectRef>` is the header address.
                 // Write the shadow-stack range into that vec. The codewriter
                 // sends the call back when that argument is not a signed word.
+                // Method `RootScope::pin_roots(&self, slice)` is two Ref
+                // words (scope, GcArray). The bound helper is the 3-word
+                // pair ABI `root_scope_pin_roots_jit_abi`. Free `pin_roots`
+                // takes the same length-prefixed GcArray (`pin_roots_jit_abi`,
+                // `rlist.py` `GcArray(OBJECTPTR)`).
                 let (segments, method_hint) = if args.len() == 2
-                    && fmt_path_ends_with(
-                        &original_segments,
-                        &["gc_roots", "shadow_stack_copy_range"],
-                    )
-                    && self.var_is_object_vec_header(&args[1])
+                    && original_segments.last().map(String::as_str) == Some("pin_roots")
+                    && original_segments.iter().any(|s| s == "gc_roots")
                 {
+                    args.remove(0);
+                    arg_locals.remove(0);
                     (
                         vec![
                             "pyre_object".to_string(),
                             "gc_roots".to_string(),
-                            "shadow_stack_copy_range_into_vec".to_string(),
+                            "pin_roots".to_string(),
                         ],
                         None,
                     )
+                } else {
+                    (segments, method_hint)
+                };
+                // Method `RootScope::publish(&self, slice)` is the same
+                // two-Ref graph / 3-word pair split (`root_scope_publish_jit_abi`).
+                // `get_and_call_function` publishes then normalizes; a pair
+                // helper with the GcArray in rdi and leftover `len` in rdx
+                // copies the length word as slot 0 (`pair_items`). Free
+                // `publish_roots` takes the length-prefixed GcArray
+                // (`publish_roots_jit_abi`).
+                let (segments, method_hint) = if original_segments.last().map(String::as_str)
+                    == Some("publish")
+                    && original_segments.iter().any(|s| s == "gc_roots")
+                {
+                    if args.len() == 2 {
+                        args.remove(0);
+                        arg_locals.remove(0);
+                    }
+                    if args.len() == 1 {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "publish_roots".to_string(),
+                            ],
+                            None,
+                        )
+                    } else {
+                        (segments, method_hint)
+                    }
+                } else {
+                    (segments, method_hint)
+                };
+                let (segments, method_hint) = if args.len() == 2
+                    && fmt_path_ends_with(
+                        &original_segments,
+                        &["gc_roots", "shadow_stack_copy_range"],
+                    ) {
+                    let into_vec = || {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "shadow_stack_copy_range_into_vec".to_string(),
+                            ],
+                            None,
+                        )
+                    };
+                    let dest_local = arg_locals.get(1).copied().flatten().or_else(|| {
+                        match arg_operands.get(1)? {
+                            Operand::Copy(place) | Operand::Move(place) => place_base_local(place),
+                            Operand::Const(_) => None,
+                        }
+                    });
+                    let dest_is_object_pair = pair_lens.iter().any(|(at, _)| *at == 1)
+                        || dest_local.is_some_and(|local| {
+                            matches!(
+                                self.local_var.get(local).and_then(|slot| slot.as_ref()),
+                                Some(LocalValue::Pair(_, _))
+                            ) && self.body.locals.locals.get(local).is_some_and(|loc| {
+                                slice_ty_item_is_object_pointer(&loc.ty, self.llbc)
+                            })
+                        });
+                    if self.var_is_object_vec_header(&args[1]) {
+                        into_vec()
+                    } else if let Some(local) = dest_local {
+                        let vec_var = self.vec_header_var_of_slice_local(local).or_else(|| {
+                            let loc = self.body.locals.locals.get(local)?;
+                            if !tyref_is_object_pointer_rust_vec(&loc.ty, self.llbc) {
+                                return None;
+                            }
+                            self.local_var
+                                .get(local)?
+                                .as_ref()
+                                .map(LocalValue::link_word)
+                        });
+                        if let Some(vec_var) = vec_var {
+                            args[1] = vec_var;
+                            pair_lens.retain(|(at, _)| *at != 1);
+                            into_vec()
+                        } else if dest_is_object_pair {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: shadow_stack_copy_range dest is an object-pointer \
+                                 pair slice with no Vec header"
+                            )));
+                        } else {
+                            (segments, method_hint)
+                        }
+                    } else if dest_is_object_pair {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: shadow_stack_copy_range dest is an object-pointer \
+                             pair slice with no Vec header"
+                        )));
+                    } else {
+                        (segments, method_hint)
+                    }
                 } else {
                     (segments, method_hint)
                 };
@@ -29553,6 +30204,7 @@ impl<'a> Lowering<'a> {
                                     "jit_bigint_from_i64".to_string(),
                                 ],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![cst]),
                             result_ty: ValueType::Ref(None),
@@ -29659,6 +30311,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -29892,6 +30545,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -30062,6 +30716,7 @@ impl<'a> Lowering<'a> {
                         CallTarget::FunctionPath {
                             segments: path,
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         }
                     } else if args.len() == 1
                         && let Some(marker) = promote_marker
@@ -30069,6 +30724,7 @@ impl<'a> Lowering<'a> {
                         CallTarget::FunctionPath {
                             segments: vec![marker.to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         }
                     } else {
                         // `CallTarget::Method` requires a receiver in `args[0]`
@@ -30102,6 +30758,22 @@ impl<'a> Lowering<'a> {
                         }
                         let same_callee =
                             segments == original_segments && method_hint == original_method_hint;
+                        // The FunctionPath names a FunDecl when it still
+                        // carries that decl's id. A later rewrite
+                        // (`ll_vec_*`, pin_roots, …) drops it. Blanket
+                        // `Into` already resolved a different `from` id
+                        // inside `call_target_segments`.
+                        let path_fun_decl_id = if !same_callee {
+                            None
+                        } else if let Some(IntoDevirt::Target {
+                            fun_decl_id: from_id,
+                            ..
+                        }) = self.blanket_into_devirt(&reg)
+                        {
+                            Some(from_id)
+                        } else {
+                            fun_decl_id
+                        };
                         match method_hint {
                             Some((owner_root, leaf)) if !args.is_empty() => {
                                 // Method is this FunDecl: stamp its registered
@@ -30160,12 +30832,34 @@ impl<'a> Lowering<'a> {
                                     });
                                     args[0] = narrowed;
                                 }
+                                let names_fun_decl = fun_decl_id.is_some_and(|id| {
+                                    function_path_names_fun_decl(path_fun_decl_id, id)
+                                });
                                 let mut target = CallTarget::FunctionPath {
                                     segments,
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 };
-                                if same_callee && let Some(id) = fun_decl_id {
+                                if let Some(id) = path_fun_decl_id {
                                     target = target.with_fun_decl_id(id);
+                                }
+                                // A rewritten std `Vec` helper (`ll_vec_*`) is
+                                // monomorphic; the original FunDecl's type
+                                // arguments must not ride along as turbofish
+                                // (`ll_vec_newlist_hint_r::<PyObject>`), or
+                                // the oopspec / fnaddr lookup misses. Stamp
+                                // generics only when the path still names
+                                // that FunDecl.
+                                if names_fun_decl
+                                    && let Some(id) = fun_decl_id
+                                    && let Some(fd) = self.llbc.fn_by_id(id)
+                                {
+                                    target = self.attach_call_generics(
+                                        target,
+                                        fd,
+                                        &reg.generics,
+                                        first_arg_ty.as_ref(),
+                                    );
                                 }
                                 target
                             }
@@ -30244,6 +30938,9 @@ impl<'a> Lowering<'a> {
                 let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
+                let const_fn_id = operand_fundef(self.llbc, &dyn_operand);
+                let closed_fnptr_graphs =
+                    closed_fnptr_graphs_for(self.llbc, self.body, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
                 // `*const ()`: the call casts the slot to the method's fn-ptr
                 // type into a temporary and calls the temporary.  The slot
@@ -30302,6 +30999,21 @@ impl<'a> Lowering<'a> {
                             result_ty,
                         }
                     }
+                } else if let Some(fun_id) = const_fn_id.or_else(|| {
+                    folded_fun_id_from_immutable_static(self.llbc, self.body, &dyn_operand)
+                }) && let Some(fd) = self.llbc.fn_by_id(fun_id)
+                {
+                    // A Const `FnDef` (or a field of an immutable static
+                    // that folded to one) is `direct_call`.
+                    // `jtransform.py handle_regular_indirect_call` inlines
+                    // the same target when the funcbox is Const; naming
+                    // the FunDecl here lets `find_all_graphs` enter it.
+                    let path = registered_path_for_fun_decl(self.llbc, fd);
+                    OpKind::Call {
+                        target: CallTarget::function_path(path.segments).with_fun_decl_id(fun_id),
+                        args: crate::model::call_args(args),
+                        result_ty,
+                    }
                 } else if let Some(graphs) = eval_hook_graphs {
                     // `register_eval_override`'s function and the `FnDef`
                     // cast to that parameter's type are one prebuilt
@@ -30312,6 +31024,23 @@ impl<'a> Lowering<'a> {
                     // funcptr is `portal_runner_ptr`; this pointer is not,
                     // so `rewrite_op_indirect_call` takes
                     // `handle_regular_indirect_call` or `handle_residual_call`.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        graphs: Some(graphs),
+                        family_key: None,
+                        result_ty,
+                    }
+                } else if let Some(graphs) = closed_fnptr_graphs {
+                    // `FunctionsPBCRepr` / `SmallFunctionSetPBCRepr`:
+                    // the funcptr was loaded from a field of a type that
+                    // only exists as immutable statics, so the family is
+                    // the FnDefs those initializers stored.
+                    // `handle_regular_indirect_call` records them as
+                    // `indirectcalltargets`; `pyjitpl.py
+                    // do_residual_or_indirect_call` inlines a Const
+                    // funcbox via `bytecode_for_address`.
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
                     OpKind::IndirectCall {
                         funcptr,
@@ -30346,6 +31075,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__dyn_call".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(full_args),
                         result_ty,
@@ -30419,6 +31149,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Str,
@@ -30478,6 +31209,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -30517,6 +31249,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -30560,6 +31293,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -30709,6 +31443,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Bool,
@@ -30751,6 +31486,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty,
@@ -30795,6 +31531,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -30826,6 +31563,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -30857,6 +31595,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -30971,6 +31710,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Bool,
@@ -31047,6 +31787,7 @@ impl<'a> Lowering<'a> {
                     target: CallTarget::FunctionPath {
                         segments: residual,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: args.clone(),
                     result_ty: ValueType::Ref(None),
@@ -31081,6 +31822,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -31106,6 +31848,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -31140,6 +31883,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -31206,6 +31950,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
@@ -31313,12 +32058,8 @@ impl<'a> Lowering<'a> {
         // combinator, and lowering only the downstream `?` would leave that
         // unregistered residual (while lowering only the Option select would
         // materialise the Result shell RPython never has).
-        let captured_option_ok_or_else_try = if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && name == "ok_or_else"
+        let captured_option_ok_or_else_try = if let OpKind::Call { target, args, .. } = &op_kind
+            && call_target_leaf_is(target, "ok_or_else")
             && args.len() == 2
             && let Some(site) = self.recognize_option_ok_or_else_try_site(
                 first_arg_ty.as_ref(),
@@ -31598,19 +32339,33 @@ impl<'a> Lowering<'a> {
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
         });
-        let identity_layout = if matches!(
+        let identity_layout_ty = if matches!(
             &op_kind,
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
             } if segments.last().is_some_and(|leaf| leaf == "new")
         ) {
-            self.adt_struct_fields(&call.dest.ty)
+            Some(&call.dest.ty)
         } else {
-            first_arg_ty
-                .as_ref()
-                .and_then(|ty| self.adt_struct_fields(ty))
+            first_arg_ty.as_ref()
         };
+        let identity_layout = identity_layout_ty.and_then(|ty| {
+            self.adt_struct_fields(ty).or_else(|| {
+                let OpKind::Call { target, .. } = &op_kind else {
+                    return None;
+                };
+                if !crate::front::std_identity::is_identity_wrapper_target(
+                    target,
+                    identity_recv.as_deref(),
+                    identity_dest.as_deref(),
+                    false,
+                ) {
+                    return None;
+                }
+                self.opaque_one_type_param_payload_layout(ty)
+            })
+        });
         // Only a thin `Box<T>` is one pointer word. `Box<[T]>`, `Box<str>` and
         // `Box<dyn Trait>` carry a metadata word that a `same_as` would drop.
         let receiver_is_thin_box = first_arg_ty.as_ref().is_some_and(|ty| {
@@ -31716,18 +32471,8 @@ impl<'a> Lowering<'a> {
         // validates the producer/consumer CFG adjacency; this site only keeps
         // the closure and Result type ownership that is unavailable after MIR
         // lowering.
-        if let OpKind::Call {
-            target:
-                CallTarget::Method {
-                    name,
-                    receiver_root,
-                    ..
-                },
-            args,
-            ..
-        } = &op_kind
-            && name == "ok_or_else"
-            && receiver_root.as_deref() == Some("Option")
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && call_target_leaf_is(target, "ok_or_else")
             && args.len() == 2
             && let Some(closure_arg) = args.get(1).and_then(|arg| arg.as_variable()).cloned()
             && let Some(site) = self.recognize_checked_arith_ok_or_else_site(
@@ -32611,11 +33356,69 @@ impl<'a> Lowering<'a> {
         Some((spec_segments(self.llbc, fd, leaf), None))
     }
 
+    /// Depth-0 `TypeVar`s in a nested call's `generics` are this
+    /// `cachedgraph` copy's type arguments. Substitute them before
+    /// `concrete_type_args` / `call_site_generic_rust_args` so a call
+    /// `pop_n::<H>` inside `opcode_build_list::<PyFrame>` carries `PyFrame`.
+    fn instantiate_call_generics(&self, generics: &serde_json::Value) -> serde_json::Value {
+        let mut g = generics.clone();
+        if self.spec_body && !(self.spec_types.is_empty() && self.spec_const_generics.is_empty()) {
+            crate::front::clause_spec::substitute_type_vars(
+                &mut g,
+                self.llbc,
+                self.spec_types,
+                self.spec_const_generics,
+            );
+        }
+        g
+    }
+
+    fn attach_call_generics(
+        &self,
+        target: CallTarget,
+        fd: &FunDecl,
+        generics: &serde_json::Value,
+        fallback_arg_ty: Option<&TyRef>,
+    ) -> CallTarget {
+        let generics = self.instantiate_call_generics(generics);
+        let target = attach_call_generic_instance(target, fd, &generics, self.llbc);
+        if !target.generic_rust_args().is_empty() {
+            return target;
+        }
+        match self.generic_args_from_arg_ty(fd, fallback_arg_ty) {
+            Some(args) => target.with_generic_rust_args(args),
+            None => target,
+        }
+    }
+
+    /// When the call's `generics.types` are still TypeVars, the first
+    /// argument's (peeled) type is the instantiation of a single type
+    /// parameter (`pop_n::<H>(&mut H, ...)`).
+    fn generic_args_from_arg_ty(&self, fd: &FunDecl, ty: Option<&TyRef>) -> Option<Vec<String>> {
+        let n_types = fd.generics.as_ref()?.get("types")?.as_array()?.len();
+        if n_types != 1 {
+            return None;
+        }
+        let ty = ty?;
+        let peeled = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| ty.clone());
+        let value = tyref_to_spec_json(&peeled);
+        let name = crate::front::clause_spec::spec_type_name(&value, self.llbc, 0, false);
+        if name.is_empty() || name.starts_with('?') || name.starts_with('v') {
+            return None;
+        }
+        Some(vec![name])
+    }
+
+
     fn enqueue_spec(&self, fd: &FunDecl, generics: &serde_json::Value) -> Option<Vec<String>> {
         let spec = self.spec?;
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
         }
+        let generics_owned = self.instantiate_call_generics(generics);
+        let generics = &generics_owned;
         // Only a body this LLBC extracted can be copied here. An opaque
         // foreign or std declaration keeps its bare path. A bodyless
         // local-crate generic is the copy that crate's own LLBC carries
@@ -32776,7 +33579,8 @@ impl<'a> Lowering<'a> {
                     // is generic-trait shaped and never lifts.  (The
                     // reflexive `Identity` outcome is intercepted at
                     // `lower_call` before reaching here.)
-                    if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
+                    if let Some(IntoDevirt::Target { segments, .. }) = self.blanket_into_devirt(reg)
+                    {
                         return (segments, None);
                     }
                     if let Some(segments) =
@@ -33715,6 +34519,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![sum]),
                     result_ty: ValueType::Ref(None),
@@ -33956,6 +34761,7 @@ impl<'a> Lowering<'a> {
                                         crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                     ],
                                     fun_decl_id: None,
+                                    generic_rust_args: Vec::new(),
                                 },
                                 args: Vec::new(),
                                 result_ty: ValueType::Ref(None),
@@ -34133,6 +34939,7 @@ impl<'a> Lowering<'a> {
             None => CallTarget::FunctionPath {
                 segments,
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
         };
         target = target.with_fun_decl_id(fd.def_id);
@@ -34723,11 +35530,18 @@ impl<'a> Lowering<'a> {
             owner_id,
             ty,
         } = &span.kind;
+        let value = self.coerce_gcref_null_store(
+            bb_id,
+            owner,
+            name,
+            Some(ty),
+            crate::model::LinkArg::Value(value),
+        );
         let kind = OpKind::FieldWrite {
             base: base.clone(),
             field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
                 .with_owner_id(Some(*owner_id)),
-            value: crate::model::LinkArg::Value(value),
+            value,
             ty: ty.clone(),
         };
         self.graph
@@ -35920,6 +36734,7 @@ impl<'a> Lowering<'a> {
         let target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
         .with_fun_decl_id(fun_decl_id);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -37758,15 +38573,19 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let path = fd.item_meta.name_path();
             matches!(
-                fd.item_meta.name_path().as_str(),
+                path.as_str(),
                 "core::slice::<Impl>::as_slice"
                     | "core::slice::<Impl>::as_mut_slice"
                     | "alloc::vec::<Impl>::as_slice"
                     | "alloc::vec::<Impl>::as_mut_slice"
                     | "pyre_object::object_array::<Impl>::as_slice"
                     | "pyre_object::object_array::<Impl>::as_mut_slice"
-            )
+            ) || {
+                let segs: Vec<String> = path.split("::").map(str::to_string).collect();
+                matches!(rust_vec_std_leaf(&segs), Some("as_slice" | "as_mut_slice"))
+            }
         })
     }
 
@@ -38102,6 +38921,40 @@ impl<'a> Lowering<'a> {
         }
         impl_method_owner_for_fundecl(self.llbc, fd)
             .is_some_and(|(owner, leaf)| leaf_is_word(&leaf) && owner_is_cell(&owner))
+    }
+
+    /// `Cell::get(&self) -> T`: load of the inner word.
+    fn is_cell_word_get(&self, reg: &RegularCall) -> bool {
+        self.is_std_cell_word_method(reg, "get")
+    }
+
+    /// `Cell::set(&self, val)`: store of the inner word.
+    fn is_cell_word_set(&self, reg: &RegularCall) -> bool {
+        self.is_std_cell_word_method(reg, "set")
+    }
+
+    fn is_std_cell_word_method(&self, reg: &RegularCall, leaf: &str) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let owner_is_cell = |owner: &str| {
+            owner == "cell::Cell"
+                || owner == "core::cell::Cell"
+                || owner == "std::cell::Cell"
+                || owner.ends_with("::cell::Cell")
+        };
+        let path = fd.item_meta.name_path();
+        if let Some((owner, path_leaf)) = path.rsplit_once("::")
+            && path_leaf == leaf
+            && owner_is_cell(owner)
+        {
+            return true;
+        }
+        impl_method_owner_for_fundecl(self.llbc, fd)
+            .is_some_and(|(owner, path_leaf)| path_leaf == leaf && owner_is_cell(&owner))
     }
 
     /// `<[T]>::as_ptr` — the data-pointer projection of a slice receiver.  In
@@ -38568,6 +39421,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "intrinsics".into(), leaf.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![lhs, rhs]),
                 result_ty,
@@ -38783,6 +39637,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["longlong2float".to_string(), leaf.to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![operand]),
                 result_ty,
@@ -38931,7 +39786,10 @@ impl<'a> Lowering<'a> {
             let path = crate::parse::CallPath::from_segments(trait_impl_identity_path(
                 &owner, &identity, &method,
             ));
-            return Some(IntoDevirt::Target(path.segments));
+            return Some(IntoDevirt::Target {
+                segments: path.segments,
+                fun_decl_id: fn_id,
+            });
         }
         None
     }
@@ -39240,6 +40098,35 @@ impl<'a> Lowering<'a> {
             return Some(arg.clone());
         }
         None
+    }
+
+    /// An Opaque TypeDecl with exactly one type argument (std `Cell<T>`):
+    /// the payload is that argument. RPython has no Cell — the field *is*
+    /// the value. Used only when `is_identity_wrapper_target` already
+    /// selected the call, so a one-parameter Opaque such as `Box<T>` does
+    /// not grow a synthetic field.
+    fn opaque_one_type_param_payload_layout(&self, ty: &TyRef) -> Option<Vec<(String, ValueType)>> {
+        let peeled = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| ty.clone());
+        let id = self.tyref_adt_def_id(&peeled)?;
+        let td = self.llbc.type_by_id(id)?;
+        if !matches!(td.kind, TypeDeclKind::Opaque) {
+            return None;
+        }
+        let payload = self.tyref_adt_type_arg(&peeled, 0)?;
+        if self.tyref_adt_type_arg(&peeled, 1).is_some() {
+            return None;
+        }
+        Some(vec![(
+            "value".into(),
+            tyref_to_value_type_with(
+                &payload,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+            ),
+        )])
     }
 
     /// Named fields of a struct lltype, after peeling a borrow. `None`
@@ -41908,13 +42795,13 @@ impl<'a> Lowering<'a> {
         if tyref_is_option_of_shared_u8_slice(ty, self.llbc) {
             return true;
         }
-        // A `Vec` of one-word items is the header address, never null
-        // (`RustVecRepr`). Charon's `Option<Vec<T>>` layout may still be
-        // a pointer niche (the source `Unique` word); the translated
-        // Option keeps its tag so the payload stays `Int` for
-        // `ll_vec_length` / `gcarray_from_pyobject_vec`.
+        // A `Vec<T>` is the header address, never null (`RustVecRepr`).
+        // Charon's `Option<Vec<T>>` layout may still be a pointer niche
+        // (the source `Unique` word); the translated Option keeps its
+        // tag so the payload stays `Int` for `ll_vec_length` /
+        // `gcarray_from_pyobject_vec`.
         if crate::front::result_exc::tyref_option_payload(ty, self.llbc)
-            .is_some_and(|payload| tyref_rust_vec_item_kind(&payload, self.llbc).is_some())
+            .is_some_and(|payload| tyref_is_rust_vec_header(&payload, self.llbc))
         {
             return false;
         }
@@ -42524,6 +43411,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "cmp".into(), leaf.clone()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(args.iter().cloned()),
                 result_ty,
@@ -43416,6 +44304,7 @@ impl<'a> Lowering<'a> {
                         "jit_bigint_to_i64_value_or_zero".to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: ValueType::Int,
@@ -43431,6 +44320,7 @@ impl<'a> Lowering<'a> {
                         "jit_bigint_to_i64_fits".to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![arg]),
                 result_ty: ValueType::Int,
@@ -43544,6 +44434,7 @@ impl<'a> Lowering<'a> {
                         "wtf8_key_is_utf8".to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: ValueType::Bool,
@@ -43771,6 +44662,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![receiver.clone(), divisor.clone()]),
                 result_ty: ValueType::Ref(Some("RBigIntPair".to_string())),
@@ -43807,6 +44699,7 @@ impl<'a> Lowering<'a> {
                     name: format!("__pos_{i}"),
                     void: false,
                     narrow_root: None,
+                    ty: ValueType::Ref(None),
                 })
                 .collect(),
         };
@@ -43933,6 +44826,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Unsigned,
@@ -44414,6 +45308,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Unsigned,
@@ -44433,6 +45328,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Int,
@@ -44868,6 +45764,7 @@ impl<'a> Lowering<'a> {
                                 .map(str::to_string)
                                 .collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![arg]),
                         result_ty: ValueType::Unsigned,
@@ -44887,6 +45784,7 @@ impl<'a> Lowering<'a> {
                                 .map(str::to_string)
                                 .collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![arg]),
                         result_ty: ValueType::Int,
@@ -48398,10 +49296,43 @@ fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
     segments
 }
 
+/// Inherent-impl UFCS `Owner::method` using the owner TypeDecl's full
+/// `name_path`. Trait-impl methods use `<Self as Trait>::method` instead.
+/// `None` when the FunDecl is not an inherent impl or the owner ADT is
+/// unresolved — the catalog then keeps `name_path`, which still contains
+/// the `Impl` path element and is not a Rust path.
+pub(crate) fn inherent_callable_rust_path(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    if fd.item_meta.trait_impl_id().is_some() {
+        return None;
+    }
+    let segs = &fd.item_meta.name;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    let leaf = match &segs[last_idx] {
+        NameSeg::Ident { ident: (s, _) } => s.clone(),
+        _ => return None,
+    };
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
+    let td = llbc.type_by_id(adt_def_id)?;
+    let owner = td.item_meta.name_path();
+    if owner.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}::{leaf}"))
+}
+
 /// The `CallPath` `lib.rs` registers for this FunDecl: the same
 /// segments [`spec_segments`] emits, so a Fun call and a Trait call
 /// that resolve to this declaration share one registry key.
-fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
+pub(crate) fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
     let leaf = match instance_leaf(llbc, fd) {
         Some(leaf) => leaf,
         None => fd
@@ -51157,6 +52088,27 @@ impl OwnedRootScopes {
 /// only shrink the dominator sets this feeds, so an unwind edge that is not
 /// really taken costs an erasure rather than licensing one.
 fn block_successors(llbc: &Llbc, body: &Unstructured, bb: usize) -> Vec<usize> {
+    block_successors_kind(llbc, body, bb, true)
+}
+
+/// The edges the lowering keeps: `Call` / `Assert` / `Drop` `target` only.
+///
+/// `on_unwind` is a Rust panic-cleanup chain the front drops
+/// (`lower_terminator` `UnwindResume`, `lower_call`). Python exceptions ride
+/// the success edge as `Result::Err`. A bracket proof that followed those
+/// chains would charge destructor glue and `UnwindResume`
+/// (`root_bracket_stack_effects_are_known` `_ => return false`) and keep
+/// every bracket that contains a call.
+fn block_normal_successors(llbc: &Llbc, body: &Unstructured, bb: usize) -> Vec<usize> {
+    block_successors_kind(llbc, body, bb, false)
+}
+
+fn block_successors_kind(
+    llbc: &Llbc,
+    body: &Unstructured,
+    bb: usize,
+    include_unwind: bool,
+) -> Vec<usize> {
     let n = body.body.len();
     let mut out = Vec::new();
     let mut push = |target: u64| {
@@ -51189,7 +52141,9 @@ fn block_successors(llbc: &Llbc, body: &Unstructured, bb: usize) -> Vec<usize> {
             target, on_unwind, ..
         }) => {
             push(*target);
-            push(*on_unwind);
+            if include_unwind {
+                push(*on_unwind);
+            }
         }
         _ => {}
     }
@@ -51298,7 +52252,7 @@ fn root_bracket_region(
         {
             continue;
         }
-        work.extend(block_successors(llbc, body, bb));
+        work.extend(block_normal_successors(llbc, body, bb));
     }
     region
 }
@@ -51527,7 +52481,7 @@ fn root_bracket_stack_effects_are_known(
                     // `dyn Trait` dispatch: see `RootStackAnalyzer`'s
                     // pointer arm.
                     CallFunc::Dynamic(_) => {
-                        work.extend(block_successors(llbc, body, bb));
+                        work.extend(block_normal_successors(llbc, body, bb));
                         continue;
                     }
                     CallFunc::Unknown => return false,
@@ -51543,7 +52497,16 @@ fn root_bracket_stack_effects_are_known(
                     // leaf only when `free_sites` recorded that call for it.
                     let own_leaf = matches!(
                         path.as_deref().and_then(|path| path.rsplit("::").next()),
-                        Some("base" | "pin_root" | "pin_roots" | "get")
+                        Some(
+                            "base"
+                                | "pin_root"
+                                | "pin_roots"
+                                | "publish"
+                                | "publish_roots"
+                                | "normalize"
+                                | "normalize_roots"
+                                | "get",
+                        )
                     ) && operand_local(call.args.first())
                         .and_then(|receiver| aliases.get(&receiver).copied())
                         == Some(scope)
@@ -51586,7 +52549,7 @@ fn root_bracket_stack_effects_are_known(
             ) => {}
             _ => return false,
         }
-        work.extend(block_successors(llbc, body, bb));
+        work.extend(block_normal_successors(llbc, body, bb));
     }
     true
 }
@@ -51613,9 +52576,11 @@ fn mentions_local(v: &serde_json::Value, wanted: &bit_set::BitSet) -> bool {
 /// the temporaries its slice argument was built through.
 ///
 /// MIR spells the argument as `_arr = [move _a, move _b]`, `_r = &_arr`, a
-/// reborrow `_r2 = &(*_r)` and `_s = _r2 as &[_] (Unsize)`.  Each temporary
-/// has to be assigned exactly once, and each element a plain local, or the
-/// pin is not one this pass can answer a read-back for.
+/// reborrow `_r2 = &(*_r)` and `_s = _r2 as &[_] (Unsize)`.  Charon records
+/// that Unsize as [`Rvalue::Cast`] (`liveness.rs` `pin_src`); a copy of any
+/// of those temporaries is [`Rvalue::Use`].  Each temporary has to be
+/// assigned exactly once, and each element a plain local, or the pin is not
+/// one this pass can answer a read-back for.
 fn pin_roots_slice_values(
     body: &Unstructured,
     slice: usize,
@@ -51642,6 +52607,18 @@ fn pin_roots_slice_values(
             }
         })
     };
+    let alias_place = |place: Place| -> Option<usize> {
+        match place.kind {
+            PlaceKind::Local(src) => Some(src as usize),
+            PlaceKind::Projection(base, ProjectionElem::Atom(elem)) if elem == "Deref" => {
+                match base.kind {
+                    PlaceKind::Local(src) => Some(src as usize),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
     let mut temps = Vec::new();
     let mut local = slice;
     loop {
@@ -51650,23 +52627,15 @@ fn pin_roots_slice_values(
             return None;
         }
         match definition(local)? {
-            Rvalue::UnaryOp(kind, operand)
-                if kind
-                    .get("Cast")
-                    .is_some_and(|cast| cast.get("Unsize").is_some()) =>
-            {
+            Rvalue::UnaryOp(kind, operand) if cast_kind_is_unsize(&kind) => {
                 local = operand_local(Some(&operand))?;
             }
-            Rvalue::Ref { place, .. } => match place.kind {
-                PlaceKind::Local(src) => local = src as usize,
-                PlaceKind::Projection(base, ProjectionElem::Atom(elem)) if elem == "Deref" => {
-                    match base.kind {
-                        PlaceKind::Local(src) => local = src as usize,
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            },
+            Rvalue::Cast(_, operand, _) | Rvalue::Use(operand, _) => {
+                local = operand_local(Some(&operand))?;
+            }
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                local = alias_place(place)?;
+            }
             Rvalue::Aggregate(kind, operands) if kind.get("Array").is_some() => {
                 let values = operands
                     .iter()
@@ -53768,6 +54737,56 @@ fn analyze_root_brackets(
     )
 }
 
+/// The locals `pin_roots(&[...])` publishes, for tests of the slice walk.
+pub fn pin_roots_published_locals(
+    llbc: &Llbc,
+    body: &Unstructured,
+    slice: usize,
+) -> Option<Vec<usize>> {
+    let mut assigned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let PlaceKind::Local(dest) = place.kind
+            {
+                *assigned.entry(dest as usize).or_default() += 1;
+            }
+        }
+    }
+    pin_roots_slice_values(body, slice, &assigned, &forward_blocks).map(|(values, _)| values)
+}
+
+/// Whether [`RootStackAnalyzer`] charges `path` with a root-stack effect.
+pub fn function_touches_root_stack(llbc: &Llbc, path: &str) -> Option<bool> {
+    let fd = llbc
+        .iter_fun_decls()
+        .find(|fd| fd.item_meta.name_path() == path)?;
+    let state = RootStackState::new(llbc);
+    let analyzer = RootStackAnalyzer::new(llbc, &state);
+    Some(analyzer.fn_touches_root_stack(fd.def_id))
+}
+
+/// Whether [`erase_shadow_stack`] rewrote this body, after the same
+/// [`ensure_stack_sensitive_fns`] the lowering runs.  `Ok(true)` is a
+/// rewrite, `Ok(false)` is a body with no bracket, `Err` is the refusal
+/// that left the brackets in.
+pub fn shadow_stack_erase_status(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    body: &Unstructured,
+) -> Result<bool, &'static str> {
+    shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
+    match shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(reason) => Err(reason),
+    }
+}
+
 /// The root-bracket guards [`lower_fun_decl`] takes out of this body, as MIR
 /// locals.
 ///
@@ -53776,6 +54795,10 @@ fn analyze_root_brackets(
 /// the lowering dropped on the floor.
 pub fn erased_root_bracket_guards(llbc: &Llbc, fd: &FunDecl, body: &Unstructured) -> Vec<usize> {
     // A body the scalar replacement rewrote keeps no bracket at all.
+    // The lowering runs [`ensure_stack_sensitive_fns`] first; a caller that
+    // only asks the plan must too, or the rewrite always refuses with
+    // `callee-stack-effects-unknown`.
+    shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
     if let Ok(Some(_)) = shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
         return (0..body.locals.locals.len())
             .filter(|local| shadow_stack_erase::is_root_scope_local(body, llbc, *local))
@@ -53946,11 +54969,16 @@ fn analyze_root_brackets_with(
         let Some(path) = name_of(reg) else {
             continue;
         };
-        // `gc_roots::pin_roots(&[..])` pins onto the bracket open where it
-        // runs, and answers with the slot its first value took. A later run
-        // in the same bracket is not the guard's base; `run_dests` names it.
-        if path.rsplit("::").next() == Some("pin_roots")
-            && call.args.len() == 1
+        // `gc_roots::pin_roots(&[..])` / `publish_roots(&[..])` pin onto
+        // the bracket open where they run, and answer with the slot the
+        // first value took. `get_and_call_function` uses `publish` then
+        // `normalize` so later slices are visible before the first query.
+        // A later run in the same bracket is not the guard's base;
+        // `run_dests` names it.
+        if matches!(
+            path.rsplit("::").next(),
+            Some("pin_roots" | "publish_roots")
+        ) && call.args.len() == 1
             && path.split("::").any(|s| s == ROOT_SCOPE_MODULE)
         {
             let (Some(slice), PlaceKind::Local(dest)) =
@@ -54019,7 +55047,8 @@ fn analyze_root_brackets_with(
             }
             continue;
         }
-        let pins_many = path.rsplit("::").next() == Some("pin_roots") && call.args.len() == 2;
+        let pins_many = matches!(path.rsplit("::").next(), Some("pin_roots" | "publish"))
+            && call.args.len() == 2;
         if !(gc_root_scope_base_path(&path) && call.args.len() == 1) && !pins_many {
             continue;
         }
@@ -54457,7 +55486,7 @@ fn analyze_root_brackets_with(
                 }
                 if call.args.len() == 1 && !dest_is_guard {
                     match free_leaf.as_deref() {
-                        Some("pin_roots") => {
+                        Some("pin_roots" | "publish_roots") => {
                             if let Some((scope, values, _)) = pin_runs.get(&bb_idx)
                                 && free_sites.get(&bb_idx) == Some(scope)
                                 && candidates.contains(*scope)
@@ -54535,7 +55564,7 @@ fn analyze_root_brackets_with(
                                 ("base", Some(dest)) if call.args.len() == 1 => {
                                     bases.get(&dest) == Some(scope)
                                 }
-                                ("pin_roots", Some(dest)) if call.args.len() == 2 => {
+                                ("pin_roots" | "publish", Some(dest)) if call.args.len() == 2 => {
                                     match pin_runs.get(&bb_idx) {
                                         Some((run_scope, values, _))
                                             if run_scope == scope
@@ -54565,6 +55594,8 @@ fn analyze_root_brackets_with(
                                         None => false,
                                     }
                                 }
+                                ("normalize", _) if call.args.len() == 3 => true,
+                                ("normalize_roots", _) if call.args.len() == 2 => true,
                                 _ => false,
                             }
                         }
@@ -57624,6 +58655,45 @@ fn pointer_elem_pointee_is_gc(
     declared_adt_struct_id(pointee, llbc).is_some_and(|sid| gc_struct_ids.contains(&sid))
 }
 
+/// `history.py` `getkind`: a raw `Ptr` whose `TO` is itself a `Ptr` /
+/// `Ref` is the address of a slot (`rffi.CArray` of GCREF / Unsigned),
+/// hence `'int'`. A GC ADT pointer (`*mut PyObject`) and a byte pointer
+/// (`*mut u8`) stay off this arm so [`tyref_to_value_type_with`] keeps
+/// `Ref`.
+fn tyref_raw_ptr_points_at_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(mut pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
+        return false;
+    };
+    for _ in 0..24 {
+        let Some(obj) = pointee.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            let Some(next) = llbc.dedup_body(id) else {
+                return false;
+            };
+            pointee = next;
+            continue;
+        }
+        if let Some([_, body]) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+        {
+            pointee = body;
+            continue;
+        }
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            pointee = &arr[1];
+            continue;
+        }
+        return obj.contains_key("RawPtr") || obj.contains_key("Ref");
+    }
+    false
+}
+
 /// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
 ///
 /// References return `None`. Their flow value stays the address;
@@ -57837,9 +58907,40 @@ fn spill_substituted_fields(
 /// A `TypeVar` inside the looked-up argument is the caller's variable
 /// and is not replaced again.
 fn substitute_spill_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
+    substitute_typevars(ty, owner, llbc, true)
+}
+
+/// Field-kind substitution: a nested TypeVar in the looked-up argument
+/// (Vec's allocator, a trait ref) does not make the argument unknown.
+/// A root TypeVar is still unknown. `RustVecRepr.lowleveltype` is a raw
+/// `Ptr`, so `Result<Vec<T>, E>::Ok.__pos_0` is `'int'` (`history.py`
+/// `getkind`) for every item type T.
+fn substitute_field_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
+    substitute_typevars(ty, owner, llbc, false)
+}
+
+fn substitute_typevars(
+    ty: &TyRef,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+    nested_typevar_unknown: bool,
+) -> Option<TyRef> {
     let node = tyref_node(ty, llbc)?;
-    let value = substitute_spill_value(node, owner, llbc, &mut Vec::new(), 0)?;
+    let value = substitute_spill_value(
+        node,
+        owner,
+        llbc,
+        &mut Vec::new(),
+        0,
+        nested_typevar_unknown,
+    )?;
     Some(TyRef::Other(value))
+}
+
+/// Whether `node` is a TypeVar after peeling `Deduplicated` / `Value`.
+/// Nested TypeVars (a Vec allocator, a trait ref) are not this.
+fn argument_root_is_typevar(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    strip_ty_indirections(node, llbc).is_none_or(|stripped| stripped.get("TypeVar").is_some())
 }
 
 /// `arg` was copied out of an aggregate's generic arguments, so it is
@@ -57889,6 +58990,7 @@ fn substitute_spill_value(
     llbc: &Llbc,
     dedup_stack: &mut Vec<u64>,
     depth: u32,
+    nested_typevar_unknown: bool,
 ) -> Option<serde_json::Value> {
     if depth > 32 {
         return None;
@@ -57899,7 +59001,14 @@ fn substitute_spill_value(
         }
         dedup_stack.push(id);
         let body = llbc.dedup_body(id)?;
-        let replaced = substitute_spill_value(body, owner, llbc, dedup_stack, depth + 1);
+        let replaced = substitute_spill_value(
+            body,
+            owner,
+            llbc,
+            dedup_stack,
+            depth + 1,
+            nested_typevar_unknown,
+        );
         dedup_stack.pop();
         return replaced;
     }
@@ -57914,7 +59023,11 @@ fn substitute_spill_value(
             .get("types")?
             .as_array()?
             .get(index as usize)?;
-        if spill_argument_carries_typevar(arg, llbc, &mut Vec::new(), 0) {
+        if nested_typevar_unknown {
+            if spill_argument_carries_typevar(arg, llbc, &mut Vec::new(), 0) {
+                return None;
+            }
+        } else if argument_root_is_typevar(arg, llbc) {
             return None;
         }
         return Some(arg.clone());
@@ -57928,6 +59041,7 @@ fn substitute_spill_value(
                 llbc,
                 dedup_stack,
                 depth + 1,
+                nested_typevar_unknown,
             )?);
         }
         return Some(serde_json::Value::Array(out));
@@ -57937,7 +59051,14 @@ fn substitute_spill_value(
         for (key, value) in obj {
             out.insert(
                 key.clone(),
-                substitute_spill_value(value, owner, llbc, dedup_stack, depth + 1)?,
+                substitute_spill_value(
+                    value,
+                    owner,
+                    llbc,
+                    dedup_stack,
+                    depth + 1,
+                    nested_typevar_unknown,
+                )?,
             );
         }
         return Some(serde_json::Value::Object(out));
@@ -62669,6 +63790,7 @@ fn push_direct_ptradd(
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![ptr, count]),
             result_ty: ValueType::Int,
@@ -62773,6 +63895,139 @@ fn item_lltype_for_size(n: i64) -> crate::translator::rtyper::lltypesystem::llty
 /// `rbuiltin.py rtype_cast_ptr_to_int` uses `resulttype=lltype.Signed`.
 /// Leaving it `Unknown` makes `get_value_kind_var` report `'r'` and
 /// jtransform re-inserts a second cast.
+/// Last path segment of a direct call, stripping a trailing turbofish
+/// and a `__spec_` specialization marker.
+fn call_target_leaf_is(target: &CallTarget, leaf: &str) -> bool {
+    let Some(name) = (match target {
+        CallTarget::Method { name, .. } => Some(name.as_str()),
+        CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let base = name.split("::<").next().unwrap_or(name);
+    let base = match base.split_once("__spec_") {
+        Some((name, _)) => name,
+        None => base,
+    };
+    base == leaf
+}
+
+/// The FunctionPath still names this FunDecl: the path's resolved
+/// `fun_decl_id` is that declaration. A rewritten helper (`ll_vec_*`,
+/// a blanket-`Into` `from`) has a different id, or none.
+fn function_path_names_fun_decl(path_fun_decl_id: Option<u64>, fd_id: u64) -> bool {
+    path_fun_decl_id == Some(fd_id)
+}
+
+fn tyref_to_spec_json(ty: &TyRef) -> serde_json::Value {
+    match ty {
+        TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
+        TyRef::Inline { value: (id, body) } => serde_json::json!({ "Value": [id, body] }),
+        TyRef::Other(v) => v.clone(),
+    }
+}
+
+/// Call-site `generics.types` spelled as Rust paths. `None` when the
+/// callee is not generic or a type argument is still a TypeVar.
+fn call_site_generic_rust_args(
+    fd: &FunDecl,
+    generics: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<Vec<String>> {
+    if !crate::front::clause_spec::decl_is_generic(fd) {
+        return None;
+    }
+    let types = generics.get("types")?.as_array()?;
+    if types.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = types
+        .iter()
+        .map(|ty| crate::front::clause_spec::spec_type_name(ty, llbc, 0, false))
+        .collect();
+    if names
+        .iter()
+        .any(|n| n.is_empty() || n.starts_with('?') || n.starts_with('v'))
+    {
+        return None;
+    }
+    Some(names)
+}
+
+/// Stamp call-site type arguments on a FunctionPath. Segments stay the
+/// template/spec path so Regular `graphs_from` still resolves; the residual
+/// shim path is instantiated later in `handle_residual_call`.
+fn attach_call_generic_instance(
+    target: CallTarget,
+    fd: &FunDecl,
+    generics: &serde_json::Value,
+    llbc: &Llbc,
+) -> CallTarget {
+    match call_site_generic_rust_args(fd, generics, llbc) {
+        Some(args) => target.with_generic_rust_args(args),
+        None => target,
+    }
+}
+
+/// By-value multi-word ADT: `'i'` raw address, `'r'` if the type is `Gc`.
+fn pass_by_value_multiword_kind(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let obj = node.as_object()?;
+    if obj.contains_key("Ref") || obj.contains_key("RawPtr") || obj.contains_key("Slice") {
+        return None;
+    }
+    let adt_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(adt_id)?;
+    // A struct that the value model paints as a classed instance (RBigInt,
+    // ObjectKey) keeps the Ref bank. A multi-word enum is a raw payload
+    // (`DisplayMessage`); RPython passes that as `Ptr` (`'i'`).
+    if !matches!(td.kind, TypeDeclKind::Enum(_)) {
+        return None;
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let (size, _) = td.size_align_for_target(llbc, &target)?;
+    let size = size?;
+    if size <= 8 {
+        return None;
+    }
+    if type_decl_is_declared_gc(td, llbc) {
+        Some(ValueType::Ref(None))
+    } else {
+        Some(ValueType::Int)
+    }
+}
+
+fn type_decl_is_declared_gc(td: &TypeDecl, llbc: &Llbc) -> bool {
+    let want = td.def_id;
+    for row in llbc.trait_impls_raw() {
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        let Some(trait_id) = impl_trait.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(decl) = llbc.trait_by_id(trait_id) else {
+            continue;
+        };
+        if !trait_path_is_majit_gc_gctype(&decl.item_meta.name_path()) {
+            continue;
+        }
+        let Some(self_ty) = impl_trait
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+        else {
+            continue;
+        };
+        if resolve_tyexpr_to_adt_def_id_free(llbc, self_ty) == Some(want) {
+            return true;
+        }
+    }
+    false
+}
+
 fn push_cast_ptr_to_int(graph: &mut FunctionGraph, bb_id: BlockId, arg: Variable) -> Variable {
     let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -62790,6 +64045,7 @@ fn push_cast_ptr_to_int(graph: &mut FunctionGraph, bb_id: BlockId, arg: Variable
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![arg]),
             result_ty: ValueType::Int,
@@ -62815,6 +64071,7 @@ fn rarithmetic_mask(name: &str, arg: Variable, result_ty: ValueType) -> OpKind {
                 .map(str::to_string)
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         },
         args: crate::model::call_args(vec![arg]),
         result_ty,
@@ -62843,6 +64100,7 @@ fn push_ptr_to_unsigned_cast(
                 .map(str::to_string)
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         },
         args: crate::model::call_args(vec![signed]),
         result_ty: ValueType::Unsigned,
@@ -63050,6 +64308,14 @@ fn adt_def_is_raw_storage(
     if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
         return false;
     }
+    // Same predicate `tyref_is_raw_struct_value` uses: RootScope is a
+    // class instance, so a field of that type is not a raw word. A
+    // container (`RootedItems`) that stores the guard would otherwise
+    // inherit Int and stamp FUNC.RESULT `i` while its `new` CFG
+    // constructs the instance (`r`).
+    if gc_root_scope_type_path(&td.item_meta.name_path()) {
+        return false;
+    }
     let carrier = llbc.exception_carrier();
     if !carrier.is_empty() && td.item_meta.name_path() == carrier {
         return false;
@@ -63086,6 +64352,36 @@ fn tyref_is_raw_value(
         return false;
     }
     field_ty_is_raw_word(ty, llbc, gc_struct_ids, &mut Vec::new())
+}
+
+/// A by-value raw struct (`Fmt`, `Position`): the translator's value is
+/// that struct's address (`history.py` `getkind` of a raw `Ptr` is
+/// `'int'`). Enums stay out: a payload `Option` is still a tagged
+/// instance even when every payload word is raw.
+///
+/// The root-bracket guard is a class instance (`Ref`) even though its
+/// fields are raw words: dependents see it as `TypeDeclKind::Opaque`
+/// (`Ref`), and `pin_root` / `publish` dispatch on that instance. A
+/// defining-crate `Int` token against an opaque `Ref` dest is the
+/// `getcalldescr` `RESULT != FUNC.RESULT` wall on `push_roots`.
+fn tyref_is_raw_struct_value(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    if one_level_pointer_pointee(node, llbc).is_some() {
+        return false;
+    }
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    llbc.type_by_id(def_id).is_some_and(|td| {
+        matches!(td.kind, TypeDeclKind::Struct(_))
+            && !gc_root_scope_type_path(&td.item_meta.name_path())
+    }) && declared_raw_adt_node(node, llbc, gc_struct_ids).is_some()
 }
 
 fn field_ty_is_raw_word(
@@ -63369,9 +64665,17 @@ fn tyref_to_value_type_with(
     if type_node_is_fn_ptr(value, llbc) {
         return ValueType::Int;
     }
-    // A `Vec` of one-word items is the address of its raw `{ptr, len, cap}`
-    // header (`RustVecRepr`, kind `int`), not a GC reference.
-    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+    // A `Vec<T>` is the address of its raw `{ptr, len, cap}` header
+    // (`RustVecRepr`, kind `int`), for every item type T, not a GC
+    // reference. Item kind selects the `ll_vec_*` helper; the header
+    // word itself is always `int` (`history.py` `getkind`).
+    if tyref_is_rust_vec_header(ty, llbc) {
+        return ValueType::Int;
+    }
+    // A by-value raw struct is that struct's address (`history.py`
+    // `getkind` of a raw `Ptr` is `int`), not a GC instance. Item
+    // helpers stay one-word; this is the header word itself.
+    if tyref_is_raw_struct_value(ty, llbc, gc_struct_ids) {
         return ValueType::Int;
     }
     // A densely numbered fieldless enum gives `Option<E>` a scalar niche
@@ -63978,12 +65282,12 @@ struct FieldlessOptionNiche {
 /// Physical scalar representation of `Option<E>` when `E` is a densely
 /// numbered fieldless enum.
 ///
-/// rustc uses E's first invalid scalar as the `None` niche, while every valid
-/// E value is `Some(E)`.  Charon does not serialize a separate layout for a
-/// generic `core::option::Option<T>` declaration, but it does serialize E's
-/// exact tag width and discriminants.  Restricting this projection to the
-/// dense `0..N` shape makes the inferred niche unique and rejects enums with
-/// explicit gaps, negative tags, or a full scalar range.
+/// rustc stores `Some(e)` as `e` and reserves one invalid scalar for `None`
+/// ([`fieldless_option_none_tag`]).  Charon does not serialize a separate
+/// layout for a generic `core::option::Option<T>` declaration, but it does
+/// serialize E's exact tag width and discriminants.  Restricting this
+/// projection to the dense `0..N` shape makes the inferred niche unique and
+/// rejects enums with explicit gaps, negative tags, or a full scalar range.
 fn tyref_option_fieldless_niche(ty: &TyRef, llbc: &Llbc) -> Option<FieldlessOptionNiche> {
     if !crate::front::result_exc::tyref_is_option(ty, llbc) {
         return None;
@@ -64019,30 +65323,31 @@ fn tyref_option_fieldless_niche(ty: &TyRef, llbc: &Llbc) -> Option<FieldlessOpti
 
 /// The value the compiler reserved for `None` in an `Option<E>` over a
 /// fieldless enum with `variants` densely numbered variants stored in
-/// `storage_ty` — `None` when this layer cannot know it, which is every
-/// case today.
+/// `storage_ty`.
 ///
-/// MEASURED, and the measurement refutes `variants` itself as the tag. On
-/// this toolchain a dense fieldless enum in a `u8` puts `None` at `2` with
-/// two variants but at `255` — the storage maximum, not the variant count —
-/// with three, four, five and eight, a 300-variant enum in a `u16` puts it
-/// at `65535`, and a single-variant enum is inverted outright (`None` is
-/// `0`, `Some` is `1`). So a derived `variants` tag names a value the
-/// compiler never writes, the `ne` against it misclassifies every `Some`,
-/// and a constructed `None` is indistinguishable from a live variant.
-///
-/// The tag that would be right is the niche the compiler actually reserved,
-/// and this artefact does not carry it: Charon spells a discriminant only as
-/// `Branch { offset, int_ty }` or `Known`, with no niche encoding, and runs
-/// with `monomorphize: false`, so there is no `Option<E>` layout to read one
-/// off either. Rust does not specify the placement, so it is not derivable
-/// by rule. Declining here leaves every `Option<fieldless enum>` on the
-/// ordinary aggregate lowering; the tag threading the combinators carry
-/// ([`crate::front::option_unwrap_or::UnwrapOrSite::fieldless_none_tag`])
-/// stays exercised by its own tests and is ready for a niche encoding that
-/// reaches the artefact.
-fn fieldless_option_none_tag(_variants: usize, _storage_ty: &str) -> Option<i64> {
-    None
+/// rustc's niche for a dense fieldless `E` is one invalid scalar of E's
+/// tag width, which is the same physical layout
+/// [`tyref_to_field_layout_string`] already uses for such Options. The
+/// placement is not `variants` itself: two variants put `None` at `2`
+/// even in a `u16`, and three or more put it at the storage maximum
+/// (`u8` → 255, `u16` → 65535). A single-variant default-repr enum is a
+/// ZST and never reaches this function (no `storage_ty`); a
+/// `#[repr(u8)]` one-variant enum uses the storage maximum. A full
+/// scalar range has no niche.
+fn fieldless_option_none_tag(variants: usize, storage_ty: &str) -> Option<i64> {
+    if variants == 0 {
+        return None;
+    }
+    if variants == 2 {
+        return Some(2);
+    }
+    let max = match storage_ty {
+        "u8" | "i8" => 0xff,
+        "u16" | "i16" => 0xffff,
+        "u32" | "i32" => 0xffff_ffff,
+        _ => return None,
+    };
+    (variants <= max as usize).then_some(max)
 }
 
 /// `Option<NonZeroU*>` / `Option<NonZeroI*>` is one integer. `None` is 0,
@@ -64784,15 +66089,25 @@ fn tyref_to_attr_value_type_with(
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
-    // Matching [`tyref_to_value_type`]: a `Vec` of one-word items is the
-    // address of its raw `{ptr, len, cap}` header (`RustVecRepr`, kind
-    // `int`). Layout and the register bank keep that Int. FORCE does not
+    // Matching [`tyref_to_value_type`]: a `Vec<T>` is the address of its
+    // raw `{ptr, len, cap}` header (`RustVecRepr`, kind `int`) for every
+    // item type. Layout and the register bank keep that Int. FORCE does not
     // seed the field (`register_struct_fields` skips a Vec layout row) so
     // `project_struct_rows` installs `SomeRustVec` from the `*mut Vec<…>`
     // annotation spelling. An Integer FORCE made `len` of the field
     // `'int' has no length`.
-    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+    if tyref_is_rust_vec_header(ty, llbc) {
         return ValueType::Int;
+    }
+    // Matching [`tyref_to_value_type`]: a by-value raw struct is the
+    // address of that struct (`history.py` `getkind` `'int'`).
+    if tyref_is_raw_struct_value(ty, llbc, gc_struct_ids) {
+        return ValueType::Int;
+    }
+    // Inlined `[T; N]` of a scalar: Repeat's fill is that item
+    // (`lltype.FixedSizeArray` has no `getkind` as a value).
+    if let Some(item_ty) = scalar_fixed_array_item(ty, llbc) {
+        return item_ty;
     }
     // `rutf8.py` `Utf8StringBuilder._s` is a `StringBuilder` instance
     // attribute: seed it `SomeStringBuilder`, matching the value site.
@@ -65829,6 +67144,14 @@ fn tyref_transparent_inner_value_type(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(id)?;
+    // Same predicate `tyref_is_raw_struct_value` uses: RootScope is a
+    // class instance (`Ref`), not the word its one non-ZST field stores.
+    // Peeling it to `usize` stamps FUNC.RESULT `i` while the CFG
+    // constructs the instance (`r`). One lowleveltype per type
+    // (`rtyper` `getrepr` → `lowleveltype`; `getkind`).
+    if gc_root_scope_type_path(&decl.item_meta.name_path()) {
+        return None;
+    }
     // A foreign `Opaque` decl keeps `repr.transparent: false`: the defining
     // crate is outside the extraction set, so the layout does not record the
     // wrapper. The linked kind is that missing field.
@@ -65901,10 +67224,646 @@ pub(crate) fn attached_foldable_lit(llbc: &Llbc, def_id: u64) -> Option<OpKind> 
 }
 
 fn global_is_thread_local(g: &GlobalDecl) -> bool {
-    g.rest
-        .get("global_kind")
-        .and_then(serde_json::Value::as_str)
-        == Some("ThreadLocal")
+    let Some(kind) = g.rest.get("global_kind") else {
+        return false;
+    };
+    if kind.as_str() == Some("ThreadLocal") {
+        return true;
+    }
+    kind.get("Static")
+        .and_then(|st| st.get("is_thread_local"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+/// An immutable `static` binding: Charon's `Static { is_mut: false }`,
+/// not TLS, not a `static mut` source spelling. The interpreter never
+/// assigns the binding after init, so a read is a prebuilt constant
+/// (`bookkeeper.py immutablevalue`).
+fn global_is_immutable_static(g: &GlobalDecl) -> bool {
+    g.is_immutable_static() && !global_source_text_is_static_mut(g)
+}
+
+/// An immutable `static` whose type is a prebuilt table: every field is
+/// a fnptr / `Option<fnptr>` / integer / fieldless enum /
+/// `Option<fieldless enum>`, and the type tree has no interior
+/// mutability (`UnsafeCell` / `Cell` / `sync::atomic`). `INT_BINOP_SHORTCUTS`
+/// is this shape (`bookkeeper.py immutablevalue`). A `static AtomicBool`
+/// is still `Static { is_mut: false }` in Charon, so the binding is not
+/// the fact; the declared type is.
+fn immutable_static_is_prebuilt_table(llbc: &Llbc, g: &GlobalDecl) -> bool {
+    if !global_is_immutable_static(g) {
+        return false;
+    }
+    if global_tyref(g).is_some_and(|ty| tyref_has_interior_mutability(&ty, llbc)) {
+        return false;
+    }
+    let Some(type_id) = global_decl_adt_id(llbc, g) else {
+        return false;
+    };
+    type_is_prebuilt_table(llbc, type_id)
+}
+
+fn type_is_prebuilt_table(llbc: &Llbc, type_id: u64) -> bool {
+    if type_has_interior_mutability(llbc, type_id) {
+        return false;
+    }
+    let Some(td) = llbc.type_by_id(type_id) else {
+        return false;
+    };
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return false;
+    };
+    !fields.is_empty()
+        && fields
+            .iter()
+            .all(|field| field_ty_is_prebuilt_immutable(&field.ty, llbc))
+}
+
+fn projection_elem_is_deref(elem: &ProjectionElem) -> bool {
+    matches!(elem, ProjectionElem::Atom(s) if s == "Deref")
+        || matches!(elem, ProjectionElem::Tagged(v) if v.as_str() == Some("Deref"))
+}
+
+/// Non-null sentinel for an immutable `static` that has no host-registered
+/// address. Distinct from [`JITDRIVER_NAMEDCONST_SENTINEL_ADDR`]. The
+/// identity is the global's `def_id`; a later `HostStaticAddrs.refs` row
+/// still wins via [`Lowering::static_addr_op`].
+fn immutable_static_sentinel_addr(def_id: u64) -> i64 {
+    0x0700_0000_0000 + (def_id as i64 + 1) * 16
+}
+
+/// Fold a struct-field read of an immutable static to the initializer
+/// value of that field. Function-pointer slots become `__fn_const`
+/// (`decoded_const_to_op`); `Option<fn>` `None` is the null function
+/// pointer (`ConstInt(0)`). Anything the initializer does not name as a
+/// translation-time constant stays a pure getfield of the prebuilt.
+fn fold_immutable_static_field(llbc: &Llbc, def_id: u64, field_idx: usize) -> Option<OpKind> {
+    let fields = immutable_static_struct_fields(llbc, def_id)?;
+    fields.into_iter().nth(field_idx).flatten()
+}
+
+fn immutable_static_struct_fields(llbc: &Llbc, def_id: u64) -> Option<Vec<Option<OpKind>>> {
+    immutable_static_init_tables(llbc, def_id).map(|(fields, _)| fields)
+}
+
+fn immutable_static_field_fun_id(llbc: &Llbc, def_id: u64, field_idx: usize) -> Option<u64> {
+    let (_, funs) = immutable_static_init_tables(llbc, def_id)?;
+    funs.into_iter().nth(field_idx).flatten()
+}
+
+fn immutable_static_init_tables(
+    llbc: &Llbc,
+    def_id: u64,
+) -> Option<(Vec<Option<OpKind>>, Vec<Option<u64>>)> {
+    let g = llbc.global_by_id(def_id)?;
+    if !immutable_static_is_prebuilt_table(llbc, g) {
+        return None;
+    }
+    let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    let mut locals: std::collections::HashMap<u64, OpKind> = std::collections::HashMap::new();
+    let mut local_funs: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut struct_fields: Option<Vec<Option<OpKind>>> = None;
+    let mut struct_funs: Option<Vec<Option<u64>>> = None;
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dst) = place.kind else {
+                continue;
+            };
+            if let Some(fun_id) = eval_static_init_fun_id(llbc, &rvalue, &local_funs) {
+                local_funs.insert(dst, fun_id);
+            }
+            if let Rvalue::Aggregate(kind, operands) = &rvalue
+                && aggregate_kind_is_struct(kind)
+            {
+                struct_fields = Some(
+                    operands
+                        .iter()
+                        .map(|operand| eval_static_init_operand(llbc, operand, &locals))
+                        .collect(),
+                );
+                struct_funs = Some(
+                    operands
+                        .iter()
+                        .map(|operand| eval_static_init_operand_fun_id(llbc, operand, &local_funs))
+                        .collect(),
+                );
+            }
+            if let Some(op) = eval_static_init_rvalue(llbc, &rvalue, &locals) {
+                locals.insert(dst, op);
+            }
+        }
+    }
+    Some((struct_fields?, struct_funs.unwrap_or_default()))
+}
+
+fn aggregate_adt_parts(kind: &serde_json::Value) -> Option<(u64, Option<u64>)> {
+    let adt = kind.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = head
+        .as_u64()
+        .or_else(|| head.get("id").and_then(serde_json::Value::as_u64))?;
+    let variant = match adt.get(1) {
+        Some(v) if v.is_null() => None,
+        Some(v) => v.as_u64(),
+        None => None,
+    };
+    Some((type_id, variant))
+}
+
+fn type_decl_is_option(llbc: &Llbc, type_id: u64) -> bool {
+    llbc.type_by_id(type_id)
+        .is_some_and(|td| td.item_meta.name_path() == "core::option::Option")
+}
+
+fn aggregate_kind_is_struct(kind: &serde_json::Value) -> bool {
+    matches!(aggregate_adt_parts(kind), Some((_, None)))
+}
+
+fn eval_static_init_rvalue(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    locals: &std::collections::HashMap<u64, OpKind>,
+) -> Option<OpKind> {
+    match rvalue {
+        Rvalue::Use(operand, _) | Rvalue::Cast(_, operand, _) | Rvalue::UnaryOp(_, operand) => {
+            eval_static_init_operand(llbc, operand, locals)
+        }
+        Rvalue::Aggregate(kind, operands) => {
+            if let Some((type_id, variant)) = aggregate_adt_parts(kind)
+                && type_decl_is_option(llbc, type_id)
+            {
+                return match (variant, operands.len()) {
+                    (Some(0), 0) => Some(OpKind::ConstInt(0)),
+                    (Some(1), 1) => eval_static_init_operand(llbc, &operands[0], locals),
+                    _ => None,
+                };
+            }
+            None
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => match &place.kind {
+            PlaceKind::Local(id) => locals.get(id).cloned(),
+            PlaceKind::Global { id, .. } => eval_prebuilt_static_ref(llbc, *id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn eval_prebuilt_static_ref(llbc: &Llbc, id: u64) -> Option<OpKind> {
+    let g = llbc.global_by_id(id)?;
+    immutable_static_is_prebuilt_table(llbc, g)
+        .then_some(OpKind::ConstRefAddr(immutable_static_sentinel_addr(id)))
+}
+
+fn eval_static_init_operand(
+    llbc: &Llbc,
+    operand: &Operand,
+    locals: &std::collections::HashMap<u64, OpKind>,
+) -> Option<OpKind> {
+    match operand {
+        Operand::Const(value) => {
+            if let Some(fun_id) = const_fn_def_regular_id(llbc, value)
+                && let Some(fd) = llbc.fn_by_id(fun_id)
+            {
+                let path = registered_path_for_fun_decl(llbc, fd);
+                return Some(decoded_const_to_op(DecodedConst::FnPath(path.segments)));
+            }
+            decode_constant(llbc, value).ok().map(decoded_const_to_op)
+        }
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(id) => locals.get(id).cloned(),
+            PlaceKind::Global { id, .. } => eval_prebuilt_static_ref(llbc, *id),
+            _ => None,
+        },
+    }
+}
+
+fn eval_static_init_fun_id(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    local_funs: &std::collections::HashMap<u64, u64>,
+) -> Option<u64> {
+    match rvalue {
+        Rvalue::Use(operand, _) | Rvalue::Cast(_, operand, _) | Rvalue::UnaryOp(_, operand) => {
+            eval_static_init_operand_fun_id(llbc, operand, local_funs)
+        }
+        Rvalue::Aggregate(kind, operands) => {
+            if let Some((type_id, variant)) = aggregate_adt_parts(kind)
+                && type_decl_is_option(llbc, type_id)
+                && variant == Some(1)
+                && operands.len() == 1
+            {
+                return eval_static_init_operand_fun_id(llbc, &operands[0], local_funs);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn eval_static_init_operand_fun_id(
+    llbc: &Llbc,
+    operand: &Operand,
+    local_funs: &std::collections::HashMap<u64, u64>,
+) -> Option<u64> {
+    match operand {
+        Operand::Const(value) => const_fn_def_regular_id(llbc, value),
+        Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+            PlaceKind::Local(id) => local_funs.get(id).copied(),
+            _ => None,
+        },
+    }
+}
+
+/// `FnDef` stored in an immutable static field this operand names.
+fn folded_fun_id_from_immutable_static(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<u64> {
+    let (gid, field_idx) = operand_immutable_static_field(llbc, body, operand, 0)?;
+    immutable_static_field_fun_id(llbc, gid, field_idx)
+}
+
+/// Closed PBC family for a call through a field of a type that only
+/// exists as immutable statics: every `FnDef` those initializers store.
+fn closed_fnptr_graphs_for(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<Vec<crate::parse::CallPath>> {
+    let type_id = operand_fnptr_table_adt(llbc, body, operand, 0)?;
+    let mut graphs = Vec::new();
+    for g in llbc.iter_global_decls() {
+        if !immutable_static_is_prebuilt_table(llbc, g) {
+            continue;
+        }
+        if global_decl_adt_id(llbc, g) != Some(type_id) {
+            continue;
+        }
+        let Some((_, funs)) = immutable_static_init_tables(llbc, g.def_id) else {
+            continue;
+        };
+        for fun_id in funs.into_iter().flatten() {
+            let Some(fd) = llbc.fn_by_id(fun_id) else {
+                continue;
+            };
+            let path = registered_path_for_fun_decl(llbc, fd);
+            if !graphs.contains(&path) {
+                graphs.push(path);
+            }
+        }
+    }
+    (!graphs.is_empty()).then_some(graphs)
+}
+
+fn global_tyref(g: &GlobalDecl) -> Option<TyRef> {
+    serde_json::from_value(g.rest.get("ty")?.clone()).ok()
+}
+
+fn global_decl_adt_id(llbc: &Llbc, g: &GlobalDecl) -> Option<u64> {
+    let tyref = global_tyref(g)?;
+    let node = tyref_node(&tyref, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    adt_node_def_id(node)
+}
+
+fn operand_immutable_static_field(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+    depth: usize,
+) -> Option<(u64, usize)> {
+    if depth > 8 {
+        return None;
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    place_immutable_static_field(llbc, body, place, depth)
+}
+
+fn place_global_id(place: &Place) -> Option<u64> {
+    match &place.kind {
+        PlaceKind::Global { id, .. } => Some(*id),
+        PlaceKind::Projection(inner, elem) if projection_elem_is_deref(elem) => {
+            place_global_id(inner)
+        }
+        _ => None,
+    }
+}
+
+fn place_immutable_static_field(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+    depth: usize,
+) -> Option<(u64, usize)> {
+    if depth > 8 {
+        return None;
+    }
+    match &place.kind {
+        PlaceKind::Projection(inner, elem) => {
+            if projection_elem_is_deref(elem) {
+                return place_immutable_static_field(llbc, body, inner, depth + 1);
+            }
+            if let Some(payload) = elem.field_payload() {
+                let (_, field_idx) = indexed_field_parts(payload)?;
+                if let Some(gid) = place_global_id(inner) {
+                    let g = llbc.global_by_id(gid)?;
+                    return immutable_static_is_prebuilt_table(llbc, g).then_some((gid, field_idx));
+                }
+                // Option payload field: peel to the Option place.
+                if let Some(head) = tyref_node(&inner.ty, llbc)
+                    .and_then(|n| strip_ty_wrappers(n, llbc))
+                    .and_then(adt_node_def_id)
+                    && type_decl_is_option(llbc, head)
+                {
+                    return place_immutable_static_field(llbc, body, inner, depth + 1);
+                }
+            }
+            None
+        }
+        PlaceKind::Local(index) => {
+            let assigned = local_assigned_operand(body, *index)?;
+            operand_immutable_static_field(llbc, body, &assigned, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn operand_fnptr_table_adt(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+    depth: usize,
+) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    place_fnptr_table_adt(llbc, body, place, depth)
+}
+
+fn place_fnptr_table_adt(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+    depth: usize,
+) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    match &place.kind {
+        PlaceKind::Projection(inner, elem) => {
+            if projection_elem_is_deref(elem) {
+                return place_fnptr_table_adt(llbc, body, inner, depth + 1);
+            }
+            if elem.field_payload().is_some() {
+                if let Some(head) = tyref_node(&inner.ty, llbc)
+                    .and_then(|n| strip_ty_wrappers(n, llbc))
+                    .and_then(adt_node_def_id)
+                {
+                    if type_decl_is_option(llbc, head) {
+                        return place_fnptr_table_adt(llbc, body, inner, depth + 1);
+                    }
+                    if immutable_static_exists_for_adt(llbc, head) {
+                        return Some(head);
+                    }
+                }
+            }
+            None
+        }
+        PlaceKind::Global { id, .. } => {
+            let g = llbc.global_by_id(*id)?;
+            if !immutable_static_is_prebuilt_table(llbc, g) {
+                return None;
+            }
+            global_decl_adt_id(llbc, g)
+        }
+        PlaceKind::Local(index) => {
+            let assigned = local_assigned_operand(body, *index)?;
+            operand_fnptr_table_adt(llbc, body, &assigned, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn immutable_static_exists_for_adt(llbc: &Llbc, type_id: u64) -> bool {
+    type_is_prebuilt_table(llbc, type_id)
+        && llbc.iter_global_decls().any(|g| {
+            immutable_static_is_prebuilt_table(llbc, g)
+                && global_decl_adt_id(llbc, g) == Some(type_id)
+        })
+}
+
+fn local_assigned_operand(body: &Unstructured, local: u64) -> Option<Operand> {
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            if !matches!(&place.kind, PlaceKind::Local(dst) if *dst == local) {
+                continue;
+            }
+            return match rvalue {
+                Rvalue::Use(operand, _)
+                | Rvalue::Cast(_, operand, _)
+                | Rvalue::UnaryOp(_, operand) => Some(operand.clone()),
+                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                    Some(Operand::Copy(place.clone()))
+                }
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Fields of a type that only materialises as immutable statics, and whose
+/// every field is a prebuilt scalar (fnptr / `Option<fnptr>` / integer /
+/// fieldless enum / `Option<fieldless enum>`), are class-level
+/// `_immutable_fields_` (`rclass.py _parse_field_list`). A type tree that
+/// contains `UnsafeCell` / `Cell` / `sync::atomic` is interior-mutable and
+/// stays off this harvest.
+pub(crate) fn harvest_immutable_fields_from_immutable_statics(
+    llbc: &Llbc,
+) -> std::collections::HashMap<String, Vec<(String, crate::model::ImmutableRank)>> {
+    let mut out = std::collections::HashMap::new();
+    for g in llbc.iter_global_decls() {
+        if !immutable_static_is_prebuilt_table(llbc, g) {
+            continue;
+        }
+        let Some(type_id) = global_decl_adt_id(llbc, g) else {
+            continue;
+        };
+        let Some(td) = llbc.type_by_id(type_id) else {
+            continue;
+        };
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
+        let entries: Vec<(String, crate::model::ImmutableRank)> = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let name = field
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(index));
+                (name, crate::model::ImmutableRank::Immutable)
+            })
+            .collect();
+        let path = td.item_meta.name_path();
+        let stripped = strip_crate_prefix(&path);
+        let leaf = stripped
+            .rsplit("::")
+            .next()
+            .unwrap_or(stripped.as_str())
+            .to_string();
+        out.entry(leaf).or_insert_with(|| entries.clone());
+        out.entry(stripped).or_insert(entries);
+    }
+    out
+}
+
+fn field_ty_is_prebuilt_immutable(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_option_payload_is_fn_ptr(ty, llbc) || tyref_option_fieldless_niche(ty, llbc).is_some()
+    {
+        return true;
+    }
+    if tyref_fieldless_enum_def(ty, llbc).is_some() {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if type_node_is_fn_ptr(node, llbc) {
+        return true;
+    }
+    node.get("Scalar")
+        .is_some_and(|scalar| scalar_value_type(scalar).is_some())
+}
+
+/// Declared interior mutability of a type: `UnsafeCell`, `Cell`, or a
+/// `sync::atomic` struct appears in the type tree. The static's binding
+/// name is not consulted.
+fn tyref_has_interior_mutability(ty: &TyRef, llbc: &Llbc) -> bool {
+    let mut seen = Vec::new();
+    tyref_node(ty, llbc)
+        .is_some_and(|node| type_node_has_interior_mutability(node, llbc, &mut seen))
+}
+
+fn type_has_interior_mutability(llbc: &Llbc, type_id: u64) -> bool {
+    let mut seen = Vec::new();
+    type_id_has_interior_mutability(llbc, type_id, &mut seen)
+}
+
+fn type_node_has_interior_mutability(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    seen: &mut Vec<u64>,
+) -> bool {
+    if seen.len() > 64 {
+        return false;
+    }
+    let Some(node) = strip_ty_wrappers(node, llbc) else {
+        return false;
+    };
+    let Some(obj) = node.as_object() else {
+        return false;
+    };
+    if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Array").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Slice").and_then(serde_json::Value::as_array) {
+        return arr
+            .first()
+            .is_some_and(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(arr) = obj.get("Tuple").and_then(serde_json::Value::as_array) {
+        return arr
+            .iter()
+            .any(|inner| type_node_has_interior_mutability(inner, llbc, seen));
+    }
+    if let Some(adt) = obj.get("Adt") {
+        if let Some(types) = adt
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            && types
+                .iter()
+                .any(|inner| type_node_has_interior_mutability(inner, llbc, seen))
+        {
+            return true;
+        }
+        if let Some(id) = adt_node_def_id(node) {
+            return type_id_has_interior_mutability(llbc, id, seen);
+        }
+    }
+    false
+}
+
+fn type_id_has_interior_mutability(llbc: &Llbc, type_id: u64, seen: &mut Vec<u64>) -> bool {
+    if seen.contains(&type_id) {
+        return false;
+    }
+    seen.push(type_id);
+    let Some(td) = llbc.type_by_id(type_id) else {
+        return false;
+    };
+    if adt_path_is_interior_mut_constructor(&td.item_meta.name_path(), &td.kind) {
+        return true;
+    }
+    match &td.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
+            .iter()
+            .any(|field| tyref_node_interior_mut(&field.ty, llbc, seen)),
+        TypeDeclKind::Enum(variants) => variants.iter().any(|variant| {
+            variant
+                .fields
+                .iter()
+                .any(|field| tyref_node_interior_mut(&field.ty, llbc, seen))
+        }),
+        TypeDeclKind::Alias(aliased) => type_node_has_interior_mutability(aliased, llbc, seen),
+        TypeDeclKind::Opaque | TypeDeclKind::Unknown => false,
+    }
+}
+
+fn tyref_node_interior_mut(ty: &TyRef, llbc: &Llbc, seen: &mut Vec<u64>) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| type_node_has_interior_mutability(node, llbc, seen))
+}
+
+/// Type constructors that *are* interior mutability, identified by the
+/// declaration path. `AtomicBool` is a struct in `sync::atomic`;
+/// `Ordering` in the same module is a fieldless enum and is not.
+fn adt_path_is_interior_mut_constructor(path: &str, kind: &TypeDeclKind) -> bool {
+    if path == "core::cell::UnsafeCell" || path.ends_with("::UnsafeCell") {
+        return true;
+    }
+    if path == "core::cell::Cell" || path == "std::cell::Cell" || path.ends_with("::cell::Cell") {
+        return true;
+    }
+    if path.contains("::sync::atomic::") {
+        return matches!(
+            kind,
+            TypeDeclKind::Struct(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown
+        );
+    }
+    false
 }
 
 fn global_source_text_is_static_mut(g: &GlobalDecl) -> bool {
@@ -68636,11 +70595,16 @@ fn tyref_to_field_layout_string(
             .map(|arg| tyref_to_ast_string(&arg, llbc))
             .unwrap_or_else(|| "*mut PyObject".to_string());
     }
-    // A `Vec` of one-word items is the header address (`RustVecRepr`,
-    // kind `int`): one pointer-sized word, not the 24-byte inline Vec.
-    // Spelling the Vec ADT here registers a `FLAG_STRUCT` row whose
+    // A `Vec<T>` is the header address (`RustVecRepr`, kind `int`): one
+    // pointer-sized word, not the 24-byte inline Vec, for every item
+    // type. Spelling the Vec ADT here registers a `FLAG_STRUCT` row whose
     // size disagrees with the Int publish.
-    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+    if tyref_is_rust_vec_header(ty, llbc) {
+        return "isize".to_string();
+    }
+    // A by-value raw struct is one pointer-sized word, not an inline
+    // FLAG_STRUCT row whose size disagrees with the Int publish.
+    if tyref_is_raw_struct_value(ty, llbc, gc_struct_ids) {
         return "isize".to_string();
     }
     // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
@@ -68658,6 +70622,11 @@ fn tyref_to_field_layout_string(
     let Some(decl) = llbc.type_by_id(id) else {
         return tyref_to_ast_string(ty, llbc);
     };
+    // Same predicate as `tyref_is_raw_struct_value` / the value-type
+    // peel: RootScope is the instance, not its `usize` save_point.
+    if gc_root_scope_type_path(&decl.item_meta.name_path()) {
+        return tyref_to_ast_string(ty, llbc);
+    }
     if !decl.is_repr_transparent() {
         return tyref_to_ast_string(ty, llbc);
     }
@@ -68666,7 +70635,7 @@ fn tyref_to_field_layout_string(
         && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
         && let Some(field) = fields.get(index)
         && !matches!(
-            tyref_to_value_type(&field.ty, llbc),
+            tyref_to_value_type_with(&field.ty, llbc, no_tombstoned_leaves(), gc_struct_ids),
             ValueType::Ref(_)
                 | ValueType::Str
                 | ValueType::StringBuilder
@@ -68849,6 +70818,27 @@ pub fn slice_array_type_id(spelling: &str) -> Option<String> {
         return Some(format!("[{element}]"));
     }
     slice_element_spelling(normalized).map(|_| normalized.to_string())
+}
+
+/// Identity and `nolength` of a fixed `Array<ITEM;N>`
+/// (`slice_array_type_id`'s fixed-array path).
+///
+/// `rewrite_op_direct_call` lowers the ctor to `do_fixed_newlist` /
+/// `do_fixed_newlist_clear` when `nolength` is false. `fold_unit_variant_ctors`
+/// uses the same answer so a length-prefixed `Array<ITEM;0>` stays a ctor
+/// and a headerless one keeps the interned singleton.
+pub(crate) fn fixed_list_reader(item: &str) -> Option<(String, bool)> {
+    let id = slice_array_type_id(&format!("[{item};0]"))?;
+    let nolength = crate::front::typestr::nolength_from_array_type_id(Some(id.as_str()));
+    Some((id, nolength))
+}
+
+/// An `Array<ITEM;N>` whose `&[ITEM]` reader is a length-prefixed GcArray.
+pub(crate) fn fixed_array_lowers_to_gcarray(name: &str) -> bool {
+    let Some((item, _)) = shaped_array_parts(name) else {
+        return false;
+    };
+    matches!(fixed_list_reader(item), Some((_, false)))
 }
 
 /// `local[i]` versus `(*p)[i]`. A deref's type is the pointee, so the
@@ -69357,8 +71347,11 @@ enum IntoDevirt {
     /// is a `T -> T` identity conversion.
     Identity,
     /// A concrete `impl From<T> for U` was selected; the segments are
-    /// its `from` function's path.
-    Target(Vec<String>),
+    /// its `from` function's path and `fun_decl_id` is that FunDecl.
+    Target {
+        segments: Vec<String>,
+        fun_decl_id: u64,
+    },
 }
 
 /// Render a Charon `DynTrait` body to `dyn <trait-leaf>`.  Falls back to
@@ -69653,6 +71646,71 @@ fn tyref_tuple_arity(ty: &TyRef, llbc: &Llbc) -> usize {
         n += 1;
     }
     n
+}
+
+/// Register kind of one aggregate field (`history.py` `getkind` of the
+/// field lltype). A raw `Ptr` whose `TO._gckind` is `raw` is `'int'`:
+/// `*mut usize` is the address word, `*mut *mut T` is a slot address.
+/// A byte pointer and a GC ADT pointer stay `Ref`.
+fn tyref_aggregate_field_value_type(ty: &TyRef, llbc: &Llbc, spelling: &str) -> ValueType {
+    if let Some(raw) = raw_scalar_address_value_type(ty, llbc) {
+        return raw;
+    }
+    if tyref_raw_ptr_points_at_pointer(ty, llbc) {
+        return ValueType::Int;
+    }
+    match tyref_to_value_type(ty, llbc) {
+        ValueType::Ref(None) => tuple_field_value_type(spelling),
+        kind => kind,
+    }
+}
+
+/// Positional `__pos_N` rows of a non-Adt aggregate, typed from `dest_ty`.
+///
+/// `resolve_aggregate_adt` returns `None` for `Tuple` / `Array` / `Closure`
+/// (no user `TypeDecl`). The constructor suffix already comes from
+/// `dest_ty`; the field kinds must too, or `tuple_field_value_type` of an
+/// empty spelling answers `Ref` and a host integer is rewritten to
+/// `CONST_NULL` (`history.py`).
+fn positional_aggregate_field_rows(
+    dest_ty: &TyRef,
+    n_operands: usize,
+    llbc: &Llbc,
+) -> Vec<(String, String, Option<TyRef>)> {
+    (0..n_operands)
+        .map(|i| {
+            let ty =
+                tyref_tuple_element(dest_ty, i, llbc).or_else(|| tyref_array_item(dest_ty, llbc));
+            let spelling = ty
+                .as_ref()
+                .map(|t| tyref_to_ast_string(t, llbc))
+                .unwrap_or_default();
+            (format!("__pos_{i}"), spelling, ty)
+        })
+        .collect()
+}
+
+/// Item type of a fixed-size array `ty` (`{"Array":[item,len,…]}`).
+fn tyref_array_item(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    // Charon wraps the array (and interned items) in `Value` / `Deduplicated`.
+    // `strip_ty_indirections` peels those so a field spelled
+    // `{"Value":[id, {"Array":[{"Deduplicated": item}, len, null]}]}`
+    // is the same `[T; N]` as an inline `Array` node.
+    let value = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let mut element = value.get("Array")?.as_array()?.first()?;
+    loop {
+        let stripped = strip_ty_indirections(element, llbc)?;
+        if let Some([_, body]) = stripped
+            .as_object()
+            .and_then(|obj| obj.get("HashConsedValue"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+        {
+            element = body;
+            continue;
+        }
+        return Some(TyRef::Other(stripped.clone()));
+    }
 }
 
 /// Element `idx` of a tuple type `ty`, read off its `generics.types`.
@@ -70984,6 +73042,7 @@ fn encoding_name_const(segments: &[String]) -> Option<OpKind> {
         target: CallTarget::FunctionPath {
             segments: vec!["__str_const".to_string(), text.to_string()],
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         },
         args: crate::model::call_args(vec![]),
         result_ty: ValueType::Ref(None),
@@ -71130,11 +73189,9 @@ enum DecodedConst {
     FnPath(Vec<String>),
 }
 
-/// The `OpKind` `build_rvalue` emits for a decoded constant. A promoted-const
-/// accessor that copies such a literal is this same translation-time
-/// `Constant` (`rtyper` prebuilt `Constant` of a global; residualizing it
-/// would keep a function pointer `Transformer.handle_residual_call` cannot
-/// bind).
+/// The op `build_rvalue` emits for an `Operand::Const`. A PromotedConst
+/// body that copies that constant and returns a borrow of it folds to
+/// the same op (`flowspace` `Constant`).
 fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
     match decoded {
         DecodedConst::Int(n) => OpKind::ConstInt(n),
@@ -71144,14 +73201,25 @@ fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
         DecodedConst::Bool(b) => OpKind::ConstBool(b),
         DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
         DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
+        // String / byte-string constants — no ConstStr opkind exists;
+        // synthesise a 0-arg `Call` whose path encodes the literal text
+        // so the IR stays stable. A `&str` / `&[u8]` literal lowers to
+        // `Ptr(STR)` (getkind `r`). The `__str_const` path is never
+        // registered: the flowspace adapter pre-folds it to
+        // `Constant('text')` (`flowspace_adapter.rs::is_str_const_define`).
         DecodedConst::Str(s) => OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), s],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(None),
         },
+        // A function item used as a *value* rather than called. Upstream
+        // materialises `Constant(funcptr)` of lltype `Ptr(FuncType)`
+        // (`rtyper.getcallable`); `FuncType._gckind` is `raw`, so
+        // `getkind` maps that pointer to `int`.
         DecodedConst::FnPath(segments) => {
             let mut synthetic = Vec::with_capacity(segments.len() + 1);
             synthetic.push(crate::model::FN_CONST_HEAD.to_string());
@@ -71160,6 +73228,7 @@ fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
                 target: CallTarget::FunctionPath {
                     segments: synthetic,
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Int,
@@ -71185,8 +73254,10 @@ enum ConstLit {
     /// `Field[Tuple 2, 0|1]` projections.
     Checked(i64, bool),
     CheckedUInt(u64, bool),
-    /// Fieldless enum discriminant. Not a folded constant by itself:
-    /// `bitflagset`'s `from_element` shifts by this value (`element as u8`).
+    /// Fieldless enum discriminant. Intermediate for `bitflagset`'s
+    /// `from_element` (`element as u8`). As a const's result it is the
+    /// by-value fieldless-enum constant: `tyref_to_value_type` colors
+    /// that type `Int`, and the constructor folds to `ConstInt`.
     EnumDisc(u64),
     /// `1 << disc` from an opaque `from_element`. `bits` reads the word back.
     BitflagBits(u64),
@@ -71495,29 +73566,7 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
             }
         }
     }
-    match decode_literal(&found?).ok()? {
-        DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
-        DecodedConst::UInt(n) => Some(OpKind::ConstUInt(n)),
-        DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
-        DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
-        DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
-        DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
-        // A `const NAME: &str = "..."` global reads as a named-const
-        // fold, not a static address; without this arm the read falls
-        // through to a residual `FunctionPath` Call on the const path
-        // (`ATTR_W_OBJ_WEAK` etc.) the registry cannot bind.  Emit the
-        // same synthetic `__str_const` the `build_rvalue` const path
-        // uses (result kind `Ref` — a `&str` literal is `Ptr(STR)`).
-        DecodedConst::Str(s) => Some(OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec!["__str_const".to_string(), s],
-                fun_decl_id: None,
-            },
-            args: crate::model::call_args(vec![]),
-            result_ty: ValueType::Ref(None),
-        }),
-        _ => None,
-    }
+    Some(decoded_const_to_op(decode_literal(&found?).ok()?))
 }
 
 /// Discriminant of a fieldless enum variant aggregate.
@@ -74091,10 +76140,10 @@ pub(crate) fn emit_rust_vec_drop_if_allocated(
     graph.block_mut(bb_id).operations.push(SpaceOperation {
         result: None,
         kind: OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: rust_vec_helper_segments(majit_ir::rvec::VecOp::Free, kind),
-                fun_decl_id: None,
-            },
+            target: CallTarget::function_path(rust_vec_helper_segments(
+                majit_ir::rvec::VecOp::Free,
+                kind,
+            )),
             args: crate::model::call_args(vec![header.clone()]),
             result_ty: ValueType::Void,
         },
@@ -74751,6 +76800,11 @@ struct AggregateField {
     void: bool,
     /// Instance root the stored value is narrowed to.
     narrow_root: Option<String>,
+    /// Register kind of this operand (`tuple_field_value_type` of the
+    /// field spelling). `rewrite_op_setfield` and
+    /// `coerce_gcref_null_store` take the kind from the field
+    /// (`history.py` `CONST_NULL` vs `CONST_0`), not from a host `0`.
+    ty: ValueType,
 }
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
@@ -74813,7 +76867,11 @@ fn emit_aggregate_ctor_with_pairs(
             }
             None => value.clone(),
         };
-        let ty = positional_ctor_field_value_type(&ctor.result_owner, &field.name);
+        let ty = positional_ctor_field_value_type(
+            &ctor.result_owner,
+            &field.name,
+            field.ty.clone(),
+        );
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -74870,7 +76928,11 @@ fn emit_aggregate_ctor(
             }
             None => value.clone(),
         };
-        let ty = positional_ctor_field_value_type(&ctor.result_owner, &field.name);
+        let ty = positional_ctor_field_value_type(
+            &ctor.result_owner,
+            &field.name,
+            field.ty.clone(),
+        );
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -74902,7 +76964,11 @@ fn emit_aggregate_ctor(
 /// [`positional_shape_metadata`] intern's `__pos_N` from the shape
 /// spelling; a raw `*mut usize` item is `int` (`history.py` `getkind`).
 /// The write has to use that same bank so setattr and getattr agree.
-fn positional_ctor_field_value_type(result_owner: &str, field_name: &str) -> ValueType {
+fn positional_ctor_field_value_type(
+    result_owner: &str,
+    field_name: &str,
+    fallback: ValueType,
+) -> ValueType {
     crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
         result_owner,
         field_name,
@@ -74913,7 +76979,7 @@ fn positional_ctor_field_value_type(result_owner: &str, field_name: &str) -> Val
                     .find(|(name, _)| name == field_name)
                     .map(|(_, vt)| vt)
             })
-            .unwrap_or(ValueType::Ref(None)),
+            .unwrap_or(fallback),
     )
 }
 
@@ -77269,11 +79335,10 @@ fn tyref_ptr_pointee_is_vec(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
 }
 
-/// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,
-/// behind a borrow, or behind a raw pointer, all of which the translator
-/// represents as the address of the raw `{ptr, len, cap}` header
-/// (`RustVecRepr`).  `None` for every other type.
-fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+/// The `alloc::vec::Vec` ADT node of `ty`, by value, behind a borrow, or
+/// behind a raw pointer. All three are the address of the raw
+/// `{ptr, len, cap}` header (`RustVecRepr`).
+fn tyref_rust_vec_adt_node<'a>(ty: &'a TyRef, llbc: &'a Llbc) -> Option<&'a serde_json::Value> {
     let mut node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     if let Some(pointee) = node
         .get("RawPtr")
@@ -77286,6 +79351,25 @@ fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::V
     if llbc.type_by_id(id)?.item_meta.name_path() != "alloc::vec::Vec" {
         return None;
     }
+    Some(node)
+}
+
+/// Whether `ty` is an `alloc::vec::Vec<T>` header — by value, behind a
+/// borrow, or behind a raw pointer — regardless of the item type T.
+/// The translator's value is that header address (`RustVecRepr`, kind
+/// `int`). Item kind ([`tyref_rust_vec_item_kind`]) only selects the
+/// `ll_vec_*` helper.
+fn tyref_is_rust_vec_header(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_rust_vec_adt_node(ty, llbc).is_some()
+}
+
+/// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,
+/// behind a borrow, or behind a raw pointer, all of which the translator
+/// represents as the address of the raw `{ptr, len, cap}` header
+/// (`RustVecRepr`).  `None` when `ty` is not a Vec or the item is not
+/// one word.
+fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    let node = tyref_rust_vec_adt_node(ty, llbc)?;
     majit_ir::rvec::rust_vec_item_kind_for_spelling(
         &charon_type_value_to_ast_string(node, llbc, 0),
         crate::layout::target_word_size(),
@@ -77888,9 +79972,9 @@ fn item_addr_locals(
     addr
 }
 
-fn pair_len_shadows(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
+fn pair_len_shadows(name: &str, body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
     let views = objectptr_pair_view_locals(body, llbc);
-    pair_len_shadows_of(&body.locals, llbc, &views)
+    pair_len_shadows_of(name, &body.locals, llbc, &views)
 }
 
 /// Locals that hold the `{ptr, len}` view of an object-pointer `Vec`
@@ -77919,6 +80003,10 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
         if tyref_rust_vec_item_kind(first_ty, llbc).is_some()
             && slice_ty_item_is_object_pointer(&call.dest.ty, llbc)
             && (ref_kind_is_mut(&call.dest.ty, llbc) || raw_ptr_kind_is_mut(&call.dest.ty, llbc))
+            // `Vec::reverse` is the only use: keep the dest a one-word
+            // alias of the header (`ll_vec_reverse`), not a pair view
+            // whose shadow is never bound.
+            && !rust_vec_deref_feeds_only_reverse(body, llbc, dest)
         {
             // A Range / RangeFrom / RangeTo subslice stays the aliasing view.
             let whole_list_mut = matches!(&call.func, CallFunc::Regular(reg)
@@ -77973,6 +80061,7 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
 }
 
 fn pair_len_shadows_of(
+    name: &str,
     locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,
     view_locals: &[bool],
@@ -77980,7 +80069,7 @@ fn pair_len_shadows_of(
     let n_locals = locals.locals.len();
     let arg_count = locals.arg_count as usize;
     let mut next = n_locals;
-    locals
+    let mut shadows: Vec<Option<usize>> = locals
         .locals
         .iter()
         .enumerate()
@@ -78006,7 +80095,22 @@ fn pair_len_shadows_of(
                 next - 1
             })
         })
-        .collect()
+        .collect();
+    // Residual ABI is `(ptr, len)` (`build_*_from_refs_jit_abi` / `cpa2`).
+    // Callers expand the length-prefixed object GcArray to that pair;
+    // `FUNC.ARGS` has to name the same two ints or `getcalldescr` panics.
+    if path_is_build_refs_pair_abi(name) {
+        for (index, local) in locals.locals.iter().enumerate() {
+            if index == 0 || index > arg_count || shadows[index].is_some() {
+                continue;
+            }
+            if tyref_is_object_pointer_slice(&local.ty, llbc) {
+                shadows[index] = Some(next);
+                next += 1;
+            }
+        }
+    }
+    shadows
 }
 
 /// The role of a MIR local in a `[T; N]` array the lowering keeps in a raw
@@ -78063,6 +80167,19 @@ fn tyref_raw_array_parts<'l>(
         .parse::<u64>()
         .ok()?;
     Some((&array[0], len))
+}
+
+/// `[T; N]` whose item is an int/uint/float register. `history.py getkind`
+/// has no kind for a `FixedSizeArray` value; the items are the registers.
+/// Length may be a const-generic, so this does not parse `N`.
+fn scalar_fixed_array_item(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let item = tyref_array_item(ty, llbc)?;
+    let item_ty = tyref_to_value_type(&item, llbc);
+    matches!(
+        item_ty,
+        ValueType::Int | ValueType::Unsigned | ValueType::Float
+    )
+    .then_some(item_ty)
 }
 
 /// Whether the JSON `place` is `a` or `*b` for a raw-array storage local `a`
@@ -78559,6 +80676,33 @@ fn rust_vec_std_leaf(segments: &[String]) -> Option<&str> {
     }
 }
 
+/// `Vec::deref` / `deref_mut` / `as_slice` / `as_mut_slice`: the slice view
+/// of a one-word-item `Vec`. Both Charon impl spellings (`<Impl>` and `Vec`)
+/// and the crate-stripped residual path (`vec::Vec::…`).
+fn rust_vec_slice_view_leaf(segments: &[String]) -> Option<&str> {
+    match rust_vec_std_leaf(segments)? {
+        leaf @ ("deref" | "deref_mut" | "as_slice" | "as_mut_slice") => Some(leaf),
+        _ => None,
+    }
+}
+
+fn path_is_vec_slice_view(path: &str) -> bool {
+    let segs: Vec<String> = path.split("::").map(str::to_string).collect();
+    rust_vec_slice_view_leaf(&segs).is_some()
+}
+
+fn path_is_vec_extend_from_slice(path: &str) -> bool {
+    let segs: Vec<String> = path.split("::").map(str::to_string).collect();
+    rust_vec_std_leaf(&segs) == Some("extend_from_slice")
+}
+
+fn path_is_build_refs_pair_abi(path: &str) -> bool {
+    path.ends_with("::build_list_from_refs")
+        || path.ends_with("::build_tuple_from_refs")
+        || path == "build_list_from_refs"
+        || path == "build_tuple_from_refs"
+}
+
 /// `alloc::vec::from_elem`, the call `vec![item; count]` lowers to.
 fn is_alloc_vec_from_elem(segments: &[String]) -> bool {
     matches!(segments, [a, b, c] if a == "alloc" && b == "vec" && c == "from_elem")
@@ -78592,6 +80736,11 @@ fn rust_vec_std_call(
         ("as_ptr" | "as_mut_ptr", 1) => {
             Some((VecOp::Items, tyref_rust_vec_item_kind(first_arg_ty?, llbc)?))
         }
+        // `v.reverse()` — `rlist.py ll_reverse` / `ll_vec_reverse_*`.
+        ("reverse", 1) => Some((
+            VecOp::Reverse,
+            tyref_rust_vec_item_kind(first_arg_ty?, llbc)?,
+        )),
         _ => None,
     }
 }
@@ -78601,90 +80750,187 @@ fn is_core_slice_reverse(segments: &[String]) -> bool {
     matches!(segments, [a, b, c, d] if a == "core" && b == "slice" && c == "<Impl>" && d == "reverse")
 }
 
+/// The local a copy / reborrow `rvalue` reads, if it is only that.
+fn assign_copy_source(rvalue: &Rvalue) -> Option<usize> {
+    match rvalue {
+        Rvalue::Use(op, _) => operand_local(Some(op)),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place_base_local(place),
+        _ => None,
+    }
+}
+
+fn place_base_local(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Local(i) => Some(*i as usize),
+        PlaceKind::Projection(inner, _) => place_base_local(inner),
+        _ => None,
+    }
+}
+
 /// Item kind of the `Vec` of one-word items whose `deref` / `deref_mut`
-/// call defines MIR `local`.
+/// / `as_mut_slice` defines MIR `local`, walking copy / reborrow aliases.
 fn local_is_rust_vec_deref(
     body: &Unstructured,
     llbc: &Llbc,
     local: usize,
 ) -> Option<majit_ir::rvec::VecItemKind> {
     let forward_blocks = forward_reachable_mask(llbc, body);
-    body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
-        if !forward_blocks[bb_idx] {
+    let mut cur = local;
+    let mut seen = bit_set::BitSet::new();
+    loop {
+        if !seen.insert(cur) {
             return None;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
-            return None;
-        };
-        if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local) {
-            return None;
+        let from_call = body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
+            if !forward_blocks[bb_idx] {
+                return None;
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+                return None;
+            };
+            if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == cur) {
+                return None;
+            }
+            let CallFunc::Regular(reg) = &call.func else {
+                return None;
+            };
+            if !(is_rust_vec_slice_view_call(reg, llbc) || is_deref_call(reg, llbc)) {
+                return None;
+            }
+            tyref_rust_vec_item_kind(operand_tyref(call.args.first()?)?, llbc)
+        });
+        if from_call.is_some() {
+            return from_call;
         }
-        let CallFunc::Regular(reg) = &call.func else {
-            return None;
-        };
-        if !is_deref_call(reg, llbc) {
-            return None;
-        }
-        tyref_rust_vec_item_kind(operand_tyref(call.args.first()?)?, llbc)
-    })
+        cur = body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
+            if !forward_blocks[bb_idx] {
+                return None;
+            }
+            bb.statements.iter().find_map(|stmt| {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    return None;
+                };
+                if place_base_local(place) != Some(cur) {
+                    return None;
+                }
+                assign_copy_source(rvalue)
+            })
+        })?;
+    }
 }
 
-/// Whether every use of MIR `local`, the slice a `Vec` deref defines, is
-/// the receiver of a `<[T]>::reverse` call.
+fn is_rust_vec_slice_view_call(reg: &RegularCall, llbc: &Llbc) -> bool {
+    regular_call_name_path(reg, llbc)
+        .as_deref()
+        .is_some_and(path_is_vec_slice_view)
+}
+
+/// Whether every use of MIR `local`, the slice a `Vec` deref / `as_mut_slice`
+/// defines, is the receiver of a `<[T]>::reverse` call. `Vec::reverse` is
+/// `as_mut_slice` then `<[T]>::reverse`; rustc may copy or reborrow that
+/// temporary and `Drop` it after the call (`rlist.py ll_reverse`).
 fn rust_vec_deref_feeds_only_reverse(body: &Unstructured, llbc: &Llbc, local: usize) -> bool {
     let mut watched = bit_set::BitSet::new();
     watched.insert(local);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let Some(dest) = place_base_local(place) else {
+                    continue;
+                };
+                if watched.contains(dest) {
+                    continue;
+                }
+                if assign_copy_source(rvalue).is_some_and(|src| watched.contains(src)) {
+                    watched.insert(dest);
+                    grew = true;
+                }
+            }
+        }
+    }
     let mut reverses = 0;
     let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
-        if bb.statements.iter().any(|stmt| {
-            !matches!(
-                stmt.stmt_kind(),
+        for stmt in &bb.statements {
+            if matches!(
+                stmt.stmt_kind_ref(),
                 Ok(StmtKind::StorageLive(_)
                     | StmtKind::StorageDead(_)
                     | StmtKind::PlaceMention(_)
                     | StmtKind::Borrowck(_))
-            ) && mentions_local(stmt.kind_value(), &watched)
-        }) {
-            return false;
+            ) {
+                continue;
+            }
+            if !mentions_local(stmt.kind_value(), &watched) {
+                continue;
+            }
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                return false;
+            };
+            let Some(dest) = place_base_local(place) else {
+                return false;
+            };
+            let Some(src) = assign_copy_source(rvalue) else {
+                return false;
+            };
+            if !watched.contains(src) || !watched.contains(dest) {
+                return false;
+            }
         }
         if !mentions_local(bb.terminator.kind_value(), &watched) {
             continue;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
-            return false;
-        };
-        let CallFunc::Regular(reg) = &call.func else {
-            return false;
-        };
-        if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local) {
-            if is_deref_call(reg, llbc) {
-                continue;
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Drop { place, .. }) => {
+                if place_base_local(place).is_none_or(|id| !watched.contains(id)) {
+                    return false;
+                }
             }
-            return false;
+            Ok(TermKind::Call { call, .. }) => {
+                let CallFunc::Regular(reg) = &call.func else {
+                    return false;
+                };
+                if matches!(call.dest.kind, PlaceKind::Local(i) if watched.contains(i as usize)) {
+                    if is_deref_call(reg, llbc) || is_rust_vec_slice_view_call(reg, llbc) {
+                        continue;
+                    }
+                    return false;
+                }
+                let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                    return false;
+                };
+                let Some(fd) = llbc.fn_by_id(*id) else {
+                    return false;
+                };
+                let segments: Vec<String> = fd
+                    .item_meta
+                    .name_path()
+                    .split("::")
+                    .map(str::to_string)
+                    .collect();
+                let arg_local =
+                    operand_local(call.args.first()).or_else(|| match call.args.first()? {
+                        Operand::Copy(place) | Operand::Move(place) => place_base_local(place),
+                        Operand::Const(_) => None,
+                    });
+                if !is_core_slice_reverse(&segments)
+                    || call.args.len() != 1
+                    || arg_local.is_none_or(|arg| !watched.contains(arg))
+                {
+                    return false;
+                }
+                reverses += 1;
+            }
+            _ => return false,
         }
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let segments: Vec<String> = fd
-            .item_meta
-            .name_path()
-            .split("::")
-            .map(str::to_string)
-            .collect();
-        if !is_core_slice_reverse(&segments)
-            || call.args.len() != 1
-            || operand_local(call.args.first()) != Some(local)
-        {
-            return false;
-        }
-        reverses += 1;
     }
     reverses > 0
 }
@@ -78909,6 +81155,7 @@ fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Vari
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), text.to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Str,
@@ -79099,6 +81346,7 @@ fn emit_fmt_expansion_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text.to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Str,
@@ -79190,6 +81438,7 @@ fn emit_lower_hex_byte_02_ops(
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "0123456789abcdef".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Str,
@@ -79282,6 +81531,7 @@ fn emit_lower_hex_byte_02_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[0].clone()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Str,
@@ -79300,6 +81550,7 @@ fn emit_lower_hex_byte_02_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[1].clone()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Str,
@@ -79940,11 +82191,7 @@ fn collapse_const_fmt(graph: &mut FunctionGraph) -> usize {
                 .map(|o| &o.kind)
             {
                 Some(OpKind::Call {
-                    target:
-                        CallTarget::FunctionPath {
-                            segments: pseg,
-                            fun_decl_id: None,
-                        },
+                    target: CallTarget::FunctionPath { segments: pseg, .. },
                     args: pargs,
                     ..
                 }) if pargs.is_empty() && pseg.len() == 2 && pseg[0] == "__str_const" => {
@@ -79963,6 +82210,7 @@ fn collapse_const_fmt(graph: &mut FunctionGraph) -> usize {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
@@ -81461,6 +83709,18 @@ pub(crate) fn bind_array_view_len_in_block(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fieldless_option_none_tag_uses_storage_max_except_two_variants() {
+        assert_eq!(super::fieldless_option_none_tag(2, "u8"), Some(2));
+        assert_eq!(super::fieldless_option_none_tag(2, "u16"), Some(2));
+        assert_eq!(super::fieldless_option_none_tag(1, "u8"), Some(0xff));
+        assert_eq!(super::fieldless_option_none_tag(14, "u8"), Some(0xff));
+        assert_eq!(super::fieldless_option_none_tag(3, "u16"), Some(0xffff));
+        assert_eq!(super::fieldless_option_none_tag(0, "u8"), None);
+        assert_eq!(super::fieldless_option_none_tag(3, "u64"), None);
+        assert_eq!(super::fieldless_option_none_tag(0x1_0000, "u8"), None);
+    }
+
+    #[test]
     fn int_cast_action_narrows_inside_the_64_bit_int_box() {
         // `int_or_float_decode_int`: `value as u32 as i32 as i64`. With a
         // 32-bit `usize` (wasm32) the first two steps still narrow inside
@@ -81705,10 +83965,11 @@ mod tests {
         charon_type_value_to_ast_string, decode_literal, dont_look_inside_return_token,
         fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
         is_core_result_map_err_path, json_ty_is_thin_pointer_element,
-        json_ty_scalar_element_spelling, no_tombstoned_leaves, primitive_float_const,
-        push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
+        json_ty_scalar_element_spelling, no_tombstoned_leaves, positional_aggregate_field_rows,
+        primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
         scalar_replace_named_struct_aggregates, scalar_to_const_value, shaped_array_parts,
-        simplify_lowered_graph, static_key_segments, type_decl_is_closure_env, tyref_array_suffix,
+        simplify_lowered_graph, static_key_segments, type_decl_is_closure_env,
+        tyref_aggregate_field_value_type, tyref_array_suffix,
         tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
         tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
         tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type,
@@ -87131,6 +89392,7 @@ mod tests {
                         "new_display".to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![arg_ref]),
                 result_ty: ValueType::Ref(Some("Argument".to_string())),
@@ -87199,6 +89461,7 @@ mod tests {
                         "new".to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![pieces_arr.clone(), args_arr]),
                 result_ty: ValueType::Ref(Some("Arguments".to_string())),
@@ -87276,6 +89539,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![arg_ref]),
                 result_ty: ValueType::Ref(None),
@@ -87340,6 +89604,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![pieces_arr, args_arr]),
                 result_ty: ValueType::Ref(None),
@@ -87361,6 +89626,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![fmt_args_in.clone()]),
                 result_ty: ValueType::Ref(None),
@@ -87497,6 +89763,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![arg_ref]),
                 result_ty: ValueType::Ref(None),
@@ -87560,6 +89827,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![pieces_arr, args_arr]),
                 result_ty: ValueType::Ref(None),
@@ -87580,6 +89848,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![fmt_args_in.clone()]),
                 result_ty: ValueType::Ref(None),
@@ -87675,6 +89944,7 @@ mod tests {
                             .map(|s| s.to_string())
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![fmt_args]),
                     result_ty: ValueType::Ref(None),
@@ -87820,6 +90090,7 @@ mod tests {
                             .map(|s| s.to_string())
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![fmt_args]),
                     result_ty: ValueType::Ref(None),
@@ -87924,6 +90195,7 @@ mod tests {
         let fpath = |segs: &[&str]| CallTarget::FunctionPath {
             segments: segs.iter().map(|s| s.to_string()).collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         };
 
         // ── B0: Tuple{x, y} + FieldRead __pos_0 + new_display(&x) ──
@@ -88206,6 +90478,7 @@ mod tests {
         let fpath = |segs: &[&str]| CallTarget::FunctionPath {
             segments: segs.iter().map(|s| s.to_string()).collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         };
 
         // ── B0: Tuple{x, y} + both FieldWrites + FieldRead __pos_0 + new_display ──
@@ -91088,6 +93361,76 @@ mod tests {
             Some("Tuple<usize,usize>")
         );
         assert_eq!(tyref_positional_aggregate_root(&scalar, &llbc), None);
+    }
+
+    #[test]
+    fn positional_tuple_field_rows_take_kind_from_dest_ty() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let pair = TyRef::Other(serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {"types": [i64_ty.clone(), i64_ty]}
+            }
+        }));
+        let rows = positional_aggregate_field_rows(&pair, 2, &llbc);
+        assert_eq!(
+            rows.iter()
+                .map(|(name, spelling, ty)| {
+                    (
+                        name.as_str(),
+                        spelling.as_str(),
+                        ty.as_ref().map(|t| tyref_to_value_type(t, &llbc)),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("__pos_0", "i64", Some(ValueType::Int)),
+                ("__pos_1", "i64", Some(ValueType::Int)),
+            ]
+        );
+    }
+
+    #[test]
+    fn positional_tuple_raw_ptr_fields_take_int_kind_from_getkind() {
+        // `mapdict::<Impl>::slots` returns `(*mut usize, *mut *mut ItemsBlock)`.
+        // `history.py` `getkind` of a raw `Ptr` is `'int'`.
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let raw_usize = serde_json::json!({"RawPtr": [usize_ty, "Mut"]});
+        let items = serde_json::json!({"Adt": {"id": 1, "generics": {"types": []}}});
+        let raw_items = serde_json::json!({"RawPtr": [items, "Mut"]});
+        let raw_slot = serde_json::json!({"RawPtr": [raw_items, "Mut"]});
+        let pair = TyRef::Other(serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {"types": [raw_usize.clone(), raw_slot.clone()]}
+            }
+        }));
+        let rows = positional_aggregate_field_rows(&pair, 2, &llbc);
+        assert_eq!(
+            rows.iter()
+                .map(|(name, spelling, ty)| {
+                    (
+                        name.as_str(),
+                        ty.as_ref()
+                            .map(|t| tyref_aggregate_field_value_type(t, &llbc, spelling)),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("__pos_0", Some(ValueType::Int)),
+                ("__pos_1", Some(ValueType::Int)),
+            ]
+        );
+        let byte = TyRef::Other(serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+        }));
+        assert_eq!(
+            tyref_aggregate_field_value_type(&byte, &llbc, ""),
+            ValueType::Ref(None),
+            "*mut u8 stays the GC-erasure Ref"
+        );
     }
 
     #[test]
@@ -95242,6 +97585,45 @@ mod tests {
         ] {
             assert_eq!(super::rust_vec_std_leaf(&p), None, "{p:?}");
         }
+        for (p, leaf) in [
+            (path(&["alloc", "vec", "<Impl>", "deref_mut"]), "deref_mut"),
+            (path(&["alloc", "vec", "Vec", "deref_mut"]), "deref_mut"),
+            (path(&["vec", "Vec", "deref_mut"]), "deref_mut"),
+            (
+                path(&["alloc", "vec", "<Impl>", "as_mut_slice"]),
+                "as_mut_slice",
+            ),
+            (path(&["vec", "Vec", "as_slice"]), "as_slice"),
+        ] {
+            assert_eq!(super::rust_vec_slice_view_leaf(&p), Some(leaf), "{p:?}");
+        }
+        for p in [
+            path(&["alloc", "vec", "<Impl>", "extend_from_slice"]),
+            path(&["alloc", "vec", "Vec", "extend_from_slice"]),
+            path(&["vec", "Vec", "extend_from_slice"]),
+        ] {
+            assert_eq!(
+                super::rust_vec_std_leaf(&p),
+                Some("extend_from_slice"),
+                "{p:?}"
+            );
+            assert!(super::path_is_vec_extend_from_slice(&p.join("::")), "{p:?}");
+        }
+        assert!(super::path_is_vec_slice_view("vec::Vec::deref_mut"));
+        assert!(!super::path_is_vec_slice_view("vec::Vec::push"));
+        assert!(super::path_is_vec_extend_from_slice(
+            "alloc::vec::<Impl>::extend_from_slice"
+        ));
+        assert!(!super::path_is_vec_extend_from_slice("vec::Vec::extend"));
+        assert!(super::path_is_build_refs_pair_abi(
+            "pyre_interpreter::runtime_ops::build_list_from_refs"
+        ));
+        assert!(super::path_is_build_refs_pair_abi(
+            "pyre_interpreter::build_tuple_from_refs"
+        ));
+        assert!(!super::path_is_build_refs_pair_abi(
+            "pyre_interpreter::runtime_ops::build_map_from_refs"
+        ));
     }
 
     #[test]
@@ -97433,7 +99815,7 @@ mod tests {
         assert_handle_class(&llbc, &ty, Some("Word"));
         assert_eq!(
             super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
-            "i64"
+            "isize"
         );
 
         let split = paint_handle(
@@ -97584,6 +99966,96 @@ mod tests {
         }))
         .expect("query TyRef parses");
         (llbc, ty)
+    }
+
+    /// RootScope is a class instance (`Ref`) even when Charon records
+    /// `repr.transparent` over its `usize` save_point. The peel and
+    /// `tyref_is_raw_struct_value` share `gc_root_scope_type_path`
+    /// (`rtyper` `getrepr` → `lowleveltype`; `getkind`).
+    #[test]
+    fn root_scope_is_ref_even_when_layout_is_transparent_usize() {
+        let decls = vec![(
+            1,
+            struct_decl(
+                1,
+                ident_path(&["pyre_object", "gc_roots", "RootScope"]),
+                serde_json::json!([{
+                    "name": "save_point",
+                    "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                    "attr_info": null
+                }]),
+                true,
+            ),
+        )];
+        let (llbc, ty) = load_handle(decls, serde_json::json!([]), 1);
+        assert!(
+            matches!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)),
+            "RootScope getkind is ref; peel must not yield the save_point word"
+        );
+        let word = vec![(
+            1,
+            struct_decl(1, ident_path(&["fixture", "Word"]), i64_field(), true),
+        )];
+        let (llbc, ty) = load_handle(word, serde_json::json!([]), 1);
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
+    }
+
+    /// A container that stores a RootScope is an instance (`Ref`). The
+    /// guard is not raw storage, so `RootedItems { scope, base, len }`
+    /// does not inherit Int (`rtyper` `getrepr` → `lowleveltype`;
+    /// `getkind`).
+    #[test]
+    fn rooted_items_containing_root_scope_is_ref() {
+        let decls = vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["pyre_object", "gc_roots", "RootScope"]),
+                    serde_json::json!([{
+                        "name": "save_point",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                        "attr_info": null
+                    }]),
+                    false,
+                ),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["pyre_object", "gc_roots", "RootedItems"]),
+                    serde_json::json!([
+                        {
+                            "name": "scope",
+                            "ty": {"Adt": {"id": 1, "generics": {"types": []}}},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "base",
+                            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "len",
+                            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                            "attr_info": null
+                        }
+                    ]),
+                    false,
+                ),
+            ),
+        ];
+        let (llbc, scope) = load_handle(decls.clone(), serde_json::json!([]), 1);
+        assert!(
+            matches!(super::tyref_to_value_type(&scope, &llbc), ValueType::Ref(_)),
+            "RootScope getkind is ref"
+        );
+        let (llbc, items) = load_handle(decls, serde_json::json!([]), 2);
+        assert!(
+            matches!(super::tyref_to_value_type(&items, &llbc), ValueType::Ref(_)),
+            "RootedItems stores a RootScope instance; getkind is ref"
+        );
     }
 
     /// An external `repr(transparent)` handle is `Opaque`. The wrapper
@@ -99907,6 +102379,731 @@ mod tests {
         );
     }
 
+    fn immutable_static_kind() -> serde_json::Value {
+        serde_json::json!({
+            "Static": {"is_mut": false, "is_safe": true, "is_thread_local": false}
+        })
+    }
+
+    fn prebuilt_fn_ptr_ty() -> serde_json::Value {
+        serde_json::json!({"FnPtr": {"inputs": [], "output": {"Tuple": []}}})
+    }
+
+    fn prebuilt_unit_ty() -> serde_json::Value {
+        serde_json::json!({"Tuple": []})
+    }
+
+    fn prebuilt_adt_ty(id: u64) -> serde_json::Value {
+        serde_json::json!({"Adt": {"id": id, "generics": empty_generics()}})
+    }
+
+    fn prebuilt_fn_def_const(fun_id: u64, ty: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!([{"FnDef": {"kind": {"Fun": fun_id}, "generics": empty_generics()}}, ty])
+    }
+
+    fn u8_field_struct(def_id: u64, path: &[&str], field: &str) -> serde_json::Value {
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "kind": {"Struct": [{
+                "name": field,
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "attr_info": field_attr
+            }]}
+        })
+    }
+
+    fn types_only_llbc(type_decls: Vec<serde_json::Value>) -> Llbc {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": type_decls,
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("type fixture")
+    }
+
+    fn scalar_struct_static_llbc(
+        type_path: &[&str],
+        static_path: &[&str],
+        reader_path: &[&str],
+    ) -> Llbc {
+        let adt = prebuilt_adt_ty(0);
+        let reader = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(reader_path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": adt},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": adt}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": adt},
+                            {"Use": [{"Copy": {
+                                "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                                "ty": adt
+                            }}, "No"]}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [u8_field_struct(0, type_path, "bits")],
+                "fun_decls": [reader],
+                "global_decls": [
+                    null,
+                    {
+                        "def_id": 1,
+                        "item_meta": item_meta_json(static_path, "", true),
+                        "global_kind": immutable_static_kind(),
+                        "ty": adt
+                    }
+                ],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("scalar static fixture")
+    }
+
+    fn leaf_fun(def_id: u64, path: &[&str]) -> serde_json::Value {
+        let ty = prebuilt_unit_ty();
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [{"statements": [], "terminator": {"span": span_json(), "kind": "Return"}}]
+            }}
+        })
+    }
+
+    fn vtable_static_init(
+        def_id: u64,
+        path: &[&str],
+        leaf_id: u64,
+        vtable_ty: &serde_json::Value,
+    ) -> serde_json::Value {
+        let fn_ty = prebuilt_fn_ptr_ty();
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": vtable_ty},
+            "src": {"GlobalInitializer": {"id": def_id}},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": vtable_ty},
+                    {"index": 1, "name": null, "span": span_json(), "ty": fn_ty}
+                ]},
+                "body": [{
+                    "statements": [
+                        {"span": span_json(), "kind": {"Assign": [
+                            {"kind": {"Local": 1}, "ty": fn_ty},
+                            {"Use": [{"Const": prebuilt_fn_def_const(leaf_id, &fn_ty)}, "No"]}
+                        ]}},
+                        {"span": span_json(), "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": vtable_ty},
+                            {"Aggregate": [
+                                {"Adt": [0, null]},
+                                [{"Move": {"kind": {"Local": 1}, "ty": fn_ty}}]
+                            ]}
+                        ]}}
+                    ],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn immutable_vtable_global(
+        def_id: u64,
+        path: &[&str],
+        init: u64,
+        vtable_ty: &serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "pub static TABLE: Vtable = Vtable { slot: leaf };", true),
+            "global_kind": immutable_static_kind(),
+            "ty": vtable_ty,
+            "value": {"Value": [0, [{"Call": [{"kind": {"Fun": init}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}, []]}, vtable_ty]]}
+        })
+    }
+
+    fn vtable_fixture() -> Llbc {
+        let vtable_ty = prebuilt_adt_ty(0);
+        let fn_ty = prebuilt_fn_ptr_ty();
+        let unit = prebuilt_unit_ty();
+        let vtable_ref = serde_json::json!({"Ref": ["Erased", vtable_ty.clone(), "Shared"]});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let vtable = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "Vtable"], "", true),
+            "kind": {"Struct": [{
+                "name": "slot",
+                "ty": fn_ty,
+                "attr_info": field_attr
+            }]}
+        });
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span_json(), "ty": ty});
+        let slot_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &vtable_ref),
+                    "Deref"
+                ]}), &vtable_ty),
+                {"Field": [null, 0]}
+            ]}),
+            &fn_ty,
+        );
+        let reader = reader_fun(&["fixture", "read_table"], 1);
+        let field_reader = serde_json::json!({
+            "def_id": 7,
+            "item_meta": item_meta_json(&["fixture", "read_slot"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": fn_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    local(0, &fn_ty)
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 0}), &fn_ty),
+                            {"Use": [{"Copy": place(
+                                serde_json::json!({"Projection": [
+                                    place(serde_json::json!({"Projection": [
+                                        place(serde_json::json!({"Global": {"generics": empty_generics(), "id": 1}}), &vtable_ty),
+                                        "Deref"
+                                    ]}), &vtable_ty),
+                                    {"Field": [null, 0]}
+                                ]}),
+                                &fn_ty
+                            )}, "No"]}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let caller = serde_json::json!({
+            "def_id": 8,
+            "item_meta": item_meta_json(&["fixture", "call_slot"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [vtable_ref.clone()], "output": unit},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &unit),
+                    local(1, &vtable_ref),
+                    local(2, &fn_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span_json(),
+                            "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 2}), &fn_ty),
+                                {"Use": [{"Copy": slot_place}, "No"]}
+                            ]}
+                        }],
+                        "terminator": {"span": span_json(), "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Copy": place(
+                                    serde_json::json!({"Local": 2}),
+                                    &fn_ty
+                                )}},
+                                "args": [],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 1,
+                            "on_unwind": 2
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [vtable],
+                "fun_decls": [
+                    reader,
+                    null,
+                    null,
+                    vtable_static_init(3, &["fixture", "TABLE_A", "init"], 4, &vtable_ty),
+                    leaf_fun(4, &["fixture", "leaf_a"]),
+                    vtable_static_init(5, &["fixture", "TABLE_B", "init"], 6, &vtable_ty),
+                    leaf_fun(6, &["fixture", "leaf_b"]),
+                    field_reader,
+                    caller
+                ],
+                "global_decls": [
+                    null,
+                    immutable_vtable_global(1, &["fixture", "TABLE_A"], 3, &vtable_ty),
+                    immutable_vtable_global(2, &["fixture", "TABLE_B"], 5, &vtable_ty)
+                ],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("vtable fixture parses")
+    }
+
+    fn op_kinds(graph: &crate::model::FunctionGraph) -> Vec<&OpKind> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| &op.kind)
+            .collect()
+    }
+
+    /// An immutable `static` Place::Global is the prebuilt constant
+    /// (`bookkeeper.py immutablevalue`), not a residual call to the
+    /// static's symbolic path.
+    #[test]
+    fn immutable_static_global_lowers_to_const_ref_addr() {
+        let llbc = vtable_fixture();
+        let graph = super::lower_function(&llbc, "read_table").expect("lower read_table");
+        let addrs: Vec<i64> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::ConstRefAddr(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, vec![super::immutable_static_sentinel_addr(1)]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "TABLE_A"),
+            0,
+            "immutable static must not residualize as FunctionPath: {graph:?}"
+        );
+    }
+
+    /// A field of that static folds to the initializer's `FnDef`
+    /// (`decoded_const_to_op` `__fn_const`).
+    #[test]
+    fn immutable_static_fnptr_field_folds_to_fn_const() {
+        let llbc = vtable_fixture();
+        let graph = super::lower_function(&llbc, "read_slot").expect("lower read_slot");
+        let fn_consts: Vec<&[String]> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::Call { target, .. } => crate::model::fn_const_segments(target),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fn_consts
+                .iter()
+                .any(|segments| segments.last().map(String::as_str) == Some("leaf_a")),
+            "expected __fn_const of leaf_a, got {graph:?}"
+        );
+    }
+
+    /// A call through a field of a type that only exists as immutable
+    /// statics is `indirect_call` with the initializer `FnDef`s as
+    /// `c_graphs` (`rpbc.py FunctionsPBCRepr` /
+    /// `jtransform.py handle_regular_indirect_call`).
+    #[test]
+    fn immutable_static_fnptr_call_carries_closed_family() {
+        let llbc = vtable_fixture();
+        let graph = super::lower_function(&llbc, "call_slot").expect("lower call_slot");
+        let families: Vec<Vec<String>> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::IndirectCall {
+                    graphs: Some(graphs),
+                    ..
+                } => Some(
+                    graphs
+                        .iter()
+                        .filter_map(|path| path.segments.last().cloned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(families.len(), 1, "one IndirectCall family: {graph:?}");
+        let mut leaves = families[0].clone();
+        leaves.sort();
+        assert_eq!(leaves, vec!["leaf_a".to_string(), "leaf_b".to_string()]);
+        let harvested = super::harvest_immutable_fields_from_immutable_statics(&llbc);
+        let slot = harvested
+            .get("Vtable")
+            .or_else(|| harvested.get("fixture::Vtable"));
+        assert_eq!(
+            slot.map(|fields| fields
+                .iter()
+                .map(|(name, rank)| (name.as_str(), *rank))
+                .collect::<Vec<_>>()),
+            Some(vec![("slot", crate::model::ImmutableRank::Immutable)]),
+            "harvested {harvested:?}"
+        );
+    }
+
+    /// A Const `FnDef` dynamic call is `direct_call`
+    /// (`jtransform.py handle_regular_indirect_call` when the funcbox
+    /// is Const).
+    #[test]
+    fn const_fndef_dynamic_call_is_direct() {
+        let fn_ty = prebuilt_fn_ptr_ty();
+        let unit = prebuilt_unit_ty();
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span_json(), "ty": ty});
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "call_const"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [local(0, &unit)]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Const": prebuilt_fn_def_const(1, &fn_ty)}},
+                                "args": [],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 1,
+                            "on_unwind": 2
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, leaf_fun(1, &["fixture", "leaf_direct"])],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("const FnDef fixture");
+        let graph = super::lower_function(&llbc, "call_const").expect("lower call_const");
+        let directs: Vec<_> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::FunctionPath {
+                            segments,
+                            fun_decl_id,
+                            ..
+                        },
+                    ..
+                } if segments.last().map(String::as_str) == Some("leaf_direct") => {
+                    Some(*fun_decl_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            directs,
+            vec![Some(1)],
+            "direct Call of the Const FnDef: {graph:?}"
+        );
+        assert_eq!(
+            op_kinds(&graph)
+                .iter()
+                .filter(|kind| matches!(
+                    kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("__dyn_call")
+                ))
+                .count(),
+            0,
+            "Const FnDef must not residualize as __dyn_call: {graph:?}"
+        );
+    }
+
+    fn fieldless_enum_decl(def_id: u64, path: &[&str], n: usize) -> serde_json::Value {
+        let variants: Vec<_> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("V{i}"),
+                    "fields": [],
+                    "discriminant": {"Unsigned": ["U8", i.to_string()]},
+                })
+            })
+            .collect();
+        let layouts: Vec<_> = (0..n)
+            .map(|_| serde_json::json!({"field_offsets": []}))
+            .collect();
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "kind": {"Enum": variants},
+            "layout": [{
+                "key": "test",
+                "value": {
+                    "size": 1,
+                    "align": 1,
+                    "variant_layouts": layouts,
+                    "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U8"}}}
+                }
+            }]
+        })
+    }
+
+    fn option_of_enum_ty(option_id: u64, enum_id: u64) -> serde_json::Value {
+        serde_json::json!({"Adt": {
+            "id": option_id,
+            "generics": {
+                "regions": [],
+                "types": [prebuilt_adt_ty(enum_id)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }})
+    }
+
+    /// `Option<E>` over a dense fieldless E is E's scalar plus the
+    /// reserved `None` tag (`tyref_to_field_layout_string`); it is not
+    /// a boxed two-word aggregate.
+    #[test]
+    fn option_of_fieldless_enum_is_scalar_niche() {
+        let option_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["core", "option", "Option"], "", false),
+            "kind": {"Enum": [
+                {"name": "None", "fields": [], "discriminant": {"Unsigned": ["U8", "0"]}},
+                {"name": "Some", "fields": [{
+                    "name": null,
+                    "is_positional": true,
+                    "ty": prebuilt_adt_ty(1)
+                }], "discriminant": {"Unsigned": ["U8", "1"]}}
+            ]}
+        });
+        let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+        let opt_ty = option_of_enum_ty(0, 1);
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span_json(), "ty": ty});
+        let disc_fn = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "opt_disc"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [opt_ty.clone()], "output": disc_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &disc_ty),
+                    local(1, &opt_ty)
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 0}), &disc_ty),
+                            {"Discriminant": place(serde_json::json!({"Local": 1}), &opt_ty)}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    option_decl.clone(),
+                    fieldless_enum_decl(1, &["fixture", "Kind"], 3)
+                ],
+                "fun_decls": [disc_fn],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("option fixture");
+        let opt_tyref: TyRef = serde_json::from_value(opt_ty).unwrap();
+        assert_eq!(tyref_to_value_type(&opt_tyref, &llbc), ValueType::Int);
+        let niche = super::tyref_option_fieldless_niche(&opt_tyref, &llbc)
+            .expect("Option<fieldless> has a scalar niche");
+        assert_eq!(niche.none_tag, 0xff);
+        assert_eq!(niche.storage_ty, "u8");
+        let graph = super::lower_function(&llbc, "opt_disc").expect("lower opt_disc");
+        let kinds = op_kinds(&graph);
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, OpKind::ConstInt(0xff))),
+            "None tag is the u8 storage max, got {graph:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                OpKind::BinOp { op, .. } if op == "ne"
+            )),
+            "discriminant of the niche Option is a scalar compare, got {graph:?}"
+        );
+        assert!(
+            kinds.iter().all(|kind| !matches!(
+                kind,
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+            )),
+            "must not box Option<fieldless> as an aggregate: {graph:?}"
+        );
+        let two = fieldless_enum_decl(1, &["fixture", "Kind"], 2);
+        let two_file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    option_decl,
+                    two
+                ],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let two_llbc =
+            Llbc::from_slice(two_file.to_string().as_bytes()).expect("two-variant fixture");
+        let two_niche =
+            super::tyref_option_fieldless_niche(&opt_tyref, &two_llbc).expect("N=2 niche");
+        assert_eq!(two_niche.none_tag, 2);
+    }
+
+    /// Interior mutability is a fact of the declared type tree
+    /// (`UnsafeCell` / `Cell` / `sync::atomic`), not of the static's
+    /// binding name. A struct of one integer with no cell in the tree
+    /// is a prebuilt table; the same layout under an atomic/cell path
+    /// is not.
+    #[test]
+    fn type_tree_interior_mutability_is_a_declared_fact() {
+        let atomic = types_only_llbc(vec![u8_field_struct(
+            0,
+            &["core", "sync", "atomic", "AtomicBool"],
+            "v",
+        )]);
+        assert!(super::type_has_interior_mutability(&atomic, 0));
+        assert!(!super::type_is_prebuilt_table(&atomic, 0));
+
+        let cell = types_only_llbc(vec![u8_field_struct(0, &["core", "cell", "Cell"], "value")]);
+        assert!(super::type_has_interior_mutability(&cell, 0));
+        assert!(!super::type_is_prebuilt_table(&cell, 0));
+
+        let unsafecell = u8_field_struct(0, &["core", "cell", "UnsafeCell"], "value");
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let flag = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "Flag"], "", true),
+            "kind": {"Struct": [{
+                "name": "v",
+                "ty": prebuilt_adt_ty(0),
+                "attr_info": field_attr
+            }]}
+        });
+        let nested = types_only_llbc(vec![unsafecell, flag]);
+        assert!(super::type_has_interior_mutability(&nested, 1));
+        assert!(!super::type_is_prebuilt_table(&nested, 1));
+
+        let mask = types_only_llbc(vec![u8_field_struct(0, &["fixture", "Mask"], "bits")]);
+        assert!(!super::type_has_interior_mutability(&mask, 0));
+        assert!(super::type_is_prebuilt_table(&mask, 0));
+    }
+
+    /// `static TABLE: AtomicBool` is not a prebuilt constant value, but
+    /// the binding still has an address to load through. A residual
+    /// FunctionPath of the static's symbolic path is not that address.
+    #[test]
+    fn atomic_static_named_table_is_read_through_its_address() {
+        let llbc = scalar_struct_static_llbc(
+            &["core", "sync", "atomic", "AtomicBool"],
+            &["fixture", "TABLE"],
+            &["fixture", "read_table"],
+        );
+        let graph = super::lower_function(&llbc, "read_table").expect("lower read_table");
+        let addrs: Vec<i64> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::ConstRefAddr(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, vec![super::immutable_static_sentinel_addr(1)]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "TABLE"),
+            0,
+            "interior-mut static must not residualize as FunctionPath: {graph:?}"
+        );
+    }
+
+    /// `static SYS_DEV_MODE: Mask` with no cell in the type tree is the
+    /// prebuilt integer table. The binding name is the one that panicked
+    /// when `AtomicBool` was folded; the type tree is what decides.
+    #[test]
+    fn integer_table_named_dev_mode_lowers_to_const_ref_addr() {
+        let llbc = scalar_struct_static_llbc(
+            &["fixture", "Mask"],
+            &["fixture", "SYS_DEV_MODE"],
+            &["fixture", "read_flag"],
+        );
+        let graph = super::lower_function(&llbc, "read_flag").expect("lower read_flag");
+        let addrs: Vec<i64> = op_kinds(&graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                OpKind::ConstRefAddr(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, vec![super::immutable_static_sentinel_addr(1)]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "SYS_DEV_MODE"),
+            0,
+            "prebuilt integer table must not residualize: {graph:?}"
+        );
+    }
+
     #[test]
     fn discover_foldable_const_lits_harvests_size_of_usize() {
         let path = ["fixture", "LOWLEVEL_STRING_LEN_OFFSET"];
@@ -100309,6 +103506,7 @@ mod tests {
             .expect("substituted unstructured body");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -100652,6 +103850,7 @@ mod tests {
         let body = fd.unstructured().expect("caller unstructured");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -100666,7 +103865,7 @@ mod tests {
             &crate::front::semantic::StructFieldRegistry::default(),
             &empty_set,
             &empty_set,
-            &std::collections::HashSet::new(),
+            &empty_gc_struct_ids,
             accum.has_builder,
             &accum,
             &root_stack,
@@ -100782,6 +103981,7 @@ mod tests {
         let body = fd.unstructured().expect("caller unstructured");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -100793,8 +103993,10 @@ mod tests {
                 crate::HostStaticAddrs::default(),
                 &[],
                 &empty_map,
+                &crate::front::semantic::StructFieldRegistry::default(),
                 &empty_set,
                 &empty_set,
+                &empty_gc_struct_ids,
                 accum.has_builder,
                 &accum,
                 &root_stack,
@@ -100962,6 +104164,7 @@ mod tests {
         let body = fd.unstructured().expect("caller unstructured");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -100976,7 +104179,7 @@ mod tests {
             &crate::front::semantic::StructFieldRegistry::default(),
             &empty_set,
             &empty_set,
-            &std::collections::HashSet::new(),
+            &empty_gc_struct_ids,
             accum.has_builder,
             &accum,
             &root_stack,
@@ -101159,6 +104362,7 @@ mod tests {
         let body = fd.unstructured().expect("caller unstructured");
         let accum = super::AccumulatorFacts::build(&llbc, &body);
         let empty_set = std::collections::HashSet::new();
+        let empty_gc_struct_ids = std::collections::HashSet::new();
         let empty_map = std::collections::HashMap::new();
         let root_state = super::RootStackState::new(&llbc);
         let root_stack = super::RootStackAnalyzer::new(&llbc, &root_state);
@@ -101170,8 +104374,10 @@ mod tests {
             crate::HostStaticAddrs::default(),
             &[],
             &empty_map,
+            &crate::front::semantic::StructFieldRegistry::default(),
             &empty_set,
             &empty_set,
+            &empty_gc_struct_ids,
             accum.has_builder,
             &accum,
             &root_stack,
@@ -104722,6 +107928,7 @@ mod tests {
                     "frame_anchor_release".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: Vec::new(),
             result_ty: crate::model::ValueType::Void,
@@ -105752,6 +108959,39 @@ mod tests {
             assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
         }
 
+        // Charon records `&[T; N] as &[T]` as `Rvalue::Cast` (`pin_src`), and
+        // rustc may copy that temporary. The walk must still name the array.
+        let stmt_of = |value: serde_json::Value| -> majit_charon_reader::ullbc::Statement {
+            serde_json::from_value(value).expect("statement JSON")
+        };
+        let mut cast_unsize = body_of(vec![mv(19), mv(20)]);
+        cast_unsize.body[1].statements[5] = stmt_of(assign(
+            9,
+            serde_json::json!({"Cast": [
+                {"Unsize": [ty(), ty(), {"Length": usize_lit(2)}]},
+                mv(8),
+                ty()
+            ]}),
+        ));
+        cast_unsize.body[1].statements.push(stmt_of(assign(
+            18,
+            serde_json::json!({"Use": [copy(9), "No"]}),
+        )));
+        cast_unsize.body[1].set_terminator_kind(call(3, vec![copy(4), mv(18)], 5, 2));
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &cast_unsize,
+            &super::MovedOutLocals::with_set(&cast_unsize, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "a Cast Unsize of the array, copied, must still be erased"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+        assert_eq!(plan.get_sites, vec![(3usize, 19usize), (5usize, 20usize)]);
+
         // A read of a slot some other guard's pin filled is not this one's.
         let mut stray = body_of(vec![mv(19), mv(20)]);
         stray.body[3].set_terminator_kind(call(7, vec![copy(13)], 18, 4));
@@ -106417,8 +109657,10 @@ mod tests {
         );
 
         // A call inside the bracket unwinds to that same `UnwindResume`
-        // once cleanup blocks are stripped. Visiting it must not refuse
-        // a bracket whose normal path is still balanced.
+        // once cleanup blocks are stripped. `on_unwind` is the panic-cleanup
+        // chain the lowering drops (`lower_call`); Python exceptions ride
+        // the success edge as `Result`. Visiting the terminator itself is
+        // also a known stack no-op, so a balanced normal path stays erased.
         let mut inner_unwinding = body_of(blocks(second_pin(), vec![]));
         let resume = inner_unwinding.body.len();
         inner_unwinding.body.push(
@@ -110995,6 +114237,7 @@ mod tests {
             &cells,
             &gc_struct_ids,
             false,
+            false,
         );
         let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
             panic!("slot op is an input");
@@ -111014,6 +114257,7 @@ mod tests {
             &residual,
             &gc_struct_ids,
             false,
+            true,
         );
         let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
             panic!("slot op is an input");
@@ -117043,6 +120287,7 @@ mod tests {
                 crate::front::iter_next::is_iterator_next_target(&CallTarget::FunctionPath {
                     segments: (*segments).clone(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 })
             })
             .cloned()
@@ -119710,6 +122955,7 @@ mod tests {
                 name: "__pos_0".into(),
                 void: false,
                 narrow_root: None,
+                ty: ValueType::Int,
             }],
         })
     }
@@ -119842,6 +123088,7 @@ mod tests {
                 name: "__pos_0".into(),
                 void: false,
                 narrow_root: None,
+                ty: ValueType::Int,
             }],
         })
     }
@@ -119913,6 +123160,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Int,

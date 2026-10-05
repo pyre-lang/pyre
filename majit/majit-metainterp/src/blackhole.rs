@@ -4598,6 +4598,7 @@ mod tests {
         #[test]
         fn test_convert_and_run_from_pyjitpl_starts_at_frame_pc() {
             use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_ir::OpRef;
             use majit_jitcode::insns;
 
             let mut b = JitCodeBuilder::default();
@@ -4658,6 +4659,7 @@ mod tests {
         #[test]
         fn convert_and_run_cast_ptr_int_is_identity_on_an_even_word() {
             use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_ir::OpRef;
             use majit_translate::insns;
 
             const PTR: i64 = 0x1000;
