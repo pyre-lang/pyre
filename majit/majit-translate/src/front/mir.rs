@@ -21810,17 +21810,14 @@ impl<'a> Lowering<'a> {
                     }
                     VecInit::Uninit => return Ok(true),
                     VecInit::Init => {
-                        self.lower_rust_vec_drop(self.block_id[mir_bb], place);
-                        return Ok(true);
+                        return Ok(self.lower_rust_vec_drop(self.block_id[mir_bb], place));
                     }
                 }
             }
-            self.lower_rust_vec_drop(self.block_id[mir_bb], place);
-            return Ok(true);
+            return Ok(self.lower_rust_vec_drop(self.block_id[mir_bb], place));
         }
         if tyref_rust_vec_item_kind(&place.ty, self.llbc).is_some() {
-            self.lower_rust_vec_drop(self.block_id[mir_bb], place);
-            return Ok(true);
+            return Ok(self.lower_rust_vec_drop(self.block_id[mir_bb], place));
         }
         if glue.is_none() && self.tyref_is_trivially_dropless(&place.ty, 0) {
             return Ok(true);
@@ -21841,9 +21838,11 @@ impl<'a> Lowering<'a> {
     /// `ll_vec_newemptylist` / `ll_vec_newlist_hint` / `ll_vec_alloc_and_set`,
     /// following SSA copies through block-input Links and phi merges. A
     /// call result or function input is not this graph's allocation.
-    fn lower_rust_vec_drop(&mut self, bb_id: BlockId, place: &Place) {
+    /// Returns false so the caller keeps the drop glue. `true` means
+    /// `ll_vec_free` was queued.
+    fn lower_rust_vec_drop(&mut self, bb_id: BlockId, place: &Place) -> bool {
         let PlaceKind::Local(local) = place.kind else {
-            return;
+            return false;
         };
         let Some(kind) = tyref_rust_vec_item_kind(&place.ty, self.llbc) else {
             if tyref_is_vec_value(&place.ty, self.llbc) {
@@ -21853,7 +21852,7 @@ impl<'a> Lowering<'a> {
                     &self.graph.name,
                 );
             }
-            return;
+            return false;
         };
         let Some(header) = self.local_var[local as usize]
             .as_ref()
@@ -21864,10 +21863,11 @@ impl<'a> Lowering<'a> {
                 "header-not-live-at-drop",
                 &self.graph.name,
             );
-            return;
+            return false;
         };
         // Prove ownership after links match inputargs (framestate Pass 2).
         self.pending_vec_frees.push((bb_id, header, kind));
+        true
     }
 
     fn emit_pending_vec_frees(&mut self) {

@@ -518,6 +518,7 @@ pub fn ll_vec_extend_from_slice_i(l: &mut Vec<usize>, items: usize, length: usiz
 }
 
 /// Panic for a pair-slice index or `copy_from_slice` length mismatch.
+#[majit_macros::dont_look_inside]
 pub fn ll_slice_bounds_panic() {
     panic!("slice index out of bounds");
 }
@@ -1640,6 +1641,7 @@ mod tests {
             "ll_slice_rotate_left_i",
             "ll_slice_rotate_right_r",
             "ll_slice_rotate_left_f",
+            "ll_slice_bounds_panic",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(
