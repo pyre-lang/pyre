@@ -390,11 +390,12 @@ fn ll_vec_alloc_and_set_jit_i(count: usize, item: usize) -> Vec<usize> {
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
 ///
-/// The traced body returns the header from `ll_vec_newlist_i` or
-/// `ll_vec_alloc_and_clear_i`. `#[fnaddr]` keeps the residual address:
-/// this helper is not a prepass subject, so that address is not a graph
-/// pointer.
-#[majit_macros::fnaddr]
+/// Residual for now: upstream traces into this body, but these helper graphs
+/// are never prepass subjects, so the calls inside carry no `RustVec` result
+/// type and the list-oopspec rewrite cannot tell their header from a GC
+/// list.  Tracing it waits on rtyping the helper bodies the way
+/// `annlowlevel` annotates low-level helpers.
+#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_i(count: usize, item: usize) -> Vec<usize> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_i(count, item)
@@ -731,11 +732,12 @@ fn ll_vec_alloc_and_set_jit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
 ///
-/// The traced body returns the header from `ll_vec_newlist_r` or
-/// `ll_vec_alloc_and_clear_r`. `#[fnaddr]` keeps the residual address:
-/// this helper is not a prepass subject, so that address is not a graph
-/// pointer.
-#[majit_macros::fnaddr]
+/// Residual for now: upstream traces into this body, but these helper graphs
+/// are never prepass subjects, so the calls inside carry no `RustVec` result
+/// type and the list-oopspec rewrite cannot tell their header from a GC
+/// list.  Tracing it waits on rtyping the helper bodies the way
+/// `annlowlevel` annotates low-level helpers.
+#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_r(count, item)
@@ -1118,11 +1120,12 @@ fn ll_vec_alloc_and_set_jit_f(count: usize, item: f64) -> Vec<f64> {
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
 ///
-/// The traced body returns the header from `ll_vec_newlist_f` or
-/// `ll_vec_alloc_and_clear_f`. `#[fnaddr]` keeps the residual address:
-/// this helper is not a prepass subject, so that address is not a graph
-/// pointer.
-#[majit_macros::fnaddr]
+/// Residual for now: upstream traces into this body, but these helper graphs
+/// are never prepass subjects, so the calls inside carry no `RustVec` result
+/// type and the list-oopspec rewrite cannot tell their header from a GC
+/// list.  Tracing it waits on rtyping the helper bodies the way
+/// `annlowlevel` annotates low-level helpers.
+#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_f(count: usize, item: f64) -> Vec<f64> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_f(count, item)

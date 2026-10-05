@@ -2501,34 +2501,6 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     expanded.into()
 }
 
-/// Publish the word-ABI entry of a function the tracer looks inside.
-///
-/// The entry is the address a residual or blackhole call uses. The
-/// function carries no `_jit_look_inside_ = false` marker and no
-/// `dont_look_inside` policy byte.
-#[proc_macro_attribute]
-pub fn fnaddr(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let func = parse_macro_input!(item as ItemFn);
-    let attrs = &func.attrs;
-    let vis = &func.vis;
-    let sig = &func.sig;
-    let block = &func.block;
-    let call_target_fn = match emit_helper_call_target_fn(&func, true, None, "fnaddr", &[], false) {
-        Ok(Some((_, _, tokens))) => tokens,
-        Ok(None) => quote! {},
-        Err(err) => return err.to_compile_error().into(),
-    };
-    let expanded = quote! {
-        #(#attrs)*
-        #vis #sig {
-            #block
-        }
-
-        #call_target_fn
-    };
-    expanded.into()
-}
-
 /// Mark a function as opaque to the tracer.
 ///
 /// The JIT will not trace into this function; it will be called as a black box.
