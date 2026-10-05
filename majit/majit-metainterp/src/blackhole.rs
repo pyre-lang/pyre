@@ -6877,6 +6877,11 @@ mod tests {
                     other => panic!("abort handler must return Err(LeaveFrame), got {other:?}"),
                 }
                 assert!(bh.aborted);
+                assert!(
+                    bh.abort_permanent_bail,
+                    "abort markers must BailToInterpreter, not panic in \
+                     blackhole_resume_via_rd_numb"
+                );
             }
         }
 
@@ -7819,12 +7824,19 @@ bhhandler_i_i!(handler_int_deref, bhimpl_int_same_as);
 // `aborted = true` + `LeaveFrame`. RPython has no
 // direct analog: its codewriter raises before lowering, so a jitcode
 // never carries an unrecognized op.
+//
+// `convert_and_run_from_pyjitpl` turns every abort into one resume.
+// Consumers accept that resume only when `abort_permanent_bail` is set
+// (`bhimpl_abort_permanent` / `reject_unresolved_call` /
+// `handler_vtable_method_ptr_bail`). Without it, `blackhole_resume_via_rd_numb`
+// panics instead of `BailToInterpreter`.
 fn handler_abort_marker(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
     _position: usize,
 ) -> Result<usize, DispatchError> {
     bh.aborted = true;
+    bh.abort_permanent_bail = true;
     Err(DispatchError::LeaveFrame)
 }
 
@@ -10529,6 +10541,7 @@ fn check_blackhole_allocation_after(
     // in `resume_mainloop`. Mark the frame aborted so the caller bails.
     if matches!(err, DispatchError::LeaveFrame) {
         bh.aborted = true;
+        bh.abort_permanent_bail = true;
     }
     Err(err)
 }

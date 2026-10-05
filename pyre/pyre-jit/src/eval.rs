@@ -13048,7 +13048,13 @@ fn compile_and_run_once(
             eprintln!("[interpret] abort blackhole resume_pc={bh_pc}");
         }
         if let Some(name) = driver.take_interpret_bail_residual() {
-            panic!("interpret blackhole bailed on residual {name}");
+            // `blackhole.py convert_and_run_from_pyjitpl` never returns.
+            // An unbound residual has no callable `fnaddr`, so the chain
+            // bails (`reject_unresolved_call`) and the interpreter replays
+            // the opcode from the pre-walk snapshot below (`bh_pc == MAX`).
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[interpret] abort blackhole bailed on residual {name}");
+            }
         }
         // The blackhole's own outcome decides the resume; a walk result
         // staged before the abort is not the frame's.

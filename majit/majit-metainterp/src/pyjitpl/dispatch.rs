@@ -5551,7 +5551,16 @@ pub fn publish_walk_abort_handoff(
         // framestack instead. Keep i0 and the framestack when the host
         // marked a committed residual or this walk is already a
         // guard-resume bridge.
-        if std::mem::replace(&mut ctx.symbolic_residual_abort, false)
+        //
+        // A refused residual never ran (`do_residual_call` always
+        // executes before `SwitchToBlackhole`). `snap_pc_to_instruction_start`
+        // prefers `code_cursor` when that is already a startpoint, which
+        // after operand decode is the *next* instruction, so the blackhole
+        // would skip the call. Resume at `last_opcode_position` (`orgpc`)
+        // instead, matching `MetaInterp::interpret` /
+        // `stage_interpret_abort_blackhole`.
+        let refused = std::mem::replace(&mut ctx.symbolic_residual_abort, false);
+        if refused
             && !crate::take_residual_committed()
             && !crate::is_bridge_walking()
             && !ctx.is_bridge_trace
@@ -5649,7 +5658,11 @@ pub fn publish_walk_abort_handoff(
         let abort_after_panic = std::mem::replace(&mut ctx.abort_after_panic, false);
         if !abort_after_panic && stub_resume_pc.is_none() {
             if let Some(top) = standalone.frames.frames.last_mut() {
-                top.pc = snap_pc_to_instruction_start(top);
+                top.pc = if refused && top.jitcode.is_valid_startpoint(top.last_opcode_position) {
+                    top.last_opcode_position
+                } else {
+                    snap_pc_to_instruction_start(top)
+                };
             }
             ctx.aborted_framestack = Some(std::mem::take(&mut standalone.frames));
         }
@@ -6650,6 +6663,57 @@ mod tests {
         let top = resumed.frames.last().expect("top frame");
         assert_eq!(top.pc, start);
         assert!(top.jitcode.is_valid_startpoint(top.pc));
+    }
+
+    #[test]
+    fn refused_residual_on_a_bridge_resumes_at_the_unrun_opcode() {
+        // `do_residual_call` has not run. After operand decode `code_cursor`
+        // is the next startpoint, so `snap_pc_to_instruction_start` would
+        // skip the call. A bridge must convert the live framestack
+        // (`run_blackhole_interp_to_cancel_tracing`) at the refused
+        // instruction's `orgpc`.
+        let mut builder = JitCodeBuilder::new();
+        builder.set_name("refused_residual_bridge_pc");
+        builder.load_const_i_value(1, 0);
+        builder.load_const_i_value(2, 1);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let start = jitcode
+            .startpoints
+            .as_ref()
+            .expect("assembled jitcode records startpoints")
+            .iter()
+            .copied()
+            .min()
+            .expect("at least one instruction");
+        let next = jitcode
+            .startpoints
+            .as_ref()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&pc| pc > start)
+            .min()
+            .expect("a second instruction");
+
+        let sd = std::sync::Arc::new(crate::MetaInterpStaticData::new());
+        let mut ctx = TraceCtx::new(crate::recorder::Trace::new(), 0, sd);
+        ctx.symbolic_residual_abort = true;
+        ctx.is_bridge_trace = true;
+        let mut standalone = StandaloneFrameStack::new();
+        let mut frame = standalone.frames.take_frame(jitcode, start, None, None);
+        frame.last_opcode_position = start;
+        frame.code_cursor = next;
+        frame.pc = 0;
+        standalone.frames.push(frame);
+
+        publish_walk_abort_handoff(&mut ctx, &TraceAction::Abort, &mut standalone);
+        let resumed = ctx
+            .aborted_framestack
+            .expect("a bridge refused residual publishes the framestack");
+        let top = resumed.frames.last().expect("top frame");
+        assert_eq!(top.pc, start);
+        assert!(top.jitcode.is_valid_startpoint(top.pc));
+        assert_eq!(top.code_cursor, next);
     }
 
     #[test]
