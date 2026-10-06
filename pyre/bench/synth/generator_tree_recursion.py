@@ -1,11 +1,17 @@
-# pyre-check: max-pypy-ratio=11
-# ubuntu dynasm 2.8x, cranelift 9.8x; floor 2.75x.
+# pyre-check: max-pypy-ratio=6.5
 # Successful bridge closure and a pre-trace Decline are not aborts in
 # `MetaInterp._interpret`. Charging both to pyre's local abort ceiling held this
 # fixture at 29 bridges / 3600 guard failures; the corrected lifecycle reaches
 # 48 / 7378. The PyPy oracle compiles still more (65 bridges) with forcings=0,
 # virtualizables forced=0 and nvirtuals=721, so the higher count is coverage,
-# not a regression to suppress. The recovery target is PyPy's
+# not a regression to suppress. Generator-loop tracing
+# (`descend_generatorentry`) records the generator `next` and lets a raised
+# StopIteration go through GUARD_EXCEPTION; that is what moved the ratio off
+# the earlier cranelift band (ubuntu cranelift 9.8x before it). macOS runs
+# read dynasm 3.3x-3.7x and cranelift 4.1x-4.6x; the ubuntu cranelift leg
+# reads 5.6x and 5.9x. 6.5x is the 5.9x maximum times 1.10, rounded up, about
+# 10% headroom; the derived floor is 1.625x.
+# The recovery target is PyPy's
 # zero-forcing per-`MIFrame` recursive-frame/blackhole path, not restoring the
 # abort-ceiling shortcut.
 # Jitcounter decay is 0.96 every 32 minor collections

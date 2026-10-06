@@ -3125,6 +3125,7 @@ fn long_shift_identity_survives_poisoned_nursery() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .env("MAJIT_GC_NURSERY_POISON", "1")
@@ -3174,6 +3175,7 @@ fn positional_call_binds_an_empty_varkeywords_dict() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .output()
             .expect("run isolated varkeywords regression");
