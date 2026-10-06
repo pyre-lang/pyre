@@ -463,6 +463,30 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `dont_look_inside`, so the walk still residualizes at allocation
     // rather than expanding a new fold row.
     ("_orig_unpack", "argument.py unpack"),
+    // `argument.py` `_match_keywords` / `_collect_keyword_args` are
+    // `@jit.look_inside_iff(lambda ... jiton: jiton)`. `look_inside_iff.inner`
+    // does `func = unroll_safe(func)`, so the harvested names are the
+    // originals.
+    (
+        "_orig_match_keywords",
+        "argument.py look_inside_iff unroll_safe(_match_keywords)",
+    ),
+    (
+        "_orig_collect_keyword_args",
+        "argument.py look_inside_iff unroll_safe(_collect_keyword_args)",
+    ),
+    (
+        "_orig_check_not_duplicate_kwargs",
+        "argument.py look_inside_iff unroll_safe(_check_not_duplicate_kwargs)",
+    ),
+    (
+        "_orig_setitem_correct_indirection",
+        "kwargsdict.py look_inside_iff unroll_safe(_setitem_correct_indirection)",
+    ),
+    (
+        "_orig_getitem_correct_indirection",
+        "kwargsdict.py look_inside_iff unroll_safe(_getitem_correct_indirection)",
+    ),
     (
         "_orig__dict_merge_loop",
         "pyopcode.py look_inside_iff unroll_safe(_dict_merge_loop)",

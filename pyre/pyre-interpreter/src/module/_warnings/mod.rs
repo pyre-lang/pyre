@@ -241,12 +241,17 @@ fn setup_context(
             pyre_object::gc_roots::shadow_stack_get(globals_slot),
         )
     } else {
-        let frame = unsafe { &*frame };
-        (
-            unsafe { crate::pycode::w_code_filename_obj(frame.fget_f_code()) },
-            frame.get_last_lineno() as i64,
-            frame.get_w_globals(),
-        )
+        // `get_last_lineno` reads `last_instr`. `InstanceRepr.hook_access_field`
+        // emits `jit_force_virtualizable` at that read. `force_frame` is
+        // `dont_look_inside` and would stay in the graph. The force can
+        // collect, so each read goes back through the anchor.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        crate::executioncontext::jit_force_virtualizable(frame);
+        let lineno = unsafe { (*anchor.live()).get_last_lineno() } as i64;
+        let filename =
+            unsafe { crate::pycode::w_code_filename_obj((*anchor.live()).fget_f_code()) };
+        let globals = unsafe { (*anchor.live()).get_w_globals() };
+        (filename, lineno, globals)
     };
     let pair = pyre_object::gc_roots::pin_roots(&[filename, globals]);
     let filename_slot = pair;

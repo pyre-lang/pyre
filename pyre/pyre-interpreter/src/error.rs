@@ -1868,53 +1868,34 @@ impl PyError {
         Self::new(PyErrorKind::KeyError, msg)
     }
 
-    /// `baseobjspace.py raise_key_error(w_key)` parity — builds
-    /// `KeyError(w_key)` with the key itself (not a stringified copy)
-    /// as args[0], so callers reading `e.args[0]` get back the missing
-    /// key object.  The display message is the key's repr, matching
-    /// what `KeyError.__str__` yields.
+    /// `baseobjspace.py raise_key_error(w_key)` — `KeyError(w_key)`, so
+    /// `e.args[0]` is the key object. `key_error_str` does
+    /// `space.repr(args_w[0])` when the exception is displayed, not when it
+    /// is raised. An eager repr here walks `module_repr_string` → `is_true`
+    /// → `space.index` → `warn_deprecation` → `_warnings.do_warn` →
+    /// `setup_context`, and `setup_context` calls `jit_force_virtualizable`
+    /// (`rvirtualizable.py hook_access_field` on `last_instr`).
+    /// `W_LibObject._get_attr_elidable` is only `dict_w[attr]`
+    /// (`ll_dict_getitem` raises a bare `KeyError`), so this helper must not
+    /// force a virtualizable.
     pub fn key_error_with_key(key: PyObjectRef) -> Self {
-        // Root the caller's key and the fresh exception across the repr,
-        // exception, and args allocations below: they live only in Rust
-        // locals, which the precise collector does not scan, so a collection
-        // inside `py_repr` / `w_exception_new` / `w_list_new` could sweep the
-        // key or the exception before `w_exception_set_args` stamps them.
-        // The key is pinned before `py_repr` because that repr itself
-        // allocates.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let key_slot = pyre_object::gc_roots::shadow_stack_len();
-        let key = pyre_object::gc_roots::pin_root(key);
-        let message = if key.is_null() {
-            Wtf8Buf::from_string("<null>".to_string())
-        } else {
-            unsafe { crate::display::py_repr_wtf8(key) }
-                .unwrap_or_else(|_| Wtf8Buf::from_string("<unrepresentable>".to_string()))
-        };
-        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_exception_new_wtf8(ExcKind::KeyError, &message));
-        // The exception is read back out of its slot at every use: the pin
-        // keeps it alive without keeping it in place, and the allocations
-        // below can relocate it.
-        let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
-        // Reload the key after the repr / exception allocations: the pin
-        // keeps it alive, but a minor collection may have relocated the
-        // young key, leaving the raw local pointing at the old address.
-        let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
-        if !key.is_null() {
-            let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![key]);
-            unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc(), args_list) };
+        if key.is_null() {
+            return Self::new(PyErrorKind::KeyError, "<null>");
         }
-        make_pyerror(
-            PyErrorKind::KeyError,
-            DisplayMessage::Text(message),
-            exc(),
-            true,
-            false,
-            -1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+        // Same lazy shell as `unicode_encode_error`: pin the key across the
+        // exception and args allocations, then `from_exc_object` so
+        // `message_text` runs `key_error_str` at display time.
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(key);
+        fields.push(pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::KeyError,
+        ));
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![fields.get(0)]);
+        fields.push(args_list);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_args(fields.get(1), fields.get(2));
+            Self::from_exc_object(fields.get(1))
+        }
     }
 
     pub fn index_error(msg: impl Into<Wtf8Buf>) -> Self {
@@ -5956,6 +5937,7 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
 /// Each format code keeps the operand kind that
 /// `get_operrcls2.OpErrFmt._compute_value` expects, so conversion is selected
 /// by the code rather than by one common display implementation.
+#[derive(Clone, Copy)]
 pub enum FmtArg<'a> {
     /// `%s`: text copied as-is.
     Text(&'a str),

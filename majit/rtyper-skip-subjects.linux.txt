@@ -7,7 +7,6 @@ direct-skip (never reaches unported_category)	pyre_interpreter::argument::<Impl>
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::finditem_str_named
 direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::dict_update
 direct-skip (never reaches unported_category)	pyre_interpreter::pyopcode::execute_dict_update
-two-phase-annotate-skipped	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-annotate-skipped	baseobjspace::fixedview_impl__spec_c684d1c2f14dd62d
 two-phase-annotate-skipped	error::write_exception_from_parts__spec_Global__d6f1eb33c3bf8ff4
 two-phase-annotate-skipped	eval_loop_jit_portal
@@ -61,8 +60,11 @@ two-phase-annotate-skipped	pyre_interpreter::app_functional::is_published_sorted
 two-phase-annotate-skipped	pyre_interpreter::argument::<Impl>::_combine_wrapped
 two-phase-annotate-skipped	pyre_interpreter::argument::<Impl>::new
 two-phase-annotate-skipped	pyre_interpreter::argument::<Impl>::positional_only
+two-phase-annotate-skipped	pyre_interpreter::argument::_orig_check_not_duplicate_kwargs
+two-phase-annotate-skipped	pyre_interpreter::argument::check_not_duplicate_kwargs
 two-phase-annotate-skipped	pyre_interpreter::argument::combine_starargs_wrapped
 two-phase-annotate-skipped	pyre_interpreter::argument::combine_starstarargs_wrapped
+two-phase-annotate-skipped	pyre_interpreter::argument::type_error_oefmt
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::<Impl>::into_bytes
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::<Impl>::release
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::_descr_contains_unroll_safe

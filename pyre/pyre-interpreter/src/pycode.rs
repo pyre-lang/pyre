@@ -545,6 +545,17 @@ pub const _immutable_fields_CodeObject: &str =
 #[allow(non_upper_case_globals, dead_code)]
 pub const _alloc_flavor_CodeObject: &str = "raw";
 
+/// `signature.py` `class Signature`: `_immutable_ = True` and
+/// `_immutable_fields_ = ["argnames[*]"]`. The harvester keys this const's
+/// bare leaf `Signature`, which is the field read's `owner_root` for
+/// `gateway::Signature`. The scalar slots are fixed at `Signature::new` too,
+/// so a promoted signature folds `num_argnames` / `find_w_argname` the same
+/// way `argnames[i]` does.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _immutable_fields_Signature: &str =
+    "argnames[*],varargname,kwargname,posonlyargcount,kwonlyargcount";
+
 /// Python code object wrapper.
 ///
 /// Stores a raw pointer to the bytecode `CodeObject`. A top-level body is
