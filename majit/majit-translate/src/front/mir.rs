@@ -44025,6 +44025,10 @@ fn gc_root_pin_path(name: &str) -> bool {
 /// from the dropped value's own resolved path, so nothing below names one.
 const ROOT_SCOPE_MODULE: &str = "gc_roots";
 const ROOT_SCOPE_TYPE: &str = "RootScope";
+/// The set constructor that opens a `RootScope` and returns it inside the
+/// value (`gc_roots.rs` `RootedItems::new`).  An importing artefact sees
+/// that constructor as opaque; the type name is what names the bracket.
+const ROOTED_ITEMS_TYPE: &str = "RootedItems";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
 /// that takes the guard by reference.
 pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
@@ -44033,6 +44037,13 @@ pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
 fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
+}
+
+/// True for the set that holds a `RootScope` and answers as that bracket's
+/// guard (`RootedItems`).
+fn gc_rooted_items_type_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&ROOTED_ITEMS_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
@@ -46137,9 +46148,11 @@ impl<'a> RootStackAnalyzer<'a> {
                     &|reg| regular_call_name_path(reg, self.llbc),
                     &|reg| self.call_returns_owned_scope(reg),
                 ),
-                None => fd
-                    .returns_owned_scope
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                None => {
+                    fd.returns_owned_scope
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        || opaque_rooted_items_constructor(fd, self.llbc)
+                }
             },
             None => false,
         };
@@ -46580,6 +46593,18 @@ fn owned_root_scopes(
         opener.remove(&dest);
     }
     OwnedRootScopes { opener }
+}
+
+/// An imported `RootedItems` constructor: no body in this artefact, but the
+/// return type is the set that holds the guard.  `new` and `Default::default`
+/// (`gc_roots.rs` `RootedItems`) are the only leaves that open one.
+fn opaque_rooted_items_constructor(fd: &FunDecl, llbc: &Llbc) -> bool {
+    let path = fd.item_meta.name_path();
+    let leaf = path.rsplit("::").next().unwrap_or("");
+    matches!(leaf, "new" | "default")
+        && output_adt_def_id_free(&fd.signature.output, llbc)
+            .and_then(|id| llbc.type_by_id(id))
+            .is_some_and(|t| gc_rooted_items_type_path(&t.item_meta.name_path()))
 }
 
 /// Whether `body` opens a bracket and hands its guard back inside the value
@@ -94147,6 +94172,92 @@ mod tests {
             plan.scopes.contains(2),
             "a bracket around a callee that touches no slot is erased"
         );
+    }
+
+    #[test]
+    fn opaque_rooted_items_constructor_opens_the_scope() {
+        use majit_charon_reader::ullbc::RegularCall;
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let opaque = |def_id: u64, path: &[&str], output: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                    "span": span,
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": false
+                },
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": output
+                },
+                "body": "Opaque"
+            })
+        };
+        let rooted = adt_node(0);
+        let other = adt_node(1);
+        let llbc = llbc_with_types(
+            "pyre_object",
+            vec![
+                code_struct(0, &["pyre_object", "gc_roots", "RootedItems"]),
+                code_struct(1, &["pyre_object", "other", "NotItems"]),
+            ],
+            vec![
+                opaque(
+                    0,
+                    &["pyre_object", "gc_roots", "RootedItems", "new"],
+                    rooted.clone(),
+                ),
+                opaque(
+                    1,
+                    &["pyre_object", "gc_roots", "RootedItems", "default"],
+                    rooted.clone(),
+                ),
+                opaque(
+                    2,
+                    &["pyre_object", "gc_roots", "RootedItems", "len"],
+                    rooted,
+                ),
+                opaque(3, &["pyre_object", "gc_roots", "RootedItems", "new"], other),
+            ],
+        );
+        let is_ctor = |id: u64| {
+            super::opaque_rooted_items_constructor(llbc.fn_by_id(id).expect("fun"), &llbc)
+        };
+        assert!(
+            is_ctor(0),
+            "imported RootedItems::new with output gc_roots::RootedItems opens a scope"
+        );
+        assert!(
+            is_ctor(1),
+            "imported RootedItems::default with output gc_roots::RootedItems opens a scope"
+        );
+        assert!(
+            !is_ctor(2),
+            "a non-new/default RootedItems leaf is not a scope constructor"
+        );
+        assert!(
+            !is_ctor(3),
+            "RootedItems::new with another output type is not a scope constructor"
+        );
+
+        let state = super::RootStackState::new(&llbc);
+        let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+        let direct = |id: u64| -> RegularCall {
+            serde_json::from_value(serde_json::json!({"kind": {"Fun": id}, "generics": null}))
+                .expect("fixture call parses")
+        };
+        assert!(
+            analyzer.call_returns_owned_scope(&direct(0)),
+            "an opaque RootedItems::new FunDecl is a scope constructor at the call site"
+        );
+        assert!(analyzer.call_returns_owned_scope(&direct(1)));
+        assert!(!analyzer.call_returns_owned_scope(&direct(2)));
+        assert!(!analyzer.call_returns_owned_scope(&direct(3)));
     }
 
     #[test]

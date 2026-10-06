@@ -720,21 +720,10 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 );
 
 /// The name of the canonical `math` builtin `callable` is, or `None` for any
-/// other value.  Only `frexp` keeps a walker fold, so it is the one name
-/// answered; a value rebound under it carries a different builtin code and
-/// answers `None`.
-pub fn math_builtin_name(callable: PyObjectRef) -> Option<&'static str> {
-    unsafe {
-        if callable.is_null() || !pyre_interpreter::is_function(callable) {
-            return None;
-        }
-        let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
-        let is_frexp = !code.is_null()
-            && pyre_interpreter::gateway::is_builtin_code(code)
-            && pyre_interpreter::gateway::builtin_code_get(code) as usize
-                == frexp as *const () as usize;
-        is_frexp.then_some("frexp")
-    }
+/// other value.  Math builtins are walked through their `__majit_wrap_math_*`
+/// gateways, so no walker fold keys off this hook.
+pub fn math_builtin_name(_callable: PyObjectRef) -> Option<&'static str> {
+    None
 }
 
 /// `ldexp` off its exact arm: a zero, subnormal or non-finite `x`, an
@@ -2116,10 +2105,17 @@ pub fn frexp(args: &[PyObjectRef]) -> PyResult {
     Ok(w_tuple_new(fields.take()))
 }
 
-/// Discovery root for the frexp boxing leaves. The installed builtin stays
-/// [`frexp`]; this wrapper is seeded with the other math gateways so
-/// `_float_frexp_mantissa` and `_int_frexp_exponent` are jitcodes. A traced
-/// pair would root the mantissa box across the exponent box.
+/// Arity / keyword / domain residual of `frexp`.
+#[majit_macros::dont_look_inside]
+fn frexp_slow(args: &[PyObjectRef]) -> PyResult {
+    pyre_interpreter::gateway::check_declared_positional_arity("frexp", 1, args)?;
+    frexp(args)
+}
+
+/// interp_math.py `frexp`: `mant, expo = math1_w(space, math.frexp, w_x)` then
+/// `space.newtuple2(space.newfloat(mant), space.newint(expo))`.  ll_math.py
+/// `ll_math_frexp` first-arm specials (`not isfinite or x == 0`) box `(x, 0)`;
+/// a normal finite uses the boxing leaves.  Subnormals stay in `frexp`.
 pub fn __majit_wrap_math_frexp(args: &[PyObjectRef]) -> PyResult {
     if args.len() == 1 {
         let w_x = args[0];
@@ -2135,20 +2131,25 @@ pub fn __majit_wrap_math_frexp(args: &[PyObjectRef]) -> PyResult {
             } else {
                 None
             };
-        if let Some(x) = x
-            && x.is_finite()
-            && x != 0.0
-            && x.abs().is_normal()
-        {
-            let mut mantissa = _float_frexp_mantissa(x)?;
-            let exponent = pyre_object::with_roots!(mantissa => _int_frexp_exponent(x))?;
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(mantissa);
-            fields.push(exponent);
-            return Ok(w_tuple_new(fields.take()));
+        if let Some(x) = x {
+            if !x.is_finite() || x == 0.0 {
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(floatobject::w_float_new(x));
+                fields.push(w_int_new(0));
+                return Ok(wraptuple2(fields.get(0), fields.get(1)));
+            }
+            // Smallest positive normal: a subnormal's exponent field is 0,
+            // and the boxing leaves assume a normal. `is_normal` does not
+            // lower; `ldexp`'s gateway pins the same bound.
+            if x >= f64::MIN_POSITIVE || x <= -f64::MIN_POSITIVE {
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(_float_frexp_mantissa(x)?);
+                fields.push(_int_frexp_exponent(x)?);
+                return Ok(wraptuple2(fields.get(0), fields.get(1)));
+            }
         }
     }
-    frexp(args)
+    frexp_slow(args)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(
