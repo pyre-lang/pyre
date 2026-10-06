@@ -3552,9 +3552,10 @@ pub fn __majit_wrap_descr_typecheck_fget_f_back(
     Ok(if back.is_null() {
         pyre_object::w_none()
     } else {
-        // Exposing the frame to app level: mark escaped so the JIT
-        // materialises it (pyframe.py mark_as_escaped), mirroring `_getframe`.
-        unsafe { (*back).mark_as_escaped() };
+        // pyframe.py `fget_f_back` → `get_f_back`: return the next
+        // non-hidden frame.  `mark_as_escaped` is not this getter —
+        // `executioncontext.py leave`, `sys/vm.py getframe`, and
+        // `error.py` / `interp_exceptions.py` traceback frames own it.
         back as pyre_object::PyObjectRef
     })
 }

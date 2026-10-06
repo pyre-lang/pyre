@@ -1621,6 +1621,166 @@ fn portal_may_force_records_the_callee_execution_context() {
     let _ = (recorded, frame);
 }
 
+/// `record_walker_loop_callee_portal_call` keeps the callee vref live across
+/// `GUARD_NOT_FORCED` (`opimpl_jit_merge_point` / `do_recursive_call(
+/// assembler_call=True)`). A snapshot abort after that guard still runs
+/// `execute_frame`'s `finally: executioncontext.leave(...)`.
+#[test]
+fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
+    use crate::state::PyreSym;
+    use pyre_interpreter::compile_exec;
+
+    extern "C" fn portal_runner_stub() -> i64 {
+        0
+    }
+
+    let pair = crate::state::ensure_trace_test_driver();
+    {
+        let meta = pair.0.meta_interp_mut();
+        let wired = meta.staticdata.jitdrivers_sd.iter().any(|jd| {
+            jd.num_greens() > 0 && jd.portal_runner_adr != 0 && jd.portal_calldescr.is_some()
+        });
+        if !wired {
+            let mut jd = majit_metainterp::JitDriverStaticData::new(
+                vec![("pycode", Type::Ref)],
+                vec![("frame", Type::Ref), ("ec", Type::Ref)],
+            );
+            jd.portal_runner_adr = portal_runner_stub as *const () as i64;
+            meta.register_jitdriver_sd(jd);
+            meta.finish_setup_descrs_for_jitdrivers();
+        }
+    }
+
+    let raw_code = compile_exec("None").expect("test code should compile");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame;
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    assert!(
+        !ec.is_null(),
+        "PyFrame::new installs the thread ExecutionContext"
+    );
+    unsafe {
+        (*ec).enter(frame_ptr);
+    }
+    let caller_top = unsafe { (*frame_ptr).f_backref };
+    assert_eq!(
+        unsafe { (*ec).topframeref },
+        frame_ptr,
+        "the assembler leg starts with the callee as topframeref"
+    );
+
+    // GuardFalse (activation charge) resolves a `-live-` at pc 0; GuardNotForced
+    // is `after_residual_call` and has no trailing `-live-`, so its snapshot
+    // aborts after the guard is recorded.
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("loop_callee_guard_not_forced_leave");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![crate::state::op_live(), 0, 0],
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = 1;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0)];
+    pyjit.metadata.resume_marker_marker_by_jit_pc = vec![(0, Some(0))];
+    let installed =
+        crate::state::install_jitcode_for(frame_ptr as *const (), std::sync::Arc::new(pyjit))
+            as *const crate::state::JitCode;
+
+    let jitcode_index = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let callee_frame = OpRef::input_arg_ref(0);
+    let callee_ec = OpRef::input_arg_ref(1);
+    tc.set_opref_concrete(
+        callee_frame,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
+    );
+    tc.set_opref_concrete(
+        callee_ec,
+        majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)),
+    );
+
+    let mut snapshot_sym = PyreSym::new_uninit(callee_frame);
+    snapshot_sym.jitcode = installed;
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let r0 = tc.const_ref(1);
+    let i0 = tc.const_int(0);
+    let f0 = tc.const_float(0);
+    let regs_r = vec![r0, r0, r0, r0];
+    let regs_i = vec![i0, i0, i0, i0];
+    let regs_f = vec![f0, f0, f0, f0];
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    // Inline route: `emit_walker_loop_callee_call_assembler` always
+    // passes `Some((dst_bank, dst))`. `dst = None` is the bridge-resume
+    // route (`leave_callee_ec = false`) and declines before any op when
+    // the paused callers cannot take the result.
+    let recorded = super::inline_call::record_walker_loop_callee_portal_call(
+        &mut wc,
+        0,
+        Some(('r', 0)),
+        callee_frame,
+        callee_ec,
+        None,
+        0,
+        std::ptr::null(),
+        false,
+        true,
+        None,
+    );
+    assert!(
+        wc.trace_ctx
+            .ops()
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced),
+        "the abort must be the GUARD_NOT_FORCED snapshot, after the activation charge"
+    );
+    assert_eq!(
+        recorded.err(),
+        Some(DispatchError::GuardResumeCoordinateUnavailable { pc: 0 }),
+        "after_residual_call capture has no trailing -live- on this fixture"
+    );
+    assert_eq!(
+        unsafe { (*ec).topframeref },
+        caller_top,
+        "execute_frame finally restores topframeref when the snapshot aborts"
+    );
+    let _ = (frame, snapshot_sym);
+}
+
 /// The globals guard reads a frame's namespace override with a plain
 /// `GETFIELD_GC_R` on the live `debugdata` box, so the descr it uses has to
 /// name `FrameDebugData.w_globals` and has to stay mutable: `pyframe.py
