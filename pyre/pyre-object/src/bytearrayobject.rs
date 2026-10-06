@@ -376,7 +376,10 @@ pub unsafe fn w_bytearray_reinit_empty(obj: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_advance_logical_start(obj: PyObjectRef, amount: usize) {
-    unsafe { (*(obj as *mut W_BytearrayObject)).logical_offset += amount }
+    unsafe {
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        ba.logical_offset += amount;
+    }
 }
 
 /// # Safety
@@ -472,7 +475,7 @@ pub unsafe fn w_bytearray_data(obj: PyObjectRef) -> &'static [u8] {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
     unsafe {
-        let ba = &*(obj as *const W_BytearrayObject);
+        let ba = &mut *(obj as *mut W_BytearrayObject);
         &mut *ba.data
     }
 }
@@ -488,7 +491,7 @@ pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     unsafe {
-        let ba = &*(obj as *const W_BytearrayObject);
+        let ba = &mut *(obj as *mut W_BytearrayObject);
         &mut *ba.data
     }
 }
