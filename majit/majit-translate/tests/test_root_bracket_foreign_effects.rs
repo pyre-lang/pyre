@@ -142,8 +142,16 @@ fn a_bodyless_rooted_items_new_returns_the_scope_its_defining_crate_published() 
     let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
     let owning = harvest_scope_owning_identities(&object);
     assert!(
-        owning.iter().any(|p| p.contains("RootedItems")),
+        owning
+            .iter()
+            .any(|p| p.contains("RootedItems") && p.contains("::new")),
         "RootedItems::new opens push_roots and returns that guard: {owning:?}"
+    );
+    assert!(
+        owning
+            .iter()
+            .any(|p| p.contains("RootedItems") && p.contains("::default")),
+        "RootedItems::default forwards new and returns that guard: {owning:?}"
     );
     assert!(
         owning.iter().any(|p| p.contains("DictOperationGuard")),

@@ -48523,6 +48523,10 @@ fn gc_identity_hash_path(name: &str) -> bool {
 /// from the dropped value's own resolved path, so nothing below names one.
 const ROOT_SCOPE_MODULE: &str = "gc_roots";
 const ROOT_SCOPE_TYPE: &str = "RootScope";
+/// The set constructor that opens a `RootScope` and returns it inside the
+/// value (`gc_roots.rs` `RootedItems::new`).  An importing artefact sees
+/// that constructor as opaque; the type name is what names the bracket.
+const ROOTED_ITEMS_TYPE: &str = "RootedItems";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
 /// that takes the guard by reference.
 pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
@@ -48531,6 +48535,13 @@ pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
 fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
+}
+
+/// True for the set that holds a `RootScope` and answers as that bracket's
+/// guard (`RootedItems`).
+fn gc_rooted_items_type_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&ROOTED_ITEMS_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
@@ -51123,9 +51134,11 @@ fn owned_root_scopes(
 }
 
 /// Whether `body` opens a bracket and hands its guard back inside the value
-/// it returns: the guard, through any plain moves, enters an aggregate that
-/// becomes `_0`, directly or through one moved local.  Such a constructor's pins belong to
-/// the bracket its caller now holds.
+/// it returns: the guard, through any plain moves, is `_0` itself or enters
+/// an aggregate that becomes `_0`, directly or through one moved local.
+/// `RootedItems::new` is the aggregate case; `Default::default` forwards
+/// that constructor's result.  Such a constructor's pins belong to the
+/// bracket its caller now holds.
 fn body_returns_owned_scope(
     llbc: &Llbc,
     body: &Unstructured,
@@ -51207,7 +51220,10 @@ fn body_returns_owned_scope(
             }
         }
     }
-    holders.contains(0) || holders.iter().any(|h| moved_into_result.contains(h))
+    holders.contains(0)
+        || holders.iter().any(|h| moved_into_result.contains(h))
+        || guards.contains(0)
+        || guards.iter().any(|g| moved_into_result.contains(g))
 }
 
 impl OwnedRootScopes {
