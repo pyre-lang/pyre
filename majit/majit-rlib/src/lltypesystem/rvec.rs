@@ -324,7 +324,12 @@ pub fn ll_vec_newlist_hint_i(lengthhint: usize) -> Vec<usize> {
 /// until the caller writes it, and `length` is already the list length.
 #[majit_macros::oopspec("newlist(length)")]
 pub fn ll_vec_newlist_i(length: usize) -> Vec<usize> {
-    vec![0; length]
+    let mut l = Vec::with_capacity(length);
+    unsafe {
+        l.set_len(length);
+    }
+    ll_vec_arrayclear_i(&mut l, length);
+    l
 }
 
 /// `rlist.py _ll_zero_or_null` for a word item.
@@ -662,7 +667,12 @@ pub fn ll_vec_newemptylist_r() -> Vec<*mut u8> {
 /// until the caller writes it, and `length` is already the list length.
 #[majit_macros::oopspec("newlist(length)")]
 pub fn ll_vec_newlist_r(length: usize) -> Vec<*mut u8> {
-    vec![std::ptr::null_mut(); length]
+    let mut l = Vec::with_capacity(length);
+    unsafe {
+        l.set_len(length);
+    }
+    ll_vec_arrayclear_r(&mut l, length);
+    l
 }
 
 /// `rlist.py _ll_zero_or_null` for a pointer item.
@@ -1043,7 +1053,12 @@ pub fn ll_vec_newemptylist_f() -> Vec<f64> {
 /// until the caller writes it, and `length` is already the list length.
 #[majit_macros::oopspec("newlist(length)")]
 pub fn ll_vec_newlist_f(length: usize) -> Vec<f64> {
-    vec![0.0; length]
+    let mut l = Vec::with_capacity(length);
+    unsafe {
+        l.set_len(length);
+    }
+    ll_vec_arrayclear_f(&mut l, length);
+    l
 }
 
 /// `rlist.py _ll_zero_or_null`: `not` of the widened number.
