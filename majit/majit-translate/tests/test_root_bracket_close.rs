@@ -860,6 +860,40 @@ fn shadow_stack_erase_census() {
     }
 }
 
+/// Nested exclusive RootScopes in `zip_two_tuple_next` close before they
+/// merge with a sibling that never opened them. Closing must drop that
+/// set's pin-count key; leftover keys refuse the rewrite and leave a
+/// residual unpublished `push_roots` that declines `zip_two_tuple_iters`.
+#[test]
+fn zip_two_tuple_next_erases_the_nested_root_brackets() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let context = LowerContext::new(&interpreter);
+    let graph = lower_fun(&interpreter, &context, "zip_two_tuple_next");
+    for leaf in [
+        "push_roots",
+        "pin_root",
+        "pin_roots",
+        "shadow_stack_len",
+        "shadow_stack_get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "zip_two_tuple_next still calls {leaf} after nested-scope erasure"
+        );
+    }
+}
+
 /// `slice_unpack` pins with free `pin_root` onto a `shadow_stack_len` base.
 /// Scalar replacement refuses it (`calls-stack-sensitive-fn`: `__index__`),
 /// and [`RootBracketPlan`] erases the bracket, including the len call.
