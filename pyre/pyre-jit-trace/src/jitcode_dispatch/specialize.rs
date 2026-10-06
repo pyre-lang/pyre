@@ -6724,13 +6724,13 @@ const TUPLE_GETITEM_DESCENT: HelperDescent = HelperDescent {
 
 /// An operator's descent: which body to enter and how the trace names the
 /// site.
-struct HelperDescent {
+pub(crate) struct HelperDescent {
     /// Canonical path of the operator's own body -- `descroperation::pos`,
     /// `opcode_ops::binary_value_from_tag` -- not a split of it.
-    path: &'static str,
-    commit_label: &'static str,
-    call_site_label: &'static str,
-    decline_tag: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) commit_label: &'static str,
+    pub(crate) call_site_label: &'static str,
+    pub(crate) decline_tag: &'static str,
 }
 
 /// `argument.py` `_match_signature` `space.newdict(kwargs=True)` —
@@ -8046,16 +8046,16 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
 
 /// Jitcode, body, portal sym, and nested resume entry for one descent.
 /// Resolved before any guard so a decline leaves the trace untouched.
-struct OrthodoxDescentPrep<Sym: WalkSym> {
-    body: SubJitCodeBody,
-    sym_ptr: *const Sym,
-    nested: HelperEntry,
+pub(crate) struct OrthodoxDescentPrep<Sym: WalkSym> {
+    pub(crate) body: SubJitCodeBody,
+    pub(crate) sym_ptr: *const Sym,
+    pub(crate) nested: HelperEntry,
 }
 
 /// Resolve every decline before recording anything. Each decline names
 /// itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1 fired=0` census
 /// line can be attributed without a rebuild.
-fn prepare_orthodox_descent<Sym: WalkSym>(
+pub(crate) fn prepare_orthodox_descent<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     descent: &HelperDescent,
@@ -16269,7 +16269,7 @@ fn loop_header_guard_resume_marker(
 /// the full-body coordinate from a callee `op_pc` restored the wrong frame
 /// image after an overflow guard failed in `step` of `a, b = step(a, b)`.
 #[allow(clippy::too_many_arguments)]
-fn run_orthodox_helper_subwalk<Sym: WalkSym>(
+pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     sym: &Sym,

@@ -1015,8 +1015,12 @@ unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     };
 }
 
-/// Custom trace for `W_BytearrayObject`. `data` is a GC-managed leaf
-/// `Vec<u8>` storage box (off-GC storage).
+/// Custom trace for `W_BytearrayObject`.
+///
+/// `W_BytearrayObject` holds `_data` (the char list, `data`) and `_offset`
+/// (`logical_offset`, an integer). The GC edges are `w_class` and the
+/// GC-managed leaf `Vec<u8>` storage box behind `data`. The `Vec` bytes
+/// themselves sit off the GC heap.
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
     f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -6406,16 +6410,18 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
             });
             trim_forced_pyframe_stack(root.frame());
         };
-        // Force the traced frame only when the frame handed to Python belongs
-        // to the traced virtualizable — either it IS the virtualizable, or it
-        // is the concrete frame an inline sub-walk published and therefore
-        // runs under it. Clearing TOKEN_TRACING_RESCALL is what
+        // Force the traced virtualizable only when the frame handed to Python
+        // IS that virtualizable.  `flush_active_frame_escape` reports that.
+        // `virtualizable.py force_virtualizable_if_necessary` decides from the
+        // object's own `vable_token`, and a published inline frame keeps 0, so
+        // it is not this clear.  Clearing `TOKEN_TRACING_RESCALL` is what
         // `tracing_after_residual_call` reads as "the callee forced the
-        // virtualizable", raising `VableEscapedDuringResidualCall` so the walk
-        // resumes forward.  Any other frame a residual callee inspects is not
-        // the traced shadow; clearing the token there raises a spurious escape
-        // with no committed resume pc, so the walk replays from entry —
-        // double-applying the residual's non-journaled body effects.
+        // virtualizable", and `pyjitpl.py vable_after_residual_call` then
+        // raises `SwitchToBlackhole(ABORT_ESCAPE)`.  A forced virtualref does
+        // not: `vrefs_after_residual_call` stops tracking that one vref.
+        // Clearing the portal token for any other frame raises a spurious
+        // escape with no committed resume pc, so the walk replays from entry
+        // and double-applies the residual's non-journaled body effects.
         if traced_frame_escaped && let Some(ptr) = tracing_frame {
             // Step-0 attribution probe: this clear of the PORTAL's token is
             // what the post-residual probe reads as an escape and turns into
@@ -7876,7 +7882,9 @@ fn drive_portal_metatrace(
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
-    if driver.meta_interp_mut().is_tracing() {
+    // `is_tracing` misses the recorder `with_trace_ctx_and_framestack` parked
+    // in `compile_tracing`. `compile_and_run_once` is not re-entrant.
+    if driver.meta_interp_mut().trace_attempt_in_progress() {
         return None;
     }
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
@@ -8202,7 +8210,9 @@ fn genentry_merge_point_jit(
     }
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        // Parked recorder (`compile_tracing`) still belongs to the caller.
+        // `compile_and_run_once` / `force_start_tracing` must not re-enter.
+        driver.meta_interp().trace_attempt_in_progress()
     };
     if tracing {
         return None;
@@ -8310,11 +8320,11 @@ fn drive_generatorentry_trace(
 
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        driver.meta_interp().trace_attempt_in_progress()
     };
     if tracing {
         if dbg {
-            eprintln!("[jd2] bail: meta.is_tracing()");
+            eprintln!("[jd2] bail: meta.trace_attempt_in_progress()");
         }
         return None;
     }
@@ -8899,11 +8909,11 @@ fn drive_unpack_iterable_trace(
 
     let (driver, _) = driver_pair();
     let meta = driver.meta_interp_mut();
-    // The shared `MetaInterp.tracing` slot holds exactly one ctx; never nest a
-    // jd1 trace inside an active (jd0 or jd1) session.
-    if meta.is_tracing() {
+    // The shared `MetaInterp` holds exactly one attempt. `is_tracing` misses
+    // the recorder while `with_trace_ctx_and_framestack` parks it.
+    if meta.trace_attempt_in_progress() {
         if dbg {
-            eprintln!("[jd1] bail: meta.is_tracing()");
+            eprintln!("[jd1] bail: meta.trace_attempt_in_progress()");
         }
         return;
     }
@@ -10495,7 +10505,9 @@ fn generatorentry_ll_portal_runner(
     // A trace already in progress belongs to the caller.
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        // A parked attempt still belongs to the caller (`compile_and_run_once`
+        // is not re-entrant). `is_tracing` is false for that window.
+        driver.meta_interp().trace_attempt_in_progress()
     };
     // The portal's reds and green stay live across `maybe_compile_and_run`,
     // which can trace, compile or run the loop.
@@ -13005,7 +13017,14 @@ fn bound_reached(
     // object. Read it once here too: the decision below and the run further
     // down used to walk the cell chain separately for the same answer.
     let procedure_token = driver.runnable_procedure_token(green_key);
-    if procedure_token.is_none() && !driver.is_tracing() {
+    // `maybe_compile_and_run` only skips this cell's `JC_TRACING`. A different
+    // cell reaches here and, upstream, `bound_reached` builds a fresh
+    // `MetaInterp` for `compile_and_run_once` (`profiler.start_tracing`).
+    // This process shares one. `is_tracing` is false while
+    // `with_trace_ctx_and_framestack` parks the recorder, so decline on
+    // `trace_attempt_in_progress` instead of opening a second scope. A
+    // procedure token still runs (`EnterJitAssembler`).
+    if procedure_token.is_none() && !driver.trace_attempt_in_progress() {
         return compile_and_run_once(
             frame_root.frame(),
             green_key,
@@ -13394,7 +13413,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         );
     }
 
-    if driver.is_tracing() {
+    // Same shared-MetaInterp decline as `bound_reached`. The `RunCompiled`
+    // arm above already returned, so this only skips `compile_and_run_once`.
+    if driver.trace_attempt_in_progress() {
         return None;
     }
 

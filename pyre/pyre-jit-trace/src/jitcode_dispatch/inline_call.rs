@@ -239,6 +239,19 @@ fn refresh_varkw_concretes(extras: &mut [VarkwExtra], slots: &[Option<usize>]) {
             *obj = pyre_object::gc_roots::shadow_stack_get(slot);
         }
     }
+    // The name's slot is on the extra. A collection rewrites that slot in
+    // place; the `Vec` copy is not a root.
+    for extra in extras {
+        if let Some(name_slot) = extra.name_slot {
+            extra.name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+        }
+    }
+}
+
+fn refresh_star_kw_names(kw: &mut StarKwargsInline, slots: &[usize]) {
+    for (entry, &slot) in kw.bound.iter_mut().zip(slots) {
+        entry.1 = pyre_object::gc_roots::shadow_stack_get(slot);
+    }
 }
 
 /// Publish `obj` on `roots` and point `slots[index]` at that word. A later
@@ -3098,12 +3111,16 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let _assembler_code_roots = pyre_object::gc_roots::push_roots();
     let assembler_code_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
-    let empty_vararg = if has_varargs {
+    // The empty tuple is rooted in this bracket until `const_ref` interns
+    // it. Movability is the backend's concern (`Rewrite.remove_constptr`).
+    let empty_vararg_slot = if has_varargs {
         let concrete = pyre_object::w_tuple_new_array_backed(Vec::new());
-        if concrete.is_null() || majit_gc::can_move(majit_ir::GcRef(concrete as usize)) {
+        if concrete.is_null() {
             return Ok(None);
         }
-        Some(concrete)
+        let empty_vararg_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(concrete);
+        Some(empty_vararg_slot)
     } else {
         None
     };
@@ -3215,7 +3232,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             param_boxes.push(value_op);
         }
     }
-    if let Some(concrete) = empty_vararg {
+    if let Some(slot) = empty_vararg_slot {
+        let concrete = pyre_object::gc_roots::shadow_stack_get(slot);
         param_boxes.push(ctx.trace_ctx.const_ref(concrete as i64));
     }
     if has_varkeywords {
@@ -4038,7 +4056,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
 ///
 /// # Safety
 /// `w_code` must be the live code object pointer for the resolved callable.
-/// Whether every local of `w_code` that a call must bind lives in
+/// Whether every local of `w_code` that a positional call binds lives in
 /// `registers_r[0..co_argcount]`, which is all the inline seeding fills.
 ///
 /// `*args` and `**kwargs` own locals the seeding never packs, and a
@@ -4131,7 +4149,11 @@ fn fbw_callee_kwonly_count(w_code: *const ()) -> Option<usize> {
 /// `**kwargs` mapping because it names no parameter, in call order.
 struct VarkwExtra {
     /// The `kwnames` entry, a `str` constant of the calling code.
+    /// Rooted at [`Self::name_slot`] until `const_ref` interns it.
+    /// Movability is the backend's concern (`Rewrite.remove_constptr`).
     name: pyre_object::PyObjectRef,
+    /// Shadow-stack index of `name` on the argument-root bracket, once pinned.
+    name_slot: Option<usize>,
     value: OpRef,
     concrete: ConcreteValue,
 }
@@ -4677,11 +4699,20 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     let w_code = extract_roots.get(code_slot) as *const ();
     let mut star_kwargs =
         unsafe { fbw_bind_star_kwargs(r_args[3], kwargs_live, w_code, args.len(), nparams) }?;
-    let bound_live: Vec<pyre_object::PyObjectRef> =
-        star_kwargs.bound.iter().map(|entry| entry.2).collect();
+    // Names and values share one `pin_roots`: normalizing the values first
+    // would collect while a name was still only a local. Both words stay on
+    // this holder until they are copied back; the resolved half pins them
+    // again for the `const_ref`. Movability is the backend's concern
+    // (`Rewrite.remove_constptr`).
+    let mut bound_live = Vec::with_capacity(star_kwargs.bound.len().saturating_mul(2));
+    for entry in &star_kwargs.bound {
+        bound_live.push(entry.1);
+        bound_live.push(entry.2);
+    }
     let bound_base = extract_roots.pin_roots(&bound_live);
     for (offset, entry) in star_kwargs.bound.iter_mut().enumerate() {
-        entry.2 = extract_roots.get(bound_base + offset);
+        entry.1 = extract_roots.get(bound_base + offset * 2);
+        entry.2 = extract_roots.get(bound_base + offset * 2 + 1);
     }
     if let Some(base) = extracted_base {
         rehome_extracted_star(&extract_roots, base, &mut concretes, star.as_mut());
@@ -4809,30 +4840,36 @@ unsafe fn fbw_bind_star_kwargs(
     };
     let mut bound = Vec::new();
     let mut value_slots = Vec::new();
+    let mut name_slots = Vec::new();
     for (index, name) in names {
-        // The name is baked into the lookup, so it has to be the canonical
-        // object a collection cannot move.  Parameter names are interned when
-        // the code object is built; one that is not declines rather than
-        // interning a value at trace time.
+        // Parameter names are interned when the code object is built; one
+        // that is not declines rather than interning a value at trace time.
+        // The interned word is rooted here, then on the caller's holder,
+        // until `const_ref` interns it. Movability is the backend's concern
+        // (`Rewrite.remove_constptr`).
         let name_obj = pyre_object::get_interned_wtf8(Wtf8::new(name.as_str()))?;
-        if majit_gc::can_move(majit_ir::GcRef(name_obj as usize)) {
-            return None;
-        }
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let name_obj = roots.pin_root(name_obj);
         let kwargs = roots.get(kwargs_slot);
         if let Some(value) = unsafe { lookup(kwargs, name_obj) } {
-            value_slots.push(pyre_object::gc_roots::shadow_stack_len());
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(value);
+            name_slots.push(name_slot);
+            value_slots.push(value_slot);
             bound.push((index, name_obj, value));
         }
-    }
-    for (entry, slot) in bound.iter_mut().zip(&value_slots) {
-        entry.2 = roots.get(*slot);
     }
     // A key no parameter took is either unknown or names a parameter the
     // positional fill already bound.
     let kwargs = roots.get(kwargs_slot);
     if bound.len() != unsafe { pyre_object::dictmultiobject::w_dict_len(kwargs) } {
         return None;
+    }
+    for (entry, slot) in bound.iter_mut().zip(&value_slots) {
+        entry.2 = roots.get(*slot);
+    }
+    for (entry, slot) in bound.iter_mut().zip(&name_slots) {
+        entry.1 = roots.get(*slot);
     }
     Some(StarKwargsInline {
         dict_op,
@@ -7970,7 +8007,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     mut varkw_extra: Vec<VarkwExtra>,
     // A `f(**mapping)` dict the named parameters are read from; its
     // placeholders in `callee_args` are replaced after the eligibility checks.
-    star_kwargs: Option<StarKwargsInline>,
+    // `mut`: name words are re-read from their shadow slots after each pin.
+    mut star_kwargs: Option<StarKwargsInline>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // Callers read these copies before guards of their own, which append to
     // `opencoder.py Trace._ops` and can minor-collect.  A box that carries its
@@ -8009,12 +8047,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
     }
-    // Argument boxes and surplus keyword values stay reachable across every
-    // allocation this inline records (`wrapint`, the kwargs dict, a default
-    // box). The shadow slots, not the `Vec` copies, are what a collection
-    // forwards.
+    // The callee function, the guard operand's value and the bound method's
+    // halves are read back after the vararg allocation, the callee guards and
+    // the callee sub-walk, each of which can minor-collect. Install the pins
+    // before the argument `pin_roots` below: that publish normalizes, and on
+    // a safepoint the raw copies are not roots.
+    let callable_pin = residual_call::owner_root_if_gc(callable as usize);
+    let live_callable = || pinned_obj(&callable_pin, callable);
+    let guard_value_pin = residual_call::owner_root_if_gc(callable_guard_value as usize);
+    let bound_pins = bound_method.as_ref().map(|bound| {
+        (
+            residual_call::owner_root_if_gc(bound.function as usize),
+            residual_call::owner_root_if_gc(bound.receiver as usize),
+        )
+    });
+    // Argument boxes, surplus keyword values, and interned keyword names stay
+    // reachable across every allocation this inline records (`wrapint`, the
+    // kwargs dict, a default box). The shadow slots, not the `Vec` copies,
+    // are what a collection forwards. A name stays in its slot until
+    // `const_ref` interns it. Movability is the backend's concern
+    // (`Rewrite.remove_constptr`).
     let _arg_roots = pyre_object::gc_roots::push_roots();
     let mut arg_root_slots = Vec::with_capacity(callee_arg_concretes.len());
+    let mut star_kw_name_slots = Vec::new();
     {
         let mut live = Vec::new();
         for concrete in callee_arg_concretes.iter().copied() {
@@ -8027,10 +8082,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 arg_root_slots.push(None);
             }
         }
+        // Names join the same publish as the values. A second `pin_roots`
+        // would normalize the values before the names were on the stack.
+        let name_base_off = live.len();
+        if let Some(kw) = star_kwargs.as_ref() {
+            for entry in &kw.bound {
+                live.push(entry.1);
+            }
+        }
+        let name_count = live.len() - name_base_off;
         let base = _arg_roots.pin_roots(&live);
         for slot in &mut arg_root_slots {
             if let Some(offset) = *slot {
                 *slot = Some(base + offset);
+            }
+        }
+        if name_count > 0 {
+            star_kw_name_slots = (0..name_count).map(|i| base + name_base_off + i).collect();
+            if let Some(kw) = star_kwargs.as_mut() {
+                refresh_star_kw_names(kw, &star_kw_name_slots);
             }
         }
         refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
@@ -8038,7 +8108,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let mut varkw_root_slots = Vec::with_capacity(varkw_extra.len());
     {
         let mut live = Vec::new();
+        let mut name_offsets = Vec::with_capacity(varkw_extra.len());
         for extra in &varkw_extra {
+            name_offsets.push(live.len());
+            live.push(extra.name);
             if let ConcreteValue::Ref(obj) = extra.concrete
                 && !obj.is_null()
             {
@@ -8055,22 +8128,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     *slot = Some(base + offset);
                 }
             }
+            for (extra, offset) in varkw_extra.iter_mut().zip(name_offsets) {
+                extra.name_slot = Some(base + offset);
+            }
             refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
             refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
+            if let Some(kw) = star_kwargs.as_mut() {
+                refresh_star_kw_names(kw, &star_kw_name_slots);
+            }
         }
     }
-    // The callee function, the guard operand's value and the bound method's
-    // halves are read back after the vararg allocation, the callee guards and
-    // the callee sub-walk, each of which can minor-collect.
-    let callable_pin = residual_call::owner_root_if_gc(callable as usize);
-    let live_callable = || pinned_obj(&callable_pin, callable);
-    let guard_value_pin = residual_call::owner_root_if_gc(callable_guard_value as usize);
-    let bound_pins = bound_method.as_ref().map(|bound| {
-        (
-            residual_call::owner_root_if_gc(bound.function as usize),
-            residual_call::owner_root_if_gc(bound.receiver as usize),
-        )
-    });
     let is_being_profiled = live_frame_is_being_profiled(ctx);
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
@@ -8088,8 +8155,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if !positional_only && vararg_slot.is_none() && kwonly_count == 0 && varkw_slot.is_none() {
         return resolved_inline_decline(op.pc, line!());
     }
-    // Each collected keyword is stored under its `kwnames` constant, which the
-    // emit bakes, so it has to be an object a collection cannot move; its
+    // Each collected keyword is stored under its `kwnames` constant. The name
+    // word is rooted in a shadow-stack slot until `const_ref` interns it.
+    // Movability is the backend's concern (`Rewrite.remove_constptr`). The
     // value is read off the live register at the emit.
     if !varkw_extra.is_empty() && varkw_slot.is_none() {
         return resolved_inline_decline(op.pc, line!());
@@ -8098,7 +8166,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let ConcreteValue::Ref(value) = extra.concrete else {
             return resolved_inline_decline(op.pc, line!());
         };
-        if value.is_null() || majit_gc::can_move(majit_ir::GcRef(extra.name as usize)) {
+        if value.is_null() {
             return resolved_inline_decline(op.pc, line!());
         }
     }
@@ -8936,6 +9004,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
     refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
     refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
+    if let Some(kw) = star_kwargs.as_mut() {
+        refresh_star_kw_names(kw, &star_kw_name_slots);
+    }
     if let Some(star) = star_args {
         // `space.fixedview(w_stararg)` -> `w_obj.tolist()`: the class guard
         // re-proves the layout the resolve picked the reads for, and an exact
@@ -9054,14 +9125,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         } else {
             crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const ()
         };
-        for &(index, name, _) in &kw.bound {
-            let value = match arg_root_slots.get(index).copied().flatten() {
+        debug_assert_eq!(star_kw_name_slots.len(), kw.bound.len());
+        for (offset, entry) in kw.bound.iter().enumerate() {
+            let index = entry.0;
+            let value_slot_for_stamp = arg_root_slots.get(index).copied().flatten();
+            let value = match value_slot_for_stamp {
                 Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
                 None => match callee_arg_concretes.get(index).copied() {
                     Some(ConcreteValue::Ref(obj)) if !obj.is_null() => obj,
                     _ => continue,
                 },
             };
+            // The guards above append to the trace and can minor-collect.
+            // The slot, not `entry.1`, is the root that was forwarded.
+            let name = pyre_object::gc_roots::shadow_stack_get(star_kw_name_slots[offset]);
             let name_op = ctx.trace_ctx.const_ref(name as i64);
             let value_op = ctx.trace_ctx.call_ref_typed_with_effect(
                 lookup,
@@ -9069,11 +9146,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 &[Type::Ref, Type::Ref],
                 effect.clone(),
             );
+            // `const_ref` and the lookup append to the trace and can collect.
+            // The value's root is the argument slot, same as before the calls.
+            let value = match value_slot_for_stamp {
+                Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+                None => value,
+            };
             ctx.trace_ctx.set_opref_concrete(
                 value_op,
                 majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
             );
             walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[value_op])?;
+            let value = match value_slot_for_stamp {
+                Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+                None => value,
+            };
             callee_args[index] = value_op;
             callee_arg_concretes[index] = ConcreteValue::Ref(value);
         }
@@ -9619,14 +9706,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         callee_args[vararg_index] = tuple_op;
     }
-
     // `w_kwds = space.newdict(kwargs=True)` and one `space.setitem(w_kwds,
     // ...)` per keyword that named no parameter (`_match_signature`),
     // replacing the placeholder pushed above.
     if varkw_slot.is_some() {
-        // `newdict` / `setitem` allocate. The vararg tuple and the keyword
-        // values are already live objects; pin them before that, then read
-        // the slots the collector rewrites. A raw copy in
+        // `newdict` / `setitem` allocate. The vararg tuple, the keyword
+        // values, and the keyword names are already live objects; pin them
+        // before that, then read the slots the collector rewrites.
+        // `refresh_varkw_concretes` rewrites each name from its capture slot
+        // so this pin publishes the forwarded word. A raw copy in
         // `callee_arg_concretes` would otherwise keep the pre-move address.
         refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
         refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
@@ -16154,7 +16242,11 @@ fn descend_generatorentry<Sym: WalkSym>(
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // `direct_assembler_call` executes the call, then rewrites the recorded
     // op to `CALL_ASSEMBLER`. `jit_next` is that execution for `next(gen)`,
-    // run through the residual executor so the walk's virtualizable heap
+    // the residual this `ForIterNext` descr already names: `StopIteration`
+    // returns null and is not published (`runtime_ops.rs` `jit_next`), so
+    // `raised` stays 0 and the walker continues. The codewriter's trailing
+    // `GuardNonnull` is the loop exit (`pyopcode.py` `FOR_ITER`). Run
+    // through the residual executor so the walk's virtualizable heap
     // pointer is saved and restored around the callee's own portal
     // activation and `tracing_after_residual_call` runs after it (the same
     // route `emit_walker_loop_callee_call_assembler` takes). A raw call
@@ -16219,10 +16311,11 @@ fn descend_generatorentry<Sym: WalkSym>(
     // `GUARD_NOT_FORCED` and `handle_possible_exception`.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[iter_op]);
     if raised != 0 {
-        // A returning generator raises `StopIteration` out of `send_ex`.
-        // The executor already returned that exception word.
-        // `execute_ll_raised(..., constant=False)` then
-        // `handle_possible_exception`: `last_exc_box` is the
+        // `jit_next` publishes only a non-`StopIteration` error. That word
+        // is what the executor returned. `StopIteration` is a null ref on
+        // the `Continue` arm (`pyopcode.py` `FOR_ITER`, trailing
+        // `GuardNonnull`). `execute_ll_raised(..., constant=False)` then
+        // `handle_possible_exception` (`pyjitpl.py`): `last_exc_box` is the
         // `GUARD_EXCEPTION` result.
         let exc_concrete = ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
         ctx.set_last_exc_value_concrete(exc_concrete);
