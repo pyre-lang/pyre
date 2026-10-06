@@ -4879,7 +4879,7 @@ mod tests {
     /// A ref result is a pointer word: register the same word shim an int
     /// result uses, so the table type is the descr FUNC on wasm32.
     #[test]
-    fn non_int_result_calls_register_the_callee_address() {
+    fn non_int_result_calls_publish_the_callee_word() {
         let call = parse_call("helper(1)");
         let mut lowerer =
             lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualRef);

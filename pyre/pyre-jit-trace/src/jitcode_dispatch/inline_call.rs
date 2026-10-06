@@ -3833,17 +3833,19 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     };
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
-    // `execute_frame`'s `finally: ec.leave(...)` after
+    // `execute_frame`'s `finally: executioncontext.leave(...)` after
     // `do_recursive_call(assembler_call=True)` returns (`opimpl_jit_merge_point`).
     // Snapshot first so this GUARD_NOT_FORCED keeps a resume position
     // (`resume.py` `assert resume_position >= 0`). Then leave, before
     // GUARD_NO_EXCEPTION, so a raising assembler call still unwinds
-    // `topframeref`. The self-recursive fold uses the same slot for
-    // `record_ec_leave_frame_chain`.
+    // `topframeref` — including when the snapshot aborts
+    // (`GuardSnapshotVableUntyped`). The self-recursive fold uses the same
+    // slot for `record_ec_leave_frame_chain`.
+    let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope);
     if leave_callee_ec {
         leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
     }
+    snapshot?;
     // Restore before either exception arm leaves the compiled caller.  Put
     // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
     // an emitted call-adjacent operation even when the restore stores fold.
