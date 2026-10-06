@@ -3180,7 +3180,15 @@ pub(crate) struct ParkedTraceAttempt<M: Clone> {
     last_quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     compile_snapshot_refs: Vec<usize>,
     compile_short_preamble_producer: Option<usize>,
+    /// Address of `UnrollOptimizer.target_tokens` for the parked compile.
+    compile_target_tokens: Option<usize>,
     compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
+    /// `ConstPtr` index of the parked compile's virtualizable.
+    compile_vable_index: Option<u32>,
+    /// Concrete virtualizable address for the parked compile.
+    compile_vable_root: GcRef,
+    /// Prepared ops, optimizer context, and emitted ops for the parked compile.
+    compile_live_op_roots: crate::optimizeopt::CompileLiveOpRoots,
     retrace_after_bridge: bool,
     keep_tracing_after_close: bool,
     pending_frontend_boxes: Option<Vec<i64>>,
@@ -3559,6 +3567,147 @@ fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     }
 }
 
+/// Forward one compile's `SnapshotBox.opref` ConstPtr slots in place.
+///
+/// `park_attempt` moves `compile_snapshot_refs` onto `ParkedTraceAttempt`
+/// (`warmstate.py bound_reached` builds a fresh MetaInterp; pyre reuses
+/// one object). Active and parked holders share this body.
+fn walk_compile_snapshot_ref_slots(slots: &[usize], visitor: &mut dyn FnMut(&mut GcRef)) {
+    for &slot_addr in slots {
+        // SAFETY: entries are collected from `SnapshotBox.opref` slots
+        // owned by the in-flight optimizer/OptContext and cleared at every
+        // compile exit. The extra-root walker runs on the same thread while
+        // compilation is paused for GC, mirroring RPython's in-place field
+        // update of `ConstPtr.value`.
+        let r = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
+        // Forward the snapshot slot's inline const gcref in place (an
+        // in-place `ConstPtr.value` update).
+        r.trace_const_ptr(visitor);
+    }
+}
+
+/// Forward the virtualizable anchor published for one compile.
+///
+/// After `compile_tracing` is taken, `initial_inputarg_consts` is no
+/// longer reached by `walk_active_trace_refs`. The index or rooted
+/// address captured for `patch_new_loop_to_load_virtualizable_fields`
+/// still has to move when `NUMBERING` allocation collects.
+/// `park_attempt` moves these onto `ParkedTraceAttempt`
+/// (`warmstate.py bound_reached` builds a fresh MetaInterp; pyre reuses
+/// one object). Active and parked holders share this body.
+fn walk_compile_vable_anchor(
+    compile_vable_index: Option<u32>,
+    compile_vable_root: &mut GcRef,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    if let Some(index) = compile_vable_index {
+        majit_ir::const_ptr_table::trace_index(index, visitor);
+    }
+    if !compile_vable_root.is_null() {
+        visitor(compile_vable_root);
+    }
+}
+
+/// Forward the in-flight `Optimizer.short_preamble_producer` published as
+/// a raw slot address on `compile_short_preamble_producer`.
+fn walk_compile_short_preamble_producer_slot(
+    slot_addr: Option<usize>,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    let Some(slot_addr) = slot_addr else {
+        return;
+    };
+    // SAFETY: UnrollOptimizer publishes the address of the in-flight
+    // `Optimizer.short_preamble_producer` for one compile, and
+    // `CompileSnapshotRootsGuard` clears it before that optimizer is
+    // dropped. Phases run on the same thread as this root walker.
+    let producer = unsafe {
+        &mut *(slot_addr
+            as *mut Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>)
+    };
+    if let Some(builder) = producer.as_mut() {
+        builder.walk_const_ptr_refs_mut(visitor);
+    }
+}
+
+/// Forward each live `ResumeDataLoopMemo` an in-flight optimizer still
+/// owns. Dead `Weak` handles are dropped (`resume.py finish` roots the
+/// pool through the optimizer; pyre copies it per guard).
+fn walk_compile_resume_memos(
+    memos: &mut Vec<crate::resume::LiveResumeMemo>,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    memos.retain(|weak| {
+        let Some(memo) = weak.upgrade() else {
+            return false;
+        };
+        // SAFETY: pyre is single-threaded and this walker runs from the
+        // allocation path, so the only other code that could hold the
+        // `RefCell` is the optimizer frame this walk interrupted. Going
+        // through `as_ptr` rather than `borrow_mut` is what lets the
+        // collector forward a pool the interrupted frame is mid-way
+        // through appending to — the same escape hatch
+        // `SharedConstPool::as_mut_vec_for_gc` exists for.
+        let memo = unsafe { &mut *memo.as_ptr() };
+        memo.walk_const_ptr_refs_mut(visitor);
+        true
+    });
+}
+
+/// pyjitpl.py `MetaInterp.__init__` stores `last_exc_value` as an ordinary
+/// `OBJECTPTR` field (`lltype.nullptr(rclass.OBJECT)`), so RPython's
+/// collector traces it with the MetaInterp object. `handle_possible_exception`
+/// may also keep `last_exc_box = ConstPtr(val)` of that same object.
+/// Pyre parks both onto `ParkedTraceAttempt` for a nested attempt, so the
+/// extra-root walker has to forward the live slots and the parked copies.
+fn walk_raw_gcref_i64(slot: &mut i64, visitor: &mut dyn FnMut(&mut GcRef)) {
+    if *slot != 0 {
+        let mut gcref = GcRef(*slot as usize);
+        visitor(&mut gcref);
+        *slot = gcref.0 as i64;
+    }
+}
+
+fn walk_raw_gcref_ptr(slot: &mut *const u8, visitor: &mut dyn FnMut(&mut GcRef)) {
+    if slot.is_null() {
+        return;
+    }
+    let mut gcref = GcRef(*slot as usize);
+    visitor(&mut gcref);
+    *slot = gcref.0 as *const u8;
+}
+
+fn walk_last_exc_refs(
+    last_exc_value: &mut i64,
+    last_exc_box: &mut Option<OpRef>,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    walk_raw_gcref_i64(last_exc_value, visitor);
+    if let Some(exc_box) = last_exc_box.as_mut() {
+        exc_box.walk_const_ptr_refs_mut(visitor);
+    }
+}
+
+fn walk_pending_abort_blackhole_refs(
+    pending: &mut crate::PendingAbortBlackhole,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    walk_raw_gcref_i64(&mut pending.last_exc_value, visitor);
+    walk_raw_gcref_i64(&mut pending.virtualizable_ptr, visitor);
+    for value in pending.ref_scalar_values.iter_mut() {
+        walk_raw_gcref_i64(value, visitor);
+    }
+    for frame in pending.framestack.frames.iter_mut() {
+        for slot in frame.ref_regs.iter_mut() {
+            // Forward the interned `ConstPtr` table slot; non-Const
+            // positions (ResOp / InputArg refs) carry no inline ref.
+            if let Some(opref) = slot.as_ref() {
+                opref.trace_const_ptr(visitor);
+            }
+        }
+    }
+}
+
 /// Values produced by the collection-capable half of
 /// `pyjitpl.py initialize_virtualizable`, consumed by the TraceCtx-writing
 /// half. Split so a parked recorder in `compile_tracing` is not borrowed
@@ -3616,7 +3765,11 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: std::mem::take(&mut self.last_quasi_immutable_deps),
             compile_snapshot_refs: std::mem::take(&mut self.compile_snapshot_refs),
             compile_short_preamble_producer: self.compile_short_preamble_producer.take(),
+            compile_target_tokens: self.compile_target_tokens.take(),
             compile_resume_memos: std::mem::take(&mut self.compile_resume_memos),
+            compile_vable_index: self.compile_vable_index.take(),
+            compile_vable_root: std::mem::replace(&mut self.compile_vable_root, GcRef::NULL),
+            compile_live_op_roots: std::mem::take(&mut self.compile_live_op_roots),
             retrace_after_bridge: std::mem::take(&mut self.retrace_after_bridge),
             keep_tracing_after_close: std::mem::take(&mut self.keep_tracing_after_close),
             pending_frontend_boxes: self.pending_frontend_boxes.take(),
@@ -3706,7 +3859,11 @@ impl<M: Clone> MetaInterp<M> {
         self.last_quasi_immutable_deps = parked.last_quasi_immutable_deps;
         self.compile_snapshot_refs = parked.compile_snapshot_refs;
         self.compile_short_preamble_producer = parked.compile_short_preamble_producer;
+        self.compile_target_tokens = parked.compile_target_tokens;
         self.compile_resume_memos = parked.compile_resume_memos;
+        self.compile_vable_index = parked.compile_vable_index;
+        self.compile_vable_root = parked.compile_vable_root;
+        self.compile_live_op_roots = parked.compile_live_op_roots;
         self.retrace_after_bridge = parked.retrace_after_bridge;
         self.keep_tracing_after_close = parked.keep_tracing_after_close;
         self.pending_frontend_boxes = parked.pending_frontend_boxes;
@@ -4001,29 +4158,28 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        if let Some(slot_addr) = self.compile_target_tokens {
+        fn walk_compile_target_tokens_slot(
+            slot_addr: Option<usize>,
+            visitor: &mut dyn FnMut(&mut GcRef),
+        ) {
+            let Some(slot_addr) = slot_addr else {
+                return;
+            };
             // SAFETY: compile_loop_body / compile_retrace publish
             // `UnrollOptimizer.target_tokens` for one compile.
             // `PublishedCompileTargetTokens` clears the slot before that
             // vec is dropped. Same thread as this root walker.
+            // `park_attempt` moves the slot onto `ParkedTraceAttempt`
+            // (`warmstate.py bound_reached`).
             let tokens =
                 unsafe { &*(slot_addr as *const Vec<std::sync::Arc<crate::history::TargetToken>>) };
             for tt in tokens {
-                walk_target_token_const_ptrs(tt, &mut visitor);
+                walk_target_token_const_ptrs(tt, visitor);
             }
         }
-        if let Some(slot_addr) = self.compile_short_preamble_producer {
-            // SAFETY: UnrollOptimizer publishes the address of the in-flight
-            // `Optimizer.short_preamble_producer` for one compile, and
-            // `CompileSnapshotRootsGuard` clears it before that optimizer is
-            // dropped. Phases run on the same thread as this root walker.
-            let producer = unsafe {
-                &mut *(slot_addr
-                    as *mut Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>)
-            };
-            if let Some(builder) = producer.as_mut() {
-                builder.walk_const_ptr_refs_mut(&mut visitor);
-            }
+        walk_compile_target_tokens_slot(self.compile_target_tokens, &mut visitor);
+        for parked in &self.parked_attempts {
+            walk_compile_target_tokens_slot(parked.compile_target_tokens, &mut visitor);
         }
         // `resume.py finish` hands each guard `self.memo.consts` itself, so
         // upstream roots the pool through the optimizer that owns it. Pyre
@@ -4035,21 +4191,21 @@ impl<M: Clone> MetaInterp<M> {
         // `self`, which the registered root area derives from its `data`
         // pointer — a foreign collecting thread runs this walk during STW, so
         // it must not read the caller's TLS.
-        self.compile_resume_memos.retain(|weak| {
-            let Some(memo) = weak.upgrade() else {
-                return false;
-            };
-            // SAFETY: pyre is single-threaded and this walker runs from the
-            // allocation path, so the only other code that could hold the
-            // `RefCell` is the optimizer frame this walk interrupted. Going
-            // through `as_ptr` rather than `borrow_mut` is what lets the
-            // collector forward a pool the interrupted frame is mid-way
-            // through appending to — the same escape hatch
-            // `SharedConstPool::as_mut_vec_for_gc` exists for.
-            let memo = unsafe { &mut *memo.as_ptr() };
-            memo.walk_const_ptr_refs_mut(&mut visitor);
-            true
-        });
+        // Nested `compile_and_run_once` parks the outer producer/memos
+        // (`warmstate.py bound_reached`); walk those copies with the same
+        // per-entry bodies as the active fields.
+        walk_compile_short_preamble_producer_slot(
+            self.compile_short_preamble_producer,
+            &mut visitor,
+        );
+        walk_compile_resume_memos(&mut self.compile_resume_memos, &mut visitor);
+        for parked in &mut self.parked_attempts {
+            walk_compile_short_preamble_producer_slot(
+                parked.compile_short_preamble_producer,
+                &mut visitor,
+            );
+            walk_compile_resume_memos(&mut parked.compile_resume_memos, &mut visitor);
+        }
     }
 
     /// Arm the off-GC compiled-graph write barrier around a compile that can
@@ -4399,10 +4555,15 @@ impl<M: Clone> MetaInterp<M> {
 
     fn walk_attempt_trace_refs(
         framestack: &mut MIFrameStack,
+        last_exc_value: &mut i64,
         last_exc_box: &mut Option<OpRef>,
         exc_resume: &mut Option<(OpRef, OpRef)>,
         pending_frontend_boxes: Option<&mut Vec<i64>>,
         pending_frontend_box_types: Option<&[Type]>,
+        forced_virtualizable: &mut i64,
+        pending_vable_ptr: &mut *const u8,
+        single_pass_ref_scalar_values: Option<&mut Vec<i64>>,
+        pending_abort_blackhole: Option<&mut crate::PendingAbortBlackhole>,
         tracing: Option<&mut TraceCtx>,
         visitor: &mut dyn FnMut(&mut GcRef),
     ) {
@@ -4437,9 +4598,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        if let Some(op) = last_exc_box.as_ref() {
-            op.trace_const_ptr(visitor);
-        }
+        walk_last_exc_refs(last_exc_value, last_exc_box, visitor);
         if let Some((op1, op2)) = exc_resume.as_ref() {
             op1.trace_const_ptr(visitor);
             op2.trace_const_ptr(visitor);
@@ -4452,6 +4611,16 @@ impl<M: Clone> MetaInterp<M> {
                     *value = gcref.0 as i64;
                 }
             }
+        }
+        walk_raw_gcref_i64(forced_virtualizable, visitor);
+        walk_raw_gcref_ptr(pending_vable_ptr, visitor);
+        if let Some(values) = single_pass_ref_scalar_values {
+            for value in values.iter_mut() {
+                walk_raw_gcref_i64(value, visitor);
+            }
+        }
+        if let Some(pending) = pending_abort_blackhole {
+            walk_pending_abort_blackhole_refs(pending, visitor);
         }
         if let Some(trace_ctx) = tracing {
             Self::walk_trace_ctx_refs(trace_ctx, framestack, *last_exc_box, *exc_resume, visitor);
@@ -4469,20 +4638,30 @@ impl<M: Clone> MetaInterp<M> {
         );
         {
             let framestack = &mut self.framestack;
+            let last_exc_value = &mut self.last_exc_value;
             let last_exc_box = &mut self.last_exc_box;
             let exc_resume = &mut self.exc_resume;
             let pending_frontend_boxes = self.pending_frontend_boxes.as_mut();
             let pending_frontend_box_types = self.pending_frontend_box_types.as_deref();
+            let forced_virtualizable = &mut self.forced_virtualizable;
+            let pending_vable_ptr = &mut self.pending_vable_ptr;
+            let single_pass_ref_scalar_values = self.single_pass_ref_scalar_values.as_mut();
+            let pending_abort_blackhole = self.pending_abort_blackhole.as_mut();
             let tracing = self
                 .tracing
                 .as_deref_mut()
                 .or(self.compile_tracing.as_deref_mut());
             Self::walk_attempt_trace_refs(
                 framestack,
+                last_exc_value,
                 last_exc_box,
                 exc_resume,
                 pending_frontend_boxes,
                 pending_frontend_box_types,
+                forced_virtualizable,
+                pending_vable_ptr,
+                single_pass_ref_scalar_values,
+                pending_abort_blackhole,
                 tracing,
                 &mut visitor,
             );
@@ -4503,10 +4682,15 @@ impl<M: Clone> MetaInterp<M> {
             }
             Self::walk_attempt_trace_refs(
                 &mut parked.framestack,
+                &mut parked.last_exc_value,
                 &mut parked.last_exc_box,
                 &mut parked.exc_resume,
                 parked.pending_frontend_boxes.as_mut(),
                 parked.pending_frontend_box_types.as_deref(),
+                &mut parked.forced_virtualizable,
+                &mut parked.pending_vable_ptr,
+                parked.single_pass_ref_scalar_values.as_mut(),
+                parked.pending_abort_blackhole.as_mut(),
                 parked
                     .tracing
                     .as_deref_mut()
@@ -4548,19 +4732,24 @@ impl<M: Clone> MetaInterp<M> {
     /// GC walker for ConstPtr GcRefs from snapshot maps during
     /// compilation. Cleared after compilation completes.
     pub fn walk_compile_snapshot_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
-        for &slot_addr in &self.compile_snapshot_refs {
-            // SAFETY: entries are collected from `SnapshotBox.opref` slots
-            // owned by the in-flight optimizer/OptContext and cleared at every
-            // compile exit. The extra-root walker runs on the same thread while
-            // compilation is paused for GC, mirroring RPython's in-place field
-            // update of `ConstPtr.value`.
-            let r = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
-            // Forward the snapshot slot's inline const gcref in place (an
-            // in-place `ConstPtr.value` update).
-            r.trace_const_ptr(&mut visitor);
+        walk_compile_snapshot_ref_slots(&self.compile_snapshot_refs, &mut visitor);
+        for parked in &self.parked_attempts {
+            walk_compile_snapshot_ref_slots(&parked.compile_snapshot_refs, &mut visitor);
         }
-        self.walk_compile_vable_anchor(&mut visitor);
+        walk_compile_vable_anchor(
+            self.compile_vable_index,
+            &mut self.compile_vable_root,
+            &mut visitor,
+        );
         self.compile_live_op_roots.walk(&mut visitor);
+        for parked in &mut self.parked_attempts {
+            walk_compile_vable_anchor(
+                parked.compile_vable_index,
+                &mut parked.compile_vable_root,
+                &mut visitor,
+            );
+            parked.compile_live_op_roots.walk(&mut visitor);
+        }
     }
 
     /// Publish `ops` until the returned guard drops. The guard does not
@@ -4582,21 +4771,6 @@ impl<M: Clone> MetaInterp<M> {
         trace: &mut crate::history::TreeLoop,
     ) -> crate::optimizeopt::LiveOpPublication {
         self.compile_live_op_roots.publish_tree_loop(trace)
-    }
-
-    /// Forward the virtualizable anchor published for the in-flight compile.
-    ///
-    /// After `compile_tracing` is taken, `initial_inputarg_consts` is no
-    /// longer reached by `walk_active_trace_refs`. The index or rooted
-    /// address captured for `patch_new_loop_to_load_virtualizable_fields`
-    /// still has to move when `NUMBERING` allocation collects.
-    fn walk_compile_vable_anchor(&mut self, visitor: &mut impl FnMut(&mut GcRef)) {
-        if let Some(index) = self.compile_vable_index {
-            majit_ir::const_ptr_table::trace_index(index, visitor);
-        }
-        if !self.compile_vable_root.is_null() {
-            visitor(&mut self.compile_vable_root);
-        }
     }
 
     #[inline]
@@ -33004,6 +33178,193 @@ mod tests {
         let ctx = meta.tracing.as_ref().unwrap();
         assert_eq!(ctx.box_bits(ident), Some(0x8000));
         assert_eq!(ctx.virtualizable_heap_ptr(), Some(0x8000 as *const u8));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_active_last_exc_value_and_box() {
+        // pyjitpl.py `MetaInterp.__init__` `self.last_exc_value` is an
+        // ordinary `OBJECTPTR` GC field; `handle_possible_exception`
+        // stores `last_exc_box = ConstPtr(val)` of the same object.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.last_exc_value = 0xA000;
+        meta.last_exc_box = Some(OpRef::const_ptr(GcRef(0xA000)));
+        meta.forced_virtualizable = 0xA000;
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        assert_eq!(meta.last_exc_value, 0xB000);
+        assert_eq!(
+            meta.last_exc_box.and_then(OpRef::as_const_ptr),
+            Some(GcRef(0xB000))
+        );
+        assert_eq!(meta.forced_virtualizable, 0xB000);
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_parked_last_exc_value_and_box() {
+        // `park_attempt` stashes the outer `last_exc_value` /
+        // `last_exc_box` while a nested attempt runs. A minor
+        // collection in that window must forward the parked slots so
+        // `restore_attempt` does not write a from-space pointer back.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.last_exc_value = 0xA000;
+        meta.last_exc_box = Some(OpRef::const_ptr(GcRef(0xA000)));
+        meta.forced_virtualizable = 0xA000;
+        meta.park_attempt();
+        assert_eq!(meta.last_exc_value, 0);
+        assert!(meta.last_exc_box.is_none());
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        meta.restore_attempt();
+        assert_eq!(meta.last_exc_value, 0xB000);
+        assert_eq!(
+            meta.last_exc_box.and_then(OpRef::as_const_ptr),
+            Some(GcRef(0xB000))
+        );
+        assert_eq!(meta.forced_virtualizable, 0xB000);
+    }
+
+    /// Nested `compile_and_run_once` parks the outer compile holders
+    /// (`warmstate.py bound_reached` builds a fresh MetaInterp). A
+    /// collection in that window must still forward parked snapshot
+    /// ConstPtr slots, the short-preamble producer, resume memos,
+    /// `compile_vable_root`, and `compile_live_op_roots`.
+    #[test]
+    fn parked_attempt_compile_holders_are_walked() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let snap_dead = GcRef(0x96E5_1100);
+        let snap_live = GcRef(0x96E5_2100);
+        let prod_dead = GcRef(0x96E5_3100);
+        let prod_live = GcRef(0x96E5_4100);
+        let memo_dead = GcRef(0x96E5_5100);
+        let memo_live = GcRef(0x96E5_6100);
+        let vable_dead = GcRef(0x96E5_7100);
+        let vable_live = GcRef(0x96E5_8100);
+        let op_dead = GcRef(0x96E5_9100);
+        let op_live = GcRef(0x96E5_A100);
+        let (mut snap_slot, snap_index, _snap_restore) = intern_const_ptr(snap_dead);
+        let (prod_const, prod_index, _prod_restore) = intern_const_ptr(prod_dead);
+        let (op_const, op_index, _op_restore) = intern_const_ptr(op_dead);
+
+        let memo = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::resume::ResumeDataLoopMemo::new(),
+        ));
+        memo.borrow_mut()
+            .getconst_ref(memo_dead.0 as i64)
+            .expect("pool the parked memo const");
+
+        let sb = crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
+            &[prod_const],
+            &[],
+            &[prod_const],
+        );
+        let tt = crate::history::TargetToken::new_loop(15);
+        let mut producer = Some(
+            crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder::new(
+                tt.as_jump_target_descr(),
+                &sb,
+            ),
+        );
+        let tokens: Vec<std::sync::Arc<crate::history::TargetToken>> = Vec::new();
+        let tokens_addr = (&raw const tokens) as usize;
+        let vable_index = 0xC0DE_u32;
+        let op = majit_ir::OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::GuardTrue,
+            &[majit_ir::operand::Operand::from_opref(op_const)],
+        ));
+        let ops = vec![op];
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.compile_snapshot_refs
+            .push((&mut snap_slot as *mut OpRef) as usize);
+        meta.compile_short_preamble_producer = Some((&mut producer as *mut Option<_>) as usize);
+        meta.compile_resume_memos
+            .push(std::rc::Rc::downgrade(&memo));
+        meta.compile_target_tokens = Some(tokens_addr);
+        meta.compile_vable_index = Some(vable_index);
+        meta.compile_vable_root = vable_dead;
+        let _published = meta.compile_live_op_roots.publish_vec(&ops);
+
+        meta.park_attempt();
+        assert!(meta.compile_snapshot_refs.is_empty());
+        assert!(meta.compile_short_preamble_producer.is_none());
+        assert!(meta.compile_resume_memos.is_empty());
+        assert!(meta.compile_target_tokens.is_none());
+        assert!(meta.compile_vable_index.is_none());
+        assert!(meta.compile_vable_root.is_null());
+        assert!(meta.compile_live_op_roots.is_empty());
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut snap_seen = 0;
+        let mut vable_seen = 0;
+        let mut op_seen = 0;
+        meta.walk_compile_snapshot_refs(|slot| {
+            if slot.0 == snap_dead.0 {
+                slot.0 = snap_live.0;
+                snap_seen += 1;
+            }
+            if slot.0 == vable_dead.0 {
+                slot.0 = vable_live.0;
+                vable_seen += 1;
+            }
+            if slot.0 == op_dead.0 {
+                slot.0 = op_live.0;
+                op_seen += 1;
+            }
+        });
+        assert_eq!(snap_seen, 1, "parked compile_snapshot_refs was walked");
+        assert_eq!(vable_seen, 1, "parked compile_vable_root was walked");
+        assert!(op_seen >= 1, "parked compile_live_op_roots was walked");
+        assert_eq!(majit_ir::const_ptr_table::resolve(snap_index), snap_live);
+        assert_eq!(majit_ir::const_ptr_table::resolve(op_index), op_live);
+
+        let mut prod_seen = 0;
+        let mut memo_seen = 0;
+        meta.walk_rd_consts_refs(|slot| {
+            if slot.0 == prod_dead.0 {
+                slot.0 = prod_live.0;
+                prod_seen += 1;
+            }
+            if slot.0 == memo_dead.0 {
+                slot.0 = memo_live.0;
+                memo_seen += 1;
+            }
+        });
+        assert!(
+            prod_seen >= 1,
+            "parked compile_short_preamble_producer was walked"
+        );
+        assert!(memo_seen >= 1, "parked compile_resume_memos was walked");
+        assert_eq!(majit_ir::const_ptr_table::resolve(prod_index), prod_live);
+        // ResumeDataLoopMemo.getconst_ref appends Const::Ref(address)
+        // without intern. walk_rd_consts_refs writes that field, matching
+        // history.py ConstPtr.value / resume.py _newconst.
+        assert_eq!(
+            memo.borrow().consts()[0].getref_base(),
+            memo_live,
+            "walk_rd_consts_refs must write the memo Const::Ref field"
+        );
+
+        meta.restore_attempt();
+        assert_eq!(meta.compile_target_tokens, Some(tokens_addr));
+        assert_eq!(meta.compile_vable_index, Some(vable_index));
+        assert_eq!(meta.compile_vable_root, vable_live);
+        assert!(
+            !meta.compile_live_op_roots.is_empty(),
+            "restore_attempt puts the parked live-op roots back"
+        );
+        assert_eq!(majit_ir::const_ptr_table::resolve(op_index), op_live);
     }
 
     /// `incminimark.py old_objects_pointing_to_young`: the off-GC compiled

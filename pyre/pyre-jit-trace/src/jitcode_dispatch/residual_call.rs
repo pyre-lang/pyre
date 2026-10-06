@@ -2903,13 +2903,11 @@ struct ResidualFrameChainGuard {
     /// A root, not a raw copy.  The callee frame an inline sub-walk executes
     /// is a nursery allocation (`emit_new_pyframe_inline_with_params` ->
     /// `NewWithVtable`), so a minor collection inside the residual relocates
-    /// it and `Drop`'s `f_backref` / `escaped()` reads would follow a stale
-    /// address.  The collector forwards `OWNER_ROOTS` in place
-    /// (`shadow_stack::walk_roots`), which is the same reason
-    /// [`current_inline_concrete_frame`] reads its frame back out of a root
-    /// rather than out of a copy.  Rooting is also why this can be an owner
-    /// root and not a shadow-stack slot: the shadow stack is LIFO and the
-    /// residual publishes across this scope.
+    /// it.  `PUBLISHED_INLINE_FRAME` and the force paths read that identity
+    /// during the residual; the collector forwards `OWNER_ROOTS` in place
+    /// (`shadow_stack::walk_roots`).  Rooting is also why this can be an
+    /// owner root and not a shadow-stack slot: the shadow stack is LIFO and
+    /// the residual publishes across this scope.
     frame_root: majit_gc::shadow_stack::OwnerRootGuard,
     previous_published: *mut pyre_interpreter::PyFrame,
     previous_shadow: Option<PublishedInlineShadow>,
@@ -3006,15 +3004,10 @@ impl ResidualFrameChainGuard {
     }
 
     /// The execution this guard brackets left through an exception.
+    /// `executioncontext.py leave` consumes this; Drop does not mark
+    /// `f_back` (`heapcache.py` `invalidate_unescaped`).
     fn note_got_exception(&self) {
         self.got_exception.set(true);
-    }
-
-    /// The frame as the collector last left it.  Every read below goes through
-    /// here rather than through a field, so a residual that collected cannot
-    /// hand `Drop` an address from before the move.
-    fn frame(&self) -> *mut pyre_interpreter::PyFrame {
-        self.frame_root.get().0 as *mut pyre_interpreter::PyFrame
     }
 }
 
@@ -3028,15 +3021,23 @@ impl Drop for ResidualFrameChainGuard {
             if let Some(previous_top) = self.previous_top_root.take() {
                 (*self.ec).topframeref = previous_top.get().0 as *mut pyre_interpreter::PyFrame;
             }
-            let frame = self.frame();
-            // `if frame.escaped or got_exception:` -- an exception leaves a
-            // traceback that names this frame, and through it the caller.
-            if (*frame).escaped() || self.got_exception.get() {
-                let f_back = (*frame).get_f_back();
-                if !f_back.is_null() {
-                    (*f_back).mark_as_escaped();
-                }
-            }
+            // Keep the nursery frame rooted until `topframeref` is restored;
+            // a collection inside the residual forwarded it in place.
+            let _ = self.frame_root.get();
+            let _ = self.got_exception.get();
+            // `executioncontext.py ExecutionContext.leave` marks
+            // `f_back` only at leave (`f_back.mark_as_escaped`).  A
+            // concrete write here is not that leave: it runs while the
+            // callee is still open, bypasses `heapcache.py`
+            // `do_write_with_aliasing` / `invalidate_unescaped`, and
+            // leaves a rematerialised `NewWithVtable` caching
+            // constructor `flags=0` while the object already holds the
+            // bit.  The next `GETFIELD_GC` of that field is
+            // `_opimpl_getfield_gc_any_pureornot`'s cache-hit sanity
+            // check.  `walker_ec_leave` records the store; abort paths
+            // (`abandon_entered_frame`, `leave_compiled_frame_chain`)
+            // still mark.  `got_exception` is the portal's
+            // `execute_frame` finally latch; leave records it.
         }
     }
 }
@@ -3209,6 +3210,12 @@ fn materialize_published_callee_locals(frame: *mut pyre_interpreter::PyFrame) ->
 pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
     let escaped_published = PUBLISHED_INLINE_FRAME.with(|slot| {
         let published = slot.get();
+        // Match only.  `f_back.mark_as_escaped` is
+        // `executioncontext.py leave`, recorded by `walker_ec_leave`
+        // (`pyjitpl.py` `setfield_gc` + `heapcache.setfield`).  Writing
+        // the bit here is a concrete store the heapcache does not
+        // see (`heapcache.py invalidate_unescaped` keeps an unescaped
+        // allocation's constructor `flags=0`).
         !published.is_null() && std::ptr::eq(published, frame)
     });
     ACTIVE_FRAME_ESCAPE.with(|slot| {
@@ -3247,15 +3254,9 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 };
                 // `executioncontext.py leave` marks the caller when the frame
                 // escaped, including a token-0 read that does not clear the
-                // portal token.  A failed write and a matched portal still
-                // mark, as they did when this returned true unconditionally.
-                if escaped_published && (frame_escaped || escaped_portal || published_unflushed)
-                {
-                    let f_back = unsafe { (*frame).get_f_back() };
-                    if !f_back.is_null() {
-                        unsafe { (*f_back).mark_as_escaped() };
-                    }
-                }
+                // portal token.  `walker_ec_leave` records that store; a
+                // concrete write here is the same heapcache miss the match
+                // site above documents (`heapcache.py invalidate_unescaped`).
                 if escaped_portal || published_unflushed {
                     use crate::trace::fbw_diag;
                     match (escaped_portal, escaped_published) {
