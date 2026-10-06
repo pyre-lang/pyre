@@ -1893,7 +1893,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
         return p2_drain_abort();
     }
-
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
     // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
@@ -6154,7 +6153,11 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
 /// the codewriter appends after the whole body, and the floor table keys each
 /// Python PC to its FIRST jitcode offset, so it attributes that late block to
 /// whichever opcode last opened a segment.
-fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<usize> {
+fn loop_body_abort_permanent_pc(
+    w_code: *const (),
+    start_pc: usize,
+    is_bridge_trace: bool,
+) -> Option<usize> {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
     };
@@ -6235,8 +6238,41 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         // reported as an instruction index.
         loop_handler.map(|(target, _, _)| target as usize / 2)
     };
+    // `merge_entry_by_green` stores the block-head `-live-` the codewriter
+    // emits before `jit_merge_point`, so the header this merge point closes
+    // is the greatest entry at or before it. A function-entry green (py pc 0)
+    // is an earlier entry: the same next `jit_merge_point` is not proof that
+    // the trace started on the header.
+    let trace_starts_at_header = pjc.merge_entry_for(start_pc).is_some_and(|start_entry| {
+        pjc.metadata
+            .merge_entry_by_green
+            .iter()
+            .map(|&(_, off)| off as usize)
+            .filter(|&off| off <= merge_point)
+            .max()
+            == Some(start_entry)
+    });
     abort_permanent_pcs
         .filter(|pc| {
+            // A `YIELD_VALUE` marker is the frame exit, not an unported
+            // opcode: `interp_jit.py` `dispatch` returns the yielded value
+            // and the trace ends in `compile_done_with_this_frame`
+            // (`portal_yield_frame_exit`). That covers a trace whose green
+            // is the loop header, and a guard-failure bridge. The bridge is
+            // `TraceCtx::is_bridge_trace`, set in `start_bridge_tracing`
+            // (`ResumeGuardDescr`); its resume pc is the failing guard, so
+            // `merge_entry_for` does not name the header. A walk whose green
+            // is the function-entry pc — `ResumeFromInterpDescr`, so
+            // `is_bridge_trace` stays false, and an earlier merge entry than
+            // the header — still counts the yield and declines, so it does
+            // not finish a separate entry bridge at the first yield.
+            let yield_marker =
+                abort_permanent_owner(w_code, &pjc, *pc).is_some_and(|(_, instr)| {
+                    matches!(instr, pyre_interpreter::Instruction::YieldValue { .. })
+                });
+            if yield_marker && (trace_starts_at_header || is_bridge_trace) {
+                return false;
+            }
             if *pc < loop_end {
                 return true;
             }
@@ -6756,7 +6792,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // guard, exit early, and concretely double-execute the post-loop tail;
     // declining before the walk reaches the unported op avoids frame
     // corruption and returns to interpretation.
-    if let Some(abort_pc) = loop_body_abort_permanent_pc(w_code, start_pc) {
+    if let Some(abort_pc) = loop_body_abort_permanent_pc(w_code, start_pc, ctx.is_bridge_trace) {
         // Tag the decline so `PYRE_FBW_DEBUG_ABORT` census attributes it to the
         // up-front `abort_permanent` scan, not the trait retry fall-through
         // (`Trait::DeclinedAbort`).  Without this the real declining class is

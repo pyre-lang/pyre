@@ -142,23 +142,29 @@ pub(crate) fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: 
 /// same multi-frame snapshot decline used by nearby unavailable-coordinate
 /// paths; it is never a panic.
 pub(crate) fn resolve_parent_resume_py_pc(parent: &InlineParentFrame) -> Option<u32> {
-    match parent.resume_coord {
+    resolve_resume_coord_py_pc(parent.jitcode_index, parent.resume_coord)
+}
+
+pub(crate) fn resolve_resume_coord_py_pc(
+    jitcode_index: u32,
+    resume_coord: ParentResumeCoord,
+) -> Option<u32> {
+    match resume_coord {
         ParentResumeCoord::Backxlat(jitcode_pc) => {
             // #73: read the forward py_pc twin, a codewriter-built
             // trivia-normalized twin of the containing coordinate. The
             // containing lookup survives only for the empty-twin class.
-            let twin = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
+            let twin = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
                 .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(jitcode_pc));
             Some(twin.unwrap_or_else(|| {
                 crate::py_coord::trivia_normalized_py_pc_for_jitcode_pc(
-                    parent.jitcode_index as i32,
+                    jitcode_index as i32,
                     jitcode_pc as i32,
                 ) as u32
             }))
         }
         ParentResumeCoord::CallFallthrough(call_jit_pc) => {
-            let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
-            else {
+            let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
                 return None;
             };
             if pjc.code_ptr.is_null() {

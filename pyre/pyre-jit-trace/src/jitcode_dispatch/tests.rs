@@ -26,6 +26,8 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     let parent = |word: usize| InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: None,
         call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
         blackhole: Some(InlineParentBlackhole {
             resume_pc: 0,
@@ -130,6 +132,8 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
     let parent = |word: usize| InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: None,
         call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
         blackhole: Some(InlineParentBlackhole {
             resume_pc: 0,
@@ -421,6 +425,8 @@ fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
         resume_coord: ParentResumeCoord::Backxlat(0),
@@ -1532,6 +1538,8 @@ fn portal_may_force_records_the_callee_execution_context() {
         vec![InlineParentFrame {
             jitcode_index: jitcode_index as u32,
             call_jitcode_pc: None,
+            call_pc: None,
+            resume_pc: None,
             call_stack_overrides: Vec::new(),
             blackhole: None,
             resume_coord: ParentResumeCoord::Backxlat(0),
@@ -17228,6 +17236,175 @@ fn loop_header_stamps_seen_flag() {
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, 0);
     assert_eq!(wc.trace_ctx.seen_loop_header_jit_pc, Some(0));
     assert_eq!(wc.trace_ctx.num_ops(), 0, "loop_header records nothing");
+}
+
+/// `opimpl_loop_header` only stamps `seen_loop_header_for_jdindex`.
+/// A later Python-opcode boundary records `DEBUG_MERGE_POINT` and leaves
+/// the stamp set. `opimpl_jit_merge_point` is what consumes it and closes
+/// (`pyjitpl.py`), on the marker `handle_jit_marker__jit_merge_point`
+/// emits at the loop-header block.
+#[test]
+fn loop_header_stamp_is_consumed_by_jit_merge_point() {
+    use crate::state::PyreSym;
+
+    let lh_byte = *insns_opname_to_byte()
+        .get("loop_header/i")
+        .expect("`loop_header/i` must be in insns table");
+    let goto_byte = *insns_opname_to_byte()
+        .get("goto/L")
+        .expect("`goto/L` must be in insns table");
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    // loop_header/i (2) + goto/L (3) + jit_merge_point/cIRFIRF with empty reds.
+    // The goto is an exact `py_floor_by_jit_pc` key sitting between the stamp
+    // and the marker, so a hand close on the synthesized boundary would fire
+    // there.
+    let goto_pc = 2u32;
+    let merge_pc = 5usize;
+    let bytes = vec![
+        lh_byte,
+        0x01, // i1 = jdindex
+        goto_byte,
+        merge_pc as u8,
+        (merge_pc >> 8) as u8,
+        jmp_byte,
+        0x00, // c: jdindex
+        0x01,
+        0x00, // gi: [i0 = next_instr]
+        0x01,
+        0x00, // gr: [r0 = pycode]
+        0x00, // gf
+        0x00, // ri
+        0x00, // rr
+        0x00, // rf
+    ];
+    let code_obj = pyre_interpreter::compile_exec("None").expect("test code should compile");
+    let w_code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code_obj)) as *const ());
+    let raw_code =
+        unsafe { pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject };
+    pyre_interpreter::register_live_code_wrapper(raw_code as *const (), w_code);
+    assert!(
+        !pyre_interpreter::live_code_wrapper(raw_code as *const ()).is_null(),
+        "the synthesized boundary bails without a live code wrapper"
+    );
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("loop_header_merge_point");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: bytes,
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.built_as_portal = true;
+    // Offset 0 keeps `containing_py_pc_for_jitcode_pc` defined for the
+    // header byte. Offset 2 is the goto, the boundary between the stamp
+    // and the marker.
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (goto_pc, 9)];
+    let pyjit = std::sync::Arc::new(pyjit);
+    let installed =
+        crate::state::install_jitcode_for(w_code as *const (), std::sync::Arc::clone(&pyjit))
+            as *const crate::state::JitCode;
+    assert!(!installed.is_null());
+    let code = pyjit.jitcode.code.as_slice();
+
+    let pycode_ptr = 0x1_0000usize;
+    let green_key = crate::driver::make_green_key(pycode_ptr as *const (), 42, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[], green_key);
+    tc.seed_compile_and_run_once_merge_point();
+    assert!(
+        tc.has_merge_point_with_shape_assert(green_key, 0),
+        "seed must match the empty red list so the merge point closes"
+    );
+    let next_instr = tc.const_int(42);
+    let jdindex = tc.const_int(0);
+    let pycode = tc.const_ref(pycode_ptr as i64);
+    let regs_i = [next_instr, jdindex];
+    let regs_r = [pycode];
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.jitcode = installed;
+    let mut fbw_mode = test_fbw_mode();
+    fbw_mode.snapshot_sym = &snapshot_sym;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let ops_before_header = wc.trace_ctx.num_ops();
+    let (header, header_next) = step(code, 0, &mut wc).expect("loop_header must dispatch");
+    assert_eq!(header, DispatchOutcome::Continue);
+    assert_eq!(header_next, goto_pc as usize);
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, 0);
+    assert_eq!(wc.trace_ctx.seen_loop_header_jit_pc, Some(0));
+    assert!(
+        wc.trace_ctx.num_ops() > ops_before_header,
+        "the header byte is a floor key, so debug_merge_point must record"
+    );
+
+    let ops_before_boundary = wc.trace_ctx.num_ops();
+    let (boundary, boundary_next) =
+        step(code, goto_pc as usize, &mut wc).expect("floor boundary must dispatch");
+    assert_eq!(
+        boundary,
+        DispatchOutcome::Continue,
+        "a floor key between loop_header and jit_merge_point must not close"
+    );
+    assert_eq!(boundary_next, merge_pc);
+    assert_eq!(
+        wc.trace_ctx.seen_loop_header_for_jdindex, 0,
+        "only opimpl_jit_merge_point consumes the stamp"
+    );
+    assert_eq!(wc.trace_ctx.seen_loop_header_jit_pc, Some(0));
+    assert!(
+        wc.trace_ctx.num_ops() > ops_before_boundary,
+        "the boundary must be the synthesized debug_merge_point, not a missed floor"
+    );
+
+    let (closed, closed_next) = step(code, merge_pc, &mut wc).expect("jit_merge_point must close");
+    assert_eq!(closed_next, code.len());
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    match closed {
+        DispatchOutcome::CloseLoop {
+            jump_args,
+            loop_header_pc,
+            ..
+        } => {
+            assert_eq!(loop_header_pc, 42);
+            assert_eq!(jump_args.len(), 0);
+        }
+        other => panic!("expected CloseLoop from jit_merge_point, got {other:?}"),
+    }
 }
 
 #[test]

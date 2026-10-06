@@ -69429,7 +69429,14 @@ fn rust_vec_header_allocated_in_graph_rec(
         } else if saw_alloc {
             Some(true)
         } else {
-            Some(false)
+            // Every incoming arm is a cycle (`None`). Caching `Some(false)`
+            // here makes the header that also carries `ll_vec_alloc_and_set`
+            // look unowned, so the drop never emits `free`. A loop-carried
+            // copy is that same raw pointer (`Block.inputargs`):
+            // `rtype_free_non_gc_object` emits `free` for the malloc, and
+            // `rewrite_op_free` turns flavor `raw` into `raw_free`. The
+            // cycle stays `None` (and is not cached) so the alloc arm decides.
+            None
         }
     };
 
@@ -80305,6 +80312,134 @@ mod tests {
         assert!(
             !leaves.iter().any(|leaf| leaf.starts_with("ll_vec_free")),
             "mixed phi must not free: {leaves:?}"
+        );
+    }
+
+    /// A loop-carried copy of an in-graph `ll_vec_alloc_and_set` header is
+    /// the same raw pointer. The latch is visited before the alloc arm, so
+    /// its phi is a cycle; that cycle must not count as a foreign owner.
+    /// `rtype_free_non_gc_object` still emits `free`, and `rewrite_op_free`
+    /// rewrites flavor `raw` to `raw_free`.
+    #[test]
+    fn rust_vec_drop_frees_loop_carried_header() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("loop_vec_drop");
+        // Latch first so the header's incoming walk sees the back edge
+        // before the allocating predecessor.
+        let latch_bb = graph.create_block();
+        let alloc_bb = graph.create_block();
+        let header_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let allocated = Variable::new();
+        graph
+            .block_mut(alloc_bb)
+            .operations
+            .push(vec_alloc_and_set_r(allocated.clone()));
+
+        let carried = Variable::new();
+        graph.block_mut(header_bb).inputargs = vec![carried.clone()];
+        let latch_h = Variable::new();
+        graph.block_mut(latch_bb).inputargs = vec![latch_h.clone()];
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+
+        graph.block_mut(latch_bb).exits = vec![
+            Link::from_variables(&graph, vec![latch_h.clone()], header_bb, None)
+                .with_prevblock(latch_bb),
+        ];
+        graph.block_mut(alloc_bb).exits = vec![
+            Link::from_variables(&graph, vec![allocated.clone()], header_bb, None)
+                .with_prevblock(alloc_bb),
+        ];
+        graph.block_mut(header_bb).exits = vec![
+            Link::from_variables(&graph, vec![carried.clone()], latch_bb, None)
+                .with_prevblock(header_bb),
+            Link::from_variables(&graph, vec![carried.clone()], drop_bb, None)
+                .with_prevblock(header_bb),
+        ];
+
+        assert!(rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(rust_vec_header_allocated_in_graph(&graph, &latch_h));
+        assert!(emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            leaves.iter().any(|leaf| leaf == "ll_vec_free_r"),
+            "loop-carried in-graph header must be freed: {leaves:?}"
+        );
+    }
+
+    /// A loop phi that also merges a call result is not wholly this
+    /// graph's malloc. `rewrite_op_free` must not run on that header.
+    #[test]
+    fn rust_vec_drop_does_not_free_loop_mixed_with_call_result() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("loop_mixed_vec_drop");
+        let latch_bb = graph.create_block();
+        let alloc_bb = graph.create_block();
+        let call_bb = graph.create_block();
+        let header_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let allocated = Variable::new();
+        graph
+            .block_mut(alloc_bb)
+            .operations
+            .push(vec_alloc_and_set_r(allocated.clone()));
+        let returned = Variable::new();
+        graph
+            .block_mut(call_bb)
+            .operations
+            .push(vec_call_result(returned.clone(), "returns_vec"));
+
+        let carried = Variable::new();
+        graph.block_mut(header_bb).inputargs = vec![carried.clone()];
+        let latch_h = Variable::new();
+        graph.block_mut(latch_bb).inputargs = vec![latch_h.clone()];
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+
+        graph.block_mut(latch_bb).exits = vec![
+            Link::from_variables(&graph, vec![latch_h.clone()], header_bb, None)
+                .with_prevblock(latch_bb),
+        ];
+        graph.block_mut(alloc_bb).exits = vec![
+            Link::from_variables(&graph, vec![allocated.clone()], header_bb, None)
+                .with_prevblock(alloc_bb),
+        ];
+        graph.block_mut(call_bb).exits = vec![
+            Link::from_variables(&graph, vec![returned.clone()], latch_bb, None)
+                .with_prevblock(call_bb),
+        ];
+        graph.block_mut(header_bb).exits = vec![
+            Link::from_variables(&graph, vec![carried.clone()], latch_bb, None)
+                .with_prevblock(header_bb),
+            Link::from_variables(&graph, vec![carried.clone()], drop_bb, None)
+                .with_prevblock(header_bb),
+        ];
+
+        assert!(!rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(!emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            !leaves.iter().any(|leaf| leaf.starts_with("ll_vec_free")),
+            "loop mixed with a call result must not free: {leaves:?}"
         );
     }
 

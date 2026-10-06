@@ -245,6 +245,19 @@ thread_local! {
     /// in a register for it stays absent.  A blackhole level resumed on such a
     /// frame reads those slots as Python NULL.
     static UNFLUSHED_ESCAPED_CALLEE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Published inline frame whose locals this residual already wrote.
+    ///
+    /// The first force `take`s [`PUBLISHED_INLINE_SHADOW`] so a later force
+    /// cannot put the pre-residual shadow back over a fastlocals write the
+    /// callee made in between (`virtualizable.py write_boxes`, once).  The
+    /// cell is then empty, and an empty cell is also "this level never had a
+    /// shadow".  Those two have opposite answers: the consumed shadow already
+    /// published the slots (`force_virtualizable_if_necessary` on a token that
+    /// is still 0 is a no-op), while a level that never had one cannot
+    /// materialize and must still escape.  Cleared per residual by
+    /// [`ActiveFrameEscapeGuard`], which saves the enclosing residual's value
+    /// the way it saves [`ACTIVE_FRAME_ESCAPE`].
+    static MATERIALIZED_PUBLISHED_CALLEE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
     /// post-call commit withdrawal can put the live frame back.  The legacy
     /// replay's correctness contract is "the live frame still holds pre-walk
@@ -702,19 +715,38 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
             .first(),
         "innermost frame has no parent"
     );
-    let call_jit_pc = need!(parent.call_jitcode_pc, "parent has no call_jitcode_pc");
     let pjc = need!(
         crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32),
         "parent jitcode index unresolved"
     );
+    // `call_pc` is the CALL's jitcode pc. `resume_pc` is `MIFrame.pc`
+    // (`setup_resume_at_op`, the pc half of `read_jitcode_pos_pc`).
+    // `call_jitcode_pc` stays the Rewind arm: a bridge root leaves it unset.
+    // A live inline still resolves `CallFallthrough` through that arm.
+    let call_jit_pc = need!(
+        parent.call_pc.or(parent.call_jitcode_pc),
+        "parent has no call jitcode pc"
+    );
+    let resume_py_pc = if parent.call_jitcode_pc.is_none()
+        && let Some(resume_pc) = parent.resume_pc
+    {
+        need!(
+            resolve_resume_coord_py_pc(
+                parent.jitcode_index,
+                ParentResumeCoord::Backxlat(resume_pc),
+            ),
+            "parent resume py_pc unresolved"
+        ) as usize
+    } else {
+        need!(
+            resolve_parent_resume_py_pc(parent),
+            "parent resume py_pc unresolved"
+        ) as usize
+    };
     if pjc.code_ptr.is_null() {
         latchdbg!("root-parent-stack: parent code_ptr null");
         return None;
     }
-    let resume_py_pc = need!(
-        resolve_parent_resume_py_pc(parent),
-        "parent resume py_pc unresolved"
-    ) as usize;
     let depth = need!(
         crate::liveness::liveness_for(pjc.code_ptr)
             .depth_at_py_pc()
@@ -2333,6 +2365,7 @@ impl Drop for ResidualFrameChainGuard {
 struct ActiveFrameEscapeGuard {
     prev: Option<(usize, Option<usize>)>,
     prev_stack: Option<Vec<OpRef>>,
+    prev_materialized: usize,
 }
 
 impl ActiveFrameEscapeGuard {
@@ -2345,6 +2378,7 @@ impl ActiveFrameEscapeGuard {
         Self {
             prev: ACTIVE_FRAME_ESCAPE.with(|slot| slot.replace(current)),
             prev_stack,
+            prev_materialized: MATERIALIZED_PUBLISHED_CALLEE.with(|slot| slot.replace(0)),
         }
     }
 }
@@ -2353,20 +2387,12 @@ impl Drop for ActiveFrameEscapeGuard {
     fn drop(&mut self) {
         ACTIVE_FRAME_ESCAPE.with(|slot| slot.set(self.prev));
         ACTIVE_FRAME_ESCAPE_STACK.with(|slot| *slot.borrow_mut() = self.prev_stack.take());
+        MATERIALIZED_PUBLISHED_CALLEE.with(|slot| slot.set(self.prev_materialized));
     }
 }
 
-/// Returns whether `frame` is the one recorded as escaping this residual call
-/// (`expected == frame`) — i.e. the traced virtualizable itself was handed to
-/// Python, so its tracing token must be forced.  The concrete frame an inline
-/// sub-walk published counts as well: it runs under that virtualizable, so
-/// handing it out escapes the virtualizable too. Any other frame a residual
-/// callee inspects returns false. Independently, the walk-end resume pc is
-/// committed only when the state flush succeeds (a merge point with cached
-/// depth); a directly matched frame that cannot flush still escaped and must
-/// be forced, so for it the two signals are decoupled.
-/// Step-0 attribution probe: consume the classification recorded by the most
-/// recent matched escape and tally which disjunct owns this token clear.
+/// Consume the classification recorded by the most recent matched escape and
+/// tally which disjunct owns this token clear.
 pub fn attribute_last_escape_force() {
     if let Some(callee_only) = LAST_ESCAPE_WAS_CALLEE_ONLY.with(|c| c.take()) {
         use crate::trace::fbw_diag;
@@ -2393,29 +2419,131 @@ pub(crate) fn reset_unflushed_escaped_callee() {
     UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(0));
 }
 
+/// `virtualizable.py write_boxes` for one published inline frame.
+///
+/// `Some(true)` — the shadow named `frame` and the write landed.
+/// `Some(false)` — a shadow was present and the write declined.
+/// `None` — nothing left to write (never published, or an earlier force in
+/// this residual already consumed it).
+fn materialize_published_callee_locals(frame: *mut pyre_interpreter::PyFrame) -> Option<bool> {
+    let Some((state, frame_reg)) = PUBLISHED_INLINE_SHADOW.with(|slot| slot.take()) else {
+        return None;
+    };
+    // The shadow describes ONE level's frame.  Only that frame may be
+    // written from it: a nested residual publishes its own, and writing one
+    // level's slots onto another's array would replace live values with
+    // unrelated ones.
+    let matches_frame = state
+        .borrow()
+        .callee_shadow
+        .as_ref()
+        .is_some_and(|shadow| shadow.concrete_frame == frame as usize);
+    Some(matches_frame && super::flush_callee_locals_region(&state, frame, frame_reg))
+}
+
+/// Whether `frame` is the traced virtualizable this residual armed
+/// (`expected == frame`), so its tracing token must be forced.
+///
+/// `virtualizable.py force_virtualizable_if_necessary` forces only when that
+/// object's own `vable_token` is set, and `pyjitpl.py vable_after_residual_call`
+/// reads the result off `virtualizable_boxes[-1]` alone.  A published inline
+/// frame is not that object: it is built with `vable_token: 0` and nothing in
+/// the inline materialization writes the slot.  Reporting it clears the portal
+/// `TOKEN_TRACING_RESCALL`.  A loop trace must not: the abort never closes
+/// the loop.  A bridge is the guard-failure continuation.  When the frame has
+/// already escaped (`PyFrame::escaped`, set by `mark_as_escaped` in
+/// `getframe` / `fget_f_back`), that report is what the blackhole adopt
+/// resumes.  `executioncontext.py leave` marks the caller either way.  A
+/// token-0 read on a frame that has not escaped, and any loop-trace read,
+/// writes the locals and returns false, so the portal virtualizable stays
+/// put.  A forced virtualref is `vrefs_after_residual_call`, which stops
+/// tracking that vref and does not raise `SwitchToBlackhole(ABORT_ESCAPE)`.
+///
+/// The published frame's locals are still written first
+/// (`virtualizable.py write_boxes` of the frame the residual is about to
+/// read).  The walk holds those slots in `CalleeLocalsShadow`, and a reader
+/// inside the residual would otherwise see nulls.  A successful write that
+/// does not report the portal leaves the heap matching the shadow and returns
+/// false.  A shadow that cannot supply the region still returns true: the
+/// blackhole adopt declines rather than resuming on the unwritten array
+/// (`UNFLUSHED_ESCAPED_CALLEE`).
+///
+/// Any other frame a residual callee inspects returns false.  The walk-end
+/// resume pc is committed only when the portal flush succeeds; a directly
+/// matched portal frame that cannot flush still escaped and must be forced.
 pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
-    // `executioncontext.py leave` — a frame handed to application code
-    // keeps a reference to its caller, so escaping the concrete frame an inline
-    // sub-walk published escapes the traced virtualizable it runs under.  The
-    // flush stays keyed on that virtualizable, whose resume pc this residual
-    // already latched, so the walk resumes forward rather than replaying from
-    // entry.
     let escaped_published = PUBLISHED_INLINE_FRAME.with(|slot| {
         let published = slot.get();
-        let matched = !published.is_null() && std::ptr::eq(published, frame);
-        if matched {
-            let f_back = unsafe { (*published).get_f_back() };
-            if !f_back.is_null() {
-                unsafe { (*f_back).mark_as_escaped() };
-            }
-        }
-        matched
+        !published.is_null() && std::ptr::eq(published, frame)
     });
     ACTIVE_FRAME_ESCAPE.with(|slot| {
         if let Some((expected, portal_py_pc)) = slot.get()
             && {
                 let escaped_portal = expected == frame as usize;
-                if escaped_portal || escaped_published {
+                // Token 0 on a published frame is not the virtualizable
+                // (`force_virtualizable_if_necessary`).  Write its locals so
+                // the residual's read sees the shadow.  Return true only for
+                // a bridge whose frame `mark_as_escaped` already set, so the
+                // blackhole adopt still records that escape.  A loop trace
+                // returns false and `force_pyframe` leaves the portal token.
+                let frame_escaped = unsafe { (*frame).escaped() };
+                // See the comment on this function.  `bridge` is
+                // `TraceCtx::is_bridge_trace`: the guard-failure continuation,
+                // not the loop the portal still has to close.
+                let bridge = ctx.is_bridge_trace;
+                let report_portal = frame_escaped && bridge;
+                let published_unflushed = if !escaped_portal && escaped_published {
+                    let note_written = move |written: bool| {
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-escape-callee] frame={:#x} locals written={written} escaped={frame_escaped} bridge={bridge}",
+                                frame as usize
+                            );
+                        }
+                        if written {
+                            // Locals are on the heap.  Remember that so a second
+                            // force in this residual does not treat the consumed
+                            // shadow as "never had one" and decline the adopt.
+                            MATERIALIZED_PUBLISHED_CALLEE
+                                .with(|slot| slot.set(frame as usize));
+                        }
+                    };
+                    match materialize_published_callee_locals(frame) {
+                        Some(true) => {
+                            note_written(true);
+                            report_portal
+                        }
+                        None if MATERIALIZED_PUBLISHED_CALLEE.with(|slot| slot.get())
+                            == frame as usize =>
+                        {
+                            note_written(true);
+                            report_portal
+                        }
+                        Some(false) | None => {
+                            // The shadow cannot supply the region (or never
+                            // existed).  Same residue as before: record the
+                            // frame so the blackhole adopt declines instead of
+                            // resuming on null slots.
+                            UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(frame as usize));
+                            note_written(false);
+                            true
+                        }
+                    }
+                } else {
+                    false
+                };
+                // `executioncontext.py leave` marks the caller when the frame
+                // escaped, including a token-0 read that does not clear the
+                // portal token.  A failed write and a matched portal still
+                // mark, as they did when this returned true unconditionally.
+                if escaped_published && (frame_escaped || escaped_portal || published_unflushed)
+                {
+                    let f_back = unsafe { (*frame).get_f_back() };
+                    if !f_back.is_null() {
+                        unsafe { (*f_back).mark_as_escaped() };
+                    }
+                }
+                if escaped_portal || published_unflushed {
                     use crate::trace::fbw_diag;
                     match (escaped_portal, escaped_published) {
                         (true, false) => fbw_diag::bump(fbw_diag::ESCAPE_PORTAL_ONLY),
@@ -2427,62 +2555,6 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                     }
                     LAST_ESCAPE_WAS_CALLEE_ONLY
                         .with(|c| c.set(Some(!escaped_portal && escaped_published)));
-                    if !escaped_portal && escaped_published {
-                        // `virtualizable.py write_boxes` writes the array of
-                        // the virtualizable being forced.  The flush below
-                        // stays keyed on the traced virtualizable — the portal
-                        // frame — so for this disjunct nothing would write the
-                        // frame that was actually handed to the residual, and
-                        // every local the compiled trace held in a register for
-                        // it would stay absent from `locals_cells_stack_w`.  A
-                        // blackhole level later resumed on that frame reads
-                        // those slots as Python NULL; the witness is an
-                        // `f_locals` write in the resumed tail of a recursive
-                        // callee whose following `LOAD_FAST` of a local
-                        // assigned one line earlier lowers to
-                        // `getarrayitem_vable_r` and answers NULL.
-                        //
-                        // A bridge-resume sub-walk seeds this level's locals
-                        // into its own `CalleeLocalsShadow`
-                        // (`bridge_subwalk.rs`), which is what the publish
-                        // carries here; when it cannot supply the whole region
-                        // the frame is recorded so the blackhole adopt declines
-                        // rather than resuming on an unwritten array.
-                        //
-                        // `take` rather than `get`: this is the force's
-                        // write_boxes, and only the FIRST force in a residual
-                        // may perform it.  The callee can legitimately mutate
-                        // its own fastlocals afterwards — an `f_locals`
-                        // write-through is exactly that — and a second force
-                        // re-running the write would put the shadow's
-                        // pre-residual values back over it.  The guard restores
-                        // the previous entry when the residual ends, so the
-                        // suppression is scoped to this residual.
-                        let written = PUBLISHED_INLINE_SHADOW
-                            .with(|slot| slot.take())
-                            .is_some_and(|(state, frame_reg)| {
-                                // The shadow describes ONE level's frame.  Only
-                                // that frame may be written from it: a nested
-                                // residual publishes its own, and writing one
-                                // level's slots onto another's array would
-                                // replace live values with unrelated ones.
-                                let matches_frame =
-                                    state.borrow().callee_shadow.as_ref().is_some_and(|shadow| {
-                                        shadow.concrete_frame == frame as usize
-                                    });
-                                matches_frame
-                                    && super::flush_callee_locals_region(&state, frame, frame_reg)
-                            });
-                        if !written {
-                            UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(frame as usize));
-                        }
-                        if fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-escape-callee] frame={:#x} locals written={written}",
-                                frame as usize
-                            );
-                        }
-                    }
                     true
                 } else {
                     false

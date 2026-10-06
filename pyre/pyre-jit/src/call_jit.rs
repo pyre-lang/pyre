@@ -4589,21 +4589,25 @@ fn jit_ca_handle_guard_failure(
     if deadframe.is_null() {
         return None;
     }
-    // `enter_profiler_tracing` is not re-entrant (pyjitpl.py handle_guard_failure — RPython's
-    // `handle_guard_failure` unwinds to the top-level `execute_token` before any
-    // tracing decision, so a guard never fires while another trace is open).
-    // pyre's CALL_ASSEMBLER guard callback runs synchronously from the backend
-    // trampoline, so it CAN fire mid-trace: the self-recursion fold replays its
-    // CALL_ASSEMBLER concretely while the outer trace is still recording, and a
-    // deopt in that callee reaches here with the outer trace's profiler event
-    // still open.  Starting a nested bridge trace would panic in
-    // `start_retrace_from_guard`'s `enter_profiler_tracing`.  Bail to the
-    // blackhole resume (return false) so the callee completes in the interpreter
-    // and the outer trace keeps recording; the deferred bridge compiles later
-    // when this guard fails outside a trace.
+    // `enter_profiler_tracing` is not re-entrant (`pyjitpl.py`
+    // `handle_guard_failure` — RPython unwinds to the top-level
+    // `execute_token` before any tracing decision, so a guard never fires
+    // while another trace is open). pyre's CALL_ASSEMBLER guard callback
+    // runs synchronously from the backend trampoline, so it CAN fire
+    // mid-trace: the self-recursion fold replays its CALL_ASSEMBLER
+    // concretely while the outer trace is still recording, and a deopt in
+    // that callee reaches here with the outer trace's profiler event still
+    // open. `with_trace_ctx_and_framestack` parks the recorder in
+    // `compile_tracing`, so `is_tracing` is false for that window;
+    // `trace_attempt_in_progress` still sees the open
+    // `profiler.start_tracing`. Starting a nested bridge would panic in
+    // `start_retrace_from_guard`'s `enter_profiler_tracing`. Bail to the
+    // blackhole resume (return false) so the callee completes in the
+    // interpreter and the outer trace keeps recording; the deferred bridge
+    // compiles later when this guard fails outside a trace.
     {
         let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
+        if driver.trace_attempt_in_progress() {
             return None;
         }
     }
