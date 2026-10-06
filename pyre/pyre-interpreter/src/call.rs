@@ -1843,6 +1843,140 @@ fn call_function_ex_impl(
     )
 }
 
+/// A plain user function `CALL_KW` can bind through `parse_into_scope`.
+/// Methods, builtins, profiled frames and a missing signature stay on
+/// [`call_kw_in_ctx_impl`].
+fn plain_user_kw_eligible(
+    frame: &PyFrame,
+    callable: PyObjectRef,
+    self_or_null: PyObjectRef,
+) -> bool {
+    if frame.get_is_being_profiled() || self_or_null != PY_NULL || callable.is_null() {
+        return false;
+    }
+    let is_user = unsafe {
+        pyre_object::pyobject::py_type_check(callable, &crate::FUNCTION_TYPE)
+            || pyre_object::pyobject::py_type_check(callable, &crate::BUILTIN_FUNCTION_TYPE)
+    };
+    if !is_user {
+        return false;
+    }
+    let code = unsafe { crate::getcode(callable) };
+    if code.is_null() || unsafe { crate::gateway::is_builtin_code(code) } {
+        return false;
+    }
+    !unsafe { crate::w_code_signature(code) }.is_null()
+}
+
+/// `argument.py parse_into_scope` / `_match_signature` for one plain user
+/// keyword call. The jitcode arm is [`match_signature_indexed`]; warmup
+/// runs [`bind_plain_user_kw_scope_native`] because `we_are_jitted` is false.
+#[majit_macros::unroll_safe]
+pub fn bind_plain_user_kw_scope(
+    func: PyObjectRef,
+    w_firstarg: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+    scope_w: &mut [PyObjectRef],
+) -> Result<usize, crate::PyError> {
+    if majit_rlib::jit::we_are_jitted() {
+        crate::argument::match_signature_indexed(func, w_firstarg, positional, kwarg_names, scope_w)
+    } else {
+        crate::argument::bind_plain_user_kw_scope_native(
+            func,
+            w_firstarg,
+            positional,
+            kwarg_names,
+            scope_w,
+        )
+    }
+}
+
+/// Interpreter `CALL_KW` for [`plain_user_kw_eligible`]. Creates the callee
+/// frame, fills its fast locals from [`bind_plain_user_kw_scope`], then runs
+/// it. The heavy frame setup stays opaque; the binder is what a trace records.
+#[majit_macros::dont_look_inside]
+fn call_plain_user_kw(
+    _frame: &mut PyFrame,
+    func: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+) -> PyResult {
+    let nargs = positional.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let func_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(func);
+    let kw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwarg_names);
+    let pos_base = pyre_object::gc_roots::pin_roots(positional);
+
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let code = unsafe { crate::getcode(func_now) };
+    if code.is_null() {
+        return Err(crate::PyError::type_error(
+            "plain keyword call requires a Python function",
+        ));
+    }
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(code);
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let globals = unsafe { function_get_globals_obj(func_now) };
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(globals);
+
+    let execution_context = getexecutioncontext();
+    let mut frame = crate::pyframe::createframe_obj(
+        pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
+        pyre_object::gc_roots::shadow_stack_get(globals_slot),
+        execution_context,
+        Some(pyre_object::gc_roots::shadow_stack_get(func_slot)),
+    )?;
+    let sig_ptr =
+        unsafe { crate::w_code_signature(pyre_object::gc_roots::shadow_stack_get(code_slot)) };
+    if sig_ptr.is_null() {
+        return Err(crate::PyError::type_error("code object has no signature"));
+    }
+    let scope_len = unsafe { (*sig_ptr).scope_length() };
+    let mut scope_w = vec![PY_NULL; scope_len];
+    let mut positional_now = Vec::with_capacity(nargs);
+    for i in 0..nargs {
+        positional_now.push(pyre_object::gc_roots::shadow_stack_get(pos_base + i));
+    }
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let kw_now = pyre_object::gc_roots::shadow_stack_get(kw_slot);
+    let filled =
+        bind_plain_user_kw_scope(func_now, PY_NULL, &positional_now, kw_now, &mut scope_w)?;
+    let ncopy = filled.min(scope_w.len());
+    let mut i = 0usize;
+    while i < ncopy {
+        let locals = frame.locals_cells_stack_w;
+        if locals.is_null() {
+            break;
+        }
+        let locals_len = unsafe { (*locals).len() };
+        if i >= locals_len {
+            break;
+        }
+        unsafe { &mut *locals }.set_ref(i, scope_w[i]);
+        i += 1;
+    }
+    let code_ptr = unsafe {
+        crate::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(code_slot))
+            as *const crate::CodeObject
+    };
+    if !code_ptr.is_null()
+        && crate::pyframe::code_flags_make_generator(unsafe { (*code_ptr).flags })
+    {
+        return frame_into_generator_for_function(
+            frame,
+            pyre_object::gc_roots::shadow_stack_get(func_slot),
+        );
+    }
+    frame.fix_array_ptrs();
+    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
+    get_eval_fn()(&mut frame, None)
+}
+
 /// [`call_kw_in_ctx`] reached from a frame — the `pyopcode.py:1402
 /// CALL_FUNCTION_KW` shape, whose else-branch is the frameless
 /// `space.call_args(w_function, args)`.  The caller frame is already rooted
@@ -1854,6 +1988,9 @@ pub fn call_kw(
     positional: &[PyObjectRef],
     kwarg_names: PyObjectRef,
 ) -> PyResult {
+    if plain_user_kw_eligible(frame, callable, self_or_null) {
+        return call_plain_user_kw(frame, callable, positional, kwarg_names);
+    }
     let profile_frame = frame as *mut PyFrame;
     let execution_context = getexecutioncontext();
     call_kw_in_ctx_impl(
