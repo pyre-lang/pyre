@@ -7779,7 +7779,82 @@ impl TraceCtx {
         concrete: Value,
         live_null_push: bool,
     ) -> VableArrayStore {
+        self.vable_setarrayitem_impl(
+            nonstandard,
+            pc,
+            vable_opref,
+            index,
+            index_runtime_value,
+            fdescr,
+            adescr,
+            value,
+            concrete,
+            live_null_push,
+            false,
+        )
+    }
+
+    /// Same store as [`Self::vable_setarrayitem_checked`] without a second
+    /// concrete heap write.
+    ///
+    /// `do_residual_call` step 3 runs after the call has already written the
+    /// frame. `optimize_VIRTUAL_REF_FINISH` forces the virtual into the trace
+    /// before `direct_call_may_force`; the nonstandard arm
+    /// (`execute_setarrayitem_gc`) already records only, and the standard arm
+    /// skips `write_virtualizable_heap_value_at` / `synchronize_virtualizable_at`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
+    pub fn vable_setarrayitem_record_only(
+        &mut self,
+        nonstandard: bool,
+        pc: usize,
+        vable_opref: OpRef,
+        index: OpRef,
+        index_runtime_value: i64,
+        fdescr: DescrRef,
+        adescr: DescrRef,
+        value: OpRef,
+        concrete: Value,
+        live_null_push: bool,
+    ) -> VableArrayStore {
+        self.vable_setarrayitem_impl(
+            nonstandard,
+            pc,
+            vable_opref,
+            index,
+            index_runtime_value,
+            fdescr,
+            adescr,
+            value,
+            concrete,
+            live_null_push,
+            true,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
+    fn vable_setarrayitem_impl(
+        &mut self,
+        nonstandard: bool,
+        pc: usize,
+        vable_opref: OpRef,
+        index: OpRef,
+        index_runtime_value: i64,
+        fdescr: DescrRef,
+        adescr: DescrRef,
+        value: OpRef,
+        concrete: Value,
+        live_null_push: bool,
+        record_only: bool,
+    ) -> VableArrayStore {
         if nonstandard {
+            // `execute_setarrayitem_gc` records `SETARRAYITEM_GC` and updates
+            // the heapcache. It does not write the concrete array.
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
             self.execute_setarrayitem_gc(array_opref, index, value, adescr);
@@ -7821,18 +7896,24 @@ impl TraceCtx {
         {
             live_null_slots[flat_idx] = true;
         }
-        // pyjitpl.py MIFrame._opimpl_setarrayitem_vable →
-        // virtualizable.py write_box_at. A Const OpRef's
-        // `inline_const_to_value` is not a root; write the live word the
-        // caller pinned across `walker_promote_vable_array_index`.
-        if matches!(concrete, Value::Ref(_)) {
-            let live = pinned
-                .as_ref()
-                .map(|g| Value::Ref(g.get()))
-                .unwrap_or(stamp);
-            self.write_virtualizable_heap_value_at(flat_idx, live);
-        } else {
-            self.synchronize_virtualizable_at(flat_idx);
+        // `record_only` is `optimize_VIRTUAL_REF_FINISH` forcing the virtual
+        // into the trace after the concrete frame was already written.
+        // `write_box_at` would store the pre-call word over the residual's
+        // update.
+        if !record_only {
+            // pyjitpl.py MIFrame._opimpl_setarrayitem_vable →
+            // virtualizable.py write_box_at. A Const OpRef's
+            // `inline_const_to_value` is not a root; write the live word the
+            // caller pinned across `walker_promote_vable_array_index`.
+            if matches!(concrete, Value::Ref(_)) {
+                let live = pinned
+                    .as_ref()
+                    .map(|g| Value::Ref(g.get()))
+                    .unwrap_or(stamp);
+                self.write_virtualizable_heap_value_at(flat_idx, live);
+            } else {
+                self.synchronize_virtualizable_at(flat_idx);
+            }
         }
         VableArrayStore::Stored(overwritten)
     }

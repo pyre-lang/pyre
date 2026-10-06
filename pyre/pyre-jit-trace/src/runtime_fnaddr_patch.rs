@@ -14,8 +14,8 @@
 //! whose addresses are invalidated by ASLR (per-process random slide) and by
 //! the divergent executable layouts (the build-script binary embeds a
 //! subset of the runtime's symbols).  A walker that follows
-//! `execute_residual_call`'s elidable-EI branch
-//! (`jitcode_dispatch::residual_call`'s `try_fold_pure_call_via_executor`)
+//! `execute_residual_call` for an elidable effect info
+//! (`try_execute_residual_call_via_executor_inner`)
 //! into one of those stale addresses dereferences arbitrary memory →
 //! SEGV.
 //!

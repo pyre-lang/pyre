@@ -6792,13 +6792,13 @@ const TUPLE_GETITEM_DESCENT: HelperDescent = HelperDescent {
 
 /// An operator's descent: which body to enter and how the trace names the
 /// site.
-struct HelperDescent {
+pub(crate) struct HelperDescent {
     /// Canonical path of the operator's own body -- `descroperation::pos`,
     /// `opcode_ops::binary_value_from_tag` -- not a split of it.
-    path: &'static str,
-    commit_label: &'static str,
-    call_site_label: &'static str,
-    decline_tag: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) commit_label: &'static str,
+    pub(crate) call_site_label: &'static str,
+    pub(crate) decline_tag: &'static str,
 }
 
 /// `argument.py` `_match_signature` `space.newdict(kwargs=True)` —
@@ -8085,16 +8085,16 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
 
 /// Jitcode, body, portal sym, and nested resume entry for one descent.
 /// Resolved before any guard so a decline leaves the trace untouched.
-struct OrthodoxDescentPrep<Sym: WalkSym> {
-    body: SubJitCodeBody,
-    sym_ptr: *const Sym,
-    nested: HelperEntry,
+pub(crate) struct OrthodoxDescentPrep<Sym: WalkSym> {
+    pub(crate) body: SubJitCodeBody,
+    pub(crate) sym_ptr: *const Sym,
+    pub(crate) nested: HelperEntry,
 }
 
 /// Resolve every decline before recording anything. Each decline names
 /// itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1 fired=0` census
 /// line can be attributed without a rebuild.
-fn prepare_orthodox_descent<Sym: WalkSym>(
+pub(crate) fn prepare_orthodox_descent<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     descent: &HelperDescent,
@@ -13536,7 +13536,13 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
             ctx.trace_ctx.vrefs_before_residual_call();
             let next_ptr = pyre_interpreter::executioncontext::force_vref(raw_ptr);
+            // `do_residual_call` step 3. `vrefs_after_residual_call` /
+            // `stop_tracking_virtualref` records `VIRTUAL_REF_FINISH`, then
+            // the folded frame that vref named spills
+            // (`optimize_VIRTUAL_REF_FINISH`) before this `CALL_MAY_FORCE`.
+            let vrefs_before = ctx.trace_ctx.snapshot_virtualref_boxes();
             ctx.trace_ctx.vrefs_after_residual_call();
+            residual_call::record_forced_inline_locals_before_call(ctx, op.pc, &vrefs_before)?;
             let force_fn = pyre_interpreter::residual_word_addr!(1, crate::helpers::jit_force_vref);
             let forced_op = ctx.trace_ctx.call_typed_with_effect(
                 OpCode::CallMayForceR,
@@ -15512,7 +15518,7 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
 /// aggregate (`SyntheticTransparentCtor "Tuple"`) is elided to `ConstRefNull`
 /// at build time (`jtransform.rs`), so the descent completes and commits a
 /// working trace.  Safety net: if a stale build-time jitcode kept that ctor as
-/// a symbolic (tagged) fnaddr, `try_execute_residual_call_via_executor`
+/// a symbolic (tagged) fnaddr, `try_execute_residual_call_via_executor_inner`
 /// declines it (`OrthodoxSubWalkTraceUnsupported`) and the method-call form
 /// records the append as a residual call instead of baking the hash as a code
 /// address and branching to garbage.
@@ -16329,7 +16335,7 @@ fn loop_header_guard_resume_marker(
 /// the full-body coordinate from a callee `op_pc` restored the wrong frame
 /// image after an overflow guard failed in `step` of `a, b = step(a, b)`.
 #[allow(clippy::too_many_arguments)]
-fn run_orthodox_helper_subwalk<Sym: WalkSym>(
+pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     sym: &Sym,
@@ -16530,7 +16536,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class
-    // as a symbolic residual (`try_execute_residual_call_via_executor` →
+    // as a symbolic residual (`try_execute_residual_call_via_executor_inner` →
     // `OrthodoxSubWalkTraceUnsupported`). Propagating `AbortMarkerReached`
     // kills the enclosing portal/bridge walk; the fold contract
     // (`try_walker_orthodox_list_append` / `_opcode`) is to residualize
@@ -16804,7 +16810,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // (`SyntheticTransparentCtor "Tuple"`) was elided to `ConstRefNull` at
     // build time.  Any residual that does NOT lower —
     // e.g. a stale build-time jitcode whose tuple ctor kept a symbolic
-    // symbolic-tagged funcbox — is declined by `try_execute_residual_call_via_executor`
+    // symbolic-tagged funcbox — is declined by `try_execute_residual_call_via_executor_inner`
     // (`OrthodoxSubWalkTraceUnsupported`) and the sub-walk helper propagates that
     // abort before this point (graceful interpreter fallback, never a wrong
     // trace).  The descr-pool wiring above (strategy/header field descrs) is
@@ -16819,7 +16825,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // guaranteed to: the per-strategy store the descended arm reaches
     // (`W_ListObject::object_push`, `IntArray::push`, `FloatArray::push`) is a
     // `residual_call`, and a residual whose funcptr resolves to a real address
-    // is EXECUTED by `try_execute_residual_call_via_executor` rather than only
+    // is EXECUTED by `try_execute_residual_call_via_executor_inner` rather than only
     // recorded.  Those three carry runtime bindings, so on a target where the
     // arm keeps them as residuals the sub-walk has already appended, and
     // appending again puts the value in twice — one extra element per compiled

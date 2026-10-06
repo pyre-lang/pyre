@@ -6708,12 +6708,11 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     // A backward goto closes the loop headed at `merge_point` only when it
     // jumps to that header.  One that jumps further back closes an ENCLOSING
     // loop, and letting it set the end here stretches this loop's body across
-    // the enclosing one: for a loop nested inside a yield-bearing loop that
-    // sweeps the `YIELD_VALUE` marker in and declines a body that never goes
-    // near it.  Take the nearest header first, then its last back edge, so a
-    // `continue` earlier in the body cannot truncate the region either.  With
-    // no candidate at all the region stays open to the end of the code, the
-    // conservative direction.
+    // the enclosing one, so a nested loop declines on a marker that belongs
+    // to the outer body.  Take the nearest header first, then its last back
+    // edge, so a `continue` earlier in the body cannot truncate the region
+    // either.  With no candidate at all the region stays open to the end of
+    // the code, the conservative direction.
     let back_edge_end = back_edges
         .iter()
         .map(|&(target, _)| target)
@@ -6742,10 +6741,10 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     // loops over markers they can never run.
     //
     // A generator is where the difference shows.  Its body is a single entry
-    // whose target is the PEP 479 epilogue, so a whole-tail scan sweeps up the
-    // `YIELD_VALUE` markers sitting between the back edge and that target and
-    // declines every generator's loop — including a loop that never goes near
-    // a yield.
+    // whose target is the PEP 479 epilogue, so a whole-tail scan sweeps up
+    // markers sitting between the back edge and that target and declines a
+    // loop over ops it never runs.  `YIELD_VALUE` is the frame exit on every
+    // green key (`dispatch`'s `except Yield`), so the filter below skips it.
     //
     // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the handler region too and
     // `PYRE_FBW_LOOPBODY_SCAN_FULL` restores the whole-tail scan, so both ends
@@ -6762,6 +6761,19 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     };
     abort_permanent_pcs
         .filter(|pc| {
+            // `YIELD_VALUE` is the frame exit on every green key.
+            // `interp_jit.py` `PyFrame.dispatch`'s `except Yield` pops the
+            // value, `jit.hint(self, force_virtualizable=True)`, and returns.
+            // `pyjitpl.py` `compile_done_with_this_frame` finishes the trace
+            // from that return. `portal_yield_frame_exit` records the same
+            // exit when the walk reaches the marker, for a header trace, a
+            // bridge, and a function-entry trace.
+            let owner = abort_permanent_owner(w_code, &pjc, *pc);
+            if owner.as_ref().is_some_and(|(_, instr)| {
+                matches!(instr, pyre_interpreter::Instruction::YieldValue { .. })
+            }) {
+                return false;
+            }
             if *pc < loop_end {
                 return true;
             }
@@ -6770,7 +6782,7 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
             };
             // A marker whose owner cannot be named keeps declining, the
             // conservative direction `abort_permanent_owner` documents.
-            abort_permanent_owner(w_code, &pjc, *pc).is_none_or(|(py_pc, _)| py_pc >= handler_py_pc)
+            owner.is_none_or(|(py_pc, _)| py_pc >= handler_py_pc)
         })
         .next()
 }

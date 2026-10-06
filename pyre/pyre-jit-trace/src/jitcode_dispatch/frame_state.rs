@@ -165,6 +165,12 @@ impl WalkFrameState {
         self.0.borrow_mut()
     }
 
+    /// Same `MIFrame` image. `InlineParentFrame` clones this `Rc` when the
+    /// caller pauses, so an ancestor and the live walk can name one state.
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
     /// `virtualizable.py write_boxes`: validate the sparse native shadow, then
     /// read each live value. The callback must not allocate. A caller that
     /// boxes Int/Float slots has to pin every copied `Ref` first: the shadow

@@ -316,7 +316,7 @@ thread_local! {
     ///
     /// Kept separate from the residual force's `ESCAPE_FLUSH_UNDO` even though
     /// both snapshot the same array: that capture is consumed by the tail
-    /// restore in `try_execute_residual_call_via_executor`, which runs after
+    /// restore in `try_execute_residual_call_via_executor_inner`, which runs after
     /// EVERY non-forcing residual, so a mirror recorded there would be reverted
     /// by the next call in the same walk.  This one is consumed only by the
     /// walk-end legs, beside [`fbw_exit_last_instr_rollback`].
@@ -2974,7 +2974,7 @@ pub(crate) fn fbw_abort_carrier_clear() {
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
 }
 
-/// A declined residual call (`try_execute_residual_call_via_executor`
+/// A declined residual call (`try_execute_residual_call_via_executor_inner`
 /// returned `None`) reached during a multiframe-inlined callee sub-walk
 /// (the framestack is non-empty) cannot fall back to the walk-end
 /// legacy replay.  The replay re-enters the freshly compiled loop from the
