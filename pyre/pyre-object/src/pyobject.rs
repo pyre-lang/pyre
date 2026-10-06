@@ -415,6 +415,10 @@ pub unsafe fn is_exact_builtin_instance_nonnull(obj: PyObjectRef) -> bool {
 /// `obj` must be a valid non-null, untagged `PyObjectRef`.
 #[inline]
 pub unsafe fn typeptr_is_exact_builtin(obj: PyObjectRef) -> bool {
+    // `get_unique_interplevel_subclass` / `_getusercls` stamps
+    // `user_overridden_class` on the subclass, and the allocator publishes
+    // that typeptr before the instance is observable. A null `ob_type` is
+    // not a value this flag can have.
     unsafe { !(*(*obj).ob_type).user_subclass.is_null() }
 }
 
