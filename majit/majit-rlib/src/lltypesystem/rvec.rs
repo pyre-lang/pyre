@@ -395,6 +395,10 @@ fn ll_vec_alloc_and_set_jit_i(count: usize, item: usize) -> Vec<usize> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
+///
+/// Residual until the helper graphs seed `SomeRustVec`. Looking inside
+/// types the header as `Int` and the annotator panics on getattr `items`.
+#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_i(count: usize, item: usize) -> Vec<usize> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_i(count, item)
@@ -737,6 +741,10 @@ fn ll_vec_alloc_and_set_jit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
+///
+/// Residual until the helper graphs seed `SomeRustVec`. Looking inside
+/// types the header as `Int` and the annotator panics on getattr `items`.
+#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_r(count, item)
@@ -1124,6 +1132,10 @@ fn ll_vec_alloc_and_set_jit_f(count: usize, item: f64) -> Vec<f64> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
+///
+/// Residual until the helper graphs seed `SomeRustVec`. Looking inside
+/// types the header as `Int` and the annotator panics on getattr `items`.
+#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_f(count: usize, item: f64) -> Vec<f64> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_f(count, item)
