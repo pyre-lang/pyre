@@ -333,6 +333,7 @@ fn ll_vec_zero_or_null_i(item: usize) -> bool {
 }
 
 /// `rgc.ll_arrayclear`. Writes zero into each of the `count` slots.
+#[majit_macros::dont_look_inside_cannot_raise]
 fn ll_vec_arrayclear_i(l: &mut Vec<usize>, count: usize) {
     let mut i = 0;
     while i < count {
@@ -389,13 +390,6 @@ fn ll_vec_alloc_and_set_jit_i(count: usize, item: usize) -> Vec<usize> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual for now: upstream traces into this body, but these helper graphs
-/// are never prepass subjects, so the calls inside carry no `RustVec` result
-/// type and the list-oopspec rewrite cannot tell their header from a GC
-/// list.  Tracing it waits on rtyping the helper bodies the way
-/// `annlowlevel` annotates low-level helpers.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_i(count: usize, item: usize) -> Vec<usize> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_i(count, item)
@@ -677,6 +671,7 @@ fn ll_vec_zero_or_null_r(item: *mut u8) -> bool {
 }
 
 /// `rgc.ll_arrayclear`. Writes null into each of the `count` slots.
+#[majit_macros::dont_look_inside_cannot_raise]
 fn ll_vec_arrayclear_r(l: &mut Vec<*mut u8>, count: usize) {
     let mut i = 0;
     while i < count {
@@ -732,13 +727,6 @@ fn ll_vec_alloc_and_set_jit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual for now: upstream traces into this body, but these helper graphs
-/// are never prepass subjects, so the calls inside carry no `RustVec` result
-/// type and the list-oopspec rewrite cannot tell their header from a GC
-/// list.  Tracing it waits on rtyping the helper bodies the way
-/// `annlowlevel` annotates low-level helpers.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_r(count, item)
@@ -1065,6 +1053,7 @@ fn ll_vec_zero_or_null_f(item: f64) -> bool {
 }
 
 /// `rgc.ll_arrayclear`. Writes `0.0` into each of the `count` slots.
+#[majit_macros::dont_look_inside_cannot_raise]
 fn ll_vec_arrayclear_f(l: &mut Vec<f64>, count: usize) {
     let mut i = 0;
     while i < count {
@@ -1120,13 +1109,6 @@ fn ll_vec_alloc_and_set_jit_f(count: usize, item: f64) -> Vec<f64> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual for now: upstream traces into this body, but these helper graphs
-/// are never prepass subjects, so the calls inside carry no `RustVec` result
-/// type and the list-oopspec rewrite cannot tell their header from a GC
-/// list.  Tracing it waits on rtyping the helper bodies the way
-/// `annlowlevel` annotates low-level helpers.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_f(count: usize, item: f64) -> Vec<f64> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_f(count, item)
