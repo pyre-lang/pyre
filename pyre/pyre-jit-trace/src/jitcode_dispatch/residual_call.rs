@@ -699,6 +699,65 @@ pub(crate) fn reset_single_frame_blackhole() {
     });
 }
 
+/// Put a single-frame image back after `try_adopt_single_frame_blackhole`
+/// declined. The adopt `take`s the TLS latch; a decline used to drop it,
+/// so `convert_and_run_from_pyjitpl` fell through to the GUARD-rebuilt
+/// `MetaInterp.framestack`. The abort epilogue publishes the relatched
+/// image onto `TraceCtx.aborted_framestack`.
+pub(crate) fn relatch_single_frame_blackhole(latched: LatchedSingleFrameBlackhole) {
+    FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
+        debug_assert!(
+            slot.borrow().is_none(),
+            "relatch_single_frame_blackhole overwrites a live latch"
+        );
+        *slot.borrow_mut() = Some(latched);
+    });
+}
+
+/// Put a multi-frame image back after `try_adopt_multi_frame_blackhole`
+/// declined. Same consumer as [`relatch_single_frame_blackhole`].
+pub(crate) fn relatch_multi_frame_blackhole(latched: LatchedMultiFrameBlackhole) {
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        debug_assert!(
+            slot.borrow().is_none(),
+            "relatch_multi_frame_blackhole overwrites a live latch"
+        );
+        *slot.borrow_mut() = Some(latched);
+    });
+}
+
+/// Unused abort image for `run_blackhole_interp_to_cancel_tracing`.
+///
+/// `dispatch_via_miframe` does not publish `aborted_framestack`. A walk
+/// that latched and then declined adopt still owns the live walker
+/// frames; convert-before-rewind should copy those, not the GUARD
+/// rebuild sitting on `MetaInterp.framestack`.
+pub(crate) fn take_latched_abort_framestack() -> Option<majit_metainterp::MIFrameStack> {
+    if let Some(latched) = take_multi_frame_blackhole() {
+        return Some(latched.framestack);
+    }
+    let latched = take_single_frame_blackhole()?;
+    Some(majit_metainterp::MIFrameStack::new(latched.miframe))
+}
+
+/// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` converts the live
+/// walker frames (`MIFrame.run_one_step` keeps `pc` current;
+/// `blackhole.py convert_and_run_from_pyjitpl` copies each `MIFrame.pc`).
+/// FBW latches that image into TLS; the Abort arm stages
+/// `TraceCtx.aborted_framestack` first, then the GUARD-rebuilt
+/// `MetaInterp.framestack`. Publish the latch so convert starts at the
+/// walk's current pc.
+pub(crate) fn publish_latched_abort_framestack(ctx: &mut majit_metainterp::TraceCtx) -> bool {
+    if ctx.aborted_framestack.is_some() {
+        return true;
+    }
+    let Some(stack) = take_latched_abort_framestack() else {
+        return false;
+    };
+    ctx.aborted_framestack = Some(stack);
+    true
+}
+
 /// Discard a staged abort that will not be adopted: the latched image and
 /// the session's coordinate claim together.
 ///

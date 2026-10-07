@@ -4932,11 +4932,6 @@ pub fn walk<Sym: WalkSym>(
                             ..
                         } | DispatchError::AbortPermanentMarkerReached { .. }
                     );
-                // Kept in lockstep with the epilogue's own gate: an abort that
-                // reports a MISSING value cannot be converted, because the
-                // image it would hand the blackhole is the one that just
-                // failed to resolve ([`DispatchError::leaves_complete_image`]).
-                //
                 // A translated builtin gateway is not an MIFrame.  Let its
                 // error unwind to the enclosing Python walk, where the same
                 // latch is built from that frame's own register banks.  If we
@@ -4947,15 +4942,18 @@ pub fn walk<Sym: WalkSym>(
                 // Trace-length is not deferred: `_interpret` checks it on the
                 // helper MIFrame itself, and the post-step arm below does too.
                 //
-                // A seeded inline whose abort is a modeling gap rather than a
-                // missing value latches even when the root allow-list has not
-                // named the class: `run_blackhole_interp_to_cancel_tracing`
-                // (`pyjitpl.py`) converts whatever `framestack` is live.
-                if coordinate_belongs_to_this_frame
-                    && (error.leaves_complete_image()
-                        || (frames_materialized && error.can_convert_seeded_inline()))
-                    && !carrier_owned
-                    && !abort_blackhole_latched()
+                // A missing-value abort in a transparent helper does not
+                // punch a hole in the enclosing Python frame.
+                // `fill_abort_miframe_register_banks` is the completeness
+                // check (`blackhole.py _copy_data_from_miframe` copies live
+                // boxes; the latch declines when a box has no concrete).
+                // Gating on the helper's error class skipped that latch
+                // (`GotoIfNotValueNotConcrete` is not in
+                // `leaves_complete_image`), so convert copied
+                // MetaInterp.framestack at the loop-header pc.
+                // `run_blackhole_interp_to_cancel_tracing` (`pyjitpl.py`)
+                // converts whatever `framestack` is live.
+                if coordinate_belongs_to_this_frame && !carrier_owned && !abort_blackhole_latched()
                 {
                     // The image belongs to THIS WalkContext's MIFrame, so its
                     // resume coordinate must be this frame's opcode boundary.

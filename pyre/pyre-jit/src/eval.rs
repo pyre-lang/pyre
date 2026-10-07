@@ -12178,26 +12178,6 @@ fn handle_fail(
                 true,
             )
         };
-        if matches!(
-            &resolution,
-            crate::call_jit::BridgeResolution::ResumeBlackhole
-        ) {
-            let (driver, _) = driver_pair();
-            if !driver
-                .meta_interp_mut()
-                .last_quasi_immutable_deps
-                .is_empty()
-            {
-                majit_metainterp::mc_diag_bump(77);
-            }
-        }
-        // compile.py record_loop_or_bridge registers dependencies
-        // for every compiled bridge, independent of its next resolution.
-        if let Some((green_key, _, _)) =
-            crate::call_jit::bridge_source_identity_from_descr(descr_arc)
-        {
-            register_quasi_immutable_deps(green_key);
-        }
         match resolution {
             crate::call_jit::BridgeResolution::CompiledContinue => {
                 // compile.py:708: bridge compiled → ContinueRunningNormally.
@@ -12913,7 +12893,7 @@ struct NestedTraceGuard<'a> {
 /// unextracted `majit-metainterp` (no ClassDef, no CallRegistry graph) —
 /// the `register_external` analog of those foreign bodies.
 #[majit_macros::dont_look_inside]
-fn park_nested_trace_if_tracing(driver: &mut JitDriver<PyreJitState>) -> bool {
+pub(crate) fn park_nested_trace_if_tracing(driver: &mut JitDriver<PyreJitState>) -> bool {
     // `is_tracing()` is only History in the `tracing` slot.
     // `with_trace_ctx_and_framestack` moves that History into
     // `compile_tracing` for the walk, and `profiler_tracing_active` is

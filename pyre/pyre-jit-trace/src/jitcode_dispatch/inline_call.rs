@@ -11035,8 +11035,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         );
         if let Some(slot) = raise_slot {
             let live = pyre_object::gc_roots::shadow_stack_get(slot);
-            if let Ok((DispatchOutcome::SubRaise { exc_concrete, .. }, _)) = &mut callee_outcome
-            {
+            if let Ok((DispatchOutcome::SubRaise { exc_concrete, .. }, _)) = &mut callee_outcome {
                 let old = *exc_concrete;
                 *exc_concrete = ConcreteValue::Ref(live);
                 if ctx.last_exc_value_concrete() == old {

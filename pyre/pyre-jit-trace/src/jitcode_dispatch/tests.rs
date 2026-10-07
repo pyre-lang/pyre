@@ -278,6 +278,44 @@ fn nested_park_restores_outer_escape_flush_undo() {
     assert_eq!(unflushed_escaped_callee(), outer_unflushed);
 }
 
+#[test]
+fn abort_trace_live_clears_live_history_before_blackhole_drive() {
+    // `pyjitpl.py run_blackhole_interp_to_cancel_tracing`: `aborted_tracing`
+    // then `convert_and_run_from_pyjitpl`. Nested `warmstate.py bound_reached`
+    // then finds no History to `write_boxes`. The profiler `finally` in
+    // `compile_and_run_once` stays open until after the blackhole, so
+    // `has_live_metainterp_attempt` still parks leftover driver state.
+    let mut meta = majit_metainterp::MetaInterp::<()>::new(0);
+    extern "C" fn portal_runner_helper() -> i64 {
+        0
+    }
+    let mut sd = majit_metainterp::JitDriverStaticData::new(vec![], vec![]);
+    sd.portal_runner_adr = portal_runner_helper as *const () as i64;
+    sd.index = Some(0);
+    let _idx = meta.register_jitdriver_sd(sd.clone());
+    meta.finish_setup_descrs_for_jitdrivers();
+    let key = 0xab07_u64;
+    let action = meta.force_start_tracing(key, (0, 0), None, Some(sd), &[]);
+    assert!(matches!(
+        action,
+        majit_metainterp::BackEdgeAction::StartedTracing
+    ));
+    assert!(
+        meta.live_history_mut().is_some(),
+        "force_start_tracing installs History"
+    );
+    meta.abort_trace_history(false);
+    meta.aborted_tracing(majit_metainterp::counters::ABORT_TOO_LONG);
+    assert!(
+        meta.live_history_mut().is_none(),
+        "aborted_tracing drops History before convert_and_run_from_pyjitpl"
+    );
+    assert!(
+        meta.has_live_metainterp_attempt(),
+        "compile_and_run_once finally closes the profiler after the blackhole"
+    );
+}
+
 fn finish_payload_of(outcome: &DispatchOutcome) -> Option<(OpRef, Type)> {
     match outcome {
         DispatchOutcome::Terminate {
