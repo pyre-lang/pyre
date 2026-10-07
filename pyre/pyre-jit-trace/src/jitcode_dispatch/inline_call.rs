@@ -1488,10 +1488,13 @@ pub(crate) fn helper_resume_reaches_blocker(
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return true;
     };
+    // Runtime-installed payloads (`install_codeless_jitcode`) live in
+    // `MetaInterpStaticData.jitcodes`, not the build-time `JITCODE_CELLS`
+    // table `get_jitcode_ref_by_index` reads. The payload already in
+    // hand is the body to scan.
+    let payload = std::sync::Arc::clone(&pjc);
     let scan = || {
-        let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-            return true;
-        };
+        let jitcode = &payload.jitcode;
         let descrs = crate::jitcode_runtime::descr_ref_table();
         let entry_array_lengths: Vec<(usize, usize)> =
             entry_array_len.map(|len| (0, len)).into_iter().collect();
@@ -4699,64 +4702,46 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     };
     // `typeobject.py W_TypeObject.descr_call` after `get_and_call_args`:
     // a non-None `__init__` result raises TypeError there, and the
-    // constructor is not re-entered. Keep the assembler record and play
-    // that tail after GUARD_NO_EXCEPTION (`ctor_continuation`
-    // `bh_check_init_returned_none`) instead of aborting into an entry replay.
-    // `check_init_returned_none` returns the TypeError without publishing
-    // into `BH_LAST_EXC_VALUE` / the compiled `_store_exception` cell.
-    // `execute_residual_call` is what consumes those channels after a
-    // concrete helper run (`BH_LAST_EXC_VALUE` cleared on read, then
-    // `drain_backend_jit_exc`); invoking `bh_check_init_returned_none` here
-    // would skip that consume and leave a pending exception for a later
-    // `GUARD_NO_EXCEPTION`. Record the residual, compute the error here.
-    let record_init_none_check = constructor_result.is_some();
-    let mut init_type_error = None;
+    // constructor is not re-entered. Keep the assembler record. The
+    // residual `bh_check_init_returned_none` below stands in for
+    // `is_w(w_result, w_None)` until the real `descr_call` graph is
+    // traced (follow-up: walls = oefmt `&[u8]` slice window, Acquire
+    // load in `w_type_disallows_instantiation`, shadow-stack root calls
+    // visible to the walker).
     if let Some((dst_bank, dst)) = dst {
         // `descr_call` discards `__init__`'s result after checking it is None
         // and returns `w_newobject`. The assembler result is `__init__`'s
-        // return; writing that into the CALL dst made `C()` evaluate to None,
-        // and residualizing the original CALL would re-run the prefix the
-        // sub-walk already executed. `opimpl_jit_merge_point` continues this
-        // frame, so the instance replaces None here, before GUARD_NOT_FORCED
-        // snapshots the dst. A non-None result skips the dst write: the CALL
-        // raises instead.
-        let write_err = if let Some((instance, instance_concrete)) = constructor_result {
-            if let ResidualExecOutcome::Executed(Ok(result)) = &exec
-                && let Err(e) = pyre_interpreter::call::check_init_returned_none(
-                    *result as pyre_object::PyObjectRef,
-                )
-            {
-                init_type_error = Some(e);
-            }
-            if init_type_error.is_some() {
-                Ok(())
-            } else {
-                match &exec {
-                    ResidualExecOutcome::Executed(Err(_)) => {
-                        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
-                    }
-                    _ => write_ref_reg(ctx, pc, dst, instance, instance_concrete),
+        // return; writing that into the CALL dst made `C()` evaluate to None.
+        // The instance is written only after the check, matching
+        // `descr_call`'s `return w_newobject`. A non-constructor call writes
+        // the assembler dest before `GUARD_NOT_FORCED` (`pyjitpl.py`
+        // `make_result_of_lastop`).
+        if constructor_result.is_none() {
+            if let Err(e) = write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result) {
+                if leave_callee_ec {
+                    leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
+                } else {
+                    abandon_portal_scope(ctx);
                 }
+                return Err(e);
             }
-        } else {
-            write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
-        };
-        if let Err(e) = write_err {
-            if leave_callee_ec {
-                leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
-            } else {
-                abandon_portal_scope(ctx);
-            }
-            return Err(e);
         }
     }
     // `opimpl_jit_merge_point` pops the frame holding the merge point
     // (`finishframe(None, leave_portal_frame=False)`) before its caller
     // records the call, so the guards below capture the callers alone. The
     // inline route is already in its caller; the bridge resume is still in
-    // the callee and scopes its captures to the callers.
+    // the callee and scopes its captures to the callers. A constructor
+    // keeps `descr_call`'s tail on those snapshots (`ctor_continuation`):
+    // deopt must run the None check before yielding the instance.
     let scope = GuardCaptureScope {
-        finished_callee_result: dst.is_none().then_some(ca_result),
+        finished_callee_result: if constructor_result.is_some() {
+            None
+        } else {
+            dst.is_none().then_some(ca_result)
+        },
+        constructor_assembler: constructor_result
+            .map(|(instance, _)| (instance, ca_result, constructor_assembler_caller)),
         ..Default::default()
     };
 
@@ -4769,7 +4754,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // `topframeref` — including when the snapshot aborts
     // (`GuardSnapshotVableUntyped`). The self-recursive fold uses the same
     // slot for `record_ec_leave_frame_chain`.
-    let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope);
+    let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope.clone());
     if leave_callee_ec {
         leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
     } else if portal_vref.is_some() {
@@ -4811,27 +4796,35 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
 
-    if record_init_none_check {
+    if let Some((instance, instance_concrete)) = constructor_result {
         // `W_TypeObject.descr_call` checks every successful `__init__`
         // result (`if not space.is_w(w_result, space.w_None)`), after
-        // `get_and_call_args` returns. Record that tail after this
-        // assembler GUARD_NO_EXCEPTION, matching `ctor_continuation`
-        // (`residual_call_r_v bh_check_init_returned_none` then `-live-`
-        // / GUARD_NO_EXCEPTION). The tracing-time outcome only chooses
-        // which continuation the walker takes; the residual itself is
-        // not gated on a non-None result, so a later compiled iteration
-        // that returns a value still raises. Do not invoke the helper at
-        // trace time: `check_init_returned_none` already computed the
-        // error, and a concrete `bh_check_init_returned_none` would
-        // publish into `BH_LAST_EXC_VALUE` without
-        // `execute_residual_call` consuming it.
+        // `get_and_call_args` returns. Record that residual after this
+        // assembler GUARD_NO_EXCEPTION. Do not walk `descr_call_tail`
+        // while tracing: that jitcode is a resume stand-in. The
+        // tracing-time outcome only chooses which continuation the
+        // walker takes; the residual itself is not gated on a non-None
+        // result, so a later compiled iteration that returns a value
+        // still raises. Do not invoke the helper at trace time:
+        // `check_init_returned_none` computes the error, and a concrete
+        // `bh_check_init_returned_none` would publish into
+        // `BH_LAST_EXC_VALUE` without `execute_residual_call` consuming
+        // it.
+        let mut init_type_error = None;
+        if let ResidualExecOutcome::Executed(Ok(result)) = &exec
+            && let Err(e) = pyre_interpreter::call::check_init_returned_none(
+                *result as pyre_object::PyObjectRef,
+            )
+        {
+            init_type_error = Some(e);
+        }
         ctx.trace_ctx.call_void_typed_with_effect(
             pyre_interpreter::residual_word_addr!(
                 1,
                 crate::ctor_continuation::bh_check_init_returned_none
             ) as *const (),
             &[ca_result],
-            &[majit_ir::Type::Ref],
+            &[Type::Ref],
             majit_metainterp::default_effect_info(),
         );
         if let Some(mut err) = init_type_error {
@@ -4849,6 +4842,17 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         }
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
+        // `descr_call` returns `w_newobject` only after the None check.
+        if let Some((_, dst_color)) = dst {
+            if let Err(e) = write_ref_reg(ctx, pc, dst_color, instance, instance_concrete) {
+                if leave_callee_ec {
+                    leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
+                } else {
+                    abandon_portal_scope(ctx);
+                }
+                return Err(e);
+            }
+        }
     }
 
     Ok(Some(WalkerLoopCalleePortalRecord {
@@ -11342,6 +11346,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             state.current_exception_seed_concrete = parent_state.current_exception_seed_concrete;
             state.outer_active_boxes = inline_outer_active_boxes;
         }
+        // Capture before `sub_wc` takes `ctx.trace_ctx`. The CALL lives in
+        // this walk's jitcode; the callee sub-walk's `inline_callee_consts`
+        // names the body being entered, not the caller.
+        let walk_jc_index = ctx.walk_jitcode_index();
+        let caller_resume_pc = op.next_pc;
         let mut sub_wc = WalkContext {
             frame_state: callee_state,
             // Path-1: resolve scalar static-field reads off this callee's own
@@ -11578,25 +11587,59 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `can_inline_callable` never found, the same callee was re-inlined on
         // the next attempt, and the root took neither the disable nor
         // `prepare_trace_segmenting`'s permanent stamp.
-        // pyjitpl.py `perform_call` → `newframe` then `ChangeFrame`, then
-        // `_interpret` runs `blackhole_if_trace_too_long` after that step.
-        // The log entry must exist before the abort: a too-long check that
-        // ran first left `portal_trace_positions` empty, so
-        // `find_biggest_function` named no callee and
+        // pyjitpl.py `perform_call` → `newframe` then `setup_call` then
+        // `ChangeFrame`; `_interpret` runs `blackhole_if_trace_too_long`
+        // after that step. The log entry must exist before the abort: a
+        // too-long check that ran first left `portal_trace_positions`
+        // empty, so `find_biggest_function` named no callee and
         // `prepare_trace_segmenting` wrote `JC_DONT_TRACE_HERE` on the portal.
+        // `allboxes` is greens then reds (`interp_jit.py`
+        // `['next_instr', 'is_being_profiled', 'pycode']` + `['frame', 'ec']`).
+        let w_code_ptr = pyre_object::gc_roots::shadow_stack_get(inline_code_slot);
+        let next_instr_box = sub_wc.trace_ctx.const_int(0);
+        let profiled_box = sub_wc.trace_ctx.const_int(is_being_profiled as i64);
+        let pycode_box = sub_wc.trace_ctx.const_ref(w_code_ptr as i64);
+        let mut argboxes = vec![
+            (majit_metainterp::JitArgKind::Int, next_instr_box, 0),
+            (
+                majit_metainterp::JitArgKind::Int,
+                profiled_box,
+                is_being_profiled as i64,
+            ),
+            (
+                majit_metainterp::JitArgKind::Ref,
+                pycode_box,
+                w_code_ptr as i64,
+            ),
+        ];
+        if callee_frame_seeded {
+            let frame_bits = match sub_wc.trace_ctx.concrete_of_opref(ca_callee_frame) {
+                Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+                _ => 0,
+            };
+            let ec_bits = match sub_wc.trace_ctx.concrete_of_opref(ca_callee_ec) {
+                Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+                _ => 0,
+            };
+            argboxes.push((
+                majit_metainterp::JitArgKind::Ref,
+                ca_callee_frame,
+                frame_bits,
+            ));
+            argboxes.push((majit_metainterp::JitArgKind::Ref, ca_callee_ec, ec_bits));
+        }
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
                 callee_green_key.get_uhash(),
                 // The callee's greens are in scope here, so the log carries
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.
-                crate::driver::make_green_key_typed(
-                    pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                    0,
-                    is_being_profiled,
-                ),
+                crate::driver::make_green_key_typed(w_code_ptr as *const (), 0, is_being_profiled),
             ),
             None,
+            &argboxes,
+            walk_jc_index,
+            caller_resume_pc,
         );
         // `_interpret` checks `blackhole_if_trace_too_long` after the
         // `run_one_step` that `newframe`s, before the callee's first
@@ -12023,8 +12066,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         );
         if let Some(slot) = raise_slot {
             let live = pyre_object::gc_roots::shadow_stack_get(slot);
-            if let Ok((DispatchOutcome::SubRaise { exc_concrete, .. }, _)) = &mut callee_outcome
-            {
+            if let Ok((DispatchOutcome::SubRaise { exc_concrete, .. }, _)) = &mut callee_outcome {
                 let old = *exc_concrete;
                 *exc_concrete = ConcreteValue::Ref(live);
                 if ctx.last_exc_value_concrete() == old {
@@ -12455,8 +12497,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // original CALL would re-run the prefix the sub-walk already
             // executed. A recorder refusal blackholes from the merge point
             // (the mid-body latch above; `ctor_continuation` plays the
-            // tail). When the recorder can emit, `descr_call`'s tail is the
-            // dst write that substitutes the instance for `__init__`'s None.
+            // tail). When the recorder can emit, the assembler's after-call
+            // guards snapshot that same tail, and the instance is written
+            // to the CALL dst only after `descr_call`'s None check.
             if !loop_callee_portal_call_can_record(
                 ctx,
                 ca_callee_frame,

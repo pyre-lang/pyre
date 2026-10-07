@@ -42,7 +42,10 @@
 //! `descr_call`.  Then `__init__` is a frame inside a frame, the discard and
 //! the None check are that graph's own jitcode, and this module deletes.
 //! Until then the stand-in is deliberately the smallest thing that can hold a
-//! resume coordinate: three ops, entered only by resume, never compiled.
+//! resume coordinate: the None check and `ref_return`, entered by resume.
+//! Tracing does not walk this jitcode. After a constructor `CALL_ASSEMBLER`
+//! the walker records a residual `bh_check_init_returned_none` in the
+//! caller until `type_descr_call_impl` is an ordinary inlined frame.
 //!
 //! Without such a level the constructor route cannot be seeded at all.  A
 //! blackhole level's return kind is decided by the `*_return` op the callee
@@ -62,19 +65,27 @@
 //!
 //! ```text
 //!   0:          inline_call_r_r <placeholder>, self -> init_result
-//!   resume_pc:  -live-                       [r0 live, r1 pending]
+//!   resume_pc:  -live-                       [r0 live, r1 live]
 //!               residual_call_r_v  bh_check_init_returned_none(init_result)
+//!               -live-                       [r0 live]
 //!               ref_return         instance
 //! ```
 //!
-//! The level is only ever *resumed*, never entered from the top:
+//! r1 is live at the resume `-live-` so a post-return guard
+//! (`CALL_ASSEMBLER` `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) can resume
+//! here with `__init__`'s result already in `descr_call`'s `w_result`, the
+//! same `get_list_of_active_boxes(after_residual_call=True)` (`pyjitpl.py`)
+//! window. An in-dunder abort still fills that slot through
+//! `_setup_return_value_r` (`blackhole.py`).
+//!
+//! The blackhole only ever *resumes* the level, never enters it from the top:
 //! `blackhole_from_resumedata` sets each level's `position` from its resume
 //! section, and `run_this_frame` dispatches forward from there.  The
-//! `inline_call` before the anchor therefore never decodes — it exists because
-//! `_setup_return_value_r` reads `code[position-1]`, the call's result
-//! register. Its callee operand is a placeholder for the same reason: the
-//! instruction is never executed, and the real callee varies per class while
-//! this jitcode is shared.
+//! `inline_call` before the anchor therefore never decodes — it exists
+//! because `_setup_return_value_r` reads `code[position-1]`, the call's
+//! result register. Its callee operand is a placeholder for the same reason:
+//! the instruction is never executed, and the real callee varies per class
+//! while this jitcode is shared.
 
 use crate::PyJitCode;
 use majit_metainterp::jitcode::{JitCallArg, JitCodeBuilder};
@@ -85,9 +96,9 @@ pub(crate) const INSTANCE_REG: u16 = 0;
 
 /// Where the inlined `__init__`'s return lands when it leaves the blackhole
 /// (`_setup_return_value_r` → `call_result_reg`).  `descr_call`'s `w_result`.
-/// Never carried by the resume section: `get_list_of_active_boxes(in_a_call=
-/// True)` (`pyjitpl.py`) clears a caller's pending call-result slot, and this
-/// register is exactly that slot.
+/// Live at the resume `-live-` so a post-return assembler guard can carry it;
+/// `get_list_of_active_boxes(in_a_call=True)` (`pyjitpl.py`) still clears the
+/// slot to a placeholder that `_setup_return_value_r` overwrites.
 pub(crate) const INIT_RESULT_REG: u16 = 1;
 
 /// Callee operand of the never-decoded `inline_call`.  See the module doc:
@@ -103,10 +114,10 @@ const PLACEHOLDER_CALLEE: u16 = 0;
 /// would be a signature mismatch.  A refusal publishes through
 /// `ResidualError::publish_residual` (`jit_publish_residual_error`):
 /// `BH_LAST_EXC_VALUE` for the blackhole handler and the compiled
-/// `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` cell.  The walker records this
-/// helper after a loop-callee `CALL_ASSEMBLER` so a non-None `__init__`
-/// result raises as `descr_call`'s outcome instead of aborting into an
-/// entry replay.
+/// `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` cell.  After a loop-callee
+/// `CALL_ASSEMBLER` the walker records this helper as a residual in the
+/// caller so a non-None `__init__` result raises as `descr_call`'s
+/// outcome instead of aborting into an entry replay.
 pub extern "C" fn bh_check_init_returned_none(result: pyre_object::PyObjectRef) {
     if let Err(err) = pyre_interpreter::call::check_init_returned_none(result) {
         use majit_ir::helper_fnaddr::ResidualError;
@@ -164,18 +175,27 @@ fn build() -> Option<(i32, usize)> {
     // `-live-` operands are 2-byte offsets into the ONE shared
     // `MetaInterpStaticData.liveness_info` pool (`pyjitpl.py`), so the
     // triple is interned there rather than in a private assembler buffer.
-    let liveness_offset = crate::state::intern_liveness(&[], &[INSTANCE_REG as u8], &[])?;
+    //
+    // A post-return guard (`GUARD_NOT_FORCED` after `CALL_ASSEMBLER`) resumes
+    // HERE with `__init__`'s result already in r1, so that register is live
+    // at the resume `-live-`. An in-dunder abort still fills the slot
+    // through `_setup_return_value_r` (`blackhole.py`).
+    let liveness_offset =
+        crate::state::intern_liveness(&[], &[INSTANCE_REG as u8, INIT_RESULT_REG as u8], &[])?;
     let live_patch = builder.live_placeholder();
     builder.patch_live_offset(live_patch, liveness_offset);
 
     let funcptr = pyre_interpreter::residual_word_addr!(1, bh_check_init_returned_none) as i64;
-    let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
-        // One `Ref` argument, no result: the same signature
-        // `bh_check_init_returned_none` is declared with.
-        arg_classes: "r".to_string(),
-        result_type: 'v',
-        ..Default::default()
-    };
+    // `descr_call` can raise TypeError on a non-None `__init__` result
+    // (`check_can_raise`) and does not force a virtualizable
+    // (`check_forces_virtual_or_virtualizable` is false). Blackhole
+    // resume runs this residual from the resume `-live-`; the EffectInfo
+    // matches `handle_possible_exception` after `get_and_call_args`.
+    let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr::from_arg_classes(
+        "r".to_string(),
+        'v',
+        majit_metainterp::can_raise_effect_info(),
+    );
     builder.residual_call_void_canonical_typed_args(
         funcptr,
         &[JitCallArg {
@@ -184,6 +204,14 @@ fn build() -> Option<(i32, usize)> {
         }],
         calldescr,
     );
+
+    // `generate_guard(after_residual_call=True)` (`pyjitpl.py`) resumes at
+    // the `-live-` the codewriter emits immediately after a can-raise
+    // residual. Blackhole resume of this level uses that coordinate;
+    // tracing does not walk the tail.
+    let after_residual_liveness = crate::state::intern_liveness(&[], &[INSTANCE_REG as u8], &[])?;
+    let after_residual_live = builder.live_placeholder();
+    builder.patch_live_offset(after_residual_live, after_residual_liveness);
 
     // `descr_call` returns `w_newobject`, not `__init__`'s result.
     builder.ref_return(INSTANCE_REG);
@@ -243,11 +271,11 @@ mod tests {
             "the anchor must be addressable as a resume coordinate",
         );
         // `run_inner` asserts membership on every dispatched position, not
-        // only the entry one, so the tail's three remaining ops need theirs
-        // too: `inline_call`, `-live-`, `residual_call_r_v`, `ref_return`.
+        // only the entry one, so the tail's remaining ops need theirs too:
+        // `inline_call`, `-live-`, `residual_call_r_v`, `-live-`, `ref_return`.
         assert_eq!(
             startpoints.len(),
-            4,
+            5,
             "startpoints must cover every op in the tail, got {startpoints:?}",
         );
     }
@@ -273,6 +301,26 @@ mod tests {
             payload.resolve_resume_pc_with_jitcode_pc(resume_pc as i32, crate::state::op_live()),
             Some(resume_pc),
             "the parent loop must resolve the anchor to itself",
+        );
+    }
+
+    /// Post-return assembler guards plant `__init__`'s result in r1, so both
+    /// the instance and that result have to be live at the resume `-live-`.
+    #[test]
+    fn resume_liveness_names_the_instance_and_init_result() {
+        let Some((index, resume_pc)) = level() else {
+            return;
+        };
+        let live = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            index,
+            resume_pc as i32,
+        )
+        .expect("the resume `-live-` must decode");
+        assert!(live.int.is_empty() && live.float.is_empty());
+        assert_eq!(
+            live.ref_,
+            vec![INSTANCE_REG as u32, INIT_RESULT_REG as u32],
+            "after_residual_call liveness carries w_newobject and w_result",
         );
     }
 

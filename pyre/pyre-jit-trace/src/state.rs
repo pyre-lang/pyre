@@ -1526,7 +1526,7 @@ pub(crate) fn sub_jitcode_body_for_code(
     sub_jitcode_body_from_payload(&pjc)
 }
 
-fn sub_jitcode_body_from_payload(
+pub(crate) fn sub_jitcode_body_from_payload(
     pjc: &crate::PyJitCode,
 ) -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
     let jc = &pjc.jitcode;
@@ -1604,7 +1604,7 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
     Some(sub_descr_pool_for_payload(&pjc))
 }
 
-fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
+pub(crate) fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
     use majit_metainterp::jitcode::RuntimeBhDescr;
     *pjc.sub_descr_pool.get_or_init(|| {
         // SAFETY: the borrow is valid for `'static` because the payload is
@@ -3996,17 +3996,41 @@ pub(crate) fn note_root_trace_too_long(
     }
 }
 
-/// pyjitpl.py `_opimpl_recursive_call` → `perform_call` → `newframe` for a
-/// callee the FBW walker is about to inline.
+/// pyjitpl.py `_opimpl_recursive_call`: the decoder consumes the whole
+/// call (result byte included) and stores `frame.pc = code_cursor` before
+/// `perform_call` → `newframe` + `setup_call`. FBW walks the body instead,
+/// so the MetaInterp caller still has pc 0 (or a guard-rebuild coordinate)
+/// until this publishes the post-call position.
+///
+/// `caller_resume_pc` is the walk's `op.next_pc`. It is a coordinate in
+/// the caller only when `caller.jitcode` is the walk jitcode.
+fn publish_caller_pc_past_inlined_call(
+    caller: &mut majit_metainterp::MIFrame,
+    walk_jitcode_index: Option<usize>,
+    caller_resume_pc: usize,
+) {
+    let code_len = caller.jitcode.code.len();
+    if caller.jitcode.try_index() == walk_jitcode_index
+        && caller_resume_pc > 0
+        && caller_resume_pc <= code_len
+    {
+        caller.pc = caller_resume_pc;
+    }
+}
+
+/// pyjitpl.py `_opimpl_recursive_call` → `perform_call` for a callee the
+/// FBW walker is about to inline.
 ///
 /// Upstream fills `portal_trace_positions` from `newframe`, reached through
 /// `_opimpl_recursive_call`'s greenkey-bearing `perform_call`. The walker
-/// inlines a Python callee by walking its body directly and never builds an
-/// `MIFrame`, so that `newframe` never ran and `find_biggest_function` read
-/// an empty log. This runs the same `newframe`; `newframe` itself appends
+/// inlines a Python callee by walking its body directly, so that
+/// `perform_call` never ran and `find_biggest_function` read an empty log.
+/// This is the same `perform_call`; `newframe` appends
 /// `(jitcode.jitdriver_sd, greenkey, self.history.get_trace_position())`
 /// from `tracing.or(compile_tracing)`, the one `TraceCtx` the walker holds a
 /// `&mut` into, so the walker does not stamp or append anything of its own.
+/// `setup_call` runs before any abort can observe the framestack
+/// (`perform_call`: `newframe` then `setup_call`, nothing in between).
 ///
 /// Returns the owning driver when this is a recursive portal activation.
 /// A normal exit pairs with [`note_inline_subwalk_end`]. `TraceTooLong` does
@@ -4016,6 +4040,9 @@ pub(crate) fn note_root_trace_too_long(
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
     portal_index: Option<usize>,
+    argboxes: &[(majit_metainterp::JitArgKind, OpRef, i64)],
+    walk_jitcode_index: Option<usize>,
+    caller_resume_pc: usize,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;
     // `None` is the Python portal (driver 0). A recursive call passes the
@@ -4030,10 +4057,17 @@ pub(crate) fn note_inline_subwalk_start(
         return None;
     }
     let jd_no = canonical.jitdriver_sd()?;
-    // pyjitpl.py `newframe(portal_code, greenkey)` — one owner for
-    // portal_call_depth, call_ids, ENTER_PORTAL_FRAME, and the log.
     let jitcode = crate::jitcode_runtime::get_runtime_jitcode_by_index(index)?;
-    meta.newframe(jitcode, Some(green_key));
+    // pyjitpl.py `_opimpl_recursive_call`: `frame.pc = code_cursor` after
+    // the decoder consumes the call, then `perform_call`. Callers below
+    // the top already published it when pushing their callees
+    // (`run_blackhole_interp_to_cancel_tracing`).
+    if let Some(caller) = meta.framestack.frames.last_mut() {
+        publish_caller_pc_past_inlined_call(caller, walk_jitcode_index, caller_resume_pc);
+    }
+    // pyjitpl.py `perform_call`: `newframe` then `setup_call`. FBW walks
+    // the body instead of raising `ChangeFrame`.
+    let _ = meta.perform_call(jitcode, argboxes, Some(green_key));
     majit_metainterp::mc_diag_bump(58);
     Some(jd_no)
 }
@@ -6017,32 +6051,36 @@ pub(crate) fn concrete_frame_local_is_writable(value: &Value) -> bool {
 /// (`own_frame_array_store_target` → `store_live_frame_array_slot`); this
 /// write still covers every slot, including those above `valuestackdepth`
 /// (`pyframe.py popvalue` stores None there). `write_boxes` unwraps every
-/// box: `Void` / `NO_CONCRETE` / a missing entry never reached this helper
-/// (556 residual flushes across 80 synth fixtures). A `debug_assert!` names
-/// that invariant; release still skips so boxing cannot store `PY_NULL`.
-pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usize) {
+/// box. A missing entry, `Void`, or `NO_CONCRETE` declines the whole write
+/// so the frame is left untouched.
+pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usize) -> bool {
     if frame == 0 {
-        return;
+        return false;
     }
     let Some(info) = ctx.virtualizable_info() else {
-        return;
+        return false;
+    };
+    let Some(len) = concrete_frame_array_len(frame) else {
+        return false;
     };
     let static_count = info.num_static_extra_boxes;
+    let base = static_count;
+    for index in 0..static_count {
+        if !known_vable_slot_is_readable(ctx, index) {
+            return false;
+        }
+    }
+    for j in 0..len {
+        if !known_vable_slot_is_readable(ctx, base + j) {
+            return false;
+        }
+    }
     for index in 0..static_count {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(index) else {
-            debug_assert!(
-                false,
-                "write_boxes: static slot {index} must have a virtualizable box"
-            );
-            continue;
+            return false;
         };
-        let bits = known_vable_bits(&value);
-        debug_assert!(
-            bits.is_some(),
-            "write_boxes: static slot {index} must carry a runtime concrete (not Void/NO_CONCRETE)"
-        );
-        let Some(bits) = bits else {
-            continue;
+        let Some(bits) = known_vable_bits(&value) else {
+            return false;
         };
         match info.static_fields.get(index).map(|field| field.field_type) {
             Some(Type::Int) => store_live_frame_static_int(frame, index, bits),
@@ -6054,33 +6092,21 @@ pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usiz
             frame as pyre_object::gc_hook::GCREF,
         ) as usize;
         if frame == 0 {
-            return;
+            return false;
         }
     }
-    let Some(len) = concrete_frame_array_len(frame) else {
-        return;
-    };
-    let base = static_count;
     for j in 0..len {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + j) else {
-            debug_assert!(
-                false,
-                "write_boxes: array item {j} must have a virtualizable box"
-            );
-            continue;
+            return false;
         };
-        debug_assert!(
-            known_vable_bits(&value).is_some(),
-            "write_boxes: array item {j} must carry a runtime concrete (not Void/NO_CONCRETE)"
-        );
-        let Some(_) = known_vable_bits(&value) else {
-            continue;
-        };
+        if known_vable_bits(&value).is_none() {
+            return false;
+        }
         frame = pyre_object::gc_hook::try_gc_current_object_address(
             frame as pyre_object::gc_hook::GCREF,
         ) as usize;
         if frame == 0 {
-            return;
+            return false;
         }
         // GCREF array items (`write_boxes` unwrap + setarrayitem) are
         // already boxed; `store_live_frame_array_slot` is the same
@@ -6094,6 +6120,14 @@ pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usiz
                 }
             }
         }
+    }
+    true
+}
+
+fn known_vable_slot_is_readable(ctx: &TraceCtx, index: usize) -> bool {
+    match ctx.virtualizable_entry_at(index) {
+        Some((_, value)) => known_vable_bits(&value).is_some(),
+        None => false,
     }
 }
 
@@ -13909,7 +13943,7 @@ mod tests {
         }
     }
 
-    /// Shipped FBW abort: `note_inline_subwalk_start` is `newframe`, then
+    /// Shipped FBW abort: `note_inline_subwalk_start` is `perform_call`, then
     /// `note_root_trace_too_long` is `blackhole_if_trace_too_long`. The log
     /// must name `names()` so the portal cell is not `JC_DONT_TRACE_HERE`.
     #[test]
@@ -13957,7 +13991,7 @@ mod tests {
             meta.warm_state_for_driver(idx0)
                 .attach_procedure_to_interp_for_key(&portal, std::sync::Arc::clone(&token));
         }
-        let started = note_inline_subwalk_start((names_hash, names.clone()), None);
+        let started = note_inline_subwalk_start((names_hash, names.clone()), None, &[], None, 0);
         assert!(
             started.is_some(),
             "note_inline_subwalk_start logs names() through the portal jitcode"
@@ -14010,6 +14044,37 @@ mod tests {
                 "maybe_compile_and_run still finds the already-compiled portal cell"
             );
         }
+    }
+
+    /// pyjitpl.py `_opimpl_recursive_call` stores `frame.pc` past the call
+    /// before `perform_call`. An unindexed caller whose walk index is also
+    /// `None` is that matching case: `caller_resume_pc` is the dest-byte
+    /// coordinate `_setup_return_value_r` later reads as `code[position-1]`.
+    #[test]
+    fn publish_caller_pc_past_inlined_call_stamps_matching_walk() {
+        use majit_metainterp::jitcode::JitCodeBuilder;
+        let mut b = JitCodeBuilder::default();
+        b.inline_call_r_r(0, &[], Some(7));
+        let post = b.current_pos();
+        b.void_return();
+        let jitcode = std::sync::Arc::new(b.finish());
+        assert_eq!(jitcode.code[post - 1], 7);
+        let mut caller = majit_metainterp::MIFrame::new(jitcode, 0);
+        publish_caller_pc_past_inlined_call(&mut caller, None, post);
+        assert_eq!(caller.pc, post);
+    }
+
+    /// A caller that already published its pc when pushing an earlier
+    /// callee is left alone when the walk jitcode does not match.
+    #[test]
+    fn publish_caller_pc_leaves_nonzero_when_walk_differs() {
+        use majit_metainterp::jitcode::JitCodeBuilder;
+        let mut b = JitCodeBuilder::default();
+        b.void_return();
+        let jitcode = std::sync::Arc::new(b.finish());
+        let mut caller = majit_metainterp::MIFrame::new(jitcode, 40);
+        publish_caller_pc_past_inlined_call(&mut caller, Some(99), 0);
+        assert_eq!(caller.pc, 40);
     }
 
     #[test]
@@ -17459,18 +17524,24 @@ pub(crate) fn setup_reconstructed_callee_frame(
             };
             let _ = pyre_object::gc_roots::pin_root(value);
         }
+        // `consume_boxes` / `decode_box` read the box's current GCREF
+        // (`liveboxes` / `get_ref_value`). This recipe is a clone; a
+        // preceding publication or allocation can forward the recorder
+        // cell without rewriting `concrete_r`, so re-read it here.
         for k in stack_base..valuestackdepth {
-            let from_recipe = recipe
+            let opref = recipe.registers_r.get(k).copied().unwrap_or(OpRef::NONE);
+            let captured = recipe
                 .concrete_r
                 .get(k)
-                .and_then(|&captured| match captured {
-                    majit_ir::Value::Ref(gc)
-                        if gc != majit_ir::GcRef::NO_CONCRETE && !gc.is_null() =>
-                    {
-                        Some(gc.as_usize() as pyre_object::PyObjectRef)
-                    }
-                    _ => None,
-                });
+                .copied()
+                .unwrap_or(majit_ir::Value::Void);
+            let live = rooted_recipe_ref(ctx, opref, captured);
+            let from_recipe = match live {
+                majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE && !gc.is_null() => {
+                    Some(gc.as_usize() as pyre_object::PyObjectRef)
+                }
+                _ => None,
+            };
             let from_orig = orig_frame
                 .and_then(|orig| concrete_stack_value(orig as usize, k).filter(|p| !p.is_null()));
             let value = match (from_recipe, from_orig) {

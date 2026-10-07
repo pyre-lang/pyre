@@ -2939,11 +2939,16 @@ impl Default for ResumeDataVirtualAdder {
     }
 }
 
-/// A handle to a `ResumeDataLoopMemo` some in-flight `Optimizer` still owns.
+/// Strong handle to a `ResumeDataLoopMemo` an in-flight compile numbered.
 ///
-/// `Weak`, so a dropped `Optimizer` needs no unregister hook; the root walk
-/// drops the handles that no longer upgrade.
-pub type LiveResumeMemo = std::rc::Weak<std::cell::RefCell<ResumeDataLoopMemo>>;
+/// `resume.py ResumeDataVirtualAdder.finish` does
+/// `storage.rd_consts = self.memo.consts`. The `Optimizer` that owns the
+/// memo is dropped when `optimize_trace` returns, and
+/// `backend.compile_loop` can collect before `insert_compiled_loop`
+/// publishes the same `Arc` on `exit_layouts`. Keep the memo until
+/// `CompileSnapshotRootsGuard` drops (after that insert) so
+/// `walk_rd_consts_refs` still forwards the pool in that window.
+pub type LiveResumeMemo = std::rc::Rc<std::cell::RefCell<ResumeDataLoopMemo>>;
 
 /// Shared resume data storage that deduplicates common snapshot sections
 /// across multiple guards in the same trace.

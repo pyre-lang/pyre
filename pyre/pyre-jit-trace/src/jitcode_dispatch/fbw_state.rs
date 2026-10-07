@@ -743,7 +743,7 @@ pub fn restore_walk_tls() {
     super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(parked.unflushed_escaped_callee));
 }
 
-fn visit_pyobject_ref(
+pub(crate) fn visit_pyobject_ref(
     slot: &mut pyre_object::PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
@@ -751,6 +751,63 @@ fn visit_pyobject_ref(
         return;
     }
     visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+}
+
+/// Visit a raw frame address as a GC ref slot and write the forwarded
+/// address back in place.  Null is skipped.
+pub(crate) fn visit_frame_addr(addr: &mut usize, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    if *addr == 0 {
+        return;
+    }
+    visitor(unsafe { &mut *(addr as *mut usize).cast() });
+}
+
+/// Forward every GC word the store-journal TLS still holds for a live frame.
+///
+/// Shared by the live extra-area walker and [`walk_parked_walk_tls_stack`] so
+/// the field lists cannot diverge.  A JIT-created `PyFrame` can live in the
+/// nursery; while the outer walk is parked, a nested trace can minor-collect
+/// and move it.  `gc_current_object_address` (`live_frame_addr`) is not a
+/// root — it only follows a forwarding stub that still exists.
+/// `shadowstack.py` `push_roots` pushes every live GC var;
+/// `rthread.py` `_trace_tlref` walks every GC field of a TLS-held object.
+/// A 0 / null address is skipped.  `EscapeFlushUndo.frame_root` stays a
+/// shadow-stack owner root; this still rewrites the parked `.frame` copy.
+pub(crate) fn visit_journalled_frame_roots(
+    exit_last_instr_undo: &mut [(usize, isize)],
+    frame_vsd_undo: &mut [(usize, usize)],
+    locals_mirror_undo: &mut [FbwLocalsMirrorUndo],
+    generator_yield_tos: &mut Option<GeneratorStackStore>,
+    unflushed_escaped_callee: &mut usize,
+    escape_flush_undo: &mut Option<super::EscapeFlushUndo>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    for (frame, _) in exit_last_instr_undo.iter_mut() {
+        visit_frame_addr(frame, visitor);
+    }
+    for (frame, _) in frame_vsd_undo.iter_mut() {
+        visit_frame_addr(frame, visitor);
+    }
+    for entry in locals_mirror_undo.iter_mut() {
+        visit_frame_addr(&mut entry.frame, visitor);
+        for slot in &mut entry.slots {
+            visit_pyobject_ref(slot, visitor);
+        }
+    }
+    if let Some(store) = generator_yield_tos.as_mut() {
+        visit_frame_addr(&mut store.frame, visitor);
+        store.value.trace_const_ptr(visitor);
+    }
+    visit_frame_addr(unflushed_escaped_callee, visitor);
+    if let Some(undo) = escape_flush_undo.as_mut() {
+        visit_frame_addr(&mut undo.frame, visitor);
+        for slot in &mut undo.slots {
+            visit_pyobject_ref(slot, visitor);
+        }
+        for slot in &mut undo.flush_image {
+            visit_pyobject_ref(slot, visitor);
+        }
+    }
 }
 
 fn walk_parked_abort_resume(
@@ -832,9 +889,7 @@ pub(crate) fn walk_parked_walk_tls_stack(
             }
         }
         for entry in &mut parked.namespace_store_journal {
-            visit_pyobject_ref(&mut entry.namespace, visitor);
-            visit_pyobject_ref(&mut entry.name, visitor);
-            visit_pyobject_ref(&mut entry.displaced, visitor);
+            entry.visit_gc_refs(visitor);
         }
         for displaced in &mut parked.sys_exc_journal {
             visit_pyobject_ref(displaced, visitor);
@@ -864,28 +919,21 @@ pub(crate) fn walk_parked_walk_tls_stack(
             op.trace_const_ptr(visitor);
             visit_pyobject_ref(prev, visitor);
         }
-        for entry in &mut parked.locals_mirror_undo {
-            for slot in &mut entry.slots {
-                visit_pyobject_ref(slot, visitor);
-            }
-        }
-        if let Some(store) = parked.generator_yield_tos.as_mut() {
-            store.value.trace_const_ptr(visitor);
-        }
+        visit_journalled_frame_roots(
+            &mut parked.exit_last_instr_undo,
+            &mut parked.frame_vsd_undo,
+            &mut parked.locals_mirror_undo,
+            &mut parked.generator_yield_tos,
+            &mut parked.unflushed_escaped_callee,
+            &mut parked.escape_flush_undo,
+            visitor,
+        );
         if let Some(finish) = parked.finish_concrete.as_mut() {
             let value = match finish {
                 FinishConcrete::Return(value) | FinishConcrete::Raise(value) => value,
             };
             if let ConcreteValue::Ref(ptr) = value {
                 visit_pyobject_ref(ptr, visitor);
-            }
-        }
-        if let Some(undo) = parked.escape_flush_undo.as_mut() {
-            for slot in &mut undo.slots {
-                visit_pyobject_ref(slot, visitor);
-            }
-            for slot in &mut undo.flush_image {
-                visit_pyobject_ref(slot, visitor);
             }
         }
     }
@@ -929,6 +977,236 @@ mod parked_walk_tls_root_tests {
         resume_tx.send(()).unwrap();
         assert_eq!(seen, vec![live, parked]);
         owner.join().unwrap();
+    }
+
+    #[test]
+    fn parked_namespace_store_forwards_written() {
+        let (area_tx, area_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let forwarded = 0xA55_usize;
+        let owner = std::thread::spawn(move || {
+            let namespace = 0xA11_usize as pyre_object::PyObjectRef;
+            let name = 0xA22_usize as pyre_object::PyObjectRef;
+            let displaced = 0xA33_usize as pyre_object::PyObjectRef;
+            let written = 0xA44_usize as pyre_object::PyObjectRef;
+            fbw_namespace_store_journal_push(namespace, name, displaced, false, Some(written));
+            park_walk_tls();
+            area_tx
+                .send((
+                    capture_fbw_store_journal_root_area() as usize,
+                    namespace as usize,
+                    name as usize,
+                    displaced as usize,
+                    written as usize,
+                ))
+                .unwrap();
+            resume_rx.recv().unwrap();
+            restore_walk_tls();
+            let mut restored = Vec::new();
+            fbw_store_journal_root_walker(&mut |root| {
+                if root.as_usize() != 0 {
+                    restored.push(root.as_usize());
+                }
+            });
+            fbw_store_journal_reset();
+            restored
+        });
+
+        let (area, namespace, name, displaced, written) = area_rx.recv().unwrap();
+        let mut seen = Vec::new();
+        unsafe {
+            super::super::fbw_store_journal_root_walker_area(area as *const (), &mut |root| {
+                let addr = root.as_usize();
+                if addr != 0 {
+                    seen.push(addr);
+                }
+                if addr == written {
+                    *root = majit_ir::GcRef(forwarded);
+                }
+            });
+        }
+        resume_tx.send(()).unwrap();
+        let restored = owner.join().unwrap();
+        assert!(
+            seen.contains(&written),
+            "parked walker must visit written: {seen:?}"
+        );
+        assert!(
+            restored.contains(&forwarded),
+            "written must be forwarded in place: {restored:?}"
+        );
+        for slot in [namespace, name, displaced] {
+            assert!(
+                seen.contains(&slot),
+                "parked walker must visit {slot:#x}: {seen:?}"
+            );
+        }
+    }
+
+    const FRAME_DELTA: usize = 0x1000;
+    const LOCALS_FRAME: usize = 0x0000_F101;
+    const UNFLUSHED_FRAME: usize = 0x0000_F102;
+    const EXIT_FRAME: usize = 0x0000_F103;
+    const VSD_FRAME: usize = 0x0000_F104;
+    const YIELD_FRAME: usize = 0x0000_F105;
+    const ESCAPE_FRAME: usize = 0x0000_F106;
+
+    fn arm_journalled_frame_addrs() {
+        FBW_LOCALS_MIRROR_UNDO.with(|c| {
+            c.borrow_mut().push(FbwLocalsMirrorUndo {
+                frame: LOCALS_FRAME,
+                slots: Vec::new(),
+            });
+        });
+        UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(UNFLUSHED_FRAME));
+        FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().push((EXIT_FRAME, 0)));
+        FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().push((VSD_FRAME, 0)));
+        FBW_GENERATOR_YIELD_TOS.with(|c| {
+            c.set(Some(GeneratorStackStore {
+                frame: YIELD_FRAME,
+                slot: 0,
+                value: OpRef::const_int(0),
+            }));
+        });
+        ESCAPE_FLUSH_UNDO.with(|c| {
+            *c.borrow_mut() = Some(EscapeFlushUndo {
+                frame: ESCAPE_FRAME,
+                frame_root: None,
+                last_instr: 0,
+                valuestackdepth: 0,
+                slots: Vec::new(),
+                flush_image: Vec::new(),
+            });
+        });
+    }
+
+    fn journalled_frame_addrs() -> [usize; 6] {
+        [
+            FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow()[0].frame),
+            UNFLUSHED_ESCAPED_CALLEE.with(|c| c.get()),
+            FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow()[0].0),
+            FBW_FRAME_VSD_UNDO.with(|c| c.borrow()[0].0),
+            FBW_GENERATOR_YIELD_TOS.with(|c| c.get().unwrap().frame),
+            ESCAPE_FLUSH_UNDO.with(|c| c.borrow().as_ref().unwrap().frame),
+        ]
+    }
+
+    fn forward_journalled_frame_addrs() -> Vec<usize> {
+        let olds = [
+            LOCALS_FRAME,
+            UNFLUSHED_FRAME,
+            EXIT_FRAME,
+            VSD_FRAME,
+            YIELD_FRAME,
+            ESCAPE_FRAME,
+        ];
+        let mut seen = Vec::new();
+        unsafe {
+            super::super::fbw_store_journal_root_walker_area(
+                capture_fbw_store_journal_root_area(),
+                &mut |root| {
+                    if olds.contains(&root.0) {
+                        seen.push(root.0);
+                        root.0 += FRAME_DELTA;
+                    }
+                },
+            );
+        }
+        seen.sort_unstable();
+        seen
+    }
+
+    #[test]
+    fn parked_walker_forwards_journalled_frame_addrs() {
+        // Nested `compile_and_run_once` parks the outer journals. A JIT-created
+        // PyFrame can live in the nursery; the parked copies of those raw
+        // addresses have to move with it (`shadowstack.py` `push_roots`).
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                restore_walk_tls();
+                fbw_store_journal_reset();
+                discard_escape_flush_undo();
+                reset_unflushed_escaped_callee();
+            }
+        }
+        let _restore = RestoreOnDrop;
+        fbw_store_journal_reset();
+        discard_escape_flush_undo();
+        reset_unflushed_escaped_callee();
+        arm_journalled_frame_addrs();
+        park_walk_tls();
+
+        let seen = forward_journalled_frame_addrs();
+        let mut expected = [
+            LOCALS_FRAME,
+            UNFLUSHED_FRAME,
+            EXIT_FRAME,
+            VSD_FRAME,
+            YIELD_FRAME,
+            ESCAPE_FRAME,
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "parked walker must visit every journalled frame addr"
+        );
+
+        restore_walk_tls();
+        assert_eq!(
+            journalled_frame_addrs(),
+            [
+                LOCALS_FRAME + FRAME_DELTA,
+                UNFLUSHED_FRAME + FRAME_DELTA,
+                EXIT_FRAME + FRAME_DELTA,
+                VSD_FRAME + FRAME_DELTA,
+                YIELD_FRAME + FRAME_DELTA,
+                ESCAPE_FRAME + FRAME_DELTA,
+            ]
+        );
+    }
+
+    #[test]
+    fn live_store_journal_area_forwards_journalled_frame_addrs() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                fbw_store_journal_reset();
+                discard_escape_flush_undo();
+                reset_unflushed_escaped_callee();
+            }
+        }
+        let _restore = RestoreOnDrop;
+        fbw_store_journal_reset();
+        discard_escape_flush_undo();
+        reset_unflushed_escaped_callee();
+        arm_journalled_frame_addrs();
+
+        let seen = forward_journalled_frame_addrs();
+        let mut expected = [
+            LOCALS_FRAME,
+            UNFLUSHED_FRAME,
+            EXIT_FRAME,
+            VSD_FRAME,
+            YIELD_FRAME,
+            ESCAPE_FRAME,
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "live extra-area walker must visit every journalled frame addr"
+        );
+        assert_eq!(
+            journalled_frame_addrs(),
+            [
+                LOCALS_FRAME + FRAME_DELTA,
+                UNFLUSHED_FRAME + FRAME_DELTA,
+                EXIT_FRAME + FRAME_DELTA,
+                VSD_FRAME + FRAME_DELTA,
+                YIELD_FRAME + FRAME_DELTA,
+                ESCAPE_FRAME + FRAME_DELTA,
+            ]
+        );
     }
 
     #[test]
@@ -1245,6 +1523,19 @@ pub(crate) fn fbw_durable_frame_rollback_one(frame: usize) {
 /// [`capture_fbw_store_journal_root_area`]).
 pub(crate) fn locals_mirror_undo_cell_ptr() -> *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>> {
     FBW_LOCALS_MIRROR_UNDO.with(|c| c as *const _)
+}
+
+pub(crate) fn exit_last_instr_undo_cell_ptr() -> *const std::cell::RefCell<Vec<(usize, isize)>> {
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| c as *const _)
+}
+
+pub(crate) fn frame_vsd_undo_cell_ptr() -> *const std::cell::RefCell<Vec<(usize, usize)>> {
+    FBW_FRAME_VSD_UNDO.with(|c| c as *const _)
+}
+
+pub(crate) fn generator_yield_tos_cell_ptr() -> *const std::cell::Cell<Option<GeneratorStackStore>>
+{
+    FBW_GENERATOR_YIELD_TOS.with(|c| c as *const _)
 }
 
 /// Record the element a walked eager list store displaces, for rollback

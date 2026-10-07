@@ -4496,161 +4496,12 @@ fn call_with_kwargs_in_ctx_impl(
         } // end user function branch
     } // end is_function
 
-    // For type objects: allocate via __new__ then call __init__ with kwargs.
-    // PyPy: typeobject.py descr_call → __new__ + __init__
+    // typeobject.py `W_TypeObject.descr_call(self, __args__)`.
     if unsafe { pyre_object::is_type(current_callable()) } {
-        // `typeobject.py::descr_call` keeps `self` live across the arbitrary
-        // Python call to `__new__`.  The translated RPython GC transform
-        // reloads it from the shadow stack afterwards; a Rust local would
-        // otherwise retain the pre-move address of a heap type.
-        let _type_root = pyre_object::gc_roots::push_roots();
-        let type_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(current_callable());
-        let current_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
-        if std::ptr::eq(current_type(), crate::typedef::w_type()) {
-            let pos = rooted_pos();
-            if let Some(result) = type_call_special_case(current_type(), &pos, nkw > 0) {
-                return result;
-            }
-        }
-        if type_declares_vectorcall(current_type()) {
-            let pos = rooted_pos();
-            let names = rooted_names();
-            let values = rooted_values();
-            if let Some(result) = type_call_vectorcall(current_type(), &pos, &names, &values) {
-                return result;
-            }
-        }
-        // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
-        // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
-        // The `function`, `memoryview`, `traceback`, deque iterator, and
-        // constructors whose `__new__`/`__init__` Signature binds keywords
-        // (`cdata=` on `_cffi_backend.buffer`, `format=` on `_lzma`, `ident=`
-        // on `select.kevent`) are non-acceptable-as-base too. Route those
-        // through `__new__` / `__init__`.  `traceback` and `memoryview` bind
-        // the keywords in the body instead of through a `Signature`.
-        let accepts_keywords_despite_nonbase = std::ptr::eq(
-            current_type(),
-            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::module::_collections::deque_iter::public_type(),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::module::_collections::deque_rev_iter::public_type(),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::typedef::gettypeobject(&crate::pytraceback::PYTRACEBACK_TYPE),
-        ) || type_new_accepts_keywords(current_type());
-        if nkw > 0
-            && !accepts_keywords_despite_nonbase
-            && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }
-        {
-            // The constructor names itself the way its own argument clause
-            // does — bare, without the defining module — so a dotted type
-            // reports `BZ2Compressor()`, not `_bz2.BZ2Compressor()`.
-            let type_name = unsafe { pyre_object::w_type_get_name(current_type()) };
-            let type_name = type_name.rsplit('.').next().unwrap_or(type_name);
-            return Err(crate::PyError::type_error(format!(
-                "{type_name}() takes no keyword arguments",
-            )));
-        }
-        // Three-argument `type(name, bases, namespace, **kw)` must select the
-        // winning metaclass.  Keep the check at the actual type-construction
-        // shape: the former `len >= 2 && args[1] is tuple` condition also
-        // captured ordinary constructors such as
-        // `_GenericAlias(origin, args, **kw)`.
-        let w_metaclass = if npos >= 3
-            && unsafe { pyre_object::is_str(current_pos_arg(0)) }
-            && unsafe { pyre_object::is_tuple(current_pos_arg(1)) }
-        {
-            calculate_metaclass(current_type(), current_pos_arg(1)).unwrap_or(current_type())
-        } else {
-            current_type()
-        };
-        let metaclass_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_metaclass);
-        let current_metaclass = || pyre_object::gc_roots::shadow_stack_get(metaclass_slot);
-        // Step 1: __new__(cls, *args, **kwargs)
-        let instance = if let Some(new_fn) =
-            unsafe { crate::baseobjspace::lookup_in_type(current_metaclass(), "__new__") }
-        {
-            let new_fn = unsafe { unwrap_static_new(new_fn) };
-            let mut new_args = Vec::with_capacity(1 + npos);
-            // `lookup_in_type` interns its name and can collect; reload the
-            // winning metaclass and the arguments rather than retaining their
-            // pre-lookup addresses.
-            new_args.push(current_metaclass());
-            extend_current_args(&mut new_args);
-            // typeobject.py descr_call: `space.call_obj_args(w_newfunc, self, __args__)`.
-            // The same Arguments object reaches both `__new__` and `__init__`.
-            if nkw > 0 {
-                forward_kw(new_fn, &new_args, true, std::ptr::null_mut())?
-            } else {
-                call_callable_in_ctx(execution_context, new_fn, &new_args)?
-            }
-        } else {
-            pyre_object::w_instance_new(current_type())
-        };
-        // `instance` is a movable nursery object held only as a Rust local
-        // across the `__init__` dispatch below, which runs arbitrary
-        // allocating code and can relocate it during a minor collection.
-        // Pin it on the shadow stack and reload the (possibly forwarded)
-        // pointer afterwards — the manual equivalent of the translator's
-        // shadowstack save/restore around a collecting call
-        // (framework.py:853-856).
-        let _instance_roots = pyre_object::gc_roots::push_roots();
-        let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(instance);
-        // Step 2: __init__(self, *args, **kwargs) with full kwargs support.
-        if let Some(w_insttype) = type_call_init_type(
-            pyre_object::gc_roots::shadow_stack_get(instance_slot),
-            current_type(),
-        ) && let Some(init_descr) =
-            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-        {
-            // typeobject.py `space.get_and_call_args`: exact
-            // Function takes the instance explicitly; every other descriptor
-            // binds itself and receives only the original constructor args.
-            // A slot wrapper (`object.__init__`, `BaseException.__init__`) is
-            // an interp2app Function there and takes the same arm; its
-            // `__get__` only wraps it back up around the same slot.
-            let init_result = if unsafe {
-                crate::is_function(init_descr) || crate::is_slot_wrapper(init_descr)
-            } {
-                let mut init_args = Vec::with_capacity(1 + npos);
-                // The `__new__` result and the constructor arguments are
-                // movable nursery objects, and `__new__` has just run
-                // arbitrary allocating code. Reload every one of them from
-                // the roots instead of retaining the pre-collection locals
-                // across argument binding and descriptor dispatch.
-                init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
-                extend_current_args(&mut init_args);
-                forward_kw(init_descr, &init_args, true, std::ptr::null_mut())?
-            } else {
-                // One pin covers the descriptor and the instance type: a
-                // per-value pin would collect before the second word was visible.
-                let init_slot = pyre_object::gc_roots::pin_roots(&[init_descr, w_insttype]);
-                let init_fn = unsafe {
-                    crate::baseobjspace::get(
-                        pyre_object::gc_roots::shadow_stack_get(init_slot),
-                        pyre_object::gc_roots::shadow_stack_get(instance_slot),
-                        pyre_object::gc_roots::shadow_stack_get(init_slot + 1),
-                    )?
-                }
-                .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(init_slot));
-                // Binding the descriptor allocates, so the arguments are
-                // reloaded after it rather than before.
-                let mut init_args = Vec::with_capacity(npos);
-                extend_current_args(&mut init_args);
-                forward_kw(init_fn, &init_args, true, std::ptr::null_mut())?
-            };
-            check_init_returned_none(init_result)?;
-        }
-        return Ok(pyre_object::gc_roots::shadow_stack_get(instance_slot));
+        let pos = rooted_pos();
+        let names = rooted_names();
+        let values = rooted_values();
+        return type_descr_call_impl(current_callable(), &pos, &names, &values);
     }
 
     // For methods: unwrap and retry — same `_Method` unwrap as above.
@@ -4906,14 +4757,7 @@ pub fn call_function_impl_result(
                 return call_function_impl_result(bound, &reloaded_args());
             }
             // The override lookup can collect: dispatch from the roots.
-            clear_call_error();
-            let result = type_descr_call_impl(_roots.get(root_base), &reloaded_args());
-            if result.is_null()
-                && let Some(err) = take_call_error()
-            {
-                return Err(err);
-            }
-            return Ok(result);
+            return type_descr_call_impl(_roots.get(root_base), &reloaded_args(), &[], &[]);
         }
         // staticmethod → unwrap and call the wrapped function
         // PyPy: function.py StaticMethod.descr_staticmethod__call__
@@ -5022,6 +4866,7 @@ pub(crate) fn calculate_metaclass(
 /// `typeobject.c type_call` — a type whose `tp_new` is NULL
 /// (`Py_TPFLAGS_DISALLOW_INSTANTIATION`, e.g. generator) refuses
 /// `Type()` with `cannot create 'X' instances`.
+#[inline(never)]
 pub(crate) fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError> {
     if unsafe { pyre_object::w_type_disallows_instantiation(w_type) } {
         // The name here is `tp_name`, which a heap type such as `sys.flags`
@@ -5057,6 +4902,8 @@ pub(crate) fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError
     not(feature = "sandbox"),
     any(target_os = "macos", target_os = "linux")
 ))]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn type_call_vectorcall(
     w_type: PyObjectRef,
     args: &[PyObjectRef],
@@ -5093,6 +4940,8 @@ fn type_declares_vectorcall(w_type: PyObjectRef) -> bool {
     not(feature = "sandbox"),
     any(target_os = "macos", target_os = "linux")
 )))]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn type_call_vectorcall(
     _w_type: PyObjectRef,
     _args: &[PyObjectRef],
@@ -5149,98 +4998,362 @@ fn type_new_accepts_keywords(w_type: PyObjectRef) -> bool {
     type_slot_accepts_keywords(w_type, "__new__") || type_slot_accepts_keywords(w_type, "__init__")
 }
 
-/// `type.__call__(cls, *args)` — the metaclass-level instantiation entry
-/// (`typeobject.c type_call`).  Runs `__new__`/`__init__` directly, WITHOUT
-/// re-dispatching through the metaclass (a custom metaclass `__call__` that
-/// delegates via `super().__call__` lands here), and surfaces the stashed
-/// error instead of a null sentinel.
+/// `type.__call__(cls, *args)` — `W_TypeObject.descr_call` without keywords.
+/// A custom metaclass whose `__call__` delegates via `super().__call__` lands
+/// here and must not consult that override a second time.
 pub fn type_call_instantiate(
     w_type: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
-    clear_call_error();
-    let result = type_descr_call_impl(w_type, args);
-    if result.is_null()
-        && let Some(err) = take_call_error()
-    {
-        return Err(err);
-    }
-    Ok(result)
+    type_descr_call_impl(w_type, args, &[], &[])
 }
 
 /// Keyword-preserving `type.__call__` entry.
 ///
-/// PyPy: `typeobject.py W_TypeObject.descr_call(self, __args__)`.  The same
-/// `Arguments` object is passed to both `__new__` and `__init__`, and this
-/// descriptor is already the default metaclass implementation reached after
-/// `super().__call__`; it must not consult the custom metaclass override a
-/// second time.
+/// typeobject.py `W_TypeObject.descr_call(self, __args__)`: the same
+/// `Arguments` object is passed to both `__new__` and `__init__`.
 pub fn type_call_instantiate_with_kwargs(
     w_type: PyObjectRef,
     args: &[PyObjectRef],
     keyword_names_w: &[PyObjectRef],
     keywords_w: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
-    // `descr_call` reads the keyword names off the `Arguments` it was handed,
-    // so the caller unpacks its mapping with `_combine_starstarargs_wrapped`
-    // and the key objects arrive here. Do not redispatch the metaclass.
-    call_with_kwargs_in_ctx_impl(
-        take_last_exec_ctx(),
-        w_type,
-        args,
-        keyword_names_w,
-        keywords_w,
-        false,
-        std::ptr::null_mut(),
-        false,
+    type_descr_call_impl(w_type, args, keyword_names_w, keywords_w)
+}
+
+/// Shadow-stack slots for `descr_call`'s `self` and `__args__`.
+///
+/// Publish then one `normalize_roots` so a collection cannot run between
+/// slices (`gc_roots::pin_roots`). `#[inline(never)]` keeps the item loops
+/// out of [`type_descr_call_impl`]'s graph. Rooting helper with no
+/// upstream counterpart; `dont_look_inside` keeps it residual.
+struct DescrCallLivevars {
+    type_slot: usize,
+    args_base: usize,
+    args_len: usize,
+    names_base: usize,
+    values_base: usize,
+    nkw: usize,
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn pin_descr_call_livevars(
+    w_type: PyObjectRef,
+    args: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    keywords_w: &[PyObjectRef],
+) -> DescrCallLivevars {
+    debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
+    let type_slot = pyre_object::gc_roots::publish_roots(&[w_type]);
+    let args_len = args.len();
+    let nkw = keyword_names_w.len();
+    let args_base = pyre_object::gc_roots::publish_roots(args);
+    let names_base = pyre_object::gc_roots::publish_roots(keyword_names_w);
+    let values_base = pyre_object::gc_roots::publish_roots(keywords_w);
+    pyre_object::gc_roots::normalize_roots(type_slot, 1 + args_len + nkw + nkw);
+    DescrCallLivevars {
+        type_slot,
+        args_base,
+        args_len,
+        names_base,
+        values_base,
+        nkw,
+    }
+}
+
+/// Reload a rooted slice. `#[inline(never)]` so the copy stays out of
+/// [`type_descr_call_impl`]. Rooting copy with no upstream counterpart;
+/// `dont_look_inside` keeps it residual.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn rooted_object_slice(base: usize, len: usize) -> Vec<PyObjectRef> {
+    let mut items = vec![pyre_object::PY_NULL; len];
+    pyre_object::gc_roots::shadow_stack_copy_range(base, &mut items);
+    items
+}
+
+/// typeobject.py `W_TypeObject.descr_call(self, space, __args__)`.
+///
+/// One look-inside graph: `promote(self)`, `lookup_where('__new__')`,
+/// `space.get`, `space.call_obj_args`, `isinstance_w`, skip `__init__` only
+/// for one-argument `type(x)`, `space.lookup('__init__')`,
+/// `get_and_call_args`, `check_init_returned_none`, return the instance.
+fn type_descr_call_impl(
+    w_type: PyObjectRef,
+    args: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    keywords_w: &[PyObjectRef],
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let live = pin_descr_call_livevars(w_type, args, keyword_names_w, keywords_w);
+    let current_type = || pyre_object::gc_roots::shadow_stack_get(live.type_slot);
+
+    // typeobject.py `W_TypeObject.descr_call`: `promote(self)`.
+    let _ = majit_metainterp::jit::promote(current_type());
+
+    // One-argument `type(x)` is `type_call` / `type_vectorcall`, not
+    // `type.__new__` (`type_descr_new` requires three arguments). Moving
+    // the shortcut past `__new__` would raise `type.__new__() takes exactly
+    // 3 arguments`.
+    if std::ptr::eq(current_type(), crate::typedef::w_type()) {
+        let pinned_args = rooted_object_slice(live.args_base, live.args_len);
+        if let Some(result) = type_call_special_case(current_type(), &pinned_args, live.nkw > 0) {
+            return result;
+        }
+    }
+
+    // `Py_tp_vectorcall` on a C-extension class answers `Type(...)` ahead of
+    // `__new__` / `__init__`. `descr_call` has no equivalent; dropping this
+    // would change those types.
+    if type_declares_vectorcall(current_type()) {
+        let pinned_args = rooted_object_slice(live.args_base, live.args_len);
+        let names = rooted_object_slice(live.names_base, live.nkw);
+        let values = rooted_object_slice(live.values_base, live.nkw);
+        if let Some(result) = type_call_vectorcall(current_type(), &pinned_args, &names, &values) {
+            return result;
+        }
+    }
+
+    if live.nkw > 0 && type_constructor_rejects_keywords(current_type()) {
+        return Err(type_constructor_keyword_error(current_type()));
+    }
+
+    check_type_instantiable(current_type())?;
+
+    // typeobject.py `lookup_where('__new__')`; the value half is
+    // `lookup_in_type`. Missing descriptor: `cannot create '%N' instances`.
+    let Some(new_descr) =
+        (unsafe { crate::baseobjspace::lookup_in_type(current_type(), "__new__") })
+    else {
+        return Err(cannot_create_instances_error(current_type()));
+    };
+
+    // typeobject.py: `w_newfunc = space.get(w_newdescr, space.w_None, w_type=self)`.
+    let new_descr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(new_descr);
+    let new_fn = descr_call_get(
+        pyre_object::gc_roots::shadow_stack_get(new_descr_slot),
+        pyre_object::PY_NULL,
+        current_type(),
+    )?
+    .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(new_descr_slot));
+
+    // typeobject.py: `w_newobject = space.call_obj_args(w_newfunc, self, __args__)`.
+    let pinned_args = rooted_object_slice(live.args_base, live.args_len);
+    let names = rooted_object_slice(live.names_base, live.nkw);
+    let values = rooted_object_slice(live.values_base, live.nkw);
+    let instance = descr_call_call_obj_args(new_fn, current_type(), &pinned_args, &names, &values)?;
+    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(instance);
+
+    // typeobject.py: `call_init = space.isinstance_w(w_newobject, self)`.
+    let call_init = unsafe {
+        crate::baseobjspace::isinstance_w(
+            pyre_object::gc_roots::shadow_stack_get(instance_slot),
+            current_type(),
+        )
+    };
+
+    // Skip `__init__` only for one-argument `type(x)` with no keywords.
+    if call_init
+        && !(std::ptr::eq(current_type(), crate::typedef::w_type())
+            && live.nkw == 0
+            && live.args_len == 1)
+        && let Some(init_descr) = unsafe {
+            crate::baseobjspace::lookup(
+                pyre_object::gc_roots::shadow_stack_get(instance_slot),
+                "__init__",
+            )
+        }
+    {
+        let pinned_args = rooted_object_slice(live.args_base, live.args_len);
+        let names = rooted_object_slice(live.names_base, live.nkw);
+        let values = rooted_object_slice(live.values_base, live.nkw);
+        let init_result = descr_call_get_and_call_args(
+            init_descr,
+            pyre_object::gc_roots::shadow_stack_get(instance_slot),
+            &pinned_args,
+            &names,
+            &values,
+        )?;
+        check_init_returned_none(init_result)?;
+    }
+
+    Ok(pyre_object::gc_roots::shadow_stack_get(instance_slot))
+}
+
+/// typeobject.py `cannot create '%N' instances`. `format!` stays out of
+/// [`type_descr_call_impl`] so the annotator does not merge it with the
+/// argument lists.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn cannot_create_instances_error(w_type: PyObjectRef) -> PyError {
+    let name = unsafe { pyre_object::w_type_get_name(w_type) };
+    PyError::type_error(format!("cannot create '{name}' instances"))
+}
+
+/// typeobject.py `space.get(w_newdescr, space.w_None, w_type=self)`.
+///
+/// `baseobjspace.py get` is look-inside. Here it is residual:
+/// `baseobjspace::get` reaches `oefmt`, whose `&[u8]` slice-window
+/// `__getitem__` does not lower yet (`Tuple(Ptr Array Char, Int)`).
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn descr_call_get(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    unsafe { crate::baseobjspace::get(descr, obj, w_type) }
+}
+
+/// `space.call_obj_args(w_func, w_obj, __args__)`. No JIT hint:
+/// `baseobjspace.py call_obj_args` has none (`look_inside` by default).
+#[inline(never)]
+fn descr_call_call_obj_args(
+    callable: PyObjectRef,
+    w_obj: PyObjectRef,
+    args: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    keywords_w: &[PyObjectRef],
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::publish_roots(&[callable, w_obj]);
+    let args_len = args.len();
+    let nkw = keyword_names_w.len();
+    let args_base = pyre_object::gc_roots::publish_roots(args);
+    let names_base = pyre_object::gc_roots::publish_roots(keyword_names_w);
+    let values_base = pyre_object::gc_roots::publish_roots(keywords_w);
+    pyre_object::gc_roots::normalize_roots(callable_slot, 2 + args_len + nkw + nkw);
+    let mut pos = Vec::with_capacity(1 + args_len);
+    pos.push(pyre_object::gc_roots::shadow_stack_get(callable_slot + 1));
+    pos.extend(rooted_object_slice(args_base, args_len));
+    let names = rooted_object_slice(names_base, nkw);
+    let values = rooted_object_slice(values_base, nkw);
+    descr_call_invoke(
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        &pos,
+        &names,
+        &values,
     )
 }
 
-/// Type call without a PyFrame.
-/// PyPy: typeobject.py descr_call
-fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    // One-argument `type(x)` is `type_call_special_case` before any
-    // allocation. The instantiation tail is a separate graph.
-    // `type_of_object` can intern the unnamed-layout name
-    // (`box_str_constant`), so the type and every argument stay in
-    // shadow-stack slots across that call (`framework.py` `push_roots`).
-    let args_len = args.len();
-    let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_type);
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
+#[majit_macros::dont_look_inside]
+fn descr_call_invoke(
+    callable: PyObjectRef,
+    pos: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    keywords_w: &[PyObjectRef],
+) -> PyResult {
+    if keyword_names_w.is_empty() {
+        call_function_impl_result(callable, pos)
+    } else {
+        call_args(
+            callable,
+            &crate::argument::Arguments::with_kw(pos, keyword_names_w, keywords_w),
+        )
     }
-    let current_args = || {
-        let mut pinned_args = Vec::with_capacity(args_len);
-        for i in 0..args_len {
-            pinned_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
-        }
-        pinned_args
-    };
-    if std::ptr::eq(
-        pyre_object::gc_roots::shadow_stack_get(root_base),
-        crate::typedef::w_type(),
-    ) {
-        if let Some(result) = type_call_special_case(
-            pyre_object::gc_roots::shadow_stack_get(root_base),
-            &current_args(),
-            false,
-        ) {
-            return match result {
-                Ok(value) => value,
-                Err(error) => {
-                    set_call_error(error);
-                    PY_NULL
-                }
-            };
-        }
-    }
-    type_descr_call_instantiate(
-        pyre_object::gc_roots::shadow_stack_get(root_base),
-        &current_args(),
-    )
 }
+
+/// descroperation.py `get_and_call_args`: a Function (and a slot wrapper,
+/// which is an interp2app Function there) takes the instance explicitly;
+/// every other descriptor binds through `space.get` and is called with the
+/// original `__args__`. No JIT hint: `get_and_call_args` has none.
+#[inline(never)]
+fn descr_call_get_and_call_args(
+    init_descr: PyObjectRef,
+    instance: PyObjectRef,
+    args: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    keywords_w: &[PyObjectRef],
+) -> PyResult {
+    if unsafe { crate::is_function(init_descr) || crate::is_slot_wrapper(init_descr) } {
+        return descr_call_call_obj_args(init_descr, instance, args, keyword_names_w, keywords_w);
+    }
+    let w_insttype = crate::typedef::r#type(instance)
+        .map(|t| t.as_ptr())
+        .unwrap_or(pyre_object::PY_NULL);
+    let init_slot = pyre_object::gc_roots::pin_roots(&[init_descr, instance, w_insttype]);
+    let init_fn = descr_call_get(
+        pyre_object::gc_roots::shadow_stack_get(init_slot),
+        pyre_object::gc_roots::shadow_stack_get(init_slot + 1),
+        pyre_object::gc_roots::shadow_stack_get(init_slot + 2),
+    )?
+    .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(init_slot));
+    descr_call_invoke(init_fn, args, keyword_names_w, keywords_w)
+}
+
+/// Non-base types whose `__new__`/`__init__` have no keyword Signature
+/// reject constructor keywords (`bool()` / `NoneType()`).
+#[inline(never)]
+fn type_constructor_rejects_keywords(w_type: PyObjectRef) -> bool {
+    let accepts_keywords_despite_nonbase =
+        std::ptr::eq(w_type, crate::typedef::gettypeobject(&crate::FUNCTION_TYPE))
+            || std::ptr::eq(
+                w_type,
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+            )
+            || std::ptr::eq(
+                w_type,
+                crate::module::_collections::deque_iter::public_type(),
+            )
+            || std::ptr::eq(
+                w_type,
+                crate::module::_collections::deque_rev_iter::public_type(),
+            )
+            || std::ptr::eq(
+                w_type,
+                crate::typedef::gettypeobject(&crate::pytraceback::PYTRACEBACK_TYPE),
+            )
+            || type_new_accepts_keywords(w_type);
+    !accepts_keywords_despite_nonbase
+        && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(w_type) }
+}
+
+/// Bare constructor name for `{name}() takes no keyword arguments`.
+/// `str.rsplit` is not a registered host call, so this stays out of
+/// [`type_descr_call_impl`].
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn type_constructor_keyword_error(w_type: PyObjectRef) -> PyError {
+    let type_name = unsafe { pyre_object::w_type_get_name(w_type) };
+    let type_name = type_name.rsplit('.').next().unwrap_or(type_name);
+    PyError::type_error(format!("{type_name}() takes no keyword arguments"))
+}
+
+/// Gateway the tracer enters for `type.__call__`.
+///
+/// typeobject.py `W_TypeObject.descr_call(self, __args__)`. Positional
+/// `BuiltinCodePassThroughArguments1.funcrun_obj` hands `[self, *arguments_w]`.
+pub fn __majit_wrap_type_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    if args.is_empty() {
+        return Err(PyError::type_error(
+            "type.__call__() takes at least 1 argument (0 given)",
+        ));
+    }
+    type_descr_call_impl(args[0], &args[1..], &[], &[])
+}
+
+/// Keyword `func__args__` twin of [`__majit_wrap_type_descr_call`].
+///
+/// `BuiltinCodePassThroughArguments1.func__args__(space, w_obj, args)`.
+/// The name is not `__majit_wrap_*`: WRAP_PREFIX BFS seeds the positional
+/// wrapper, matching `type_descr_init_args`.
+pub fn type_descr_call_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    let pos = args.arguments_w.as_slice();
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    type_descr_call_impl(w_type, pos, names, values)
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_type_descr_call_target,
+    __majit_wrap_type_descr_call
+);
 
 /// Gateway the tracer enters for one-argument `type(x)`.
 ///
@@ -5269,106 +5382,6 @@ fn type_query(w_obj: PyObjectRef) -> PyObjectRef {
 
 crate::builtin_wrapper_descriptor!(__majit_wrap_type_query_target, __majit_wrap_type_query);
 
-#[majit_macros::dont_look_inside]
-fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    // typeobject.py descr_call keeps `w_type`, every argument, and the new
-    // instance live across both Python calls.  In translated RPython the GC
-    // transform reloads these from shadow-stack slots after `__new__`; Rust
-    // slices are only copies and otherwise retain pre-move addresses.
-    let args_len = args.len();
-    let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_type);
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
-    let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    // `Arguments.prepend` builds one list per call, so both call sites below
-    // fill their argument vector straight from the pinned slots — reloading
-    // into a throwaway `Vec` first would allocate a second one per call.
-    let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
-        for i in 0..args_len {
-            dst.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
-        }
-    };
-
-    // typeobject.py W_TypeObject.descr_call dispatches on `__args__` in place,
-    // so the argument list is copied only for the form that consumes it.
-    if std::ptr::eq(current_type(), crate::typedef::w_type()) {
-        if let Some(result) = {
-            let mut pinned_args = Vec::with_capacity(args_len);
-            extend_current_args(&mut pinned_args);
-            type_call_special_case(current_type(), &pinned_args, false)
-        } {
-            return match result {
-                Ok(value) => value,
-                Err(error) => {
-                    set_call_error(error);
-                    PY_NULL
-                }
-            };
-        }
-    }
-    if type_declares_vectorcall(current_type()) {
-        if let Some(result) = {
-            let mut pinned_args = Vec::with_capacity(args_len);
-            extend_current_args(&mut pinned_args);
-            type_call_vectorcall(current_type(), &pinned_args, &[], &[])
-        } {
-            return match result {
-                Ok(value) => value,
-                Err(error) => {
-                    set_call_error(error);
-                    PY_NULL
-                }
-            };
-        }
-    }
-
-    if let Err(e) = check_type_instantiable(current_type()) {
-        set_call_error(e);
-        return PY_NULL;
-    }
-    // Step 1: __new__
-    let instance = if let Some(new_fn) =
-        unsafe { crate::baseobjspace::lookup_in_type(current_type(), "__new__") }
-    {
-        let mut new_args = Vec::with_capacity(1 + args_len);
-        new_args.push(current_type());
-        extend_current_args(&mut new_args);
-        call_function_impl(new_fn, &new_args)
-    } else {
-        pyre_object::w_instance_new(current_type())
-    };
-    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(instance);
-
-    // Step 2: __init__ — only if __new__ returned an instance of w_type.
-    // PyPy checks the Python-level type(instance), so builtin-layout subtypes
-    // like set subclasses still run __init__.
-    if let Some(w_insttype) = type_call_init_type(
-        pyre_object::gc_roots::shadow_stack_get(instance_slot),
-        current_type(),
-    ) && let Some(init_fn) =
-        unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-    {
-        let mut init_args = Vec::with_capacity(1 + args_len);
-        init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
-        extend_current_args(&mut init_args);
-        let res = call_function_impl(init_fn, &init_args);
-        if res.is_null() {
-            // `__init__` raised — error already stashed; propagate it.
-            return PY_NULL;
-        }
-        if let Err(e) = check_init_returned_none(res) {
-            set_call_error(e);
-            return PY_NULL;
-        }
-    }
-
-    pyre_object::gc_roots::shadow_stack_get(instance_slot)
-}
-
 /// `typeobject.py descr_call` — `__init__` must return None.  A non-null,
 /// non-None result raises `TypeError: __init__() should return None, not
 /// 'X'`.
@@ -5386,6 +5399,7 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
 /// `?`-propagating call) and forwarding the stashed error themselves;
 /// this function returns `Ok(())` for null purely as a defensive guard so
 /// it never overwrites the original error with a spurious `TypeError`.
+#[inline(never)]
 pub fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
     if result.is_null() || unsafe { pyre_object::is_none(result) } {
         return Ok(());
@@ -5410,6 +5424,7 @@ fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyO
 /// CPython 3.14 `type_call` / `type_vectorcall` — exact `type` owns the
 /// one-argument query form.  `type.__new__` itself accepts only the three
 /// class-construction arguments.
+#[inline(never)]
 fn type_call_special_case(
     w_type: PyObjectRef,
     args: &[PyObjectRef],
@@ -7511,144 +7526,13 @@ pub(crate) fn call_init_subclass_on_bases(
 // PyPy equivalent: typeobject.py descr_call → __new__ + __init__
 
 fn type_descr_call_with_mode(
-    execution_context: *const crate::PyExecutionContext,
+    _execution_context: *const crate::PyExecutionContext,
     w_type: PyObjectRef,
     args: &[PyObjectRef],
-    mode: CallMode,
+    _mode: CallMode,
 ) -> PyResult {
-    // `typeobject.py:731,738-739` threads one `__args__` through `__new__` and
-    // then `__init__`; it needs no reload because `Arguments.arguments_w` is a
-    // traced list the moving GC updates in place. This slice is a raw copy the
-    // collector cannot see, so pin the type and every argument here and read
-    // them back from the shadow stack after `__new__` has run Python code.
-    // `type_call_special_case` can intern via `type_of_object`, so the same
-    // slots cover that call (`framework.py` `push_roots`).
-    let args_len = args.len();
-    let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_type);
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
-    let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    if std::ptr::eq(current_type(), crate::typedef::w_type()) {
-        if let Some(result) = {
-            let mut pinned_args = Vec::with_capacity(args_len);
-            for index in 0..args_len {
-                pinned_args.push(pyre_object::gc_roots::shadow_stack_get(
-                    root_base + 1 + index,
-                ));
-            }
-            type_call_special_case(current_type(), &pinned_args, false)
-        } {
-            return result;
-        }
-    }
-    let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
-        for index in 0..args_len {
-            dst.push(pyre_object::gc_roots::shadow_stack_get(
-                root_base + 1 + index,
-            ));
-        }
-    };
-
-    if type_declares_vectorcall(current_type()) {
-        if let Some(result) = {
-            let mut pinned_args = Vec::with_capacity(args_len);
-            extend_current_args(&mut pinned_args);
-            type_call_vectorcall(current_type(), &pinned_args, &[], &[])
-        } {
-            return result;
-        }
-    }
-    check_type_instantiable(current_type())?;
-    // Step 1: Look up __new__ via type MRO → allocate instance.
-    // PyPy: typeobject.py descr_call → `w_newtype, w_newdescr =
-    // self.lookup_where('__new__')`; a missing descriptor (the pathological
-    // mro-without-object case) raises, otherwise the descriptor is bound via
-    // `space.get(w_newdescr, space.w_None, w_type=self)` and called with
-    // w_type as the first arg.
-    let Some(new_descr) =
-        (unsafe { crate::baseobjspace::lookup_in_type(current_type(), "__new__") })
-    else {
-        // typeobject.py:715 — `raise oefmt(space.w_TypeError,
-        // "cannot create '%N' instances", self)`.
-        let name = unsafe { pyre_object::w_type_get_name(current_type()) };
-        return Err(crate::PyError::type_error(format!(
-            "cannot create '{name}' instances"
-        )));
-    };
-    // typeobject.py:726 — `w_newfunc = space.get(w_newdescr, space.w_None,
-    // w_type=self)`.  A descriptor with no __get__ (`get` → None) is its own
-    // bound value, matching `space.get`'s `if w_get is None: return w_descr`.
-    let new_descr_slot = pyre_object::gc_roots::shadow_stack_len();
-    let new_descr = pyre_object::gc_roots::pin_root(new_descr);
-    let new_fn =
-        unsafe { crate::baseobjspace::get(new_descr, pyre_object::PY_NULL, current_type())? }
-            .unwrap_or(pyre_object::gc_roots::shadow_stack_get(new_descr_slot));
-    // typeobject.py — `space.call_obj_args(w_newfunc, self, __args__)`.
-    let mut new_args = Vec::with_capacity(1 + args_len);
-    new_args.push(current_type());
-    extend_current_args(&mut new_args);
-    // `typeobject.py descr_call` runs `__new__` and `__init__` through
-    // `space.call_args` / `get_and_call_args`, neither of which is handed a
-    // frame — so neither reports a `c_call`, however builtin the descriptor
-    // turns out to be.
-    let instance = call_callable_with_mode(
-        execution_context,
-        new_fn,
-        &new_args,
-        mode,
-        std::ptr::null_mut(),
-    )?;
-    let _instance_roots = pyre_object::gc_roots::push_roots();
-    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(instance);
-    let current_instance = || pyre_object::gc_roots::shadow_stack_get(instance_slot);
-
-    // Step 2: __init__ — only if __new__ returned an instance of w_type.
-    // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
-    if let Some(w_insttype) = type_call_init_type(current_instance(), current_type())
-        && let Some(init_descr) =
-            unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-    {
-        // `get_and_call_args`: a slot wrapper is an interp2app Function there,
-        // so it takes the instance explicitly like one.
-        let init_result = if unsafe {
-            crate::is_function(init_descr) || crate::is_slot_wrapper(init_descr)
-        } {
-            let mut init_args = Vec::with_capacity(1 + args_len);
-            init_args.push(current_instance());
-            extend_current_args(&mut init_args);
-            call_callable_with_mode(
-                execution_context,
-                init_descr,
-                &init_args,
-                mode,
-                std::ptr::null_mut(),
-            )?
-        } else {
-            let init_descr_slot = pyre_object::gc_roots::shadow_stack_len();
-            let init_descr = pyre_object::gc_roots::pin_root(init_descr);
-            let init_fn =
-                unsafe { crate::baseobjspace::get(init_descr, current_instance(), w_insttype)? }
-                    .unwrap_or(pyre_object::gc_roots::shadow_stack_get(init_descr_slot));
-            // Binding the descriptor allocates, so the arguments are reloaded
-            // after it rather than before.
-            let mut init_args = Vec::with_capacity(args_len);
-            extend_current_args(&mut init_args);
-            call_callable_with_mode(
-                execution_context,
-                init_fn,
-                &init_args,
-                mode,
-                std::ptr::null_mut(),
-            )?
-        };
-        check_init_returned_none(init_result)?;
-    }
-
-    Ok(current_instance())
+    // `descr_call` is frameless `space.call_args` / `get_and_call_args`.
+    type_descr_call_impl(w_type, args, &[], &[])
 }
 
 /// typeobject.py:1157-1176 — unpack __slots__ to slot name strings.

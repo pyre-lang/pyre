@@ -1110,10 +1110,13 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     })?;
     // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
     // authoritative for optimization, while the matching concrete frame is
-    // its blackhole-resume image; mirror only own-frame standard-vable writes,
-    // never an outer/nonstandard virtualizable.
+    // its blackhole-resume image. `_opimpl_setfield_gc_any` executes the
+    // store (`execute_and_record` → `cpu.bh_setfield_gc`); pyre records
+    // only, so the live `last_instr` / `valuestackdepth` write uses the same
+    // own-frame target as `setarrayitem_vable` (published inline frame,
+    // reconstructed `callee_shadow`, or the standard virtualizable).
     if let (Some(frame), Some(Value::Int(value)), Some(field_index)) = (
-        current_inline_vable_target(ctx, obj),
+        own_frame_array_store_target(ctx, obj),
         concrete,
         inline_field_index,
     ) {
@@ -1178,7 +1181,7 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
         ))
     })?;
     if let (Some(frame), Some(field_index)) =
-        (current_inline_vable_target(ctx, obj), inline_field_index)
+        (own_frame_array_store_target(ctx, obj), inline_field_index)
     {
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);

@@ -2650,6 +2650,40 @@ fn inline_shadow_matches(shadow: &CalleeLocalsShadow, obj: OpRef, concrete: usiz
 }
 
 impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
+    /// Jitcode this walk is currently decoding (`MIFrame.jitcode`).
+    ///
+    /// A helper keeps `transparent_helper_jitcode_index`; an inlined
+    /// Python callee keeps `inline_callee_consts.jitcode_index`; a
+    /// top-level per-function walk stamps `WalkSession::recording_jitcode_index`.
+    /// `snapshot_sym.jitcode()` is the eval-loop portal and is only the
+    /// last fallback (`resume_snapshot.rs` `walked_snapshot_jitcode`).
+    pub(crate) fn walk_jitcode_index(&self) -> Option<usize> {
+        if let Some(index) = self.fbw_mode.transparent_helper_jitcode_index {
+            return Some(index);
+        }
+        if let Some(consts) = self.inline_callee_consts
+            && consts.jitcode_index >= 0
+        {
+            return Some(consts.jitcode_index as usize);
+        }
+        let rec = self.session.borrow().recording_jitcode_index;
+        if rec >= 0 {
+            return Some(rec as usize);
+        }
+        if self.fbw_mode.snapshot_sym.is_null() {
+            return None;
+        }
+        unsafe {
+            let jc = (*self.fbw_mode.snapshot_sym).jitcode();
+            if jc.is_null() {
+                None
+            } else {
+                let idx = (*jc).index;
+                (idx >= 0).then_some(idx as usize)
+            }
+        }
+    }
+
     /// The frame on this trace — portal virtualizable or any inline level —
     /// whose box or concrete address is `obj` / `concrete`.
     pub(crate) fn receiver_trace_locals(
@@ -4410,6 +4444,51 @@ pub(crate) fn opref_concrete(ctx_value: Option<majit_ir::Value>) -> crate::state
     }
 }
 
+fn concrete_bits(value: crate::state::ConcreteValue) -> i64 {
+    match value {
+        crate::state::ConcreteValue::Int(n) => n,
+        crate::state::ConcreteValue::Bool(b) => i64::from(b),
+        crate::state::ConcreteValue::Ref(p) => p as i64,
+        crate::state::ConcreteValue::Float(n) => n.to_bits() as i64,
+        crate::state::ConcreteValue::Null => 0,
+    }
+}
+
+/// `pyjitpl.py` `_opimpl_recursive_call`: `allboxes = greenboxes + redboxes`
+/// packed the way `MIFrame.setup_call` distributes by kind.
+fn recursive_call_argboxes(
+    int_args: &[OpRef],
+    int_concretes: &[crate::state::ConcreteValue],
+    ref_args: &[OpRef],
+    ref_concretes: &[crate::state::ConcreteValue],
+    float_args: &[OpRef],
+    float_concretes: &[crate::state::ConcreteValue],
+) -> Vec<(majit_metainterp::JitArgKind, OpRef, i64)> {
+    let mut boxes = Vec::with_capacity(int_args.len() + ref_args.len() + float_args.len());
+    for (op, concrete) in int_args.iter().zip(int_concretes) {
+        boxes.push((
+            majit_metainterp::JitArgKind::Int,
+            *op,
+            concrete_bits(*concrete),
+        ));
+    }
+    for (op, concrete) in ref_args.iter().zip(ref_concretes) {
+        boxes.push((
+            majit_metainterp::JitArgKind::Ref,
+            *op,
+            concrete_bits(*concrete),
+        ));
+    }
+    for (op, concrete) in float_args.iter().zip(float_concretes) {
+        boxes.push((
+            majit_metainterp::JitArgKind::Float,
+            *op,
+            concrete_bits(*concrete),
+        ));
+    }
+    boxes
+}
+
 fn portal_mainjitcode_index(jd_index: usize) -> Option<usize> {
     let key = match jd_index {
         0 => {
@@ -4560,10 +4639,24 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     .iter()
                     .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
                     .collect();
-                // `pyjitpl.py newframe`: portal_call_depth, call_ids, ENTER_PORTAL_FRAME.
+                let float_concretes: Vec<crate::state::ConcreteValue> = float_args
+                    .iter()
+                    .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
+                    .collect();
+                // pyjitpl.py `_opimpl_recursive_call`: `perform_call(portal_code, allboxes, greenkey=greenboxes)`.
                 let subwalk_jd = crate::state::note_inline_subwalk_start(
                     (green_key.get_uhash(), green_key.clone()),
                     Some(index),
+                    &recursive_call_argboxes(
+                        &int_args,
+                        &int_concretes,
+                        &ref_args,
+                        &ref_concretes,
+                        &float_args,
+                        &float_concretes,
+                    ),
+                    ctx.walk_jitcode_index(),
+                    op.next_pc,
                 );
                 let walked = match inline_call::run_sub_jitcode_walk(
                     ctx,
@@ -5216,11 +5309,6 @@ pub fn walk<Sym: WalkSym>(
                             ..
                         } | DispatchError::AbortPermanentMarkerReached { .. }
                     );
-                // Kept in lockstep with the epilogue's own gate: an abort that
-                // reports a MISSING value cannot be converted, because the
-                // image it would hand the blackhole is the one that just
-                // failed to resolve ([`DispatchError::leaves_complete_image`]).
-                //
                 // A translated builtin gateway is not an MIFrame.  Let its
                 // error unwind to the enclosing Python walk, where the same
                 // latch is built from that frame's own register banks.  If we
@@ -5231,15 +5319,18 @@ pub fn walk<Sym: WalkSym>(
                 // Trace-length is not deferred: `_interpret` checks it on the
                 // helper MIFrame itself, and the post-step arm below does too.
                 //
-                // A seeded inline whose abort is a modeling gap rather than a
-                // missing value latches even when the root allow-list has not
-                // named the class: `run_blackhole_interp_to_cancel_tracing`
-                // (`pyjitpl.py`) converts whatever `framestack` is live.
-                if coordinate_belongs_to_this_frame
-                    && (error.leaves_complete_image()
-                        || (frames_materialized && error.can_convert_seeded_inline()))
-                    && !carrier_owned
-                    && !abort_blackhole_latched()
+                // A missing-value abort in a transparent helper does not
+                // punch a hole in the enclosing Python frame.
+                // `fill_abort_miframe_register_banks` is the completeness
+                // check (`blackhole.py _copy_data_from_miframe` copies live
+                // boxes; the latch declines when a box has no concrete).
+                // Gating on the helper's error class skipped that latch
+                // (`GotoIfNotValueNotConcrete` is not in
+                // `leaves_complete_image`), so convert copied
+                // MetaInterp.framestack at the loop-header pc.
+                // `run_blackhole_interp_to_cancel_tracing` (`pyjitpl.py`)
+                // converts whatever `framestack` is live.
+                if coordinate_belongs_to_this_frame && !carrier_owned && !abort_blackhole_latched()
                 {
                     // The image belongs to THIS WalkContext's MIFrame, so its
                     // resume coordinate must be this frame's opcode boundary.
@@ -8250,7 +8341,7 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// Call-scoped inputs for one guard-snapshot capture — the explicit-parameter
 /// port of `capture_resumedata`'s keyword arguments (pyjitpl.py),
 /// alongside the already-explicit `after_residual_call`.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GuardCaptureScope {
     /// Request that a residual call's after-call guard route its resume
     /// through the call's OWN post-call `catch_exception` instead of the
@@ -8299,6 +8390,17 @@ pub(crate) struct GuardCaptureScope {
     /// `do_recursive_call`). The guard captures the paused callers alone,
     /// the innermost holding this box in its result slot.
     pub finished_callee_result: Option<OpRef>,
+
+    /// Constructor `CALL_ASSEMBLER`: snapshot `descr_call`'s tail
+    /// (`ctor_continuation`) with `(instance, __init__ result, immediate
+    /// caller)` so deopt at `GUARD_NOT_FORCED` / the assembler's exception
+    /// guard resumes in `typeobject.py descr_call` with the Python caller
+    /// still numbered. `pyjitpl.py` `opimpl_jit_merge_point` `finishframe`
+    /// pops `__init__`, then `do_recursive_call(assembler_call=True)`
+    /// records from `framestack[-1]`, the real caller. The caller is the
+    /// rooted `InlineParentFrame` taken before `InlineFrameGuard` drops,
+    /// matching the operator-tail path.
+    pub constructor_assembler: Option<(OpRef, OpRef, Option<InlineParentFrame>)>,
 
     /// Select which already-recorded guard op receives the resume position.
     /// Needed whenever the guard being captured is not the last thing recorded:
@@ -8559,13 +8661,20 @@ enum ParentResumeCoord {
 /// (`try_walker_inline_type_call`), so the level has to be spelled out; the
 /// jitcode it names is `crate::ctor_continuation`'s.
 ///
-/// `boxes` is the instance alone: that is the tail's whole live state, and its
-/// `ref_return` is what fills the caller's pending call-result slot on the way
-/// out. `blackhole` is `None` because the level owns no register banks to
-/// force, and `call_stack_overrides` is empty because it has no operand stack.
+/// `boxes` is the instance then `__init__`'s result: the resume `-live-`
+/// names both so a post-return guard (`CALL_ASSEMBLER` `GUARD_NOT_FORCED`)
+/// can carry `w_result`, matching `get_list_of_active_boxes` with
+/// `after_residual_call=True` (`pyjitpl.py`). An in-dunder snapshot still
+/// seeds a placeholder that `_setup_return_value_r` (`blackhole.py`)
+/// overwrites. `ref_return` of the instance fills the caller's pending
+/// call-result slot on the way out. `blackhole` is `None` because the
+/// level owns no register banks to force, and `call_stack_overrides` is
+/// empty because it has no operand stack.
 pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlineParentFrame> {
     let jitcode_index = crate::ctor_continuation::jitcode_index()?;
     let resume_pc = crate::ctor_continuation::resume_pc()?;
+    let boxes = vec![instance, OpRef::const_ptr(majit_ir::GcRef::NULL)];
+    let result_slot = call_result_slot(jitcode_index as u32, resume_pc, boxes.len());
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
@@ -8578,15 +8687,13 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
         // a frame, which is the existing spelling for "no Python coordinate".
         resume_coord: ParentResumeCoord::Backxlat(resume_pc),
         resume_marker_jit_pc: Some(resume_pc),
-        boxes: vec![instance],
+        boxes,
         registers_r: None,
         registers_i: None,
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
-        // `__init__`'s result register is pending, not live, at the resume
-        // pc, so `boxes` has no place for a finished `__init__`'s result.
-        result_slot: CallResultSlot::Unknown,
+        result_slot,
     })
 }
 
@@ -9438,6 +9545,33 @@ struct FbwNamespaceStore {
     written: Option<pyre_object::PyObjectRef>,
 }
 
+impl FbwNamespaceStore {
+    /// Forward every GC pointer this entry still owns.
+    ///
+    /// Rollback compares `written` by identity (`fbw_namespace_store_journal_rollback`).
+    /// A nested collect that skips it leaves a stale pointer that looks like a
+    /// concurrent replacement.  Shared by the live extra-area walker and
+    /// `walk_parked_walk_tls_stack` so the field lists cannot diverge —
+    /// RPython traces every GC field of a TLS-held object (`rthread.py`
+    /// `_trace_tlref` walks the same slot on every thread; `framework.py`
+    /// `BaseRootWalker.walk_roots` then forwards each collected root).
+    fn visit_gc_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        fbw_state::visit_pyobject_ref(&mut self.namespace, visitor);
+        fbw_state::visit_pyobject_ref(&mut self.name, visitor);
+        fbw_state::visit_pyobject_ref(&mut self.displaced, visitor);
+        if let Some(written) = self.written.as_mut() {
+            fbw_state::visit_pyobject_ref(written, visitor);
+        }
+    }
+}
+
+/// Extra-area cells for the store-journal walker.
+///
+/// Frame-address journals (`exit_last_instr_undo`, `frame_vsd_undo`,
+/// `locals_mirror_undo.frame`, `generator_yield_tos.frame`,
+/// `unflushed_escaped_callee`, `escape_flush_undo.frame`) are visited by
+/// [`fbw_state::visit_journalled_frame_roots`], the same helper
+/// [`fbw_state::walk_parked_walk_tls_stack`] calls.
 struct FbwStoreJournalRootArea {
     stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
     list_effects: *const std::cell::RefCell<Vec<FbwListEffect>>,
@@ -9452,6 +9586,10 @@ struct FbwStoreJournalRootArea {
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
     locals_mirror_undo: *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>>,
+    exit_last_instr_undo: *const std::cell::RefCell<Vec<(usize, isize)>>,
+    frame_vsd_undo: *const std::cell::RefCell<Vec<(usize, usize)>>,
+    generator_yield_tos: *const std::cell::Cell<Option<GeneratorStackStore>>,
+    unflushed_escaped_callee: *const std::cell::Cell<usize>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
     multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
     parked_stack: *const std::cell::RefCell<Vec<fbw_state::ParkedWalkTls>>,
@@ -9471,6 +9609,10 @@ thread_local! {
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
         escape_flush_undo: escape_flush_undo_cell_ptr(),
         locals_mirror_undo: locals_mirror_undo_cell_ptr(),
+        exit_last_instr_undo: exit_last_instr_undo_cell_ptr(),
+        frame_vsd_undo: frame_vsd_undo_cell_ptr(),
+        generator_yield_tos: generator_yield_tos_cell_ptr(),
+        unflushed_escaped_callee: unflushed_escaped_callee_cell_ptr(),
         single_frame_blackhole: single_frame_blackhole_cell_ptr(),
         multi_frame_blackhole: multi_frame_blackhole_cell_ptr(),
         parked_stack: fbw_state::parked_walk_tls_stack_cell_ptr(),
@@ -9818,24 +9960,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // rollback reads the dict and the name back to put it there — forward all
     // three.  A null `displaced` is the unbound case and names no object.
     // `written` is the object a `STORE_SUBSCR` rollback compares by identity;
-    // it has to move with the dict entry or the comparison misses.
+    // it has to move with the dict entry or the comparison misses.  The parked
+    // walker uses the same helper (`FbwNamespaceStore::visit_gc_refs`).
     let namespace_stores = unsafe { &mut *(*area.namespace_stores).as_ptr() };
     for entry in namespace_stores.iter_mut() {
-        for slot in [
-            &mut entry.namespace as *mut pyre_object::PyObjectRef,
-            &mut entry.name as *mut pyre_object::PyObjectRef,
-            &mut entry.displaced as *mut pyre_object::PyObjectRef,
-        ] {
-            if unsafe { *slot }.is_null() {
-                continue;
-            }
-            visitor(unsafe { &mut *slot.cast() });
-        }
-        if let Some(written) = entry.written.as_mut() {
-            if !written.is_null() {
-                visitor(unsafe { &mut *(written as *mut pyre_object::PyObjectRef).cast() });
-            }
-        }
+        entry.visit_gc_refs(visitor);
     }
     // The displaced `sys_exc_value` entries are exception objects that may be
     // nursery-resident and no longer referenced elsewhere once the eager store
@@ -9865,33 +9994,24 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         // `usize` body pc and the bool flag are plain scalars.
         visitor(unsafe { &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast() });
     }
-    // The escape-flush undo snapshot stays armed from force time until the
-    // abort epilogue consumes it, and its slots can be the ONLY reference to
-    // pre-walk locals the flush displaced (the live-frame slots now hold
-    // walk-end values) — forward each so a minor collection on the abort
-    // unwind cannot move/free what `restore_escape_flush_undo` writes back.
+    // Same field list as `walk_parked_walk_tls_stack`: frame-address words
+    // plus the slots / yield value those journals already forwarded
+    // (`fbw_state::visit_journalled_frame_roots`).
     let escape_undo = unsafe { &mut *(*area.escape_flush_undo).as_ptr() };
-    if let Some(undo) = escape_undo.as_mut() {
-        for slot in undo.slots.iter_mut() {
-            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-        }
-        // The post-flush image is compared against the live slots, so it has to
-        // be forwarded on the same window: a stale address would read as "the
-        // residual wrote this" for every moved value and suppress the undo.
-        for slot in undo.flush_image.iter_mut() {
-            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-        }
-    }
-    // The `f_locals` fold's pre-mirror images are armed the same way and live
-    // just as long — until the walk's commit or rollback leg consumes them —
-    // and the live-frame slots they shadow now hold the mirrored values, so
-    // each displaced entry needs forwarding too.
     let locals_mirror = unsafe { &mut *(*area.locals_mirror_undo).as_ptr() };
-    for entry in locals_mirror.iter_mut() {
-        for slot in entry.slots.iter_mut() {
-            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-        }
-    }
+    let exit_last_instr = unsafe { &mut *(*area.exit_last_instr_undo).as_ptr() };
+    let frame_vsd = unsafe { &mut *(*area.frame_vsd_undo).as_ptr() };
+    let generator_yield = unsafe { &mut *(*area.generator_yield_tos).as_ptr() };
+    let unflushed = unsafe { &mut *(*area.unflushed_escaped_callee).as_ptr() };
+    fbw_state::visit_journalled_frame_roots(
+        exit_last_instr,
+        frame_vsd,
+        locals_mirror,
+        generator_yield,
+        unflushed,
+        escape_undo,
+        visitor,
+    );
     // The vable-force and trace-too-long MIFrame images survive the dispatch
     // unwind in TLS. Their Option<i64> Ref banks are not otherwise visible to
     // the collector, so forward every populated color until the walk-end

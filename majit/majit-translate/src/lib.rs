@@ -401,14 +401,6 @@ fn build_semantic_program_via_active_frontend(
                     static_addrs.error_carrier,
                     &raw_alloc_flavor_structs,
                 ));
-                unsafe_fn_stubs.extend(
-                    front::mir::collect_raw_storage_impl_method_stubs_from_llbc(
-                        &llbc,
-                        &gc_struct_ids,
-                        static_addrs.error_carrier,
-                        &raw_alloc_flavor_structs,
-                    ),
-                );
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
                 let prog = graph_bodies.lower_prelinked_crate(

@@ -555,6 +555,7 @@ impl UnrollOptimizer {
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
         opt.set_compile_live_op_roots_slot(self.compile_live_op_roots_slot);
+        self.register_resume_memo(opt);
     }
 
     fn publish_ops_span(&self, ops: &[majit_ir::OpRc]) -> super::LiveOpPublication {
@@ -741,7 +742,6 @@ impl UnrollOptimizer {
         }
         optimizer.published_short_preamble_producer_slot =
             self.compile_short_preamble_producer_slot;
-        self.register_resume_memo(optimizer);
         PublishedShortPreambleProducer {
             slot: self.compile_short_preamble_producer_slot,
             previous,
@@ -759,8 +759,10 @@ impl UnrollOptimizer {
     /// registers its own memo — `unroll.py optimize_preamble`'s as well as
     /// `optimize_peeled_loop`'s.
     ///
-    /// The handle is `Weak`, so a dropped `Optimizer` needs no withdrawal:
-    /// `MetaInterp::walk_rd_consts_refs` keeps only the ones that upgrade.
+    /// The handle is strong until `CompileSnapshotRootsGuard` drops: the
+    /// `Optimizer` local dies when `optimize_trace` returns, and
+    /// `backend.compile_loop` can collect before `compiled_loops` holds
+    /// the guard (`resume.py finish` / `storage.rd_consts = self.memo.consts`).
     fn register_resume_memo(&self, optimizer: &crate::optimizeopt::optimizer::Optimizer) {
         let Some(addr) = self.compile_resume_memos_slot else {
             return;
@@ -772,7 +774,7 @@ impl UnrollOptimizer {
         // registered root walker.
         unsafe {
             (*(addr as *mut Vec<crate::resume::LiveResumeMemo>))
-                .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
+                .push(std::rc::Rc::clone(&optimizer.resumedata_memo));
         }
     }
 
@@ -968,7 +970,6 @@ impl UnrollOptimizer {
             // ── Phase 1: optimize_preamble (compile.py:275-276) ──
             let mut consts_p1 = constants.clone();
             let mut opt_p1 = self.phase_optimizer(vable_config.clone());
-            self.register_resume_memo(&opt_p1);
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
             self.pin_inner_optimizer(&mut opt_p1);
@@ -2765,7 +2766,7 @@ impl ExportedState {
             let mut pos = op.pos().get();
             visit_opref(&mut pos, visitor);
             op.pos().set(pos);
-            op.walk_const_ptr_refs_mut(visitor);
+            crate::optimizeopt::walk_live_op(op, visitor);
         }
 
         fn visit_op_info(
