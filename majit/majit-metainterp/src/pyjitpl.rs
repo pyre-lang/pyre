@@ -6991,10 +6991,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `initialize_virtualizable` has appended `virtualizable_boxes`.
     /// `initial_inputarg_consts` already interns the reds, and
     /// `walk_active_trace_refs` forwards those ConstPtrs only from
-    /// `self.tracing`, so the ctx is stored first. `set_cpu` and
-    /// `set_force_finish` do not allocate. Bridges go through
-    /// `start_retrace_from_guard` and do not use this helper, so their
-    /// merge-point list stays empty.
+    /// `self.tracing`, so the ctx is stored first. `set_cpu`,
+    /// `set_metainterp_cpu` and `set_force_finish` do not allocate.
+    /// Bridges go through `start_retrace_from_guard` and do not use this
+    /// helper, so their merge-point list stays empty.
     fn publish_trace_start(
         &mut self,
         mut ctx: TraceCtx,
@@ -7009,6 +7009,9 @@ impl<M: Clone> MetaInterp<M> {
         // MetaInterp owns both `tracing` and `backend`, and tracing is
         // torn down before `self` moves.
         ctx.set_cpu(Some(&self.backend));
+        // pyjitpl.py `MetaInterp.cpu` for `execute_and_record` /
+        // `executor.execute` (`model.py AbstractCPU`).
+        ctx.set_metainterp_cpu(self.cpu.clone());
         self.tracing = Some(ctx);
         self.initialize_virtualizable(live_values);
         if let Some(ctx) = self.tracing.as_mut() {
@@ -17750,6 +17753,7 @@ impl<M: Clone> MetaInterp<M> {
         // pinning by MetaInterp ownership.  Bridge traces share the
         // same backend reference as the source loop.
         ctx.set_cpu(Some(&self.backend));
+        ctx.set_metainterp_cpu(self.cpu.clone());
         // pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
         // Stash the source token on the trace context so
         // `prepare_trace_segmenting` can set FORCE_BRIDGE_SEGMENTING here.

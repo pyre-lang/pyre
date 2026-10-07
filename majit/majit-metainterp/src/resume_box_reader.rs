@@ -1368,9 +1368,10 @@ pub fn materialize_bridge_virtual(
             // resume.py: buffer = decoder.int_add_const(base_buffer, self.offset)
             let offset_ref = ctx.const_int(*offset);
             // `INT_ADD` is always-pure, so the funnel neither reads
-            // `last_exc_value` nor consults the cpu — the integer row folds
-            // from the operands alone.
-            let cpu = crate::cpu::default_cpu();
+            // `last_exc_value` nor consults a live memory reader — the
+            // integer row folds from the operands alone. The fold gate
+            // still needs `MetaInterp.cpu`.
+            let cpu = ctx.metainterp_cpu.clone();
             let buffer = ctx.execute_and_record(
                 Some(cpu.as_ref()),
                 OpCode::IntAdd,
@@ -1534,10 +1535,11 @@ pub fn materialize_bridge_virtual(
             let largerstr = decode_fieldnum(ctx, fieldnums[0], rd_virtuals, resume_data, cache);
             let start = decode_fieldnum(ctx, fieldnums[1], rd_virtuals, resume_data, cache);
             let length = decode_fieldnum(ctx, fieldnums[2], rd_virtuals, resume_data, cache);
-            // resume.py:1157-1158 / :1185-1186: stopbox = INT_ADD(startbox, lengthbox)
+            // resume.py `slice_string` / `slice_unicode`:
+            // `stopbox = execute_and_record(INT_ADD, startbox, lengthbox)`.
             // See the `VRawSliceInfo` arm on the cpu and `last_exc_value`
             // arguments an always-pure opcode does not reach.
-            let cpu = crate::cpu::default_cpu();
+            let cpu = ctx.metainterp_cpu.clone();
             let stop = ctx.execute_and_record(
                 Some(cpu.as_ref()),
                 OpCode::IntAdd,

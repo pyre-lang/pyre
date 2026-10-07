@@ -360,6 +360,68 @@ fn leftover_bh_args(v: &[i64]) -> Option<&[i64]> {
     if v.is_empty() { None } else { Some(v) }
 }
 
+/// executor.py `do_cond_call(cpu, metainterp, argboxes, descr)`:
+///
+/// ```python
+/// def do_cond_call(cpu, metainterp, argboxes, descr):
+///     condbox = argboxes[0]
+///     if condbox.getint():
+///         do_call_n(cpu, metainterp, argboxes[1:], descr)
+/// ```
+///
+/// Trace-time `emit_force_virtualizable` has the funcptr / calldescr /
+/// virtualizable argument at the record site and no `MetaInterp`. When
+/// a Backend CPU is installed (`TraceCtx::blackhole_cpu`, wired by
+/// `TraceCtx::set_cpu` from `MetaInterp.backend`) the call goes through
+/// `cpu.bh_call_v`. Otherwise `_do_call` is the walker leftover
+/// `do_call_positional`.
+pub fn do_cond_call(
+    cpu: Option<&dyn majit_backend::Backend>,
+    cond: i64,
+    func_ptr: i64,
+    args: &[i64],
+    descr: &dyn majit_ir::descr::CallDescr,
+) {
+    if cond == 0 {
+        return;
+    }
+    match cpu {
+        Some(cpu) => do_call_n(cpu, func_ptr, args, descr),
+        None => {
+            let _ = do_call_positional(descr, func_ptr, args);
+        }
+    }
+}
+
+/// executor.py `do_call_n` → `_do_call(..., rettype='v')`: split
+/// positional args by `descr.arg_types()` and `cpu.bh_call_v`.
+fn do_call_n(
+    cpu: &dyn majit_backend::Backend,
+    func_ptr: i64,
+    args: &[i64],
+    descr: &dyn majit_ir::descr::CallDescr,
+) {
+    let mut args_i = Vec::new();
+    let mut args_r = Vec::new();
+    let mut args_f = Vec::new();
+    for (i, ty) in descr.arg_types().iter().enumerate().take(args.len()) {
+        match ty {
+            majit_ir::Type::Int => args_i.push(args[i]),
+            majit_ir::Type::Ref => args_r.push(args[i]),
+            majit_ir::Type::Float => args_f.push(args[i]),
+            majit_ir::Type::Void => panic!("do_call_n: void argument class at slot {i}"),
+        }
+    }
+    let calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(descr);
+    cpu.bh_call_v(
+        func_ptr,
+        leftover_bh_args(&args_i),
+        leftover_bh_args(&args_r),
+        leftover_bh_args(&args_f),
+        &calldescr,
+    );
+}
+
 /// `executor.py _do_call`: split argboxes[1..] into I/R/F and call
 /// `cpu.bh_call_*`. `argboxes[0]` is the funcbox.
 fn do_call<M: Clone>(
@@ -655,6 +717,18 @@ pub fn execute_ptr_compare_const(opcode: OpCode, a: usize, b: usize) -> Option<i
         _ => return None,
     };
     Some(result as i64)
+}
+
+/// `executor.py execute` for the pointer-compare row: unbox two values
+/// (`getref_base()` / the Int word a non-moving pointer constant carries)
+/// and run [`execute_ptr_compare_const`]. `blackhole.py bhimpl_ptr_ne`
+/// does not take `cpu`.
+pub fn execute_ptr_compare_values(
+    opcode: OpCode,
+    a: majit_ir::Value,
+    b: majit_ir::Value,
+) -> Option<i64> {
+    execute_ptr_compare_const(opcode, const_pointer_word(a)?, const_pointer_word(b)?)
 }
 
 /// The machine word a constant carries when it stands for a pointer: a GC
@@ -1182,6 +1256,44 @@ mod execute_residual_call_tests {
             Ok(3),
             "stale BH_LAST_EXC_VALUE must be cleared before dispatch"
         );
+    }
+}
+
+#[cfg(test)]
+mod do_cond_call_tests {
+    use super::*;
+    use majit_ir::descr::SimpleCallDescr;
+    use majit_ir::{EffectInfo, ExtraEffect, Type};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static LAST: AtomicI64 = AtomicI64::new(0);
+
+    extern "C" fn probe(vable: i64) {
+        LAST.store(vable, Ordering::SeqCst);
+    }
+
+    fn void_ref_descr() -> SimpleCallDescr {
+        SimpleCallDescr::new(
+            0,
+            vec![Type::Ref],
+            Type::Void,
+            false,
+            0,
+            EffectInfo {
+                extraeffect: ExtraEffect::CannotRaise,
+                ..EffectInfo::default()
+            },
+        )
+    }
+
+    #[test]
+    fn do_cond_call_respects_the_condition() {
+        LAST.store(0, Ordering::SeqCst);
+        let descr = void_ref_descr();
+        do_cond_call(None, 0, probe as *const () as i64, &[0xBEEF], &descr);
+        assert_eq!(LAST.load(Ordering::SeqCst), 0);
+        do_cond_call(None, 1, probe as *const () as i64, &[0xBEEF], &descr);
+        assert_eq!(LAST.load(Ordering::SeqCst), 0xBEEF);
     }
 }
 
