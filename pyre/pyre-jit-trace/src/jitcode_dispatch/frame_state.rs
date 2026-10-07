@@ -166,9 +166,9 @@ impl WalkFrameState {
     }
 
     /// `virtualizable.py write_boxes`: validate the sparse native shadow, then
-    /// read each live value immediately before its write. The writer may box
-    /// Int/Float values and collect; neither a borrow nor a copied Ref list may
-    /// span that allocation. Ref values themselves require no boxing allocation.
+    /// read each live value. The callback must not allocate. A caller that
+    /// boxes Int/Float slots has to pin every copied `Ref` first: the shadow
+    /// is not a root, and a minor resets the from-space address.
     pub(crate) fn write_callee_locals(
         &self,
         nlocals: usize,

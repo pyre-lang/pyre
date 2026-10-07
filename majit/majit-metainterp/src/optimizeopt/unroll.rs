@@ -457,6 +457,10 @@ pub struct UnrollOptimizer {
     /// because the unroll optimizer owns the inner phase optimizers while the
     /// registered GC walker enters through MetaInterp.
     pub compile_snapshot_root_slots: Option<usize>,
+    /// Address of `MetaInterp.compile_live_op_roots`. The phase optimizers
+    /// and this unroll's `TraceIterator` source ops publish through it, so a
+    /// collection while `next` re-interns `Op.value` forwards those refs.
+    pub compile_live_op_roots_slot: Option<usize>,
     /// Address of `MetaInterp.compile_resume_memos`, forwarded to every
     /// `Optimizer` this unroll builds so its memo is rooted while in flight.
     pub compile_resume_memos_slot: Option<usize>,
@@ -552,6 +556,25 @@ impl UnrollOptimizer {
         opt.string_length_resolver = self.string_length_resolver.clone();
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
+        opt.set_compile_live_op_roots_slot(self.compile_live_op_roots_slot);
+    }
+
+    fn publish_ops_span(&self, ops: &[majit_ir::OpRc]) -> super::LiveOpPublication {
+        let Some(slot) = self.compile_live_op_roots_slot else {
+            return super::LiveOpPublication::noop();
+        };
+        // SAFETY: pyjitpl installs this address from `compile_live_op_roots`
+        // for the duration of one compile. The walker runs on this thread.
+        unsafe { &mut *(slot as *mut super::CompileLiveOpRoots) }.publish_span(ops)
+    }
+
+    fn publish_ops_vec(&self, ops: &Vec<majit_ir::OpRc>) -> super::LiveOpPublication {
+        let Some(slot) = self.compile_live_op_roots_slot else {
+            return super::LiveOpPublication::noop();
+        };
+        // SAFETY: same publication as `publish_ops_span`. The `Vec` header
+        // stays put for the guard's lifetime; growth does not move it.
+        unsafe { &mut *(slot as *mut super::CompileLiveOpRoots) }.publish_vec(ops)
     }
 
     /// Supply the target tokens an earlier compile of this green key left
@@ -633,6 +656,7 @@ impl UnrollOptimizer {
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
+            compile_live_op_roots_slot: None,
             compile_resume_memos_slot: None,
             compile_short_preamble_producer_slot: None,
             persistent_snapshot_root_slots: Vec::new(),
@@ -908,6 +932,10 @@ impl UnrollOptimizer {
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
         phase1_out: Option<&mut Option<(Vec<majit_ir::OpRc>, ExportedState)>>,
     ) -> Result<(Vec<majit_ir::OpRc>, usize), crate::optimize::InvalidLoop> {
+        // `TraceIterator::next` re-interns each recorded `Op.value`. That
+        // asks `id_or_identityhash` and can collect. The source ops are the
+        // only holders of those refs once `compile_tracing` has been taken.
+        let _input_ops_root = self.publish_ops_span(ops);
         // compile.py: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
         let (mut exported_state, consts_p1, p1_ops) = if let Some(pre_imported) =
@@ -1006,6 +1034,7 @@ impl UnrollOptimizer {
                 0, // start_fresh = 0 — inputargs at [0..num_inputs)
             );
             let mut p1_ops_in: Vec<majit_ir::OpRc> = Vec::with_capacity(ops.len());
+            let _p1_ops_root = self.publish_ops_vec(&p1_ops_in);
             while let Some(op) = p1_iter.next() {
                 p1_ops_in.push(op);
             }
@@ -1377,6 +1406,7 @@ impl UnrollOptimizer {
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
         );
         let mut p2_ops_in: Vec<majit_ir::OpRc> = Vec::with_capacity(ops.len());
+        let _p2_ops_root = self.publish_ops_vec(&p2_ops_in);
         while let Some(op) = iter.next() {
             p2_ops_in.push(op);
         }
@@ -1773,14 +1803,39 @@ impl UnrollOptimizer {
             imported_short_preamble_builder.as_ref(),
         );
         self.target_tokens.push(target_token);
-        // `publish_const_ptr_root` dies with `imported_loop_state`. The loop
-        // token outlives that compile; keep the deduped indexes registered
-        // on its virtual state until the token drops.
-        if let Some(state) = opt_p2.imported_loop_state.as_ref() {
-            let indexes = state.const_ptr_indexes();
-            if let Some(token) = self.target_tokens.last_mut()
-                && let Some(virtual_state) = token.virtual_state.as_mut()
+        // `publish_const_ptr_root` dies with `imported_loop_state`. That
+        // list also names ConstPtrs in partial-trace ops, which die with
+        // the state. The token keeps its virtual state and short preamble,
+        // so register only the indexes those two still hold.
+        if let Some(token) = self.target_tokens.last_mut() {
+            // Virtual-state walks do not take the table lock. Holder and
+            // exported-state walks call `trace_index`, which holds it:
+            // copy addresses first, then resolve.
+            let mut addrs = Vec::new();
+            let mut take_addr = |gcref: &mut majit_ir::GcRef| {
+                if !gcref.is_null() {
+                    addrs.push(*gcref);
+                }
+            };
+            let mut attrs = token.attrs();
+            if let Some(virtual_state) = attrs.virtual_state.as_mut() {
+                virtual_state.walk_const_ptr_refs_mut(&mut take_addr);
+            }
+            if let Some(short_preamble) = attrs.short_preamble.as_mut()
+                && let Some(exported_state) = short_preamble.exported_state.as_mut()
             {
+                exported_state.walk_const_ptr_refs_mut(&mut take_addr);
+            }
+            if let Some(short_preamble) = attrs.short_preamble.as_mut() {
+                short_preamble.walk_const_ptr_holders_mut(&mut take_addr);
+            }
+            let mut indexes = Vec::with_capacity(addrs.len());
+            for addr in addrs {
+                if let Some(index) = majit_ir::const_ptr_table::index_of_current(addr) {
+                    indexes.push(index);
+                }
+            }
+            if let Some(virtual_state) = attrs.virtual_state.as_mut() {
                 virtual_state.retain_const_ptr_indexes(&indexes);
             }
         }
@@ -3102,21 +3157,6 @@ impl ExportedState {
             area: Some(area),
             indexes,
         });
-    }
-
-    /// Deduped `ConstPtr` indexes `publish_const_ptr_root` registered.
-    ///
-    /// Empty when that publication declined. The loop token copies this
-    /// list onto its virtual state; the copy outlives this state.
-    fn const_ptr_indexes(&self) -> Vec<u32> {
-        let Some(root) = &self.const_ptr_root else {
-            return Vec::new();
-        };
-        if root.indexes.is_null() {
-            return Vec::new();
-        }
-        // SAFETY: the box lives until this root is dropped. `&self` holds it.
-        unsafe { (*root.indexes).indexes.clone() }
     }
 
     /// Update GcRef values from shadow stack — GC may have moved objects.

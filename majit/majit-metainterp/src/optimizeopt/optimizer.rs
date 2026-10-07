@@ -4433,6 +4433,20 @@ impl Optimizer {
         self.building_bridge = building_bridge_saved;
         self.skip_flush = skip_flush_saved;
         let mut optimized_ops = optimized_ops?;
+        // `optimize_with_constants_and_inputs_at` drops its context and
+        // emitted-vec guards before returning. This tail still runs `flush`,
+        // `force_box_for_end_of_preamble`, `export_state`, and
+        // `send_extra_operation`, any of which can minor-collect. The closing
+        // JUMP is removed from the vec, so it needs its own holder: cranelift
+        // `from_opref` re-interns ConstPtr indexes, and a slot that missed
+        // the walk still names the nursery (`intern` → `find_shadow`).
+        let mut ops_pub = Some(self.publish_live_op_vec(&optimized_ops));
+        let ctx_ptr: *const OptContext = self
+            .final_ctx
+            .as_ref()
+            .map(|ctx| ctx as *const OptContext)
+            .unwrap_or(std::ptr::null());
+        let mut ctx_pub = Some(self.publish_live_op_context(ctx_ptr));
 
         // `reached_loop_header` emits the GUARD_FUTURE_CONDITION before both
         // of its closes, so upstream always has a `patchguardop`:
@@ -4473,23 +4487,30 @@ impl Optimizer {
         // `info.jump_op`. Pyre's skip_flush=false path instead sends it
         // through the passes into `new_operations`; pull it back out so
         // `jump_to_preamble` can rewrite `descr=cell_token.target_tokens[0]`.
-        let mut terminal_jump = self
+        // Keep the detached JUMP's `OpRc` alive. `(*op).clone()` drops the
+        // handle, and a const that lives only on that JUMP is then untraced.
+        let mut detached_jump: Vec<majit_ir::OpRc> = Vec::new();
+        if let Some(op) = self
             .terminal_op
             .take()
-            .filter(|op| op.opcode == OpCode::Jump);
-        if terminal_jump.is_none()
+            .filter(|op| op.opcode == OpCode::Jump)
+        {
+            detached_jump.push(majit_ir::OpRc::new(op));
+        }
+        if detached_jump.is_empty()
             && let Some(idx) = optimized_ops
                 .iter()
                 .rposition(|op| op.opcode == OpCode::Jump)
         {
-            terminal_jump = Some((*optimized_ops.remove(idx)).clone());
+            detached_jump.push(optimized_ops.remove(idx));
         }
+        let _detached_jump_pub = self.publish_live_op_vec(&detached_jump);
 
         if optimized_ops.len() < 120 && crate::smallir_enabled() {
             eprintln!(
                 "@@@SMALLIR BRIDGE total={} has_jump={} front_targets={}",
                 optimized_ops.len(),
-                terminal_jump.is_some() as i32,
+                !detached_jump.is_empty() as i32,
                 target_tokens.len(),
             );
             for (i, op) in optimized_ops.iter().enumerate() {
@@ -4503,7 +4524,7 @@ impl Optimizer {
 
         // A FINISH-only trace belongs on SimpleCompileData.optimize_loop
         // (`compile.py compile_trace` `ends_with_jump=False`).
-        let Some(terminal_jump) = terminal_jump else {
+        let Some(terminal_jump) = detached_jump.last().map(|op| (**op).clone()) else {
             return Err(crate::optimize::InvalidLoop(
                 "optimize_bridge requires a JUMP; FINISH uses optimize_loop",
             ));
@@ -4524,6 +4545,7 @@ impl Optimizer {
             // resolves it off the JUMP target, not the bridge origin).
             // `assert cell_token.target_tokens`: require a target.
             if !target_tokens.is_empty() {
+                drop(ctx_pub.take());
                 let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
                     // opencoder.py:259 inputarg_from_tp parity — seed inputarg
                     // operands with the producer-side types when available; the
@@ -4543,15 +4565,20 @@ impl Optimizer {
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
+                let ctx_here = self.publish_live_op_context(&ctx);
+                drop(ops_pub.take());
                 let result =
                     self.jump_to_preamble(&terminal_jump, target_tokens, optimized_ops, &mut ctx);
+                drop(ctx_here);
                 self.final_ctx = Some(ctx);
                 return result;
             }
+            drop(ops_pub.take());
             return Ok((optimized_ops, false));
         }
 
         // unroll.py:203: self.flush()
+        drop(ctx_pub.take());
         let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
             // opencoder.py:259 inputarg_from_tp parity — same fallback shape
             // as the inline_short_preamble path above.
@@ -4567,6 +4594,7 @@ impl Optimizer {
                 .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
             OptContext::with_inputarg_types(32, &types)
         });
+        let ctx_tail = self.publish_live_op_context(&ctx);
 
         // unroll.py:148-158 `_optimize_unrolled_loop` ordering:
         //
@@ -4638,17 +4666,23 @@ impl Optimizer {
             // RPython: self.jump_to_preamble → send_extra_operation
             Err(_) => {
                 if !target_tokens.is_empty() {
+                    drop(ops_pub.take());
                     let result = self.jump_to_preamble(
                         &terminal_jump,
                         target_tokens,
                         optimized_ops,
                         &mut ctx,
                     );
+                    drop(ctx_tail);
                     self.final_ctx = Some(ctx);
                     return result;
                 }
+                drop(ops_pub.take());
                 let mut result = optimized_ops;
+                let result_pub = self.publish_live_op_vec(&result);
                 result.append(&mut ctx.new_operations);
+                drop(result_pub);
+                drop(ctx_tail);
                 self.final_ctx = Some(ctx);
                 return Ok((result, false));
             }
@@ -4656,8 +4690,12 @@ impl Optimizer {
 
         // unroll.py:212-213: vs is None → matched, JUMP redirected
         if vs.is_none() {
+            drop(ops_pub.take());
             let mut result = optimized_ops;
+            let result_pub = self.publish_live_op_vec(&result);
             result.append(&mut ctx.new_operations);
+            drop(result_pub);
+            drop(ctx_tail);
             self.final_ctx = Some(ctx);
             return Ok((result, false));
         }
@@ -4731,10 +4769,14 @@ impl Optimizer {
             // OptHeap's deferred setfield_gc stores are exactly what the
             // `self.flush` above emitted — dropping this buffer would erase a
             // heap store the bridge body performed.
+            drop(ops_pub.take());
             let mut result = optimized_ops;
+            let result_pub = self.publish_live_op_vec(&result);
             result.append(&mut ctx.new_operations);
             // unroll.py `_clean_optimization_info(self._newoperations)`
             Self::clean_optimization_info(&result);
+            drop(result_pub);
+            drop(ctx_tail);
             self.final_ctx = Some(ctx);
             return Ok((result, true));
         }
@@ -4763,8 +4805,12 @@ impl Optimizer {
 
         // unroll.py:226-227: vs is None → matched with forced boxes
         if vs2.is_none() {
+            drop(ops_pub.take());
             let mut result = optimized_ops;
+            let result_pub = self.publish_live_op_vec(&result);
             result.append(&mut ctx.new_operations);
+            drop(result_pub);
+            drop(ctx_tail);
             self.final_ctx = Some(ctx);
             return Ok((result, false));
         }
@@ -4778,13 +4824,17 @@ impl Optimizer {
                 retraced_count, retrace_limit,
             );
         }
+        drop(ops_pub.take());
         let result = if !target_tokens.is_empty() {
             self.jump_to_preamble(&terminal_jump, target_tokens, optimized_ops, &mut ctx)
         } else {
             let mut result = optimized_ops;
+            let result_pub = self.publish_live_op_vec(&result);
             result.append(&mut ctx.new_operations);
+            drop(result_pub);
             Ok((result, false))
         };
+        drop(ctx_tail);
         self.final_ctx = Some(ctx);
         result
     }
@@ -4800,6 +4850,10 @@ impl Optimizer {
         mut optimized_ops: Vec<majit_ir::OpRc>,
         ctx: &mut OptContext,
     ) -> Result<(Vec<majit_ir::OpRc>, bool), crate::optimize::InvalidLoop> {
+        // Caller dropped its vec guard before moving `optimized_ops` in.
+        // `send_extra_operation` can minor-collect before the JUMP lands
+        // in `ctx.new_operations`.
+        let ops_pub = self.publish_live_op_vec(&optimized_ops);
         // unroll.py: `assert cell_token.target_tokens[0].virtual_state is None`
         if target_tokens
             .first()
@@ -4832,6 +4886,7 @@ impl Optimizer {
         }
         self.send_extra_operation(&OpRc::new(jump_op.clone()), ctx)?;
         optimized_ops.append(&mut ctx.new_operations);
+        drop(ops_pub);
         Ok((optimized_ops, false))
     }
 

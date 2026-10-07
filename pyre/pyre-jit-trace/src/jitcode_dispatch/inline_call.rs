@@ -14761,6 +14761,7 @@ fn publish_yield_vable_array<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
     // stack slots included, because this flush writes those too.
     fbw_note_locals_mirror_undo(frame, len);
     let base = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let mut slots = Vec::with_capacity(len);
     for slot in 0..len {
         let Some((op, mut value)) = ctx.trace_ctx.virtualizable_entry_at(base + slot) else {
             continue;
@@ -14775,13 +14776,11 @@ fn publish_yield_vable_array<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
                 value = stamped;
             }
         }
-        let boxed = crate::state::boxed_slot_value_for_type(majit_ir::Type::Ref, &value);
-        crate::state::store_live_frame_array_slot(
-            frame,
-            slot,
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed as usize)),
-        );
+        slots.push((slot, value));
     }
+    // Pin every ref before the first `w_int_new`. Storing one boxed slot at
+    // a time rewrites a later shadow ref with its pre-collection address.
+    let _ = crate::state::store_pinned_frame_locals(frame, &slots);
 }
 
 /// Python pc and code object of an `abort_permanent` at `op_pc`, when that

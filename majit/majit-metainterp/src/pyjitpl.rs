@@ -1000,7 +1000,13 @@ pub(crate) fn snapshot_tagged_to_box(
 /// is `[InputArg(0), InputArg(2)]` while ops still name slot 2. The fresh
 /// boxes are allocated densely from 0, which is the namespace
 /// `UnrollOptimizer`'s later `TraceIterator::new` walks.
-fn prepare_retrace_snapshot(mut trace: crate::history::TreeLoop) -> crate::history::TreeLoop {
+fn prepare_retrace_snapshot(
+    mut trace: crate::history::TreeLoop,
+    roots: &mut crate::optimizeopt::CompileLiveOpRoots,
+) -> crate::history::TreeLoop {
+    // `TraceIterator::next` re-interns each source value. The reminted
+    // ops are a second holder; publish that vec before `next` can collect.
+    let _src = roots.publish_tree_loop(&mut trace);
     let (ops, reminted_inputargs, cache) = {
         let mut iter = crate::opencoder::TraceIterator::new_with_inputargs(
             &trace.ops,
@@ -1011,6 +1017,7 @@ fn prepare_retrace_snapshot(mut trace: crate::history::TreeLoop) -> crate::histo
             0,
         );
         let mut ops = Vec::with_capacity(trace.ops.len());
+        let _fresh = roots.publish_vec(&ops);
         while let Some(op) = iter.next() {
             ops.push(op);
         }
@@ -1061,6 +1068,7 @@ fn prepare_retrace_snapshot(mut trace: crate::history::TreeLoop) -> crate::histo
     }
     trace.ops = ops;
     trace.inputargs = reminted_inputargs;
+    drop(_src);
     trace
 }
 
@@ -3919,6 +3927,10 @@ impl<M: Clone> MetaInterp<M> {
             return;
         };
         trace_ctx.recorder.walk_const_ptr_refs(&mut visitor);
+        // Resume copies in `ReconstructRecipe::concrete_r` are not recorder
+        // cells. Forward them until `take_bridge_inline_carrier` moves the
+        // carrier onto the stack.
+        trace_ctx.walk_bridge_carrier_concrete_refs(&mut visitor);
         // `set_concrete_at` also stamps a runtime `Value::Ref` onto recorder
         // InputArgs (loop / bridge entry args). No other walker visits them,
         // and an InputArg carries no args / fail_args, so `.value` is the only
@@ -4156,6 +4168,17 @@ impl<M: Clone> MetaInterp<M> {
         ops: &Vec<majit_ir::OpRc>,
     ) -> crate::optimizeopt::LiveOpPublication {
         self.compile_live_op_roots.publish_vec(ops)
+    }
+
+    /// Forward ops, inputarg values, and snapshots on a compile-local loop.
+    ///
+    /// The guard does not borrow `trace`. The `TreeLoop` must not move
+    /// while the guard is alive: the walker re-reads that header.
+    fn publish_tree_loop(
+        &mut self,
+        trace: &mut crate::history::TreeLoop,
+    ) -> crate::optimizeopt::LiveOpPublication {
+        self.compile_live_op_roots.publish_tree_loop(trace)
     }
 
     /// Forward the virtualizable anchor published for the in-flight compile.
@@ -9042,8 +9065,14 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap()
             .recorder
             .close_loop(jump_args);
-        // Taking the parked ctx ends walk_active_trace_refs coverage;
-        // compile_snapshot_refs roots the final maps below.
+        // `materialize_ops` copies `FrontendSlot.concrete` onto op values
+        // and interns. `walk_active_trace_refs` stops seeing this recorder
+        // at `take`, so materialize first.
+        self.compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .materialize_into_ops();
         let mut ctx = self.compile_tracing.take().unwrap();
         let mut recorder = ctx.recorder;
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
@@ -9071,7 +9100,10 @@ impl<M: Clone> MetaInterp<M> {
         // When the trace was retargeted to a different loop header,
         // cut_trace_from removes ops before the merge point and
         // replaces inputargs with original_boxes at the cut position.
-        let trace = if let Some((ref original_boxes, start)) = cross_loop_cut {
+        let mut trace = if let Some((ref original_boxes, start)) = cross_loop_cut {
+            // `cut_trace_from` reads op values while it builds
+            // the cut. Keep the source forwarded for that whole read.
+            let _cut_src = self.publish_tree_loop(&mut trace);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] cut_trace_from: start.op_index={} original_boxes={} jump_args={} trace_ops={} header_pc={}",
@@ -9097,7 +9129,10 @@ impl<M: Clone> MetaInterp<M> {
             // is total: `opencoder.py CutTrace` views the suffix with
             // `inputargs` = the merge-point live boxes. A pre-cut producer
             // the suffix names is one of those boxes (`TraceIterator._get`).
-            trace.cut_trace_from(start, original_boxes)
+            let cut = trace.cut_trace_from(start, original_boxes);
+            drop(_cut_src);
+            drop(trace);
+            cut
         } else {
             trace
         };
@@ -9112,6 +9147,9 @@ impl<M: Clone> MetaInterp<M> {
             .max_retrace_guards();
         let (enable_opts, disable_unrolling, pureop_historylength) =
             self.snapshot_compiling_opt_params();
+        // `compile_tracing` no longer names these ops. Preamble setup and
+        // snapshot lowering allocate before `publish_ops_span`.
+        let _trace_roots = self.publish_tree_loop(&mut trace);
         let preamble_data =
             compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, &enable_opts);
         let trace_snapshots = preamble_data.base.snapshots();
@@ -9202,6 +9240,10 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_live_op_roots_slot = Some(
+            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
+                as usize,
+        );
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.compile_resume_memos_slot = Some(
@@ -11027,7 +11069,7 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor,
             loop_jitcell_token,
             mut constants,
-            trace,
+            mut trace,
             call_pure_results,
             phase2_input_ops_seed,
             mut ctx,
@@ -11110,9 +11152,13 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.close_loop(jump_args);
                 jump_cut
             };
+            // Decode snapshots and copy `FrontendSlot.concrete` while
+            // `walk_active_trace_refs` still forwards this recorder.
+            let parked_trace = self.compile_tracing.as_mut().unwrap().snapshot_tree_loop();
             let mut ctx = self.compile_tracing.take().unwrap();
-            let trace = ctx.snapshot_tree_loop();
+            let mut trace = parked_trace;
             let trace = if let Some((ref original_boxes, start)) = retrace_cut {
+                let _cut_src = self.publish_tree_loop(&mut trace);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={}",
@@ -11134,7 +11180,10 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile.py compile_retrace` `cut_trace_from` is total:
                 // `opencoder.py CutTrace` views the suffix with the merge
                 // point's live boxes as inputargs.
-                trace.cut_trace_from(start, original_boxes)
+                let cut = trace.cut_trace_from(start, original_boxes);
+                drop(_cut_src);
+                drop(trace);
+                cut
             } else {
                 trace
             };
@@ -11142,7 +11191,7 @@ impl<M: Clone> MetaInterp<M> {
             // `inputargs[i].get_position()`, then `next` rewrites ops and
             // snapshots onto the fresh boxes. The unroll phases walk that
             // rewritten trace with a dense `TraceIterator::new`.
-            let trace = prepare_retrace_snapshot(trace);
+            let trace = prepare_retrace_snapshot(trace, &mut self.compile_live_op_roots);
             // Seed the retrace optimizer's `input_ops` directly. Retrace runs
             // no Phase 1, so the recorder ops carry no `_forwarded`, and
             // `trace.ops` (non-cut) are the recorder `Rc<Op>` themselves. Cut
@@ -11166,6 +11215,7 @@ impl<M: Clone> MetaInterp<M> {
             )
         };
 
+        let _retrace_roots = self.publish_tree_loop(&mut trace);
         let partial_ops_before = partial.ops.len();
         // unroll.py `optimize_peeled_loop(trace.get_iter())` mints a fresh
         // ResOperation per `next()`. The recorder `OpRc` slice is that
@@ -11207,6 +11257,10 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_live_op_roots_slot = Some(
+            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
+                as usize,
+        );
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.compile_resume_memos_slot = Some(
@@ -12348,10 +12402,16 @@ impl<M: Clone> MetaInterp<M> {
         self.jitlog_start_new_trace(true, green_key, &jd_name);
         let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         // resume.py ResumeDataLoopMemo.number consumes the encoded snapshot
-        // arrays without a materialized intermediate. Taking the parked ctx
-        // ends walk_active_trace_refs coverage; the recorder's `_refs` stay
+        // arrays without a materialized intermediate. `materialize_ops`
+        // copies `FrontendSlot.concrete` before `take` ends
+        // `walk_active_trace_refs` coverage. The recorder's `_refs` stay
         // rooted by their owner roots, and compile_snapshot_refs roots the
         // list recorder's maps below, before optimization can invoke the GC.
+        self.compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .materialize_into_ops();
         let mut ctx = self.compile_tracing.take().unwrap();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
         let number_from_recorder = ctx.recorder.has_byte_buffer();
@@ -12363,13 +12423,14 @@ impl<M: Clone> MetaInterp<M> {
         let mut recorder = ctx.recorder;
         // `snapshot_recorder` stays put until the optimizer has numbered
         // every guard; the feed holds a pointer to it.
-        let (trace, snapshot_recorder) = if number_from_recorder {
+        let (mut trace, snapshot_recorder) = if number_from_recorder {
             (recorder.to_tree_loop(), Some(recorder))
         } else {
             (recorder.get_trace(), None)
         };
         let (enable_opts, _disable_unrolling, _pureop_historylength) =
             self.snapshot_compiling_opt_params();
+        let _finish_roots = self.publish_tree_loop(&mut trace);
         let SimpleCompileViews {
             data: simple_data,
             trace_ops,
@@ -12891,6 +12952,12 @@ impl<M: Clone> MetaInterp<M> {
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
         // resume.py ResumeDataLoopMemo.number walks the encoded snapshot
         // of each surviving guard; only the list recorder needs maps.
+        // Copy `FrontendSlot.concrete` before `take` detaches the recorder.
+        self.compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .materialize_into_ops();
         let mut ctx = self.compile_tracing.take().unwrap();
         let number_from_recorder = ctx.recorder.has_byte_buffer();
         let snapshot_maps = if number_from_recorder {
@@ -12899,13 +12966,14 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_maps_from_ctx(&mut ctx, &mut constants)
         };
         let mut recorder = ctx.recorder;
-        let (trace, snapshot_recorder) = if number_from_recorder {
+        let (mut trace, snapshot_recorder) = if number_from_recorder {
             (recorder.to_tree_loop(), Some(recorder))
         } else {
             (recorder.get_trace(), None)
         };
         let (enable_opts, _disable_unrolling, _pureop_historylength) =
             self.snapshot_compiling_opt_params();
+        let _simple_roots = self.publish_tree_loop(&mut trace);
         let SimpleCompileViews {
             data: simple_data,
             trace_ops,
@@ -30430,6 +30498,60 @@ mod tests {
     }
 
     #[test]
+    fn walk_active_trace_refs_forwards_carrier_recipe_ref() {
+        // `ReconstructRecipe::concrete_r` copies the resume ref. While the
+        // carrier is still on the trace, a minor has to move that word; a
+        // null slot and a non-ref stay put.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        trace_ctx.set_bridge_inline_carrier(crate::trace_ctx::BridgeInlineCarrier {
+            root_pc: 0,
+            root_jitcode_index: 0,
+            recipes: vec![crate::trace_ctx::ReconstructRecipe {
+                code_ptr: std::ptr::null(),
+                jitcode_index: 0,
+                jitcode_pc: 0,
+                nlocals: 1,
+                valuestackdepth: 3,
+                registers_i: Vec::new(),
+                registers_r: vec![OpRef::ref_op(1), OpRef::NONE, OpRef::ref_op(2)],
+                registers_f: Vec::new(),
+                concrete_r: vec![
+                    Value::Ref(GcRef(0xC000)),
+                    Value::Ref(GcRef::NULL),
+                    Value::Int(4),
+                ],
+                frame: OpRef::NONE,
+                nargs: 0,
+                return_substitute: None,
+                len_tail: false,
+                rebuilt_frame: None,
+                rebuilt_ec: None,
+            }],
+        });
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xC000 {
+                slot.0 = 0xD000;
+            }
+        });
+
+        let concrete = &meta
+            .tracing
+            .as_ref()
+            .unwrap()
+            .bridge_inline_carrier
+            .as_ref()
+            .unwrap()
+            .recipes[0]
+            .concrete_r;
+        assert!(matches!(concrete[0], Value::Ref(GcRef(0xD000))));
+        assert!(matches!(concrete[1], Value::Ref(GcRef::NULL)));
+        assert!(matches!(concrete[2], Value::Int(4)));
+    }
+
+    #[test]
     fn walk_active_trace_refs_forwards_inputarg_value_ref() {
         // `set_concrete_at` also stamps `Value::Ref` onto recorder
         // InputArgs (loop / bridge entry args), reached only through this
@@ -35191,7 +35313,8 @@ mod tests {
         rec.close_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(2)]);
         let (inputargs, ops) = rec.clone_materialized_parts();
         let trace = crate::history::TreeLoop::from_oprc(inputargs, ops, Vec::new());
-        let prepared = prepare_retrace_snapshot(trace);
+        let mut roots = crate::optimizeopt::CompileLiveOpRoots::default();
+        let prepared = prepare_retrace_snapshot(trace, &mut roots);
         assert_eq!(
             prepared.ops[0].arg(1).to_opref(),
             prepared.inputargs[1].opref(),

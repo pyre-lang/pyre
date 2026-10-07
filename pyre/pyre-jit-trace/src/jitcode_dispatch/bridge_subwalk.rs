@@ -1749,6 +1749,32 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         )?;
     }
 
+    // `sub_wc` borrows `ctx` for the whole walk. Re-read resume refs
+    // before that borrow; the recipe slices are copies the minor does
+    // not forward once the carrier has left the trace.
+    let rooted_local_concretes: Vec<majit_ir::Value> = local_concretes
+        .iter()
+        .enumerate()
+        .map(|(slot, &captured)| {
+            let opref = local_oprefs
+                .get(slot)
+                .copied()
+                .unwrap_or(majit_ir::OpRef::NONE);
+            crate::state::rooted_recipe_ref(ctx, opref, captured)
+        })
+        .collect();
+    let rooted_stack_concretes: Vec<majit_ir::Value> = resumed_stack_concretes
+        .iter()
+        .enumerate()
+        .map(|(slot, &captured)| {
+            let opref = resumed_stack_oprefs
+                .get(slot)
+                .copied()
+                .unwrap_or(majit_ir::OpRef::NONE);
+            crate::state::rooted_recipe_ref(ctx, opref, captured)
+        })
+        .collect();
+
     let outcome = {
         let mut sub_wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -1876,7 +1902,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 .unwrap()
                 .set_opref(slot as i64, opref);
         }
-        for (slot, &v) in local_concretes.iter().enumerate() {
+        for (slot, &v) in rooted_local_concretes.iter().enumerate() {
             sub_wc
                 .frame_state
                 .borrow_mut()
@@ -1900,7 +1926,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 .unwrap()
                 .set_opref((stack_base + s) as i64, opref);
         }
-        for (s, &value) in resumed_stack_concretes.iter().enumerate() {
+        for (s, &value) in rooted_stack_concretes.iter().enumerate() {
             sub_wc
                 .frame_state
                 .borrow_mut()

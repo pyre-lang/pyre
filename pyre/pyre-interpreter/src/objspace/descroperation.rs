@@ -3203,6 +3203,11 @@ fn compare_tuples_general(
     }
     let la = unsafe { w_tuple_len(roots.get(base)) };
     let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
+    // `tupleobject.py _descr_eq`: `if lgt1 != lgt2: return space.w_False`
+    // before any item `eq_w`; `descr_ne` is `negate(descr_eq)`.
+    if matches!(op, CompareOp::Eq | CompareOp::Ne) && la != lb {
+        return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+    }
     let min_len = la.min(lb);
     for i in 0..min_len {
         let ea = unsafe { w_tuple_getitem(roots.get(base), i as i64) }.unwrap_or(PY_NULL);
@@ -8227,6 +8232,80 @@ mod tests {
     fn assert_compare_bool(a: PyObjectRef, b: PyObjectRef, op: CompareOp, expected: bool) {
         let result = compare(a, b, op).unwrap();
         assert_eq!(unsafe { w_bool_get_value(result) }, expected);
+    }
+
+    #[test]
+    fn tuple_eq_length_first_does_not_call_element_eq() {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile::compile_exec(
+            "calls = []\n\
+             class X:\n    \
+             def __eq__(self, other):\n        \
+             calls.append(1)\n        \
+             return True\n\
+             eq_len = (X(),) == (X(), 0)\n\
+             ne_len = (X(),) != (X(), 0)\n\
+             same = (1, 2) == (1, 2)\n\
+             nan_a = float('nan')\n\
+             nan_b = float('nan')\n\
+             nan_same = (1.0, nan_a) == (1.0, nan_a)\n\
+             nan_distinct = (1.0, nan_a) == (1.0, nan_b)\n\
+             a, b, c = object(), object(), object()\n\
+             ne_tail = (a, b) != (a, c)\n",
+        )
+        .expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execute");
+        let globals = frame.get_w_globals();
+        let eq_len = unsafe { pyre_object::w_dict_getitem_str(globals, "eq_len") }.expect("eq_len");
+        let ne_len = unsafe { pyre_object::w_dict_getitem_str(globals, "ne_len") }.expect("ne_len");
+        let same = unsafe { pyre_object::w_dict_getitem_str(globals, "same") }.expect("same");
+        let nan_same =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "nan_same") }.expect("nan_same");
+        let nan_distinct = unsafe { pyre_object::w_dict_getitem_str(globals, "nan_distinct") }
+            .expect("nan_distinct");
+        let ne_tail =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "ne_tail") }.expect("ne_tail");
+        let calls = unsafe { pyre_object::w_dict_getitem_str(globals, "calls") }.expect("calls");
+        assert!(!unsafe { w_bool_get_value(eq_len) });
+        assert!(unsafe { w_bool_get_value(ne_len) });
+        assert!(unsafe { w_bool_get_value(same) });
+        assert!(unsafe { w_bool_get_value(nan_same) });
+        assert!(!unsafe { w_bool_get_value(nan_distinct) });
+        assert!(unsafe { w_bool_get_value(ne_tail) });
+        assert_eq!(unsafe { pyre_object::w_list_len(calls) }, 0);
+    }
+
+    #[test]
+    fn tuple_lt_calls_ordering_on_first_differing_pair() {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile::compile_exec(
+            "seen = []\n\
+             class X:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __lt__(self, other):\n        \
+             seen.append('X')\n        \
+             return True\n\
+             class Y:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __lt__(self, other):\n        \
+             seen.append('Y')\n        \
+             return False\n\
+             ordered = (1, X()) < (1, Y())\n",
+        )
+        .expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execute");
+        let globals = frame.get_w_globals();
+        let ordered =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "ordered") }.expect("ordered");
+        let seen = unsafe { pyre_object::w_dict_getitem_str(globals, "seen") }.expect("seen");
+        assert!(unsafe { w_bool_get_value(ordered) });
+        assert_eq!(unsafe { pyre_object::w_list_len(seen) }, 1);
+        let first = unsafe { pyre_object::w_list_getitem(seen, 0) }.expect("seen[0]");
+        assert_eq!(crate::baseobjspace::str_utf8_w(first).unwrap(), "X");
     }
 
     #[test]

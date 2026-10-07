@@ -135,6 +135,8 @@ pub(crate) struct CompileLiveOpRoots {
     contexts: Vec<usize>,
     spans: Vec<(usize, usize)>,
     vecs: Vec<usize>,
+    /// `TreeLoop` still owned by the compile after `compile_tracing` is taken.
+    loops: Vec<usize>,
 }
 
 /// Pops one published holder. Empty when the optimizer has no metainterp slot.
@@ -150,10 +152,17 @@ impl CompileLiveOpRoots {
         self.contexts.clear();
         self.spans.clear();
         self.vecs.clear();
+        self.loops.clear();
     }
 
+    /// True when no compile holder is published. The snapshot-walk test
+    /// checks the guard released every vec, including a `TreeLoop`.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.contexts.is_empty() && self.spans.is_empty() && self.vecs.is_empty()
+        self.contexts.is_empty()
+            && self.spans.is_empty()
+            && self.vecs.is_empty()
+            && self.loops.is_empty()
     }
 
     pub(crate) fn publish_context(&mut self, ctx: *const OptContext) -> LiveOpPublication {
@@ -195,6 +204,21 @@ impl CompileLiveOpRoots {
         }
     }
 
+    /// `trace` must stay put until the guard drops. A moved `TreeLoop`
+    /// leaves this address pointing at the old header.
+    pub(crate) fn publish_tree_loop(
+        &mut self,
+        trace: &mut crate::history::TreeLoop,
+    ) -> LiveOpPublication {
+        let key = trace as *mut crate::history::TreeLoop as usize;
+        self.loops.push(key);
+        LiveOpPublication {
+            roots: self as *mut _,
+            kind: 4,
+            key,
+        }
+    }
+
     pub(crate) fn walk(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
         for &addr in &self.contexts {
             if addr == 0 {
@@ -221,6 +245,26 @@ impl CompileLiveOpRoots {
             let ops = unsafe { &*(addr as *const Vec<OpRc>) };
             for op in ops {
                 walk_live_op(op, visitor);
+            }
+        }
+        for &addr in &self.loops {
+            if addr == 0 {
+                continue;
+            }
+            // SAFETY: the publisher drops this entry before moving the
+            // `TreeLoop`. The walker runs only while that compile is paused.
+            let trace = unsafe { &mut *(addr as *mut crate::history::TreeLoop) };
+            for op in &trace.ops {
+                walk_live_op(op, visitor);
+            }
+            for ia in &trace.inputargs {
+                if let Some(majit_ir::Value::Ref(mut r)) = ia.get_value() {
+                    visitor(&mut r);
+                    ia.set_value(majit_ir::Value::Ref(r));
+                }
+            }
+            for snapshot in &mut trace.snapshots {
+                snapshot.walk_const_ptr_refs(visitor);
             }
         }
     }
@@ -259,6 +303,11 @@ impl Drop for LiveOpPublication {
                 3 => {
                     if let Some(i) = roots.vecs.iter().rposition(|p| *p == self.key) {
                         roots.vecs.swap_remove(i);
+                    }
+                }
+                4 => {
+                    if let Some(i) = roots.loops.iter().rposition(|p| *p == self.key) {
+                        roots.loops.swap_remove(i);
                     }
                 }
                 _ => {}
@@ -9930,8 +9979,9 @@ impl OptContext {
     /// Trace ConstPtr indexes this context owns while it is still in place.
     ///
     /// `trace_index` is idempotent across overlapping holders (`new_operations`
-    /// and `resop_refs` share ops). `const_infos` keys are raw addresses and
-    /// are not slots.
+    /// and `resop_refs` share ops). `const_infos` keys are raw addresses;
+    /// the values hold `_fields` and must still be walked (`info.py`
+    /// `optheap.const_infos`).
     fn walk_live_const_ptrs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         for op in &self.new_operations {
             walk_live_op(op, visitor);
@@ -10008,6 +10058,9 @@ impl OptContext {
                     operand.walk_const_ptr_refs(visitor);
                 }
             }
+        }
+        for info in self.const_infos.values_mut() {
+            info.walk_const_ptr_refs_mut(visitor);
         }
     }
 

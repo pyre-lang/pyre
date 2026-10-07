@@ -2415,6 +2415,29 @@ impl TraceCtx {
         self.bridge_inline_carrier.take()
     }
 
+    /// Forward `ReconstructRecipe::concrete_r` ref words while the carrier
+    /// still sits on this context. Those words are copies of resume values;
+    /// once the carrier is taken off, the caller has to publish them onto a
+    /// recorder cell or the shadow stack before the next minor.
+    pub(crate) fn walk_bridge_carrier_concrete_refs(
+        &mut self,
+        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
+        let Some(carrier) = self.bridge_inline_carrier.as_mut() else {
+            return;
+        };
+        for recipe in &mut carrier.recipes {
+            for value in &mut recipe.concrete_r {
+                if let majit_ir::Value::Ref(r) = value
+                    && !r.is_null()
+                    && *r != majit_ir::GcRef::NO_CONCRETE
+                {
+                    visitor(r);
+                }
+            }
+        }
+    }
+
     /// Stash the bridge guard frame's per-bank live register indices (set by
     /// `start_bridge_tracing` before `setup_bridge_sym`).
     pub fn set_bridge_reg_indices(&mut self, indices: crate::resume::FrameLivenessRegIndices) {

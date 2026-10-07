@@ -581,10 +581,10 @@ pub struct VirtualState {
     /// `enum_into` to assign per-instance positions.
     info_counter: i32,
     /// `ExportedState::publish_const_ptr_root`'s extra area dies with the
-    /// optimizer, before the next minor, while a later bridge snapshot
-    /// still re-interns those `ConstPtr` slots through `Operand::from_opref`.
-    /// The loop token's virtual state outlives that compile, so the same
-    /// index list stays registered here until the token is dropped.
+    /// optimizer. A later bridge snapshot still re-interns `ConstPtr` slots
+    /// the token's virtual state and short preamble still hold, so those
+    /// indexes stay registered here until the token is dropped. Partial-trace
+    /// ops are not part of that graph and must not be.
     const_ptr_root: Option<Arc<RetainedConstPtrRoot>>,
 }
 
@@ -628,20 +628,28 @@ impl VirtualState {
 
     /// Register `indexes` until the last clone of this virtual state drops.
     ///
-    /// Skips an empty list and a thread with no registered mutator, matching
-    /// `ExportedState::publish_const_ptr_root`. Replaces any previous root
-    /// on this state. `trace_index` is idempotent inside one wave, so a
-    /// second registration beside the optimizer's short-lived root is safe.
+    /// A thread with no registered mutator skips the registration, matching
+    /// `ExportedState::publish_const_ptr_root`. An empty index list still
+    /// registers when this state has info nodes, so those `Constant` refs
+    /// are forwarded. Replaces any previous root on this state.
+    /// `trace_index` is idempotent inside one wave, so a second registration
+    /// beside the optimizer's short-lived root is safe.
     pub(crate) fn retain_const_ptr_indexes(&mut self, indexes: &[u32]) {
         self.const_ptr_root = None;
-        if indexes.is_empty() || !majit_gc::shadow_stack::mutator_is_registered() {
+        if !majit_gc::shadow_stack::mutator_is_registered() {
+            return;
+        }
+        // Top-level nodes. The walk follows children from these payloads.
+        // An empty index list still has to walk them: a `Constant` ref is
+        // not always an interned table slot, and skipping the registration
+        // leaves that copy unforwarded.
+        let nodes: Vec<*const VirtualStateInfoNode> = self.state.iter().map(Rc::as_ptr).collect();
+        if indexes.is_empty() && nodes.is_empty() {
             return;
         }
         let mut indexes = indexes.to_vec();
         indexes.sort_unstable();
         indexes.dedup();
-        // Top-level nodes. The walk follows children from these payloads.
-        let nodes: Vec<*const VirtualStateInfoNode> = self.state.iter().map(Rc::as_ptr).collect();
         let indexes = Box::into_raw(Box::new(RetainedConstPtrIndexes { indexes, nodes }));
         // SAFETY: `indexes` stays allocated until `RetainedConstPtrRoot`'s
         // drop, which unregisters `area` first. The `Arc` shares one

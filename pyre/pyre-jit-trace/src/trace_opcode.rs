@@ -1785,7 +1785,7 @@ impl MIFrame {
         // `last_instr` / `valuestackdepth` are plain values that evolve
         // with the trace, so they stay snapshot-sourced below.
         let statics_addr = {
-            let live = self.sym().live_vable_frame_addr;
+            let live = self.sym().current_live_vable_frame();
             if live != 0 && self.sym().owns_virtualizable_shadow() {
                 live
             } else {

@@ -82,12 +82,18 @@ fn lock_instance_stripe(index: usize) -> MapDictGuard {
 ///
 /// One guard when both classes hash to the same stripe. The locks are
 /// reentrant, but a second acquire of the same stripe is not required.
-struct InstanceStripes {
+pub(crate) struct InstanceStripes {
     _first: MapDictGuard,
     _second: Option<MapDictGuard>,
 }
 
-fn lock_instance_stripes(first: usize, second: usize) -> InstanceStripes {
+/// Residual: the acquire parks in `before_external_block` (`Lock.acquire`).
+/// Stripe indices stay inside this boundary so `INSTANCE_LOCKS` is not a
+/// host path on a looked-inside caller.
+#[majit_macros::dont_look_inside]
+pub(crate) fn lock_instance_stripes(first: PyObjectRef, second: PyObjectRef) -> InstanceStripes {
+    let first = instance_stripe_index(first);
+    let second = instance_stripe_index(second);
     if first == second {
         InstanceStripes {
             _first: lock_instance_stripe(first),
@@ -752,8 +758,8 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
 /// `descr_set___class__` for a `W_ObjectObject`. pyre additionally keeps the
 /// `w_class` field authoritative for `type()` (the node layer's
-/// `terminator.w_cls` is never read for `getclass`), so the caller sets that
-/// after this returns.
+/// `terminator.w_cls` is never read for `getclass`), so this store writes
+/// that field while the stripes are held.
 ///
 /// `dont_look_inside` — same residual-call rationale as
 /// [`instance_node_setdictvalue`]: `node_set_terminator` rebuilds through
@@ -762,8 +768,8 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
 /// not annotator-lowerable.
 ///
 /// # Safety
-/// `obj` must be a live `W_ObjectObject`. `publish` runs while both the
-/// old and the new class stripes are held; it stores `w_class`.
+/// `obj` must be a live `W_ObjectObject`. The class store runs while both
+/// the old and the new class stripes are held.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     unsafe { ensure_mapdict_initialized(obj) };

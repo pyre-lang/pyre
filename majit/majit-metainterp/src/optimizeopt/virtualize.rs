@@ -2488,8 +2488,10 @@ pub(crate) fn parent_list_slot(field: &dyn FieldDescr) -> u32 {
 /// Rust `Arc` itself to be shared.  When that identity is not populated yet,
 /// resolve the qualified display owners through pyre's StructId table; never
 /// collapse two *known* distinct owners merely because their leaf field and
-/// offset happen to agree.  Unnamed dynamic/test descriptors carry no owner
-/// evidence at all and retain the positional fallback.
+/// offset happen to agree.  `_getusercls`'s `<Base>User` layout is the
+/// exception: it embeds the base and keeps those fields.  Unnamed
+/// dynamic/test descriptors carry no owner evidence at all and retain the
+/// positional fallback.
 ///
 /// The key is not always carried — the flattened inline aggregates
 /// (`ob_header`, an enum's `__pos_0`) reach here under the documented
@@ -2666,9 +2668,25 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         })
     }
 
+    // `_getusercls` publishes `<Base>User` (`W_BaseExceptionUser`,
+    // `W_ExceptionExtendedUser`) with the base fields at the same offsets.
+    // A read through the base descr (`W_BaseException.w_traceback`) and a
+    // store through the user descr name one field. A `::` suffix is an enum
+    // variant, not that embedding; only the tag crosses that edge.
+    fn user_layout_embeds_base(slot_owner: &str, field_owner: &str) -> bool {
+        let slot = majit_ir::descr::strip_generic_args(slot_owner);
+        let field = majit_ir::descr::strip_generic_args(field_owner);
+        slot.strip_suffix("User")
+            .is_some_and(|stem| stem == field.as_ref())
+            || field
+                .strip_suffix("User")
+                .is_some_and(|stem| stem == slot.as_ref())
+    }
+
     let owners_agree = |slot_owner: &str, field_owner: &str, parent_keys: Option<(u64, u64)>| {
         explicit_sum_inherits(slot_owner, field_owner)
             || variant_inherits_enum_tag(slot_owner, field_owner, field.field_key(), parent_keys)
+            || user_layout_embeds_base(slot_owner, field_owner)
     };
 
     let names_name_same_owner = || match (display_owner(slot), display_owner(field)) {
@@ -4179,6 +4197,50 @@ mod tests {
         assert!(
             slot_holds_field(&alias_slot, &alias_base),
             "the crate-stripped alias of the standard-library shell must still reconcile"
+        );
+    }
+
+    /// `typedef.py` `_getusercls` lays `W_BaseExceptionUser` out as the base
+    /// fields plus the mapdict tail. A raise stores `w_traceback` through the
+    /// user descr and `sys.exc_info` reads it through `W_BaseException`.
+    #[test]
+    fn slot_identity_accepts_user_layout_embedding_of_the_base_field() {
+        let descr = |size: usize, owner: &str, key: &str, offset: usize| {
+            let mut size_descr = majit_ir::descr::SimpleSizeDescr::new(0, size, 1);
+            size_descr
+                .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(owner).as_u64());
+            let parent = Arc::new(size_descr) as DescrRef;
+            let field = majit_ir::SimpleFieldDescr::new_with_name(
+                0,
+                offset,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                format!("{owner}.{key}"),
+                key.to_string(),
+            )
+            .with_parent_descr(parent.clone(), 4);
+            (field, parent)
+        };
+
+        let (user_tb, _user_parent) = descr(88, "W_BaseExceptionUser", "w_traceback", 48);
+        let (base_tb, _base_parent) = descr(64, "W_BaseException", "w_traceback", 48);
+        assert!(
+            slot_holds_field(&user_tb, &base_tb),
+            "W_BaseException.w_traceback reads the field W_BaseExceptionUser stored"
+        );
+
+        let (base_context, _context_parent) = descr(64, "W_BaseException", "w_context", 48);
+        assert!(
+            !slot_holds_field(&user_tb, &base_context),
+            "a different field key at the same offset is not the embedded traceback"
+        );
+
+        let (extended_tb, _extended_parent) = descr(160, "W_ExceptionExtended", "w_traceback", 48);
+        assert!(
+            !slot_holds_field(&extended_tb, &base_tb),
+            "the extended layout is not the `<Base>User` embedding"
         );
     }
 

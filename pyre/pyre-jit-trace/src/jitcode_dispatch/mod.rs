@@ -1448,22 +1448,16 @@ pub(crate) fn flush_callee_locals_region(
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
         return false;
     }
-    // `virtualizable.py write_boxes` keeps the source boxes and destination
-    // array live throughout writeback. Native boxing can collect: retain roots
-    // for both destinations and read each source from its shared owner after
-    // the preceding allocation, with no frame-state borrow across boxing.
-    let frame_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame as usize));
-    let array_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(arr_ptr as usize));
-    state.write_callee_locals(nlocals, frame_reg, |abs, value| {
-        let boxed = crate::state::boxed_slot_value_for_type(Type::Ref, &value);
-        let arr_ptr = array_root.get().0 as *mut pyre_object::FixedObjectArray;
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
-        }
-        // Boxing an Int/Float slot allocates, and each minor collection
-        // consumes the array's remembered-set entry, so re-arm per store.
-        crate::state::frame_array_write_barrier(frame_root.get().0 as *mut u8, arr_ptr);
-    })
+    // Copy the shadow first. `write_callee_locals` must not allocate, and
+    // boxing inside the callback would collect between a copied `Ref` and
+    // its store.
+    let mut slots = Vec::new();
+    if !state.write_callee_locals(nlocals, frame_reg, |abs, value| {
+        slots.push((abs, value));
+    }) {
+        return false;
+    }
+    crate::state::store_pinned_frame_locals(frame as usize, &slots).is_some()
 }
 
 /// Apply `PyFrame.frame_finished_execution = True` on the concrete frame a

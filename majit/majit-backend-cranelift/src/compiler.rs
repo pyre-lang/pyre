@@ -25696,7 +25696,7 @@ mod tests {
             descr
                 .as_fail_descr()
                 .unwrap()
-                .set_rd_locs(smallvec::smallvec![0u16]);
+                .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         }
         let inputargs = vec![InputArg::new_int_rc(0)];
         let counter = OpRef::input_arg_int(0);
@@ -25776,7 +25776,7 @@ mod tests {
         enter_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let counter = OpRef::input_arg_int(0);
         let exit = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
@@ -26337,7 +26337,7 @@ mod tests {
         descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
     }
 
     /// A adds 1 and, on an odd value, bridges to C. C adds 10 and, on an odd
@@ -26869,12 +26869,12 @@ mod tests {
         exit_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(
@@ -26980,12 +26980,12 @@ mod tests {
         exit_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(
@@ -27072,17 +27072,17 @@ mod tests {
         exit_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let bridge_guard_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
         bridge_guard_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(
