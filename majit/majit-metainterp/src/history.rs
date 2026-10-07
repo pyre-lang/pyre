@@ -671,7 +671,9 @@ impl TreeLoop {
         }
     }
 
-    /// Get the input arg types.
+    /// Types of the live inputargs, in `History.set_inputargs` order.
+    /// Dead failarg holes are absent, so this list is not indexed by
+    /// `get_position()`.
     pub fn inputarg_types(&self) -> Vec<majit_ir::Type> {
         self.inputargs.iter().map(|ia| ia.tp.get()).collect()
     }
@@ -679,16 +681,21 @@ impl TreeLoop {
     /// opencoder.py Trace.get_iter() — produce a TraceIterator over
     /// the recorded ops with fresh per-iteration boxes.
     ///
-    /// `start_index = 0` reproduces the canonical positional layout:
-    /// inputargs allocated at `OpRef::input_arg_typed(0..num_inputargs,
-    /// tp)` (typed by `inputarg_from_tp(arg.type)` per
-    /// opencoder.py), op results at op-namespace OpRefs
-    /// starting at `num_inputargs`. Phase 2 / bridge callers that need
-    /// disjoint OpRef namespaces must construct `TraceIterator::new`
-    /// directly with a higher `start_index`.
+    /// Seeds `_cache` by each inputarg's `get_position()`
+    /// (`TraceIterator.new_with_inputargs`), so a hole-filtered bridge
+    /// list keeps its original coordinates. `start_fresh = 0` remints
+    /// those boxes from `inputarg_from_tp(arg.type)`. Phase 2 / bridge
+    /// callers that need disjoint OpRef namespaces must construct
+    /// `TraceIterator::new` directly with a higher `start_index`.
     pub fn get_iter(&self) -> crate::opencoder::TraceIterator<'_> {
-        let inputarg_types = self.inputarg_types();
-        crate::opencoder::TraceIterator::new(&self.ops, 0, self.ops.len(), None, &inputarg_types, 0)
+        crate::opencoder::TraceIterator::new_with_inputargs(
+            &self.ops,
+            0,
+            self.ops.len(),
+            None,
+            &self.inputargs,
+            0,
+        )
     }
 
     /// history.py check_consistency — full structural validation.
@@ -3204,6 +3211,14 @@ impl TraceCtx {
         self.recorder.opcode_at(i)
     }
 
+    /// Number of recorded ops [`Self::opcode_at`] indexes.
+    ///
+    /// Distinct from [`Self::num_ops`] / [`Self::num_recorded_ops`]
+    /// (`History.length`), which count dead failarg holes.
+    pub fn opcode_at_len(&self) -> usize {
+        self.recorder.opcode_at_len()
+    }
+
     /// `num_inputargs()` — alias for `num_inputs()` keeping RPython
     /// `Trace.num_inputargs` name parity in external call sites.
     pub fn num_inputargs(&self) -> usize {
@@ -3241,14 +3256,14 @@ impl TraceCtx {
     }
 
     /// pyjitpl.py `blackhole_if_trace_too_long` check:
-    /// `length > warmrunnerstate.trace_limit`.  `num_ops` is the non-inputarg
-    /// op count (= `history.length()`); `trace_limit` is cached from warmstate
-    /// at trace start.
+    /// `length > warmrunnerstate.trace_limit`.  `num_ops` is
+    /// `History.length` (`trace._count - len(trace.inputargs)`);
+    /// `trace_limit` is cached from warmstate at trace start.
     pub fn is_too_long(&self) -> bool {
         self.recorder.num_ops() > self.trace_limit
     }
 
-    /// Non-inputarg recorded op count (`History.length`).
+    /// `History.length`: `trace._count - len(trace.inputargs)`.
     ///
     /// Read by the `[interpret]` logs in `JitCodeMachine::run_to_end` and
     /// `compile_and_run_once`, and copied onto `DispatchError::TraceTooLong`

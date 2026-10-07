@@ -32941,10 +32941,11 @@ mod tests {
 
     fn take_recorded_ops(meta: &mut MetaInterp<()>) -> Vec<Op> {
         let mut ctx = meta.tracing.take().expect("expected active trace context");
-        let num_inputs = ctx.num_inputargs();
-        let input_types = ctx.inputarg_types();
-        let jump_args: Vec<OpRef> = (0..num_inputs)
-            .map(|i| OpRef::input_arg_typed(i as u32, input_types[i]))
+        let jump_args: Vec<OpRef> = ctx
+            .recorder
+            .inputargs()
+            .iter()
+            .map(|arg| arg.opref())
             .collect();
         ctx.close_loop(&jump_args);
         let trace = ctx.into_tree_loop();

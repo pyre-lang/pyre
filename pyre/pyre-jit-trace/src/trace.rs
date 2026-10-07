@@ -6905,14 +6905,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // which only a MAIN trace should do.  So skip it for bridges.
     if !ctx.is_bridge_trace {
         let start_key = crate::driver::make_green_key(w_code, start_pc, is_being_profiled);
-        let input_types = ctx.inputarg_types();
-        let input_args: Vec<majit_metainterp::GreenBox> = input_types
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| {
-                majit_metainterp::GreenBox::new(majit_ir::OpRef::input_arg_typed(i as u32, tp), tp)
-            })
-            .collect();
+        let input_args: Vec<majit_metainterp::GreenBox> = ctx.inputarg_greenboxes();
         ctx.add_merge_point_with_key(
             start_key,
             Some(crate::driver::make_green_key_typed(

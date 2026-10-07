@@ -209,10 +209,9 @@ impl GreenBox {
         recorder
             .inputargs()
             .iter()
-            .enumerate()
-            .map(|(i, arg)| {
+            .map(|arg| {
                 let tp = arg.tp.get();
-                Self::new(OpRef::input_arg_typed(i as u32, tp), tp)
+                Self::new(arg.opref(), tp)
             })
             .collect()
     }
@@ -2260,6 +2259,17 @@ impl TraceCtx {
         )
     }
 
+    /// Like [`Self::for_test_types`] with a sparse failarg layout:
+    /// reserved prefix `input_types.len()`, live boxes only where
+    /// `live_inputs` is true (`Trace::with_input_layout`).
+    pub fn for_test_input_layout(input_types: &[majit_ir::Type], live_inputs: &[bool]) -> Self {
+        Self::new(
+            Trace::with_input_layout(input_types, live_inputs),
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        )
+    }
+
     /// Like [`Self::for_test_types`] but seeds the trace green key (and thus
     /// `root_green_key`).  A unit test that drives a loop-closing
     /// `jit_merge_point` uses this to model the trace as having STARTED at
@@ -3023,7 +3033,7 @@ impl TraceCtx {
     /// `initial_inputarg_consts`; the inputarg Box identity itself is still the
     /// ordinary `OpRef(index)`, matching RPython's `original_boxes` list.
     pub fn initial_inputarg_argbox(&self, index: usize) -> Option<(JitArgKind, OpRef, i64)> {
-        let tp = self.recorder.inputarg_types().get(index).copied()?;
+        let tp = self.recorder.inputarg_type_at(index as u32)?;
         let const_ref = self.initial_inputarg_consts.get(index)?;
         // history.py/268/314 — Const{Int,Float,Ptr}.value lives inline
         // on the Box; read it and resolve the raw bits (Int→value,
@@ -3136,12 +3146,31 @@ impl TraceCtx {
             .is_some_and(|op| op.result_type() == Type::Void)
     }
 
-    /// Input argument types in loop-header order.
+    /// Types of the live inputargs, in `History.set_inputargs` order.
+    /// Dead failarg holes are absent; do not index this list by
+    /// `get_position()`. Use [`Self::inputarg_type_at`] or `opref.ty()`.
     pub fn inputarg_types(&self) -> Vec<Type> {
         self.recorder.inputarg_types()
     }
 
-    /// Number of traced operations recorded so far.
+    /// Type of the live InputArg whose `get_position()` is `position`.
+    /// `None` when that coordinate is a dead failarg hole.
+    ///
+    /// `resume.py ResumeDataBoxReader.load_box_from_cpu` yields a typed
+    /// box; the type is on the box, not a compact-list index.
+    pub fn inputarg_type_at(&self, position: u32) -> Option<Type> {
+        self.recorder.inputarg_type_at(position)
+    }
+
+    /// One GreenBox per live recorder inputarg, each keeping its
+    /// original `get_position()`.
+    pub fn inputarg_greenboxes(&self) -> Vec<GreenBox> {
+        GreenBox::from_recorder_inputargs(&self.recorder)
+    }
+
+    /// `History.length`: `trace._count - len(trace.inputargs)`.
+    /// Trace-length limit; dead failarg holes count. The recorded-op
+    /// index bound for [`Self::opcode_at`] is [`Self::opcode_at_len`].
     pub fn num_ops(&self) -> usize {
         self.recorder.num_ops()
     }
@@ -9051,14 +9080,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initial_inputarg_argbox_reads_type_from_sparse_live_box() {
+        // [Int, dead, Float]: compact inputarg_types() is [Int, Float].
+        // Indexing it with position 2 is OOB; the box at get_position() 2
+        // is the live Float (ResumeDataBoxReader.load_box_from_cpu).
+        let rec =
+            Trace::with_input_layout(&[Type::Int, Type::Ref, Type::Float], &[true, false, true]);
+        let mut ctx = TraceCtx::new(
+            rec,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.initial_inputarg_consts = vec![
+            OpRef::const_int(1),
+            OpRef::const_int(0),
+            OpRef::const_float(1.5),
+        ];
+        assert_eq!(ctx.inputarg_types(), vec![Type::Int, Type::Float]);
+        assert_eq!(ctx.inputarg_type_at(2), Some(Type::Float));
+        let (kind, opref, bits) = ctx
+            .initial_inputarg_argbox(2)
+            .expect("live Float at position 2");
+        assert_eq!(kind, crate::jitcode::JitArgKind::Float);
+        assert_eq!(opref, OpRef::input_arg_float(2));
+        assert_eq!(opref.ty(), Some(Type::Float));
+        assert_eq!(bits, 1.5f64.to_bits() as i64);
+        let boxes = ctx.inputarg_greenboxes();
+        assert_eq!(
+            boxes.iter().map(|b| (b.opref, b.ty)).collect::<Vec<_>>(),
+            vec![
+                (OpRef::input_arg_int(0), Type::Int),
+                (OpRef::input_arg_float(2), Type::Float)
+            ]
+        );
+    }
+
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {
         let mut recorder = ctx.recorder;
-        let inputarg_types = recorder.inputarg_types();
-        let jump_args: Vec<OpRef> = inputarg_types
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
-            .collect();
+        let jump_args: Vec<OpRef> = recorder.inputargs().iter().map(|arg| arg.opref()).collect();
         recorder.close_loop(&jump_args);
         let trace = recorder.get_trace();
         // Return only non-JUMP ops

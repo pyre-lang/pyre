@@ -18441,6 +18441,36 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
         subwalk_guard_follows_store(&tc, past_end),
         "an unreadable window declines"
     );
+
+    // A dead failarg hole makes `num_ops()` (`History.length`) larger than
+    // the recorded-op sequence `opcode_at` indexes. Scanning to `num_ops()`
+    // would read `None` past the last slot and decline a sound window.
+    let mut tc =
+        TraceCtx::for_test_input_layout(&[Type::Ref, Type::Int, Type::Int], &[true, true, false]);
+    assert!(
+        tc.num_ops() > tc.opcode_at_len(),
+        "History.length counts the dead hole; opcode_at_len does not"
+    );
+    let start = tc.get_trace_position();
+    assert!(
+        !subwalk_guard_follows_store(&tc, start),
+        "an empty recorded window is not a guard after a store"
+    );
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
+    assert!(
+        !subwalk_guard_follows_store(&tc, start),
+        "guard-then-store stays sound when History.length counts a hole"
+    );
+    let mut tc =
+        TraceCtx::for_test_input_layout(&[Type::Ref, Type::Int, Type::Int], &[true, true, false]);
+    let start = tc.get_trace_position();
+    tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    assert!(
+        subwalk_guard_follows_store(&tc, start),
+        "a guard past the body's first store still declines with a hole"
+    );
 }
 
 /// `mirror_vable_static_to_boxes` must complete the `_opimpl_setfield_vable`

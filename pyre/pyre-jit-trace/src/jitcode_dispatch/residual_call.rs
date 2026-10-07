@@ -189,8 +189,10 @@ fn record_list_write_barrier_residual<Sym: WalkSym>(
 /// when deciding whether the preceding barrier was a moving safepoint.
 fn last_non_guard_is_cond_call_gc_wb<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
     // Byte-mode `ops()` is empty until materialize. Opcode lives on
-    // `FrontendSlot` (`history.py AbstractResOp.getopnum`).
-    let n = ctx.trace_ctx.num_ops();
+    // `FrontendSlot` (`history.py AbstractResOp.getopnum`). Walk the
+    // recorded-op sequence `opcode_at` indexes; `num_ops()` is
+    // `History.length` and counts dead failarg holes.
+    let n = ctx.trace_ctx.opcode_at_len();
     for i in (0..n).rev() {
         let Some(opcode) = ctx.trace_ctx.opcode_at(i) else {
             continue;

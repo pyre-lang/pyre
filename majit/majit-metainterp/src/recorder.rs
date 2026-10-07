@@ -1957,14 +1957,15 @@ impl Trace {
         self.box_count = pos._index;
     }
 
-    /// history.py `length`: number of non-inputarg ops recorded so far.
+    /// history.py `History.length`: `self.trace._count - len(self.trace.inputargs)`.
+    ///
+    /// `op_count` is `opencoder.py Trace._count` (`Trace.__init__` seeds it
+    /// at `max_num_inputargs`; `_op_end` increments it). Live `inputargs`
+    /// may be shorter than that reserved prefix (`Trace.set_inputargs`).
     /// Compared against `warmstate.trace_limit` by
     /// `MetaInterp.blackhole_if_trace_too_long` (pyjitpl.py).
     pub fn num_ops(&self) -> usize {
-        if self.byte_mode() {
-            return self.slots.len();
-        }
-        self.ops.len()
+        (self.op_count as usize).saturating_sub(self.inputargs.len())
     }
 
     /// `opencoder.py Trace.max_num_inputargs` — reserved TAGBOX prefix.
@@ -1973,9 +1974,21 @@ impl Trace {
         self.max_num_inputargs as usize
     }
 
-    /// Input argument types in loop-header order.
+    /// Types of the live inputargs, in `History.set_inputargs` order.
+    /// Dead failarg holes are absent, so this list is not indexed by
+    /// `get_position()`. The type of a box is `opref.ty()` or
+    /// [`Self::inputarg_type_at`].
     pub fn inputarg_types(&self) -> Vec<Type> {
         self.inputargs.iter().map(|arg| arg.tp.get()).collect()
+    }
+
+    /// Type of the live InputArg whose `get_position()` is `position`.
+    /// `None` when that coordinate is a dead failarg hole.
+    ///
+    /// `resume.py ResumeDataBoxReader.load_box_from_cpu` yields a typed
+    /// box; the type is on the box, not a compact-list index.
+    pub fn inputarg_type_at(&self, position: u32) -> Option<Type> {
+        self.inputarg_at(position).map(|ia| ia.tp.get())
     }
 
     /// Number of guards recorded so far.
@@ -2001,6 +2014,19 @@ impl Trace {
             return Some(slot.opcode);
         }
         self.ops.get(i).map(|op| op.opcode)
+    }
+
+    /// Number of recorded ops [`Self::opcode_at`] indexes.
+    ///
+    /// `slots` in byte mode, `ops` otherwise. Distinct from [`Self::num_ops`]
+    /// (`History.length` = `_count - len(inputargs)`), which counts dead
+    /// failarg holes and is the trace-length limit, not this index bound.
+    pub fn opcode_at_len(&self) -> usize {
+        if self.byte_mode() {
+            self.slots.len()
+        } else {
+            self.ops.len()
+        }
     }
 
     /// Opcode of the recorded op named by `opref`.
@@ -3490,14 +3516,29 @@ mod tests {
 
     #[test]
     fn test_num_ops_counts_non_inputargs() {
-        // history.py length() = trace._count - len(inputargs).
-        // In pyre that's ops.len() since inputargs aren't stored in ops.
+        // history.py History.length = trace._count - len(inputargs).
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         assert_eq!(rec.num_ops(), 0);
 
         rec.record_op(OpCode::IntAdd, &[i0, i0]);
         assert_eq!(rec.num_ops(), 1);
+    }
+
+    #[test]
+    fn test_num_ops_reserved_prefix_minus_live_inputargs() {
+        // history.py History.length with Trace.__init__(max_num_inputargs=3)
+        // then set_inputargs of two live boxes and no recorded ops:
+        // _count - len(inputargs) = 3 - 2 = 1.
+        let rec =
+            Trace::with_input_layout(&[Type::Int, Type::Int, Type::Int], &[true, true, false]);
+        assert_eq!(rec.num_inputargs(), 3);
+        assert_eq!(rec.live_inputargs_cloned().len(), 2);
+        assert_eq!(rec.num_ops(), 1);
+        // `opcode_at` indexes recorded ops, not History.length: a dead
+        // failarg hole is not a recorded slot.
+        assert_eq!(rec.opcode_at_len(), 0);
+        assert_eq!(rec.opcode_at(0), None);
     }
 
     #[test]
@@ -3760,6 +3801,33 @@ mod tests {
         let rec = Trace::with_num_inputs(3);
         assert_eq!(rec.num_inputargs(), 3);
         assert_eq!(rec.num_ops(), 0);
+    }
+
+    #[test]
+    fn sparse_bridge_inputarg_type_is_on_the_box_not_compact_index() {
+        // History.set_inputargs keeps [Int@0, Float@2]; the dead Ref at 1
+        // is absent. inputarg_types() is the compact live list [Int, Float].
+        // Indexing that list with get_position() 2 is OOB and would default
+        // a reader to Ref (resume.py ResumeDataBoxReader.load_box_from_cpu
+        // yields the typed box instead).
+        let rec =
+            Trace::with_input_layout(&[Type::Int, Type::Ref, Type::Float], &[true, false, true]);
+        assert_eq!(rec.inputarg_types(), vec![Type::Int, Type::Float]);
+        assert_eq!(
+            rec.inputarg_types().get(2).copied().unwrap_or(Type::Ref),
+            Type::Ref,
+            "compact list indexed by position 2 is OOB and defaults to Ref"
+        );
+
+        let live = rec.live_inputargs_cloned();
+        assert_eq!(
+            live.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
+            vec![OpRef::input_arg_int(0), OpRef::input_arg_float(2)]
+        );
+        assert_eq!(live[1].opref().ty(), Some(Type::Float));
+        assert_eq!(rec.inputarg_type_at(0), Some(Type::Int));
+        assert_eq!(rec.inputarg_type_at(1), None);
+        assert_eq!(rec.inputarg_type_at(2), Some(Type::Float));
     }
 
     #[test]
