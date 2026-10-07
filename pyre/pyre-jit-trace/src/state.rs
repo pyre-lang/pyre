@@ -9044,18 +9044,24 @@ fn reconstruct_inline_recipe(
         Some(d) => d,
         None => decline!("NoStackDepthAtPc"),
     };
+    // `get_list_of_active_boxes` (`pyjitpl.py`): `in_a_call` is true for
+    // every non-top frame (`opencoder.py` `create_snapshot` /
+    // `capture_resumedata`). The destination is the call's last operand
+    // (`self.bytecode[self.pc - 1]`) and the bank is
+    // `self._result_argcode`. `frame.pc` is the post-call `-live-`
+    // coordinate, so the call is the op that ends there. The
+    // after-residual color table is keyed by the CALL offset
+    // (`result_color_after_residual_for_jitcode_pc`); feeding it this
+    // resume pc would read the next Python instruction's TOS.
+    // `'v'` (`CallResultRegister::Void`) clears no register. A loop-header
+    // CALL_ASSEMBLER residualized by `opimpl_jit_merge_point` has no
+    // result at all; `call_result_register_in` returns Void for that
+    // merge-point coordinate (the marker itself, the op3 `-live-` before
+    // it, or the op2 `-live-` after it). Any other miss declines.
     let pending_result_color = if in_a_call {
         let Some(pc) = usize::try_from(frame.pc).ok() else {
             decline!("NoPendingResultColor");
         };
-        // `MIFrame.get_list_of_active_boxes` (`pyjitpl.py`): when
-        // `in_a_call`, the destination is the call's last operand
-        // (`self.bytecode[self.pc - 1]`) and the bank is
-        // `self._result_argcode`. `frame.pc` is the post-call `-live-`
-        // coordinate, so the call is the op that ends there. The
-        // after-residual color table is keyed by the CALL offset
-        // (`result_color_after_residual_for_jitcode_pc`); feeding it
-        // this resume pc would read the next Python instruction's TOS.
         let Some(p) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
             decline!("NoPendingResultColor");
         };
@@ -9064,12 +9070,40 @@ fn reconstruct_inline_recipe(
             CallResultRegister::Reg('r', color) => Some(color),
             CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
             CallResultRegister::Void => None,
-            // The paused `MIFrame` keeps its `_result_argcode`; a call op
-            // that does not decode at the resume pc leaves no bank to clear.
             CallResultRegister::Unknown => decline!("NoPendingResultColor"),
         }
     } else {
         None
+    };
+    // `get_list_of_active_boxes` (`pyjitpl.py`) writes CONST_NULL into
+    // `registers_r[index]` where `index = ord(self.bytecode[self.pc - 1])`
+    // — the result COLOR, not the TOS semantic slot.  The recipe banks are
+    // slot-indexed, so invert that color through the same pcdep map the
+    // encoder used.  A TOS (`nlocals + stack_only - 1`) skip leaves the
+    // dest color's slot filled and the live sibling that owns TOS empty,
+    // which `recipe_parent_frame_from_recipe` then declines as
+    // `P2Parent::RefBankHole`.
+    let mut maps = bridge_semantic_maps_from_jitcode_pc(frame.jitcode_index, frame.pc);
+    // `assemble_bridge_inline_pending` reads the same recipe's map via
+    // `pcdep_trivia_at` (`pcdep_trivia_for_jitcode_pc`). At a loop-header
+    // `-live-` whose containing py is trivia (`ExtendedArg`), that twin holds
+    // `skip_python_trivia_forward`'s opcode map, which is the live color→slot
+    // inversion used below.
+    maps.pcdep_entries = pcdep_trivia_at(frame.jitcode_index, frame.pc).unwrap_or_default();
+    // `MIFrame.get_list_of_active_boxes` (`pyjitpl.py`) under `in_a_call`
+    // clears only the pending call's result register (`_result_argcode` and
+    // `ord(self.bytecode[self.pc - 1])`) to `CONST_NULL` / `CONST_FALSE` /
+    // `CONST_FZERO`. That color's semantic `locals_cells_stack_w` slot is
+    // delivered by `make_result_of_lastop`; every other live color holds a
+    // real box. A register colour is not a semantic slot index.
+    let pending_result_abs_slot = match pending_result_color {
+        Some(color) => {
+            match semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color) {
+                Some(slot) => Some(slot),
+                None => decline!("PendingResultColorUnmapped"),
+            }
+        }
+        None => None,
     };
     // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
     // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
@@ -9212,26 +9246,10 @@ fn reconstruct_inline_recipe(
     // `pframe_reg` -> `frame_vidx` -> the `locals_cells_stack_w` array and never
     // reads `ec`, so `[frame]` alone is still faithfully reconstructable (the
     // pending call-result slot is delivered by `make_result_of_lastop`, not from
-    // resumedata, and is skipped by `pending_result_abs_slot` below).
+    // resumedata, and is skipped by `pending_result_abs_slot`).
     let (pframe_reg, pec_reg) = portal_red_regs_at(frame.jitcode_index);
     let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);
     let has_frame = reg_indices.ref_.contains(&pframe_reg);
-    let mut maps = bridge_semantic_maps_from_jitcode_pc(frame.jitcode_index, frame.pc);
-    // `assemble_bridge_inline_pending` reads the same recipe's map via
-    // `pcdep_trivia_at` (`pcdep_trivia_for_jitcode_pc`). At a loop-header
-    // `-live-` whose containing py is trivia (`ExtendedArg`), that twin holds
-    // `skip_python_trivia_forward`'s opcode map, which is the live color→slot
-    // inversion used below.
-    maps.pcdep_entries = pcdep_trivia_at(frame.jitcode_index, frame.pc).unwrap_or_default();
-    // `MIFrame.get_list_of_active_boxes` (`pyjitpl.py`) under `in_a_call`
-    // clears only the pending call's result register (`_result_argcode` and
-    // `ord(self.bytecode[self.pc - 1])`) to `CONST_NULL` / `CONST_FALSE` /
-    // `CONST_FZERO`. That color's semantic `locals_cells_stack_w` slot is
-    // delivered by `make_result_of_lastop`; every other live color holds a
-    // real box.
-    let pending_result_abs_slot = pending_result_color.and_then(|color| {
-        semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color)
-    });
     // The Ref bank decodes COLOR-indexed (the liveness register `reg_idx` is the
     // post-regalloc color). Built once here so the LiveRefColorUnmapped check
     // and both portal returns share the same vector.
@@ -17103,7 +17121,11 @@ fn emit_reconstructed_callee_pyframe(
     let freevar_cells: Vec<OpRef> = recipe.registers_r[nlocals..stack_base].to_vec();
     // The operands live at the guard, at their `locals_cells_stack_w` slots:
     // the walk resumes mid-body and reads the frame image there (a callee
-    // loop header's FOR_ITER reads its iterator from the stack slot).
+    // loop header's FOR_ITER peeks `array[valuestackdepth - 1]`, pyframe.py
+    // `peekvalue`). Store the slots *and* the absolute depth; a prefix-only
+    // `valuestackdepth` (`stack_base`) makes that peek a local/cell instead
+    // of the iterator (`rebuild_from_resumedata` / `consume_boxes` refill
+    // the rebuilt MIFrame's live image, including operand-stack depth).
     let stack_items: Vec<OpRef> = recipe.registers_r[stack_base..recipe.valuestackdepth].to_vec();
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
     crate::helpers::emit_new_pyframe_inline_with_params(
@@ -17113,7 +17135,7 @@ fn emit_reconstructed_callee_pyframe(
         &stack_items,
         nlocals,
         frame_array_size,
-        stack_base,
+        recipe.valuestackdepth,
         pycode_const,
         w_globals_const,
     )
@@ -17509,11 +17531,18 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // frame red can execute while tracing. Without this value the very first
         // such residual sees a symbolic-only Ref and the carrier sub-walk aborts.
         //
-        // Root the code, globals, and every reconstructed prefix slot before the
-        // closure tuple/frame allocations. This is the same shadow-stack shape as
-        // the forward-inline constructor in `inline_call.rs`; the resulting
-        // GC-managed FrameBox relinquishes only its host handle after the frontend
-        // op becomes its trace root.
+        // Root the code, globals, optional original frame, the locals/cells
+        // prefix, and one slot per operand position before any allocation.
+        // Operand k lives at the fixed index `slot_root+k` (the Ref value or
+        // PY_NULL). The cell tuple is allocated after those pins and sits at
+        // `slot_root+valuestackdepth`, so a freevar callee with a FOR_ITER
+        // iterator on the stack does not hand the iterator to the frame as
+        // its closure.
+        // `resume.py rebuild_from_resumedata` / `consume_boxes` fill the
+        // rebuilt frame from the current box values; the shadow-stack slot
+        // is the box value that survives a collection. The resulting
+        // GC-managed FrameBox relinquishes only its host handle after the
+        // frontend op becomes its trace root.
         let concrete_roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
@@ -17521,15 +17550,12 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // Pin the parent-trace frame before reading it: a nursery object
         // moves on the FrameBox allocation below. Dead locals at the
         // loop-header live list (`get_list_of_active_boxes`) still sit in
-        // that array; `consume_virtualizable_boxes` does not write them.
+        // that array; `consume_virtualizable_boxes` does not write them,
+        // and the prefix and operand pins both fall back to it.
         let orig_frame = original_callee_concrete_frame(ctx, recipe, w_code, stack_base);
-        let orig_pin = if let Some(orig) = orig_frame {
-            let idx = pyre_object::gc_roots::shadow_stack_len();
+        if let Some(orig) = orig_frame {
             let _ = pyre_object::gc_roots::pin_root(orig as pyre_object::PyObjectRef);
-            Some(idx)
-        } else {
-            None
-        };
+        }
         let slot_root = pyre_object::gc_roots::shadow_stack_len();
         for (slot, &captured) in recipe.concrete_r[..stack_base].iter().enumerate() {
             let opref = recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE);
@@ -17552,6 +17578,27 @@ pub(crate) fn setup_reconstructed_callee_frame(
             };
             let _ = pyre_object::gc_roots::pin_root(value);
         }
+        for k in stack_base..valuestackdepth {
+            let from_recipe = recipe
+                .concrete_r
+                .get(k)
+                .and_then(|&captured| match captured {
+                    majit_ir::Value::Ref(gc)
+                        if gc != majit_ir::GcRef::NO_CONCRETE && !gc.is_null() =>
+                    {
+                        Some(gc.as_usize() as pyre_object::PyObjectRef)
+                    }
+                    _ => None,
+                });
+            let from_orig = orig_frame
+                .and_then(|orig| concrete_stack_value(orig as usize, k).filter(|p| !p.is_null()));
+            let value = match (from_recipe, from_orig) {
+                (Some(ptr), _) => ptr,
+                (None, Some(ptr)) => ptr,
+                (None, None) => pyre_object::PY_NULL,
+            };
+            let _ = pyre_object::gc_roots::pin_root(value);
+        }
         // `initialize_frame_scopes` reads the closure as the freevar cells
         // alone and allocates each pure cellvar itself; the rebuilt cells of
         // both bands are stored over the array by
@@ -17564,10 +17611,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
                 .collect();
             let closure = pyre_object::w_tuple_new(cells);
-            let closure = pyre_object::gc_roots::pin_root(closure);
-            closure
+            pyre_object::gc_roots::pin_root(closure)
         };
-        let closure_root = (stack_base != freevar_base).then_some(slot_root + stack_base);
+        let closure_root = (stack_base != freevar_base).then_some(slot_root + valuestackdepth);
         let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
             .collect();
@@ -17576,18 +17622,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
         let current_closure = closure_root
             .map(pyre_object::gc_roots::shadow_stack_get)
             .unwrap_or(closure);
-        for k in stack_base..valuestackdepth.min(recipe.concrete_r.len()) {
-            let opref = recipe.registers_r.get(k).copied().unwrap_or(OpRef::NONE);
-            let captured = recipe.concrete_r[k];
-            let live = rooted_recipe_ref(ctx, opref, captured);
-            let value = match live {
-                majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
-                    gc.as_usize() as pyre_object::PyObjectRef
-                }
-                _ => pyre_object::PY_NULL,
-            };
-            let _ = pyre_object::gc_roots::pin_root(value);
-        }
         let mut concrete_frame = pyre_interpreter::pyframe::FrameBox::new(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
                 current_code,
@@ -17608,35 +17642,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
         if !concrete_frame.is_gc_owned() {
             return None;
         }
-        let concrete_frame_ptr = concrete_frame.as_mut_ptr();
-        ctx.set_opref_concrete(
-            frame_vable,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
-        );
-        // FrameBox::new may have moved the parent-trace frame. Re-read it
-        // from the pin and copy any slot the live-list left null — the
-        // iterator lives past `stack_base`, and `e` is a dead local.
-        if let Some(orig_pin) = orig_pin {
-            let orig_now = pyre_object::gc_roots::shadow_stack_get(orig_pin) as usize;
-            let dst_arr = unsafe { (*concrete_frame_ptr).locals_cells_stack_w };
-            let src_arr =
-                unsafe { (*(orig_now as *const pyre_interpreter::PyFrame)).locals_cells_stack_w };
-            if !dst_arr.is_null() && !src_arr.is_null() {
-                let copy_end = valuestackdepth
-                    .min(unsafe { (*dst_arr).len() })
-                    .min(unsafe { (*src_arr).len() });
-                for k in 0..copy_end {
-                    let dst = unsafe { (*dst_arr).as_slice()[k] };
-                    if dst.is_null() {
-                        let src = unsafe { (*src_arr).as_slice()[k] };
-                        if !src.is_null() {
-                            unsafe { (*dst_arr).set_ref(k, src) };
-                        }
-                    }
-                }
-                frame_array_write_barrier(concrete_frame_ptr as *mut u8, dst_arr);
-            }
-        }
         // FrameBox::new (and w_tuple_new) may have moved young objects; the
         // pinned slots hold the forwarded addresses, recipe.concrete_r does not.
         let live_prefix: Vec<majit_ir::Value> = (0..stack_base)
@@ -17646,9 +17651,40 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 ) as usize))
             })
             .collect();
-        stack_slot_root = closure_root
-            .map(|i| i + 1)
-            .unwrap_or(slot_root + stack_base);
+        let mut live_stack = vec![majit_ir::Value::Void; valuestackdepth];
+        for k in 0..stack_base.min(valuestackdepth) {
+            live_stack[k] = live_prefix[k];
+        }
+        for k in stack_base..valuestackdepth {
+            let pinned = pyre_object::gc_roots::shadow_stack_get(slot_root + k);
+            live_stack[k] = if !pinned.is_null() {
+                majit_ir::Value::Ref(majit_ir::GcRef(pinned as usize))
+            } else {
+                match recipe.concrete_r.get(k).copied() {
+                    Some(majit_ir::Value::Ref(_)) | None => majit_ir::Value::Void,
+                    Some(other) => other,
+                }
+            };
+        }
+        // `PyFrame::new_for_call_*` leaves `valuestackdepth` at the locals/cells
+        // prefix. Write the operand stack from the shadow-stack slots (`consume_boxes`
+        // fills the rebuilt frame from the current box values) and bump the depth
+        // so a residual `FOR_ITER` peek on this recording-time frame sees
+        // the same iterator the symbolic image holds.
+        let frame_ptr = concrete_frame.as_mut_ptr() as usize;
+        for k in stack_base..valuestackdepth {
+            store_live_frame_array_slot(frame_ptr, k, live_stack[k]);
+        }
+        store_live_frame_static_int(frame_ptr, 2, valuestackdepth as i64);
+        let concrete_frame_ptr = concrete_frame.as_mut_ptr();
+        ctx.set_opref_concrete(
+            frame_vable,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
+        );
+        // Pins sit at `slot_root+k` (before the closure tuple). Later
+        // `stack_slot_root + (k - stack_base)` therefore equals `slot_root+k`
+        // for every live register, locals included.
+        stack_slot_root = slot_root + stack_base;
         store_reconstructed_callee_array_image(
             ctx,
             frame_vable,
@@ -17782,8 +17818,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 // example the non-null callable pinned by GUARD_VALUE), just
                 // as the locals-prefix restamp above does.
                 let live = if held_callee_roots.is_some() {
+                    // `stack_slot_root` is `slot_root + stack_base`, so this is
+                    // `slot_root + k` for locals and stack alike (`consume_boxes`).
                     majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::gc_roots::shadow_stack_get(
-                        stack_slot_root + (k - stack_base),
+                        stack_slot_root + k - stack_base,
                     ) as usize))
                 } else {
                     rooted_recipe_ref(ctx, opref, majit_ir::Value::Ref(gc))

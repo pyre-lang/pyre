@@ -2716,7 +2716,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             if let Some(catch_target) = catch_target {
                 crate::jitcode_dispatch::census_record("P2Drain::ChangeFrameMiddle");
                 match walk_transparent_helper_middle_from_handler(
-                    live_trace_ctx(meta),
+                    ctx,
                     session,
                     sym,
                     root_pc,
@@ -2728,7 +2728,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                 ) {
                     Some(Ok(result)) => {
                         return drive_middles_finishframe(
-                            meta,
+                            ctx,
                             flush_committed,
                             session,
                             sym,
@@ -5105,7 +5105,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // walk uses the sidecar whenever `merge_entry_for` answers. A bridge
     // starts at its guard resume py_pc, outside that sidecar by construction.
     let is_plain_portal = !ctx.is_bridge_trace;
-    let sidecar_entry = pjc.merge_entry_for(start_pc);
+    let sidecar_entry = pjc.function_entry_for(start_pc);
     let uses_entry_sidecar = is_plain_portal && sidecar_entry.is_some();
     let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
@@ -6950,14 +6950,18 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
             })
         });
 
+
     // A backward goto closes the loop headed at `merge_point` only when it
     // jumps to that header.  One that jumps further back closes an ENCLOSING
     // loop, and letting it set the end here stretches this loop's body across
-    // the enclosing one, so a nested loop declines on a marker that belongs
-    // to the outer body.  Take the nearest header first, then its last back
-    // edge, so a `continue` earlier in the body cannot truncate the region
-    // either.  With no candidate at all the region stays open to the end of
-    // the code, the conservative direction.
+    // the enclosing one: a nested loop would then pick up abort_permanent
+    // markers that belong to the enclosing body and decline a walk that never
+    // goes near them.  (`YIELD_VALUE` markers are dropped above as portal
+    // frame exits; remaining markers are unported ops.)  Take the nearest
+    // header first, then its last back edge, so a `continue` earlier in the
+    // body cannot truncate the region either.  With no candidate at all the
+    // region stays open to the end of the code, the conservative direction.
+
     let back_edge_end = back_edges
         .iter()
         .map(|&(target, _)| target)

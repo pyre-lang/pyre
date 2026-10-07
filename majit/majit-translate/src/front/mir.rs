@@ -5467,7 +5467,10 @@ pub(crate) use self::lltype::{
     push_unichr, same_nominal_adt, strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin,
     type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
-pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
+pub use self::lltype::{
+    collect_raw_storage_impl_method_stubs_from_llbc, collect_unsafe_fn_stubs_from_llbc,
+    slice_array_type_id,
+};
 pub(crate) use self::malloc::forward_identity;
 pub(crate) use self::operation::{
     cast_int_to_ptr_call, cast_ptr_to_int_call, lltype_for_direct_ptradd_pointer, value_type_bank,

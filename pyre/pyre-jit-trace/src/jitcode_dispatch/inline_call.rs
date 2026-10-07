@@ -4778,6 +4778,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
                 .discard_innermost_virtualref_if_frame(frame.as_usize());
         }
     };
+
     // `direct_assembler_call` records CALL_ASSEMBLER on the portal reds
     // after `vrefs_after_residual_call`. With no token,
     // `do_recursive_call`'s `assembler_call=False` arm records
@@ -4843,6 +4844,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     if let Some(displaced) = displaced_portal_call_frame {
         ctx.session.borrow_mut().portal_call_frame = displaced;
     }
+
     let exec = match exec {
         Ok(exec) => exec,
         Err(e) => {
@@ -4919,6 +4921,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
                 }
                 return Err(e);
             }
+
         }
     }
     // `opimpl_jit_merge_point` pops the frame holding the merge point
