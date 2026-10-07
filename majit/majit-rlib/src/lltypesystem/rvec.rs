@@ -322,7 +322,8 @@ pub fn ll_vec_newlist_hint_i(lengthhint: usize) -> Vec<usize> {
 
 /// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is zero
 /// until the caller writes it, and `length` is already the list length.
-#[majit_macros::oopspec("newlist(length)")]
+/// No `newlist(length)` oopspec: the result is a raw `Vec` header (kind
+/// int), and that rewrite emits GC `new_array_clear` into a ref bank.
 pub fn ll_vec_newlist_i(length: usize) -> Vec<usize> {
     let mut l = Vec::with_capacity(length);
     unsafe {
@@ -348,7 +349,7 @@ fn ll_vec_arrayclear_i(l: &mut Vec<usize>, count: usize) {
 }
 
 /// `rlist.py _ll_alloc_and_clear`.
-#[majit_macros::oopspec("newlist_clear(count)")]
+/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
 pub fn ll_vec_alloc_and_clear_i(count: usize) -> Vec<usize> {
     let mut l = ll_vec_newlist_i(count);
     ll_vec_arrayclear_i(&mut l, count);
@@ -395,10 +396,6 @@ fn ll_vec_alloc_and_set_jit_i(count: usize, item: usize) -> Vec<usize> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual until the helper graphs seed `SomeRustVec`. Looking inside
-/// types the header as `Int` and the annotator panics on getattr `items`.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_i(count: usize, item: usize) -> Vec<usize> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_i(count, item)
@@ -669,7 +666,8 @@ pub fn ll_vec_newemptylist_r() -> Vec<*mut u8> {
 
 /// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is null
 /// until the caller writes it, and `length` is already the list length.
-#[majit_macros::oopspec("newlist(length)")]
+/// No `newlist(length)` oopspec: the result is a raw `Vec` header (kind
+/// int), and that rewrite emits GC `new_array_clear` into a ref bank.
 pub fn ll_vec_newlist_r(length: usize) -> Vec<*mut u8> {
     let mut l = Vec::with_capacity(length);
     unsafe {
@@ -695,7 +693,7 @@ fn ll_vec_arrayclear_r(l: &mut Vec<*mut u8>, count: usize) {
 }
 
 /// `rlist.py _ll_alloc_and_clear`.
-#[majit_macros::oopspec("newlist_clear(count)")]
+/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
 pub fn ll_vec_alloc_and_clear_r(count: usize) -> Vec<*mut u8> {
     let mut l = ll_vec_newlist_r(count);
     ll_vec_arrayclear_r(&mut l, count);
@@ -741,10 +739,6 @@ fn ll_vec_alloc_and_set_jit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual until the helper graphs seed `SomeRustVec`. Looking inside
-/// types the header as `Int` and the annotator panics on getattr `items`.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_r(count, item)
@@ -1059,7 +1053,8 @@ pub fn ll_vec_newemptylist_f() -> Vec<f64> {
 
 /// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is `0.0`
 /// until the caller writes it, and `length` is already the list length.
-#[majit_macros::oopspec("newlist(length)")]
+/// No `newlist(length)` oopspec: the result is a raw `Vec` header (kind
+/// int), and that rewrite emits GC `new_array_clear` into a ref bank.
 pub fn ll_vec_newlist_f(length: usize) -> Vec<f64> {
     let mut l = Vec::with_capacity(length);
     unsafe {
@@ -1086,7 +1081,7 @@ fn ll_vec_arrayclear_f(l: &mut Vec<f64>, count: usize) {
 }
 
 /// `rlist.py _ll_alloc_and_clear`.
-#[majit_macros::oopspec("newlist_clear(count)")]
+/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
 pub fn ll_vec_alloc_and_clear_f(count: usize) -> Vec<f64> {
     let mut l = ll_vec_newlist_f(count);
     ll_vec_arrayclear_f(&mut l, count);
@@ -1132,10 +1127,6 @@ fn ll_vec_alloc_and_set_jit_f(count: usize, item: f64) -> Vec<f64> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual until the helper graphs seed `SomeRustVec`. Looking inside
-/// types the header as `Int` and the annotator panics on getattr `items`.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_f(count: usize, item: f64) -> Vec<f64> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_f(count, item)
