@@ -605,42 +605,6 @@ fn apply_setfield(
     true
 }
 
-/// resume.py `ResumeDataBoxReader.setinteriorfield` applying half.
-///
-/// `execute_setinteriorfield_gc` stores through the array the
-/// `allocate_array` just returned. The field bank is the one
-/// `VArrayStructInfo.field_types` recorded (0 ref, 1 int, 2 float).
-fn apply_setinteriorfield(
-    ctx: &crate::TraceCtx,
-    cache: &BridgeVirtualCache<'_>,
-    allocator: &dyn crate::resume::BlackholeAllocator,
-    array_op: OpRef,
-    index: usize,
-    value_op: OpRef,
-    descr: &majit_ir::DescrRef,
-    field_ty: u8,
-) -> bool {
-    use majit_ir::Value;
-    let Some(Value::Ref(array)) = operand_concrete(ctx, cache, array_op) else {
-        return false;
-    };
-    let Some(value) = operand_concrete(ctx, cache, value_op) else {
-        return false;
-    };
-    let array = array.as_usize() as i64;
-    match (field_ty, value) {
-        (0, Value::Ref(r)) => {
-            allocator.bh_setinteriorfield_gc_r(array, index, r.as_usize() as i64, descr)
-        }
-        (2, Value::Float(f)) => {
-            allocator.bh_setinteriorfield_gc_f(array, index, f.to_bits() as i64, descr)
-        }
-        (1, Value::Int(i)) => allocator.bh_setinteriorfield_gc_i(array, index, i, descr),
-        _ => return false,
-    }
-    true
-}
-
 /// resume.py `ResumeDataBoxReader.setarrayitem` applying half.
 ///
 /// `_prepare_pendingfields` dispatches `itemindex >= 0` to
@@ -686,6 +650,88 @@ fn apply_setarrayitem(
         };
         allocator.bh_setarrayitem_gc_i(array, index, i, descr);
     }
+    true
+}
+
+/// resume.py `ResumeDataBoxReader.setinteriorfield` applying half.
+///
+/// `metainterp.execute_setinteriorfield_gc` executes the store as well as
+/// recording it, dispatching on `descr.is_pointer_field()` /
+/// `is_float_field()` — the same three-way split
+/// `ResumeDataDirectReader.setinteriorfield` makes over
+/// `cpu.bh_setinteriorfield_gc_{r,f,i}`.
+fn apply_setinteriorfield(
+    ctx: &crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
+    allocator: &dyn crate::resume::BlackholeAllocator,
+    array_op: OpRef,
+    index: i32,
+    value_op: OpRef,
+    descr: &majit_ir::DescrRef,
+) -> bool {
+    use majit_ir::Value;
+    let Some(Value::Ref(array)) = operand_concrete(ctx, cache, array_op) else {
+        return false;
+    };
+    let Some(value) = operand_concrete(ctx, cache, value_op) else {
+        return false;
+    };
+    let array = array.as_usize() as i64;
+    let index = index as usize;
+    // resume.py ResumeDataDirectReader.setinteriorfield
+    let is_pointer = descr
+        .as_interior_field_descr()
+        .is_some_and(|ifd| ifd.field_descr().is_pointer_field());
+    let is_float = descr
+        .as_interior_field_descr()
+        .is_some_and(|ifd| ifd.field_descr().is_float_field());
+    if is_pointer {
+        let Value::Ref(r) = value else {
+            return false;
+        };
+        allocator.bh_setinteriorfield_gc_r(array, index, r.as_usize() as i64, descr);
+    } else if is_float {
+        let Value::Float(f) = value else {
+            return false;
+        };
+        allocator.bh_setinteriorfield_gc_f(array, index, f.to_bits() as i64, descr);
+    } else {
+        let Value::Int(i) = value else {
+            return false;
+        };
+        allocator.bh_setinteriorfield_gc_i(array, index, i, descr);
+    }
+    true
+}
+
+/// `pyjitpl.py MetaInterp.execute_setinteriorfield_gc`: record the
+/// `SETINTERIORFIELD_GC`, execute it when this is the applying reader,
+/// then `heapcache.setarrayitem` (works for interior fields too).
+fn execute_setinteriorfield_gc(
+    ctx: &mut crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
+    array: OpRef,
+    index: i32,
+    value: OpRef,
+    descr: &majit_ir::DescrRef,
+) -> bool {
+    use majit_ir::OpCode;
+    let idx_ref = ctx.const_int(index as i64);
+    ctx.profiler()
+        .count_ops(OpCode::SetinteriorfieldGc, crate::counters::OPS);
+    ctx.profiler()
+        .count_ops(OpCode::SetinteriorfieldGc, crate::counters::RECORDED_OPS);
+    ctx.record_op_with_descr(
+        OpCode::SetinteriorfieldGc,
+        &[array, idx_ref, value],
+        descr.clone(),
+    );
+    if let Some(allocator) = cache.allocator()
+        && !apply_setinteriorfield(ctx, cache, allocator, array, index, value, descr)
+    {
+        return false;
+    }
+    ctx.heapcache_setarrayitem(array, idx_ref, descr.index(), value);
     true
 }
 
@@ -892,6 +938,10 @@ pub fn materialize_bridge_virtual(
                 &[],
                 size_descr.clone(),
             );
+            // `execute_new_with_vtable`: `heapcache.new(resbox)` then
+            // `heapcache.class_now_known(resbox)`. `publish_new_virtual`
+            // already did `heapcache.new`.
+            ctx.heap_cache_mut().class_now_known(new_op);
             // resume.py self.setfields(decoder, struct)
             if !setfields(
                 ctx,
@@ -1028,6 +1078,11 @@ pub fn materialize_bridge_virtual(
                 &[len_ref],
                 array_descr.clone(),
             );
+            // `execute_new_array` / `execute_new_array_clear`:
+            // `heapcache.new_array(resbox, lengthbox)`. Resume always
+            // allocates with ConstInt(length).
+            ctx.heap_cache_mut()
+                .new_array(new_op, len_ref, len_ref.is_constant());
             // resume.py:656-670 element loop: dispatch by arraydescr kind
             // NB. the check for the kind of array elements is moved out of the loop
             let set_opcode = match kind {
@@ -1069,6 +1124,9 @@ pub fn materialize_bridge_virtual(
                 {
                     return OpRef::NONE;
                 }
+                // `execute_setarrayitem_gc`: after recording,
+                // `heapcache.setarrayitem(arraybox, indexbox, itembox, arraydescr)`.
+                ctx.heapcache_setarrayitem(new_op, idx_ref, array_descr.index(), value);
             }
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -1086,7 +1144,6 @@ pub fn materialize_bridge_virtual(
             fielddescrs,
             size,
             fieldnums,
-            field_types,
             ..
         } => {
             let len_ref = ctx.const_int(*size as i64);
@@ -1121,6 +1178,9 @@ pub fn materialize_bridge_virtual(
                 &[len_ref],
                 array_descr.clone(),
             );
+            // `execute_new_array_clear`: `heapcache.new_array(resbox, lengthbox)`.
+            ctx.heap_cache_mut()
+                .new_array(new_op, len_ref, len_ref.is_constant());
             // resume.py:752-759:
             //   p = 0
             //   for i in range(self.size):
@@ -1136,7 +1196,7 @@ pub fn materialize_bridge_virtual(
             // longer one leaves its tail unread.
             let mut p = 0;
             for i in 0..*size {
-                for (j, fielddescr) in fielddescrs.iter().take(num_fields).enumerate() {
+                for fielddescr in fielddescrs.iter().take(num_fields) {
                     let fnum = fieldnums[p];
                     p += 1;
                     if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -1149,18 +1209,9 @@ pub fn materialize_bridge_virtual(
                         }
                         continue;
                     }
-                    let idx_ref = ctx.const_int(i as i64);
-                    // resume.py: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
-                    ctx.record_op_with_descr(
-                        OpCode::SetinteriorfieldGc,
-                        &[new_op, idx_ref, value],
-                        fielddescr.clone(),
-                    );
-                    let field_ty = field_types.get(j).copied().unwrap_or(1);
-                    if let Some(allocator) = cache.allocator()
-                        && !apply_setinteriorfield(
-                            ctx, cache, allocator, new_op, i as usize, value, fielddescr, field_ty,
-                        )
+                    // resume.py: decoder.setinteriorfield →
+                    // `metainterp.execute_setinteriorfield_gc`
+                    if !execute_setinteriorfield_gc(ctx, cache, new_op, i as i32, value, fielddescr)
                     {
                         return OpRef::NONE;
                     }
@@ -2384,5 +2435,281 @@ mod tests {
             Some(seed),
             "virtuals_cache must keep the DirectReader seed"
         );
+    }
+
+    /// `execute_new_with_vtable` stamps `heapcache.new` then
+    /// `heapcache.class_now_known` on the recorded box.
+    #[test]
+    fn new_with_vtable_stamps_heapcache_new_and_class() {
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let resume_data = empty_resume_data(Vec::new());
+        let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
+        let descr = majit_ir::make_size_descr_with_vtable(0, 16, 0, 0x1000);
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
+            descr: Some(descr),
+            type_id: 0,
+            known_class: Some(0x1000),
+            fielddescrs: Vec::new(),
+            fieldnums: Vec::new(),
+            descr_size: 16,
+        })];
+        let box_ =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        let heap = ctx.heap_cache();
+        assert!(heap.saw_allocation(box_));
+        assert!(heap.is_unescaped(box_));
+        assert!(heap.is_class_known(box_));
+        assert!(heap.is_nullity_known(box_));
+    }
+
+    /// `execute_new` stamps `heapcache.new` and leaves the class unknown.
+    #[test]
+    fn new_stamps_heapcache_new_without_class() {
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let resume_data = empty_resume_data(Vec::new());
+        let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
+        let descr = majit_ir::make_size_descr_full(0, 16, 0);
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VStructInfo {
+            typedescr: Some(descr),
+            type_id: 0,
+            fielddescrs: Vec::new(),
+            fieldnums: Vec::new(),
+            descr_size: 16,
+        })];
+        let box_ =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        let heap = ctx.heap_cache();
+        assert!(heap.saw_allocation(box_));
+        assert!(heap.is_unescaped(box_));
+        assert!(!heap.is_class_known(box_));
+        assert!(heap.is_nullity_known(box_));
+    }
+
+    /// `execute_new_array_clear` stamps `heapcache.new_array`, which
+    /// records the constant length so a later ARRAYLEN_GC can fold.
+    #[test]
+    fn new_array_stamps_heapcache_new_array() {
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let resume_data = empty_resume_data(Vec::new());
+        let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
+        let arraydescr = majit_ir::make_array_descr(16, 8, Type::Int);
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VArrayInfoClear {
+            arraydescr: Some(arraydescr),
+            kind: 1,
+            fieldnums: vec![
+                majit_ir::resumedata::UNINITIALIZED_TAG,
+                majit_ir::resumedata::UNINITIALIZED_TAG,
+            ],
+        })];
+        let box_ =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        let expected_len = ctx.const_int(2);
+        let heap = ctx.heap_cache();
+        assert!(heap.saw_allocation(box_));
+        assert!(heap.is_likely_virtual(box_));
+        assert!(heap.is_unescaped(box_));
+        assert_eq!(heap.arraylen(box_), Some(expected_len));
+    }
+
+    /// `execute_setarrayitem_gc` stamps `heapcache.setarrayitem` so a later
+    /// GETARRAYITEM_GC on the rematerialized box folds against the item.
+    #[test]
+    fn setarrayitem_stamps_heapcache() {
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let resume_data = empty_resume_data(Vec::new());
+        let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
+        let arraydescr = majit_ir::make_array_descr(16, 8, Type::Int);
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VArrayInfoClear {
+            arraydescr: Some(arraydescr.clone()),
+            kind: 1,
+            fieldnums: vec![tag_int(42), majit_ir::resumedata::UNINITIALIZED_TAG],
+        })];
+        let box_ =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        let idx0 = ctx.const_int(0);
+        let idx1 = ctx.const_int(1);
+        let expected = ctx.const_int(42);
+        let descr_index = arraydescr.index();
+        assert_eq!(
+            ctx.heapcache_getarrayitem(box_, idx0, descr_index),
+            Some(expected)
+        );
+        assert_eq!(ctx.heapcache_getarrayitem(box_, idx1, descr_index), None);
+    }
+
+    /// `execute_setinteriorfield_gc` stamps the same `heapcache.setarrayitem`
+    /// (works for interior fields too).
+    #[test]
+    fn setinteriorfield_stamps_heapcache() {
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let resume_data = empty_resume_data(Vec::new());
+        let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
+        let arraydescr = majit_ir::make_array_descr(16, 8, Type::Int);
+        let fielddescr = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let virtuals = vec![std::rc::Rc::new(
+            majit_ir::RdVirtualInfo::VArrayStructInfo {
+                arraydescr: Some(arraydescr),
+                size: 1,
+                fielddescrs: vec![fielddescr.clone()],
+                fielddescr_indices: vec![fielddescr.index()],
+                field_types: vec![1],
+                base_size: 16,
+                item_size: 8,
+                field_offsets: vec![0],
+                field_sizes: vec![8],
+                fieldnums: vec![tag_int(7)],
+            },
+        )];
+        let box_ =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        let idx = ctx.const_int(0);
+        let expected = ctx.const_int(7);
+        assert_eq!(
+            ctx.heapcache_getarrayitem(box_, idx, fielddescr.index()),
+            Some(expected)
+        );
+    }
+
+    /// `ResumeDataBoxReader.setinteriorfield` calls
+    /// `execute_setinteriorfield_gc`, which executes the store through the
+    /// allocator before caching it. Caching without that write lets a later
+    /// read fold to a value the heap does not hold.
+    #[test]
+    fn setinteriorfield_executes_through_allocator() {
+        struct RecordingAllocator {
+            stores: std::cell::RefCell<Vec<(i64, usize, i64)>>,
+        }
+        impl crate::resume::BlackholeAllocator for RecordingAllocator {
+            fn bh_new_array_clear(&self, _length: usize, _arraydescr: &majit_ir::DescrRef) -> i64 {
+                0x1000
+            }
+            fn bh_setinteriorfield_gc_i(
+                &self,
+                array: i64,
+                index: usize,
+                value: i64,
+                _descr: &majit_ir::DescrRef,
+            ) {
+                self.stores.borrow_mut().push((array, index, value));
+            }
+        }
+        let allocator = RecordingAllocator {
+            stores: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let resume_data = empty_resume_data(Vec::new());
+        let mut cache =
+            BridgeVirtualCache::executing(1, default_bridge_array_descr, &allocator, &[], &[]);
+        let arraydescr = majit_ir::make_array_descr(16, 8, Type::Int);
+        let fielddescr = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let virtuals = vec![std::rc::Rc::new(
+            majit_ir::RdVirtualInfo::VArrayStructInfo {
+                arraydescr: Some(arraydescr),
+                size: 1,
+                fielddescrs: vec![fielddescr.clone()],
+                fielddescr_indices: vec![fielddescr.index()],
+                field_types: vec![1],
+                base_size: 16,
+                item_size: 8,
+                field_offsets: vec![0],
+                field_sizes: vec![8],
+                fieldnums: vec![tag_int(7)],
+            },
+        )];
+        let box_ =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        assert!(!box_.is_none());
+        assert_eq!(*allocator.stores.borrow(), [(0x1000, 0, 7)]);
+        let idx = ctx.const_int(0);
+        let expected = ctx.const_int(7);
+        assert_eq!(
+            ctx.heapcache_getarrayitem(box_, idx, fielddescr.index()),
+            Some(expected)
+        );
+    }
+
+    /// Production `LlmodelBlackholeAllocator` writes the interior field
+    /// (`llmodel.py bh_setinteriorfield_gc_i`) so the heap holds the value
+    /// the heapcache just recorded.
+    #[test]
+    fn setinteriorfield_llmodel_allocator_writes_memory() {
+        use std::sync::Arc;
+        let allocator = crate::resume::LlmodelBlackholeAllocator;
+        let arr = Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+            0,
+            16,
+            8,
+            0,
+            Type::Int,
+        ));
+        let fd: Arc<dyn majit_ir::FieldDescr> =
+            Arc::new(majit_ir::SimpleFieldDescr::new(0, 0, 8, Type::Int, false));
+        let fielddescr: majit_ir::DescrRef = Arc::new(
+            majit_ir::descr::SimpleInteriorFieldDescr::new(0, arr.clone(), fd),
+        );
+        let arraydescr: majit_ir::DescrRef = arr;
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let resume_data = empty_resume_data(Vec::new());
+        let mut cache =
+            BridgeVirtualCache::executing(1, default_bridge_array_descr, &allocator, &[], &[]);
+        let virtuals = vec![std::rc::Rc::new(
+            majit_ir::RdVirtualInfo::VArrayStructInfo {
+                arraydescr: Some(arraydescr),
+                size: 1,
+                fielddescrs: vec![fielddescr.clone()],
+                fielddescr_indices: vec![fielddescr.index()],
+                field_types: vec![1],
+                base_size: 16,
+                item_size: 8,
+                field_offsets: vec![0],
+                field_sizes: vec![8],
+                fieldnums: vec![tag_int(7)],
+            },
+        )];
+        let box_ =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        assert!(!box_.is_none());
+        let ptr = cache
+            .concrete_root_of(box_)
+            .expect("bh_new_array_clear allocated");
+        let stored = unsafe { ((ptr as usize).wrapping_add(16) as *const i64).read_unaligned() };
+        assert_eq!(stored, 7);
+        let idx = ctx.const_int(0);
+        let expected = ctx.const_int(7);
+        assert_eq!(
+            ctx.heapcache_getarrayitem(box_, idx, fielddescr.index()),
+            Some(expected)
+        );
+    }
+
+    /// `VArrayStructInfo.allocate` uses `allocate_array(..., clear=True)`,
+    /// so the heapcache update is `new_array` as well.
+    #[test]
+    fn new_array_struct_stamps_heapcache_new_array() {
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let resume_data = empty_resume_data(Vec::new());
+        let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
+        let arraydescr = majit_ir::make_array_descr(16, 8, Type::Int);
+        let virtuals = vec![std::rc::Rc::new(
+            majit_ir::RdVirtualInfo::VArrayStructInfo {
+                arraydescr: Some(arraydescr),
+                size: 2,
+                fielddescrs: Vec::new(),
+                fielddescr_indices: Vec::new(),
+                field_types: Vec::new(),
+                base_size: 16,
+                item_size: 8,
+                field_offsets: Vec::new(),
+                field_sizes: Vec::new(),
+                fieldnums: Vec::new(),
+            },
+        )];
+        let box_ =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        let expected_len = ctx.const_int(2);
+        let heap = ctx.heap_cache();
+        assert!(heap.saw_allocation(box_));
+        assert!(heap.is_likely_virtual(box_));
+        assert_eq!(heap.arraylen(box_), Some(expected_len));
     }
 }

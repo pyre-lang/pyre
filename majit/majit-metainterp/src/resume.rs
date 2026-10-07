@@ -6317,6 +6317,20 @@ fn llmodel_alloc(type_id: u32, size: usize) -> i64 {
     ptr as i64
 }
 
+/// descr.py `unpack_interiorfielddescr`: `(ofs, itemsize, fieldsize)`
+/// with `ofs = arraydescr.basesize + fielddescr.offset`. The store then
+/// adds `itemindex * itemsize` (`llmodel.py bh_setinteriorfield_gc_*`).
+fn unpack_interiorfielddescr(descr: &majit_ir::DescrRef) -> Option<(usize, usize, usize)> {
+    let ifd = descr.as_interior_field_descr()?;
+    let ad = ifd.array_descr();
+    let fd = ifd.field_descr();
+    Some((
+        ad.base_size().wrapping_add(fd.offset()),
+        ad.item_size(),
+        fd.field_size(),
+    ))
+}
+
 impl BlackholeAllocator for LlmodelBlackholeAllocator {
     fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
         let Some(sd) = descr.as_size_descr() else {
@@ -6466,6 +6480,137 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
                 ofs,
                 f64::from_bits(value as u64),
             );
+        }
+    }
+
+    fn bh_setinteriorfield_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        // llmodel.py AbstractLLCPU.bh_setinteriorfield_gc_i:
+        // unpack_arraydescr_size + unpack_fielddescr_size, then
+        // ofs += itemindex * itemsize + field_offset.
+        let Some((ofs, itemsize, fieldsize)) = unpack_interiorfielddescr(descr) else {
+            return;
+        };
+        let ofs = ofs.wrapping_add(index.wrapping_mul(itemsize));
+        unsafe {
+            majit_backend::llmodel::write_int_at_mem(array as usize, ofs, fieldsize, value);
+        }
+    }
+
+    fn bh_setinteriorfield_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        // llmodel.py AbstractLLCPU.bh_setinteriorfield_gc_r:
+        // ofs = basesize + itemindex * itemsize + fielddescr.offset.
+        let Some((ofs, itemsize, _)) = unpack_interiorfielddescr(descr) else {
+            return;
+        };
+        let ofs = ofs.wrapping_add(index.wrapping_mul(itemsize));
+        // Barrier first: same as `bh_setarrayitem_gc_r` on this allocator.
+        majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
+        unsafe {
+            majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize);
+        }
+    }
+
+    fn bh_setinteriorfield_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        // llmodel.py AbstractLLCPU.bh_setinteriorfield_gc_f:
+        // ofs = basesize + itemindex * itemsize + fielddescr.offset.
+        let Some((ofs, itemsize, _)) = unpack_interiorfielddescr(descr) else {
+            return;
+        };
+        let ofs = ofs.wrapping_add(index.wrapping_mul(itemsize));
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem(
+                array as usize,
+                ofs,
+                f64::from_bits(value as u64),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod llmodel_interiorfield_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn llmodel_allocator_setinteriorfield_writes_memory() {
+        let allocator = LlmodelBlackholeAllocator;
+        let arr = Arc::new(majit_ir::descr::SimpleArrayDescr::with_flag(
+            0,
+            16,
+            24,
+            0,
+            majit_ir::Type::Int,
+            majit_ir::ArrayFlag::Struct,
+        ));
+        let int_fd: Arc<dyn majit_ir::FieldDescr> = Arc::new(majit_ir::SimpleFieldDescr::new(
+            0,
+            0,
+            8,
+            majit_ir::Type::Int,
+            false,
+        ));
+        let ref_fd: Arc<dyn majit_ir::FieldDescr> = Arc::new(majit_ir::SimpleFieldDescr::new(
+            1,
+            8,
+            8,
+            majit_ir::Type::Ref,
+            false,
+        ));
+        let float_fd: Arc<dyn majit_ir::FieldDescr> = Arc::new(majit_ir::SimpleFieldDescr::new(
+            2,
+            16,
+            8,
+            majit_ir::Type::Float,
+            false,
+        ));
+        let int_d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            0,
+            arr.clone(),
+            int_fd,
+        ));
+        let ref_d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            1,
+            arr.clone(),
+            ref_fd,
+        ));
+        let float_d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            2,
+            arr.clone(),
+            float_fd,
+        ));
+        let arraydescr: majit_ir::DescrRef = arr;
+        let ptr = allocator.bh_new_array_clear(1, &arraydescr);
+        assert_ne!(ptr, 0);
+        allocator.bh_setinteriorfield_gc_i(ptr, 0, 7, &int_d);
+        allocator.bh_setinteriorfield_gc_r(ptr, 0, 0xBEEF, &ref_d);
+        allocator.bh_setinteriorfield_gc_f(ptr, 0, 1.5f64.to_bits() as i64, &float_d);
+        let base = ptr as usize;
+        unsafe {
+            assert_eq!((base.wrapping_add(16) as *const i64).read_unaligned(), 7);
+            assert_eq!(
+                (base.wrapping_add(24) as *const usize).read_unaligned(),
+                0xBEEF
+            );
+            assert_eq!((base.wrapping_add(32) as *const f64).read_unaligned(), 1.5);
         }
     }
 }
