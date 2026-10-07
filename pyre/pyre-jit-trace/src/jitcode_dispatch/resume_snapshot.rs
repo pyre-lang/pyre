@@ -3452,6 +3452,8 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
             tail.name()
         );
     }
+    let mut caller = caller.clone();
+    refresh_paused_parent_blackhole(&mut caller);
     let mut tail_frame = super::operator_continuation_parent_frame(tail)
         .ok_or(DispatchError::callee_inline_abort(op_pc, true))?;
     tail_frame.boxes = vec![result];
@@ -3469,7 +3471,7 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
             .flat_map(|frame| frame.parents.iter().cloned())
             .collect::<Vec<_>>()
     };
-    parent_frames.push(caller.clone());
+    parent_frames.push(caller);
     parent_frames.push(tail_frame);
     walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
 }

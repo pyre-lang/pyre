@@ -5331,6 +5331,53 @@ impl MiniMarkGC {
         );
     }
 
+    /// Recorder stamp check: a nursery address must be the start of a
+    /// live object allocated since the last minor.
+    ///
+    /// `history.py` `*FrontendOp.value` is a GCREF. A Rust `Copy` of
+    /// that word held across `opencoder.py` `Trace._ops` growth is
+    /// from-space when it is later stamped. [`validate_type_id`] is the
+    /// `GC BUG: invalid type_id` diagnostic; the nursery-free test
+    /// catches a leftover header `arena_reset` mode 0 leaves in
+    /// `[nursery_free, nursery_top)`. A pin can sit in that gap and is
+    /// still live.
+    pub(crate) fn assert_stamped_ref_is_live_object(
+        &self,
+        addr: usize,
+        location: &'static std::panic::Location,
+    ) {
+        if self.nursery.contains_retired(addr) {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            panic!(
+                "stamped Ref {addr:#x} is in a retired nursery arena at {location}\n{backtrace}"
+            );
+        }
+        if !self.is_in_nursery(addr) {
+            return;
+        }
+        if !self.is_nursery_object_start(addr) {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            panic!(
+                "stamped Ref {addr:#x} is in the nursery but is not an object start \
+                 (header would sit outside the arena) at {location}\n{backtrace}"
+            );
+        }
+        let hdr = unsafe { *header_of(addr) };
+        if hdr.is_forwarded() {
+            self.report_invalid_type_id(hdr.type_id(), addr, "stamped_ref");
+        }
+        self.validate_type_id(hdr.type_id(), addr, "stamped_ref");
+        let free = self.nursery.free_ptr() as usize;
+        if addr >= free && !hdr.has_flag(GcFlags::GCFLAG_PINNED) {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            panic!(
+                "stamped Ref {addr:#x} is in the nursery but not allocated since \
+                 the last minor (nursery_free={free:#x}, type_id={}) at {location}\n{backtrace}",
+                hdr.type_id()
+            );
+        }
+    }
+
     /// `get_possibly_forwarded_type_id`: follow a nursery corpse before
     /// reading its size. `set_forwarding_address` writes the live address
     /// at payload offset 0, which is `length_offset` for a varsize type
@@ -5792,6 +5839,16 @@ impl MiniMarkGC {
             "minor_root",
             "minor_root",
         );
+        if crate::gc_stress_trace_alloc_enabled()
+            && self.nursery.contains(gcref.0)
+            && !self.is_nursery_object_start(gcref.0)
+        {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            panic!(
+                "minor_root {:#x} is in the nursery but is not an object start\n{backtrace}",
+                gcref.0
+            );
+        }
         if self.is_nursery_object_start(gcref.0) {
             let slot_addr = gcref as *mut GcRef as usize;
             // incminimark.py `_trace_drag_out`: `is_in_nursery` is a range

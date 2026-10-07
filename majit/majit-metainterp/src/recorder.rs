@@ -288,7 +288,20 @@ pub struct Trace {
     /// `value_slots` indices stamped with a `Value::Ref` since the last
     /// minor collection — the `young_objects_with_weakrefs` list of
     /// `incminimark.py`, which `invalidate_young_weakrefs` drains.
+    /// Live boxes are forwarded by `walk_active_trace_refs` /
+    /// `forward_concrete_ref` (`RefFrontendOp._resref` of a reachable box).
+    /// This list settles slots that outlive their box so `materialize_ops`
+    /// does not intern a freed address.
     young_ref_slots: RefCell<Vec<u32>>,
+    /// Dropped before [`Self::const_ptr_indexes`] (declaration order) so the
+    /// extra area unregisters while the index list is still valid.
+    const_ptr_area: RefCell<Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>>,
+    /// `history.py` `ConstPtr` table indexes this recorder still holds.
+    /// `record_bytes` borrows `&mut Trace`, so `walk_const_ptr_refs` cannot
+    /// visit `const_ptrs` then. This list is a separate extra-area root of
+    /// those table slots (`const_ptr_table::trace_index`), the `_refs`
+    /// field of a live `opencoder.py` `Trace`.
+    const_ptr_indexes: Box<RefCell<Vec<u32>>>,
 }
 
 /// TAGBOX index to the recording `OpRef`, without borrowing the whole
@@ -464,6 +477,8 @@ impl Trace {
             value_slots: Box::new(Vec::new()),
             inputarg_heapc: Vec::new(),
             young_ref_slots: RefCell::new(Vec::new()),
+            const_ptr_area: RefCell::new(None),
+            const_ptr_indexes: Box::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -534,6 +549,7 @@ impl Trace {
         self.slots.reserve(128);
         self.value_slots.reserve(128);
         self.trb = Some(Box::new(trb));
+        self.ensure_const_ptr_area();
     }
 
     fn byte_mode(&self) -> bool {
@@ -592,7 +608,7 @@ impl Trace {
             let Some(p) = slot.descr_pos else {
                 continue;
             };
-            let (idx, _) = crate::opencoder::decode_varint_signed(&trb._ops[p..]);
+            let (idx, _) = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[p..]);
             if idx >= 0 {
                 let u = idx as usize;
                 if u < data_len && out.last().copied() != Some(u) {
@@ -723,19 +739,54 @@ impl Trace {
     /// `_list_of_boxes` from tagged snapshot values, encoding each box
     /// into `_snapshot_array_data` the way `opencoder.py _add_box_to_storage`
     /// does — no intermediate `Vec<i64>`.
+    ///
+    /// Hold each `ConstPtr` index across `new_array` / `_encode` the way
+    /// `record_bytes` holds argument indexes across `reserve_ops_bytes`.
+    /// `history.py` `ConstPtr.value` is a GCREF local; a prebuilt
+    /// `Box::ConstPtr` is not. Resolve after the previous box's encode.
     fn write_tagged_array(&mut self, boxes: &[SnapshotTagged]) -> i64 {
+        let mut const_refs = Vec::new();
+        for tagged in boxes {
+            match tagged {
+                SnapshotTagged::Const(v, Type::Ref) if *v != 0 => {
+                    const_refs.push(OpRef::ConstPtr(*v as u32));
+                }
+                SnapshotTagged::Box(r, _) => const_refs.push(*r),
+                _ => {}
+            }
+        }
+        let held = self.hold_const_indexes(&const_refs);
         let res = self
             .trb
             .as_mut()
             .expect("write_tagged_array requires attach_byte_buffer")
             .new_array(boxes.len());
+        // `new_array` / an earlier `_encode` can minor-collect. The intern
+        // table slot moves; a `ConstPtr` box copied from a resolved address
+        // would keep the from-space word. Hold the index and resolve after
+        // the previous encode, matching `record_bytes`.
+        let mut const_i = 0;
         for &tagged in boxes {
-            let b = self.snapshot_tagged_to_box(tagged);
+            let b = match tagged {
+                SnapshotTagged::Const(v, Type::Ref) if v != 0 => {
+                    let opref = const_refs[const_i];
+                    const_i += 1;
+                    self.arg_to_box(opref)
+                }
+                SnapshotTagged::Box(_, _) => {
+                    let opref = const_refs[const_i];
+                    const_i += 1;
+                    self.arg_to_box(opref)
+                }
+                other => self.snapshot_tagged_to_box(other),
+            };
             self.trb
                 .as_mut()
                 .expect("write_tagged_array requires attach_byte_buffer")
                 ._add_box_to_storage_box(b);
         }
+        debug_assert_eq!(const_i, const_refs.len());
+        self.release_const_indexes(held);
         res
     }
 
@@ -989,18 +1040,26 @@ impl Trace {
         // slots. Resolve each ConstPtr in the encode loop, after the
         // previous argument's encode, so a prebuilt `Box::ConstPtr`
         // does not keep the from-space address.
-        // `history.py` `*FrontendOp.value` is a GC field of the op once
+        // `history.py` `RefFrontendOp._resref` is a GC field of the op once
         // `_make_op` attaches it. Until `value_slots` holds it, a Rust
         // `Value::Ref` is not a root, and the reserve and encode below can
         // minor-collect (`stress_trace_pool_alloc` /
         // `alloc_fast_nursery_collecting`). Pin the referent across them
         // and stamp the forwarded address. Skip the sentinel and addresses
         // the collector does not own (test CPUs return a host buffer).
+        // After the slot exists, a live box is forwarded by
+        // `walk_active_trace_refs`; a dead slot is settled after the
+        // collection. Do not owner-root every stamped slot — that would
+        // keep residual CALL results alive for the whole trace.
         let value_pin = match value {
-            Some(Value::Ref(r))
-                if r != GcRef::NO_CONCRETE && !r.is_null() && majit_gc::gc_owns_object(r.0) =>
-            {
-                Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+            Some(Value::Ref(r)) if r != GcRef::NO_CONCRETE && !r.is_null() => {
+                let r = GcRef(majit_gc::gc_current_object_address(r.0));
+                if !r.is_null() && majit_gc::gc_owns_object(r.0) {
+                    majit_gc::assert_stamped_ref_is_live_object(r.0);
+                    Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+                } else {
+                    None
+                }
             }
             _ => None,
         };
@@ -1322,6 +1381,15 @@ impl Trace {
     /// the real box object — `MIFrame.registers_r` holds these in `pyjitpl.py` —
     /// so consumers can key by box identity instead of flat `OpRef`.
     pub(crate) fn box_for_operand(&mut self, r: OpRef) -> Operand {
+        if let Some(index) = r.const_ptr_index()
+            && index != 0
+        {
+            // Publish the table index before `from_opref` allocate.
+            // `history.py` `ConstPtr.value` is the table slot; this list is
+            // the holder `walk_const_ptr_refs` cannot borrow during
+            // `record_bytes`.
+            self.hold_const_ptr_index(index);
+        }
         if r.is_none() || r.is_constant() {
             return Operand::from_opref(r);
         }
@@ -1483,9 +1551,9 @@ impl Trace {
                 .and_then(|s| s.descr_pos);
             if let Some(pos) = descr_pos {
                 let trb = self.trb.as_mut().expect("byte buffer");
-                let old_len = crate::opencoder::decode_varint_signed(&trb._ops[pos..]).1;
+                let old_len = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[pos..]).1;
                 trb.patch_descr_slot_at(pos, snapshot_id as i64);
-                let new_len = crate::opencoder::decode_varint_signed(&trb._ops[pos..]).1;
+                let new_len = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[pos..]).1;
                 if new_len != old_len {
                     let delta = new_len as isize - old_len as isize;
                     let mut seen = 0;
@@ -1569,7 +1637,7 @@ impl Trace {
                 .filter(|s| s.opcode.is_guard())
                 .nth(from_end)?;
             let p = slot.descr_pos?;
-            let (idx, _) = crate::opencoder::decode_varint_signed(&trb._ops[p..]);
+            let (idx, _) = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[p..]);
             return Some(idx as i32);
         }
         self.ops
@@ -1875,18 +1943,9 @@ impl Trace {
         }
 
         if let Some(trb) = self.trb.as_mut() {
+            // `_refs` is a GcArray of GCREF the collector traces itself;
+            // rekey `_refs_dict` by the forwarded addresses.
             trb.refresh_from_gc();
-            for r in trb._refs.iter_mut().skip(1) {
-                let mut gcref = GcRef(*r as usize);
-                visitor(&mut gcref);
-                *r = gcref.0 as u64;
-            }
-            if !trb._refs_dict.is_empty() {
-                trb._refs_dict.clear();
-                for (index, &reference) in trb._refs.iter().enumerate().skip(1) {
-                    trb._refs_dict.insert(reference, index as u32);
-                }
-            }
             trb.walk_descr_const_ptr_refs(visitor);
         }
         if self.trb.is_some() {
@@ -1984,7 +2043,8 @@ impl Trace {
         });
         let (args_pos, descr_index) = found?;
         let descr = trb.resolve_descr_index(descr_index)?;
-        let tagged = crate::opencoder::TraceRecordBuffer::encoded_arg_at(&trb._ops, args_pos, 0);
+        let tagged =
+            crate::opencoder::TraceRecordBuffer::encoded_arg_at(trb.ops_bytes(), args_pos, 0);
         let obj = match self.untag_snapshot(tagged) {
             SnapshotTagged::Box(r, _) => r,
             // `Type::Ref` payload is a const_ptr_table index (`SnapshotTagged::const_ref`).
@@ -2023,7 +2083,21 @@ impl Trace {
     /// their original `get_position()`, later indices are value-producing
     /// ops. Void ops have no value slot. Returns `false` if `position` is
     /// past the recorded range or a dead failarg hole.
+    #[track_caller]
     pub(crate) fn set_concrete_at(&self, position: u32, value: Value) -> bool {
+        // Follow a forwarding stub before stamping (`minimark.py`
+        // `id_or_identityhash`). Do not owner-root the slot: `_resref` is
+        // traced only while the box is reachable.
+        let value = match value {
+            Value::Ref(r)
+                if !r.is_null() && r != GcRef::NO_CONCRETE && majit_gc::gc_owns_object(r.0) =>
+            {
+                let r = GcRef(majit_gc::gc_current_object_address(r.0));
+                majit_gc::assert_stamped_ref_is_live_object(r.0);
+                Value::Ref(r)
+            }
+            other => other,
+        };
         if let Some(ia) = self.inputarg_at(position) {
             ia.set_value(value);
             true
@@ -2191,6 +2265,62 @@ impl Trace {
                 .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
                 .and_then(|op| op.get_value())
         }
+    }
+
+    pub(crate) fn hold_live_const_ptr(&self, opref: OpRef) {
+        if let Some(index) = opref.const_ptr_index() {
+            self.hold_const_ptr_index(index);
+        }
+    }
+
+    fn hold_const_ptr_index(&self, index: u32) {
+        if index == 0 {
+            return;
+        }
+        {
+            let mut list = self.const_ptr_indexes.borrow_mut();
+            // `VirtualState::retain_const_ptr_indexes` dedups. `box_for_operand`
+            // hits the same ConstPtr on every use; a push-only list would
+            // grow with the trace length and extra-area-walk that many times.
+            if list.last().copied() == Some(index) || list.iter().any(|&i| i == index) {
+                return;
+            }
+            list.push(index);
+        }
+        self.ensure_const_ptr_area();
+    }
+
+    fn ensure_const_ptr_area(&self) {
+        if self.const_ptr_area.borrow().is_some() {
+            return;
+        }
+        if !majit_gc::shadow_stack::mutator_is_registered() {
+            return;
+        }
+        let data = (&*self.const_ptr_indexes) as *const RefCell<Vec<u32>> as *const ();
+        let area = unsafe {
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+                walk_recorder_const_ptr_indexes,
+                data,
+                "recorder_const_ptrs",
+            )
+        };
+        *self.const_ptr_area.borrow_mut() = Some(area);
+    }
+}
+
+/// Extra-area holder for `history.py` `ConstPtr.value` table slots this
+/// recorder interned. `walk_active_trace_refs` needs `&mut Trace` and
+/// cannot run while `record_bytes` holds that borrow.
+unsafe fn walk_recorder_const_ptr_indexes(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+    let indexes = unsafe { &*(data as *const RefCell<Vec<u32>>) };
+    let list = indexes
+        .try_borrow()
+        .expect("recorder const_ptr_indexes borrow held across collection");
+    let mut i = 0;
+    while i < list.len() {
+        majit_ir::const_ptr_table::trace_index(list[i], visitor);
+        i += 1;
     }
 }
 
@@ -2900,6 +3030,55 @@ mod tests {
         assert_eq!(stored, forwarded.0 as u64);
     }
 
+    /// `write_tagged_array` must re-resolve each ConstPtr after an earlier
+    /// box's `_encode`, the same way `record_bytes` does. The snapshot
+    /// word is a table index; resolving it only after the previous encode
+    /// reads the forwarded slot into `Trace._refs`.
+    #[test]
+    fn snapshot_later_const_ptr_is_reresolved_after_an_earlier_encode() {
+        struct Restore {
+            index: u32,
+            addr: GcRef,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::opencoder::set_after_encode_hook_for_test(None);
+                majit_ir::const_ptr_table::set_slot(self.index, self.addr);
+            }
+        }
+
+        let original_a = GcRef(0x96E2_4000);
+        let original_b = GcRef(0x96E2_5000);
+        let forwarded_b = GcRef(0x96E2_6000);
+        let first = OpRef::const_ptr(original_a);
+        let later = OpRef::const_ptr(original_b);
+        let index_a = first.const_ptr_index().expect("non-null const ptr");
+        let index = later.const_ptr_index().expect("non-null const ptr");
+        let _restore_a = Restore {
+            index: index_a,
+            addr: original_a,
+        };
+        let _restore = Restore {
+            index,
+            addr: original_b,
+        };
+        let mut rec = Trace::new();
+        rec.attach_byte_buffer(Arc::new(crate::MetaInterpStaticData::new()));
+        BUMP_LATER_CONST.with(|cell| cell.set((index, forwarded_b.0)));
+        crate::opencoder::set_after_encode_hook_for_test(Some(bump_later_const_slot));
+        rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![],
+            vable_boxes: vec![
+                SnapshotTagged::const_ref(original_a.0),
+                SnapshotTagged::const_ref(original_b.0),
+            ],
+            vref_boxes: vec![],
+        });
+        let stored = rec.trb.as_ref().expect("byte buffer").current_ref(2);
+        assert_eq!(stored, forwarded_b.0 as u64);
+    }
+
     #[test]
     fn to_tree_loop_rewalks_byte_stream_after_close_loop() {
         // `unroll.py optimize_preamble` `trace.get_iter()` walks the live
@@ -2931,11 +3110,9 @@ mod tests {
             }
         });
         assert_eq!(cptr.as_const_ptr(), Some(GcRef(0x9A_0000_2000)));
+        // Materialized args come from the stream's `_refs` GcArray, which
+        // the collector forwards itself; this walk only moves the table.
         rec.materialize_into_ops();
-        assert_eq!(
-            rec.ops()[0].arg(0).to_opref().as_const_ptr(),
-            Some(GcRef(0x9A_0000_2000))
-        );
         assert!(rec.ops()[1].guard_fail_args().is_none());
     }
 

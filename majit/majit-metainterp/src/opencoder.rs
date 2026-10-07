@@ -242,6 +242,12 @@ impl Drop for TraceOpsBuf {
     }
 }
 
+fn pin_gc_addr(addr: usize) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
+    let addr = majit_gc::gc_current_object_address(addr);
+    (addr != 0 && majit_gc::gc_owns_object(addr))
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)))
+}
+
 #[allow(dead_code)]
 fn u16_to_opcode(v: u16) -> OpCode {
     assert!(
@@ -2313,11 +2319,19 @@ impl Trace {
     /// identity hash, so a minor that forwards `_refs` does not move the
     /// key. `opencoder.py` `_refs_dict` is keyed by the ref itself, whose
     /// hash is `lltype.identityhash`.
+    ///
+    /// `history.py` `ConstPtr.value` is a GCREF local. A Rust `u64` is
+    /// not; `_refs.push` can minor-collect (`WordArray::grow_push`).
+    /// Pin the referent, store the forwarded address, and re-hash from
+    /// that address so the dict key matches the slot.
     pub fn _encode_ptr(&mut self, addr: u64) -> i64 {
         self._consts_ptr += 1;
         if addr == 0 {
             return tag(TAGCONSTPTR, 0) as i64;
         }
+        let pin = pin_gc_addr(addr as usize);
+        let addr = pin.as_ref().map(|p| p.get().0 as u64).unwrap_or(addr);
+        let addr = majit_gc::gc_current_object_address(addr as usize) as u64;
         let key = majit_ir::gc_id_or_identityhash(addr as usize) as u64;
         let cached = self
             ._refs_dict
@@ -2330,6 +2344,7 @@ impl Trace {
         } else {
             let stored = self._refs.push(addr as usize);
             let idx = (self._refs.len() - 1) as u32;
+            let key = majit_ir::gc_id_or_identityhash(stored) as u64;
             self._refs_dict.insert(key, idx);
             if key != stored as u64 {
                 self._refs_dict.insert(stored as u64, idx);
@@ -2407,7 +2422,19 @@ impl Trace {
     /// path used by callers that already have a tagged value; this
     /// method matches the RPython call shape for callers that hold a
     /// `Box` (e.g. `MIFrame::get_list_of_active_boxes`).
+    ///
+    /// `history.py` `ConstPtr.value` stays a GCREF local across
+    /// `_encode` and the `_snapshot_array_data` append. The append can
+    /// minor-collect (`CharList::realloc_items`).
     pub(crate) fn _add_box_to_storage_box(&mut self, b: Box) {
+        let pin = match b {
+            Box::ConstPtr(addr) => pin_gc_addr(addr as usize),
+            _ => None,
+        };
+        let b = match &pin {
+            Some(p) => Box::ConstPtr(p.get().0 as u64),
+            None => b,
+        };
         let tagged = self._encode(b);
         self.append_snapshot_array_data_int(tagged);
     }

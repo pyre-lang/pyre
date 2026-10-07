@@ -1604,7 +1604,9 @@ impl TraceCtx {
         }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache_mut()
-            .setfield_cached(obj, field_index, value, oracle)
+            .setfield_cached(obj, field_index, value, oracle);
+        self.recorder.hold_live_const_ptr(obj);
+        self.recorder.hold_live_const_ptr(value);
     }
 
     /// heapcache.py `getfield_now_known` parity (no aliasing).
@@ -1618,7 +1620,9 @@ impl TraceCtx {
         }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache_mut()
-            .getfield_now_known(obj, field_index, value, oracle)
+            .getfield_now_known(obj, field_index, value, oracle);
+        self.recorder.hold_live_const_ptr(obj);
+        self.recorder.hold_live_const_ptr(value);
     }
 
     /// heapcache.py `invalidate_caches_varargs` parity.
@@ -2627,6 +2631,7 @@ impl TraceCtx {
     /// that was never constructed — an invariant violation that would
     /// silently swallow the value under the previous `if let Some`
     /// shape and hide cache-hit sanity-check mismatches.  Panic instead.
+    #[track_caller]
     pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
         if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return;
@@ -2655,6 +2660,7 @@ impl TraceCtx {
     /// allocated in the active recorder (a deeper inlined / recursive
     /// frame's result).  Leaving that result symbolic makes the downstream
     /// branch abort the trace cleanly rather than crash the tracer.
+    #[track_caller]
     pub fn try_set_opref_concrete(&mut self, opref: OpRef, concrete: Value) -> bool {
         if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return true;
@@ -2790,8 +2796,25 @@ impl TraceCtx {
     /// history.py `ConstPtr.value` is a field on the Box; pyre
     /// stores a `const_ptr_table` index on `OpRef::ConstPtr`. The
     /// op-graph walker traces that index across minor collection.
+    ///
+    /// `intern` records the address; the slot is a root only while a
+    /// holder traces it (`const_ptr_table::trace_index`). A Rust
+    /// `OpRef` is a Copy index, not that holder. Register the box in
+    /// `recorder.const_ptrs` immediately so the next Trace-pool append
+    /// forwards `ConstPtr.value` the way the translated local would.
     pub fn const_ref(&mut self, value: i64) -> OpRef {
-        OpRef::const_ptr(majit_ir::GcRef(value as usize))
+        let addr = majit_gc::gc_current_object_address(value as usize);
+        let pin = (addr != 0 && majit_gc::gc_owns_object(addr))
+            .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)));
+        let opref = OpRef::const_ptr(
+            pin.as_ref()
+                .map(|p| p.get())
+                .unwrap_or(majit_ir::GcRef(addr)),
+        );
+        if opref.const_ptr_index().is_some_and(|index| index != 0) {
+            let _ = self.recorder.box_for_operand(opref);
+        }
+        opref
     }
 
     /// history.py CONST_NULL = ConstPtr(ConstPtr.value).
@@ -7337,7 +7360,27 @@ impl TraceCtx {
             return VableArrayStore::OutOfVable;
         };
         let overwritten = VableEntryWrite::of(self, flat_idx);
-        self.set_virtualizable_entry_at(flat_idx, value, concrete);
+        // `set_virtualizable_entry_at` → `try_set_opref_concrete` can intern
+        // and collect. Pin the Ref before that call and store the live word
+        // (`store_reconstructed_callee_array_image`).
+        let pinned = match concrete {
+            Value::Ref(gc) if !gc.is_null() && gc != GcRef::NO_CONCRETE => {
+                let live = majit_gc::gc_current_object_address(gc.0);
+                if live == 0 {
+                    None
+                } else {
+                    Some(majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(live)))
+                }
+            }
+            _ => None,
+        };
+        // Stamp the pinned word, not the pre-pin copy: `box_value` is
+        // the GETARRAYITEM_GC_R heapcache sanity's cache side.
+        let stamp = pinned
+            .as_ref()
+            .map(|g| Value::Ref(g.get()))
+            .unwrap_or(concrete);
+        self.set_virtualizable_entry_at(flat_idx, value, stamp);
         if live_null_push
             && matches!(concrete, Value::Ref(r) if r.is_null())
             && let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut()
@@ -7345,8 +7388,18 @@ impl TraceCtx {
             live_null_slots[flat_idx] = true;
         }
         // pyjitpl.py MIFrame._opimpl_setarrayitem_vable →
-        // virtualizable.py write_box_at.
-        self.synchronize_virtualizable_at(flat_idx);
+        // virtualizable.py write_box_at. A Const OpRef's
+        // `inline_const_to_value` is not a root; write the live word the
+        // caller pinned across `walker_promote_vable_array_index`.
+        if matches!(concrete, Value::Ref(_)) {
+            let live = pinned
+                .as_ref()
+                .map(|g| Value::Ref(g.get()))
+                .unwrap_or(stamp);
+            self.write_virtualizable_heap_value_at(flat_idx, live);
+        } else {
+            self.synchronize_virtualizable_at(flat_idx);
+        }
         VableArrayStore::Stored(overwritten)
     }
 

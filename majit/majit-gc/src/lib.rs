@@ -13,6 +13,7 @@ pub use header::{
 /// Idempotent: `register_extra_root_walker` dedups by function address.
 pub fn install_const_ptr_table_walker() {
     shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
+    majit_ir::set_gc_current_object_address(Some(gc_current_object_address));
 }
 
 fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
@@ -323,6 +324,36 @@ pub fn stress_trace_pool_alloc(roots: *mut GcRef, root_count: usize) {
         return;
     }
     gc_sync::gc_op(|gc| gc.stress_trace_alloc_minor(roots, root_count));
+}
+
+/// Panic when `addr` is a nursery word that is not a live object start
+/// allocated since the last minor.
+///
+/// Recorder stamp sites (`history.py` `*FrontendOp.value`) call this
+/// before writing a `Value::Ref`. A Rust `Copy` held across
+/// `record_bytes` / `stress_trace_pool_alloc` is already from-space
+/// when it is stamped; no later extra-area walk can repair it.
+/// [`gc_stress_trace_alloc_enabled`] is the gate, read once: unset is
+/// one cached bool load.
+#[inline]
+#[track_caller]
+pub fn assert_stamped_ref_is_live_object(addr: usize) {
+    if !gc_stress_trace_alloc_enabled() {
+        return;
+    }
+    assert_stamped_ref_is_live_object_slow(addr, std::panic::Location::caller());
+}
+
+#[cold]
+#[inline(never)]
+fn assert_stamped_ref_is_live_object_slow(addr: usize, location: &'static std::panic::Location) {
+    if addr == 0 {
+        return;
+    }
+    if !gc_sync::is_initialized() || !rgil::am_i_holding_the_gil() {
+        return;
+    }
+    gc_sync::gc_query_reentrant(|gc| gc.assert_stamped_ref_is_live_object(addr, location));
 }
 
 /// `have_debug_prints_for("gc")` for the collector's own per-collection
@@ -3906,6 +3937,14 @@ pub type GcIdOrIdentityHashFn = majit_ir::value::GcIdOrIdentityHashFn;
 
 pub fn set_active_gc_id_or_identityhash(hook: Option<GcIdOrIdentityHashFn>) {
     majit_ir::set_gc_id_or_identityhash(hook);
+}
+
+/// Live-address hook. `intern` follows a nursery forwarding stub through
+/// this so a from-space intern cannot `stamp_reuse` dest with a gap corpse.
+pub type GcCurrentObjectAddressFn = majit_ir::value::GcCurrentObjectAddressFn;
+
+pub fn set_active_gc_current_object_address(hook: Option<GcCurrentObjectAddressFn>) {
+    majit_ir::set_gc_current_object_address(hook);
 }
 
 /// Return a GC-move-stable address for identity hashing.

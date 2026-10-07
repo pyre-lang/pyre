@@ -161,6 +161,10 @@ impl TraceCtx {
     ///
     /// Upstream returns `None` for `op.type == 'v'`. `History._make_op`
     /// attaches `resvalue` at construction (`IntFrontendOp(pos, value)`).
+    /// A void operation still gets a real position from
+    /// `recorder::Trace::record_op`, and `set_opref_concrete` asserts every
+    /// recorded op has one, so the OpRef is returned for every result type.
+    #[track_caller]
     fn record_helper(
         &mut self,
         opnum: OpCode,

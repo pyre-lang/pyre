@@ -133,7 +133,24 @@ fn walker_execute_gc_store<Sym: WalkSym>(
         }
         return walker_gc_store_not_executed(ctx, pc);
     };
-    let obj = obj_ptr as usize as pyre_object::PyObjectRef;
+    // `do_setfield_gc` / `do_setarrayitem_gc` write a pointer field through
+    // the barrier; the journal push afterwards names the same objects.
+    // Recording can minor-collect, so the receiver, stored word and displaced
+    // word have to be owner-rooted across the store.
+    let obj_pin = residual_call::owner_root_if_gc(obj_ptr as usize);
+    let value_pin = match value {
+        majit_ir::Value::Ref(r) => residual_call::owner_root_if_gc(r.0),
+        _ => None,
+    };
+    let before_pin = match before {
+        majit_ir::Value::Ref(r) => residual_call::owner_root_if_gc(r.0),
+        _ => None,
+    };
+    let obj_ptr = obj_pin.as_ref().map_or(obj_ptr, |pin| pin.get().0 as i64);
+    let value = match value_pin.as_ref() {
+        Some(pin) => majit_ir::Value::Ref(pin.get()),
+        None => value,
+    };
     let stored = match store {
         WalkedGcStore::Field(descr) => ctx.trace_ctx.field_store(obj_ptr, descr, value),
         WalkedGcStore::ArrayItem(descr, index) => {
@@ -145,6 +162,15 @@ fn walker_execute_gc_store<Sym: WalkSym>(
         // `execute_and_record` executes, then records: the op this store
         // belongs to is the next one, and a cut back past it undoes the store.
         let op_count = ctx.trace_ctx.get_trace_position()._count + 1;
+        let obj = obj_pin
+            .as_ref()
+            .map_or(obj_ptr as usize as pyre_object::PyObjectRef, |pin| {
+                pin.get().0 as pyre_object::PyObjectRef
+            });
+        let before = match before_pin.as_ref() {
+            Some(pin) => majit_ir::Value::Ref(pin.get()),
+            None => before,
+        };
         fbw_gc_store_journal_push(obj, offset, size, before, op_count);
         Ok(())
     } else {
@@ -569,7 +595,19 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
         // execute: the block is incomplete, so stop naming it as the
         // array's value.
         let stored = match (slot, value) {
-            (Some((ptr, i)), Some(value)) => ctx.trace_ctx.array_store(ptr, i, descr, value),
+            (Some((ptr, i)), Some(value)) => {
+                let obj_pin = residual_call::owner_root_if_gc(ptr as usize);
+                let value_pin = match value {
+                    majit_ir::Value::Ref(r) => residual_call::owner_root_if_gc(r.0),
+                    _ => None,
+                };
+                let ptr = obj_pin.as_ref().map_or(ptr, |pin| pin.get().0 as i64);
+                let value = match value_pin.as_ref() {
+                    Some(pin) => majit_ir::Value::Ref(pin.get()),
+                    None => value,
+                };
+                ctx.trace_ctx.array_store(ptr, i, descr, value)
+            }
             _ => false,
         };
         if !stored {
@@ -705,11 +743,20 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
             return;
         }
     };
+    // `box_value` resolved a ConstPtr to the live pointer. Pin the block
+    // and the stored word across the barrier (`transform_generic_set`
+    // (framework.py) runs it before the bare store).
+    let block_pin = residual_call::owner_root_if_gc(block as usize);
+    let elem_pin = residual_call::owner_root_if_gc(elem as usize);
+    let block = block_pin.as_ref().map_or(block, |pin| {
+        pin.get().0 as *mut pyre_object::object_array::ItemsBlock
+    });
+    let elem = elem_pin
+        .as_ref()
+        .map_or(elem, |pin| pin.get().0 as pyre_object::PyObjectRef);
     // Old→young barrier: the materialization block may have been promoted to
     // old-gen while `elem` is still young (the construction-barrier gap). A
     // nursery block carries no TRACK_YOUNG_PTRS so the barrier is a no-op.
-    // `transform_generic_set` (framework.py): the barrier comes before the
-    // bare store.
     pyre_object::gc_hook::try_gc_write_barrier(block as pyre_object::gc_hook::GCREF);
     unsafe {
         let base = pyre_object::object_array::items_block_items_base(block);
@@ -1235,6 +1282,21 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
             {
                 let struct_ptr = struct_ref.0 as i64;
                 if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    // `box_value` already resolved a ConstPtr to the table
+                    // slot's live pointer. Pin across `field_store`: the
+                    // barrier is an allocation.
+                    let obj_pin = residual_call::owner_root_if_gc(struct_ptr as usize);
+                    let value_pin = match value {
+                        majit_ir::Value::Ref(r) => residual_call::owner_root_if_gc(r.0),
+                        _ => None,
+                    };
+                    let struct_ptr = obj_pin
+                        .as_ref()
+                        .map_or(struct_ptr, |pin| pin.get().0 as i64);
+                    let value = match value_pin.as_ref() {
+                        Some(pin) => majit_ir::Value::Ref(pin.get()),
+                        None => value,
+                    };
                     ctx.trace_ctx.field_store(struct_ptr, &descr, value);
                 }
             }
@@ -1317,6 +1379,9 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let descr = read_descr(code, op, 1, ctx)?;
     let descr_index = descr.index();
     let concrete_obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
+    // The cache-miss record below appends to `opencoder.py Trace._ops` and can
+    // minor-collect before the sanity load reads the receiver.
+    let obj_pin = concrete_obj_ptr.and_then(|p| residual_call::owner_root_if_gc(p as usize));
 
     // ConstPtr + always-pure fast path (pyjitpl.py): a constant
     // source through an immutable descr loads the field now and
@@ -1472,9 +1537,14 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
             OpCode::GetfieldGcF => Some(majit_ir::Type::Float),
             _ => None,
         };
+        let concrete_obj_ptr =
+            concrete_obj_ptr.map(|p| obj_pin.as_ref().map_or(p, |pin| pin.get().0 as i64));
         if let (Some(ty), Some(struct_ptr)) = (load_type, concrete_obj_ptr)
             && let Some(live_value) = ctx.trace_ctx.field_sanity_load(struct_ptr, &descr, ty)
         {
+            if let majit_ir::Value::Ref(reference) = live_value {
+                majit_gc::assert_stamped_ref_is_live_object(reference.0);
+            }
             ctx.trace_ctx.try_set_opref_concrete(result, live_value);
             concrete_for_shadow = match live_value {
                 majit_ir::Value::Int(value) => ConcreteValue::Int(value),

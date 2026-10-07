@@ -1095,8 +1095,10 @@ impl HeapCache {
     /// `FO_REPLACED_WITH_CONST` and `_heapc_deps` live on the FrontendOp
     /// record; the recorder walks those ConstPtrs.
     ///
-    /// `quasiimmut_seen_refs` stores `ConstPtr.getref_base` addresses
-    /// (`heapcache.py` `new_ref_dict`). Those words are not indexes.
+    /// `quasiimmut_seen_refs` stores the `ConstPtr` table index
+    /// (`heapcache.py` `new_ref_dict` keys the live GCREF; the collector
+    /// forwards that dict). The index is the box; resolve() after a
+    /// minor would miss a set still holding the old address.
 
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
@@ -1116,6 +1118,14 @@ impl HeapCache {
             }
             if let Some(slot) = entry.last_const_box.as_mut() {
                 forward(slot, visitor);
+            }
+            if let Some(seen) = &entry.quasiimmut_seen_refs {
+                for &idx in seen {
+                    let idx = idx as u32;
+                    if idx != 0 {
+                        majit_ir::const_ptr_table::trace_index(idx, visitor);
+                    }
+                }
             }
         }
         for entry in self.heap_cache.values_mut() {
@@ -1830,11 +1840,15 @@ impl HeapCache {
     // ── Quasi-immutable tracking (heapcache.py is_quasi_immut_known) ──
 
     /// The `quasiimmut_seen_refs` key: `box.getref_base()`
-    /// (heapcache.py:609/622).  Upstream reads the raw GC pointer off the
-    /// `ConstPtr` box; pyre's constant `OpRef` carries that pointer inline
-    /// (`OpRef::const_ptr(GcRef)`), so `inline_const_bits` is the same read.
+    /// (`is_quasi_immut_known` / `quasi_immut_now_known`). Upstream's
+    /// `new_ref_dict` keys the live GCREF and the collector forwards it.
+    /// `ConstPtr` is a table index; that slot is the forwarded value.
+    /// Storing `resolve()` here would miss after a minor: the set would
+    /// still hold the old address.
     fn quasiimmut_seen_ref_key(obj: OpRef) -> usize {
-        obj.inline_const_bits().unwrap_or(0) as usize
+        obj.const_ptr_index()
+            .map(|index| index as usize)
+            .unwrap_or_else(|| obj.inline_const_bits().unwrap_or(0) as usize)
     }
 
     /// heapcache.py is_quasi_immut_known
@@ -1866,7 +1880,28 @@ impl HeapCache {
         };
         if obj.is_constant() {
             if let Some(seen) = &cache.quasiimmut_seen_refs {
-                return seen.contains(&Self::quasiimmut_seen_ref_key(obj));
+                let key = Self::quasiimmut_seen_ref_key(obj);
+                if seen.contains(&key) {
+                    return true;
+                }
+                // `heapcache.py` `box.getref_base() in quasiimmut_seen_refs`.
+                // `ConstPtr.same_constant` compares `value`. A nursery intern
+                // and the intern of the forwarded word are two indexes of
+                // one object: `minimark.py` `id_or_identityhash` follows
+                // the corpse.
+                if let Some(addr) = obj.as_const_ptr() {
+                    if !addr.is_null() {
+                        let want = majit_ir::gc_id_or_identityhash(addr.0);
+                        return seen.iter().any(|&idx| {
+                            let stored = majit_ir::const_ptr_table::resolve(idx as u32);
+                            if stored.is_null() {
+                                return false;
+                            }
+                            stored == addr || majit_ir::gc_id_or_identityhash(stored.0) == want
+                        });
+                    }
+                }
+                return false;
             }
         } else if let Some(seen) = &cache.quasiimmut_seen {
             return seen.contains(&obj);
@@ -2906,8 +2941,9 @@ mod tests {
     fn test_walk_const_ptr_refs_traces_cache_keys_without_rekeying() {
         let _lock = const_ptr_walk_lock();
         // The key word is the table index. `trace_const_ptr` keeps the
-        // referent alive and does not rewrite the `VecMap` key, so the
-        // original `OpRef` still hits and another address is another key.
+        // referent alive and does not rewrite the `VecMap` key. Intern of
+        // the forwarded word is the same `ConstPtr` (`same_constant`
+        // compares `value`), so that OpRef still hits.
         let mut fx = Fixture::new();
         let mut cache = fx.view();
         let const_obj = OpRef::const_ptr(GcRef(0x96_0CAC_E010));
@@ -2930,6 +2966,14 @@ mod tests {
         assert_eq!(
             cache.getfield_cached(
                 OpRef::const_ptr(GcRef(0x96_0CAD_E010)),
+                field,
+                IDENTITY_ORACLE
+            ),
+            Some(OpRef::ref_op(20))
+        );
+        assert_eq!(
+            cache.getfield_cached(
+                OpRef::const_ptr(GcRef(0x96_0CAE_0000)),
                 field,
                 IDENTITY_ORACLE
             ),
@@ -2970,6 +3014,37 @@ mod tests {
             "ConstPtr key is reported so the census can skip it: {visited:?}"
         );
         assert!(visited.contains(&seen), "quasiimmut_seen box: {visited:?}");
+    }
+
+    #[test]
+    fn test_quasiimmut_seen_refs_survive_a_forwarded_const_ptr() {
+        let _lock = const_ptr_walk_lock();
+        // new_ref_dict keys the live GCREF. ConstPtr is a table index;
+        // resolve() after a minor is a different word, so the seen set
+        // keys the index.
+        let mut cache = HeapCache::new();
+        let addr = GcRef(0x96_0CAC_E020);
+        let obj = OpRef::const_ptr(addr);
+        let field = 11;
+        cache.quasi_immut_now_known(field, obj);
+        assert!(cache.is_quasi_immut_known(field, obj));
+
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        majit_ir::const_ptr_table::walk(&mut |gcref: &mut GcRef| {
+            if *gcref == addr {
+                *gcref = GcRef(0x96_0CAC_E021);
+            }
+        });
+        assert_eq!(obj.as_const_ptr(), Some(GcRef(0x96_0CAC_E021)));
+        assert!(
+            cache.is_quasi_immut_known(field, obj),
+            "a forwarded ConstPtr must still be the recorded quasi-immut box"
+        );
+        let moved = OpRef::const_ptr(GcRef(0x96_0CAC_E021));
+        assert!(
+            cache.is_quasi_immut_known(field, moved),
+            "intern of the forwarded word is the same quasi-immut box"
+        );
     }
 
     #[test]

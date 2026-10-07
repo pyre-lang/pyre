@@ -4393,6 +4393,12 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                 if let Some(majit_ir::Value::Ref(loaded)) =
                     ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
                 {
+                    // `history.py` `ConstPtr.value` is a GCREF local.
+                    // `const_ref` intern's and a later Trace-pool append
+                    // can minor-collect before the returned box is stored.
+                    let pin = (loaded.0 != 0 && majit_gc::gc_owns_object(loaded.0))
+                        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(loaded));
+                    let loaded = pin.as_ref().map(|p| p.get()).unwrap_or(loaded);
                     return ctx.const_ref(loaded.0 as i64);
                 }
             }
@@ -4482,6 +4488,16 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     let live_value = concrete_gc_ptr(ctx, obj)
         .and_then(|struct_ptr| ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref));
     if let Some(live_value) = live_value {
+        let pin = match live_value {
+            majit_ir::Value::Ref(r) if r.0 != 0 && majit_gc::gc_owns_object(r.0) => {
+                Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+            }
+            _ => None,
+        };
+        let live_value = match &pin {
+            Some(p) => majit_ir::Value::Ref(p.get()),
+            None => live_value,
+        };
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
@@ -9337,13 +9353,19 @@ fn bridge_decode_box(
     match v {
         RebuiltValue::Box(n, tp) => {
             let opref = OpRef::input_arg_typed(*n as u32, *tp);
-            let bits = fail_values[*n];
             let effective_tp = fail_types.get(*n).copied().unwrap_or(*tp);
             // resume.py:1264 assert box.type == kind
             assert!(
                 effective_tp == expected_kind,
                 "bridge_decode_box: Box({n}) type {effective_tp:?} != expected {expected_kind:?}"
             );
+            // `decode_ref` reads `cpu.get_ref_value(self.deadframe, num)`.
+            // `fail_values` is an unrooted copy; `fail_ref_roots` is walked.
+            let bits = if effective_tp == Type::Ref {
+                cache.fail_ref_root(*n).unwrap_or(fail_values[*n])
+            } else {
+                fail_values[*n]
+            };
             (opref, value_for_slot(effective_tp, bits))
         }
         RebuiltValue::Const(c) => {
@@ -9359,7 +9381,14 @@ fn bridge_decode_box(
                 c.get_type(),
                 expected_kind,
             );
-            (opref, value_for_slot(c.get_type(), c.as_raw_i64()))
+            let val = if c.get_type() == Type::Ref {
+                opref
+                    .inline_const_to_value()
+                    .unwrap_or_else(|| value_for_slot(c.get_type(), c.as_raw_i64()))
+            } else {
+                value_for_slot(c.get_type(), c.as_raw_i64())
+            };
+            (opref, val)
         }
         RebuiltValue::Virtual(vidx) => {
             // resume.py `getvirtual_ptr`: a cache hit returns the box
@@ -9370,17 +9399,19 @@ fn bridge_decode_box(
             // The applying reader allocated the object at the `NEW` it
             // recorded and stamped it there; that object is the box's value.
             // Allocating another here would give the walk a second object
-            // for one box.
-            if let Some(value) = ctx.concrete_of_opref(opref)
-                && value.get_type() == expected_kind
-            {
-                return (opref, value);
-            }
+            // for one box. Prefer `concrete_roots` over `concrete_of_opref`:
+            // the stamp is a copy and a later `NEW` can collect.
             if expected_kind != Type::Int
                 && let Some(gcref) = cache.get_concrete_ptr(*vidx)
             {
                 ctx.try_set_opref_concrete(opref, majit_ir::Value::Ref(gcref));
-                return (opref, majit_ir::Value::Ref(gcref));
+                let live = cache.get_concrete_ptr(*vidx).unwrap_or(gcref);
+                return (opref, majit_ir::Value::Ref(live));
+            }
+            if let Some(value) = ctx.concrete_of_opref(opref)
+                && value.get_type() == expected_kind
+            {
+                return (opref, value);
             }
             if already {
                 // Later TAGVIRTUAL: `virtuals_cache.get_ptr` hit. `allocate()`
@@ -11103,9 +11134,16 @@ impl JitState for PyreJitState {
         let mut vvals_types: Vec<Type> = Vec::with_capacity(vvals.len());
         vvals_types.push(full_types.first().copied().unwrap_or(Type::Ref));
         vvals_types.extend_from_slice(&full_types[(1 + nreds).min(full_types.len())..]);
+        // `resume.py` `load_box_from_cpu` reads the deadframe at use time.
+        // Pin every Box GCREF before the first `bridge_decode_box` `NEW` /
+        // Trace-pool append, then pin each Virtual/Const as it is decoded.
+        // `try_set_opref_concrete` cannot do this: consume runs before
+        // `restore_inputarg_oprefs`, so an InputArg hole skips the pin, and
+        // a Const OpRef returns true without acquiring a root.
+        boxes.pre_pin_vable_boxes(vvals, fail_values);
         for (idx, v) in vvals.iter().enumerate() {
             let expected_kind = vvals_types.get(idx).copied().unwrap_or(Type::Ref);
-            boxes.virtualizable_boxes.push(bridge_decode_box(
+            let (op, val) = bridge_decode_box(
                 ctx,
                 v,
                 expected_kind,
@@ -11115,7 +11153,18 @@ impl JitState for PyreJitState {
                 fail_types,
                 backend,
                 virtuals_cache,
-            ));
+            );
+            // A Const OpRef interned during decode (`const_ref`) may have
+            // collected; `inline_const_to_value` re-reads `const_ptr_table`.
+            let val = if op.is_constant() {
+                op.inline_const_to_value().unwrap_or(val)
+            } else {
+                val
+            };
+            let val = boxes.reload_or_pin_vable(idx, val);
+            boxes
+                .virtualizable_boxes
+                .push((op, publish_bridge_box_value(ctx, op, val)));
         }
         // `consume_virtualref_boxes` decodes exactly `size * 2` entries; a
         // malformed odd-length stream is a bug.
@@ -11126,7 +11175,7 @@ impl JitState for PyreJitState {
             vref_values.len(),
         );
         for v in vref_values {
-            boxes.virtualref_boxes.push(bridge_decode_box(
+            let (op, val) = bridge_decode_box(
                 ctx,
                 v,
                 Type::Ref,
@@ -11136,7 +11185,10 @@ impl JitState for PyreJitState {
                 fail_types,
                 backend,
                 virtuals_cache,
-            ));
+            );
+            boxes
+                .virtualref_boxes
+                .push((op, publish_bridge_box_value(ctx, op, val)));
         }
         boxes
     }
@@ -11247,15 +11299,21 @@ impl JitState for PyreJitState {
                 "consume_vref_and_vable_boxes decoded the virtualizable stream"
             );
             for (idx, &(op, val)) in boxes.virtualizable_boxes.iter().enumerate() {
+                // `resume.py` `load_box_from_cpu` / `consume_boxes`: the
+                // decoded GCREF lives in a traced local. `live_vable` re-reads
+                // the `OwnerRootGuard` consume acquired; the `(OpRef, Value)`
+                // copy is not a root and `rebuild_portal_framestack_from_resumedata`
+                // may have collected.
+                let live = boxes.live_vable(idx, ctx.lookup_opref_concrete(op).unwrap_or(val));
                 if idx >= vable_array_start {
                     store_live_frame_array_slot(
                         sym.concrete_vable_ptr as usize,
                         idx - vable_array_start,
-                        val,
+                        live,
                     );
                 }
                 oprefs.push(op);
-                concrete_values.push(val);
+                concrete_values.push(live);
             }
             sym.restore_inputarg_oprefs(&oprefs, first_vable_scalar_idx);
             let vable_ref_value = concrete_values
@@ -16654,6 +16712,24 @@ fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
     !recipe.len_tail
         && recipe.return_substitute.is_none()
         && reconstructed_callee_recipe_is_portable(recipe)
+}
+
+/// Stamp a resume-decoded GCREF onto its box (`RefFrontendOp._resref` /
+/// `set_concrete_at`) before a later `bridge_decode_box` or
+/// `rebuild_portal_framestack_from_resumedata` appends to a nursery-backed
+/// Trace pool. The `(OpRef, Value)` copy in `VrefVableBoxes` is not a root.
+fn publish_bridge_box_value(
+    ctx: &mut TraceCtx,
+    op: OpRef,
+    captured: majit_ir::Value,
+) -> majit_ir::Value {
+    if let majit_ir::Value::Ref(gc) = captured
+        && !gc.is_null()
+        && gc != majit_ir::GcRef::NO_CONCRETE
+    {
+        let _ = ctx.try_set_opref_concrete(op, captured);
+    }
+    ctx.lookup_opref_concrete(op).unwrap_or(captured)
 }
 
 /// `concrete_r` stores a copy of a ref. `walk_const_ptr_refs` forwards the

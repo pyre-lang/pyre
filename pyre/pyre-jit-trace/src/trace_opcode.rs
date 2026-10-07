@@ -505,7 +505,11 @@ pub(crate) fn mirror_vable_static_to_boxes(
         .and_then(|info| info.static_field_index_by_name(static_field_name));
     if let Some(idx) = idx {
         ctx.set_virtualizable_entry_at(idx, opref, concrete);
-        ctx.synchronize_virtualizable();
+        // `_opimpl_setfield_vable` writes only the slot it stored
+        // (`synchronize_virtualizable_at`). A full `synchronize_virtualizable`
+        // flushes every array item from `box_value` copies after `const_int`
+        // may have collected.
+        ctx.synchronize_virtualizable_at(idx);
     }
 }
 

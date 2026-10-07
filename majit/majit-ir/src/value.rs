@@ -969,6 +969,37 @@ pub fn gc_id_or_identityhash(addr: usize) -> usize {
     }
 }
 
+/// Live address of a managed object (`gc_current_object_address`).
+///
+/// Follows a nursery forwarding stub without treating `addr` as a root.
+/// Unset means the address. `majit-ir` has no collector dependency; the
+/// backend installs the real query next to `set_gc_id_or_identityhash`.
+pub type GcCurrentObjectAddressFn = fn(usize) -> usize;
+
+static GC_CURRENT_OBJECT_ADDRESS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Install or clear the process-global live-address hook.
+#[inline]
+pub fn set_gc_current_object_address(hook: Option<GcCurrentObjectAddressFn>) {
+    let raw: *mut () = match hook {
+        None => std::ptr::null_mut(),
+        Some(f) => unsafe { std::mem::transmute_copy::<GcCurrentObjectAddressFn, *mut ()>(&f) },
+    };
+    GC_CURRENT_OBJECT_ADDRESS.store(raw, Ordering::Release);
+}
+
+/// The installed live address, or `addr` when the slot is clear.
+#[inline]
+pub fn gc_current_object_address(addr: usize) -> usize {
+    let p = GC_CURRENT_OBJECT_ADDRESS.load(Ordering::Acquire);
+    if p.is_null() {
+        addr
+    } else {
+        let f: GcCurrentObjectAddressFn = unsafe { std::mem::transmute_copy(&p) };
+        f(addr)
+    }
+}
+
 /// OPEN POLICY FORK — the one place that decides what an unregistered
 /// frontend gets.  Today: today's behaviour, i.e. no retain, which leaves the
 /// address-recycling hazard exactly as it is rather than changing it.
