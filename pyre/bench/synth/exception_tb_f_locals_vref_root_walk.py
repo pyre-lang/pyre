@@ -17,13 +17,15 @@
 # collection.  `walk_frame_value_slot` must forward that virtual ref before
 # the raw exception-root walk interprets the slot as a PyObject.
 #
-# PyPy's `MIFrame` and blackhole resume machinery keep one red frame per
-# inlined call.  Keeping `drive`, `locs`, and `mid` attached to their own live
-# frames is therefore load-bearing here: the traceback frame's locals cannot
-# be recovered from one portal-wide anchor.  The compile declarations pin the
-# `drive` loop, which inlines `mid` and the first `locs` iteration, and the
-# `locs` entry bridge it calls at the first back-edge, so an interpreted
-# fallback cannot make this test pass vacuously.
+# The PyPy oracle (`PYPYLOG=jit-log-opt` on pypy3 3.11) compiles `loop:locs`
+# and `loop:drive` and nothing for `mid`; pyre now also compiles nothing for
+# `mid` (it is inlined into the traced callers).  `locs` is an entry bridge
+# instead of a loop because CPython 3.14 compiles `while tb is not None:`
+# with the `JUMP_BACKWARD` landing on the condition test, so when the
+# back-edge counter fires the traced iteration can take the exit and the
+# trace ends in FINISH (`compile_done_with_this_frame`); PyPy's compiler
+# lands the back edge in the loop body.  The declarations pin the shapes
+# so an interpreted fallback cannot pass vacuously.
 
 N = 90000
 
