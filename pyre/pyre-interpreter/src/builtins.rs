@@ -21167,7 +21167,7 @@ pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn hash_secret() -> &'static [u8; 16] {
+pub(crate) fn hash_secret() -> &'static [u8; 16] {
     HASH_SECRET.get_or_init(|| {
         let mut secret = [0u8; 16];
         getrandom::fill(&mut secret)

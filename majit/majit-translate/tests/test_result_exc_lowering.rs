@@ -1091,7 +1091,7 @@ fn a_formatd_residual_declares_a_string_and_keeps_its_host_formatter_call() {
         let graph = lower_function(interp(), path).expect("formatd residual lowers");
         assert!(
             graph.return_is_str,
-            "{path}: the `*mut BytesBlock` result is the `SomeString` a stub returns"
+            "{path}: the `*mut Utf8Str` result is the `SomeString` a stub returns"
         );
         let calls_itself = graph
             .blocks

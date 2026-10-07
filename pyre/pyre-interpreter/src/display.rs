@@ -157,14 +157,14 @@ pub fn format_float_repr(val: f64) -> String {
 
 /// RPython `rfloat.formatd` residual ABI for the generated JIT.
 ///
-/// Upstream returns one low-level `STR` GC pointer. The host formatter returns
-/// a three-word Rust `String`, so the source translator retargets only that
-/// formatter call to this wrapper and keeps the bytes in the managed
-/// length-prefixed block used for translated RPython strings.
+/// Upstream returns one low-level `STR` GC pointer (`rstr.py` `rpy_string`).
+/// The host formatter returns a three-word Rust `String`, so the source
+/// translator retargets only that formatter call to this wrapper, which
+/// copies the bytes into a fresh `mallocstr` payload.
 #[majit_macros::dont_look_inside]
-pub fn jit_format_float_repr_rstr(val: f64) -> *mut pyre_object::bytesobject::BytesBlock {
+pub fn jit_format_float_repr_rstr(val: f64) -> *mut pyre_object::unicodeobject::Utf8Str {
     let text = rustpython_literal::float::to_string(val);
-    pyre_object::bytesobject::alloc_bytes_block(text.as_bytes())
+    pyre_object::unicodeobject::alloc_utf8_payload(text.as_bytes(), true)
 }
 
 /// `unicodedb.isprintable` in PyPy's `rutf8.make_utf8_escape_function` is a
@@ -2498,8 +2498,8 @@ mod tests {
     #[test]
     fn float_repr_residual_returns_the_same_lowlevel_string_bytes() {
         for value in [0.0, -0.0, 1.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
-            let block = jit_format_float_repr_rstr(value);
-            let bytes = unsafe { pyre_object::bytesobject::bytes_block_chars(block) };
+            let s = jit_format_float_repr_rstr(value);
+            let bytes = unsafe { pyre_object::unicodeobject::utf8_payload_bytes(s) };
             assert_eq!(bytes, format_float_repr(value).as_bytes());
         }
     }

@@ -10,9 +10,10 @@
 //! What the retarget is for: the translated `formatd` result is one `STR` GC
 //! pointer, but RustPython's formatter returns a three-word Rust `String`,
 //! which the residual-call ABI cannot return.  The interpreter publishes an
-//! exact one-word `BytesBlock*` wrapper; this module selects that wrapper
-//! without teaching the parity layers a Rust ABI.  Structurally this is the
-//! [`crate::front::rbigint_call`] residual-retarget family.
+//! exact one-word `Utf8Str*` (`rstr.py` `rpy_string`) wrapper; this module
+//! selects that wrapper without teaching the parity layers a Rust ABI.
+//! Structurally this is the [`crate::front::rbigint_call`] residual-retarget
+//! family.
 
 const FLOAT_TO_STRING: &[&str] = &["rustpython_literal", "float", "to_string"];
 const FLOAT_RESIDUAL: &[&str] = &["pyre_interpreter", "display", "jit_format_float_repr_rstr"];
