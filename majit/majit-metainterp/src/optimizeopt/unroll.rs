@@ -2812,7 +2812,7 @@ impl ExportedState {
             let mut pos = op.pos().get();
             visit_opref(&mut pos, visitor);
             op.pos().set(pos);
-            op.walk_const_ptr_refs_mut(visitor);
+            crate::optimizeopt::walk_live_op(op, visitor);
         }
 
         fn visit_op_info(

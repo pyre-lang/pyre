@@ -12177,7 +12177,6 @@ mod tests {
         b.ref_return(0);
         let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
         frame.ref_regs[0] = Some(OpRef::const_ptr(GcRef(0xAAAA)));
-        frame.ref_values[0] = Some(0xAAAA);
         driver.meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
         let mut before = 0usize;
         driver.walk_active_trace_refs(|_| before += 1);
