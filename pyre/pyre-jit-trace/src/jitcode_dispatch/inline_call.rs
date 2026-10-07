@@ -5160,15 +5160,17 @@ fn walker_ec_enter(
     // `frame.f_backref = self.topframeref` — the caller's vref moves into the
     // callee, unforced.  `emit_new_pyframe_inline_with_params` leaves the slot
     // at its constructor default, so this is the store that links the chain.
-    let concrete_caller_topframeref = unsafe { (*concrete_ec).topframeref };
+    //
+    // Record first. `record_op` / `virtual_ref_during_tracing` allocate in
+    // the Trace pools and can minor-collect. `topframeref` is a traced field
+    // of the execution context (`executioncontext.py enter` /
+    // `collect_roots_in_nursery`), so the collector forwards it in place.
+    // A Rust local taken before that allocation is the pre-move address;
+    // storing it writes the stale nursery pointer the barrier then remembers.
     let caller_topframeref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[callee_ec],
         crate::descr::ec_topframeref_descr(),
-    );
-    ctx.set_opref_concrete(
-        caller_topframeref,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_caller_topframeref as usize)),
     );
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
@@ -5176,15 +5178,25 @@ fn walker_ec_enter(
         crate::descr::pyframe_f_backref_descr(),
     );
     // `self.topframeref = jit.virtual_ref(frame)`.
+    // The frame is the old-gen `FrameBox` seeded above this call, so the
+    // pointer `virtual_ref_during_tracing` stores in `forced` does not move.
+    // The vref itself is old-gen (`alloc_virtual_ref`).
     let (vref, concrete_vref) = ctx.opimpl_virtual_ref(callee_frame, concrete_frame as usize);
-    ctx.set_opref_concrete(
-        vref,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_vref as usize)),
-    );
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[callee_ec, vref],
         crate::descr::ec_topframeref_descr(),
+    );
+    // Re-read after every collecting append. `history.py` `RefFrontendOp`
+    // would be the box the collector updates; the stamp is that box.
+    let concrete_caller_topframeref = unsafe { (*concrete_ec).topframeref };
+    ctx.set_opref_concrete(
+        caller_topframeref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_caller_topframeref as usize)),
+    );
+    ctx.set_opref_concrete(
+        vref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_vref as usize)),
     );
     // The recording-time shadow of the `SetfieldGc` above: `PyFrame.f_backref`
     // is a `Type::Ref` field, so the emitted store carries the generational
@@ -5197,7 +5209,7 @@ fn walker_ec_enter(
         4,
     );
     unsafe {
-        (*concrete_frame).f_backref = concrete_caller_topframeref;
+        (*concrete_frame).f_backref = (*concrete_ec).topframeref;
         (*concrete_ec).topframeref = concrete_vref as *mut pyre_interpreter::PyFrame;
     }
     vref
@@ -5315,20 +5327,23 @@ pub(crate) fn walker_ec_leave(
     }
     // `self.topframeref = frame.f_backref` — no parens: the caller's vref
     // moves back unforced, so a caller frame that stayed virtual stays virtual.
-    let concrete_f_backref = unsafe { (*concrete_frame).f_backref };
+    // Same window as `walker_ec_enter`: `f_backref` is a traced field
+    // (`pyframe.py` / `collect_roots_in_nursery`). Read it after `record_op`,
+    // which can minor-collect and forward the young pointer in place.
     let f_backref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[callee_frame],
         crate::descr::pyframe_f_backref_descr(),
     );
-    ctx.set_opref_concrete(
-        f_backref,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_f_backref as usize)),
-    );
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[callee_ec, f_backref],
         crate::descr::ec_topframeref_descr(),
+    );
+    let concrete_f_backref = unsafe { (*concrete_frame).f_backref };
+    ctx.set_opref_concrete(
+        f_backref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_f_backref as usize)),
     );
     let escaped = unsafe {
         let frame_vref = (*concrete_ec).topframeref;

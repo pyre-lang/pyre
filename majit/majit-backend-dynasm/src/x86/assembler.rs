@@ -1953,6 +1953,8 @@ pub struct Assembler386<'a> {
     pending_malloc_nursery_gcmap: Option<usize>,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
+    /// `BaseAssembler._previous_rd_locs`.
+    previous_rd_locs: majit_ir::RdLocs,
     /// Fail descriptors built during assembly — wrapped in `FailDescrCell`
     /// so `Arc::as_ptr` is a thin pointer suitable for direct
     /// `Arc::from_raw` recovery (`history.py AbstractDescr.show`).
@@ -2333,6 +2335,7 @@ impl<'a> Assembler386<'a> {
             min_bytes_before_label: 0,
             pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
+            previous_rd_locs: majit_ir::RdLocs::new(),
             fail_descrs: FailDescrStore::default(),
             trace_id,
             header_pc,
@@ -6779,25 +6782,14 @@ impl<'a> Assembler386<'a> {
             );
         }
 
-        // `llsupport/assembler.py store_info_on_descr`:
-        // encode each fail-arg location as a USHORT —
-        //   None           → 0xFFFF
-        //   GPR register   → `gen_regs.index(loc)`
-        //   float register → len(gen_regs) + loc.value * coeff
-        //   stack          → (loc.value - base_ofs) // WORD
-        //                      (here: `f.get_position() + JITFRAME_FIXED_SIZE`)
-        let rd_locs: majit_ir::RdLocs = faillocs
-            .iter()
-            .map(|fl| match fl {
-                None => 0xFFFF,
-                Some(loc) => match deadframe_slot_for_loc(loc) {
-                    Some(encoded) => encoded,
-                    None => panic!(
-                        "store_info_on_descr: cannot encode fail-arg loc {loc:?} (gen_regs.index)"
-                    ),
-                },
-            })
-            .collect();
+        // `BaseAssembler.store_info_on_descr`: encode `None`, registers
+        // and stack slots, panicking on anything else as `gen_regs.index(loc)`
+        // does, and share `_previous_rd_locs` when every position matches.
+        let rd_locs = crate::guard::store_info_on_descr(
+            &mut self.previous_rd_locs,
+            faillocs,
+            deadframe_slot_for_loc,
+        );
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
         // resume_guard_descr.rs); `layout_for_fail_descr` reads it back

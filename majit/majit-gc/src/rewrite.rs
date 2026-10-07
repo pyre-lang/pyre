@@ -834,11 +834,19 @@ impl<'a> RewriteState<'a> {
     /// possible.
     fn remove_constptr(&mut self, gcref: GcRef) -> Operand {
         let index = self.gcref_index(gcref);
+        // rewrite.py `remove_constptr`: reuse `gcrefs_recently_loaded[index]`.
         if let Some(load) = self.gcrefs_recently_loaded.get(&index) {
             return load.clone();
         }
+        // rewrite.py `remove_constptr` appends the `LOAD_FROM_GC_TABLE`
+        // straight onto `_newops`. The only arg is `ConstInt`, so this
+        // must not re-enter `emit` / `remove_constptrs_in`.
         let index_box = Operand::const_from_value(Value::Int(index as i64));
-        let load = self.emit(mk_op(OpCode::LoadFromGcTable, &[index_box]));
+        let load_op = OpRc::new(mk_op(OpCode::LoadFromGcTable, &[index_box]));
+        let pos = OpRef::ref_op(self.next_pos);
+        self.next_pos += 1;
+        load_op.pos().set(pos);
+        let load = self.push_emitted(load_op, pos);
         self.gcrefs_recently_loaded.insert(index, load.clone());
         load
     }

@@ -50,6 +50,8 @@ use majit_ir::operand::Operand;
 pub fn register_active_backend_jitframe_gc_type(gc: &mut dyn majit_gc::GcAllocator) -> u32 {
     let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
     gc.set_jitframe_type_id(id);
+    // `opencoder.py` `Trace._ops`, same registration pass as `JITFRAME`.
+    crate::opencoder::register_trace_ops_gc_type(gc);
     id
 }
 
@@ -3465,7 +3467,57 @@ impl<M: Clone> MetaInterp<M> {
     /// the same Arc, so walking the `exit_layouts` /
     /// `terminal_exit_layouts` storage slots once updates the pool for
     /// every observer.
+    /// `NUMBERING` payload addresses. A minor moves the array until it is
+    /// promoted, so this walk is not gated on the const-pool scan bit.
+    pub fn walk_rd_numb_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        for entry in self.compiled_loops.values_mut() {
+            for trace in entry.traces.values_mut() {
+                for layout in trace
+                    .exit_layouts
+                    .values_mut()
+                    .chain(trace.terminal_exit_layouts.values_mut())
+                {
+                    if let Some(fd) = layout
+                        .descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                    {
+                        fd.visit_rd_numb(&mut visitor);
+                    }
+                }
+            }
+            let tokens = entry.live_token().into_iter().chain(
+                entry
+                    .previous_tokens
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade),
+            );
+            for token in tokens {
+                let Some(clt) = token.compiled_loop_token() else {
+                    continue;
+                };
+                for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+                    let mut visit_descr = |descr: &dyn majit_ir::Descr| {
+                        if let Some(fd) = descr.as_fail_descr() {
+                            fd.visit_rd_numb(&mut visitor);
+                        }
+                    };
+                    if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+                        for cell in store.iter() {
+                            visit_descr(&*cell.descr);
+                        }
+                    } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
+                        for descr in descrs {
+                            visit_descr(&**descr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        self.walk_rd_numb_refs(&mut visitor);
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
             generation: u64,
@@ -24077,7 +24129,7 @@ mod portal_resume_rebuild_tests {
 
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::new_resume_storage(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(majit_ir::descr::make_size_descr(16)),
@@ -24166,7 +24218,7 @@ mod portal_resume_rebuild_tests {
 
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::new_resume_storage(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(majit_ir::descr::make_size_descr(16)),
@@ -24244,7 +24296,7 @@ mod portal_resume_rebuild_tests {
         );
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::new_resume_storage(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(size_descr),
@@ -30830,7 +30882,12 @@ mod tests {
             vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()].into(),
         );
         let pending_bridge_rd = PendingBridgeRd {
-            storage: crate::resume::new_resume_storage(vec![1, 2, 3], vec![], vec![], vec![]),
+            storage: crate::resume::new_resume_storage(
+                majit_ir::NumberingRef::from_bytes(&[1, 2, 3]),
+                vec![],
+                vec![],
+                vec![],
+            ),
             frontend_boxes: vec![11, 22],
             liveboxes: vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
             livebox_types: vec![Type::Int, Type::Ref],
@@ -31320,7 +31377,7 @@ mod tests {
                 descr: Some({
                     let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
                     let fd = descr.as_fail_descr().expect("resume guard");
-                    fd.set_rd_numb(Some(rd_numb));
+                    fd.set_rd_numb_arc(Some(rd_numb));
                     fd.set_rd_consts(Some(vec![]));
                     fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
                         majit_ir::RdVirtualInfo::VRawBufferInfo {
@@ -31394,7 +31451,7 @@ mod tests {
         backend: &majit_backend_dynasm::runner::DynasmBackend,
         token: &std::sync::Weak<JitCellToken>,
         fail_index: u32,
-        rd_numb: Vec<u8>,
+        rd_numb: majit_ir::NumberingRef,
         rd_consts: Vec<majit_ir::Const>,
     ) {
         // `CompiledEntry.token` is `Weak`; upgrade for the
@@ -31436,7 +31493,7 @@ mod tests {
         let descr_fd = descr_ref
             .as_fail_descr()
             .expect("descr must implement FailDescr");
-        descr_fd.set_rd_numb(Some(rd_numb));
+        descr_fd.set_rd_numb_arc(Some(rd_numb));
         descr_fd.set_rd_consts(Some(rd_consts));
         descr_fd.set_rd_virtuals(Some(vec![]));
         descr_fd.set_rd_pendingfields(Some(vec![]));
@@ -35097,7 +35154,7 @@ mod loop_side_table_tests {
                 descr: Some({
                     let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
                     let fd = descr.as_fail_descr().expect("resume guard");
-                    fd.set_rd_numb(Some(rd_numb));
+                    fd.set_rd_numb_arc(Some(rd_numb));
                     fd.set_rd_consts(Some(vec![]));
                     fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
                         majit_ir::RdVirtualInfo::VRawBufferInfo {

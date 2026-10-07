@@ -318,6 +318,9 @@ const JF_FRAME_ITEM0_OFS: i32 = JF_FRAME_OFS as i32 + BASEITEMOFS as i32;
 /// without requiring a `CraneliftBackend` instance.
 /// Install a GC box into TLS and register all `set_active_*` hooks.
 /// Used by tests and embedders whose whole managed heap is thread-confined.
+/// Two live boxes at once is not a supported configuration: `ConstPtr`
+/// `MAJOR_LIVE` and `TRACE_OPS_GC_TYPE_ID` are process-global indexes
+/// into one collector.
 fn install_gc_box(mut gc: Box<dyn GcAllocator>) -> JitframeDescrFacts {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
@@ -376,6 +379,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     // here would silently drop dynasm's, and the frames it dropped would go
     // untraced rather than fail loudly.
     majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
+    majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         alloc_nursery_headerless_no_collect_via_active_runtime,
     ));

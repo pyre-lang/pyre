@@ -504,6 +504,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
         walk_live_deadframes: Some(majit_backend::libc_deadframe::walk_live_deadframes),
     });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
+    majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         dynasm_alloc_nursery_headerless_no_collect,
     ));
@@ -588,6 +589,11 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
 /// allocator to the backend thread. Production uses
 /// [`install_gc_standalone`], which registers the same hooks WITHOUT a
 /// box so the trampolines fall through to `gc_sync`.
+///
+/// Two live boxes at once is not a supported configuration: `ConstPtr`
+/// `MAJOR_LIVE` and `TRACE_OPS_GC_TYPE_ID` are process-global indexes
+/// into one collector. Sequential replace on one thread is the test
+/// shape.
 fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> JitframeDescrFacts {
     // This thread now answers heap queries from its own allocator, whose
     // nursery is not the singleton's, so the process-wide published range can

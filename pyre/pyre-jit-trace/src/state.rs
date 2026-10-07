@@ -5023,15 +5023,38 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     )
 }
 
+/// `FixedObjectArray.len` sits at payload offset 0. `set_forwarding_address`
+/// overwrites that word with the survivor (`get_forwarding_address`), so a
+/// size read of the nursery corpse returns the forwarding address.
+/// `gc_current_object_address` follows the stub while the marker is intact;
+/// the same reload applies to the frame, whose own corpse is not rewritten
+/// by `walk_pyframe_roots`.
+fn current_live_frame_array(frame: usize) -> Option<(usize, *mut pyre_object::FixedObjectArray)> {
+    if frame == 0 {
+        return None;
+    }
+    let frame = majit_gc::gc_current_object_address(frame);
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() {
+        return None;
+    }
+    let arr =
+        majit_gc::gc_current_object_address(arr_ptr as usize) as *mut pyre_object::FixedObjectArray;
+    Some((frame, arr))
+}
+
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
 pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let arr_ptr = unsafe {
-        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *const pyre_object::FixedObjectArray)
-    };
+    let (_frame, arr_ptr) = current_live_frame_array(frame)?;
     let arr = unsafe { &*arr_ptr };
-    arr.as_slice().get(abs_idx).copied()
+    let raw = arr.as_slice().get(abs_idx).copied()?;
+    if raw.is_null() {
+        return Some(raw);
+    }
+    Some(majit_gc::gc_current_object_address(raw as usize) as PyObjectRef)
 }
 
 /// Read up to `max_len` slots of the GC-rooted live virtualizable frame's
@@ -5052,16 +5075,17 @@ fn live_frame_array_values(
     if vable_ptr == 0 {
         return fallback.to_vec();
     }
-    let f = unsafe { &*(vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
-    let lp = f.locals_cells_stack_w;
-    if lp.is_null() {
+    let Some((_frame, lp)) = current_live_frame_array(vable_ptr) else {
         return fallback.to_vec();
-    }
+    };
     let arr = unsafe { &*lp };
     let base = arr.items_ptr() as *const pyre_object::PyObjectRef;
     let n = max_len.min(arr.len());
     (0..n)
-        .map(|i| majit_ir::Value::Ref(majit_ir::GcRef(unsafe { *base.add(i) } as usize)))
+        .map(|i| {
+            let raw = unsafe { *base.add(i) } as usize;
+            majit_ir::Value::Ref(majit_ir::GcRef(majit_gc::gc_current_object_address(raw)))
+        })
         .collect()
 }
 
@@ -5096,21 +5120,17 @@ pub(crate) fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: 
     let majit_ir::Value::Ref(r) = value else {
         return;
     };
-    if vable_ptr == 0 {
+    let Some((_frame, lp)) = current_live_frame_array(vable_ptr) else {
         return;
-    }
-    let f = unsafe { &*(vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
-    let lp = f.locals_cells_stack_w;
-    if lp.is_null() {
-        return;
-    }
+    };
     let arr = unsafe { &mut *lp };
     if slot >= arr.len() {
         return;
     }
     // `setarrayitem_gc` on the GcArray of GCREF: barrier the array
     // (`write_barrier_from_array`), not a raw slot write.
-    arr.set_ref(slot, r.as_usize() as pyre_object::PyObjectRef);
+    let stored = majit_gc::gc_current_object_address(r.as_usize()) as pyre_object::PyObjectRef;
+    arr.set_ref(slot, stored);
 }
 
 /// Keep the scalar half of an inlined frame's red virtualizable coherent with
@@ -5122,6 +5142,7 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
     if vable_ptr == 0 {
         return;
     }
+    let vable_ptr = majit_gc::gc_current_object_address(vable_ptr);
     match field_index {
         0 => unsafe {
             *((vable_ptr + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) =
@@ -5142,15 +5163,8 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
 /// full heap-side array length (matching `virtualizable.py read_boxes
 /// read_boxes` which iterates `len(lst)` over the full array).
 pub(crate) fn concrete_frame_array_len(frame: usize) -> Option<usize> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let arr_ptr = unsafe {
-        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *const pyre_object::FixedObjectArray)
-    };
-    if arr_ptr.is_null() {
-        return None;
-    }
-    Some(unsafe { &*arr_ptr }.as_slice().len())
+    let (_frame, arr_ptr) = current_live_frame_array(frame)?;
+    Some(unsafe { &*arr_ptr }.len())
 }
 
 /// pyframe.py:111: valuestackdepth = co_nlocals + ncellvars + nfreevars.
@@ -5204,8 +5218,11 @@ pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize)
 
 /// Return the absolute valuestackdepth.
 pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    Some(unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
+    if frame == 0 {
+        return None;
+    }
+    let frame = majit_gc::gc_current_object_address(frame);
+    Some(unsafe { *((frame as *const u8).add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
 }
 
 /// Write the absolute valuestackdepth into the concrete `PyFrame` at
@@ -5221,6 +5238,7 @@ pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
 /// frame) report the merge-point depth instead of the stale seed.
 pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
     if frame != 0 {
+        let frame = majit_gc::gc_current_object_address(frame);
         unsafe {
             *((frame as *mut u8).add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *mut usize) = depth;
         }
@@ -15478,7 +15496,12 @@ mod tests {
             target_tagged: tagged(0),
             value_tagged: tagged(1),
         }];
-        let storage = majit_metainterp::resume::new_resume_storage(vec![], vec![], vec![], pending);
+        let storage = majit_metainterp::resume::new_resume_storage(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            vec![],
+            vec![],
+            pending,
+        );
         let fail_values = [&mut field_target as *mut FieldTarget as i64, 9];
         let fail_types = [Type::Ref, Type::Int];
         let resume_data = majit_metainterp::ResumeDataResult {
@@ -15587,8 +15610,12 @@ mod tests {
             target_tagged: tagged_box(0),
             value_tagged: tagged_virtual(0),
         }];
-        let storage =
-            majit_metainterp::resume::new_resume_storage(vec![], vec![], virtuals.clone(), pending);
+        let storage = majit_metainterp::resume::new_resume_storage(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            vec![],
+            virtuals.clone(),
+            pending,
+        );
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {
@@ -15678,8 +15705,12 @@ mod tests {
             target_tagged: tagged_box(0),
             value_tagged: tagged_virtual(0),
         }];
-        let storage =
-            majit_metainterp::resume::new_resume_storage(vec![], vec![], virtuals.clone(), pending);
+        let storage = majit_metainterp::resume::new_resume_storage(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            vec![],
+            virtuals.clone(),
+            pending,
+        );
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {
@@ -15791,8 +15822,12 @@ mod tests {
             target_tagged: tagged_box(0),
             value_tagged: tagged_virtual(0),
         }];
-        let storage =
-            majit_metainterp::resume::new_resume_storage(vec![], vec![], virtuals.clone(), pending);
+        let storage = majit_metainterp::resume::new_resume_storage(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            vec![],
+            virtuals.clone(),
+            pending,
+        );
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {

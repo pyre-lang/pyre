@@ -294,6 +294,19 @@ pub fn gc_nursery_poison_enabled() -> bool {
     *ENABLED
 }
 
+/// `MAJIT_GC_STRESS_TRACE_ALLOC` — minor-collect before every
+/// `alloc_fast_nursery_collecting_typed_rooted`.
+///
+/// Read once. The gate sits on the Trace pool allocator (`opencoder.py`
+/// `Trace._ops` and the other pools in `trace_bufs`), and
+/// `std::env::var_os` takes the environment lock on every call. Presence,
+/// matching [`gc_lifetime_log_enabled`]: any value, including empty, opts in.
+pub fn gc_stress_trace_alloc_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_STRESS_TRACE_ALLOC").is_some());
+    *ENABLED
+}
+
 /// `have_debug_prints_for("gc")` for the collector's own per-collection
 /// sites: a collection opens no debug section of its own, so the section
 /// ready bit would silence them under a `gc` prefix filter.
@@ -2583,6 +2596,12 @@ pub fn supports_guard_gc_type() -> bool {
 /// also serves embedders whose complete managed heap is execution-context
 /// local and never shares object identity across threads.
 ///
+/// Two live boxes at once is not a supported configuration: `ConstPtr`
+/// `MAJOR_LIVE` / the intern table and `TRACE_OPS_GC_TYPE_ID` are
+/// process-global indexes into one collector. Sequential install on one
+/// thread (replace, then drop) is the test shape; production is one
+/// `gc_sync` singleton.
+///
 /// Set-only, never cleared: a backend can drop one thread's box while another
 /// thread still owns one, and clearing the flag would route past that live box.
 ///
@@ -2873,6 +2892,40 @@ pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
 /// (`rpython/memory/gc/incminimark.py`), which raises MemoryError.
 pub fn gc_allocator_installed() -> bool {
     ACTIVE_ALLOC_NURSERY_TYPED.get().is_some()
+}
+
+/// Whether this thread can satisfy a collecting nursery allocation.
+///
+/// [`gc_allocator_installed`] is process-global: installing a backend hook
+/// on any thread makes it true for the whole process. A collecting nursery
+/// alloc still needs this thread's collector — the `gc_sync` singleton, or a
+/// box stored in this thread's TLS. `install_jitframe_gc` (and
+/// `install_gc_box`) install a box once per execution thread; a thread
+/// without either falls through the dynasm trampoline into
+/// `standalone_alloc_*`, which panics on an uninitialized singleton.
+pub type CurrentThreadHasGcBoxFn = fn() -> bool;
+
+global_hook!(static ACTIVE_THREAD_HAS_GC_BOX: CurrentThreadHasGcBoxFn);
+
+/// Install the active backend's "this thread holds a GC box" query.
+/// Pass `None` to clear. Backends register `gc_box::present`.
+pub fn set_active_thread_has_gc_box(hook: Option<CurrentThreadHasGcBoxFn>) {
+    ACTIVE_THREAD_HAS_GC_BOX.set(hook);
+}
+
+pub fn current_thread_gc_available() -> bool {
+    gc_sync::is_initialized() || ACTIVE_THREAD_HAS_GC_BOX.get().map(|f| f()).unwrap_or(false)
+}
+
+static MINOR_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped once at the end of each minor (`minor_collection_body`).
+pub fn minor_epoch() -> u64 {
+    MINOR_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn bump_minor_epoch() {
+    MINOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// What an allocation answered, with the two non-pointer states kept apart.

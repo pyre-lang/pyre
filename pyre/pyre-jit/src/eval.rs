@@ -5181,6 +5181,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     ));
     deque_lock_descr.gc_type_id.set(deque_lock_tid);
 
+    // `opencoder.py` `Trace._ops`: one `GcArray(Char)`. Registered at the
+    // tail so the literal type ids above keep their positions. The regex
+    // example registers the same shape from
+    // `register_active_backend_jitframe_gc_type`.
+    majit_metainterp::opencoder::register_trace_ops_gc_type(&mut gc);
+
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type registers its descriptor into the
     // whole-program registry. A type with inline managed children must
@@ -12130,7 +12136,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
         let all_virtuals = take_forced_virtuals_for_frame(savedata);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
-            storage.rd_numb().expect("rd_numb"),
+            storage.rd_numb_ref().expect("rd_numb"),
             storage.rd_consts().unwrap_or(&[]),
             majit_backend::FailArgSource::from(&*raw_values),
             storage.rd_pendingfields(),
@@ -16412,6 +16418,12 @@ mod tests {
 
     #[test]
     fn bridge_descr_storage_replays_pending_field_and_array_writes() {
+        // `NumberingRef::from_bytes` allocates a `NUMBERING` once the
+        // process-global numbering hook is installed (`resumecode.py`
+        // `create_numbering`). Tests run in parallel, so another worker
+        // may already have published that hook; enter this worker through
+        // the same per-thread runtime/GIL bootstrap as production.
+        init_gc_subsystem();
         #[repr(C)]
         struct FieldTarget {
             value: i64,
@@ -16458,7 +16470,7 @@ mod tests {
             is_finish: false,
             is_exception_exit: false,
             storage: Some(majit_metainterp::resume::new_resume_storage(
-                Vec::new(),
+                majit_ir::NumberingRef::from_bytes(&[]),
                 Vec::new(),
                 Vec::new(),
                 pending,
@@ -16485,6 +16497,10 @@ mod tests {
     /// materialize (`getvirtual_ptr` / `abstract_virtual_struct_info_setfields`).
     #[test]
     fn replay_pending_fields_rereads_virtual_target_via_live_ptr() {
+        // `NumberingRef::from_bytes` allocates a `NUMBERING`
+        // (`resumecode.py` `create_numbering`) once the numbering hook
+        // is installed; tests run in parallel so bootstrap the GIL here.
+        init_gc_subsystem();
         #[repr(C)]
         struct FieldTarget {
             value: i64,
@@ -16519,7 +16535,7 @@ mod tests {
             is_finish: false,
             is_exception_exit: false,
             storage: Some(majit_metainterp::resume::new_resume_storage(
-                Vec::new(),
+                majit_ir::NumberingRef::from_bytes(&[]),
                 Vec::new(),
                 Vec::new(),
                 pending,

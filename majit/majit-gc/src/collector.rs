@@ -1875,6 +1875,13 @@ impl MiniMarkGC {
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         unsafe {
+            // `MAJIT_GC_STRESS_TRACE_ALLOC`: every Trace-pool malloc is a
+            // minor, so a young address read into a Rust local and used
+            // after the append dies at that use. The caller's slot is the
+            // one root `malloc_fast` already publishes; register it the
+            // way `alloc_with_type_rooted_slow` does across
+            // `collect_and_reserve`.
+            self.stress_trace_alloc_minor(root, 1);
             self.alloc_with_type_rooted_body::<true>(
                 type_id,
                 payload_size,
@@ -1882,6 +1889,36 @@ impl MiniMarkGC {
                 1,
                 needs_write_barrier,
             )
+        }
+    }
+
+    /// Minor-collect before a Trace-pool allocation when
+    /// [`crate::gc_stress_trace_alloc_enabled`] is set.
+    ///
+    /// A collection callback that allocates again must not re-enter: the
+    /// flag is process-global because `gc_op` already serializes the
+    /// collector.
+    fn stress_trace_alloc_minor(&mut self, roots: *mut GcRef, root_count: usize) {
+        if !crate::gc_stress_trace_alloc_enabled() {
+            return;
+        }
+        static IN_STRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if IN_STRESS.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                IN_STRESS.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _clear = Clear;
+        for i in 0..root_count {
+            unsafe { self.roots.add(roots.add(i)) };
+        }
+        self.minor_collection_only();
+        for i in (0..root_count).rev() {
+            self.roots.remove(unsafe { roots.add(i) });
         }
     }
 
@@ -3872,6 +3909,7 @@ impl MiniMarkGC {
         // nursery is reset and accounted for, and before the timing and the
         // gc-minor hook below.
         crate::invoke_after_minor_collection_hook();
+        crate::bump_minor_epoch();
 
         // incminimark.py:1962-1974 — report the completed minor before the
         // wrapper advances the incremental major state machine.

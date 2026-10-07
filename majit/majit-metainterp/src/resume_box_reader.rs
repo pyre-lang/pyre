@@ -2101,7 +2101,7 @@ mod tests {
         let tagged = ((majit_ir::resumedata::TAG_CONST_OFFSET << 2)
             | majit_ir::resumedata::TAGCONST as i32) as i16;
         let storage = crate::resume::new_resume_storage(
-            Vec::new(),
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![Const::from_gcref(GcRef(0x1111))],
             Vec::new(),
             Vec::new(),
@@ -2247,7 +2247,7 @@ mod tests {
         let tag0 = ((0 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
         let tag1 = ((1 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
         let storage = crate::resume::new_resume_storage(
-            Vec::new(),
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![
                 Const::from_gcref(GcRef(0x1111)),
                 Const::from_gcref(GcRef(0x2222)),
@@ -2316,7 +2316,7 @@ mod tests {
         let tag0 = ((0 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
         let tag1 = ((1 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
         let storage = crate::resume::new_resume_storage(
-            Vec::new(),
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![
                 Const::from_gcref(GcRef(0x1111)),
                 Const::from_gcref(GcRef(0x2222)),

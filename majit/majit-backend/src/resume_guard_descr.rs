@@ -463,6 +463,12 @@ impl FailDescr for ResumeGuardDescr {
     fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.payload.set_rd_numb_arc(value)
     }
+    fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        self.payload.visit_rd_numb(visitor);
+    }
+    fn rd_numb_ref(&self) -> Option<&majit_ir::NumberingRef> {
+        self.payload.rd_numb_ref()
+    }
     fn rd_consts(&self) -> Option<&[Const]> {
         self.payload.rd_consts()
     }

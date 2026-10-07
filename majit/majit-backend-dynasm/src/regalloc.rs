@@ -44,15 +44,6 @@ const VARSIZE_MALLOC_SAVE_REGS: u8 = SAVE_DEFAULT_REGS;
 #[cfg(not(target_arch = "x86_64"))]
 const VARSIZE_MALLOC_SAVE_REGS: u8 = SAVE_ALL_REGS;
 
-/// `guard.getfailargs()` as OpRefs. Sixteen stay on the stack so a
-/// regex-shaped guard does not mint the 128 B SmallVec spill that
-/// `lower_op` used to allocate per guard.
-fn fail_arg_refs(op: &Op) -> SmallVec<[OpRef; 16]> {
-    op.guard_fail_args()
-        .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
-        .unwrap_or_default()
-}
-
 /// aarch64/regalloc.py DEFAULT_IMM_SIZE
 const DEFAULT_IMM_SIZE: i64 = 4096;
 
@@ -1786,8 +1777,7 @@ pub enum RegAllocOp {
     /// regalloc_perform_guard(op_index, arglocs, result_loc, faillocs)
     ///
     /// `faillocs` live in [`RegAlloc::faillocs_arena`]; start/len are
-    /// the slice. A per-guard `Vec<Option<Loc>>` was 96 B on the regex
-    /// and/or leaf (`locs_for_fail_args`).
+    /// the slice. `locs_for_fail` writes them from `getfailargs()`.
     PerformGuard {
         op_index: usize,
         arglocs_start: u32,
@@ -2491,26 +2481,6 @@ impl<'a> RegAlloc<'a> {
         );
     }
 
-    fn perform_guard_j2(
-        &mut self,
-        fail_args: &[OpRef],
-        op_index: usize,
-        arglocs: impl AsRef<[Loc]>,
-        result_loc: Option<Loc>,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        self.flush_moves(output);
-        let (faillocs_start, faillocs_len) = self.locs_for_fail_args(fail_args);
-        self.push_perform_guard(
-            op_index,
-            arglocs.as_ref(),
-            result_loc,
-            faillocs_start,
-            faillocs_len,
-            output,
-        );
-    }
-
     fn push_perform_guard(
         &mut self,
         op_index: usize,
@@ -2657,14 +2627,6 @@ impl<'a> RegAlloc<'a> {
         (start as u32, (self.faillocs_arena.len() - start) as u32)
     }
 
-    fn locs_for_fail_args(&mut self, fail_args: &[OpRef]) -> (u32, u32) {
-        let start = self.faillocs_arena.len();
-        for &arg in fail_args {
-            self.push_failloc(arg);
-        }
-        (start as u32, (self.faillocs_arena.len() - start) as u32)
-    }
-
     fn push_failloc(&mut self, arg: OpRef) {
         if arg.is_none() {
             self.faillocs_arena.push(None);
@@ -2711,9 +2673,8 @@ impl<'a> RegAlloc<'a> {
     pub fn walk_operations(&mut self) -> Result<Vec<RegAllocOp>, BackendError> {
         self.faillocs_arena.clear();
         self.arglocs_arena.clear();
-        // One reserve for the walk: a per-guard `Vec` was 96 B
-        // (`locs_for_fail_args`). Size to the failargs already on
-        // the ops so the walk does not grow mid-guard. `ops * 8`
+        // One reserve for the walk. Size to the failargs already on
+        // the ops so `locs_for_fail` does not grow mid-guard. `ops * 8`
         // over-reserved a 71-op bridge by ~9 KiB.
         let failarg_slots: usize = self
             .operations
@@ -2836,7 +2797,9 @@ impl<'a> RegAlloc<'a> {
             }
             LirOp::Guard { args, .. } => {
                 self._possibly_free_j2_vars(args.iter().copied());
-                self._possibly_free_j2_vars(fail_arg_refs(raw_op).into_iter());
+                if let Some(fa) = raw_op.guard_fail_args() {
+                    self._possibly_free_j2_vars(fa.iter().map(|a| a.to_opref()));
+                }
                 (None, raw_op.opcode.result_type())
             }
             LirOp::Load {
@@ -2931,10 +2894,7 @@ impl<'a> RegAlloc<'a> {
                 kind,
                 args,
                 fail_args: _,
-            } => {
-                let fail_args = fail_arg_refs(op);
-                self._dispatch_j2_guard(*kind, args, &fail_args, op, i, output)
-            }
+            } => self._dispatch_j2_guard(*kind, args, op, i, output),
             LirOp::Load {
                 kind,
                 dst,
@@ -3026,7 +2986,6 @@ impl<'a> RegAlloc<'a> {
         &mut self,
         kind: GuardKind,
         args: &[OpRef],
-        fail_args: &[OpRef],
         op: &Op,
         i: usize,
         output: &mut Vec<RegAllocOp>,
@@ -3034,56 +2993,51 @@ impl<'a> RegAlloc<'a> {
         match kind {
             GuardKind::True | GuardKind::False | GuardKind::NonNull | GuardKind::IsNull => {
                 if let Some(&arg) = args.first() {
-                    self.consider_guard_cc_j2(arg, fail_args, i, output);
+                    self.consider_guard_cc_j2(arg, op, i, output);
                 } else {
                     output.push(RegAllocOp::Skip);
                 }
             }
             GuardKind::Value => {
                 if args.len() >= 2 {
-                    self.consider_guard_value_j2(args[0], args[1], fail_args, i, output);
+                    self.consider_guard_value_j2(args[0], args[1], op, i, output);
                 } else {
                     output.push(RegAllocOp::Skip);
                 }
             }
             GuardKind::Class | GuardKind::GcType | GuardKind::NonNullClass => {
                 if args.len() >= 2 {
-                    self.consider_guard_class_j2(args[0], args[1], fail_args, i, output);
+                    self.consider_guard_class_j2(args[0], args[1], op, i, output);
                 } else {
                     output.push(RegAllocOp::Skip);
                 }
             }
             GuardKind::Subclass => {
                 if args.len() >= 2 {
-                    self.consider_guard_subclass_j2(args[0], args[1], fail_args, i, output);
+                    self.consider_guard_subclass_j2(args[0], args[1], op, i, output);
                 } else {
                     output.push(RegAllocOp::Skip);
                 }
             }
             GuardKind::IsObject => {
                 if let Some(&arg) = args.first() {
-                    self.consider_guard_is_object_j2(arg, fail_args, i, output);
+                    self.consider_guard_is_object_j2(arg, op, i, output);
                 } else {
                     output.push(RegAllocOp::Skip);
                 }
             }
             GuardKind::NotForced if op.opcode == OpCode::GuardNotForced2 => {
-                self.consider_guard_not_forced_2_j2(fail_args, i, output)
+                self.consider_guard_not_forced_2_j2(op, i, output)
             }
             GuardKind::NoException
             | GuardKind::NoOverflow
             | GuardKind::Overflow
             | GuardKind::NotInvalidated
             | GuardKind::FutureCondition
-            | GuardKind::AlwaysFails => self.consider_guard_no_args_j2(fail_args, i, output),
-            GuardKind::NotForced if op.opcode == OpCode::GuardNotForced2 => {
-                self.consider_guard_not_forced_2_j2(fail_args, i, output)
-            }
-            GuardKind::NotForced => self.consider_guard_no_args_j2(fail_args, i, output),
-            GuardKind::Exception => {
-                self.consider_guard_exception_j2(args, fail_args, op, i, output)
-            }
-            GuardKind::Other(_) => self.consider_guard_no_args_j2(fail_args, i, output),
+            | GuardKind::NotForced
+            | GuardKind::AlwaysFails => self.consider_guard_no_args_j2(op, i, output),
+            GuardKind::Exception => self.consider_guard_exception_j2(args, op, i, output),
+            GuardKind::Other(_) => self.consider_guard_no_args_j2(op, i, output),
         }
     }
 
@@ -4239,7 +4193,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_guard_cc_j2(
         &mut self,
         arg: OpRef,
-        fail_args: &[OpRef],
+        op: &Op,
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
@@ -4250,39 +4204,40 @@ impl<'a> RegAlloc<'a> {
         let loc = self.loc(arg, self.tp(arg));
         #[cfg(not(target_arch = "x86_64"))]
         let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
-        self.perform_guard_j2(fail_args, i, [loc], None, output);
+        // aarch64/regalloc.py `_guard_impl`: one walk of `getfailargs()`.
+        self.perform_guard(op, i, [loc], None, output);
     }
 
     fn consider_guard_value_j2(
         &mut self,
         lhs: OpRef,
         rhs: OpRef,
-        fail_args: &[OpRef],
+        op: &Op,
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
         let x = self.make_sure_var_in_reg(lhs, self.tp(lhs), &[], None, false);
         let y = self.loc(rhs, self.tp(rhs));
-        self.perform_guard_j2(fail_args, i, vec![x, y], None, output);
+        self.perform_guard(op, i, vec![x, y], None, output);
     }
 
     fn consider_guard_class_j2(
         &mut self,
         value: OpRef,
         class: OpRef,
-        fail_args: &[OpRef],
+        op: &Op,
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
         let x = self.make_sure_var_in_reg(value, Type::Ref, &[], None, false);
         let y = self.loc(class, Type::Int);
-        self.perform_guard_j2(fail_args, i, vec![x, y], None, output);
+        self.perform_guard(op, i, vec![x, y], None, output);
     }
 
     fn consider_guard_is_object_j2(
         &mut self,
         value: OpRef,
-        fail_args: &[OpRef],
+        op: &Op,
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
@@ -4303,11 +4258,11 @@ impl<'a> RegAlloc<'a> {
             ));
             self.rm
                 .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
-            self.perform_guard_j2(fail_args, i, vec![x, loc_tmp], None, output);
+            self.perform_guard(op, i, vec![x, loc_tmp], None, output);
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            self.perform_guard_j2(fail_args, i, [x], None, output);
+            self.perform_guard(op, i, [x], None, output);
         }
     }
 
@@ -4315,7 +4270,7 @@ impl<'a> RegAlloc<'a> {
         &mut self,
         value: OpRef,
         class: OpRef,
-        fail_args: &[OpRef],
+        op: &Op,
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
@@ -4337,24 +4292,23 @@ impl<'a> RegAlloc<'a> {
             ));
             self.rm
                 .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
-            self.perform_guard_j2(fail_args, i, vec![x, y, loc_tmp], None, output);
+            self.perform_guard(op, i, vec![x, y, loc_tmp], None, output);
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            self.perform_guard_j2(fail_args, i, vec![x, y], None, output);
+            self.perform_guard(op, i, vec![x, y], None, output);
         }
     }
 
     fn consider_guard_exception_j2(
         &mut self,
         args: &[OpRef],
-        fail_args: &[OpRef],
         op: &Op,
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
         let Some(&exception_class) = args.first() else {
-            return self.consider_guard_no_args_j2(fail_args, i, output);
+            return self.consider_guard_no_args_j2(op, i, output);
         };
         let loc = self.make_sure_var_in_reg(exception_class, Type::Ref, &[], None, false);
         // x86/regalloc.py:470 box = TempVar()
@@ -4384,36 +4338,33 @@ impl<'a> RegAlloc<'a> {
         } else {
             None
         };
-        self.perform_guard_j2(fail_args, i, vec![loc, loc1], resloc, output);
+        self.perform_guard(op, i, vec![loc, loc1], resloc, output);
         self.rm
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
     }
 
-    fn consider_guard_no_args_j2(
-        &mut self,
-        fail_args: &[OpRef],
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        self.perform_guard_j2(fail_args, i, vec![], None, output);
+    fn consider_guard_no_args_j2(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        self.perform_guard(op, i, vec![], None, output);
     }
 
     /// x86/regalloc.py `consider_guard_not_forced_2` and
     /// aarch64/regalloc.py `prepare_op_guard_not_forced_2`.
-    fn consider_guard_not_forced_2_j2(
-        &mut self,
-        fail_args: &[OpRef],
-        i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
+    fn consider_guard_not_forced_2_j2(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,
             &self.inputarg_pos,
             &self.op_pos,
         );
+        // regalloc.py `before_call(op.getfailargs())`. The list is the
+        // guard's own failargs; `locs_for_fail` walks them again for
+        // locations, the same split as `_guard_impl` after `before_call`.
+        let fail_args: Vec<OpRef> = op
+            .guard_fail_args()
+            .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
+            .unwrap_or_default();
         self.rm.before_call(
-            fail_args,
+            &fail_args,
             SAVE_ALL_REGS,
             &mut self.longevity,
             &mut self.fm,
@@ -4421,14 +4372,14 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
         self.xrm.before_call(
-            fail_args,
+            &fail_args,
             SAVE_ALL_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
             &type_index,
         );
-        self.perform_guard_j2(fail_args, i, vec![], None, output);
+        self.perform_guard(op, i, vec![], None, output);
     }
 
     /// x86/regalloc.py _consider_guard_cc

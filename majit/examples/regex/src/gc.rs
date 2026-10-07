@@ -45,6 +45,7 @@ static INSTALLED: OnceLock<()> = OnceLock::new();
 pub fn install() {
     INSTALLED.get_or_init(|| {
         majit_gc::gc_sync::store_singleton(Box::new(majit_gc::collector::MiniMarkGC::new()));
+        majit_gc::shadow_stack::register_mutator();
         majit_gc::gc_sync::register_thread();
         // `jitframe.py` `rgc.register_custom_trace_hook(JITFRAME, ...)` and
         // the descr-owned id every backend allocates its frames under

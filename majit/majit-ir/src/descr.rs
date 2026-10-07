@@ -4814,6 +4814,15 @@ pub trait FailDescr: Descr {
         );
     }
 
+    /// Visit the `NUMBERING` payload address stored on this descr.
+    /// The cell is the walked slot; a clone is not.
+    fn visit_rd_numb(&self, _visitor: &mut dyn FnMut(&mut crate::GcRef)) {}
+
+    /// The walked `NUMBERING` slot, not a clone.
+    fn rd_numb_ref(&self) -> Option<&crate::NumberingRef> {
+        None
+    }
+
     /// resume.py:451 — shared constant pool referenced by `rd_numb`.
     fn rd_consts(&self) -> Option<&[Const]> {
         None

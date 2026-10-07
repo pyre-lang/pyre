@@ -200,7 +200,24 @@ pub struct Matcher {
     driver: JitDriver<MatchState>,
 }
 
+unsafe fn walk_match_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let driver = unsafe { &mut *(data as *mut JitDriver<MatchState>) };
+    driver.walk_rd_numb_refs(visitor);
+}
+
 impl Matcher {
+    /// `rd_consts` area for this portal's driver. `NUMBERING` lives in
+    /// the same walk. Call once the `Matcher` will not move.
+    pub fn register_gc_roots(&self) {
+        unsafe {
+            majit_gc::shadow_stack::register_mutator_extra_area(
+                walk_match_roots,
+                &self.driver as *const JitDriver<MatchState> as *const (),
+                "rd_consts",
+            );
+        }
+    }
+
     pub fn new(root: *mut NodeRec, threshold: u32) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
         let mut driver = JitDriver::new(threshold);

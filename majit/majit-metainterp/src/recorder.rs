@@ -234,7 +234,7 @@ pub struct Trace {
     /// per input arg (`from_bound_inputarg` carries the `Rc<InputArg>`
     /// directly), and the same `Rc<InputArg>` flows through `into_parts` /
     /// `from_oprc` into `TreeLoop.inputargs` unchanged.
-    inputargs: Vec<InputArgRc>,
+    inputargs: Box<Vec<InputArgRc>>,
     /// `opencoder.py Trace.__init__(max_num_inputargs)` reserved prefix.
     /// The byte stream's `_start` / `_count` / `_index` baseline; live
     /// `inputargs` may be shorter when a bridge drops dead fail args.
@@ -253,7 +253,7 @@ pub struct Trace {
     slots: Vec<FrontendSlot>,
     /// Value-producing FrontendOps, dense in `_index` after the inputarg
     /// prefix. `OpRef.raw()` for a value op *is* that `_index`.
-    value_slots: Vec<ValueSlot>,
+    value_slots: Box<Vec<ValueSlot>>,
     /// FrontendOp heapc records for inputargs at positions `0.._start`
     /// (`warmstate.py` `wrap` builds `RefFrontendOp(position, value)`).
     inputarg_heapc: Vec<majit_trace::heapcache::HeapcRecord>,
@@ -425,13 +425,13 @@ impl Trace {
     pub fn new() -> Self {
         Trace {
             ops: Vec::with_capacity(256),
-            inputargs: Vec::new(),
+            inputargs: Box::new(Vec::new()),
             max_num_inputargs: 0,
             op_count: 0,
             box_count: 0,
             trb: None,
             slots: Vec::new(),
-            value_slots: Vec::new(),
+            value_slots: Box::new(Vec::new()),
             inputarg_heapc: Vec::new(),
             young_ref_slots: RefCell::new(Vec::new()),
         }
@@ -1570,7 +1570,7 @@ impl Trace {
         self.materialize_into_ops();
         // `History.set_inputargs` already stores the hole-filtered list
         // (`initialize_state_from_guard_failure` drops dead failargs).
-        (self.inputargs.clone(), self.ops.clone())
+        (self.inputargs.as_ref().clone(), self.ops.clone())
     }
 
     pub fn into_parts(mut self) -> (Vec<InputArgRc>, Vec<OpRc>) {
@@ -1578,7 +1578,7 @@ impl Trace {
         // stream, not a `Vec<Op>` that an earlier `materialize_into_ops`
         // may have filled before `close_loop` recorded JUMP.
         self.materialize_into_ops();
-        (self.inputargs, self.ops)
+        (*self.inputargs, self.ops)
     }
 
     /// Materialize the history's live input box list without consuming it.
@@ -1588,7 +1588,7 @@ impl Trace {
     /// retains its original position in the recorder's reserved coordinate
     /// space.  This is the pre-`into_parts` view used while closing a bridge.
     pub fn live_inputargs_cloned(&self) -> Vec<InputArgRc> {
-        self.inputargs.clone()
+        self.inputargs.as_ref().clone()
     }
 
     /// Convenience: consume the recorder and produce a `TreeLoop`.
@@ -1789,7 +1789,7 @@ impl Trace {
         for rec in &mut self.inputarg_heapc {
             rec.walk_const_ptr_refs(visitor);
         }
-        for vs in &mut self.value_slots {
+        for vs in self.value_slots.iter_mut() {
             vs.heapc.walk_const_ptr_refs(visitor);
         }
         if self.trb.is_none() {
@@ -2022,7 +2022,7 @@ impl Trace {
     /// is `value_slots` itself; a slot still on `young_ref_slots` may name an
     /// old referent this major frees, so it is settled here too.
     pub(crate) fn settle_concrete_refs(&self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
-        for vs in &self.value_slots {
+        for vs in self.value_slots.iter() {
             Self::settle_concrete_ref(vs, classify);
         }
     }

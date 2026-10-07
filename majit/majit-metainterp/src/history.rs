@@ -2556,10 +2556,18 @@ impl TraceCtx {
     /// `rd_resume_position` (`create_top_snapshot`).
     pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
         if self.recorder.has_byte_buffer() {
-            let id = self.recorder.encode_captured_snapshot(&snapshot);
-            // A later `snapshots()` / `take_snapshots` must see this
-            // capture. RPython has no cache: it always reads
-            // `_snapshot_data`. Drop any earlier decode.
+            // `history.py` `capture_resumedata` encodes the live `Const`
+            // boxes. pyre has already copied their gcrefs into
+            // `SnapshotTagged::Const`. Encoding grows `_snapshot_data` and
+            // can minor-collect between boxes. `walk_active_trace_refs`
+            // forwards `self.snapshots` and nothing else sees this copy, so
+            // the snapshot has to sit there for the encode. A word read
+            // after a box's append is then the forwarded address, which is
+            // what the next `ConstPtr` intern stores. Dropped after, same
+            // as this byte-mode path: the byte stream is the record.
+            self.snapshots.push(snapshot);
+            let snap = self.snapshots.last().unwrap() as *const crate::recorder::Snapshot;
+            let id = self.recorder.encode_captured_snapshot(unsafe { &*snap });
             self.snapshots.clear();
             return id;
         }
