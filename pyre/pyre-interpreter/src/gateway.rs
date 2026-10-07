@@ -1310,11 +1310,35 @@ pub unsafe fn builtin_code_call(
     obj: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    let code = obj as *const BuiltinCode;
+    // `blackhole.py` `registers_r` are GC fields rewritten in place. The
+    // `&[PyObjectRef]` the caller formed is a Copy of those words; a
+    // Trace-pool collect that recorded this CALL leaves the slice
+    // from-space. Publish before any check that can allocate, then reread
+    // for the body.
+    let n = args.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let _ = roots.pin_root(obj);
+    let args_base = roots.publish(args);
+    roots.normalize(args_base, n);
+    let mut live_args = Vec::with_capacity(n);
+    for i in 0..n {
+        live_args.push(roots.get(args_base + i));
+    }
+    // `publish` / the Vec can allocate; re-read the BuiltinCode from its
+    // slot so `check_receiver` sees a to-space pointer.
+    let code = roots.get(obj_slot) as *const BuiltinCode;
     // Wrap is positional. Keywords stay on `Arguments` for passthrough /
     // Signature entries; remaining HOPELESS CALL_KW already rejects them.
-    let positional = args;
-    unsafe { builtin_code_check_receiver(code, positional) }?;
+    unsafe { builtin_code_check_receiver(code, &live_args) }?;
+    for i in 0..n {
+        live_args[i] = roots.get(args_base + i);
+    }
+    let code = roots.get(obj_slot) as *const BuiltinCode;
+    let positional: &[PyObjectRef] = &live_args;
+    // The receiver the two argument refusals below name, read the same way
+    // the check above reads it: an unfilled `self` slot is `PY_NULL`, not an
+    // argument the call supplied.
     let receiver = positional.first().copied().filter(|r| !r.is_null());
     // eval.py:16-23 — a `fast_natural_arity` of 0..=4 is the exact positional
     // count the implementation was registered for; `HOPELESS`,
@@ -1345,12 +1369,16 @@ pub unsafe fn builtin_code_call(
     }
     // `get_func_to_call`: a wrapper answers with the slot it was published
     // with, and every other builtin with the body it was registered with.
+    for i in 0..n {
+        live_args[i] = roots.get(args_base + i);
+    }
+    let code = roots.get(obj_slot) as *const BuiltinCode;
     let wrapper = unsafe { (*code).wrapper };
     if wrapper.is_null() {
-        return crate::host_seam::catch_sandbox_stub(|| unsafe { ((*code).func)(args) });
+        return crate::host_seam::catch_sandbox_stub(|| unsafe { ((*code).func)(&live_args) });
     }
     let wrapper = unsafe { &*wrapper };
-    crate::host_seam::catch_sandbox_stub(|| (wrapper.call)(wrapper.slot, args))
+    crate::host_seam::catch_sandbox_stub(|| (wrapper.call)(wrapper.slot, &live_args))
 }
 
 /// The `BuiltinCodeFn` a builtin function object was registered with, when

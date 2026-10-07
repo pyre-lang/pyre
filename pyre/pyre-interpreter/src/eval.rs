@@ -6339,13 +6339,21 @@ impl OpcodeStepExecutor for PyFrame {
             // `stack_items >= nargs + 2` already proves both slots sit above
             // `stack_base`, so `peekvalue` is the same read as
             // `peekvalue_maybe_none` without the bounds re-check.
-            let mut callable = self.peekvalue(nargs + 1);
+            //
+            // `blackhole.py` `registers_r` are GC fields of the interpreter
+            // object. A nursery `PyFrame` (inlined-callee `NewWithVtable`)
+            // moves at a Trace-pool collect while CALL still holds `&mut
+            // self`. Anchor first so every peek and the valuestack call
+            // reread the forwarded frame (`FrameAnchor.live`).
+            let anchor = FrameAnchor::new(self);
+            let frame = unsafe { &mut *anchor.live() };
+            let mut callable = frame.peekvalue(nargs + 1);
             // `call_valuestack` tests `w_func` before the `_Method` unwrap
             // below. The peek above is that same raw callable.
             let profiled_builtin =
-                self.get_is_being_profiled() && crate::function::is_builtin_code(callable);
+                frame.get_is_being_profiled() && crate::function::is_builtin_code(callable);
             if !profiled_builtin {
-                let mut null_or_self = self.peekvalue(nargs);
+                let mut null_or_self = frame.peekvalue(nargs);
                 // baseobjspace.py: `_Method` is not a generic callable
                 // here.  Reuse its null/self stack slot for `w_instance`, unwrap
                 // `w_function`, and continue through the identical Function
@@ -6365,7 +6373,7 @@ impl OpcodeStepExecutor for PyFrame {
                         && !function.is_null()
                         && unsafe { crate::is_function(function) }
                     {
-                        self.settopvalue(receiver, nargs);
+                        unsafe { &mut *anchor.live() }.settopvalue(receiver, nargs);
                         null_or_self = receiver;
                         callable = function;
                         is_func = true;
@@ -6374,11 +6382,10 @@ impl OpcodeStepExecutor for PyFrame {
                 if is_func {
                     let methodcall = !null_or_self.is_null();
                     let call_nargs = nargs + usize::from(methodcall);
-                    let anchor = FrameAnchor::new(self);
                     let result = crate::function::funccall_valuestack(
                         callable,
                         call_nargs,
-                        self,
+                        unsafe { &mut *anchor.live() },
                         nargs + 2,
                         methodcall,
                     );
