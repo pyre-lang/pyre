@@ -3454,8 +3454,9 @@ fn current_walk_frame_pycode<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Op
     }
 }
 
-/// Shared inlined-frame loop-cut: unroll via
-/// `jitdriver_sd.warmstate.should_unroll_one_iteration`, and only then
+/// Shared inlined-frame loop-cut: `opimpl_jit_merge_point` depth>0
+/// ladder — auto-stamp when `no_loop_header` and seen < 0, assert
+/// `seen == jdindex`, consume, `should_unroll_one_iteration`, then
 /// `get_or_make_portal_assembler_token_arc`.
 fn try_surface_inline_subloop_for_pycode<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3468,6 +3469,19 @@ fn try_surface_inline_subloop_for_pycode<Sym: WalkSym>(
     no_loop_header: bool,
     jdindex: usize,
 ) -> Option<(DispatchOutcome, usize)> {
+    // `opimpl_jit_merge_point`: `if seen < 0` and `no_loop_header`,
+    // stamp this merge's jdindex before the mix-up assert.
+    if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 && no_loop_header {
+        ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+        ctx.trace_ctx.seen_loop_header_jit_pc = None;
+    }
+    if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 {
+        assert!(
+            ctx.trace_ctx.seen_loop_header_for_jdindex == jdindex as i32,
+            "found a loop_header for a JitDriver that does not match \
+             the following jit_merge_point's"
+        );
+    }
     let greens = [
         next_instr as i64,
         is_being_profiled as i64,
@@ -8853,18 +8867,73 @@ pub(crate) fn call_result_register(jitcode_index: u32, resume_pc: usize) -> Call
 
 /// [`call_result_register`] over a jitcode's `code` bytes.
 pub(crate) fn call_result_register_in(code: &[u8], resume_pc: usize) -> CallResultRegister {
-    let Some(call) = crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
-    else {
-        return CallResultRegister::Unknown;
-    };
-    match call.result_argcode() {
-        'v' => CallResultRegister::Void,
-        bank => code
-            .get(resume_pc - 1)
-            .map_or(CallResultRegister::Unknown, |&color| {
-                CallResultRegister::Reg(bank, color as usize)
-            }),
+    if let Some(call) = crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
+    {
+        return match call.result_argcode() {
+            'v' => CallResultRegister::Void,
+            bank => code
+                .get(resume_pc - 1)
+                .map_or(CallResultRegister::Unknown, |&color| {
+                    CallResultRegister::Reg(bank, color as usize)
+                }),
+        };
     }
+    // `decoded_ops` missed the op that ends here (`resume_pc == 0`, or a
+    // decode hole earlier in the body). The inlined
+    // `opimpl_jit_merge_point` CALL_ASSEMBLER pause is at the merge-point
+    // coordinate itself (`surface_carrier_or_inline_subloop` uses `op.pc`
+    // on a carrier resume): that residual has no result register
+    // (`pyjitpl.py` `opimpl_jit_merge_point`: the merge point "has no
+    // result at all"). Identify that coordinate positively rather than
+    // treating every miss as void.
+    if merge_point_assembler_resume(code, resume_pc) {
+        return CallResultRegister::Void;
+    }
+    CallResultRegister::Unknown
+}
+
+/// `opimpl_jit_merge_point` residualizes CALL_ASSEMBLER with no result.
+/// A paused inlined frame's resume word is one of:
+/// - the `jit_merge_point` itself
+/// - the op3 `-live-` immediately before it
+///   (`jtransform.py` `handle_jit_marker__jit_merge_point`)
+/// - the op2 `-live-` immediately after it
+///   (`resume_pc_past_merge_point`)
+fn merge_point_assembler_resume(code: &[u8], resume_pc: usize) -> bool {
+    if let Some(op) = crate::jitcode_runtime::decode_op_at(code, resume_pc) {
+        if op.opname == "jit_merge_point" {
+            return true;
+        }
+        if op.opname == "live"
+            && crate::jitcode_runtime::decode_op_at(code, op.next_pc)
+                .is_some_and(|next| next.opname == "jit_merge_point")
+        {
+            return true;
+        }
+    }
+    jit_merge_point_ends_at(code, resume_pc)
+}
+
+/// True when a sequential decode finds a `jit_merge_point` whose
+/// fallthrough is `resume_pc`, or whose next decoded op is a `-live-`
+/// at `resume_pc`.
+fn jit_merge_point_ends_at(code: &[u8], resume_pc: usize) -> bool {
+    let mut ops = crate::jitcode_runtime::decoded_ops(code).peekable();
+    while let Some(op) = ops.next() {
+        if op.opname != "jit_merge_point" {
+            continue;
+        }
+        if op.next_pc == resume_pc {
+            return true;
+        }
+        if ops
+            .peek()
+            .is_some_and(|next| next.opname == "live" && next.pc == resume_pc)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// [`CallResultSlot`] of a level resumed at `resume_pc` whose `boxes` are the
@@ -10819,24 +10888,10 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     if jit_merge_point_ahead(code, jit_pc, floor_end) {
         return Ok(None);
     }
-
-    let (portal_call_depth, current_call_id) = {
+    {
         let mut session = ctx.session.borrow_mut();
         note_debug_merge_point_py_pc(&mut session, py_pc);
-        let depth = ctx
-            .trace_ctx
-            .portal_call_depth_fn
-            .as_ref()
-            .map(|f| f() as usize)
-            .unwrap_or(0);
-        let call_id = ctx
-            .trace_ctx
-            .current_call_id_fn
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or(0);
-        (depth, call_id)
-    };
+    }
 
     record_synthetic_debug_merge_point(ctx, py_pc as usize, is_being_profiled, w_code);
     // `MIFrame.debug_merge_point` segments before `reached_loop_header`.
@@ -14777,17 +14832,6 @@ fn reached_loop_header<Sym: WalkSym>(
     Ok(None)
 }
 
-/// Portal driver index from the Python portal jitcode's stamped owner.
-///
-/// `opimpl_loop_header` stamps `jitdriver_sd.index`. A per-code body has no
-/// `c` immediate, so this is that index. Greens do not identify a driver:
-/// unpackiterable and generatorentry also have them.
-fn python_portal_jdindex() -> i32 {
-    crate::jitcode_runtime::portal_jitcode()
-        .and_then(|jc| jc.jitdriver_sd())
-        .unwrap_or(0) as i32
-}
-
 /// `warmstate.py get_assembler_token` for the portal greens.
 ///
 /// No procedure token yet goes through `compile_tmp_callback`
@@ -14807,6 +14851,17 @@ pub(crate) fn portal_assembler_token(
     ];
     let red_types = [Type::Ref, Type::Ref];
     driver.get_or_make_portal_assembler_token_arc(&key, &greenboxes, &red_types)
+}
+
+/// Portal driver index from the Python portal jitcode's stamped owner.
+///
+/// `opimpl_loop_header` stamps `jitdriver_sd.index`. A per-code body has no
+/// `c` immediate, so this is that index. Greens do not identify a driver:
+/// unpackiterable and generatorentry also have them.
+fn python_portal_jdindex() -> i32 {
+    crate::jitcode_runtime::portal_jitcode()
+        .and_then(|jc| jc.jitdriver_sd())
+        .unwrap_or(0) as i32
 }
 
 /// `MIFrame.debug_merge_point` for a per-code opcode boundary.
@@ -14859,6 +14914,56 @@ fn maybe_segment_python_merge<Sym: WalkSym>(
         create_segmented_trace(ctx, jit_pc, py_pc, true)
     } else {
         Ok(None)
+    }
+}
+
+/// `opimpl_jit_merge_point` inlined branch (`pyjitpl.py`):
+/// `should_unroll_one_iteration` (`interp_jit.py`) plus
+/// `MIFrame.unroll_iterations`. True means follow one more iteration.
+///
+/// Decrements the top MIFrame only when `portal_call_depth > 0`. The root
+/// frame is also born at 1, so a depth-0 crossing must not consume it.
+#[cfg(test)]
+fn inlined_should_unroll_one_iteration(code: &pyre_interpreter::CodeObject) -> bool {
+    // ITERABLE_COROUTINE and ASYNC_GENERATOR are deliberately not
+    // tested: the hook selects only the two bits `should_unroll_one_iteration`
+    // (`eval.rs` / `interp_jit.py`) selects.
+    if !code
+        .flags
+        .intersects(pyre_interpreter::CodeFlags::COROUTINE | pyre_interpreter::CodeFlags::GENERATOR)
+    {
+        return false;
+    }
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return false;
+    };
+    let meta = driver.meta_interp_mut();
+    if meta.portal_call_depth <= 0 {
+        return false;
+    }
+    let Some(frame) = meta.framestack.frames.last_mut() else {
+        return false;
+    };
+    if frame.unroll_iterations == 0 {
+        return false;
+    }
+    frame.unroll_iterations -= 1;
+    true
+}
+
+/// After a `loop_header` stamp, inlined `opimpl_jit_merge_point` always
+/// `do_recursive_call(assembler_call=True)`. `get_assembler_token`
+/// (`warmstate.py`) `compile_tmp_callback`s when the cell has no loop;
+/// `None` still residualizes the portal runner.
+#[cfg(test)]
+pub(crate) fn inlined_loop_header_call_assembler(
+    code_ptr: *const (),
+    header_py: usize,
+    is_being_profiled: bool,
+) -> DispatchOutcome {
+    DispatchOutcome::SubLoopCalleeCallAssembler {
+        token: portal_assembler_token(code_ptr, header_py, is_being_profiled),
+        target_pc: header_py,
     }
 }
 
@@ -15375,6 +15480,9 @@ fn handle<Sym: WalkSym>(
             // target`. The three-byte LE label was resolved by
             // `assembler.fix_labels` to a direct pc; pyre + RPython
             // agree that goto records nothing (pure control flow).
+            // An inlined loop's CALL_ASSEMBLER cut is
+            // `MIFrame.opimpl_jit_merge_point` (`pyjitpl.py`) after
+            // `opimpl_loop_header` stamps `seen_loop_header_for_jdindex`.
             let target = read_label(code, op, 0);
             Ok((DispatchOutcome::Continue, target))
         }
@@ -17962,9 +18070,26 @@ fn handle<Sym: WalkSym>(
                         .map(|frame| frame.w_code),
                 );
             }
+            // pyjitpl.py `_handle_guard_failure` pre-arms the flag when the
+            // source guard is a `ResumeAtPositionDescr` — the descr
+            // `inline_short_preamble` stamps onto the guards it replays
+            // (unroll.py OptUnroll.inline_short_preamble). Those guards sit at
+            // the target loop's entry, so the bridge grown from one has to
+            // close at its very first merge point rather than record another
+            // iteration first. Arming here rather than at the bridge setup
+            // keeps the flag equal to the `jdindex` the assert below compares
+            // against, and runs before the recursive arm so a pre-armed
+            // inlined header still takes `do_recursive_call`.
+            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
+                && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
+            {
+                ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+                ctx.trace_ctx.seen_loop_header_jit_pc = None;
+            }
             // `opimpl_jit_merge_point` (`pyjitpl.py`), the `else` taken when
-            // `metainterp.portal_call_depth` is non-zero: this header is not
-            // the traced loop's own close. Finish the callee and
+            // `metainterp.portal_call_depth` is non-zero and a loop_header has
+            // already stamped the flag: this header is not the traced loop's
+            // own close. Finish the callee and
             // `do_recursive_call(..., assembler_call=True)`. A frame rebuilt
             // by `rebuild_from_resumedata` is an ordinary MIFrame, so a bridge
             // that resumes inside a callee and later reaches that callee's
@@ -18017,22 +18142,34 @@ fn handle<Sym: WalkSym>(
             // owns one (inlined Python callee, generator resume body);
             // otherwise `framestack.last().w_code`. Nested helpers leave
             // `inline_w_code` empty (`run_sub_jitcode_walk_from` takes that
-            // argument only from `walk_generator_resume`), so they stay
-            // out of this arm.
+            // argument only from `walk_generator_resume`).
             let callee_code = (!ctx.is_top_level
                 && (ctx.fbw_mode.transparent_helper_jitcode_index.is_none()
                     || ctx.inline_w_code() != 0))
                 .then(|| current_walk_frame_pycode(ctx))
                 .flatten();
-            if let Some(callee_code) = callee_code {
-                let carrier_resume = carrier_resume_at(callee_code);
+            // `opimpl_jit_merge_point` (`pyjitpl.py`) depth>0 arm: a nested
+            // merge never `reached_loop_header`. The jd0 portal walked as a
+            // `recursive_call` helper (`SubwalkFrameKind::Helper`,
+            // `inline_w_code == 0`) takes the same `do_recursive_call(...,
+            // assembler_call=True)` surface as an inlined Python frame.
+            let nested_code = match callee_code {
+                Some(code) => Some(code),
+                None if !ctx.is_top_level => match ctx.trace_ctx.concrete_of_opref(code_green) {
+                    Some(Value::Ref(gcref)) if gcref.0 != 0 => Some(gcref.0),
+                    _ => current_walk_frame_pycode(ctx).filter(|&c| c != 0),
+                },
+                None => None,
+            };
+            if let Some(code) = nested_code {
+                let carrier_resume = carrier_resume_at(code);
                 if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                     || carrier_resume
                     || no_loop_header
                 {
                     if let Some(outcome) = try_surface_inline_subloop_for_pycode(
                         ctx,
-                        callee_code,
+                        code,
                         next_instr,
                         is_being_profiled,
                         carrier_resume,
@@ -18043,6 +18180,7 @@ fn handle<Sym: WalkSym>(
                     ) {
                         return Ok(outcome);
                     }
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
                 } else {
                     // Fall-through onto a loop header in an inlined frame:
                     // `opimpl_jit_merge_point` `if not jitdriver_sd.no_loop_header:
@@ -18052,6 +18190,8 @@ fn handle<Sym: WalkSym>(
                     // `loop_header`.
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+            } else if !ctx.is_top_level {
+                return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
             }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
@@ -18110,27 +18250,14 @@ fn handle<Sym: WalkSym>(
             // loop-header + close protocol (`pyjitpl/dispatch.rs`).
             // The `c` form's jdindex is the leading literal byte; the `i`
             // form was resolved through its Int-bank operand above.
-            // pyjitpl.py `_handle_guard_failure` pre-arms the flag
-            // when the source guard is a `ResumeAtPositionDescr` — the descr
-            // `inline_short_preamble` stamps onto the guards it replays
-            // (`unroll.py` `OptUnroll._jump_to_existing_trace`). Those guards
-            // sit at the target loop's entry, so the bridge grown from one has
-            // to close at its very first merge point rather than record another
-            // iteration first. Arming here rather than at the bridge setup
-            // keeps the flag equal to the `jdindex` the assert below compares
-            // against.
-            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
-                && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
-            {
-                ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
-                ctx.trace_ctx.seen_loop_header_jit_pc = None;
-            }
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py `if not any_operation: return`.
                 if !any_operation {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // pyjitpl.py `if not jitdriver_sd.no_loop_header:`
+                // (`no_loop_header` hoisted above, same as
+                // `pyjitpl/dispatch.rs`).
                 if !no_loop_header {
                     // pyjitpl.py `if self.metainterp.portal_call_depth:
                     // return` — nested portal call waits for an explicit

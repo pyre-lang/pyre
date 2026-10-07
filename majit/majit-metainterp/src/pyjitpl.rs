@@ -2462,6 +2462,9 @@ pub struct MetaInterp<M: Clone> {
     /// an attached bridge.  Backend invalidation generations are deliberately
     /// not exposed here: they describe guard patching, not dependency owner.
     pub(crate) last_compiled_artifact_token: Option<Arc<JitCellToken>>,
+    /// In-flight `compile_loop_body` claim. A fresh MetaInterp has None;
+    /// `cut_compiled_keys` is the compiled_loops side table and stays.
+    pub(crate) speculative_cut_owned_key: Option<u64>,
     /// pyjitpl.py `compile_trace` position saved before it records
     /// a tentative JUMP. If compile_trace triggers retrace_needed, this
     /// becomes the retracing_from position.
@@ -2820,6 +2823,7 @@ pub(crate) struct ParkedTraceAttempt<M: Clone> {
     cancel_count: u32,
     last_compiled_key: Option<u64>,
     last_compiled_artifact_token: Option<Arc<majit_backend::JitCellToken>>,
+    speculative_cut_owned_key: Option<u64>,
     potential_retrace_position: Option<crate::recorder::TracePosition>,
     last_quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     compile_snapshot_refs: Vec<usize>,
@@ -3415,8 +3419,8 @@ fn label_minted_target_tokens(
 impl<M: Clone> MetaInterp<M> {
     /// Park this attempt's per-trace fields so a nested `MetaInterp` run can
     /// use the same object. `warmstate.py` `bound_reached` constructs a new
-    /// `MetaInterp` instead; shared `warm_state` / `compiled_loops` / `backend`
-    /// / `staticdata` stay on `self`.
+    /// `MetaInterp` instead; shared `warm_state` / `compiled_loops` /
+    /// `cut_compiled_keys` / `backend` / `staticdata` stay on `self`.
     pub fn park_attempt(&mut self) {
         let parked = ParkedTraceAttempt {
             tracing: self.tracing.take(),
@@ -3441,6 +3445,7 @@ impl<M: Clone> MetaInterp<M> {
             cancel_count: std::mem::take(&mut self.cancel_count),
             last_compiled_key: self.last_compiled_key.take(),
             last_compiled_artifact_token: self.last_compiled_artifact_token.take(),
+            speculative_cut_owned_key: self.speculative_cut_owned_key.take(),
             potential_retrace_position: self.potential_retrace_position.take(),
             last_quasi_immutable_deps: std::mem::take(&mut self.last_quasi_immutable_deps),
             compile_snapshot_refs: std::mem::take(&mut self.compile_snapshot_refs),
@@ -3532,6 +3537,7 @@ impl<M: Clone> MetaInterp<M> {
         self.cancel_count = parked.cancel_count;
         self.last_compiled_key = parked.last_compiled_key;
         self.last_compiled_artifact_token = parked.last_compiled_artifact_token;
+        self.speculative_cut_owned_key = parked.speculative_cut_owned_key;
         self.potential_retrace_position = parked.potential_retrace_position;
         self.last_quasi_immutable_deps = parked.last_quasi_immutable_deps;
         self.compile_snapshot_refs = parked.compile_snapshot_refs;
@@ -4567,6 +4573,7 @@ impl<M: Clone> MetaInterp<M> {
             internal_compile_panics: 0,
             last_compiled_key: None,
             last_compiled_artifact_token: None,
+            speculative_cut_owned_key: None,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
@@ -6573,6 +6580,9 @@ impl<M: Clone> MetaInterp<M> {
         // `prepare_trace_start_runtime` must not re-open TRACING on that
         // object; `warmstate.py bound_reached` builds a fresh MetaInterp
         // instead, which pyre's NestedTraceGuard parks to empty first.
+        // Incremental `function_entry_internal` has no such park, so refuse
+        // rather than clobber the outer attempt.
+
         if self.trace_attempt_in_progress() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -6766,6 +6776,13 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        // Same decline as `force_start_tracing`: a parked recorder still owns
+        // this attempt. Return before `force_start_tracing_for_key` marks
+        // `JC_TRACING` and before `prepare_trace_start_runtime`.
+        // Callers that park (`NestedTraceGuard` / `JitDriver::park_nested_trace`)
+        // clear this first. Incremental `commit_start_tracing` has no such
+        // park, so refuse rather than clobber the outer attempt.
+
         if self.trace_attempt_in_progress() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -7085,6 +7102,9 @@ impl<M: Clone> MetaInterp<M> {
         self.single_pass_virt_array_values = None;
         self.single_pass_compiled_key = None;
         self.pending_token = None;
+        // In-flight `compile_loop_body` claim. A fresh MetaInterp has None;
+        // `cut_compiled_keys` is the compiled_loops side table and stays.
+        self.speculative_cut_owned_key = None;
     }
 
     /// Install `ctx` before `initialize_virtualizable` or the trace
@@ -7122,7 +7142,20 @@ impl<M: Clone> MetaInterp<M> {
             ctx.attach_live_byte_recorder();
             ctx.seed_compile_and_run_once_merge_point();
         }
+        self.reset_compile_and_run_once_loop_header_stamp();
         self.arm_portal_trace_positions();
+    }
+
+    /// pyjitpl.py `_compile_and_run_once`: `self.seen_loop_header_for_jdindex
+    /// = -1` after `initialize_state_from_start`. Tracing starts at the
+    /// portal entry, before the start green's `jit_merge_point`, never on
+    /// a previous iteration's `loop_header` (`jtransform.py
+    /// handle_jit_marker__loop_header`).
+    fn reset_compile_and_run_once_loop_header_stamp(&mut self) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.seen_loop_header_for_jdindex = -1;
+            ctx.seen_loop_header_jit_pc = None;
+        }
     }
 
     fn setup_tracing(
@@ -8225,6 +8258,10 @@ impl<M: Clone> MetaInterp<M> {
     /// The recorder slot only. `with_trace_ctx_and_framestack` parks it in
     /// `compile_tracing` for the walk; callers that would record or abort
     /// must keep using this, not [`Self::trace_attempt_in_progress`].
+    /// A nested `compile_and_run_once` still has to park the attempt
+    /// ([`Self::has_live_metainterp_attempt`]); `warmstate.py`
+    /// `bound_reached` constructs a fresh MetaInterp instead.
+
     #[inline]
     pub fn is_tracing(&self) -> bool {
         self.tracing.is_some()
@@ -8237,6 +8274,33 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn trace_attempt_in_progress(&self) -> bool {
         self.tracing.is_some() || self.compile_tracing.is_some() || self.profiler_tracing_active
+    }
+
+    /// True when this object holds a `compile_and_run_once` /
+    /// `handle_guard_failure` attempt.
+    ///
+    /// Same predicate `restore_attempt` requires the nested run to drain:
+    /// History in `tracing` or `compile_tracing`, the frontend session, or
+    /// the `profiler.start_tracing()` scope (`pyjitpl.py`
+    /// `compile_and_run_once` / `handle_guard_failure`). The walk parks
+    /// History in `compile_tracing`, so [`Self::is_tracing`] is not enough
+    /// for a nested `bound_reached` to know it must park.
+    #[inline]
+    pub fn has_live_metainterp_attempt(&self) -> bool {
+        self.tracing.is_some()
+            || self.compile_tracing.is_some()
+            || self.active_trace_session.is_some()
+            || self.profiler_tracing_active
+    }
+
+    /// History for the live attempt, including the
+    /// `with_trace_ctx_and_framestack` walk window.
+    pub fn live_history_mut(&mut self) -> Option<&mut TraceCtx> {
+        if self.tracing.is_some() {
+            self.tracing.as_deref_mut()
+        } else {
+            self.compile_tracing.as_deref_mut()
+        }
     }
 
     /// The active session asked `jit_merge_point_keyed` not to start a nested
@@ -17175,6 +17239,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             self.tracing = self.compile_tracing.take();
         }
+        self.reset_compile_and_run_once_loop_header_stamp();
     }
 
     /// pyjitpl.py `MetaInterp.initialize_withgreenfields(original_boxes)`.
@@ -18069,6 +18134,23 @@ impl<M: Clone> MetaInterp<M> {
         original_boxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
     ) {
         self.reset_framestack_from_start(mainjitcode, original_boxes);
+        self.reset_compile_and_run_once_loop_header_stamp();
+    }
+
+    /// Seat the root portal MIFrame at a JitCode `-live-` after `setup_call`.
+    ///
+    /// `MIFrame.setup_call` always starts at 0. A generator FunctionEntry
+    /// starts at the resolved resume marker (`derive_resume_marker`) so
+    /// `interpret` walks from that `-live-` with the live frame's value stack
+    /// (`resume_execute_frame` already pushed the sent value). Greens stay
+    /// `(next_instr, is_being_profiled, pycode)`.
+    pub fn seat_root_portal_at(&mut self, jitcode_pc: usize) {
+        if jitcode_pc == 0 {
+            return;
+        }
+        let frame = self.framestack.current_mut();
+        frame.setup_resume_at_op(jitcode_pc);
+        frame.code_cursor = jitcode_pc;
     }
 
     fn reset_framestack_from_start(
@@ -18123,7 +18205,10 @@ impl<M: Clone> MetaInterp<M> {
             };
             if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
                 // resume.py `MIFrame.setup_resume_at_op`: `self.pc = pc`.
+                // The walker reads `code_cursor`; `pc` is what a snapshot
+                // reports (`dispatch.rs` seats both).
                 frame.setup_resume_at_op(pc);
+                frame.code_cursor = pc;
             }
         }
     }
@@ -23863,9 +23948,8 @@ mod metainterp_static_data_tests {
         // `with_trace_ctx_and_framestack` parks the recorder in
         // `compile_tracing` during residual calls. `warmstate.py
         // maybe_compile_and_run` still sees an outer MetaInterp tracing;
-        // pyre cannot nest, so `trace_attempt_in_progress` /
-        // `force_start_tracing` / `function_entry_step` must treat that slot
-        // as live (`tick_or_defer_nested`).
+        // `force_start_tracing` must preserve that slot until the driver
+        // parks the attempt; the disabled function-entry counter stays cold.
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         assert!(!meta.trace_attempt_in_progress());
@@ -24798,6 +24882,23 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn seat_root_portal_at_moves_cursor_to_resume_live() {
+        use crate::jitcode::JitCodeBuilder;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let mainjitcode = builder.finish();
+        mainjitcode.set_jitdriver_sd(0);
+        let mainjitcode = std::sync::Arc::new(mainjitcode);
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.seed_root_portal_frame(mainjitcode, &[]);
+        meta.seat_root_portal_at(7);
+        let frame = meta.framestack.current_mut();
+        assert_eq!(frame.pc, 7);
+        assert_eq!(frame.code_cursor, 7);
+    }
+
+    #[test]
     fn begin_attempt_resets_constructor_fields_and_keeps_warmstate() {
         // warmstate.py bound_reached / compile.py
         // _trace_and_compile_from_bridge: each attempt is a new
@@ -24814,6 +24915,8 @@ mod metainterp_static_data_tests {
         meta.single_pass_ref_scalar_values = Some(vec![0x111, 0x222]);
         meta.ovf_flag = true;
         meta.trace_length_at_last_tco = 12;
+        meta.speculative_cut_owned_key = Some(0xC0DE);
+        meta.last_compiled_key = Some(0xC0DE);
         let leftover = std::sync::Arc::new(JitCodeBuilder::new().finish());
         meta.perform_call(leftover, &[], None).unwrap_err();
         assert!(!meta.framestack.is_empty());
@@ -24835,6 +24938,9 @@ mod metainterp_static_data_tests {
                 .is_some_and(|p| p.is_empty())
         );
         assert!(meta.single_pass_ref_scalar_values.is_none());
+        assert!(meta.speculative_cut_owned_key.is_none());
+        // last_compiled_key is the compiled_loops analog and stays.
+        assert_eq!(meta.last_compiled_key, Some(0xC0DE));
         // Long-lived owner: the same WarmEnterState instance remains.
         assert_eq!(meta.warm_state_for_driver(0).threshold(), 10);
     }
@@ -31011,6 +31117,35 @@ mod tests {
         assert_eq!(meta.forced_virtualizable, 0xB000);
     }
 
+    /// `warmstate.py` `bound_reached` constructs a fresh MetaInterp; pyre
+    /// parks the outer attempt on the same object. `speculative_cut_owned_key`
+    /// is the in-flight `compile_loop_body` claim (`MetaInterp::new` leaves
+    /// it None), so inner and outer values must not leak across park/restore.
+    #[test]
+    fn park_attempt_isolates_speculative_cut_owned_key() {
+        const OUTER_KEY: u64 = 0x0A11;
+        const INNER_KEY: u64 = 0x1B22;
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.speculative_cut_owned_key = Some(OUTER_KEY);
+
+        meta.park_attempt();
+        assert!(
+            meta.speculative_cut_owned_key.is_none(),
+            "inner attempt starts constructor-empty, as MetaInterp::new"
+        );
+
+        meta.speculative_cut_owned_key = Some(INNER_KEY);
+        meta.begin_attempt();
+        assert!(
+            meta.speculative_cut_owned_key.is_none(),
+            "begin_attempt is MetaInterp.__init__ for the reused object"
+        );
+        meta.speculative_cut_owned_key = Some(INNER_KEY);
+
+        meta.restore_attempt();
+        assert_eq!(meta.speculative_cut_owned_key, Some(OUTER_KEY));
+    }
+
     /// Published `rd_consts` pools are absent from a minor extra-root walk;
     /// MiniMark's remembered set (`remember_const_pool`) visits them. A major
     /// still walks every live pool here.
@@ -33815,6 +33950,25 @@ mod tests {
         // 0.98 (`tick_or_defer_nested`) while an attempt is in progress, so it
         // answers `NotHot` rather than starting a second trace.
         assert!(matches!(decided, crate::warmstate::HotResult::NotHot));
+        assert!(meta.tracing.is_none(), "the parked attempt stays parked");
+        assert!(meta.compile_tracing.is_some());
+        assert!(meta.profiler_tracing_active);
+        let inner_marked = meta
+            .warm_state_for_driver(0)
+            .lookup_chain_with_key(&inner_typed)
+            .is_some_and(|cell| cell.is_tracing());
+        assert!(!inner_marked, "a declined attempt must not mark JC_TRACING");
+        // The commit half (`bound_reached`) declines while the recorder is parked.
+        assert!(matches!(
+            meta.bound_reached(
+                inner_key,
+                (inner_code, inner_pc),
+                None,
+                None,
+                &[Value::Int(1)],
+            ),
+            BackEdgeAction::AlreadyTracing
+        ));
 
         meta.tracing = meta.compile_tracing.take();
         meta.abort_trace(false);

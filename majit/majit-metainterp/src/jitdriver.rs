@@ -3265,6 +3265,17 @@ impl<S: JitState> JitDriver<S> {
         self.meta.trace_attempt_in_progress()
     }
 
+    /// True when this driver holds a `compile_and_run_once` /
+    /// `handle_guard_failure` attempt, including the walk window that
+    /// parks History in `compile_tracing` (`with_trace_ctx_and_framestack`).
+    /// Nested `bound_reached` parks through [`Self::park_nested_trace`]
+    /// when this is true (`warmstate.py bound_reached` builds a fresh
+    /// MetaInterp).
+    #[inline]
+    pub fn has_live_metainterp_attempt(&self) -> bool {
+        self.meta.has_live_metainterp_attempt()
+    }
+
     /// warmstate.py `cell.flags & JC_TRACING` for this green key.
     ///
     /// `maybe_compile_and_run` skips only a cell that is already being
@@ -7473,7 +7484,7 @@ impl<S: JitState> JitDriver<S> {
                 if !result.is_finish && !result.typed_values.is_empty() {
                     state.restore_values(&compiled_meta, &result.typed_values);
                 }
-                self.sync_after(state, &compiled_meta, vable, None);
+                self.sync_after(state, &compiled_meta, vable, saved_vable_ptr);
                 std::hint::black_box(&mut *state);
             }
         }
@@ -10887,6 +10898,13 @@ impl<S: JitState> JitDriver<S> {
         self.meta.starting_green_key()
     }
 
+    /// pyjitpl.py `compile_and_run_once` `self.jitdriver_sd` of the live
+    /// attempt (`active_jitdriver_sd`). NestedTraceGuard records this at
+    /// arm time with [`Self::starting_green_key`].
+    pub fn starting_jitdriver_sd(&self) -> Option<usize> {
+        self.meta.active_jitdriver_sd
+    }
+
     /// interp_jit.py releaseall → memmgr.py release_all_loops.
     ///
     /// memmgr.py release_all_loops → alive_loops.clear().
@@ -12648,6 +12666,52 @@ mod tests {
         let mut seen_restored = Vec::new();
         owner.forward(outer_opref, &mut |r| seen_restored.push(*r));
         assert_eq!(seen_restored, vec![ref_a]);
+    }
+
+    /// `with_trace_ctx_and_framestack` parks History in `compile_tracing`
+    /// while `profiler_tracing_active` stays set (`pyjitpl.py`
+    /// `compile_and_run_once` keeps `start_tracing` open across
+    /// `interpret`). Nested `bound_reached` still parks that attempt.
+    #[test]
+    fn park_nested_trace_parks_compile_tracing_walk_window() {
+        let mut driver = JitDriver::<CountingDoorState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = CountingDoorState::default();
+        let outer = gk(2166);
+        driver.force_start_tracing(
+            outer.get_uhash(),
+            Some((&outer.values, &outer.types)),
+            0,
+            &mut state,
+            &(),
+        );
+        assert!(driver.is_tracing());
+        assert!(driver.meta.profiler_tracing_active);
+        driver.meta.compile_tracing = driver.meta.tracing.take();
+        assert!(!driver.is_tracing());
+        assert!(driver.has_live_metainterp_attempt());
+
+        driver.park_nested_trace();
+        assert!(!driver.has_live_metainterp_attempt());
+        assert!(!driver.meta.profiler_tracing_active);
+        assert!(driver.meta.compile_tracing.is_none());
+
+        let inner = gk(2167);
+        driver.force_start_tracing(
+            inner.get_uhash(),
+            Some((&inner.values, &inner.types)),
+            0,
+            &mut state,
+            &(),
+        );
+        assert!(driver.is_tracing());
+        assert!(driver.meta.profiler_tracing_active);
+
+        driver.close_bound_reached_attempt(inner.get_uhash());
+        driver.restore_nested_trace();
+        assert!(driver.meta.compile_tracing.is_some());
+        assert!(driver.meta.profiler_tracing_active);
+        assert!(!driver.is_tracing());
     }
 
     /// `warmstate.py bound_reached` finally drops the throwaway MetaInterp.
