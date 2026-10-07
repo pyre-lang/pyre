@@ -2892,6 +2892,18 @@ impl WarmEnterState {
         (cell_key, token)
     }
 
+    /// Token half of [`Self::resolved_cell_procedure_token`] when `cell_key`
+    /// already names one cell.
+    ///
+    /// `warmstate.py maybe_compile_and_run` after `get_jitcell`: tests
+    /// `JC_TRACING | JC_TEMPORARY` then `cell.get_procedure_token()` on
+    /// that same cell. No second `comparekey` walk.
+    #[inline]
+    pub fn cell_procedure_token(&self, cell_key: u64) -> Option<Arc<JitCellToken>> {
+        self.cell_by_key(cell_key)
+            .and_then(|cell| Self::cell_entry_procedure_token(&cell))
+    }
+
     /// `maybe_compile_and_run` flag-first then `cell.get_procedure_token()`.
     /// `EnterJitAssembler` holds that owned token for the run.
     #[inline(always)]
@@ -5449,6 +5461,107 @@ mod tests {
         assert!(
             ws.lookup_chain_with_key(&key).is_none(),
             "an ordinary tokenless aborted cell is cleanup_chain",
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: `JC_TRACING` returns before the
+    /// `JC_TEMPORARY` tick. A cell that is both must not count toward a nested
+    /// `bound_reached` of the same greens.
+    #[test]
+    fn function_entry_step_tracing_temporary_cell_does_not_tick() {
+        let mut ws = WarmEnterState::new(1);
+        ws.set_function_threshold(1);
+        let key = GreenKey::new(vec![0xD0C3]);
+        let tmp_token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
+        ws.memory_manager.keep_loop_alive(&tmp_token);
+        ws.get_assembler_token_with_key::<(), _>(&key, |_| Ok(tmp_token))
+            .expect("tmp callback token");
+        let cell_key = ws
+            .cell_key_for(&key)
+            .expect("tmp callback installed a cell");
+        {
+            let cell = ws
+                .lookup_chain_with_key_mut(&key)
+                .expect("tmp callback installed a cell");
+            cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
+        }
+        assert!(ws.get_cell(cell_key).is_some_and(|cell| {
+            cell.flags.get().contains(JcFlags::JC_TEMPORARY) && cell.is_tracing()
+        }));
+        assert!(
+            matches!(
+                ws.function_entry_step(cell_key, None, || false),
+                FunctionEntryStep::NotHot
+            ),
+            "JC_TRACING returns before the temporary-cell tick"
+        );
+        assert!(
+            matches!(
+                ws.function_entry_step(cell_key, None, || false),
+                FunctionEntryStep::NotHot
+            ),
+            "the first probe must not have ticked toward bound_reached"
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run` never reads
+    /// `get_procedure_token()` while the cell's `JC_TRACING` is set, so the
+    /// typed function-entry door does not trace a compiled cell that is
+    /// already being traced.
+    #[test]
+    fn should_trace_function_entry_for_key_does_not_read_token_while_cell_is_tracing() {
+        let mut ws = WarmEnterState::new(1);
+        ws.set_function_threshold(1);
+        let key = GreenKey::new(vec![0xD0, 0xC8]);
+        let token = token_with_compiled_code(&mut ws);
+        attach_alive_for_key(&mut ws, &key, token);
+        {
+            let cell = ws
+                .lookup_chain_with_key_mut(&key)
+                .expect("attach_alive_for_key installed a cell");
+            cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
+        }
+        assert!(ws.lookup_chain_with_key(&key).is_some_and(|cell| {
+            cell.is_tracing()
+                && !cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+                && cell.get_procedure_token().is_some()
+        }));
+        assert!(
+            !ws.should_trace_function_entry_for_key(&key),
+            "JC_TRACING returns before get_procedure_token"
+        );
+        assert!(
+            !ws.should_trace_function_entry_for_key(&key),
+            "the first probe must not have ticked toward bound_reached"
+        );
+    }
+
+    /// Typed twin of [`function_entry_step_tracing_temporary_cell_does_not_tick`].
+    #[test]
+    fn should_trace_function_entry_for_key_tracing_temporary_cell_does_not_tick() {
+        let mut ws = WarmEnterState::new(1);
+        ws.set_function_threshold(1);
+        let key = GreenKey::new(vec![0xD0, 0xC9]);
+        let tmp_token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
+        ws.memory_manager.keep_loop_alive(&tmp_token);
+        ws.get_assembler_token_with_key::<(), _>(&key, |_| Ok(tmp_token))
+            .expect("tmp callback token");
+        {
+            let cell = ws
+                .lookup_chain_with_key_mut(&key)
+                .expect("tmp callback installed a cell");
+            cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
+        }
+        assert!(ws.lookup_chain_with_key(&key).is_some_and(|cell| {
+            cell.flags.get().contains(JcFlags::JC_TEMPORARY) && cell.is_tracing()
+        }));
+        assert!(
+            !ws.should_trace_function_entry_for_key(&key),
+            "JC_TRACING returns before the temporary-cell tick"
+        );
+        assert!(
+            !ws.should_trace_function_entry_for_key(&key),
+            "the first probe must not have ticked toward bound_reached"
         );
     }
 

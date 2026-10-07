@@ -342,8 +342,8 @@ fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize)
 /// construction.  `walk_generator_resume` is the remaining helper-shaped
 /// path: its body is portal-shaped, and pushing that level as a Python
 /// `InlineFrame` either `compile_tmp_callback`s a second loop
-/// (`cut_inlined_loop_backedge` `CALL_ASSEMBLER`) or walks the eval-loop
-/// `goto`s through to a miscompiled `FOR_ITER` item.  Until that merge
+/// (`opimpl_jit_merge_point`'s inlined CALL_ASSEMBLER cut) or walks the
+/// eval-loop `goto`s through to a miscompiled `FOR_ITER` item.  Until that merge
 /// point is `should_unroll_one_iteration` (`interp_jit.py`), this path
 /// keeps the empty-parents collapse.  A shorter chain falls through to
 /// the single-frame collapse, whose resume re-executes the entire call.

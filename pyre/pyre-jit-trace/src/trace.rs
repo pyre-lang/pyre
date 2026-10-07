@@ -2686,7 +2686,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             if let Some(catch_target) = catch_target {
                 crate::jitcode_dispatch::census_record("P2Drain::ChangeFrameMiddle");
                 match walk_transparent_helper_middle_from_handler(
-                    live_trace_ctx(meta),
+                    ctx,
                     session,
                     sym,
                     root_pc,
@@ -2698,7 +2698,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                 ) {
                     Some(Ok(result)) => {
                         return drive_middles_finishframe(
-                            meta,
+                            ctx,
                             flush_committed,
                             session,
                             sym,
@@ -4945,8 +4945,14 @@ fn run_perfn_walk<Sym: WalkSym>(
     let is_loop_header =
         !pjc.code_ptr.is_null() && start_pc_is_loop_header(unsafe { &*pjc.code_ptr }, start_pc);
     let is_entry_green = start_pc == 0 || is_loop_header;
-    let uses_entry_sidecar = is_plain_portal && is_entry_green;
-    let sidecar_entry = pjc.merge_entry_for(start_pc);
+    let sidecar_entry = pjc.function_entry_for(start_pc);
+    // A generator FunctionEntry starts at the live `next_instr`, which is
+    // neither pc 0 nor a loop header. `merge_entry_by_green` misses; the
+    // first emitted op of that pc is the portal walk entry
+    // (`warmstate.py` `maybe_compile_and_run` / `pyjitpl.py`
+    // `compile_and_run_once` / `pyframe.py` `execute_frame` after
+    // `handle_operation_error`).
+    let uses_entry_sidecar = is_plain_portal && (is_entry_green || sidecar_entry.is_some());
     let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
         // the carried offset (override below).
@@ -6759,16 +6765,32 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         .abort_permanents
         .iter()
         .copied()
-        .filter(|&pc| pc > merge_point);
+        .filter(|&pc| pc > merge_point)
+        .filter(|&pc| {
+            // `YIELD_VALUE` lowers to `abort_permanent`, but the walker treats
+            // that marker as the frame exit `portal_yield_frame_exit` on every
+            // walk except the generator-resume sub-walk — `interp_jit.py`
+            // `dispatch` `except Yield` → `pyjitpl.py`
+            // `compile_done_with_this_frame`. Drop it so a generator loop
+            // header is not declined as an unported op. A marker whose owner
+            // is `None` keeps declining.
+            !matches!(
+                abort_permanent_owner(w_code, &pjc, pc),
+                Some((_, pyre_interpreter::Instruction::YieldValue { .. }))
+            )
+        });
 
     // A backward goto closes the loop headed at `merge_point` only when it
     // jumps to that header.  One that jumps further back closes an ENCLOSING
     // loop, and letting it set the end here stretches this loop's body across
-    // the enclosing one, so a nested loop declines on a marker that belongs
-    // to the outer body.  Take the nearest header first, then its last back
-    // edge, so a `continue` earlier in the body cannot truncate the region
-    // either.  With no candidate at all the region stays open to the end of
-    // the code, the conservative direction.
+    // the enclosing one: a nested loop would then pick up abort_permanent
+    // markers that belong to the enclosing body and decline a walk that never
+    // goes near them.  (`YIELD_VALUE` markers are dropped above as portal
+    // frame exits; remaining markers are unported ops.)  Take the nearest
+    // header first, then its last back edge, so a `continue` earlier in the
+    // body cannot truncate the region either.  With no candidate at all the
+    // region stays open to the end of the code, the conservative direction.
+
     let back_edge_end = back_edges
         .iter()
         .map(|&(target, _)| target)
@@ -6797,10 +6819,11 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     // loops over markers they can never run.
     //
     // A generator is where the difference shows.  Its body is a single entry
-    // whose target is the PEP 479 epilogue, so a whole-tail scan sweeps up
-    // markers sitting between the back edge and that target and declines a
-    // loop over ops it never runs.  `YIELD_VALUE` is the frame exit on every
-    // green key (`dispatch`'s `except Yield`), so the filter below skips it.
+    // whose target is the PEP 479 epilogue, so a whole-tail scan would pick up
+    // abort_permanent markers sitting between the back edge and that target.
+    // `YIELD_VALUE` markers are dropped above (`portal_yield_frame_exit`);
+    // remaining unported ops in the tail would still decline a loop that
+    // never goes near them.
     //
     // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the handler region too and
     // `PYRE_FBW_LOOPBODY_SCAN_FULL` restores the whole-tail scan, so both ends

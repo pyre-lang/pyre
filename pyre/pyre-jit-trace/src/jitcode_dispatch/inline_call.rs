@@ -4274,16 +4274,14 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         target_pc,
         w_code,
         is_being_profiled,
-        true,
+        false,
         constructor_result,
         constructor_assembler_caller,
     )?
     else {
-        // Recorder preflight missed after the prologue ran. Unwind the EC
-        // this emit kept live across the assembler call (`executioncontext.py`
-        // `leave`); the walker's jitcode pc is `op.pc`, not the callee's
-        // Python `target_pc`.
-        leave_loop_callee_ec(ctx, callee_frame, callee_ec, false);
+        // Recorder preflight missed after the prologue ran. The sub-walk
+        // already ran `executioncontext.py` `leave` for that prologue
+        // pair; this arm records no portal enter.
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
     if let Some((exc, exc_concrete)) = recorded.raised {
@@ -4295,9 +4293,10 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
-/// `executioncontext.py ExecutionContext.leave` for a loop-callee whose
-/// enter stayed live across `CALL_ASSEMBLER`. Looks the concrete frame up
-/// off the same box the enter published.
+/// `executioncontext.py ExecutionContext.leave` for a loop-callee portal
+/// whose caller asked this recorder to close the concrete chain
+/// (`leave_callee_ec`). Looks the concrete frame up off the same box the
+/// enter published.
 fn leave_loop_callee_ec<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     callee_frame: OpRef,
@@ -4463,6 +4462,21 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             return Err(e);
         }
     };
+    // `pyframe.py execute_frame`'s `ec.enter(self)` around
+    // `do_recursive_call` (`pyjitpl.py` `opimpl_jit_merge_point` /
+    // `opimpl_recursive_call`). The inlined prologue already closed its
+    // own `walker_ec_enter` / `walker_ec_leave` pair; this is the one
+    // enter for the portal activation, not a second enter of that
+    // prologue scope. A reconstructed callee (`dst` is None) stays in
+    // its carrier scope (`carrier_ec_leave`).
+    let portal_vref = dst.is_some().then(|| {
+        record_ec_enter_virtual_ref(
+            ctx.trace_ctx,
+            callee_frame,
+            callee_ec,
+            concrete_callee_frame as usize,
+        )
+    });
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -4560,6 +4574,16 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     let blackhole_result = resume_pc
         .zip(dst)
         .map(|(next_pc, (bank, color))| (next_pc, bank, color));
+    // Concrete half of the enter recorded above: `vm.py` `getframe` /
+    // `executioncontext.py` `gettopframe_nohidden` walk `topframeref`
+    // while the executor runs `do_recursive_call`. Publish the callee
+    // vref on `WalkSession.portal_call_frame` for that call only.
+    let displaced_portal_call_frame = portal_vref.map(|vref| {
+        ctx.session
+            .borrow_mut()
+            .portal_call_frame
+            .replace((callee_frame, vref))
+    });
     // `direct_assembler_call` records CALL_ASSEMBLER on the portal reds
     // after `vrefs_after_residual_call`. With no token,
     // `do_recursive_call`'s `assembler_call=False` arm records
@@ -4618,11 +4642,26 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             Some(&mut record_call),
         )
     };
+    if let Some(displaced) = displaced_portal_call_frame {
+        ctx.session.borrow_mut().portal_call_frame = displaced;
+    }
+    // `execute_frame` leaves from a `finally`: a walk that stops between
+    // the enter and the recorded leave below still closes the scope.
+    let abandon_portal_scope = |ctx: &mut WalkContext<'_, '_, Sym>| {
+        if portal_vref.is_some()
+            && let Some(majit_ir::Value::Ref(frame)) = ctx.trace_ctx.concrete_of_opref(callee_frame)
+        {
+            ctx.trace_ctx
+                .discard_innermost_virtualref_if_frame(frame.as_usize());
+        }
+    };
     let exec = match exec {
         Ok(exec) => exec,
         Err(e) => {
             if leave_callee_ec {
                 leave_loop_callee_ec(ctx, callee_frame, callee_ec, false);
+            } else {
+                abandon_portal_scope(ctx);
             }
             return Err(e);
         }
@@ -4705,6 +4744,8 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         if let Err(e) = write_err {
             if leave_callee_ec {
                 leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
+            } else {
+                abandon_portal_scope(ctx);
             }
             return Err(e);
         }
@@ -4731,6 +4772,23 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope);
     if leave_callee_ec {
         leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
+    } else if portal_vref.is_some() {
+        if snapshot.is_err() {
+            abandon_portal_scope(ctx);
+        } else {
+            let escaped = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
+                Some(majit_ir::Value::Ref(frame)) if frame.0 != 0 => unsafe {
+                    (*(frame.0 as *const pyre_interpreter::PyFrame)).escaped()
+                },
+                _ => false,
+            };
+            record_ec_leave_virtual_ref(
+                ctx.trace_ctx,
+                callee_frame,
+                callee_ec,
+                escaped || exec_raised,
+            );
+        }
     }
     snapshot?;
     // Restore before either exception arm leaves the compiled caller.  Put
@@ -6800,7 +6858,6 @@ fn record_ec_restore_topframeref(ctx: &mut TraceCtx, callee_frame: OpRef, callee
 /// whose body the walk itself runs.
 ///
 /// Returns the vref box for [`record_ec_leave_virtual_ref`].
-#[allow(dead_code)]
 fn record_ec_enter_virtual_ref(
     ctx: &mut TraceCtx,
     callee_frame: OpRef,
@@ -6850,7 +6907,6 @@ fn record_ec_enter_virtual_ref(
 /// [`walker_ec_leave`] records it: `VIRTUAL_REF_FINISH(vrefbox, virtualbox)`
 /// through `stop_tracking_virtualref`, unless the call already forced the
 /// vref and `vrefs_after_residual_call` recorded that.
-#[allow(dead_code)]
 fn record_ec_leave_virtual_ref(
     ctx: &mut TraceCtx,
     callee_frame: OpRef,
@@ -11916,79 +11972,63 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // sub-walk block above always completes, so every callee exit —
     // return, exception, or decline — arrives here.
     //
-    // `opimpl_jit_merge_point` keeps the callee's vref / `topframeref`
-    // current until `finishframe` -> `do_recursive_call(assembler_call=True)`
-    // returns; leave then runs on the portal side. A recorder that can emit
-    // CALL_ASSEMBLER therefore defers this leave until after GUARD_NOT_FORCED
-    // (`record_walker_loop_callee_portal_call`), so a loop body that reads
-    // the live frame (`sys._getframe()`, a traceback) still names the callee
-    // and a raising assembler call still unwinds. A recorder refusal, a
-    // return, or a raise leaves here. A constructor cut that can record
-    // keeps the frame the same way: `descr_call`'s tail is the dst write
-    // after the assembler returns, not a reason to leave early.
-    let assembler_keeps_frame = match &callee_outcome {
-        Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
-            if loop_callee_portal_call_can_record(
-                ctx,
-                ca_callee_frame,
-                pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                *target_pc,
-            ) =>
-        {
-            true
-        }
-        _ => false,
-    };
+    // `opimpl_jit_merge_point` pops the inlined MIFrame with
+    // `finishframe(None, leave_portal_frame=False)` then
+    // `do_recursive_call(assembler_call=True)`. pyre's portal sits at
+    // `execute_frame`, so that recursive call is a new activation:
+    // leave this prologue pair here and let
+    // `record_walker_loop_callee_portal_call` enter once around the
+    // portal call (`executioncontext.py` `enter` / `leave`, `vm.py`
+    // `getframe`). Keeping this enter live across CALL_ASSEMBLER would
+    // double-enter with that portal pair.
     if let Some(open_activation) = entered_ec {
-        if !assembler_keeps_frame {
-            let concrete_ec = pyre_interpreter::call::getexecutioncontext()
-                as *mut pyre_interpreter::PyExecutionContext;
-            // `leave(frame, w_exitvalue, got_exception)` — the caller passes true
-            // only when the frame is unwinding an exception, which for an inlined
-            // callee is `SubRaise` and nothing else.  A tracing decline (`Err`) or
-            // a loop transition is not an exception exit: treating it as one would
-            // permanently `mark_as_escaped` the caller and force a vref that never
-            // needed forcing.
-            let got_exception = matches!(callee_outcome, Ok((DispatchOutcome::SubRaise { .. }, _)));
-            // `SubRaise`'s concrete word is a Rust copy. `leave` forces the
-            // frame vref (`force_vref`). `registers_r` is not a root. Publish
-            // the copy for the leave and write the forwarded address back
-            // before `record_prepend_application_traceback` reads it.
-            let raised_ptr = if let Ok((
-                DispatchOutcome::SubRaise {
-                    exc_concrete: ConcreteValue::Ref(exc_ptr),
-                    ..
-                },
-                _,
-            )) = &callee_outcome
+        let concrete_ec = pyre_interpreter::call::getexecutioncontext()
+            as *mut pyre_interpreter::PyExecutionContext;
+        // `leave(frame, w_exitvalue, got_exception)` — the caller passes true
+        // only when the frame is unwinding an exception, which for an inlined
+        // callee is `SubRaise` and nothing else.  A tracing decline (`Err`) or
+        // a loop transition is not an exception exit: treating it as one would
+        // permanently `mark_as_escaped` the caller and force a vref that never
+        // needed forcing.
+        let got_exception = matches!(callee_outcome, Ok((DispatchOutcome::SubRaise { .. }, _)));
+        // `SubRaise`'s concrete word is a Rust copy. `leave` forces the
+        // frame vref (`force_vref`). `registers_r` is not a root. Publish
+        // the copy for the leave and write the forwarded address back
+        // before `record_prepend_application_traceback` reads it.
+        let raised_ptr = if let Ok((
+            DispatchOutcome::SubRaise {
+                exc_concrete: ConcreteValue::Ref(exc_ptr),
+                ..
+            },
+            _,
+        )) = &callee_outcome
+        {
+            (!exc_ptr.is_null()).then_some(*exc_ptr)
+        } else {
+            None
+        };
+        let _raise_roots = raised_ptr.map(|_| pyre_object::gc_roots::push_roots());
+        let raise_slot = raised_ptr.map(|exc_ptr| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(exc_ptr);
+            slot
+        });
+        walker_ec_leave(
+            ctx.trace_ctx,
+            ca_callee_frame,
+            ca_callee_ec,
+            ca_concrete_frame,
+            concrete_ec,
+            got_exception,
+        );
+        if let Some(slot) = raise_slot {
+            let live = pyre_object::gc_roots::shadow_stack_get(slot);
+            if let Ok((DispatchOutcome::SubRaise { exc_concrete, .. }, _)) = &mut callee_outcome
             {
-                (!exc_ptr.is_null()).then_some(*exc_ptr)
-            } else {
-                None
-            };
-            let _raise_roots = raised_ptr.map(|_| pyre_object::gc_roots::push_roots());
-            let raise_slot = raised_ptr.map(|exc_ptr| {
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(exc_ptr);
-                slot
-            });
-            walker_ec_leave(
-                ctx.trace_ctx,
-                ca_callee_frame,
-                ca_callee_ec,
-                ca_concrete_frame,
-                concrete_ec,
-                got_exception,
-            );
-            if let Some(slot) = raise_slot {
-                let live = pyre_object::gc_roots::shadow_stack_get(slot);
-                if let Ok((DispatchOutcome::SubRaise { exc_concrete, .. }, _)) = &mut callee_outcome
-                {
-                    let old = *exc_concrete;
-                    *exc_concrete = ConcreteValue::Ref(live);
-                    if ctx.last_exc_value_concrete() == old {
-                        ctx.set_last_exc_value_concrete(ConcreteValue::Ref(live));
-                    }
+                let old = *exc_concrete;
+                *exc_concrete = ConcreteValue::Ref(live);
+                if ctx.last_exc_value_concrete() == old {
+                    ctx.set_last_exc_value_concrete(ConcreteValue::Ref(live));
                 }
             }
         }
@@ -16837,32 +16877,14 @@ fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
 /// `derive_resume_marker` reads.  `py_exact_by_jit_pc` records one entry per
 /// contiguous emission run, so the smallest offset a Python PC owns is that
 /// PC's first emitted op — the `first_op_by_py_pc` value — and
-/// `block_head_py_by_jit_pc` is the table it resolves against.  Rebuilding the
-/// first-op column here and calling the same derivation keeps one definition
-/// of the resolution rather than a second spelling of it.
+/// `block_head_py_by_jit_pc` is the table it resolves against.
+/// `PyJitCode::resume_marker_offset` is that derivation; the portal
+/// FunctionEntry path shares it.
 fn generator_resume_marker_offset(
     pjc: &crate::pyjitcode::PyJitCode,
     resume_py_pc: usize,
 ) -> Option<usize> {
-    let metadata = &pjc.metadata;
-    let n_py = metadata.n_py_instrs as usize;
-    if metadata.py_exact_by_jit_pc.is_empty()
-        || metadata.block_head_py_by_jit_pc.is_empty()
-        || resume_py_pc >= n_py
-    {
-        return None;
-    }
-    let mut first_op_by_py_pc = vec![usize::MAX; n_py];
-    for &(off, py) in &metadata.py_exact_by_jit_pc {
-        if let Some(slot) = first_op_by_py_pc.get_mut(py as usize) {
-            *slot = (*slot).min(off as usize);
-        }
-    }
-    crate::pyjitcode::derive_resume_marker(
-        &first_op_by_py_pc,
-        &metadata.block_head_py_by_jit_pc,
-        resume_py_pc,
-    )
+    pjc.resume_marker_offset(resume_py_pc)
 }
 
 /// `PYRE_GEN_CENSUS=1`: print one line per `FOR_ITER` whose operand is a

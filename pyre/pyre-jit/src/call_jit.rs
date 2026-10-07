@@ -3857,6 +3857,7 @@ pub(crate) fn compiled_meta_for_bridge_source<M: Clone>(
         .cloned()
 }
 
+
 /// compile.py (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
