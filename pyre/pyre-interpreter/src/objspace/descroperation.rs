@@ -7102,6 +7102,22 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     compare_slot_rest(a, b, op)
 }
 
+/// Keys/Items dict views and sets share the set-like comparison walk.
+unsafe fn view_operand_is_set_like(obj: PyObjectRef) -> bool {
+    if pyre_object::is_set_or_frozenset(obj) {
+        return true;
+    }
+    if pyre_object::dictmultiobject::is_dict_view(obj) {
+        let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
+        return matches!(
+            kind,
+            pyre_object::dictmultiobject::DictViewKind::Keys
+                | pyre_object::dictmultiobject::DictViewKind::Items
+        );
+    }
+    false
+}
+
 /// [`compare_slot`] for layouts whose comparison iterates (containers) or
 /// is not the loop-free long/int/str arm.
 #[inline(never)]
@@ -7201,15 +7217,17 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
                 let mut index = 0usize;
                 while index < n_items {
                     let k = pyre_object::gc_roots::shadow_stack_get(items_base + index * 2);
-                    let other = pyre_object::dictmultiobject::w_dict_lookup_checked(
+                    let other = match pyre_object::dictmultiobject::w_dict_lookup_checked(
                         pyre_object::gc_roots::shadow_stack_get(root_base + 1),
                         k,
-                    )
-                    .map_err(|_| {
-                        crate::baseobjspace::take_pending_dict_key_error(
-                            pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
-                        )
-                    })?;
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Err(crate::baseobjspace::take_pending_dict_key_error(
+                                pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
+                            ));
+                        }
+                    };
                     match other {
                         Some(other_v) => {
                             // dictmultiobject.py:664 `if not space.eq_w(w_val,
@@ -7252,21 +7270,7 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             && (pyre_object::dictmultiobject::is_dict_view(a)
                 || pyre_object::dictmultiobject::is_dict_view(b))
         {
-            let view_set_like = |obj: PyObjectRef| -> bool {
-                if pyre_object::is_set_or_frozenset(obj) {
-                    return true;
-                }
-                if pyre_object::dictmultiobject::is_dict_view(obj) {
-                    let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
-                    return matches!(
-                        kind,
-                        pyre_object::dictmultiobject::DictViewKind::Keys
-                            | pyre_object::dictmultiobject::DictViewKind::Items
-                    );
-                }
-                false
-            };
-            if view_set_like(a) && view_set_like(b) {
+            if view_operand_is_set_like(a) && view_operand_is_set_like(b) {
                 // `SetLikeDictView` owns every one of these comparisons
                 // upstream: a set answers `NotImplemented` for a view, and the
                 // reflected call on the view side is what decides.  Reaching
@@ -7304,19 +7308,53 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             // value stack, so pin them for the length reads and the walk.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
-            let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
-            let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-            let la = pyre_object::w_set_len(a());
-            let lb = pyre_object::w_set_len(b());
-            let a_subset_b = || crate::typedef::set_is_subset_of(a(), b());
-            let b_subset_a = || crate::typedef::set_is_subset_of(b(), a());
+            let a = pyre_object::gc_roots::shadow_stack_get(root_base);
+            let b = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let la = pyre_object::w_set_len(a);
+            let lb = pyre_object::w_set_len(b);
             return Ok(w_bool_from(match op {
-                CompareOp::Eq => la == lb && a_subset_b()?,
-                CompareOp::Ne => la != lb || !a_subset_b()?,
-                CompareOp::Le => la <= lb && a_subset_b()?,
-                CompareOp::Lt => la < lb && a_subset_b()?,
-                CompareOp::Ge => la >= lb && b_subset_a()?,
-                CompareOp::Gt => la > lb && b_subset_a()?,
+                CompareOp::Eq => {
+                    la == lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        )?
+                }
+                CompareOp::Ne => {
+                    la != lb
+                        || !crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        )?
+                }
+                CompareOp::Le => {
+                    la <= lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        )?
+                }
+                CompareOp::Lt => {
+                    la < lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        )?
+                }
+                CompareOp::Ge => {
+                    la >= lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                        )?
+                }
+                CompareOp::Gt => {
+                    la > lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                        )?
+                }
             }));
         }
         // List comparison. Unlike tuples, element comparison may mutate either
@@ -7332,10 +7370,11 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             // what makes the "read the live lists" contract above hold.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
-            let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
-            let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             if matches!(op, CompareOp::Eq | CompareOp::Ne)
-                && pyre_object::w_list_len(a()) != pyre_object::w_list_len(b())
+                && pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base))
+                    != pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(
+                        root_base + 1,
+                    ))
             {
                 return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
             }
@@ -7349,26 +7388,39 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             let pair = elem_roots.publish(&[PY_NULL, PY_NULL]);
             elem_roots.normalize(pair, 2);
             let mut i = 0usize;
-            while i < pyre_object::w_list_len(a()) && i < pyre_object::w_list_len(b()) {
+            while i < pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base))
+                && i < pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(
+                    root_base + 1,
+                ))
+            {
                 // Integer/float/range strategies box through `w_int_new` /
                 // `w_float_new`.  Store the first box before the second
                 // getitem, which is another collecting malloc
                 // (`listobject.py list_eq` / `_compare_unwrappeditems`).
                 elem_roots.set(
                     pair,
-                    pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL),
+                    pyre_object::w_list_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(root_base),
+                        i as i64,
+                    )
+                    .unwrap_or(PY_NULL),
                 );
                 elem_roots.set(
                     pair + 1,
-                    pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL),
+                    pyre_object::w_list_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        i as i64,
+                    )
+                    .unwrap_or(PY_NULL),
                 );
                 if !crate::baseobjspace::eq_w(elem_roots.get(pair), elem_roots.get(pair + 1))? {
                     break;
                 }
                 i += 1;
             }
-            let la = pyre_object::w_list_len(a());
-            let lb = pyre_object::w_list_len(b());
+            let la = pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base));
+            let lb =
+                pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base + 1));
             if i >= la || i >= lb {
                 return Ok(w_bool_from(match op {
                     CompareOp::Lt => la < lb,
@@ -7387,11 +7439,19 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             // `set` as the equality loop: the second getitem can collect.
             elem_roots.set(
                 pair,
-                pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL),
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    i as i64,
+                )
+                .unwrap_or(PY_NULL),
             );
             elem_roots.set(
                 pair + 1,
-                pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL),
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                    i as i64,
+                )
+                .unwrap_or(PY_NULL),
             );
             return compare(elem_roots.get(pair), elem_roots.get(pair + 1), op);
         }

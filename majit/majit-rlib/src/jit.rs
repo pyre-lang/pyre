@@ -130,6 +130,10 @@ pub fn conditional_call_elidable1<T, A>(
 ///
 /// `isvirtual(lst)` is often lying for a resizable list (it reports the
 /// containing struct, not the whole list), so size must also be constant.
+/// `@specialize.call_location()` keeps each call site's first argument
+/// on its own graph so a tuple's `wrappeditems` (`SomeList`) and a
+/// specialised tuple's `self` (`SomeInstance`) never share a phi.
+#[majit_macros::specialize_call_location]
 pub fn loop_unrolling_heuristic<T: ?Sized>(lst: &T, size: usize, cutoff: usize) -> bool {
     size == 0 || (isconstant(&size) && (isvirtual(lst) || size <= cutoff))
 }

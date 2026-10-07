@@ -164,7 +164,7 @@ pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
 /// decidable from the name alone. `Tuple` and `Array` without a suffix are the
 /// bare roots and are not this: the bare `Tuple` is the unit handled above, and
 /// a bare `Array` carries no length to be zero.
-fn is_zero_length_shaped_aggregate(name: &str) -> bool {
+pub(crate) fn is_zero_length_shaped_aggregate(name: &str) -> bool {
     if majit_ir::descr::is_shaped_tuple_name(name) {
         return name
             .strip_prefix("Tuple<")

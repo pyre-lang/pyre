@@ -389,92 +389,6 @@ pub fn patch_static_addr_constants(jitcodes: &mut [Arc<JitCode>]) {
             }
         }
     }
-    // After the name-keyed rewrite. A `constants_r` word that is still a
-    // build-process heap address is not in either binding table, so the
-    // passes above leave it. `allocate_callee_register_banks` then interns
-    // it (`const_ptr_table::intern`) and the active-trace walker dereferences
-    // it as a `PyObject`.
-    disarm_unlisted_build_refs(jitcodes);
-}
-
-/// Runtime addresses a patched `constants_r` slot is allowed to keep.
-///
-/// The three registries are the same lists the build script snapshotted.
-/// Binary search, not a map: the patch runs once per jitcode load and the
-/// list is a few thousand words.
-fn runtime_static_addrs() -> &'static [i64] {
-    static ADDRS: LazyLock<Vec<i64>> = LazyLock::new(|| {
-        let mut addrs = Vec::new();
-        addrs.extend(
-            pyre_interpreter::jit_static_pytype_addrs()
-                .into_iter()
-                .map(|(_, addr)| addr),
-        );
-        addrs.extend(
-            pyre_interpreter::jit_static_ref_addrs()
-                .into_iter()
-                .map(|(_, addr)| addr),
-        );
-        addrs.extend(
-            pyre_interpreter::jit_trace_fnaddrs()
-                .into_iter()
-                .map(|(_, addr)| addr),
-        );
-        addrs.sort_unstable();
-        addrs.dedup();
-        addrs
-    });
-    ADDRS.as_slice()
-}
-
-fn is_known_runtime_addr(addr: i64) -> bool {
-    runtime_static_addrs().binary_search(&addr).is_ok()
-}
-
-fn is_deferred_const_sentinel(bits: i64) -> bool {
-    let high = (bits as u64) & SENTINEL_HIGH_MASK;
-    high == (majit_jitcode::codewriter::assembler::STR_CONST_SENTINEL_BASE as u64
-        & SENTINEL_HIGH_MASK)
-        || high
-            == (majit_jitcode::codewriter::assembler::UNIT_VARIANT_CONST_SENTINEL_BASE as u64
-                & SENTINEL_HIGH_MASK)
-        || high
-            == (majit_jitcode::codewriter::assembler::EXC_INSTANCE_CONST_SENTINEL_BASE as u64
-                & SENTINEL_HIGH_MASK)
-}
-
-/// Zero `constants_r` words that are still build-process pointers.
-///
-/// [`disarm_unpaired_build_addrs`] only clears an address whose *name* is in
-/// a binding table and absent at runtime. The codewriter also bakes heap
-/// addresses from the build-script process (a folded `ConstRef` that is not
-/// a `HostStaticAddrs` row). Those are not in the tables, so they survive
-/// every re-pair and are not deferred sentinels either.
-/// [`materialize_str_consts`] / [`materialize_unit_variant_consts`] /
-/// [`materialize_exc_instance_consts`] still need the sentinels; they run
-/// after this pass. A slot already rewritten
-/// to a runtime static is in [`runtime_static_addrs`] and stays.
-///
-/// Zero is the same answer [`disarm_unpaired_build_addrs`] uses: a type
-/// compare matches nothing, and a null call target declines.
-fn disarm_unlisted_build_refs(jitcodes: &mut [Arc<JitCode>]) {
-    for arc in jitcodes.iter_mut() {
-        let jc = Arc::get_mut(arc).expect(
-            "disarm_unlisted_build_refs: Arc<JitCode> already shared before patch — \
-             every caller must run this before publishing the table to consumers",
-        );
-        if jc.try_body().is_none() {
-            continue;
-        }
-        let body = jc.body_mut();
-        for slot in &mut body.constants_r {
-            let value = slot.get();
-            if value == 0 || is_deferred_const_sentinel(value) || is_known_runtime_addr(value) {
-                continue;
-            }
-            slot.set(0);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -972,26 +886,24 @@ mod tests {
     }
 
     #[test]
-    fn patch_static_addr_constants_zeros_an_unlisted_build_heap_address() {
+    fn patch_static_addr_constants_keeps_sentinels_and_runtime_statics() {
         let known = pyre_interpreter::jit_static_ref_addrs()
             .into_iter()
             .find(|(_, addr)| *addr != 0)
             .map(|(_, addr)| addr)
             .expect("jit_static_ref_addrs");
-        let bogus: i64 = 0x2b3a_6c70_00f0;
         let exc = majit_jitcode::codewriter::assembler::EXC_INSTANCE_CONST_SENTINEL_BASE | 2;
-        let jc = JitCode::new("unlisted-ref");
+        let jc = JitCode::new("listed-ref");
         jc.set_body(JitCodeBody {
-            constants_r: vec![sentinel(1).into(), bogus.into(), known.into(), exc.into()],
+            constants_r: vec![sentinel(1).into(), known.into(), exc.into()],
             ..Default::default()
         });
         let mut jcs = vec![Arc::new(jc)];
         patch_static_addr_constants(&mut jcs);
         let body = jcs[0].body();
         assert_eq!(body.constants_r[0].get(), sentinel(1));
-        assert_eq!(body.constants_r[1].get(), 0);
-        assert_eq!(body.constants_r[2].get(), known);
-        assert_eq!(body.constants_r[3].get(), exc);
+        assert_eq!(body.constants_r[1].get(), known);
+        assert_eq!(body.constants_r[2].get(), exc);
     }
 
     #[test]

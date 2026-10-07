@@ -178,6 +178,16 @@ pub struct GraphTransformConfig {
     /// is `rstr.py ll_streq` via `AbstractStringRepr.rtype_eq`.
     #[serde(default = "default_str_eq_helper")]
     pub str_eq_helper: String,
+    /// The host's own `str(s)` helper for a rust-heap `String`
+    /// (`{cap, ptr, len}`), called for a `str` over that Ref operand.
+    ///
+    /// Same contract as [`Self::int_str_helper`]. `AbstractStringRepr.ll_str`
+    /// is identity only for `Ptr(STR)`. A rust-heap header is not that
+    /// struct, so `Repr.rtype_str` of the non-STR layout copies into a
+    /// fresh `mallocstr` payload (`ll_str.py` `mallocstr` + copy, the
+    /// same shape as `ll_int2dec` for a non-string operand).
+    #[serde(default = "default_rust_string_str_helper")]
+    pub rust_string_str_helper: String,
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
@@ -211,6 +221,13 @@ fn default_str_eq_helper() -> String {
     "jit_ll_streq".to_string()
 }
 
+/// The [`GraphTransformConfig::rust_string_str_helper`] default, on the
+/// same terms: the `Repr.rtype_str` port that copies a rust-heap `String`
+/// into rstr `STR`. Bound in `jit_fnaddr.rs` next to `jit_ll_int2dec`.
+fn default_rust_string_str_helper() -> String {
+    "jit_ll_str_from_rust_string".to_string()
+}
+
 impl Default for GraphTransformConfig {
     fn default() -> Self {
         Self {
@@ -224,6 +241,7 @@ impl Default for GraphTransformConfig {
             str_concat_helper: default_str_concat_helper(),
             int_str_helper: default_int_str_helper(),
             str_eq_helper: default_str_eq_helper(),
+            rust_string_str_helper: default_rust_string_str_helper(),
         }
     }
 }
@@ -3572,6 +3590,16 @@ impl<'a> Transformer<'a> {
             } if unop_name == "str" && self.get_value_kind_var(operand) == 'i' => {
                 Some(self.config.int_str_helper.as_str())
             }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "str"
+                && self.get_value_kind_var(operand) == 'r'
+                && crate::front::mir::interpolant_is_rust_heap_string(graph, operand) =>
+            {
+                Some(self.config.rust_string_str_helper.as_str())
+            }
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -3581,6 +3609,10 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r' =>
             {
+                // Empty `str_concat_helper` is a host refusal of the original
+                // Ref+Ref add (`GraphTransformConfig::str_concat_helper`).
+                // `is_string_concat` (both operands `Ptr(STR)`) selects the
+                // `ll_strconcat` lowering when the helper is present.
                 Some(self.config.str_concat_helper.as_str())
             }
             OpKind::BinOp {
@@ -4022,18 +4054,20 @@ impl<'a> Transformer<'a> {
             } if unop_name == "bool" && variable_has_bool_repr(graph, operand) => {
                 RewriteResult::Identity(operand.clone())
             }
-            // `ll_str` on a string is identity (`rpython/rtyper/
-            // lltypesystem/rstr.py` `ll_str` returns the string
-            // unchanged).  The front-end's `format!` / `to_string`
-            // expansion emits `str(x)` for a string-typed value; over a
-            // Ref (string) operand it folds to a no-op alias so it does
-            // not fall through to the unwired `int_str/r>r` default.  A
-            // `str` over an Int operand keeps the integer render path.
+            // `ll_str` on an rstr `STR` is identity (`rstr.py` `ll_str`
+            // returns the string unchanged). The front-end's `format!` /
+            // `to_string` expansion emits `str(x)` for a string-typed value;
+            // over a `Ptr(STR)` operand it folds to a no-op alias so it does
+            // not fall through to the unwired `int_str/r>r` default. A Ref
+            // that is not `Ptr(STR)` (a Rust-heap `String`, an instance) is
+            // not this rewrite: identity would hand that header to
+            // `ll_strconcat`. A `str` over an Int operand keeps the integer
+            // render path.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
                 ..
-            } if unop_name == "str" && self.get_value_kind_var(operand) == 'r' => {
+            } if unop_name == "str" && operand_is_rstr_str(graph, operand) => {
                 RewriteResult::Identity(operand.clone())
             }
             // `str` over an unboxed integer renders the decimal string.
@@ -4096,6 +4130,47 @@ impl<'a> Transformer<'a> {
                     kind: OpKind::Live,
                 });
                 RewriteResult::Replace(ops)
+            }
+            // Leftover `str` of a Ref that is not rstr `STR`. A rust-heap
+            // `String` copies into `STR` (`Repr.rtype_str` of a non-STR
+            // layout); any other leftover Ref would assemble as the
+            // unwired `int_str/r>r`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "str" && self.get_value_kind_var(operand) == 'r' => {
+                if crate::front::mir::interpolant_is_rust_heap_string(graph, operand)
+                    && !self.config.rust_string_str_helper.is_empty()
+                {
+                    let target =
+                        CallTarget::function_path([self.config.rust_string_str_helper.as_str()]);
+                    let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+                    let mut ops = vec![funcptr_op];
+                    ops.push(SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::CallResidual {
+                            funcptr: CallFuncPtr::Value(funcptr),
+                            descriptor: CallDescriptor::from_signature(
+                                &[majit_ir::value::Type::Ref],
+                                majit_ir::value::Type::Ref,
+                                EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                            ),
+                            args_i: vec![],
+                            args_r: vec![operand.clone()],
+                            args_f: vec![],
+                            result_kind: 'r',
+                            indirect_targets: None,
+                        },
+                    });
+                    ops.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::Live,
+                    });
+                    RewriteResult::Replace(ops)
+                } else {
+                    self.abort_unwired_ref_result(op.result.clone())
+                }
             }
             // RPython `jtransform.py:1592` rename pass:
             //   ('cast_bool_to_float', 'cast_int_to_float'),
@@ -4554,25 +4629,24 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Replace(ops)
             }
-            // RPython `pair(StringRepr, StringRepr).rtype_add`
-            // (`rpython/rtyper/lltypesystem/rstr.py` `ll_strconcat`)
-            // lowers `s1 + s2` to a residual call to the concat helper.
-            // Pyre's front-end emits a unified `BinOp { op: "add" }`
-            // (Rust `+` is one AST node); over two Ref (string) operands
-            // this lowers to the registered `jit_ll_strconcat` host extern
-            // (`pyre_object::lowlevel_string`, address in `jit_fnaddr.rs`,
-            // descriptor `OopSpecIndex::StrConcat` in
+            // `pair(StringRepr, StringRepr).rtype_add` (`rstr.py`
+            // `ll_strconcat`) lowers `s1 + s2` to a residual call to the
+            // concat helper. Both operands must be `Ptr(STR)` (`rpy_string`
+            // / `Utf8Str`); a Rust-heap `String` is Vec-shaped and is not
+            // that struct. Pyre's front-end emits a unified `BinOp { op:
+            // "add" }` (Rust `+` is one AST node); over two `Ptr(STR)`
+            // operands this lowers to the registered `jit_ll_strconcat` host
+            // extern (`pyre_object::lowlevel_string`, address in
+            // `jit_fnaddr.rs`, descriptor `OopSpecIndex::StrConcat` in
             // `STR_CONCAT_TARGETS`), assembling to the wired
-            // `residual_call_r_r/iRd>r`.  Without this the op falls
-            // through to the unwired `int_add/rr>r` default.
+            // `residual_call_r_r/iRd>r`. Without this the op falls through
+            // to the unwired `int_add/rr>r` default.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 ..
-            } if binop_name == "add"
-                && self.get_value_kind_var(lhs) == 'r'
-                && self.get_value_kind_var(rhs) == 'r'
+            } if self.is_string_concat(graph, binop_name, lhs, rhs)
                 && !self.config.str_concat_helper.is_empty() =>
             {
                 // `rstr.py rtype_add` → `ll_strconcat`: both operands and
@@ -4613,6 +4687,21 @@ impl<'a> Transformer<'a> {
                     kind: OpKind::Live,
                 });
                 RewriteResult::Replace(ops)
+            }
+            // Leftover `add` of two Ref values that are not `Ptr(STR)`.
+            // Keeping the BinOp assembles as the unwired `int_add/rr>r`.
+            // Abort without the original op; `ConstRefNull` binds the
+            // result so later SSA uses stay defined.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "add"
+                && self.get_value_kind_var(lhs) == 'r'
+                && self.get_value_kind_var(rhs) == 'r' =>
+            {
+                self.abort_unwired_ref_result(op.result.clone())
             }
             OpKind::UnaryOp {
                 op: unop_name,
@@ -5408,6 +5497,45 @@ impl<'a> Transformer<'a> {
             return false;
         };
         crate::translator::rtyper::lltypesystem::lltype::_castdepth(outside, object) >= 0
+    }
+
+    /// Abort a leftover kind-`'r'` `str` / `add` that has no rstr `ll_str` /
+    /// `ll_strconcat`. The original op is dropped so the assembler never
+    /// names `int_str/r>r` or `int_add/rr>r`. `ConstRefNull` (`ref_copy`)
+    /// binds the result for later SSA uses; tracing and the blackhole
+    /// refuse at the abort.
+    fn abort_unwired_ref_result(
+        &self,
+        result: Option<crate::flowspace::model::Variable>,
+    ) -> RewriteResult {
+        let mut ops = vec![SpaceOperation {
+            result: None,
+            kind: OpKind::Abort {
+                kind: crate::model::UnknownKind::UnsupportedExpr {
+                    variant: crate::model::UnsupportedExprKind::OtherExpr,
+                },
+            },
+        }];
+        if let Some(result) = result {
+            ops.push(SpaceOperation {
+                result: Some(result),
+                kind: OpKind::ConstRefNull,
+            });
+        }
+        RewriteResult::Replace(ops)
+    }
+
+    /// Whether `add` over `lhs` / `rhs` is `pair(StringRepr, StringRepr).rtype_add`
+    /// → `ll_strconcat`. Both operands must be `Ptr(STR)` (`rpy_string` /
+    /// `Utf8Str`); a Rust-heap `String` is Vec-shaped and is not that struct.
+    fn is_string_concat(
+        &self,
+        graph: &crate::model::FunctionGraph,
+        binop_name: &str,
+        lhs: &crate::flowspace::model::Variable,
+        rhs: &crate::flowspace::model::Variable,
+    ) -> bool {
+        binop_name == "add" && operand_is_rstr_str(graph, lhs) && operand_is_rstr_str(graph, rhs)
     }
 
     /// Whether `eq` / `ne` over `lhs` / `rhs` is the string comparison
@@ -14146,6 +14274,40 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
     }
 }
 
+/// Whether `var` is rstr `STR` (`Ptr(STR)` / `rpy_string` / `Utf8Str`).
+///
+/// `stroruni_first_arg_kind` reads the lltype. Collapse-emitted
+/// `__str_const` / `str` / `add` also paint `ValueType::Str` on the
+/// producer; a Rust-heap `String` is `ValueType::Ref` and stays out.
+fn operand_is_rstr_str(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    if matches!(stroruni_first_arg_kind(var), StrOrUniKind::Str) {
+        return true;
+    }
+    let Some((bid, idx)) = crate::front::mir::resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    let ty = match &op.kind {
+        crate::model::OpKind::Input { ty, .. } => ty,
+        crate::model::OpKind::UnaryOp { result_ty, .. }
+        | crate::model::OpKind::BinOp { result_ty, .. }
+        | crate::model::OpKind::Call { result_ty, .. } => result_ty,
+        crate::model::OpKind::ConstStr(_) | crate::model::OpKind::ConstInternedStr(_) => {
+            return true;
+        }
+        _ => return false,
+    };
+    matches!(ty, crate::model::ValueType::Str)
+}
+
 /// The result-layout fork `_handle_list_call`'s `"newlist_clear"` arm
 /// selects between, mirroring upstream's `LIST = op.result.concretetype.TO;
 /// resizable = isinstance(LIST, lltype.GcStruct)` split
@@ -17793,9 +17955,179 @@ mod tests {
         );
     }
 
-    /// `s1 + s2` over two Ref operands, as one graph, for the two tests below.
+    /// `str(s)` over a rust-heap `String` operand (`{cap, ptr, len}`).
+    fn rust_string_str_graph() -> (FunctionGraph, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("rust_string_str");
+        let s_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Ref(Some("String".into())),
+                    class_root: Some("String".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "str".into(),
+                    operand: s_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&s_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        (graph, s_var)
+    }
+
+    #[test]
+    fn transform_graph_lowers_rust_string_str_to_copy_residual() {
+        let (graph, s_var) = rust_string_str_graph();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+                "jit_ll_str_from_rust_string",
+            ]));
+        assert!(
+            matches!(&ops[1].kind, OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr)
+        );
+        match &ops[2].kind {
+            OpKind::CallResidual {
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets,
+            } => {
+                assert!(matches!(funcptr, CallFuncPtr::Value(_)));
+                assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+                assert!(
+                    descriptor.extra_info.can_collect,
+                    "mallocstr can collect; live GC refs must be rooted across the residual"
+                );
+                assert!(args_i.is_empty());
+                assert_eq!(args_r, &vec![s_var.clone()]);
+                assert!(args_f.is_empty());
+                assert_eq!(*result_kind, 'r');
+                assert!(indirect_targets.is_none());
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
+        assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
+    #[test]
+    fn a_named_rust_string_str_helper_is_the_call_target() {
+        let (graph, _s_var) = rust_string_str_graph();
+        let config = GraphTransformConfig {
+            rust_string_str_helper: "grain_render_string".to_string(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
+        let expected = crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+            "grain_render_string",
+        ]));
+        assert!(
+            matches!(&ops[1].kind, OpKind::ConstFnAddr { value, .. } if *value == expected),
+            "the fnptr names the configured helper, not this layer's default",
+        );
+    }
+
+    #[test]
+    fn an_unnamed_rust_string_str_helper_aborts_before_the_original_op() {
+        let (graph, _s_var) = rust_string_str_graph();
+        let config = GraphTransformConfig {
+            rust_string_str_helper: String::new(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "no helper is named, so nothing is called: {ops:?}",
+        );
+        assert!(
+            matches!(
+                &ops[1].kind,
+                OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::HostHelperRefused,
+                    },
+                }
+            ),
+            "the host refusal must be explicit: {ops:?}",
+        );
+        assert!(
+            matches!(&ops[2].kind, OpKind::UnaryOp { op: name, .. } if name == "str"),
+            "the original op stays residual after the abort: {ops:?}",
+        );
+    }
+
+    /// `s1 + s2` over two `Ptr(STR)` operands, as one graph, for the two tests below.
     fn str_concat_graph() -> FunctionGraph {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
         let mut graph = FunctionGraph::new("str_concat");
+        let lhs = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Str,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Str,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        lhs.set_concretetype(Some(STRPTR.clone()));
+        rhs.set_concretetype(Some(STRPTR.clone()));
+        graph
+    }
+
+    /// Two GcRef operands that are not `Ptr(STR)` must not become `ll_strconcat`.
+    #[test]
+    fn a_ref_add_that_is_not_ptr_str_is_not_strconcat() {
+        let mut graph = FunctionGraph::new("ref_add");
         let lhs = graph
             .push_op_var(
                 graph.startblock,
@@ -17834,7 +18166,64 @@ mod tests {
         FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
         FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::GcRef);
         FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
-        graph
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "a non-STR ref add must not become ll_strconcat: {ops:?}",
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op: name, .. } if name == "add")),
+            "leftover ref add must not stay a BinOp (int_add/rr>r): {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. })),
+            "leftover ref add aborts: {ops:?}",
+        );
+    }
+
+    /// `str` of a Ref that is not `Ptr(STR)` must not assemble as `int_str/r>r`.
+    #[test]
+    fn a_ref_str_that_is_not_ptr_str_is_not_int_str() {
+        let mut graph = FunctionGraph::new("ref_str");
+        let operand = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "str".into(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(&operand, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op: name, .. } if name == "str")),
+            "leftover ref str must not stay UnaryOp (int_str/r>r): {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. })),
+            "leftover ref str aborts: {ops:?}",
+        );
     }
 
     /// The concat callee is supplied by the embedding pipeline on the same

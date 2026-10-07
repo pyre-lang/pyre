@@ -1,6 +1,7 @@
 mod common;
 
 use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc};
+use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
@@ -34,6 +35,11 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
             .field_type("W_TupleObject", "wrappeditems"),
         Some("[*mut PyObject]"),
         "PyPy tuple storage must project as GcArray(OBJECTPTR), not ItemsBlock"
+    );
+    assert_eq!(
+        program.struct_fields.field_type("W_BytesObject", "data"),
+        Some("[u8]"),
+        "W_BytesObject.data is rstr.STR.chars (GcArray of Char), not a STR struct"
     );
 
     let ops = function
@@ -110,6 +116,93 @@ fn tuple_len_reads_the_fixed_list_not_the_items_block() {
             } if segments.last().map(String::as_str) == Some("items_block_capacity")
         )),
         "the fixed list must not enter items_block_capacity"
+    );
+}
+
+/// Tuple item read is `getarrayitem_gc` on `wrappeditems`
+/// (`rlist.py` `ll_getitem_fast` / `FixedSizeListRepr`). The
+/// `items_block_items_base` accessor aliases to that array header.
+#[test]
+fn tuple_getitem_reads_the_fixed_list_not_the_items_block() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["tupleobject"],
+        &["w_tuple_getitem_known"],
+    )
+    .expect("lower tupleobject::w_tuple_getitem_known");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_tuple_getitem_known")
+        .expect("w_tuple_getitem_known graph");
+    let ops = function
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ArrayRead {
+                array_type_id: Some(id),
+                ..
+            } if id == "majit::object_ref_gcarray"
+        )),
+        "wrappeditems item is getarrayitem on the fixed list"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("items_block_items_base")
+        )),
+        "the fixed list must not enter items_block_items_base"
+    );
+}
+
+/// `*(&[u8]).as_ptr().add(i)` in `ll_bytes_strcmp`
+/// (`rstr.py` `AbstractStringRepr.ll_strcmp`) is `getarrayitem` on
+/// `GcArray(Char)`, not a `RawLoad`.
+#[test]
+fn bytes_strcmp_reads_u8_slice_as_array() {
+    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["descroperation"],
+        &["ll_bytes_strcmp"],
+    )
+    .expect("lower descroperation::ll_bytes_strcmp");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "ll_bytes_strcmp")
+        .expect("ll_bytes_strcmp graph");
+    let ops = function
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ArrayRead {
+                array_type_id: Some(id),
+                ..
+            } if id == "[u8]"
+        )),
+        "byte slice item is getarrayitem on GcArray(Char)"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::RawLoad { .. })),
+        "byte slice item must not be RawLoad"
     );
 }
 

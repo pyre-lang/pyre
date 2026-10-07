@@ -8663,10 +8663,16 @@ impl MiniMarkGC {
             }
         }
         self.oldgen_nonmoving_marked = self.oldgen_nonmoving_active;
-        // Extra-root walkers have stamped every live `ConstPtr` slot.
-        // Drain intern-during-mark first so those slots stamp `live` and
-        // forward; a slot no holder marked is then dead, matching
-        // `history.py` dropping the box when no trace, descr, or op holds it.
+        // Extra-root walkers stamp live `ConstPtr` slots. Drain intern-during-mark
+        // first so those slots stamp `live` and forward. Sweep only when
+        // this major's extra-area walk was a complete census: STW walks
+        // every mutator (`mutators_quiesced`), and a single-mutator process
+        // (`!foreign_mutator_seen`) has only this thread's extra areas.
+        // Two live `install_gc_box` collectors at once is not a supported
+        // configuration (`MAJOR_LIVE` and the intern table are
+        // process-global). A major that walked only this thread must not
+        // recycle another thread's indexes; the next STW major restamps
+        // and sweeps.
         // In test builds, hold the intern-table lock across this drain and
         // sweep so a rewrite test's slot is not freed mid-use. Compiles out
         // in production.
@@ -8675,7 +8681,9 @@ impl MiniMarkGC {
         majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
             self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
         });
-        majit_ir::const_ptr_table::sweep_untraced();
+        if crate::gc_sync::mutators_quiesced() || !crate::gc_sync::foreign_mutator_seen() {
+            majit_ir::const_ptr_table::sweep_untraced();
+        }
         // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
         // the candidate sets have been frozen and before the state changes.
         self.stat_ac_arenas_count = self.oldgen.arenas_count();

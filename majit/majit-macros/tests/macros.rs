@@ -1087,6 +1087,17 @@ mod helper_fnaddr_registry {
         if ok == 0 { Err(PyError(13)) } else { Ok(()) }
     }
 
+    struct Obj;
+
+    #[dont_look_inside]
+    fn maybe_obj(flag: i64) -> Option<*mut Obj> {
+        if flag == 0 {
+            None
+        } else {
+            Some(flag as *mut Obj)
+        }
+    }
+
     #[elidable_promote]
     fn probe_elidable(x: i64) -> i64 {
         x + 1
@@ -1163,6 +1174,24 @@ mod helper_fnaddr_registry {
         assert!(
             found_unit,
             "Result<(), PyError> trampoline was not registered"
+        );
+    }
+
+    #[test]
+    fn registered_option_raw_ptr_trampoline_is_nullable_word() {
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path.ends_with("::maybe_obj") {
+                let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+                assert_eq!(f(0), 0, "None is the null word");
+                assert_eq!(f(0x20), 0x20, "Some(p) is p");
+                assert_eq!(desc.arity, 1);
+                found = true;
+            }
+        });
+        assert!(
+            found,
+            "Option<*mut T> trampoline was not registered (None = null)"
         );
     }
 

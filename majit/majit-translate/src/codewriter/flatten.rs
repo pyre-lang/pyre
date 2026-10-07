@@ -1358,6 +1358,23 @@ impl<'a> GraphFlattener<'a> {
                 Some(ExitSwitch::Fused { opname, args }) => {
                     let arg_regs: Vec<Register> =
                         args.iter().map(|arg| self.getcolor(arg)).collect();
+                    if opname.starts_with("int_") {
+                        let mixed: Vec<_> = args
+                            .iter()
+                            .zip(arg_regs.iter())
+                            .map(|(var, reg)| {
+                                (var.id(), FunctionGraph::concretetype_of(var), reg.kind)
+                            })
+                            .filter(|(_, _, kind)| *kind != RegKind::Int)
+                            .collect();
+                        if !mixed.is_empty() {
+                            panic!(
+                                "fused goto_if_not_{opname} in {} has a non-int operand \
+                                 (blackhole.py bhimpl_goto_if_not_int_* is i,i,L): {mixed:?}",
+                                self.graph.name,
+                            );
+                        }
+                    }
                     self.emitline(FlatOp::GotoIfNotOp {
                         opname: opname.clone(),
                         args: arg_regs,

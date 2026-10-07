@@ -710,7 +710,8 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
             }
         }
         // A length, not an element — no `Unknown`-to-`GcRef` fallback applies.
-        OpKind::VableArrayLen { .. } => ConcreteType::Signed,
+        // `arraylen_gc/rd>i` is the same length word as `arraylen_vable`.
+        OpKind::ArrayLen { .. } | OpKind::VableArrayLen { .. } => ConcreteType::Signed,
         // `OpKind::Abort` for unsupported syntax — macros, unsupported
         // literals, fallback expressions.  Fall back to GcRef so these values
         // still get a regalloc coloring and the assembler's

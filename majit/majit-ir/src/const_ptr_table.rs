@@ -13,7 +13,10 @@
 //! referent alive for the process. Compiled loops keep their own
 //! `GcTable` roots. A major collection stamps the slots extra-root
 //! walkers still hold and [`sweep_untraced`] frees the rest onto a
-//! free list `intern` reuses. Index 0 stays null.
+//! free list `intern` reuses. Index 0 stays null. The table and
+//! [`MAJOR_LIVE`] are process-global: a major that walked only one
+//! thread's extra areas must not sweep. Two live `install_gc_box`
+//! collectors at once is not a supported configuration.
 //!
 //! Intern key is `gc_id_or_identityhash` (`minimark.py`
 //! `id_or_identityhash`), not the address. The key is recorded at
@@ -130,6 +133,8 @@ static DIR: AtomicPtr<ChunkDir> = AtomicPtr::new(std::ptr::null_mut());
 
 /// `history.py` drops a `ConstPtr` with the last holder. A major that
 /// traces every live holder then frees a slot no holder stamped.
+/// Process-global: one generation for the whole table. Sound when the
+/// stamping walk covered every holder (STW, or a single-mutator process).
 static MAJOR_LIVE: AtomicU32 = AtomicU32::new(1);
 
 fn current_live() -> u32 {
@@ -535,6 +540,9 @@ fn note_young(guard: &mut Table, idx: u32) {
 
 /// Free a slot no holder stamped in this major. `history.py` drops
 /// the `ConstPtr` when no trace, descr, or op holds the box.
+///
+/// Call only after a complete holder census. A major that walked one
+/// thread's extra areas would recycle another thread's live indexes.
 pub fn sweep_untraced() {
     let live = current_live();
     let mut guard = table();

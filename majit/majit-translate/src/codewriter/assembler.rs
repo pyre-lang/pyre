@@ -311,10 +311,22 @@ fn host_object_ref_bits(
             "raise/r: exception instance {name} must be a load-time descriptor, not identity_id"
         );
     }
-    if let Some(addr) = exception_class_addr(obj, callcontrol, "raise/r") {
+    if let Some(addr) = exception_class_addr(obj, callcontrol, "Assembler.emit_const") {
         return addr;
     }
-    obj.identity_id() as i64
+    // `rtuple.TUPLE_TYPE` of an empty field list is Void. A
+    // zero-length shaped aggregate (`Array<u8;0>`, `Tuple<>`) has no
+    // GC object; the ref pool stores nullptr.
+    if let Some(class) = obj.instance_class() {
+        let name = class.simple_name();
+        if crate::translator::rtyper::unit_variant_fold::is_zero_length_shaped_aggregate(name) {
+            return 0;
+        }
+    }
+    panic!(
+        "Assembler.emit_const: HostObject {} has no runtime counterpart",
+        obj.qualname()
+    );
 }
 
 /// The graph-reading half of `assembler.py` `Assembler`.
@@ -1561,14 +1573,13 @@ impl AssemblerEncode for Assembler {
             }
 
             // Ref-constant materialization mirrors `ConstInt`: the
-            // `HostObject`'s `identity_id()` goes through
-            // `emit_const_r` (the shared `'r'` constant pool) and the
-            // pool-region register index is moved into the SSA
-            // destination via `ref_copy`.  Emitted only for
+            // HostObject goes through `emit_const_r` (the shared `'r'`
+            // constant pool) and the pool-region register index is moved
+            // into the SSA destination via `ref_copy`.  Emitted only for
             // unit-variant `SyntheticTransparentCtor` results that the
             // pre-jtransform fold (`translator/rtyper/unit_variant_fold.rs`)
-            // rewrote from `OpKind::Call { args: [] }` (PyPy
-            // `rtyper/rpbc.py::SingleFrozenPBCRepr` parity).
+            // rewrote from `OpKind::Call { args: [] }` (`rpbc.py`
+            // `SingleFrozenPBCRepr`).
             OpKind::ConstRef(obj) => {
                 let const_value = crate::flowspace::model::ConstValue::HostObject(obj.clone());
                 let idx = self.emit_const_r(&const_value, state, callcontrol);
@@ -5991,10 +6002,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // shared `constants_f` pool, then a `float_copy` op moves it into
         // the SSA destination register.
         OpKind::ConstFloat(_) => "float_copy".into(),
-        // Ref-bank analog of `ConstInt`. The singleton HostObject's
-        // `identity_id()` enters the shared `constants_r` pool via
-        // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
-        // SSA destination register.
+        // Ref-bank analog of `ConstInt`. `emit_const_r` pools the
+        // runtime address or a load-time sentinel, then a `ref_copy/r>r`
+        // op moves it into the SSA destination register.
         OpKind::ConstStr(_)
         | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
@@ -8255,6 +8265,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Assembler.emit_const: HostObject hello has no runtime counterpart")]
     fn assemble_ref_return_with_host_object_constant() {
         let module = HostObject::new_module("hello");
         let mut flat = SSARepr {
@@ -8268,10 +8279,26 @@ mod tests {
 
         let regallocs = empty_regallocs();
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble(&mut flat, &regallocs);
+    }
 
-        assert_eq!(body.constants_r, vec![module.identity_id() as i64]);
-        assert!(asm.insns.contains_key("ref_return/r"));
+    #[test]
+    fn empty_shaped_array_instance_emits_null() {
+        let class = HostObject::new_class("Array<u8;0>", Vec::new());
+        let inst = class
+            .reusable_prebuilt_instance()
+            .expect("empty array instance");
+        let mut flat = SSARepr {
+            name: "empty_array".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(inst)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(body.constants_r, vec![0]);
     }
 
     fn cc_with_exc_rows(pytypes: &[(&str, i64)]) -> crate::call::CallControl {

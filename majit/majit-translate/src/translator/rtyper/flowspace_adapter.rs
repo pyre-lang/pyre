@@ -4923,7 +4923,10 @@ pub(crate) fn derive_subject_inputcells(
                 // view back to this header, so seed the header with the same
                 // `SomeString` cell that `project_struct_field_type` assigns it.
                 // A generic raw-slice owner does not take this path.
-                if class_root.as_deref() == Some("BytesBlock") {
+                if class_root.as_deref() == Some("BytesBlock")
+                    || class_root.as_deref() == Some("Utf8Str")
+                    || class_root.as_deref() == Some("UnicodeValueStorage")
+                {
                     cells.push(crate::annotator::model::s_str0());
                     continue;
                 }
