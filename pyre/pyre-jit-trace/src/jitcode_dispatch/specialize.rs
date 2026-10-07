@@ -16796,8 +16796,21 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     // (`try_walker_orthodox_list_append` / `_opcode`) is to residualize
     // the helper instead, matching `inline_call.rs` rolling a declined
     // descent back to the ordinary residual.
+    //
+    // `MayForceNullRefArgUnsupported` is the same class inside a helper.
+    // `getitem_str` / `binary_slice_values_inner` look inside
+    // `get_and_call_function(w_descr, w_obj, w_type, args_w)` and residualize
+    // it as `CALL_MAY_FORCE` with four Ref args; `args_w` is `&[]`, whose
+    // zero-length shaped-array constant is interned as `history.CONST_NULL`
+    // (`ConstPtr(0)` at arg_index 3). The portal guard
+    // `walker_abort_if_mayforce_null_ref_arg` exists to refuse a specialized
+    // *Python* entry with a PUSH_NULL globals/closure slot. An empty extra-args
+    // slice is not that slot: residualize the helper so the FOR_ITER consume
+    // stays journaled (`_copy_data_from_miframe` is not reached with a
+    // dropped item).
     let walk_result = match walk_result {
-        Err(DispatchError::AbortMarkerReached { pc }) => {
+        Err(DispatchError::AbortMarkerReached { pc })
+        | Err(DispatchError::MayForceNullRefArgUnsupported { pc }) => {
             Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
         }
         other => other,
