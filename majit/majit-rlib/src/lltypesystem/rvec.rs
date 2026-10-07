@@ -225,6 +225,7 @@ pub fn ll_slice_len_slot_take(slot: usize) -> usize {
 
 /// `lltype.free(buf, flavor='raw')` of an `ll_slice_buffer_new_*` buffer when
 /// the array's storage ends.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn ll_slice_buffer_free(items: usize) {
     raw_free(items)
 }
@@ -606,6 +607,9 @@ pub fn ll_slice_get_addr_i(items: usize, length: usize, index: usize) -> usize {
 
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
+/// Opaque like [`vec_buf_alloc`]. `checked_mul` overflow stays in this
+/// residual; `raw_malloc_varsize_char` is already dont_look_inside.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn ll_slice_buffer_new_i(length: usize) -> usize {
     let size = item_bytes(length, ITEM_SIZE_I).expect("Vec capacity overflow");
     raw_malloc_varsize_char(size)
@@ -993,6 +997,9 @@ pub fn ll_slice_get_addr_r(items: usize, length: usize, index: usize) -> usize {
 
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
+/// Opaque like [`vec_buf_alloc`]. `checked_mul` overflow stays in this
+/// residual; `raw_malloc_varsize_char` is already dont_look_inside.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn ll_slice_buffer_new_r(length: usize) -> usize {
     let size = item_bytes(length, ITEM_SIZE_R).expect("Vec capacity overflow");
     raw_malloc_varsize_char(size)
@@ -1332,6 +1339,9 @@ pub fn ll_slice_get_addr_f(items: usize, length: usize, index: usize) -> usize {
 
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
+/// Opaque like [`vec_buf_alloc`]. `checked_mul` overflow stays in this
+/// residual; `raw_malloc_varsize_char` is already dont_look_inside.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn ll_slice_buffer_new_f(length: usize) -> usize {
     let size = item_bytes(length, ITEM_SIZE_F).expect("Vec capacity overflow");
     raw_malloc_varsize_char(size)
