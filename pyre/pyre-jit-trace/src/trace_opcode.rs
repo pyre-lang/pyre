@@ -1994,6 +1994,45 @@ impl MIFrame {
         1 + extra_reds + crate::virtualizable_gen::NUM_VABLE_SCALARS + target_array_capacity
     }
 
+    /// Value to attach to one loop-carried array box.
+    ///
+    /// Int and float boxes take the unboxed word in
+    /// `PyreSym::concrete_value_at`. Those words are not GC pointers.
+    /// A ref box takes the virtualizable shadow for the same slot.
+    /// `walk_active_trace_refs` forwards that cell. `concrete_value_at`'s
+    /// ref is an off-heap copy from trace start, so stamping it replaces
+    /// the forwarded word. The jump arg may be a `SameAs` of the shadow
+    /// box; the slot's value is still the one `read_boxes` would report.
+    fn loop_carried_runtime_value(
+        &self,
+        ctx: &TraceCtx,
+        opref: OpRef,
+        flat_idx: usize,
+        slot: usize,
+    ) -> Option<Value> {
+        if opref == OpRef::NONE || opref.is_constant() {
+            return None;
+        }
+        match opref.ty()? {
+            Type::Int => match self.sym().concrete_value_at(slot) {
+                ConcreteValue::Int(v) => Some(Value::Int(v)),
+                _ => None,
+            },
+            Type::Float => match self.sym().concrete_value_at(slot) {
+                ConcreteValue::Float(v) => Some(Value::Float(v)),
+                _ => None,
+            },
+            Type::Ref => {
+                let value = ctx.virtualizable_entry_at(flat_idx)?.1;
+                match value {
+                    Value::Ref(r) if r != GcRef::NO_CONCRETE => Some(value),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// TODO: bundles `pyjitpl.py:2957-2965` `live_arg_boxes`
     /// construction (`greenboxes + redboxes + virtualizable_boxes`,
     /// `pop()` the trailing token) with the `vable_last_instr` pin
@@ -2554,8 +2593,10 @@ impl MIFrame {
         // optimizer stamps them onto BoxRefs before virtualstate matching.
         //
         // virtualstate.py generate_guards requires `runtime_boxes` to be fully
-        // parallel with `boxes`. Pyre attempts to populate every slot
-        // but skips type-mismatched and Null (untracked) entries:
+        // parallel with `boxes`. Int and float array slots take
+        // `concrete_value_at`. A ref takes the virtualizable shadow for
+        // that slot, which a minor collection has already forwarded.
+        // The frame, ec, and vable scalars are stamped below:
         //   args[0]                                ↔ frame (raw ptr)
         //   args[1..1+extra_reds]                  ↔ ec (raw ptr)
         //   args[1+extra_reds..num_scalars]        ↔ vable scalars (shadow)
@@ -2570,36 +2611,6 @@ impl MIFrame {
                 .sym()
                 .valuestackdepth
                 .saturating_sub(self.sym().nlocals);
-            let collect_kind =
-                |opref: OpRef, cv: crate::state::ConcreteValue| -> Option<majit_ir::Value> {
-                    let tp = opref.ty()?;
-                    match (tp, cv) {
-                        (Type::Int, crate::state::ConcreteValue::Int(v)) => {
-                            Some(majit_ir::Value::Int(v))
-                        }
-                        (Type::Float, crate::state::ConcreteValue::Float(v)) => {
-                            Some(majit_ir::Value::Float(v))
-                        }
-                        (Type::Ref, crate::state::ConcreteValue::Ref(obj)) => {
-                            Some(majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)))
-                        }
-                        // ConcreteValue::Null is the "untracked" sentinel
-                        // (`state.rs`); real frame nulls are preserved as
-                        // ConcreteValue::Ref(PY_NULL). Do not stamp Null as
-                        // a typed null ref — it means "no runtime value
-                        // recorded for this slot".
-                        (_, crate::state::ConcreteValue::Null) => None,
-                        // Type mismatch: pyre's locals/stack OpRefs are
-                        // Type::Ref (Python values are PyObject*), but
-                        // ConcreteValue auto-decodes unboxed int/float from
-                        // the live pyobj header. RPython's typed
-                        // InputArgInt/Ref/Float boxes prevent this
-                        // structurally. Skip stamp to preserve main's
-                        // "no value" baseline rather than injecting a
-                        // cross-typed value.
-                        _ => None,
-                    }
-                };
             let record = |ctx: &mut TraceCtx, opref: OpRef, value: majit_ir::Value| {
                 if opref != OpRef::NONE && !opref.is_constant() {
                     ctx.set_opref_concrete(opref, value);
@@ -2658,7 +2669,7 @@ impl MIFrame {
                             continue;
                         }
                     }
-                    if let Some(v) = collect_kind(opref, self.sym().concrete_value_at(i)) {
+                    if let Some(v) = self.loop_carried_runtime_value(ctx, opref, vable_idx, i) {
                         record(ctx, opref, v);
                     }
                 }
@@ -2675,7 +2686,8 @@ impl MIFrame {
                             continue;
                         }
                     }
-                    if let Some(v) = collect_kind(opref, self.sym().concrete_value_at(nlocals + j))
+                    if let Some(v) =
+                        self.loop_carried_runtime_value(ctx, opref, vable_idx, nlocals + j)
                     {
                         record(ctx, opref, v);
                     }
@@ -3023,6 +3035,12 @@ impl MIFrame {
                 declared_type.unwrap_or(majit_ir::Type::Ref),
             )
         } else if ctx.constant_value(opref).is_some() {
+            if let Some(index) = opref.const_ptr_index() {
+                return majit_metainterp::recorder::SnapshotTagged::Const(
+                    i64::from(index),
+                    majit_ir::Type::Ref,
+                );
+            }
             let val = ctx.constant_value(opref).unwrap_or(0);
             // resume.py `getconst(const)` dispatches on `const.type`.
             // Prefer the pool's actual const type over `declared_type`:
@@ -3347,6 +3365,11 @@ impl MIFrame {
             .map(|(i, &opref)| {
                 if opref.is_none() {
                     majit_metainterp::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
+                } else if let Some(index) = opref.const_ptr_index() {
+                    majit_metainterp::recorder::SnapshotTagged::Const(
+                        i64::from(index),
+                        majit_ir::Type::Ref,
+                    )
                 } else if ctx.constant_value(opref).is_some() {
                     let val = ctx.constant_value(opref).unwrap_or(0);
                     // resume.py `getconst(const)` dispatches on

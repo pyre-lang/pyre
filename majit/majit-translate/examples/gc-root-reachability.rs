@@ -247,11 +247,21 @@ fn main() {
             "   collecting-alloc seeds: {}",
             joined.graph.seed_report(framework::COLLECTING_SEEDS)
         );
+        println!(
+            "   safepoint seeds       : {}",
+            joined.graph.seed_report(framework::SAFEPOINT_SEEDS)
+        );
         let (jpy, _) = joined.graph.seeds_for(framework::PYTHON_DISPATCH_SEEDS);
         let (jcol, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
         let mut joined_seeds = jpy;
         joined_seeds.extend(jcol);
         let reach = joined.project(0, &joined.graph.reaching(&joined_seeds));
+        // A wait outside the RUNNING census lets another mutator collect.
+        // That justifies a bracket already open across the wait. It does not
+        // enter `reach`: callers that hold a word across the wait stay out of
+        // the unbracketed ratchet (`SAFEPOINT_SEEDS`).
+        let (jsp, _) = joined.graph.seeds_for(framework::SAFEPOINT_SEEDS);
+        let safepoint = joined.project(0, &joined.graph.reaching(&jsp));
         mark("reachability closure done");
         // The seeds as *this* artefact spells them.  The tiering below compares
         // a finding's `callee_id`, which is an id in this artefact, so it needs
@@ -319,7 +329,7 @@ fn main() {
         let opaque = joined.project(0, &joined.graph.reaching(&joined.graph.indirect));
         let (mut justified, mut undecidable, mut unjustified) = (0usize, 0usize, Vec::new());
         for id in &bracketed {
-            if reach.contains(id) {
+            if reach.contains(id) || safepoint.contains(id) {
                 justified += 1;
             } else if opaque.contains(id) {
                 undecidable += 1;

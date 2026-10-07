@@ -516,6 +516,19 @@ pub fn register_mutator() {
     });
 }
 
+/// Whether this thread has a [`register_mutator`] entry.
+///
+/// Scoped extra areas panic without one. Callers that root only when a
+/// moving collector can see them use this to skip the area in tests that
+/// never register.
+pub fn mutator_is_registered() -> bool {
+    let thread_id = std::thread::current().id();
+    MUTATOR_REGISTRY
+        .lock()
+        .iter()
+        .any(|entry| entry.thread_id == thread_id)
+}
+
 /// Append an opaque root area to the current registered mutator.
 ///
 /// # Safety
@@ -560,6 +573,7 @@ fn register_extra_area(
 /// Slots stay fixed so independently owned frames may retire out of order.
 pub struct MutatorExtraAreaGuard {
     index: usize,
+    scoped: bool,
     // An area belongs to its acquiring mutator; prevent Send/Sync.
     _owner: std::marker::PhantomData<*const ()>,
 }
@@ -572,6 +586,28 @@ impl MutatorExtraAreaGuard {
     pub unsafe fn new(walk: MutatorExtraWalkFn, data: *const (), name: &'static str) -> Self {
         Self {
             index: register_extra_area(walk, data, name, true),
+            scoped: true,
+            _owner: std::marker::PhantomData,
+        }
+    }
+
+    /// Mutator-lifetime extra area with RAII unregistration.
+    ///
+    /// [`Self::new`] is the frame-owned path and must drop before
+    /// [`unregister_mutator`]. `TargetToken.virtual_state` (and the short
+    /// preamble's exported state) stays reachable until the compiled-loop
+    /// token is discarded, which is after `thread_die` runs the mutator
+    /// destructor. Those walks are mutator roots: [`unregister_mutator`]
+    /// allows them to still be live, and `Drop` is a no-op once the mutator
+    /// entry is gone.
+    ///
+    /// # Safety
+    /// Same as [`Self::new`], except `data` must remain valid until this
+    /// guard is dropped *or* [`unregister_mutator`] runs, whichever is first.
+    pub unsafe fn permanent(walk: MutatorExtraWalkFn, data: *const (), name: &'static str) -> Self {
+        Self {
+            index: register_extra_area(walk, data, name, false),
+            scoped: false,
             _owner: std::marker::PhantomData,
         }
     }
@@ -581,18 +617,24 @@ impl Drop for MutatorExtraAreaGuard {
     fn drop(&mut self) {
         let thread_id = std::thread::current().id();
         let mut registry = lock_mutator_registry();
-        let entry = registry
+        let Some(entry) = registry
             .iter_mut()
             .find(|entry| entry.thread_id == thread_id)
-            .expect("scoped root area outlived its registered mutator");
+        else {
+            assert!(
+                !self.scoped,
+                "scoped root area outlived its registered mutator"
+            );
+            return;
+        };
         let area = entry
             .extra_areas
             .get_mut(self.index)
             .and_then(Option::take)
             .expect("releasing an inactive scoped root area");
-        assert!(
-            area.scoped,
-            "releasing a permanent root area through a scope"
+        assert_eq!(
+            area.scoped, self.scoped,
+            "releasing a root area through the wrong scope"
         );
         while entry.extra_areas.last().is_some_and(Option::is_none) {
             entry.extra_areas.pop();
@@ -775,13 +817,16 @@ pub fn unregister_mutator() {
         .iter()
         .position(|entry| entry.thread_id == thread_id)
         .expect("unregistering an unregistered mutator thread");
+    let live_scoped: Vec<&'static str> = registry[index]
+        .extra_areas
+        .iter()
+        .flatten()
+        .filter(|area| area.scoped)
+        .map(|area| area.name)
+        .collect();
     assert!(
-        registry[index]
-            .extra_areas
-            .iter()
-            .flatten()
-            .all(|area| !area.scoped),
-        "unregistering a mutator with live scoped root areas"
+        live_scoped.is_empty(),
+        "unregistering a mutator with live scoped root areas: {live_scoped:?}"
     );
     registry.swap_remove(index);
 }
@@ -2657,6 +2702,30 @@ mod tests {
         assert!(result.is_err());
         walk_my_extra_areas(|_| panic!("retired root still visible"));
         unregister_mutator();
+    }
+
+    #[test]
+    fn permanent_extra_area_survives_unregister() {
+        unsafe fn walk_cell(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+            let slot = unsafe { &*(data as *const Cell<GcRef>) };
+            let mut value = slot.get();
+            visitor(&mut value);
+            slot.set(value);
+        }
+        let _lock = TEST_MUTEX.lock();
+        let cell = Cell::new(GcRef(0x1000));
+        register_mutator();
+        let guard = unsafe {
+            MutatorExtraAreaGuard::permanent(
+                walk_cell,
+                &cell as *const _ as *const (),
+                "permanent_cell",
+            )
+        };
+        walk_my_extra_areas(|root| root.0 += 1);
+        assert_eq!(cell.get(), GcRef(0x1001));
+        unregister_mutator();
+        drop(guard);
     }
 
     /// A thread that unregisters leaves nothing behind for the all-mutator

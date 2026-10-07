@@ -5336,6 +5336,20 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // same user-frame signal Finding #1 uses, generalized past FOR_ITER.
     let heap_write_odometer_before =
         (!provably_side_effect_free).then(pyre_interpreter::call::frame_entry_count);
+    // A Ref result has to outlive `residual_locals_roots`. That bracket is
+    // closed before the stamp, and `root_scope_close` truncates to its save
+    // point, so a pin opened inside it does not reach `set_opref_concrete`.
+    // Reserve the slot first; `RootScope::set` publishes the word after the
+    // call returns, and the Ok arm re-reads it.
+    let (residual_result_scope, residual_result_index) =
+        if !is_void && call_descr.result_type() == majit_ir::Type::Ref {
+            let scope = pyre_object::gc_roots::push_roots();
+            let index = scope.base();
+            let _reserved = scope.pin_root(pyre_object::PY_NULL);
+            (Some(scope), Some(index))
+        } else {
+            (None, None)
+        };
     // The live frame's locals as they stood before the residual ran.  A
     // residual that writes fastlocals writes THIS object while the walk reads
     // its own copy, so the diff taken afterwards names exactly the slots the
@@ -5487,11 +5501,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter(ctx.trace_ctx);
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
-    // A Ref result is a nursery object. The next residual in this walk
-    // (`abs(x - y)` after complex subtract) allocates and can collect it
-    // before `set_opref_concrete` roots the recorded op. Pin the live
-    // word now and stamp that word below.
-    let mut residual_result_scope = None;
+    // Publish the Ref into the slot reserved above `residual_locals_roots`.
+    // The word returned here is the address at publication. A later minor
+    // forwards the slot; the Ok arm re-reads it.
     let exec_result = match exec_result {
         Ok(result_i64)
             if !is_void && call_descr.result_type() == majit_ir::Type::Ref && result_i64 != 0 =>
@@ -5499,21 +5511,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             let obj = result_i64 as usize as pyre_object::PyObjectRef;
             if obj.is_null() {
                 Ok(result_i64)
+            } else if let (Some(scope), Some(index)) =
+                (residual_result_scope.as_ref(), residual_result_index)
+            {
+                scope.set(index, obj);
+                Ok(scope.get(index) as i64)
             } else {
-                let live = if let Some((ref roots, _, _)) = residual_locals_roots {
-                    roots.pin_root(obj)
-                } else {
-                    let scope = pyre_object::gc_roots::push_roots();
-                    let live = scope.pin_root(obj);
-                    residual_result_scope = Some(scope);
-                    live
-                };
-                Ok(live as i64)
+                Ok(result_i64)
             }
         }
         other => other,
     };
-    let _residual_result_scope = residual_result_scope;
     // Declared only now, so this residual constrains the residuals that FOLLOW
     // it inside the same opcode and never itself: the gate above read the
     // window, and a force inside the callee reads it again from
@@ -6009,7 +6017,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         fbw_bump_executed_effect("residual");
     }
     match exec_result {
-        Ok(result_i64) => {
+        Ok(mut result_i64) => {
             fbw_count_executed_residual(is_void, is_may_force);
             // #57 (Finding #1): the in-place int-list extend committed; journal
             // its pre-extend length so an aborting walk's rollback rewinds it and
@@ -6028,6 +6036,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // so no in-place `result == lhs` re-check is needed.
             if let Some((list, len_before, allocated_before)) = list_append_journal {
                 fbw_list_journal_push_append(list, len_before, allocated_before);
+            }
+            // `residual_locals_roots` is already closed. Re-read the slot
+            // reserved above that bracket. The `i64` taken at `set` is
+            // not a root across a minor inside that close.
+            if call_descr.result_type() == majit_ir::Type::Ref
+                && let (Some(scope), Some(index)) =
+                    (residual_result_scope.as_ref(), residual_result_index)
+            {
+                result_i64 = scope.get(index) as i64;
             }
             // pyjitpl.py `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
@@ -6096,6 +6113,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // is correct for the loop-header FOR_ITER.
                 let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
                     .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+                if let (Some(scope), Some(index)) =
+                    (residual_result_scope.as_ref(), residual_result_index)
+                {
+                    result_i64 = scope.get(index) as i64;
+                }
                 fbw_foriter_inflight_capture(
                     result_i64 as usize as pyre_object::PyObjectRef,
                     body,

@@ -3284,10 +3284,6 @@ impl ResumeDataLoopMemo {
         if self.refs.is_empty() {
             return;
         }
-        // `_newconst` mints `tag(len(consts) + TAG_CONST_OFFSET, TAGCONST)`
-        // before pushing, so the tag names the pool slot that holds this
-        // entry's forwarded address. Rebuild in iteration order: `refs` is a
-        // dict upstream and the numbering reads it as one.
         let mut rebuilt: IndexMap<i64, i16> = IndexMap::with_capacity(self.refs.len());
         for (_, &tagged) in self.refs.iter() {
             let (num, _) = untag(tagged);
@@ -3333,11 +3329,13 @@ impl ResumeDataLoopMemo {
         if val == 0 {
             return Ok(NULLREF);
         }
-        if let Some(&tagged) = self.refs.get(&val) {
+        // `resume.py` `new_ref_dict`: the key hash is `identityhash`.
+        let key = majit_ir::gc_id_or_identityhash(val as usize) as i64;
+        if let Some(&tagged) = self.refs.get(&key) {
             return Ok(tagged);
         }
         let tagged = self.newconst(val, majit_ir::Type::Ref)?;
-        self.refs.insert(val, tagged);
+        self.refs.insert(key, tagged);
         Ok(tagged)
     }
 
@@ -3419,7 +3417,8 @@ impl ResumeDataLoopMemo {
                 if raw == 0 {
                     return tag_i64(ENCODED_NULLREF, TAGCONST);
                 }
-                if let Some(&tagged_i16) = self.refs.get(&raw) {
+                let key = majit_ir::gc_id_or_identityhash(gcref.0) as i64;
+                if let Some(&tagged_i16) = self.refs.get(&key) {
                     let (num, _) = untag(tagged_i16);
                     return tag_i64(encode_len((num - TAG_CONST_OFFSET) as usize), TAGCONST);
                 }
@@ -4781,11 +4780,12 @@ mod tests {
             "cached before the move"
         );
 
-        memo.walk_const_ptr_refs_mut(&mut |slot: &mut majit_ir::GcRef| {
+        majit_ir::const_ptr_table::walk(&mut |slot: &mut majit_ir::GcRef| {
             if slot.0 as i64 == before {
                 *slot = majit_ir::GcRef(after as usize);
             }
         });
+        memo.walk_const_ptr_refs_mut(&mut |_| {});
 
         assert_eq!(
             memo.getconst_ref(after).unwrap(),
@@ -7572,6 +7572,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     #[inline]
     pub fn next_int(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item() as i16;
+        self.finish_int(tagged)
+    }
+
+    #[inline]
+    fn finish_int(&mut self, tagged: i16) -> i64 {
         // resume.py decode_int `TAGINT`: the payload is the signed value.
         if (tagged as u16) & TAGMASK as u16 == TAGINT as u16 {
             return (tagged >> 2) as i64;
@@ -7585,8 +7590,8 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.decode_ref(tagged)
     }
 
-    fn next_ref_for_resume_slot(&mut self) -> i64 {
-        let tagged = self.resumecodereader.next_item() as i16;
+    #[inline]
+    fn finish_ref_slot(&mut self, tagged: i16) -> i64 {
         // resume.py decode_ref `TAGBOX`: the payload is a deadframe index.
         if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
             let mut idx = (tagged >> 2) as i32;
@@ -7743,16 +7748,20 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// A `-live-` entry names one bank. `TAGINT` (or a const of another
     /// type) in the ref or float section is the same bug as an int box in
     /// `registers_r`: `getref_base` is not defined on that box.
-    fn expect_liveness_item_bank(
+    ///
+    /// `resume.py` `_callback_i` / `_callback_r` / `_callback_f` consume
+    /// the item once (`next_int` / `next_ref` / `next_float`). The tag
+    /// check runs on that decoded item. A second `Reader.peek` decoded
+    /// the same varint again on every live register.
+    #[inline]
+    fn reject_liveness_tag(
         &self,
         jitcode_name: &str,
         pc: usize,
         bank: majit_ir::Type,
         reg_idx: u32,
-        num_regs: usize,
+        tagged: i16,
     ) {
-        crate::blackhole::expect_liveness_bank(jitcode_name, pc, bank, reg_idx, num_regs);
-        let tagged = self.resumecodereader.peek() as i16;
         let (num, tag) = untag(tagged);
         let got = match tag {
             TAGINT => Some(majit_ir::Type::Int),
@@ -7773,6 +7782,27 @@ impl<'a> ResumeDataDirectReader<'a> {
                 "liveness: jitcode {jitcode_name} pc {pc} bank {bank:?} register {reg_idx} holds {got:?}"
             );
         }
+    }
+
+    #[inline]
+    fn next_live_int(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
+        let tagged = self.resumecodereader.next_item() as i16;
+        self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Int, reg_idx, tagged);
+        self.finish_int(tagged)
+    }
+
+    #[inline]
+    fn next_live_ref(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
+        let tagged = self.resumecodereader.next_item() as i16;
+        self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Ref, reg_idx, tagged);
+        self.finish_ref_slot(tagged)
+    }
+
+    #[inline]
+    fn next_live_float(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
+        let tagged = self.resumecodereader.next_item() as i16;
+        self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Float, reg_idx, tagged);
+        self.decode_float(tagged)
     }
 
     /// resume.py `consume_one_section(self, blackholeinterp)`.
@@ -7839,14 +7869,15 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             for reg_idx in it.by_ref() {
-                self.expect_liveness_item_bank(
+                crate::blackhole::expect_liveness_bank(
                     &bh.jitcode.name,
                     bh.position,
                     majit_ir::Type::Int,
                     reg_idx,
                     bh.jitcode.num_regs_i(),
                 );
-                bh.registers_i[reg_idx as usize] = self.next_int();
+                let value = self.next_live_int(&bh.jitcode.name, bh.position, reg_idx);
+                bh.registers_i[reg_idx as usize] = value;
             }
             offset = it.offset;
         }
@@ -7854,14 +7885,14 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for reg_idx in it.by_ref() {
-                self.expect_liveness_item_bank(
+                crate::blackhole::expect_liveness_bank(
                     &bh.jitcode.name,
                     bh.position,
                     majit_ir::Type::Ref,
                     reg_idx,
                     bh.jitcode.num_regs_r(),
                 );
-                let value = self.next_ref_for_resume_slot();
+                let value = self.next_live_ref(&bh.jitcode.name, bh.position, reg_idx);
                 bh.registers_r[reg_idx as usize] = value;
                 if let Some(vinfo) = vinfo_heap {
                     vinfo.push_resume_ref_roots_for_value(value);
@@ -7873,14 +7904,15 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             for reg_idx in it {
-                self.expect_liveness_item_bank(
+                crate::blackhole::expect_liveness_bank(
                     &bh.jitcode.name,
                     bh.position,
                     majit_ir::Type::Float,
                     reg_idx,
                     bh.jitcode.num_regs_f(),
                 );
-                bh.registers_f[reg_idx as usize] = self.next_float();
+                let value = self.next_live_float(&bh.jitcode.name, bh.position, reg_idx);
+                bh.registers_f[reg_idx as usize] = value;
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;
@@ -7923,14 +7955,14 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             for reg_idx in it.by_ref() {
-                self.expect_liveness_item_bank(
+                crate::blackhole::expect_liveness_bank(
                     jitcode_name,
                     pc,
                     majit_ir::Type::Int,
                     reg_idx,
                     num_regs.0,
                 );
-                let value = self.next_int();
+                let value = self.next_live_int(jitcode_name, pc, reg_idx);
                 cb(majit_ir::Type::Int, reg_idx, value);
             }
             offset = it.offset;
@@ -7939,14 +7971,14 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for reg_idx in it.by_ref() {
-                self.expect_liveness_item_bank(
+                crate::blackhole::expect_liveness_bank(
                     jitcode_name,
                     pc,
                     majit_ir::Type::Ref,
                     reg_idx,
                     num_regs.1,
                 );
-                let value = self.next_ref_for_resume_slot();
+                let value = self.next_live_ref(jitcode_name, pc, reg_idx);
                 cb(majit_ir::Type::Ref, reg_idx, value);
             }
             offset = it.offset;
@@ -7955,14 +7987,14 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             for reg_idx in it {
-                self.expect_liveness_item_bank(
+                crate::blackhole::expect_liveness_bank(
                     jitcode_name,
                     pc,
                     majit_ir::Type::Float,
                     reg_idx,
                     num_regs.2,
                 );
-                let value = self.next_float();
+                let value = self.next_live_float(jitcode_name, pc, reg_idx);
                 cb(majit_ir::Type::Float, reg_idx, value);
             }
             // `offset` is the end of the float section; no further use.
@@ -9362,11 +9394,19 @@ pub fn force_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
+    numb_root: Option<&'a majit_ir::NumberingRef>,
 ) -> (Vec<i64>, Vec<i64>, i64) {
     let _bh_phase = majit_gc::BhProbePhase::enter("resume");
     // resume.py:1346
     profiler.count(crate::pyjitpl::counters::FORCE_VIRTUALIZABLES, 1);
     // resume.py:1347-1348
+    // Slice the numbering here, not at the caller. The caller may
+    // allocate before this call, and a minor would then decode the
+    // header from a stale slice while the bind below reloads the rest.
+    let rd_numb = match numb_root {
+        Some(numb) => numb.as_slice(),
+        None => rd_numb,
+    };
     let mut resumereader = ResumeDataDirectReader::new(
         rd_numb,
         rd_consts,
@@ -9376,6 +9416,9 @@ pub fn force_from_resumedata<'a>(
         None,
         allocator,
     );
+    if let Some(numb) = numb_root {
+        resumereader.resumecodereader.bind_numbering(numb);
+    }
     // resume.py common-case __init__ calls self._prepare(storage)
     // before handling_async_forcing() flips the GUARD_NOT_FORCED state.
     //

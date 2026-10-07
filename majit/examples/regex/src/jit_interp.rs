@@ -196,8 +196,13 @@ fn mainloop(
 /// loop cache survive across calls. The lowered regex is a ref green, matching
 /// `marked.py`'s module-level `JitDriver(greens=['re'])`.
 pub struct Matcher {
+    /// Dropped before `driver`, so the extra root area retires while the
+    /// driver allocation is still alive.
+    root_area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
     root: *mut NodeRec,
-    driver: JitDriver<MatchState>,
+    /// Heap allocation. `register_gc_roots` publishes this address, and
+    /// moving `Matcher` moves the `Box`, not the driver.
+    driver: Box<JitDriver<MatchState>>,
 }
 
 unsafe fn walk_match_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -206,21 +211,23 @@ unsafe fn walk_match_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit_i
 }
 
 impl Matcher {
-    /// `rd_consts` area for this portal's driver. `NUMBERING` lives in
-    /// the same walk. Call once the `Matcher` will not move.
-    pub fn register_gc_roots(&self) {
-        unsafe {
-            majit_gc::shadow_stack::register_mutator_extra_area(
+    /// Register this portal's `NUMBERING` walk. The area retires when
+    /// `self` drops. The published address is the heap driver, so moving
+    /// `self` leaves the callback's `data` pointer valid.
+    pub fn register_gc_roots(&mut self) {
+        let data = std::ptr::addr_of_mut!(*self.driver) as *const ();
+        self.root_area = Some(unsafe {
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::permanent(
                 walk_match_roots,
-                &self.driver as *const JitDriver<MatchState> as *const (),
-                "rd_consts",
-            );
-        }
+                data,
+                "rd_numb",
+            )
+        });
     }
 
     pub fn new(root: *mut NodeRec, threshold: u32) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
-        let mut driver = JitDriver::new(threshold);
+        let mut driver = Box::new(JitDriver::new(threshold));
         majit_metainterp::install_jitframe_gc(&mut driver);
         driver.set_on_compile_loop(|_gk, _before, ops_after, opcodes| {
             COMPILES.fetch_add(1, Relaxed);
@@ -248,7 +255,11 @@ impl Matcher {
             .build_meta(0, &PROGRAM)
             .install_canonical_liveness(&mut driver);
         }
-        Self { root, driver }
+        Self {
+            root_area: None,
+            root,
+            driver,
+        }
     }
 
     pub fn matches(&mut self, s: &[u8]) -> bool {
@@ -401,6 +412,30 @@ mod tests {
             COMPILES.load(Ordering::Relaxed),
             after_first,
             "a second call rebuilt the regex's JitDriver cell instead of reusing it",
+        );
+    }
+
+    /// `register_gc_roots` publishes `*driver`. A later move of `Matcher` must
+    /// keep that address: the callback holds it until the guard drops.
+    #[test]
+    fn registered_driver_address_is_stable_across_a_move() {
+        struct RegisteredMutator;
+        impl Drop for RegisteredMutator {
+            fn drop(&mut self) {
+                majit_gc::shadow_stack::unregister_mutator();
+            }
+        }
+        majit_gc::shadow_stack::register_mutator();
+        let _thread = RegisteredMutator;
+        let root = lower(&bench_regex(1));
+        let mut matcher = Matcher::new(root, 3);
+        matcher.register_gc_roots();
+        let published = std::ptr::addr_of!(*matcher.driver) as usize;
+        let matcher = Box::new(matcher);
+        assert_eq!(
+            published,
+            std::ptr::addr_of!(*matcher.driver) as usize,
+            "register_gc_roots publishes the heap driver, which a move leaves in place",
         );
     }
 

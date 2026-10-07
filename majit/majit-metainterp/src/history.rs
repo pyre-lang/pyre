@@ -2557,17 +2557,17 @@ impl TraceCtx {
     pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
         if self.recorder.has_byte_buffer() {
             // `history.py` `capture_resumedata` encodes the live `Const`
-            // boxes. pyre has already copied their gcrefs into
-            // `SnapshotTagged::Const`. Encoding grows `_snapshot_data` and
-            // can minor-collect between boxes. `walk_active_trace_refs`
-            // forwards `self.snapshots` and nothing else sees this copy, so
-            // the snapshot has to sit there for the encode. A word read
-            // after a box's append is then the forwarded address, which is
-            // what the next `ConstPtr` intern stores. Dropped after, same
-            // as this byte-mode path: the byte stream is the record.
+            // boxes. A ref `SnapshotTagged::Const` is a table index.
+            // `walk_const_ptr_refs` traces that index; the word itself
+            // does not move. Encoding can minor-collect between boxes,
+            // so the snapshot stays in `self.snapshots` for that walk.
+            // `snapshot_tagged_to_box` resolves each index immediately
+            // before `_encode`. Dropped after: the byte stream is the
+            // record.
             self.snapshots.push(snapshot);
-            let snap = self.snapshots.last().unwrap() as *const crate::recorder::Snapshot;
-            let id = self.recorder.encode_captured_snapshot(unsafe { &*snap });
+            let id = self
+                .recorder
+                .encode_captured_snapshot(self.snapshots.last().unwrap());
             self.snapshots.clear();
             return id;
         }
@@ -2891,10 +2891,17 @@ impl TraceCtx {
                     )
                 });
                 if opref.is_constant() {
-                    let value = self.constant_value(*opref).expect(
-                        "capture_snapshot_for_last_guard: constant OpRef missing recorded value",
-                    );
-                    crate::recorder::SnapshotTagged::Const(value, tp)
+                    if let Some(index) = opref.const_ptr_index() {
+                        crate::recorder::SnapshotTagged::Const(
+                            i64::from(index),
+                            majit_ir::Type::Ref,
+                        )
+                    } else {
+                        let value = self.constant_value(*opref).expect(
+                            "capture_snapshot_for_last_guard: constant OpRef missing recorded value",
+                        );
+                        crate::recorder::SnapshotTagged::Const(value, tp)
+                    }
                 } else {
                     crate::recorder::SnapshotTagged::Box(*opref, tp)
                 }

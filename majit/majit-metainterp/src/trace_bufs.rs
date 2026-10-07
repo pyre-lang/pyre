@@ -15,12 +15,29 @@ use majit_ir::GcRef;
 
 const WORD: usize = std::mem::size_of::<usize>();
 
+/// Bytes before the first item. The length word is one `usize`. On wasm32
+/// that is 4 bytes, while `_bigints` / `_floats` store `i64` / `u64`.
+/// The item pointer has to meet `align_of::<T>()`, and the registered
+/// varsize `base_size` is this same offset.
+fn items_offset<T>() -> usize {
+    let align = std::mem::align_of::<T>().max(std::mem::align_of::<usize>());
+    WORD.div_ceil(align) * align
+}
+
+fn host_align<T>() -> usize {
+    std::mem::align_of::<T>().max(std::mem::align_of::<usize>())
+}
+
 fn gc_installed() -> bool {
     majit_gc::current_thread_gc_available()
 }
 
 fn host_layout(payload: usize) -> std::alloc::Layout {
-    std::alloc::Layout::from_size_align(payload, std::mem::align_of::<usize>())
+    host_layout_aligned(payload, std::mem::align_of::<usize>())
+}
+
+fn host_layout_aligned(payload: usize, align: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(payload, align)
         .unwrap_or_else(|_| std::alloc::Layout::new::<usize>())
 }
 
@@ -34,10 +51,23 @@ fn host_alloc(payload: usize) -> *mut u8 {
 }
 
 fn host_free(ptr: *mut u8, payload: usize) {
+    host_free_aligned(ptr, payload, std::mem::align_of::<usize>());
+}
+
+fn host_alloc_aligned(payload: usize, align: usize) -> *mut u8 {
+    let layout = host_layout_aligned(payload, align);
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    ptr
+}
+
+fn host_free_aligned(ptr: *mut u8, payload: usize, align: usize) {
     if ptr.is_null() {
         return;
     }
-    unsafe { std::alloc::dealloc(ptr, host_layout(payload)) };
+    unsafe { std::alloc::dealloc(ptr, host_layout_aligned(payload, align)) };
 }
 
 fn list_overallocate(newsize: usize) -> usize {
@@ -74,7 +104,7 @@ pub(crate) fn register_trace_pool_gc_types(gc: &mut dyn majit_gc::GcAllocator) {
     ));
     TRACE_LIST_HDR_GC_TYPE_ID.store(hdr, std::sync::atomic::Ordering::Release);
     let word = gc.register_type(majit_gc::trace::TypeInfo::varsize(
-        WORD,
+        items_offset::<u64>(),
         std::mem::size_of::<u64>(),
         0,
         false,
@@ -82,7 +112,7 @@ pub(crate) fn register_trace_pool_gc_types(gc: &mut dyn majit_gc::GcAllocator) {
     ));
     TRACE_WORD_GC_TYPE_ID.store(word, std::sync::atomic::Ordering::Release);
     let refs = gc.register_type(majit_gc::trace::TypeInfo::varsize(
-        WORD,
+        items_offset::<usize>(),
         std::mem::size_of::<usize>(),
         0,
         true,
@@ -384,7 +414,19 @@ impl<T: Copy> WordArray<T> {
             "word array index {index} len {}",
             self.len
         );
+        // Same barrier as `push`. A `GCREF` store into an old or
+        // external array has to be remembered; `set` is the other
+        // store on this array.
+        self.write_barrier_if_rooted();
         unsafe { *self.item_ptr().add(index) = value };
+    }
+
+    fn write_barrier_if_rooted(&self) {
+        if self.gc_ptrs
+            && let Some(guard) = &self.root
+        {
+            majit_gc::gc_write_barrier(guard.get());
+        }
     }
 
     fn addr(&self) -> *mut u8 {
@@ -396,7 +438,7 @@ impl<T: Copy> WordArray<T> {
     }
 
     fn item_ptr(&self) -> *mut T {
-        unsafe { self.addr().add(WORD) as *mut T }
+        unsafe { self.addr().add(items_offset::<T>()) as *mut T }
     }
 
     /// Append. Returns the stored value: a `GCREF` may have been forwarded
@@ -405,11 +447,7 @@ impl<T: Copy> WordArray<T> {
         if self.len == self.cap {
             return self.grow_push(value);
         }
-        if self.gc_ptrs
-            && let Some(guard) = &self.root
-        {
-            majit_gc::gc_write_barrier(guard.get());
-        }
+        self.write_barrier_if_rooted();
         unsafe { *self.item_ptr().add(self.len) = value };
         self.len += 1;
         value
@@ -432,7 +470,9 @@ impl<T: Copy> WordArray<T> {
     }
 
     fn realloc_keeping(&mut self, new_cap: usize, extra: Option<T>) -> T {
-        let payload = WORD + new_cap * std::mem::size_of::<T>();
+        let offset = items_offset::<T>();
+        let align = host_align::<T>();
+        let payload = offset + new_cap * std::mem::size_of::<T>();
         let old_len = self.len;
         let placeholder = extra.unwrap_or_else(|| unsafe { std::mem::zeroed() });
         if !gc_installed() {
@@ -440,19 +480,23 @@ impl<T: Copy> WordArray<T> {
                 self.root.is_none(),
                 "host trace word array used while a GC is installed"
             );
-            let ptr = host_alloc(payload);
+            let ptr = host_alloc_aligned(payload, align);
             unsafe {
                 *(ptr as *mut usize) = new_cap;
                 if old_len > 0 {
                     std::ptr::copy_nonoverlapping(
                         self.item_ptr(),
-                        ptr.add(WORD) as *mut T,
+                        ptr.add(offset) as *mut T,
                         old_len,
                     );
                 }
             }
             if !self.host.is_null() {
-                host_free(self.host, WORD + self.cap * std::mem::size_of::<T>());
+                host_free_aligned(
+                    self.host,
+                    offset + self.cap * std::mem::size_of::<T>(),
+                    align,
+                );
             }
             self.host = ptr;
             self.cap = new_cap;
@@ -497,9 +541,12 @@ impl<T: Copy> WordArray<T> {
         };
         unsafe {
             *(fresh.0 as *mut usize) = new_cap;
-            let dst = (fresh.0 as *mut u8).add(WORD) as *mut T;
+            if offset > WORD {
+                std::ptr::write_bytes((fresh.0 as *mut u8).add(WORD), 0, offset - WORD);
+            }
+            let dst = (fresh.0 as *mut u8).add(offset) as *mut T;
             if roots[0].0 != 0 && old_len > 0 {
-                let src = (roots[0].0 as *const u8).add(WORD) as *const T;
+                let src = (roots[0].0 as *const u8).add(offset) as *const T;
                 std::ptr::copy_nonoverlapping(src, dst, old_len);
             }
             if new_cap > old_len {
@@ -531,7 +578,11 @@ impl<T: Copy> Drop for WordArray<T> {
         if self.root.is_some() || self.host.is_null() {
             return;
         }
-        host_free(self.host, WORD + self.cap * std::mem::size_of::<T>());
+        host_free_aligned(
+            self.host,
+            items_offset::<T>() + self.cap * std::mem::size_of::<T>(),
+            host_align::<T>(),
+        );
         self.host = std::ptr::null_mut();
     }
 }
@@ -578,4 +629,18 @@ pub fn new_floats() -> WordArray<u64> {
 
 pub fn new_snapshot() -> CharList {
     CharList::with_capacity(128)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::items_offset;
+
+    #[test]
+    fn sixty_four_bit_items_clear_their_alignment() {
+        let align = std::mem::align_of::<i64>().max(std::mem::size_of::<usize>());
+        assert_eq!(items_offset::<i64>() % align, 0);
+        assert_eq!(items_offset::<u64>(), items_offset::<i64>());
+        assert!(items_offset::<i64>() >= std::mem::size_of::<usize>());
+        assert_eq!(items_offset::<usize>() % std::mem::align_of::<usize>(), 0);
+    }
 }

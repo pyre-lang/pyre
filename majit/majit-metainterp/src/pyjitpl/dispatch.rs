@@ -1326,6 +1326,43 @@ fn refuse_walk_local_ref_args(
     Some(TraceAction::Abort)
 }
 
+/// Root for a residual Ref result across `history.py` `record_nospec`.
+///
+/// `record_nospec` reads `ConstPtr.getref_base` only after `_record_op`.
+/// `opencoder.py` `Trace._double_ops` can minor-collect inside that record,
+/// before the frontend slot exists. The shadow stack is the Const's root;
+/// [`Self::word`] is `getref_base` after the record.
+struct ResidualRefRoot {
+    depth: Option<usize>,
+}
+
+impl ResidualRefRoot {
+    fn pin(word: i64) -> Self {
+        if word == 0 {
+            return Self { depth: None };
+        }
+        let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(word as usize));
+        Self { depth: Some(depth) }
+    }
+
+    fn word(&self, fallback: i64) -> i64 {
+        match self.depth {
+            Some(depth) => majit_gc::shadow_stack::get(depth).0 as i64,
+            None => fallback,
+        }
+    }
+}
+
+impl Drop for ResidualRefRoot {
+    fn drop(&mut self) {
+        if let Some(depth) = self.depth.take() {
+            // `try_pop_to` saturates: a panic already unwinding must not
+            // assert in this drop and hide the original report.
+            majit_gc::shadow_stack::try_pop_to(depth);
+        }
+    }
+}
+
 fn host_requested_walk_abort(
     ctx: &mut TraceCtx,
     func: usize,

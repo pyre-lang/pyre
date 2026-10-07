@@ -197,8 +197,14 @@ impl Writer {
 /// resumecode.py: Reader
 pub struct Reader<'a> {
     code: &'a [u8],
-    /// When set, every read reloads `code` from this walked slot.
+    /// When set, reads come from this numbering's payload.
     numb: Option<&'a NumberingRef>,
+    /// Payload bytes of `numb` at `cached_epoch`. Null until the first load.
+    cached_ptr: *const u8,
+    cached_len: usize,
+    /// [`numbering_payload_epoch`] observed when `cached_ptr` was loaded.
+    /// `0` is never published, so a fresh reader always reloads.
+    cached_epoch: u64,
     pub cur_pos: usize,
     pub items_read: usize,
 }
@@ -208,40 +214,104 @@ impl<'a> Reader<'a> {
         Reader {
             code,
             numb: None,
+            cached_ptr: std::ptr::null(),
+            cached_len: 0,
+            cached_epoch: 0,
             cur_pos: 0,
             items_read: 0,
         }
     }
 
-    /// Reads go through `numb`, reloaded on every item.
+    /// Subsequent reads follow `numb` across a minor.
+    ///
+    /// `resumecode.py` `Reader.next_item` calls `numb_next_item`, which
+    /// loads `numb.code[index]` from the GC pointer. The pointer is
+    /// stable until a collection. Reload when
+    /// [`numbering_payload_epoch`] changes — that is
+    /// `bump_minor_epoch` — rather than on every item.
     pub fn bind_numbering(&mut self, numb: &'a NumberingRef) {
         self.numb = Some(numb);
+        self.cached_ptr = std::ptr::null();
+        self.cached_len = 0;
+        self.cached_epoch = 0;
     }
 
     pub fn from_numbering(numb: &'a NumberingRef) -> Self {
         Reader {
             code: &[],
             numb: Some(numb),
+            cached_ptr: std::ptr::null(),
+            cached_len: 0,
+            cached_epoch: 0,
             cur_pos: 0,
             items_read: 0,
         }
     }
 
+    /// Payload for one `numb_next_item`. A matching epoch means no minor
+    /// has run since the pointer was loaded (`bump_minor_epoch` publishes
+    /// the new epoch before the mutator resumes).
+    #[inline]
+    fn ensure_cache(&mut self) {
+        if self.numb.is_none() {
+            return;
+        }
+        let epoch = numbering_payload_epoch();
+        if epoch == self.cached_epoch {
+            return;
+        }
+        let addr = self.numb.unwrap().payload_addr();
+        let (ptr, len) = if addr == 0 {
+            (std::ptr::null(), 0)
+        } else {
+            // Same header `as_slice` reads: length word, then bytes.
+            let len = unsafe { *(addr as *const usize) };
+            let ptr = unsafe { (addr as *const u8).add(numb_len_word()) };
+            (ptr, len)
+        };
+        self.cached_ptr = ptr;
+        self.cached_len = len;
+        self.cached_epoch = epoch;
+    }
+
+    #[inline]
+    fn buf(&mut self) -> &[u8] {
+        if self.numb.is_some() {
+            self.ensure_cache();
+            if self.cached_ptr.is_null() {
+                return &[];
+            }
+            // SAFETY: `ensure_cache` loaded this pointer at the current
+            // payload epoch. `next_item` / `jump` do not allocate, so a
+            // minor cannot move the payload before this slice is dropped.
+            unsafe { std::slice::from_raw_parts(self.cached_ptr, self.cached_len) }
+        } else {
+            self.code
+        }
+    }
+
     fn bytes(&self) -> &[u8] {
         if let Some(numb) = self.numb {
+            if self.cached_epoch == numbering_payload_epoch() {
+                if self.cached_ptr.is_null() {
+                    return &[];
+                }
+                // SAFETY: same epoch contract as `buf`.
+                return unsafe { std::slice::from_raw_parts(self.cached_ptr, self.cached_len) };
+            }
             numb.as_slice()
         } else {
             self.code
         }
     }
 
-    /// resumecode.py: next_item
-    #[inline]
+    /// resumecode.py: next_item / `numb_next_item` (always inline).
+    #[inline(always)]
     pub fn next_item(&mut self) -> i32 {
-        let (result, new_pos) = if let Some(numb) = self.numb {
-            decode_varint(numb.as_slice(), self.cur_pos)
-        } else {
-            decode_varint(self.code, self.cur_pos)
+        let pos = self.cur_pos;
+        let (result, new_pos) = {
+            let buf = self.buf();
+            decode_varint(buf, pos)
         };
         self.cur_pos = new_pos;
         self.items_read += 1;
@@ -257,10 +327,10 @@ impl<'a> Reader<'a> {
     /// resumecode.py: jump — skip n items forward
     pub fn jump(&mut self, size: usize) {
         for _ in 0..size {
-            let (_, new_pos) = if let Some(numb) = self.numb {
-                decode_varint(numb.as_slice(), self.cur_pos)
-            } else {
-                decode_varint(self.code, self.cur_pos)
+            let pos = self.cur_pos;
+            let (_, new_pos) = {
+                let buf = self.buf();
+                decode_varint(buf, pos)
             };
             self.cur_pos = new_pos;
         }
@@ -290,9 +360,17 @@ static NUMBERING_PIN: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 static NUMBERING_READ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static NUMBERING_WRITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static NUMBERING_UNPIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// `fn() -> u64`. `minor_epoch`: the cached payload address is valid
-/// until the next minor. Absent means every read goes through `read`.
+/// `fn() -> u64`. `register_trace_ops_gc_type` still publishes
+/// `minor_epoch` here. Payload caching does not call it: the
+/// generation is [`numbering_payload_epoch`], advanced from
+/// `bump_minor_epoch` so a resume item is one relaxed load.
+#[allow(dead_code)]
 static NUMBERING_EPOCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Bumped with `minor_epoch`. `0` is reserved so a `Reader` whose
+/// `cached_epoch` is still 0 always reloads. The counter starts at 1
+/// and skips 0 if it wraps.
+static NUMBERING_PAYLOAD_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub fn set_numbering_root_hooks(
     pin: fn(usize) -> usize,
@@ -310,6 +388,30 @@ pub fn set_numbering_epoch(hook: fn() -> u64) {
     NUMBERING_EPOCH.store(hook as usize, std::sync::atomic::Ordering::Release);
 }
 
+/// Current numbering-payload generation. Matches `minor_epoch` in
+/// lockstep: `bump_minor_epoch` calls [`bump_numbering_payload_epoch`].
+#[inline]
+pub fn numbering_payload_epoch() -> u64 {
+    NUMBERING_PAYLOAD_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Invalidate cached numbering payload pointers. One minor, one bump.
+pub fn bump_numbering_payload_epoch() {
+    let prev = NUMBERING_PAYLOAD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if prev == u64::MAX - 1 {
+        // Wrapped to 0, which `Reader` treats as "not loaded".
+        NUMBERING_PAYLOAD_EPOCH.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `true` after `register_trace_ops_gc_type` installed the owner-root
+/// pin. Each nursery `NUMBERING` then lives in that slot for its whole
+/// `NumberingRef` lifetime, and `walk_roots` is the minor edge.
+#[inline]
+pub fn numbering_owner_rooted() -> bool {
+    NUMBERING_PIN.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
 fn call_numbering_pin(addr: usize) -> Option<usize> {
     let bits = NUMBERING_PIN.load(std::sync::atomic::Ordering::Acquire);
     if bits == 0 {
@@ -323,15 +425,6 @@ fn call_numbering_read(slot: usize) -> usize {
     let bits = NUMBERING_READ.load(std::sync::atomic::Ordering::Acquire);
     let hook: fn(usize) -> usize = unsafe { std::mem::transmute(bits) };
     hook(slot)
-}
-
-fn call_numbering_epoch() -> Option<u64> {
-    let bits = NUMBERING_EPOCH.load(std::sync::atomic::Ordering::Acquire);
-    if bits == 0 {
-        return None;
-    }
-    let hook: fn() -> u64 = unsafe { std::mem::transmute(bits) };
-    Some(hook())
 }
 
 fn call_numbering_write(slot: usize, addr: usize) {
@@ -443,21 +536,20 @@ impl NumberingRef {
     pub fn payload_addr(&self) -> usize {
         let slot = unsafe { self.slot.as_ref() };
         if slot.root != usize::MAX {
-            // `numb_next_item` re-reads on every item. The owner-root
-            // cell changes only in a minor (`minor_epoch`), so the
-            // mutator keeps the address it last published and re-reads
-            // `get_owner_root` once per minor, not once per item.
-            if let Some(epoch) = call_numbering_epoch() {
-                if slot.seen_epoch.load(std::sync::atomic::Ordering::Relaxed) == epoch {
-                    return unsafe { *slot.addr.get() };
-                }
-                let addr = call_numbering_read(slot.root);
-                unsafe { *slot.addr.get() = addr };
-                slot.seen_epoch
-                    .store(epoch, std::sync::atomic::Ordering::Relaxed);
-                return addr;
+            // The owner-root cell changes only in a minor. `Reader`
+            // keeps the byte pointer across items; this cache is the
+            // reload those readers share. `numbering_payload_epoch`
+            // advances in `bump_minor_epoch`, so a match means the
+            // address last published is still the object's address.
+            let epoch = numbering_payload_epoch();
+            if slot.seen_epoch.load(std::sync::atomic::Ordering::Relaxed) == epoch {
+                return unsafe { *slot.addr.get() };
             }
-            return call_numbering_read(slot.root);
+            let addr = call_numbering_read(slot.root);
+            unsafe { *slot.addr.get() = addr };
+            slot.seen_epoch
+                .store(epoch, std::sync::atomic::Ordering::Relaxed);
+            return addr;
         }
         unsafe { *slot.addr.get() }
     }
@@ -632,5 +724,22 @@ mod tests {
         assert_eq!(a.as_slice(), bytes.as_slice());
         let b = a.clone();
         assert!(NumberingRef::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn reader_follows_numbering_across_a_payload_epoch() {
+        // Host block: a minor does not move it. The reader must still
+        // drop its cached pointer when the epoch bumps and read the
+        // same bytes afterwards. `resumecode.py` `numb_next_item`.
+        let numb = create_numbering(&[1, -2, 3, 64]);
+        let mut reader = Reader::from_numbering(&numb);
+        assert_eq!(reader.next_item(), 1);
+        bump_numbering_payload_epoch();
+        assert_eq!(reader.peek(), -2);
+        assert_eq!(reader.next_item(), -2);
+        assert_eq!(reader.next_item(), 3);
+        reader.jump(1);
+        assert!(!reader.has_more());
+        assert_eq!(reader.items_read, 4);
     }
 }

@@ -4873,8 +4873,8 @@ impl TraceCtx {
     /// Each box is an `InputArg*` / `*FrontendOp` / `Const*` that carries its
     /// own value. `InputArg*` and `*FrontendOp` refs are forwarded by the
     /// recorder walk (`walk_active_trace_refs` visits `inputargs` and
-    /// `value_slots`); this walk rewrites `ConstPtr` gcrefs that live in the
-    /// box list itself, then forwards `virtualizable_heap_ptr`. The trailing
+    /// `value_slots`); this walk traces `ConstPtr` indexes the vable box
+    /// list still holds, then forwards `virtualizable_heap_ptr`. The trailing
     /// identity is `virtualizable_boxes[-1]`; a bridge must keep that rebuilt
     /// frame identity live instead of falling back to an older cached
     /// portal-frame pointer.

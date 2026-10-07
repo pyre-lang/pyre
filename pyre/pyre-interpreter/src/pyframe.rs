@@ -4678,28 +4678,47 @@ impl PyFrame {
     /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
     /// STORE_GLOBAL records as deferred IR, applied exactly once).
     fn build_snapshot_frame(&self, allocation: FrameLocalsArrayAllocation) -> PyFrame {
+        // `alloc_frame_locals_array` and `clone_debugdata_ptr` can minor-collect.
+        // `FrameAnchor` is the shadow-stack slot the collector rewrites
+        // (`FrameRoot` on the bridge path is the same slot). `live()` is that
+        // slot after the allocation. `FixedObjectArray.len` is payload offset
+        // 0, the word `GcHeader::set_forwarding_address` also stores, so the
+        // length is read only from the reloaded frame. The caller has to pass
+        // the live object: anchoring a corpse does not recover the survivor.
+        let anchor =
+            unsafe { crate::eval::FrameAnchor::from_raw(self as *const Self as *mut PyFrame) };
+        let n = unsafe {
+            let arr = (*anchor.live()).locals_cells_stack_w;
+            if arr.is_null() { 0 } else { (*arr).len }
+        };
+        let array = unsafe { alloc_frame_locals_array(n, PY_NULL, allocation) };
+        unsafe {
+            let src = (*anchor.live()).locals_cells_stack_w;
+            if !src.is_null() {
+                let items = (*src).as_slice();
+                let dst = (*array).items_mut_ptr();
+                for (i, &value) in items.iter().take(n).enumerate() {
+                    dst.add(i).write(value);
+                }
+            }
+            remember_frame_locals_array(array);
+        }
+        let debugdata = unsafe { clone_debugdata_ptr((*anchor.live()).debugdata, allocation) };
+        let frame = unsafe { &*anchor.live() };
         PyFrame {
             ob_header: frame_ob_header(),
-            pycode: self.pycode,
-            locals_cells_stack_w: unsafe {
-                let values = locals_w!(self).to_vec();
-                let array = alloc_frame_locals_array(values.len(), PY_NULL, allocation);
-                for (i, value) in values.into_iter().enumerate() {
-                    (*array).items_mut_ptr().add(i).write(value);
-                }
-                remember_frame_locals_array(array);
-                array
-            },
-            valuestackdepth: self.valuestackdepth,
-            last_instr: self.last_instr,
-            flags: self.flags,
-            failed_attr_cleanup: self.failed_attr_cleanup,
-            debugdata: unsafe { clone_debugdata_ptr(self.debugdata, allocation) },
-            vable_token: self.vable_token,
-            f_generator_wref: self.f_generator_wref,
-            w_yielding_from: self.w_yielding_from,
-            f_backref: self.f_backref,
-            w_builtin: self.w_builtin,
+            pycode: frame.pycode,
+            locals_cells_stack_w: array,
+            valuestackdepth: frame.valuestackdepth,
+            last_instr: frame.last_instr,
+            flags: frame.flags,
+            failed_attr_cleanup: frame.failed_attr_cleanup,
+            debugdata,
+            vable_token: frame.vable_token,
+            f_generator_wref: frame.f_generator_wref,
+            w_yielding_from: frame.w_yielding_from,
+            f_backref: frame.f_backref,
+            w_builtin: frame.w_builtin,
         }
     }
 

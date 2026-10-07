@@ -1166,6 +1166,7 @@ impl UnrollOptimizer {
                         short_box_producer_roots: Vec::new(),
                         rooted_refs: Vec::new(),
                         rooted_const_ptr_slots: Vec::new(),
+                        const_ptr_root: None,
                         shadow_stack_base: 0,
                     };
                     final_exported_state.root_all_gcrefs();
@@ -1772,6 +1773,17 @@ impl UnrollOptimizer {
             imported_short_preamble_builder.as_ref(),
         );
         self.target_tokens.push(target_token);
+        // `publish_const_ptr_root` dies with `imported_loop_state`. The loop
+        // token outlives that compile; keep the deduped indexes registered
+        // on its virtual state until the token drops.
+        if let Some(state) = opt_p2.imported_loop_state.as_ref() {
+            let indexes = state.const_ptr_indexes();
+            if let Some(token) = self.target_tokens.last_mut()
+                && let Some(virtual_state) = token.virtual_state.as_mut()
+            {
+                virtual_state.retain_const_ptr_indexes(&indexes);
+            }
+        }
         opt_p2.short_preamble_producer = short_preamble_producer;
 
         if crate::majit_log_enabled() {
@@ -2561,8 +2573,59 @@ pub struct ExportedState {
     /// normal Const object attributes; pyre records the walk order and copies
     /// the forwarded values back in `refresh_from_gc`.
     rooted_const_ptr_slots: Vec<usize>,
+    /// Live `ConstPtr` indexes, traced by the minor's `drag_out_root`.
+    ///
+    /// The shadow-stack copies above are updated before `Wave::enter` and
+    /// are not the table. `Operand::from_opref` re-interns `resolve` before
+    /// `refresh_from_gc`, so a minor must `trace_index` these slots in the
+    /// extra-root walk or the table keeps the nursery address.
+    const_ptr_root: Option<ExportedConstPtrRoot>,
     /// Shadow stack depth at creation. release_roots pops to here.
     shadow_stack_base: usize,
+}
+
+/// Heap list of `ConstPtr` indexes. The extra-area pointer is
+/// `Box::into_raw` provenance, so moving `ExportedState` does not stale it.
+struct ExportedConstPtrIndexes {
+    indexes: Vec<u32>,
+}
+
+/// Drops the extra area before freeing [`ExportedConstPtrIndexes`].
+/// Mutator-lifetime: a token-held `ExportedState` outlives `thread_die`.
+struct ExportedConstPtrRoot {
+    area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
+    indexes: *mut ExportedConstPtrIndexes,
+}
+
+impl std::fmt::Debug for ExportedConstPtrRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let indexes: &[u32] = if self.indexes.is_null() {
+            &[]
+        } else {
+            unsafe { (*self.indexes).indexes.as_slice() }
+        };
+        f.debug_struct("ExportedConstPtrRoot")
+            .field("indexes", &indexes)
+            .finish()
+    }
+}
+
+impl Drop for ExportedConstPtrRoot {
+    fn drop(&mut self) {
+        // Unregister before freeing. A walk in between would use the list.
+        self.area.take();
+        if !self.indexes.is_null() {
+            unsafe { drop(Box::from_raw(self.indexes)) };
+            self.indexes = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe fn walk_exported_const_ptr_indexes(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+    let roots = unsafe { &*(data as *const ExportedConstPtrIndexes) };
+    for &index in &roots.indexes {
+        majit_ir::const_ptr_table::trace_index(index, visitor);
+    }
 }
 
 // unroll.py `exported_infos - a mapping from ops to infos, including inputargs`
@@ -2647,6 +2710,7 @@ impl ExportedState {
             short_box_producer_roots: Vec::new(),
             rooted_refs: Vec::new(),
             rooted_const_ptr_slots: Vec::new(),
+            const_ptr_root: None,
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
         // gcreftracer.py parity: RPython ExportedState is a Python object
@@ -2772,7 +2836,9 @@ impl ExportedState {
     }
 
     pub fn has_shadow_roots(&self) -> bool {
-        !self.rooted_refs.is_empty() || !self.rooted_const_ptr_slots.is_empty()
+        !self.rooted_refs.is_empty()
+            || !self.rooted_const_ptr_slots.is_empty()
+            || self.const_ptr_root.is_some()
     }
 
     /// Smallest fresh OpRef that is guaranteed not to collide with any Box
@@ -2988,11 +3054,69 @@ impl ExportedState {
         }
 
         let mut rooted_const_ptr_slots = Vec::new();
+        let mut const_ptr_addrs = Vec::new();
         self.walk_const_ptr_refs_mut(&mut |slot| {
+            if !slot.is_null() {
+                const_ptr_addrs.push(*slot);
+            }
             let ss_idx = majit_gc::shadow_stack::push(*slot);
             rooted_const_ptr_slots.push(ss_idx);
         });
         self.rooted_const_ptr_slots = rooted_const_ptr_slots;
+        self.publish_const_ptr_root(&const_ptr_addrs);
+    }
+
+    /// Register `addrs` so a minor's extra-root `drag_out_root` writes
+    /// `ConstPtr.value` through `trace_index`.
+    ///
+    /// The shadow-stack copy is a different slot. `refresh_from_gc` copies
+    /// it back later; cranelift snapshot re-interns the table before that.
+    fn publish_const_ptr_root(&mut self, addrs: &[GcRef]) {
+        self.const_ptr_root = None;
+        if addrs.is_empty() || !majit_gc::shadow_stack::mutator_is_registered() {
+            return;
+        }
+        let mut indexes = Vec::with_capacity(addrs.len());
+        for &addr in addrs {
+            if let Some(index) = majit_ir::const_ptr_table::index_of_current(addr) {
+                indexes.push(index);
+            }
+        }
+        if indexes.is_empty() {
+            return;
+        }
+        indexes.sort_unstable();
+        indexes.dedup();
+        let indexes = Box::into_raw(Box::new(ExportedConstPtrIndexes { indexes }));
+        // SAFETY: `indexes` stays allocated until `ExportedConstPtrRoot`'s
+        // drop, which unregisters `area` first. Moving the owner copies the
+        // pointer and does not move the allocation. The walk only reads it.
+        let area = unsafe {
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::permanent(
+                walk_exported_const_ptr_indexes,
+                indexes.cast(),
+                "exported_state",
+            )
+        };
+        self.const_ptr_root = Some(ExportedConstPtrRoot {
+            area: Some(area),
+            indexes,
+        });
+    }
+
+    /// Deduped `ConstPtr` indexes `publish_const_ptr_root` registered.
+    ///
+    /// Empty when that publication declined. The loop token copies this
+    /// list onto its virtual state; the copy outlives this state.
+    fn const_ptr_indexes(&self) -> Vec<u32> {
+        let Some(root) = &self.const_ptr_root else {
+            return Vec::new();
+        };
+        if root.indexes.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: the box lives until this root is dropped. `&self` holds it.
+        unsafe { (*root.indexes).indexes.clone() }
     }
 
     /// Update GcRef values from shadow stack — GC may have moved objects.
@@ -3099,6 +3223,8 @@ impl ExportedState {
 
     /// Release shadow stack roots.
     fn release_roots(&mut self) {
+        // Drop the extra area before popping the shadow-stack copies.
+        self.const_ptr_root = None;
         if !self.rooted_refs.is_empty() || !self.rooted_const_ptr_slots.is_empty() {
             majit_gc::shadow_stack::pop_to(self.shadow_stack_base);
             self.rooted_refs.clear();
@@ -3142,6 +3268,7 @@ impl Clone for ExportedState {
             short_box_producer_roots: self.short_box_producer_roots.clone(),
             rooted_refs: Vec::new(),
             rooted_const_ptr_slots: Vec::new(),
+            const_ptr_root: None,
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
     }

@@ -2092,6 +2092,60 @@ fn paused_python_live<Sym: WalkSym>(
         .and_then(|frame| frame.paused_live())
 }
 
+/// Re-read a paused caller's blackhole image from its rooted register shadow.
+///
+/// `compute_inline_caller_frame` copies `getref_base` (`blackhole.py`
+/// `_copy_data_from_miframe` reads `MIFrame.registers_r`) into a Rust
+/// `Vec`. Seeding the callee then records ops (`history.py` `record` →
+/// `_record_op`) and a minor can run before the image is a
+/// `walk_session_roots` root. The collector updates the box and
+/// `walk_frame_state_roots` updates `concrete_registers_r`; it does not
+/// update that `Vec`. Publishing the copy writes the pre-move address.
+pub(in crate::jitcode_dispatch) fn refresh_paused_parent_blackhole(parent: &mut InlineParentFrame) {
+    let Some(state) = parent.frame_state.clone() else {
+        return;
+    };
+    let data = state.borrow();
+    let Some(blackhole) = parent.blackhole.as_mut() else {
+        return;
+    };
+    for (color, value) in &mut blackhole.ref_values {
+        if let Some(ConcreteValue::Ref(live)) = data.concrete_registers_r.get(*color).copied()
+            && !live.is_null()
+        {
+            *value = live;
+        }
+    }
+}
+
+/// Re-read the paused caller's concrete image immediately before
+/// [`super::InlineFrameGuard`] publishes it. See
+/// [`refresh_paused_parent_blackhole`].
+pub(in crate::jitcode_dispatch) fn refresh_paused_parent_concretes<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent: &mut InlineParentFrame,
+) {
+    refresh_paused_parent_blackhole(parent);
+    // Nested callers leave `call_stack_overrides` empty: their operand
+    // stack is reconstructed from the sym-less banks, and filling it here
+    // would publish slots the original capture deliberately omitted.
+    // A top-level caller has no inlined frame on the session yet.
+    if ctx.session.borrow().last_inline().is_some() {
+        return;
+    }
+    let Some(call_pc) = parent.call_jitcode_pc else {
+        return;
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return;
+    }
+    let caller_sym = unsafe { &*sym_ptr };
+    if let Some(overrides) = collect_call_stack_overrides(caller_sym, ctx, call_pc) {
+        parent.call_stack_overrides = overrides;
+    }
+}
+
 fn capture_inline_parent_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode_index: u32,

@@ -380,34 +380,56 @@ mod tests {
         })
     }
 
-    fn assert_refs(state: &WalkFrameState, word: usize) {
+    fn assert_refs(state: &WalkFrameState, mirror: usize, value: usize) {
         let state = state.borrow();
-        let op = OpRef::const_ptr(GcRef(word));
-        assert_eq!(state.outer_active_boxes, [op]);
-        assert_eq!(state.vstack_boxes, [op]);
-        assert_eq!(state.vstack_last_ref, op);
-        assert_eq!(state.vstack_reorder_saved.as_ref().unwrap().2, [op]);
-        assert_eq!(state.current_exception_seed, Some(op));
+        let op_ok = |op: OpRef| op.as_const_ptr() == Some(GcRef(value));
+        assert_eq!(state.outer_active_boxes.len(), 1);
+        assert!(state.outer_active_boxes.iter().copied().all(op_ok));
+        assert!(state.vstack_boxes.iter().copied().all(op_ok));
+        assert!(op_ok(state.vstack_last_ref));
         assert!(
-            matches!(state.concrete_registers_r[0], ConcreteValue::Ref(p) if p as usize == word)
+            state
+                .vstack_reorder_saved
+                .as_ref()
+                .unwrap()
+                .2
+                .iter()
+                .copied()
+                .all(op_ok)
+        );
+        assert!(op_ok(state.current_exception_seed.unwrap()));
+        assert!(
+            matches!(state.concrete_registers_r[0], ConcreteValue::Ref(p) if p as usize == mirror)
         );
         let shadow = state.callee_shadow.as_ref().unwrap();
-        assert_eq!(shadow.frame_box, op);
-        assert_eq!(shadow.concrete_frame, word);
-        assert_eq!(shadow.opref.get(&0), Some(&op));
+        assert!(op_ok(shadow.frame_box));
+        assert_eq!(shadow.concrete_frame, mirror);
+        assert!(op_ok(*shadow.opref.get(&0).unwrap()));
         assert_eq!(
             shadow.concrete.get(&0).unwrap().value,
-            Value::Ref(GcRef(word))
+            Value::Ref(GcRef(mirror))
         );
-        assert_eq!(state.inline_w_globals, word);
-        assert_eq!(state.inline_w_code, word);
-        assert_eq!(
-            state
-                .list_iter_class_guard_resume
-                .as_ref()
-                .map(|(pc, boxes)| (*pc, boxes.as_slice())),
-            Some((7, [op].as_slice()))
-        );
+        assert_eq!(state.inline_w_globals, mirror);
+        assert_eq!(state.inline_w_code, mirror);
+        // Same ConstPtr index as the other boxes. The resolved address is
+        // `value`; the frame mirrors above stay `mirror`.
+        let resume = state.list_iter_class_guard_resume.as_ref().unwrap();
+        assert_eq!(resume.0, 7);
+        assert_eq!(resume.1.len(), 1);
+        assert!(op_ok(resume.1[0]));
+    }
+
+    fn forward_pair(a: usize, b: usize) {
+        let mut step = |root: &mut GcRef| {
+            if root.0 == a || root.0 == b {
+                root.0 += 0x80;
+            }
+        };
+        // Live holders trace their indexes. The table walk still
+        // forwards a slot whose holder was dropped. One wave, one write.
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        majit_gc::shadow_stack::walk_my_extra_areas(&mut step);
+        majit_ir::const_ptr_table::walk(&mut step);
     }
 
     #[test]
@@ -419,31 +441,27 @@ mod tests {
         ];
         let _runtime = crate::trace_ctx_for_test(0);
         let _stw = majit_gc::gc_sync::quiesce_mutators();
-        let outer = state_with_refs(BASE + 0x1000);
-        let inner = state_with_refs(BASE + 0x2000);
+        let outer_addr = BASE + 0x1000;
+        let inner_addr = BASE + 0x2000;
+        let outer = state_with_refs(outer_addr);
+        let inner = state_with_refs(inner_addr);
         let paused = outer.clone();
         let outer_root = outer.root();
         let inner_root = inner.root();
         drop(outer);
-        majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-            if root.0 == BASE + 0x1000 || root.0 == BASE + 0x2000 {
-                root.0 += 0x80;
-            }
-        });
-        assert_refs(&paused, BASE + 0x1080);
-        assert_refs(&inner, BASE + 0x2080);
+        forward_pair(outer_addr, inner_addr);
+        assert_refs(&paused, outer_addr + 0x80, outer_addr + 0x80);
+        assert_refs(&inner, inner_addr + 0x80, inner_addr + 0x80);
         assert!(matches!(
             paused.borrow().concrete_registers_r[1],
-            ConcreteValue::Int(n) if n == (BASE + 0x1000) as i64
+            ConcreteValue::Int(w) if w as usize == outer_addr
         ));
         drop(outer_root);
-        majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-            if root.0 == BASE + 0x1080 || root.0 == BASE + 0x2080 {
-                root.0 += 0x80;
-            }
-        });
-        assert_refs(&paused, BASE + 0x1080);
-        assert_refs(&inner, BASE + 0x2100);
+        forward_pair(outer_addr + 0x80, inner_addr + 0x80);
+        // The dropped frame area stops moving. `ConstPtr.value` stays in
+        // the table, so the index still resolves to the forwarded address.
+        assert_refs(&paused, outer_addr + 0x80, outer_addr + 0x100);
+        assert_refs(&inner, inner_addr + 0x100, inner_addr + 0x100);
         drop(inner_root);
     }
 

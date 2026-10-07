@@ -124,37 +124,25 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Forward every inline gcref this snapshot carries.
-    ///
-    /// `MIFrame.get_list_of_active_snapshot_boxes` copies a constant ref
-    /// register's already-forwarded gcref out of its `OpRef::ConstPtr` into a
-    /// raw [`SnapshotTagged::Const`] word, and `jitcode.constants_r` entries
-    /// reach the same arm. The side table these land in accumulates for the
-    /// whole trace and is only handed to the compiler at the end of it, so
-    /// without this walk a collection between capture and compile leaves the
-    /// resume data naming a pre-move address. RPython has no such copy: its
-    /// snapshot holds the `ConstPtr` box itself, whose `value` the GC traces
-    /// through the object graph.
+    /// `Const` ref words and `OpRef::ConstPtr` are table indexes
+    /// (`history.py` `ConstPtr`). This snapshot is the holder, so the
+    /// walk traces those slots. The index word itself does not move.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-        let tagged = self
-            .frames
-            .iter_mut()
-            .flat_map(|f| f.boxes.iter_mut())
-            .chain(self.vable_boxes.iter_mut())
-            .chain(self.vref_boxes.iter_mut());
-        for t in tagged {
-            match t {
-                SnapshotTagged::Const(bits, Type::Ref) => {
-                    let mut gcref = majit_ir::GcRef(*bits as usize);
-                    visitor(&mut gcref);
-                    *bits = gcref.0 as i64;
+        let mut trace_tagged =
+            |tagged: &SnapshotTagged, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)| match tagged {
+                SnapshotTagged::Const(bits, Type::Ref) if *bits != 0 => {
+                    majit_ir::const_ptr_table::trace_index(*bits as u32, visitor);
                 }
-                // `build_vable_snapshot_boxes` / `build_vref_snapshot_boxes`
-                // tag their entries by `OpRef::ty()` without asking whether the
-                // operand is constant, so this arm can hold an inline gcref too.
                 SnapshotTagged::Box(op, _) => op.trace_const_ptr(visitor),
-                SnapshotTagged::Const(..) => {}
+                _ => {}
+            };
+        for frame in &self.frames {
+            for tagged in &frame.boxes {
+                trace_tagged(tagged, visitor);
             }
+        }
+        for tagged in self.vable_boxes.iter().chain(self.vref_boxes.iter()) {
+            trace_tagged(tagged, visitor);
         }
     }
 
@@ -218,7 +206,31 @@ pub enum SnapshotTagged {
     /// Compile-time constant value with type.
     /// RPython resume.py getconst: Const boxes carry their type (INT/REF/FLOAT)
     /// for correct TAGINT/TAGCONST encoding in rd_numb.
+    /// `Type::Ref` payload is a [`majit_ir::const_ptr_table`] index
+    /// (`history.py` `ConstPtr`), not the referent address. Index 0 is null.
     Const(i64, majit_ir::Type),
+}
+
+impl SnapshotTagged {
+    /// Intern `addr` and store the table index. Null stays 0.
+    ///
+    /// `opencoder.py` `Trace._encode` / `_cached_const_ptr` encode a
+    /// `ConstPtr` as `TAGCONSTPTR` plus an index into `Trace._refs`.
+    /// `OpRef` is a Copy word, so the intern table is that `_refs` slot.
+    pub fn const_ref(addr: usize) -> Self {
+        let index = majit_ir::const_ptr_table::intern(majit_ir::GcRef(addr));
+        SnapshotTagged::Const(i64::from(index), majit_ir::Type::Ref)
+    }
+
+    /// Current referent. `None` when this is not a ref constant.
+    pub fn ref_address(self) -> Option<majit_ir::GcRef> {
+        match self {
+            SnapshotTagged::Const(index, majit_ir::Type::Ref) => {
+                Some(majit_ir::const_ptr_table::resolve(index as u32))
+            }
+            _ => None,
+        }
+    }
 }
 
 pub struct Trace {
@@ -244,6 +256,22 @@ pub struct Trace {
     /// opencoder.py parity: count of box-yielding positions
     /// (inputargs + non-void ops).
     box_count: u32,
+    /// ConstPtr indexes of the op `record_bytes` is encoding.
+    ///
+    /// The index is not in `slots` until that op returns, and
+    /// `_double_ops` can minor-collect while reserving opcode bytes.
+    /// `walk_active_trace_refs` traces this list for that window.
+    /// `history.py` `ConstPtr` is the box the collector updates; the
+    /// list is the holder until the recorded slot takes over.
+    live_const_indexes: Vec<u32>,
+    /// QuasiImmut descrs named by the op `record_bytes` is encoding.
+    ///
+    /// `slots` does not hold the descr until the op returns, and
+    /// `reserve_ops_bytes` can minor-collect first. `struct` and
+    /// `constantfieldbox` (`quasiimmut.py QuasiImmutDescr`) are raw
+    /// addresses the slot walk forwards; this list is the holder until
+    /// the slot takes over.
+    pending_quasi_descrs: Vec<DescrRef>,
     /// Live JIT path: `History.trace` is `opencoder.Trace`. `record_*`
     /// appends bytes and a [`FrontendSlot`]. `into_parts` / `get_iter`
     /// materializes through `ByteTraceIter` (`cls()`). Tests that
@@ -315,7 +343,7 @@ fn untag_snapshot_pools(
             SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
         }
         TAGINT => SnapshotTagged::Const(v, Type::Int),
-        TAGCONSTPTR => SnapshotTagged::Const(trb.current_ref(v as usize) as i64, Type::Ref),
+        TAGCONSTPTR => SnapshotTagged::const_ref(trb.current_ref(v as usize) as usize),
         TAGCONSTOTHER => {
             let pool_idx = (v >> 1) as usize;
             if v & 1 != 0 {
@@ -429,6 +457,8 @@ impl Trace {
             max_num_inputargs: 0,
             op_count: 0,
             box_count: 0,
+            live_const_indexes: Vec::new(),
+            pending_quasi_descrs: Vec::new(),
             trb: None,
             slots: Vec::new(),
             value_slots: Box::new(Vec::new()),
@@ -596,7 +626,9 @@ impl Trace {
         match tagged {
             SnapshotTagged::Const(v, Type::Int) => OcBox::ConstInt(v),
             SnapshotTagged::Const(v, Type::Float) => OcBox::ConstFloat(v as u64),
-            SnapshotTagged::Const(v, Type::Ref) => OcBox::ConstPtr(v as u64),
+            SnapshotTagged::Const(v, Type::Ref) => {
+                OcBox::ConstPtr(majit_ir::const_ptr_table::resolve(v as u32).0 as u64)
+            }
             SnapshotTagged::Const(_, Type::Void) => {
                 panic!("encode snapshot: Const Void is not a tagged value")
             }
@@ -924,6 +956,22 @@ impl Trace {
         OcBox::ResOp(r.raw())
     }
 
+    fn hold_const_indexes(&mut self, refs: &[OpRef]) -> usize {
+        let base = self.live_const_indexes.len();
+        for r in refs {
+            if let Some(index) = r.const_ptr_index() {
+                if index != 0 {
+                    self.live_const_indexes.push(index);
+                }
+            }
+        }
+        base
+    }
+
+    fn release_const_indexes(&mut self, base: usize) {
+        self.live_const_indexes.truncate(base);
+    }
+
     /// `history.py History._make_op`: append the op and attach `value` on
     /// the FrontendOp at construction. Void ops are named by their
     /// op-sequence position (`VoidOp(slots.len())`), not `_index`.
@@ -934,11 +982,38 @@ impl Trace {
         descr: Option<DescrRef>,
         value: Option<Value>,
     ) -> OpRef {
-        // history.py record0/1/2/3 take the boxes inline. JUMP and
-        // other N-ary ops exceed that 0–3 surface; eight OcBoxes stay
-        // off the process allocator.
-        let boxes: smallvec::SmallVec<[OcBox; 8]> =
-            args.iter().copied().map(|a| self.arg_to_box(a)).collect();
+        // Hold the indexes before any nursery growth. Reserving the
+        // opcode bytes and encoding an earlier argument can both
+        // minor-collect (`reserve_ops_bytes`, `WordArray::push` on
+        // `_refs` / `_bigints` / `_floats`). The walk forwards these
+        // slots. Resolve each ConstPtr in the encode loop, after the
+        // previous argument's encode, so a prebuilt `Box::ConstPtr`
+        // does not keep the from-space address.
+        let held = self.hold_const_indexes(args);
+        // `quasiimmut.py QuasiImmutDescr` stores raw `struct` and
+        // `constantfieldbox` words. Argument indexes do not rewrite
+        // those fields. Hold the descr across the reserve below;
+        // `slots.push` is what the slot walk sees afterwards.
+        let held_quasi = if let Some(d) = descr
+            .as_ref()
+            .filter(|d| d.as_quasi_immut_descr().is_some())
+        {
+            self.pending_quasi_descrs.push(d.clone());
+            true
+        } else {
+            false
+        };
+        // Opcode byte, optional arity varint, one varint per arg, descr
+        // varint. `append_int` writes at most four bytes.
+        let reserve = 1usize
+            .saturating_add(4)
+            .saturating_add(args.len().saturating_mul(4))
+            .saturating_add(4);
+        self.trb
+            .as_mut()
+            .expect("record_bytes requires attach_byte_buffer")
+            .reserve_ops_bytes(reserve);
+        let num_inputs = self.inputargs.len();
         let trb = self
             .trb
             .as_mut()
@@ -953,7 +1028,9 @@ impl Trace {
         } else {
             descr.as_ref()
         };
-        let box_index = trb.record_op(opcode, &boxes, stream_descr);
+        let box_index = trb.record_op_resolved(opcode, args.len(), stream_descr, |i| {
+            Self::arg_to_box_at(args[i], num_inputs)
+        });
         let ty = opcode.result_type();
         // Guard `record_op` writes a 2-byte 0 placeholder; later
         // `create_top_snapshot` / a delayed restamp overwrite it.
@@ -988,7 +1065,14 @@ impl Trace {
             // the coordinate `TraceIterator._count` assigns to a void `cls()`.
             OpRef::void_op(void_seq)
         };
+        if held_quasi {
+            self.pending_quasi_descrs
+                .pop()
+                .expect("quasi descr hold missing at slot publish");
+        }
         self.op_count += 1;
+        // `slots` now names the indexes. Drop the recording-window hold.
+        self.release_const_indexes(held);
         opref
     }
 
@@ -1755,6 +1839,22 @@ impl Trace {
     /// dropped so the next `get_iter` rebuilds them from the forwarded
     /// pool.
     pub(crate) fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        // Indexes named by the op currently being encoded. Not in
+        // `slots` yet; `_double_ops` collects before `record_op` returns.
+        let mut i = 0;
+        while i < self.live_const_indexes.len() {
+            let index = self.live_const_indexes[i];
+            majit_ir::const_ptr_table::trace_index(index, visitor);
+            i += 1;
+        }
+        // QuasiImmut descrs named by the op currently being encoded.
+        // Not in `slots` yet; `reserve_ops_bytes` collects first.
+        for descr in &self.pending_quasi_descrs {
+            if let Some(qd) = descr.as_quasi_immut_descr() {
+                qd.walk_const_ptr_refs(visitor);
+            }
+        }
+
         if let Some(trb) = self.trb.as_mut() {
             trb.refresh_from_gc();
             for r in trb._refs.iter_mut().skip(1) {
@@ -1868,7 +1968,8 @@ impl Trace {
         let tagged = crate::opencoder::TraceRecordBuffer::encoded_arg_at(&trb._ops, args_pos, 0);
         let obj = match self.untag_snapshot(tagged) {
             SnapshotTagged::Box(r, _) => r,
-            SnapshotTagged::Const(v, Type::Ref) => OpRef::const_ptr(GcRef(v as usize)),
+            // `Type::Ref` payload is a const_ptr_table index (`SnapshotTagged::const_ref`).
+            SnapshotTagged::Const(v, Type::Ref) => OpRef::ConstPtr(v as u32),
             SnapshotTagged::Const(v, Type::Int) => OpRef::const_int(v),
             SnapshotTagged::Const(v, Type::Float) => OpRef::const_float(f64::from_bits(v as u64)),
             SnapshotTagged::Const(_, Type::Void) => return None,
@@ -2733,6 +2834,53 @@ mod tests {
         assert!(OpRc::ptr_eq(&first, &ops[0]));
     }
 
+    thread_local! {
+        static BUMP_LATER_CONST: std::cell::Cell<(u32, usize)> =
+            const { std::cell::Cell::new((0, 0)) };
+    }
+
+    fn bump_later_const_slot() {
+        let (index, addr) = BUMP_LATER_CONST.with(|cell| cell.get());
+        majit_ir::const_ptr_table::set_slot(index, GcRef(addr));
+        crate::opencoder::set_after_encode_hook_for_test(None);
+    }
+
+    /// An earlier argument's `_encode` can grow a trace pool and
+    /// minor-collect before a later ConstPtr is encoded. The table slot
+    /// moves; the address has to be read after that encode, not copied
+    /// into a `Box::ConstPtr` ahead of it.
+    #[test]
+    fn later_const_ptr_is_reresolved_after_an_earlier_encode() {
+        struct Restore {
+            index: u32,
+            addr: GcRef,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::opencoder::set_after_encode_hook_for_test(None);
+                majit_ir::const_ptr_table::set_slot(self.index, self.addr);
+            }
+        }
+
+        // Private sentinel. A small address collides with another test's
+        // slot in this process-lifetime table.
+        let original = GcRef(0x96E2_2000);
+        let forwarded = GcRef(0x96E2_3000);
+        let later = OpRef::const_ptr(original);
+        let index = later.const_ptr_index().expect("non-null const ptr");
+        let _restore = Restore {
+            index,
+            addr: original,
+        };
+        let mut rec = Trace::new();
+        rec.attach_byte_buffer(Arc::new(crate::MetaInterpStaticData::new()));
+        BUMP_LATER_CONST.with(|cell| cell.set((index, forwarded.0)));
+        crate::opencoder::set_after_encode_hook_for_test(Some(bump_later_const_slot));
+        rec.record_op(OpCode::PtrEq, &[OpRef::const_int(1), later]);
+        let stored = rec.trb.as_ref().expect("byte buffer").current_ref(1);
+        assert_eq!(stored, forwarded.0 as u64);
+    }
+
     #[test]
     fn to_tree_loop_rewalks_byte_stream_after_close_loop() {
         // `unroll.py optimize_preamble` `trace.get_iter()` walks the live
@@ -2758,11 +2906,16 @@ mod tests {
         let cptr = OpRef::const_ptr(GcRef(0x9A_0000_1000));
         rec.record_op(OpCode::GetfieldGcR, &[cptr]);
         rec.record_guard(OpCode::GuardTrue, &[i0], None);
-        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        majit_ir::const_ptr_table::walk(&mut |gcref| {
+            if gcref.0 == 0x9A_0000_1000 {
+                gcref.0 = 0x9A_0000_2000;
+            }
+        });
+        assert_eq!(cptr.as_const_ptr(), Some(GcRef(0x9A_0000_2000)));
         rec.materialize_into_ops();
         assert_eq!(
-            rec.ops()[0].arg(0).to_opref(),
-            OpRef::const_ptr(GcRef(0x9A_0000_2000))
+            rec.ops()[0].arg(0).to_opref().as_const_ptr(),
+            Some(GcRef(0x9A_0000_2000))
         );
         assert!(rec.ops()[1].guard_fail_args().is_none());
     }
@@ -2903,6 +3056,56 @@ mod tests {
             OpRef::const_int(0),
             "IntAdd ConstInt(0) argument must survive snapshot capture"
         );
+    }
+
+    #[test]
+    fn walk_forwards_pending_quasiimmut_before_slot() {
+        #[derive(Debug)]
+        struct Handle;
+        impl majit_ir::QuasiImmutHandle for Handle {
+            fn is_current(&self) -> bool {
+                true
+            }
+            fn register_loop_token(
+                &self,
+                _token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>,
+            ) {
+            }
+            fn instance_identity(&self) -> usize {
+                1
+            }
+        }
+        let field = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(0, 8, 8, Type::Ref, false))
+            as DescrRef;
+        let descr = std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+            field.clone(),
+            0x1000,
+            std::sync::Arc::new(Handle),
+            Some(Value::Ref(GcRef(0x1000))),
+        )) as DescrRef;
+        let mut rec = Trace::new();
+        rec.pending_quasi_descrs.push(descr.clone());
+        assert!(rec.slots.is_empty());
+        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        let qd = descr.as_quasi_immut_descr().unwrap();
+        assert_eq!(qd.struct_ptr(), 0x2000);
+        assert_eq!(qd.constantfieldbox(), Some(Value::Ref(GcRef(0x2000))));
+
+        let recorded = std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+            field,
+            0x1000,
+            std::sync::Arc::new(Handle),
+            Some(Value::Ref(GcRef(0x1000))),
+        )) as DescrRef;
+        let mut rec = Trace::new();
+        let obj = rec.record_input_arg(Type::Ref);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_op_with_descr(OpCode::QuasiimmutField, &[obj], recorded.clone());
+        assert!(rec.pending_quasi_descrs.is_empty());
+        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        let qd = recorded.as_quasi_immut_descr().unwrap();
+        assert_eq!(qd.struct_ptr(), 0x2000);
+        assert_eq!(qd.constantfieldbox(), Some(Value::Ref(GcRef(0x2000))));
     }
 
     #[test]

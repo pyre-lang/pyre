@@ -453,6 +453,16 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     "gc_hook::try_gc_collect_oldgen",
 ];
 
+/// Host calls that leave the collector's RUNNING census.
+///
+/// `gc_sync::before_external_block` drops the GIL and that census, so another
+/// mutator can minor-collect while this thread waits. A `push_roots` bracket
+/// that reaches one of these is justified (`instance_lock`, `w_list_lock`).
+/// These are not [`COLLECTING_SEEDS`]: unioning them into that set would treat
+/// every such wait as a collection, and the unbracketed ratchet would then
+/// fail on callers that hold a word across the wait without their own bracket.
+pub const SAFEPOINT_SEEDS: &[&str] = &["gc_sync::before_external_block"];
+
 impl CallGraph {
     /// Every function that can transitively reach one of `seeds`.
     pub fn reaching(&self, seeds: &HashSet<u64>) -> HashSet<u64> {

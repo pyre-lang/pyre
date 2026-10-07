@@ -416,16 +416,29 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("exception_match", "baseobjspace.py exception_match"),
     // `tupleobject.py` short-tuple arms. `_unroll_condition` is
     // `loop_unrolling_heuristic(..., UNROLL_CUTOFF=10)`; contains/hash
-    // fork to these `@jit.unroll_safe` bodies, and `_compare_tuples`
-    // is `@jit.look_inside_iff(_unroll_condition_cmp)`.
+    // fork to these `@jit.unroll_safe` bodies. `_compare_tuples` is
+    // `@jit.look_inside_iff(_unroll_condition_cmp)`. The looked-inside
+    // body is the index loop `tuple_first_diff` (`for p in range(ncmp)`):
+    // a `PyObject` success merged with the error carrier is not a prepass
+    // subject, so the element compare stays `dont_look_inside` and does
+    // not enter this closure. `look_inside_iff` still marks the orig
+    // `unroll_safe` (`rlib/jit.py`).
     (
         "_descr_contains_unroll_safe",
         "tupleobject.py _descr_contains_unroll_safe",
     ),
     ("_descr_hash_unroll", "tupleobject.py _descr_hash_unroll"),
     (
-        "_orig_compare_tuples",
-        "rlib/jit.py look_inside_iff unroll_safe(_compare_tuples)",
+        "_orig_tuple_first_diff",
+        "tupleobject.py _compare_tuples look_inside_iff(_unroll_condition_cmp)",
+    ),
+    // Pin-free prefix of that same `_compare_tuples` walk
+    // (`pin_free_builtin_eq`). It used to share `_orig_compare_tuples`
+    // with the rooted loop. The rooted `PyResult` is not a prepass
+    // subject, so this orig is only the non-raising prefix.
+    (
+        "_orig_tuple_pin_free_equal",
+        "tupleobject.py _compare_tuples pin_free_builtin_eq",
     ),
     // `intobject.py _pow_mod` / `_pow_nomod` are
     // `@jit.look_inside_iff(... jit.isconstant(iw) ...)`. With the descent,

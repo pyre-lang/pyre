@@ -2054,6 +2054,9 @@ fn call_kw_in_ctx_impl(
             0
         };
         if nkw > 0 {
+            // `w_tuple_getitem` can mint a wrapped int or float. Park the
+            // profile frame before that loop and pass the reloaded pointer.
+            let profile_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
             let n_pos = args.len() - nkw;
             let pos_args = args[..n_pos].to_vec();
             // The kwnames tuple already holds the name objects. Pass those
@@ -2077,7 +2080,7 @@ fn call_kw_in_ctx_impl(
                 &keyword_names_w,
                 &keywords_w,
                 true,
-                profile_frame,
+                profile_anchor.live(),
             );
         }
         return call_callable_with_mode(

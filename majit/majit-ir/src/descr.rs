@@ -4657,7 +4657,8 @@ impl QuasiImmutDescr {
 
     /// Forward the `struct` word and a `Value::Ref` captured on this descr
     /// after a moving collection. `MetaInterp::walk_active_trace_refs` calls
-    /// this through the recorder's slot descrs.
+    /// this through the recorder's slot descrs and the in-flight
+    /// `record_bytes` holder.
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
         let raw = self.struct_ptr();
         if raw != 0 {

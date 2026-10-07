@@ -1176,16 +1176,28 @@ impl ExecutionContext {
         // minor collection leaves `f_backref` pointing at the pre-copy nursery
         // address.  Same obligation as the inline-call push and the resumed
         // chain's relink.
-        pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
-        majit_gc::bh_probe_note_store(frame as usize, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
         // A caller that already linked the frame -- `install_current_frame`
         // sets both ends of this pair -- would make the store below name the
         // frame itself, and `walk_pyframe_roots` follows `f_backref` with no
-        // cycle guard.
-        debug_assert_ne!(
-            self.topframeref, frame,
-            "ExecutionContext::enter: frame is already the top, so f_backref would name itself",
-        );
+        // cycle guard. `topframeref` may already be a `JitVirtualRef` whose
+        // address is not the frame, so compare the referent. A `debug_assert`
+        // is absent from the release binary that runs the witnesses.
+        //
+        // `executioncontext.py` `enter` has no such refusal because upstream
+        // never reaches it twice for one frame: `interp_jit.py` puts
+        // `jit_merge_point` on `PyFrame.dispatch`, so the force and deopt
+        // legs of CALL_ASSEMBLER (`assembler_call_helper`) re-run only
+        // `dispatch`, below `enter`. pyre's portal is one level up, at
+        // `execute_frame`, so those legs re-enter through the portal helper
+        // and reach `enter` a second time for a frame that is already top.
+        // `install_current_frame` refuses the same case. The structural fix
+        // is moving the portal down to `dispatch`; until then this refusal
+        // keeps the re-entry from making `f_backref` a self loop.
+        if std::ptr::eq(vref_referent(self.topframeref), frame) {
+            return;
+        }
+        pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
+        majit_gc::bh_probe_note_store(frame as usize, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
         unsafe {
             (*frame).f_backref = self.topframeref;
         }

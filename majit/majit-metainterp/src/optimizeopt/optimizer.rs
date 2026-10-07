@@ -436,6 +436,9 @@ pub struct Optimizer {
     /// `OptContext.active_short_preamble_producer` so the root walker always
     /// follows the builder's current home.
     pub(crate) published_short_preamble_producer_slot: Option<usize>,
+    /// `*mut CompileLiveOpRoots` on the metainterp that owns this optimizer.
+    /// `None` in unit tests and in an unroll phase that never pins the host.
+    compile_live_op_roots_slot: Option<usize>,
     /// RPython unroll.py: `label_args = import_state(...)`.
     /// The peeled loop's LABEL must use these args, not the phase-1 end_args.
     pub imported_label_args: Option<Vec<OpRef>>,
@@ -1440,6 +1443,7 @@ impl Optimizer {
             imported_short_preamble_builder: None,
             short_preamble_producer: None,
             published_short_preamble_producer_slot: None,
+            compile_live_op_roots_slot: None,
             imported_label_args: None,
             patchguardop: None,
             skip_flush: false,
@@ -1497,6 +1501,7 @@ impl Optimizer {
         self.imported_short_preamble_builder = None;
         self.short_preamble_producer = None;
         self.published_short_preamble_producer_slot = None;
+        self.compile_live_op_roots_slot = None;
         self.imported_label_args = None;
         self.patchguardop = None;
         self.skip_flush = false;
@@ -2859,7 +2864,44 @@ impl Optimizer {
         )
     }
 
-    /// opencoder.py:271 _index parity entry point.
+    fn publish_live_op_span(&self, ops: &[majit_ir::OpRc]) -> super::LiveOpPublication {
+        let Some(slot) = self.compile_live_op_roots_slot else {
+            return super::LiveOpPublication::noop();
+        };
+        if slot == 0 {
+            return super::LiveOpPublication::noop();
+        }
+        // SAFETY: `pin_optimizer_host_state` stored the metainterp field.
+        // The guard pops the entry and does not borrow `ops`.
+        unsafe { (*(slot as *mut super::CompileLiveOpRoots)).publish_span(ops) }
+    }
+
+    fn publish_live_op_context(&self, ctx: *const OptContext) -> super::LiveOpPublication {
+        let Some(slot) = self.compile_live_op_roots_slot else {
+            return super::LiveOpPublication::noop();
+        };
+        if slot == 0 {
+            return super::LiveOpPublication::noop();
+        }
+        unsafe { (*(slot as *mut super::CompileLiveOpRoots)).publish_context(ctx) }
+    }
+
+    #[allow(clippy::ptr_arg)]
+    fn publish_live_op_vec(&self, ops: &Vec<majit_ir::OpRc>) -> super::LiveOpPublication {
+        let Some(slot) = self.compile_live_op_roots_slot else {
+            return super::LiveOpPublication::noop();
+        };
+        if slot == 0 {
+            return super::LiveOpPublication::noop();
+        }
+        unsafe { (*(slot as *mut super::CompileLiveOpRoots)).publish_vec(ops) }
+    }
+
+    pub(crate) fn set_compile_live_op_roots_slot(&mut self, slot: Option<usize>) {
+        self.compile_live_op_roots_slot = slot;
+    }
+
+    /// opencoder.py `_index` parity entry point.
     ///
     /// Optimizes a slice of ops whose `pos`/`args` reference OpRefs in a
     /// shifted namespace `[inputarg_base, …)`. The first fresh OpRef the
@@ -2877,6 +2919,9 @@ impl Optimizer {
         input_ops_from_ops: bool,
     ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
         use majit_ir::OpRef;
+        // The caller's slice does not reallocate during this pass. Bridge
+        // `input_ops` stays empty, so this span is the prepared-op holder.
+        let _input_span = self.publish_live_op_span(ops);
         // Test-only auto-seed of `trace_inputargs` from the variant
         // tags of any InputArg*/IntOp/FloatOp/RefOp OpRef that references
         // a slot index in `[0, num_inputs)`. Production callers populate
@@ -2919,6 +2964,10 @@ impl Optimizer {
         // In pyre we reuse the same Optimizer, so clear per-run state.
         self.last_guard_op_idx = None;
         let mut ctx = self.take_opt_context(ops.len(), num_inputs, inputarg_base, start_next_pos);
+        // Drop this before `ctx` moves into `final_ctx`. `take_new_operations`
+        // only moves the emitted buffer; the context object stays put.
+        let ctx_ptr: *const OptContext = &ctx;
+        let _ctx_roots = self.publish_live_op_context(ctx_ptr);
         ctx.skip_flush_mode = self.skip_flush;
         ctx.building_bridge = self.building_bridge;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
@@ -4156,6 +4205,9 @@ impl Optimizer {
 
         // Preserve final context for jump_to_existing_trace.
         let mut ops = ctx.take_new_operations();
+        // The emitted buffer's header stays put across the SameAs splice.
+        // Drop the guard before `Ok(ops)` moves the `Vec`.
+        let _emitted = self.publish_live_op_vec(&ops);
 
         // RPython compile.py:327 final loop assembly:
         //   loop.operations = ([start_label] + preamble_ops
@@ -4211,7 +4263,9 @@ impl Optimizer {
                 }
             }
         }
+        drop(_ctx_roots);
         self.final_ctx = Some(ctx);
+        drop(_emitted);
         Ok(ops)
     }
 

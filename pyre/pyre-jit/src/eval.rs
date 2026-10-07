@@ -17861,9 +17861,10 @@ mod tests {
             );
             // vable_boxes[0] = frame_ptr — the encoded form of `frame_ref`,
             // which the test seeded as `ctx.const_ref(frame_ptr as i64)`.
+            // Compare the referent, not a freshly interned ConstPtr index.
             assert_eq!(
-                snapshot.vable_boxes[0],
-                SnapshotTagged::Const(frame_ptr as i64, Type::Ref)
+                snapshot.vable_boxes[0].ref_address().map(|g| g.0),
+                Some(frame_ptr)
             );
             let active_boxes = snapshot
                 .frames

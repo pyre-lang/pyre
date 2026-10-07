@@ -3832,7 +3832,7 @@ pub fn trace_and_compile_from_bridge(
     // whose liveness it cannot decode. On that path the interpreter resumes
     // this frame, so a foreign pc left in `last_instr` would step a code
     // object the frame does not run. Keep the vable-derived position instead.
-    let frame_code = jit_state_local.pycode_as_usize();
+    let frame_code = bridge_frame_root.frame().pycode as usize;
     let foreign_innermost =
         is_multiframe_resume && resume_coords.last().map(|&(code, _)| code) != Some(frame_code);
     if foreign_innermost {
@@ -3999,6 +3999,9 @@ pub fn trace_and_compile_from_bridge(
         None
     }
 
+    // `start_bridge_tracing` and `rebuild_portal_framestack_from_resumedata`
+    // allocate. `set_valuestackdepth` writes through `jit_state.frame`.
+    jit_state.frame = bridge_frame_root.frame() as *const PyFrame as usize;
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
             // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
@@ -7848,10 +7851,14 @@ pub fn cranelift_resumedata_deopt(
     };
 
     // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
-    let Some(rd_numb) = rgd.payload.rd_numb() else {
+    // Keep the `NumberingRef`. The payload slice is taken immediately
+    // before the reader is built: a minor in between would leave the
+    // header decoded from from-space while `bind_numbering` reloads
+    // the rest from the owner root.
+    let Some(numb) = rgd.payload.rd_numb_ref() else {
         return false;
     };
-    if rd_numb.is_empty() {
+    if numb.as_slice().is_empty() {
         return false;
     }
     let rd_consts = rgd.payload.rd_consts().unwrap_or(&[]);
@@ -7884,7 +7891,7 @@ pub fn cranelift_resumedata_deopt(
     };
     let allocator = crate::eval::PyreBlackholeAllocator;
     let mut reader = resume::ResumeDataDirectReader::new(
-        rd_numb,
+        numb.as_slice(),
         rd_consts,
         &all_liveness,
         majit_backend::FailArgSource::Slice(&deadframe),
@@ -7892,6 +7899,10 @@ pub fn cranelift_resumedata_deopt(
         None,
         &allocator,
     );
+    // `resumecode.py` `Reader.next_item` reloads `numb.code` after a
+    // collection. `prepare_resume_heap_with_roots` materializes virtuals
+    // and can minor-collect. Same bind as `blackhole_from_resumedata`.
+    reader.resumecodereader.bind_numbering(numb);
 
     // 6. resume.py:1324-1325 — prepare virtuals/pendingfields, then
     //    consume the vref + vable sections that precede the per-frame

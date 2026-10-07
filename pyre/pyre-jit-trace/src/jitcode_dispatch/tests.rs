@@ -16,7 +16,6 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
         RestoreConstPtr::intern(BASE + 0x1020),
         RestoreConstPtr::intern(BASE + 0x2020),
         RestoreConstPtr::intern(BASE + 0x3020),
-        RestoreConstPtr::intern(BASE + 0x4000),
     ];
     let _runtime = crate::trace_ctx_for_test(0);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
@@ -44,61 +43,80 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
         caller_py_pc: None,
         result_slot: CallResultSlot::Unknown,
     };
+    let a = BASE + 0x1000;
+    let b = BASE + 0x2000;
+    let c = BASE + 0x3000;
+    let t = BASE + 0x4000;
     let frames = vec![
-        InlineFrameGuard::enter(&outer, 0, false, vec![parent(BASE + 0x1000)]),
-        InlineFrameGuard::enter(&outer, 0, false, vec![parent(BASE + 0x2000)]),
+        InlineFrameGuard::enter(&outer, 0, false, vec![parent(a)]),
+        InlineFrameGuard::enter(&outer, 0, false, vec![parent(b)]),
     ];
-    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, vec![parent(BASE + 0x3000)]);
+    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, vec![parent(c)]);
     let forward = || {
         let mut seen = Vec::new();
-        majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+        let mut visit = |root: &mut majit_ir::GcRef| {
             if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
                 seen.push(root.0);
                 root.0 += 0x80;
             }
-        });
+        };
+        // Live holders trace their indexes. The table walk forwards a
+        // slot whose holder was dropped. One wave, one write.
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
+        majit_ir::const_ptr_table::walk(&mut visit);
         seen.sort_unstable();
         seen
     };
     assert_eq!(
         forward(),
         [
-            BASE + 0x1000,
-            BASE + 0x1010,
-            BASE + 0x1020,
-            BASE + 0x2000,
-            BASE + 0x2010,
-            BASE + 0x2020,
-            BASE + 0x3000,
-            BASE + 0x3010,
-            BASE + 0x3020
+            a,
+            a + 0x10,
+            a + 0x20,
+            b,
+            b + 0x10,
+            b + 0x20,
+            c,
+            c + 0x10,
+            c + 0x20,
         ]
     );
     drop(inner_frame);
     drop(inner_roots);
+    // Inner raw slots retire with the session area. The inner `ConstPtr`
+    // stays in the table (`a + 0x20` class of word, now +0x80).
     assert_eq!(
         forward(),
         [
-            BASE + 0x1080,
-            BASE + 0x1090,
-            BASE + 0x10a0,
-            BASE + 0x2080,
-            BASE + 0x2090,
-            BASE + 0x20a0
+            a + 0x80,
+            a + 0x90,
+            a + 0xa0,
+            b + 0x80,
+            b + 0x90,
+            b + 0xa0,
+            c + 0xa0,
         ]
     );
     // Bridge reconstruction stores frame guards in a Vec; their drop order
     // must not control the session owner's root registration lifetime.
     drop(frames);
     assert!(outer.borrow().at_portal());
-    outer.borrow_mut().tmpreg_r = OpRef::const_ptr(majit_ir::GcRef(BASE + 0x4000));
-    assert_eq!(forward(), [BASE + 0x4000]);
+    // intern is not a root (`history.py` `ConstPtr` dies with the holder).
+    // Pin `t` only once `tmpreg_r` holds the box; an earlier intern would
+    // sit in the table with no holder and `walk` would forward it.
+    let _restore_t = RestoreConstPtr::intern(t);
+    let tmpreg = OpRef::const_ptr(majit_ir::GcRef(t));
+    outer.borrow_mut().tmpreg_r = tmpreg;
+    assert_eq!(forward(), [a + 0x120, b + 0x120, c + 0x120, t]);
+    assert_eq!(outer.borrow().tmpreg_r, tmpreg);
     assert_eq!(
-        outer.borrow().tmpreg_r,
-        OpRef::const_ptr(majit_ir::GcRef(BASE + 0x4080))
+        outer.borrow().tmpreg_r.as_const_ptr(),
+        Some(majit_ir::GcRef(t + 0x80))
     );
     drop(outer_roots);
-    assert!(forward().is_empty());
+    // Session raw slots are gone. Table slots are not.
+    assert_eq!(forward(), [a + 0x1a0, b + 0x1a0, c + 0x1a0, t + 0x80]);
 }
 
 #[test]
@@ -129,37 +147,43 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
         caller_py_pc: None,
         result_slot: CallResultSlot::Unknown,
     };
-    let pre_call = parent(BASE + 0x1000);
+    // A sibling `Wave` would skip `trace_index` on an already-marked slot;
+    // enter one here so the holder walk forwards this intern.
+    let word = BASE + 0x1000;
+    let pre_call = parent(word);
     let stale = pre_call.clone();
+    let interned = stale.boxes[0];
     let frame = InlineFrameGuard::enter(&session, 0, false, vec![pre_call]);
+    let _wave = majit_ir::const_ptr_table::Wave::enter();
     majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-        if (BASE + 0x1000..BASE + 0x2000).contains(&root.0) {
+        if (word..word + 0x1000).contains(&root.0) {
             root.0 += 0x80;
         }
     });
-    assert_eq!(stale.call_stack_overrides[0].1 as usize, BASE + 0x1000);
+    assert_eq!(stale.call_stack_overrides[0].1 as usize, word);
     assert_eq!(
         stale.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
-        BASE + 0x1010
+        word + 0x10
+    );
+    // The cloned `OpRef` still names the intern. Holder walk forwarded
+    // `ConstPtr.value`, so the same index now reads the to-space word.
+    assert_eq!(stale.boxes[0], interned);
+    assert_eq!(
+        stale.boxes[0].as_const_ptr(),
+        Some(majit_ir::GcRef(word + 0xa0))
     );
     let live = frame
         .rooted_immediate_caller()
         .expect("the level stores the immediate caller");
-    // ConstPtr is a table index. The clone and the live frame share one
-    // slot, so the collector's in-place write is visible through both.
-    assert_eq!(stale.boxes[0], live.boxes[0]);
-    assert_eq!(
-        stale.boxes[0].as_const_ptr(),
-        Some(majit_ir::GcRef(BASE + 0x10a0))
-    );
-    assert_eq!(live.call_stack_overrides[0].1 as usize, BASE + 0x1080);
+    assert_eq!(live.call_stack_overrides[0].1 as usize, word + 0x80);
     assert_eq!(
         live.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
-        BASE + 0x1090
+        word + 0x90
     );
+    assert_eq!(live.boxes[0], interned);
     assert_eq!(
-        live.boxes[0],
-        OpRef::const_ptr(majit_ir::GcRef(BASE + 0x10a0))
+        live.boxes[0].as_const_ptr(),
+        Some(majit_ir::GcRef(word + 0xa0))
     );
     drop(frame);
     drop(roots);
@@ -197,21 +221,25 @@ fn finish_payload_root_walker_writes_back_forwarded_const_ptr() {
     let _restore = RestoreConstPtr::intern(BASE + 0x1000);
     let _runtime = crate::trace_ctx_for_test(0);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let op = OpRef::const_ptr(majit_ir::GcRef(BASE + 0x1000));
     let session = std::cell::RefCell::new(WalkSession {
-        finish_payload: Some((OpRef::const_ptr(majit_ir::GcRef(BASE + 0x1000)), Type::Ref)),
+        finish_payload: Some((op, Type::Ref)),
         ..WalkSession::default()
     });
     let _roots = WalkSessionRoots::new(&session);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
-    majit_gc::shadow_stack::walk_my_extra_areas(|gcref| {
+    let mut visit = |gcref: &mut majit_ir::GcRef| {
         if gcref.0 == BASE + 0x1000 {
             gcref.0 = BASE + 0x2000;
         }
-    });
-    assert_eq!(
-        session.borrow().finish_payload,
-        Some((OpRef::const_ptr(majit_ir::GcRef(BASE + 0x2000)), Type::Ref))
-    );
+    };
+    // The session area traces the index. One wave so the table walk
+    // does not write the same slot again.
+    let _wave = majit_ir::const_ptr_table::Wave::enter();
+    majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
+    majit_ir::const_ptr_table::walk(&mut visit);
+    assert_eq!(session.borrow().finish_payload, Some((op, Type::Ref)));
+    assert_eq!(op.as_const_ptr(), Some(majit_ir::GcRef(BASE + 0x2000)));
 }
 
 extern "C" fn count_static_refusal_prefix() {

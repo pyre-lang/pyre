@@ -62,6 +62,33 @@ impl Drop for ObjectVecRoot {
     }
 }
 
+/// Roots a stable `i64` slice of frame pointers for `drag_out_root`.
+///
+/// The slice has to stay put: `push_resume_ref_roots` records its address,
+/// and a realloc would leave the collector writing into the freed buffer.
+/// Drop pops the registration on return and unwind.
+struct ResumeRefSliceRoots {
+    depth: usize,
+}
+
+impl ResumeRefSliceRoots {
+    fn arm(slots: &mut [i64]) -> Self {
+        let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        if !slots.is_empty() {
+            // SAFETY: `slots` is a Rust `Vec` buffer, not a nursery object,
+            // and this guard outlives every use of the slice.
+            unsafe { majit_gc::shadow_stack::push_resume_ref_roots(slots) };
+        }
+        Self { depth }
+    }
+}
+
+impl Drop for ResumeRefSliceRoots {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.depth);
+    }
+}
+
 thread_local! {
     /// Which flush leg committed the walk-end flush, recorded so the
     /// per-walk census can name it (the legs differ in what they resume at,
@@ -3773,46 +3800,58 @@ fn try_adopt_multi_frame_blackhole(
     let relink_barrier = |callee: *mut pyre_interpreter::PyFrame| {
         // `enter` stores into a frame whose allocation barrier is still in
         // effect; these frames were built many collections ago, so each
-        // store needs its own remembered-set entry.
+        // store needs its own remembered-set entry. `gc_write_barrier`
+        // runs before the store, matching `ExecutionContext::enter`.
         if pyre_object::gc_hook::try_gc_owns_object(callee as pyre_object::gc_hook::GCREF) {
             pyre_object::gc_hook::try_gc_write_barrier(callee as pyre_object::gc_hook::GCREF);
         }
     };
-    let mut saved_links: Vec<(
-        *mut pyre_interpreter::PyFrame,
-        *mut pyre_interpreter::PyFrame,
-    )> = Vec::with_capacity(per_frame.len());
+    // Frame addresses the later drive and the decline restore both consume.
+    // `write_back_outer_locals` boxes slots and can minor-collect, and a
+    // young inlined callee (`NewWithVtable`) moves. The raw `per_frame`
+    // copies would then name the vacated block.
+    let mut frame_ptrs: Vec<i64> = per_frame.iter().map(|&(ptr, _)| ptr).collect();
+    let _frame_ptr_roots = ResumeRefSliceRoots::arm(&mut frame_ptrs);
+    // Pairs of (callee, previous f_backref). A decline writes the previous
+    // value back. Held as raw pointers, that value is the pre-move nursery
+    // address once `write_back_outer_locals` or
+    // `publish_captured_frame_stack` collects, and the barrier then
+    // remembers the old frame with a stale interior. `drag_out_root`
+    // rewrites both slots. The buffer must not reallocate after `arm`.
+    let mut saved_links: Vec<i64> = Vec::with_capacity(per_frame.len() * 2);
     unsafe {
         for i in 0..per_frame.len() {
-            if per_frame[i].0 == 0 {
+            if frame_ptrs[i] == 0 {
                 continue;
             }
-            let callee = per_frame[i].0 as *mut pyre_interpreter::PyFrame;
-            let f_back = per_frame[..i]
+            let callee = frame_ptrs[i] as *mut pyre_interpreter::PyFrame;
+            let f_back = frame_ptrs[..i]
                 .iter()
                 .rev()
-                .find(|&&(ptr, _)| ptr != 0)
-                .map(|&(ptr, _)| ptr)
+                .find(|&&ptr| ptr != 0)
+                .copied()
                 .unwrap_or(root_addr as i64)
                 as *mut pyre_interpreter::PyFrame;
             if std::ptr::eq(callee, f_back) {
                 continue;
             }
-            saved_links.push((callee, (*callee).f_backref));
+            saved_links.push(callee as i64);
+            saved_links.push((*callee).f_backref as i64);
+            relink_barrier(callee);
             majit_gc::bh_probe_note_store(
                 callee as usize,
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
                 5,
             );
             (*callee).f_backref = f_back;
-            relink_barrier(callee);
         }
     }
-    let restore_links = |saved: &[(
-        *mut pyre_interpreter::PyFrame,
-        *mut pyre_interpreter::PyFrame,
-    )]| {
-        for &(callee, f_back) in saved {
+    let _saved_link_roots = ResumeRefSliceRoots::arm(&mut saved_links);
+    let restore_links = |saved: &[i64]| {
+        for pair in saved.chunks_exact(2) {
+            let callee = pair[0] as *mut pyre_interpreter::PyFrame;
+            let f_back = pair[1] as *mut pyre_interpreter::PyFrame;
+            relink_barrier(callee);
             majit_gc::bh_probe_note_store(
                 callee as usize,
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
@@ -3821,7 +3860,6 @@ fn try_adopt_multi_frame_blackhole(
             unsafe {
                 (*callee).f_backref = f_back;
             }
-            relink_barrier(callee);
         }
     };
     // Frame 0 is the walked frame, and the escape flush that ran ahead of the
@@ -3837,8 +3875,8 @@ fn try_adopt_multi_frame_blackhole(
     // no slot side-table or root-frame anchor is involved.  Frame 0 remains
     // the sole detached-snapshot case and therefore needs the explicit publish
     // below.
-    let Some(mut locals_undo) = crate::state::capture_frame_locals(root_addr) else {
-        mfdbg!("frame 0: {root_addr:#x} locals not capturable");
+    let Some(mut locals_undo) = crate::state::capture_frame_locals(frame_ptrs[0] as usize) else {
+        mfdbg!("frame 0: {:#x} locals not capturable", frame_ptrs[0]);
         restore_links(&saved_links);
         return false;
     };
@@ -3858,10 +3896,14 @@ fn try_adopt_multi_frame_blackhole(
         || commit_leg == WalkEndCommitLeg::TraceTooLong
     {
         latched.mirror_stack.as_ref().and_then(|mirror| {
-            crate::state::capture_frame_stack_from_mirror(root_addr, mirror.py_pc, &mirror.slots)
+            crate::state::capture_frame_stack_from_mirror(
+                frame_ptrs[0] as usize,
+                mirror.py_pc,
+                &mirror.slots,
+            )
         })
     } else {
-        crate::state::capture_frame_stack_for_publish(cf_addr, root_addr)
+        crate::state::capture_frame_stack_for_publish(cf_addr, frame_ptrs[0] as usize)
     };
     let Some(mut root_stack) = captured else {
         mfdbg!("frame 0: active stack not capturable (leg={commit_leg:?})");
@@ -3908,11 +3950,11 @@ fn try_adopt_multi_frame_blackhole(
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
         majit_gc::shadow_stack::push_resume_ref_roots(root_stack.roots_mut());
     }
-    if !crate::state::write_back_outer_locals(ctx, root_addr) {
-        crate::state::restore_frame_locals(root_addr, &locals_undo);
+    if !crate::state::write_back_outer_locals(ctx, frame_ptrs[0] as usize) {
+        crate::state::restore_frame_locals(frame_ptrs[0] as usize, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
         restore_links(&saved_links);
-        mfdbg!("frame 0: {root_addr:#x} locals publish declined");
+        mfdbg!("frame 0: {:#x} locals publish declined", frame_ptrs[0]);
         return false;
     }
     for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
@@ -3922,8 +3964,8 @@ fn try_adopt_multi_frame_blackhole(
     if let Some(index) = image_exception_root {
         latched.last_exc_value = image_ref_roots[index];
     }
-    if !crate::state::publish_captured_frame_stack(root_addr, &root_stack) {
-        crate::state::restore_frame_locals(root_addr, &locals_undo);
+    if !crate::state::publish_captured_frame_stack(frame_ptrs[0] as usize, &root_stack) {
+        crate::state::restore_frame_locals(frame_ptrs[0] as usize, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
         restore_links(&saved_links);
         mfdbg!("frame 0: active stack publish declined");
@@ -3954,7 +3996,7 @@ fn try_adopt_multi_frame_blackhole(
     // same recovery the single-frame path makes from its post-drive frame
     // register, and the same hazard `resume_mainloop` roots each level's
     // `virtualizable_ptr` slot against.
-    let live_root = majit_gc::shadow_stack::push(majit_ir::GcRef(root_addr));
+    let live_root = majit_gc::shadow_stack::push(majit_ir::GcRef(frame_ptrs[0] as usize));
     // `enter`: publish `ec.topframeref = <this level's frame>` before it runs.
     let set_topframeref = |frame_ptr: i64| {
         if frame_ptr == 0 {
@@ -3982,6 +4024,11 @@ fn try_adopt_multi_frame_blackhole(
     // The root is already accounted and never reaches the leave callback, so
     // omit it: the vector then contains exactly one guard for every callback
     // pop, in outer-to-inner order.
+    // `frame_ptrs` was forwarded across the publish above. `per_frame` still
+    // holds the pre-move addresses the drive would bind as virtualizables.
+    for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
+        slot.0 = ptr;
+    }
     let level_recursion = std::cell::RefCell::new(
         per_frame
             .iter()
@@ -4028,6 +4075,11 @@ fn try_adopt_multi_frame_blackhole(
         ctx.blackhole_cpu()
             .expect("multi-frame blackhole requires the tracing MetaInterp CPU"),
     );
+    // `frame_ptrs` is what `drag_out_root` updates. Copy it again after
+    // builder setup so the drive binds those addresses.
+    for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
+        slot.0 = ptr;
+    }
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,
         terminal: mf_terminal,
@@ -7206,56 +7258,64 @@ mod tests {
         ];
         let _runtime = crate::trace_ctx_for_test(0);
         let ptr = |word| OpRef::const_ptr(GcRef(word));
+        let o_reg = ptr(BASE + 0x1000);
+        let i_reg = ptr(BASE + 0x2000);
+        let o_bank_op = ptr(BASE + 0x3000);
+        let i_bank_op = ptr(BASE + 0x4000);
         let outer = Box::new(PyreSym::new_uninit(OpRef::NONE));
         let inner = Box::new(PyreSym::new_uninit(OpRef::NONE));
-        outer.registers_r.replace(vec![ptr(BASE + 0x1000)]);
-        inner.registers_r.replace(vec![ptr(BASE + 0x2000)]);
-        let outer_bank = RegisterBank::new([ptr(BASE + 0x3000), OpRef::input_arg_ref(0)]);
-        let inner_bank = RegisterBank::new([ptr(BASE + 0x4000)]);
+        outer.registers_r.replace(vec![o_reg]);
+        inner.registers_r.replace(vec![i_reg]);
+        let outer_bank = RegisterBank::new([o_bank_op, OpRef::input_arg_ref(0)]);
+        let inner_bank = RegisterBank::new([i_bank_op]);
         // Do not expose sentinel addresses to another test's real collector.
         let _stw = majit_gc::gc_sync::quiesce_mutators();
         let outer_anchor = super::TraceRoots::enter(&outer);
         let outer_registration = super::InlineRegisterBankGuard::enter(&outer_bank);
         let inner_anchor = super::TraceRoots::enter(&inner);
         let inner_registration = super::InlineRegisterBankGuard::enter(&inner_bank);
-        let mut seen = Vec::new();
-        // Sentinel words are never dereferenced. This is a forwarding visitor,
-        // not a real collection. Use the actual registry, including the
-        // independently registered frame banks, not just the current anchor.
-        {
-            majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+        let collect = || {
+            let mut seen = Vec::new();
+            let mut visit = |root: &mut GcRef| {
                 if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
                     seen.push(root.0);
                     root.0 += 0x80;
                 }
-            });
-        }
+            };
+            // Banks trace their indexes. The table walk covers a bank
+            // that a later drop retired. One wave, one write per slot.
+            let _wave = majit_ir::const_ptr_table::Wave::enter();
+            majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
+            majit_ir::const_ptr_table::walk(&mut visit);
+            seen.sort_unstable();
+            seen
+        };
+        assert_eq!(
+            collect(),
+            [BASE + 0x1000, BASE + 0x2000, BASE + 0x3000, BASE + 0x4000]
+        );
+        assert_eq!(outer.registers_r.to_vec(), [o_reg]);
+        assert_eq!(o_reg.as_const_ptr(), Some(GcRef(BASE + 0x1080)));
+        assert_eq!(outer_bank.get(0), Some(o_bank_op));
+        assert_eq!(o_bank_op.as_const_ptr(), Some(GcRef(BASE + 0x3080)));
+        assert_eq!(outer_bank.get(1), Some(OpRef::input_arg_ref(0)));
+        assert_eq!(i_reg.as_const_ptr(), Some(GcRef(BASE + 0x2080)));
+        assert_eq!(i_bank_op.as_const_ptr(), Some(GcRef(BASE + 0x4080)));
+
         drop(inner_registration);
         drop(inner_anchor);
+        // Dropping the inner bank retires that area. The indexes remain
+        // table roots, so the next minor still forwards every value.
         assert_eq!(
-            seen,
-            [BASE + 0x1000, BASE + 0x3000, BASE + 0x2000, BASE + 0x4000]
+            collect(),
+            [BASE + 0x1080, BASE + 0x2080, BASE + 0x3080, BASE + 0x4080]
         );
-        assert_eq!(outer.registers_r.to_vec(), [ptr(BASE + 0x1080)]);
-        assert_eq!(outer_bank.get(0), Some(ptr(BASE + 0x3080)));
-        assert_eq!(outer_bank.get(1), Some(OpRef::input_arg_ref(0)));
-        assert_eq!(inner.registers_r.to_vec(), [ptr(BASE + 0x2080)]);
-        assert_eq!(inner_bank.get(0), Some(ptr(BASE + 0x4080)));
-
-        seen.clear();
-        {
-            majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
-                    seen.push(root.0);
-                    root.0 += 0x80;
-                }
-            });
-        }
+        assert_eq!(o_reg.as_const_ptr(), Some(GcRef(BASE + 0x1100)));
+        assert_eq!(o_bank_op.as_const_ptr(), Some(GcRef(BASE + 0x3100)));
+        assert_eq!(i_reg.as_const_ptr(), Some(GcRef(BASE + 0x2100)));
+        assert_eq!(i_bank_op.as_const_ptr(), Some(GcRef(BASE + 0x4100)));
         drop(outer_registration);
         drop(outer_anchor);
-        assert_eq!(seen, [BASE + 0x1080, BASE + 0x3080]);
-        assert_eq!(outer.registers_r.to_vec(), [ptr(BASE + 0x1100)]);
-        assert_eq!(outer_bank.get(0), Some(ptr(BASE + 0x3100)));
     }
 
     #[test]
