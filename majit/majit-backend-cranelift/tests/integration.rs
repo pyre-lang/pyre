@@ -64,6 +64,18 @@ fn make_descr(_index: u32) -> DescrRef {
 
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 
+/// Stamp the guard's recovery list. `runner_test.py` uses
+/// `op.setfailargs(...)` the same way `compile.py`
+/// `ResumeGuardDescr.store_final_boxes` does after numbering.
+fn set_guard_failargs(trace: &RecordedTrace, guard: OpRef, args: &[OpRef]) {
+    let op = trace
+        .ops
+        .iter()
+        .find(|op| op.pos().get() == guard)
+        .expect("recorded guard");
+    op.setfailargs(args.iter().copied().map(rb).collect());
+}
+
 // Test 1: Simple arithmetic (trace -> optimize -> compile -> execute)
 
 #[test]
@@ -109,9 +121,10 @@ fn test_sum_loop() {
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
     let cmp = rec.record_op(OpCode::IntGt, &[i2, const_zero]);
-    rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
     rec.close_loop(&[i2, sum2]);
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[i, sum]);
 
     // Optimize
 
@@ -148,9 +161,7 @@ fn test_sum_loop() {
     //   The jump args are (i2=1, sum2=5049).
     //   Iteration 100: i=1, sum=5049 -> sum2=5049+1=5050, i2=0, cmp=false -> guard fails
     //
-    // At guard failure, the backend saves the *input arg* values (i, sum), not (i2, sum2).
-    // Looking at collect_guards: for guards, fail_arg_refs = (0..num_inputs).map(OpRef).
-    // So it saves var(0)=i=1 and var(1)=sum=5049.
+    // At guard failure, the backend saves fail_args=[i, sum], not (i2, sum2).
     //
     // The sum2 and i2 have NOT been written back to the input vars yet (that happens at Jump).
     assert_eq!(backend.get_int_value(&frame, 0), 1); // i at guard failure
@@ -178,10 +189,11 @@ fn test_guard_failure_path() {
     let const_two = OpRef::const_int(2);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x, const_zero]);
-    rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
     let result = rec.record_op(OpCode::IntMul, &[x, const_two]);
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[x]);
 
     // Optimize
 
@@ -235,9 +247,10 @@ fn test_bridge_end_to_end() {
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
     let cmp = rec.record_op(OpCode::IntGt, &[i2, const_zero]);
-    rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
     rec.close_loop(&[i2, sum2]);
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[i, sum]);
 
     // Optimize
 
@@ -1383,9 +1396,10 @@ fn test_call_release_gil_i_compiles_and_executes() {
     let fn_ptr = OpRef::const_int(ffi_add as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, a, b], cd);
-    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[a, b, result]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -1423,9 +1437,10 @@ fn test_call_release_gil_i_no_args() {
     let fn_ptr = OpRef::const_int(ffi_constant as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr], cd);
-    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[dummy, result]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -1461,9 +1476,10 @@ fn test_call_release_gil_n_void_return() {
     let fn_ptr = OpRef::const_int(ffi_sink as *const () as usize as i64);
 
     rec.record_op_with_descr(OpCode::CallReleaseGilN, &[saveerr, fn_ptr, input], cd);
-    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
     rec.finish(&[input], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[input]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -1498,10 +1514,11 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let tmp =
         rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, x, const_10], cd);
-    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
     let result = rec.record_op(OpCode::IntAdd, &[tmp, const_5]);
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[x, tmp]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -1899,10 +1916,11 @@ fn test_call_release_gil_with_guard_not_forced() {
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, x], cd);
 
     // GuardNotForced with fail_args — exits here if the callee forced
-    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[x, result]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -1952,10 +1970,11 @@ fn test_call_may_force_with_forcing_semantics() {
 
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, flag], cd);
 
-    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[flag, result]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -2013,12 +2032,14 @@ fn test_ffi_call_exception_propagation() {
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, val], cd);
 
     // GuardNotForced: required immediately after CallReleaseGil
-    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(2)));
+    let not_forced = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(2)));
     // GuardNoException: exits if jit_exc_get_value() != 0
-    rec.record_guard(OpCode::GuardNoException, &[], Some(make_descr(0)));
+    let no_exc = rec.record_guard(OpCode::GuardNoException, &[], Some(make_descr(0)));
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, not_forced, &[val, result]);
+    set_guard_failargs(&trace, no_exc, &[result]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -2069,9 +2090,10 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
 
     let result = rec.record_op(OpCode::IntAdd, &[x, const_5]);
     let cmp = rec.record_op(OpCode::IntLt, &[result, const_100]);
-    rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[x]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -2126,9 +2148,10 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
     let cmp = rec.record_op(OpCode::IntGt, &[i2, const_zero]);
-    rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
     rec.close_loop(&[i2, sum2]);
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[i, sum]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -2185,10 +2208,11 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let bridge_const_two = OpRef::const_int(2);
 
     let bcmp = bridge_rec.record_op(OpCode::IntGt, &[bsum, bridge_const_zero]);
-    bridge_rec.record_guard(OpCode::GuardTrue, &[bcmp], Some(make_descr(10)));
+    let bridge_guard = bridge_rec.record_guard(OpCode::GuardTrue, &[bcmp], Some(make_descr(10)));
     let bresult = bridge_rec.record_op(OpCode::IntMul, &[bsum, bridge_const_two]);
     bridge_rec.finish(&[bresult], make_descr(11));
     let bridge_trace = bridge_rec.get_trace();
+    set_guard_failargs(&bridge_trace, bridge_guard, &[_bi, bsum]);
 
     // Mint a `ResumeGuardDescr` that mirrors the source guard's identity
     // (per-trace fail_index = 0, trace_id = 910). Bridge compilation
@@ -2261,6 +2285,7 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
         ),
     ];
     assign_positions(&mut callee_ops, 0);
+    callee_ops[2].setfailargs(vec![rb(OpRef::input_arg_int(0))].into());
     let callee_ops_rc: Vec<OpRc> = callee_ops.into_iter().map(OpRc::new).collect();
 
     let mut backend = CraneliftBackend::new();
@@ -2307,9 +2332,10 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     let const_0 = OpRef::const_int(0);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x_int, const_0]);
-    rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
     rec.finish(&[x_int], make_descr(1));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[x_int, x_float]);
 
     let mut backend = CraneliftBackend::new();
 
@@ -2406,13 +2432,14 @@ fn test_ffi_exchange_buffer_pattern() {
     let _call_result =
         rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, r0], cd);
     // RPython: CallReleaseGilI must be followed by GuardNotForced
-    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(1)));
+    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(1)));
 
     // Step 3: Load result from buffer at offset 32 (exchange_result)
     let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, off_result], ad);
 
     rec.finish(&[loaded], make_descr(0));
     let trace = rec.get_trace();
+    set_guard_failargs(&trace, guard, &[r0, i0]);
 
     let mut backend = CraneliftBackend::new();
 

@@ -3438,6 +3438,12 @@ pub fn frame_entry_reads_live_positions(
     bridge_inputs == live
 }
 
+/// Live values this exit recovers, in slot order.
+///
+/// Same count the parameter-dispatch arity table stores:
+/// `live_fail_arg_count(descr, exit_fail_args(op).len())`. `exit_fail_args`
+/// reads `getarglist()` on FINISH (`genop_finish`) and `getfailargs()` on a
+/// guard (`locs_for_fail`). An absent guard list is malformed IR.
 fn live_exit_fail_args(op: &Op) -> Vec<OpRef> {
     let args = exit_fail_args(op);
     let live = live_fail_arg_mask(op.getdescr().as_ref(), args.len());
@@ -4158,10 +4164,7 @@ fn collect_guards_and_vars(inputargs: &[InputArgRc], ops: &[Op]) -> (Vec<GuardEx
         }
 
         if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-            let fail_args: Vec<OpRef> = op
-                .getfailargs()
-                .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
-                .unwrap_or_else(|| op.getarglist().iter().map(|a| a.to_opref()).collect());
+            let fail_args: Vec<OpRef> = exit_fail_args(op);
             let fail_arg_types = op
                 .get_fail_arg_types()
                 .unwrap_or_else(|| fail_args.iter().map(|_| Type::Int).collect());
@@ -12078,25 +12081,6 @@ fn emit_guard_exit(
     sink.br(block_exit_depth);
 }
 
-/// Tail-call this guard's bridge directly when its cell is armed. The guard's
-/// failure list fixes both the values and the wasm function type, so this path
-/// needs neither an arity tag nor staging locals.
-/// A guard op's fail args restricted to the positions its bridge received.
-///
-/// Same rule as `live_fail_arg_mask`, read off the op's own descr.
-fn live_fail_args_of(op: &Op) -> Vec<OpRef> {
-    let all: Vec<OpRef> = op
-        .getfailargs()
-        .map(|args| args.iter().map(|arg| arg.to_opref()).collect::<Vec<_>>())
-        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
-    let descr = op.getdescr();
-    let mask = live_fail_arg_mask(descr.as_ref(), all.len());
-    all.into_iter()
-        .zip(mask)
-        .filter_map(|(arg, live)| live.then_some(arg))
-        .collect()
-}
-
 fn dispatch_cell_addr(dispatch: BridgeDispatch<'_>, guard_idx: u32) -> u32 {
     let index = guard_idx.wrapping_sub(dispatch.fail_index_base) as usize;
     if let Some(&addr) = dispatch.cell_addrs.get(index) {
@@ -12110,6 +12094,9 @@ fn dispatch_cell_addr(dispatch: BridgeDispatch<'_>, guard_idx: u32) -> u32 {
     dispatch.cells_base + index as u32 * std::mem::size_of::<u32>() as u32
 }
 
+/// Tail-call this guard's bridge directly when its cell is armed. The guard's
+/// failure list fixes both the values and the wasm function type, so this path
+/// needs neither an arity tag nor staging locals.
 fn emit_guard_param_tail_call(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -12118,7 +12105,11 @@ fn emit_guard_param_tail_call(
     op: &Op,
     dispatch: BridgeDispatch<'_>,
 ) {
-    let fail_args: Vec<OpRef> = live_fail_args_of(op);
+    // Same live list `bridge_param_arities` counted from GuardExit
+    // (`exit_fail_args` + `live_fail_arg_count`). FINISH is not a
+    // GuardResOp, so `getfailargs()` is None while the exit writes
+    // `getarglist()`.
+    let fail_args: Vec<OpRef> = live_exit_fail_args(op);
     let arity = fail_args.len();
     let type_idx = *dispatch
         .param_type_indices
@@ -12173,7 +12164,7 @@ fn emit_guard_inline_bridge_move(
     const_tables: &ConstPtrTables,
     const_table_base: u32,
 ) {
-    let fail_args: Vec<OpRef> = live_fail_args_of(op);
+    let fail_args: Vec<OpRef> = live_exit_fail_args(op);
     assert_eq!(
         fail_args.len(),
         inputargs.len(),
@@ -12633,10 +12624,22 @@ fn live_fail_arg_position(op: &Op, fail_args: &[OpRef], value: OpRef) -> Option<
 }
 
 /// This op's fail arguments as the exit writes them, in slot order.
+///
+/// FINISH reads `getarglist()` (`genop_finish`). A guard reads
+/// `getfailargs()` (`x86/regalloc.py` `locs_for_fail`). An absent guard
+/// list skipped `store_final_boxes_in_guard` /
+/// `ResumeDataVirtualAdder.finish`.
 fn exit_fail_args(op: &Op) -> Vec<OpRef> {
-    op.getfailargs()
-        .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
-        .unwrap_or_else(|| op.getarglist().iter().map(|a| a.to_opref()).collect())
+    if op.opcode == OpCode::Finish {
+        return op.getarglist().iter().map(|a| a.to_opref()).collect();
+    }
+    match op.getfailargs() {
+        Some(fa) => fa.iter().map(|a| a.to_opref()).collect(),
+        None if op.opcode.is_guard() => {
+            panic!("{:?} reached the backend without fail args", op.opcode)
+        }
+        None => Vec::new(),
+    }
 }
 
 /// x86/assembler.py `genop_discard_check_memory_error`: the NULL test
@@ -13568,6 +13571,7 @@ mod tests {
         let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
         let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
         guard.pos().set(OpRef::void_op(1));
+        guard.setfailargs(vec![].into());
         let add = Op::new(
             OpCode::IntAdd,
             &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
@@ -13578,6 +13582,69 @@ mod tests {
         let ops = vec![guard, add, finish];
         assert_eq!(value_id_end(&inputargs, &ops), 2);
         assert_eq!(collect_guards_and_vars(&inputargs, &ops).1, 2);
+    }
+
+    #[test]
+    fn param_dispatch_arity_uses_exit_fail_args_for_finish_and_guards() {
+        // FINISH is not GuardResOp: getfailargs() is None, while the exit
+        // writes getarglist() (`genop_finish` / `exit_fail_args`). A guard
+        // reads getfailargs() (`locs_for_fail`).
+        let _cpu = cpu();
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let i0 = rb(OpRef::input_arg_int(0));
+        let finish = Op::new(OpCode::Finish, std::slice::from_ref(&i0));
+        assert!(finish.getfailargs().is_none());
+        assert_eq!(exit_fail_args(&finish).len(), 1);
+        assert_eq!(live_exit_fail_args(&finish).len(), 1);
+        assert_eq!(
+            live_exit_fail_args(&finish).len(),
+            live_fail_arg_count(finish.getdescr().as_ref(), exit_fail_args(&finish).len()),
+        );
+
+        let guard = Op::new(OpCode::GuardTrue, std::slice::from_ref(&i0));
+        guard.setfailargs(vec![i0.clone()].into());
+        assert_eq!(live_exit_fail_args(&guard).len(), 1);
+
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let ops = vec![guard, finish];
+        let inputs = ModuleBuildInputs {
+            inputargs,
+            ops,
+            inlined_bridges: Vec::new(),
+            constants: indexmap::IndexMap::new(),
+            vtable_offset: Some(0),
+            classptr_to_typeid: HashMap::new(),
+            guard_gc_type_info: GuardGcTypeInfo::default(),
+            alloc: AllocHelpers::default(),
+            wb: WriteBarrierHelpers::for_current_gc(0, 0),
+            nursery: None,
+            invalidated_flag_addr: 0,
+            gc_table_base: 0,
+            gc_const_keys: Vec::new(),
+            fail_index_base: 0,
+            bridge_cells_base: 4,
+            guard_cell_addrs: Vec::new(),
+            bridge_entry_arity: None,
+            bridge_param_dispatch: true,
+            trace_entry_census: None,
+            inline_trip: None,
+            external_jump_slot: 0,
+            external_jump_wide_slot: 0,
+            external_jump_key: 0,
+            frame: FrameGeometry::fixed(),
+            ca: CaParams::default(),
+        };
+        build_wasm_module(&inputs).expect("FINISH getarglist arity must find a param type");
+    }
+
+    #[test]
+    #[should_panic(expected = "GuardTrue reached the backend without fail args")]
+    fn absent_guard_fail_args_are_malformed() {
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let i0 = rb(OpRef::input_arg_int(0));
+        let guard_no_fa = Op::new(OpCode::GuardTrue, std::slice::from_ref(&i0));
+        assert!(guard_no_fa.getfailargs().is_none());
+        let _ = exit_fail_args(&guard_no_fa);
     }
 
     #[test]
@@ -13594,6 +13661,7 @@ mod tests {
         add.pos().set(OpRef::float_op(1));
         let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::const_int(1))]);
         guard.pos().set(OpRef::void_op(1));
+        guard.setfailargs(vec![].into());
         let finish = Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))]);
         finish.pos().set(OpRef::void_op(3));
         let ops = vec![add, guard, finish];
