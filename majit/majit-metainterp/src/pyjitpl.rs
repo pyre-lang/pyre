@@ -2523,16 +2523,18 @@ pub struct MetaInterp<M: Clone> {
     /// collect in that window. `walk_rd_consts_refs` walks the vec through
     /// this slot. Cleared when the compile returns.
     pub(crate) compile_target_tokens: Option<usize>,
-    /// Memos the in-flight optimizers own, for the window before their guards
-    /// reach a compiled trace.
+    /// Memos the in-flight compile numbered, held until the snapshot guard
+    /// drops after `compiled_loops` insert.
     ///
     /// `resume.py finish` does `storage.rd_consts = self.memo.consts`, so each
     /// guard is handed the memo's own list and one GC object roots the pool for
     /// the whole optimizer. Pyre shares that same [`majit_ir::SharedConstPool`]
-    /// with the guards. This weak memo root covers constants before any guard
-    /// owns them and rebuilds the memo's identity-hash lookup after moves;
-    /// published operations root their descriptors independently after the
-    /// optimizer dies. Emptied by [`CompileSnapshotRootsGuard`].
+    /// with the guards. The `Optimizer` local dies when `optimize_trace`
+    /// returns; `backend.compile_loop` can collect before
+    /// `insert_compiled_loop` publishes the same Arc on `exit_layouts`.
+    /// Strong handles keep that pool in `walk_rd_consts_refs` for the
+    /// window; published operations root their descriptors independently
+    /// after the optimizer dies. Emptied by [`CompileSnapshotRootsGuard`].
     pub(crate) compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
     /// `ConstPtr` index of the virtualizable for the in-flight compile.
     ///
@@ -3296,16 +3298,10 @@ fn walk_resume_memos(
     memos: &mut Vec<crate::resume::LiveResumeMemo>,
     visitor: &mut dyn FnMut(&mut GcRef),
 ) {
-    // `resume.py finish` hands each guard `self.memo.consts` itself, so
-    // upstream roots the pool through the optimizer that owns it. Pyre
-    // shares the pool with the guards; this separate memo root covers
-    // constants before a guard owns them and rekeys the identity-hash
-    // cache while an `Optimizer` is alive. Published guard descriptors
-    // remain roots independently when that optimizer has been dropped.
-    memos.retain(|weak| {
-        let Some(memo) = weak.upgrade() else {
-            return false;
-        };
+    // `resume.py finish` shares `memo.consts` as `storage.rd_consts`. The
+    // handles stay strong until `CompileSnapshotRootsGuard` drops, which is
+    // after `insert_compiled_loop` publishes the same Arc on `exit_layouts`.
+    for memo in memos {
         // SAFETY: pyre is single-threaded and this walker runs from the
         // allocation path, so the only other code that could hold the
         // `RefCell` is the optimizer frame this walk interrupted. Going
@@ -3315,8 +3311,7 @@ fn walk_resume_memos(
         // `SharedConstPool::as_mut_vec_for_gc` exists for.
         let memo = unsafe { &mut *memo.as_ptr() };
         memo.walk_const_ptr_refs_mut(visitor);
-        true
-    });
+    }
 }
 
 fn walk_target_token_const_ptrs(
@@ -6404,10 +6399,13 @@ impl<M: Clone> MetaInterp<M> {
         opt.string_constant_alloc = self.string_constant_alloc.clone();
         // optimizer.py Optimizer.__init__ owns resumedata_memo; resume.py
         // ResumeDataVirtualAdder.finish keeps memo.consts live while allocating
-        // rd_numb, before assigning the pool to the guard. Publish every
+        // rd_numb, then `storage.rd_consts = self.memo.consts`. Publish every
         // optimizer here, including simple finishes and unroll-cancel retries.
+        // Strong until CompileSnapshotRootsGuard drops: the Optimizer dies
+        // when optimize_trace returns, and backend.compile_loop can collect
+        // before insert_compiled_loop publishes the same Arc on exit_layouts.
         self.compile_resume_memos
-            .push(std::rc::Rc::downgrade(&opt.resumedata_memo));
+            .push(std::rc::Rc::clone(&opt.resumedata_memo));
         opt.set_compile_live_op_roots_slot(Some((&raw mut self.compile_live_op_roots) as usize));
     }
 
@@ -7702,7 +7700,7 @@ impl<M: Clone> MetaInterp<M> {
         builder: &mut P,
         per_frame: Option<&[(i64, usize)]>,
         on_enter_level: Option<&dyn Fn(i64)>,
-        on_leave_level: Option<&dyn Fn(i64)>,
+        on_leave_level: Option<&dyn Fn(i64, crate::blackhole::LevelExit)>,
     ) -> crate::jitexc::JitException {
         let ctx = self.tracing.as_mut().expect("cancelling a live trace");
         assert!(
@@ -7743,6 +7741,8 @@ impl<M: Clone> MetaInterp<M> {
                 frame.freeze_values_into_const_boxes(ctx);
             }
         }
+        // `blackhole.py convert_and_run_from_pyjitpl` copies every live
+        // frame (`perform_call` has already run `setup_call`).
         self.abort_trace(false);
         builder.with_builder(|builder| builder.set_cpu(self.blackhole_cpu()));
         let result = crate::jitdriver::drive_multi_frame_blackhole(
@@ -7758,6 +7758,7 @@ impl<M: Clone> MetaInterp<M> {
             per_frame,
             on_enter_level,
             on_leave_level,
+            None,
             None,
         );
         self.framestack.frames.clear();
@@ -11990,6 +11991,7 @@ impl<M: Clone> MetaInterp<M> {
             // and `_get_opimpl_method` only stores an instruction start.
             top.pc = dispatch::snap_pc_to_instruction_start(top);
         }
+        // `blackhole.py convert_and_run_from_pyjitpl` copies every live frame.
         let framestack = std::mem::replace(&mut self.framestack, MIFrameStack::empty());
         self.pending_abort_blackhole = Some(crate::PendingAbortBlackhole {
             framestack,
@@ -12072,11 +12074,18 @@ impl<M: Clone> MetaInterp<M> {
         self.staticdata.log_trace_aborted();
     }
 
-    /// Live-cleanup half of `abort_trace` — no stats, no hooks.
-    /// Callers that go through `blackhole_if_trace_too_long` should invoke
-    /// this directly and then call `aborted_tracing(AbortReason::TooLong)`
-    /// so the accounting event fires exactly once with the correct reason.
-    pub fn abort_trace_live(&mut self, permanent: bool) {
+    /// Drop live History so `live_history_mut()` is `None`.
+    ///
+    /// `pyjitpl.py MetaInterp.run_blackhole_interp_to_cancel_tracing` calls
+    /// `aborted_tracing` then `convert_and_run_from_pyjitpl`;
+    /// `compile_and_run_once` / `handle_guard_failure` close the profiler
+    /// in `finally` *after* that blackhole. This method is the History
+    /// half: nested `warmstate.py bound_reached` during the blackhole
+    /// then finds nothing to `write_boxes`. The profiler / session close
+    /// stays with [`Self::clear_trace_session`] so
+    /// `has_live_metainterp_attempt` still parks leftover driver state
+    /// for that nested run (pyre's analog of a fresh MetaInterp).
+    pub fn abort_trace_history(&mut self, permanent: bool) {
         self.force_finish_trace = false;
         self.clear_retrace_state();
         if let Some(mut ctx) = self.tracing.take() {
@@ -12104,24 +12113,31 @@ impl<M: Clone> MetaInterp<M> {
                 None
             };
             self.pending_abort_permanent = permanent;
-            // RPython invariant: `tracing` (the tracer context) and
-            // `active_trace_session` (the frontend meta envelope) share
-            // a lifetime — upstream's `MetaInterp.staticdata` carries
-            // both through `begin_tracing` / abort paths as one unit.
-            // If we take the tracer, the session must go with it, or a
-            // subsequent `bound_reached` → `begin_trace_session` will
-            // find a stale `Some(..)` and fire the "already active"
-            // assertion. Clearing unconditionally here is idempotent for
-            // sites that already consumed the session via
-            // `take_trace_meta` (e.g. the compile_loop dispatch) — a
-            // None→None set is a no-op.
-            self.clear_trace_session();
         }
-        // `pyjitpl.py:3015` — cancel/abort unwinds the tracing state
-        // atomically. Keep `self.tracing` and `self.active_trace_session`
-        // in lockstep: leaving `active_trace_session = Some` after
-        // `self.tracing = None` would leak a stale session into the next
-        // `begin_trace_session`, which asserts the slot is empty.
+    }
+
+    /// Live-cleanup half of `abort_trace` — no stats, no hooks.
+    /// Callers that go through `blackhole_if_trace_too_long` should invoke
+    /// this directly and then call `aborted_tracing(AbortReason::TooLong)`
+    /// so the accounting event fires exactly once with the correct reason.
+    pub fn abort_trace_live(&mut self, permanent: bool) {
+        self.abort_trace_history(permanent);
+        // RPython invariant: `tracing` (the tracer context) and
+        // `active_trace_session` (the frontend meta envelope) share
+        // a lifetime — upstream's `MetaInterp.staticdata` carries
+        // both through `begin_tracing` / abort paths as one unit.
+        // If we take the tracer, the session must go with it, or a
+        // subsequent `bound_reached` → `begin_trace_session` will
+        // find a stale `Some(..)` and fire the "already active"
+        // assertion. Clearing unconditionally here is idempotent for
+        // sites that already consumed the session via
+        // `take_trace_meta` (e.g. the compile_loop dispatch) — a
+        // None→None set is a no-op.
+        //
+        // `pyjitpl.py compile_and_run_once` `finally: profiler.end_tracing()`
+        // is this close. FBW `try_adopt_*_blackhole` uses
+        // [`Self::abort_trace_history`] instead so the close waits until
+        // after `convert_and_run_from_pyjitpl`.
         self.clear_trace_session();
     }
 
@@ -13139,6 +13155,69 @@ impl<M: Clone> MetaInterp<M> {
                 self.compile_snapshot_refs.clear();
                 None
             }
+        }
+    }
+
+    /// `pyjitpl.py _create_segmented_trace_and_blackhole` loop arm:
+    /// `compile.compile_simple_loop` then `warmstate.attach_procedure_to_interp`.
+    pub fn compile_and_attach_segmented_loop(&mut self) {
+        let Some((green_key, install_token)) = self.compile_simple_loop() else {
+            return;
+        };
+        // pyjitpl.py `_create_segmented_trace_and_blackhole` reads the greenkey
+        // from current_merge_points; without staging the key here, the
+        // segmented-loop abort hook reports key 0.
+        self.pending_abort_green_key = Some(green_key);
+        // pyjitpl.py `_create_segmented_trace_and_blackhole` passes
+        // `target_token.targeting_jitcell_token` from `compile.compile_simple_loop`
+        // to `warmstate.attach_procedure_to_interp`. pyre's `compile_simple_loop`
+        // returns that minted `JitCellToken` (its `target_tokens` hold the new
+        // TargetToken). `compile.py send_loop_to_backend` still records the
+        // same token on `last_compiled_artifact_token` for other readers.
+        let jd_no = self.active_jitdriver_sd.unwrap_or(0);
+        // `warmstate.py attach_procedure_to_interp` redirect+record_jump_to chain
+        // routed through MetaInterp's caller-side helper.
+        self.attach_procedure_with_redirect_on_driver(jd_no, green_key, None, install_token);
+    }
+
+    /// `pyjitpl.py _create_segmented_trace_and_blackhole` compile half.
+    ///
+    /// Compile the prefix while History is still live. The caller then
+    /// `aborted_tracing`s and `convert_and_run_from_pyjitpl`s
+    /// (`run_blackhole_interp_to_cancel_tracing`). Loop vs bridge is the
+    /// same predicate `create_segmented_trace` used when it recorded the
+    /// cut: a merge point plus `ResumeFromInterpDescr` (no resumekey
+    /// loop token) is `compile_simple_loop` + attach; anything else is
+    /// `compile_trace(metainterp, resumekey, [exception_box])`.
+    pub fn compile_segmented_trace_prefix(&mut self) {
+        let is_loop = self.tracing.as_ref().is_some_and(|ctx| {
+            ctx.current_merge_points_first_greenkey().is_some()
+                && ctx.resumekey_original_loop_token().is_none()
+        });
+        if is_loop {
+            if self.take_trace_meta().is_none() {
+                return;
+            }
+            self.compile_and_attach_segmented_loop();
+            self.stage_abort_reason(crate::counters::ABORT_SEGMENTED_TRACE);
+            return;
+        }
+        let typeptr = self
+            .staticdata
+            .host
+            .assertion_error_typeptr
+            .map_or(0, |f| f());
+        let exception_box = OpRef::const_int(typeptr);
+        let green_key = self.tracing.as_ref().map(|ctx| ctx.green_key);
+        let result = self.compile_finish_from_active_session(
+            &[exception_box],
+            vec![Type::Int],
+            /* exit_with_exception */ true,
+        );
+        self.pending_abort_green_key = green_key;
+        match result {
+            Ok(()) => self.stage_abort_reason(crate::counters::ABORT_SEGMENTED_TRACE),
+            Err(stb) => self.stage_abort_reason(stb.reason),
         }
     }
 
@@ -25183,7 +25262,8 @@ mod metainterp_static_data_tests {
         let entered = RefCell::new(Vec::new());
         let left = RefCell::new(Vec::new());
         let on_enter = |frame_ptr: i64| entered.borrow_mut().push(frame_ptr);
-        let on_leave = |frame_ptr: i64| left.borrow_mut().push(frame_ptr);
+        let on_leave =
+            |frame_ptr: i64, _exit: crate::blackhole::LevelExit| left.borrow_mut().push(frame_ptr);
         let per_frame = [(0x1000, 0), (0x2000, 0)];
         let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
             "recursive_call_v/iIRFIRF",
@@ -30811,8 +30891,53 @@ mod tests {
         );
         meta.restore_attempt();
         drop(optimizer);
-        meta.walk_rd_consts_refs(|_| panic!("a dropped optimizer must not retain roots"));
-        assert!(meta.compile_resume_memos.is_empty());
+        let mut seen = 0;
+        meta.walk_rd_consts_refs(|slot| {
+            if *slot == live {
+                seen += 1;
+            }
+        });
+        assert!(seen >= 1, "dropped optimizer memo stays a compile root");
+        assert!(!meta.compile_resume_memos.is_empty());
+    }
+
+    /// `resume.py finish` shares `memo.consts` as `storage.rd_consts`. The
+    /// `Optimizer` that numbered the pool is dropped before
+    /// `backend.compile_loop`; `compile_resume_memos` keeps a strong handle
+    /// so a collection in that window still forwards the pool.
+    #[test]
+    fn compile_resume_memos_keep_the_pool_after_optimizer_drop() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let dead = GcRef(0x96E6_1100);
+        let live = GcRef(0x96E6_2100);
+        let optimizer_memo = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::resume::ResumeDataLoopMemo::new(),
+        ));
+        optimizer_memo
+            .borrow_mut()
+            .getconst_ref(dead.0 as i64)
+            .expect("pool the interned ref");
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.compile_resume_memos
+            .push(std::rc::Rc::clone(&optimizer_memo));
+        drop(optimizer_memo);
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut seen = 0;
+        meta.walk_rd_consts_refs(|slot| {
+            if slot.0 == dead.0 {
+                slot.0 = live.0;
+                seen += 1;
+            }
+        });
+        assert_eq!(seen, 1, "dropped optimizer memo stays a compile root");
+        assert_eq!(
+            meta.compile_resume_memos[0].borrow().consts()[0].getref_base(),
+            live,
+            "walk_rd_consts_refs writes the memo Const::Ref field"
+        );
     }
 
     #[test]
@@ -30900,7 +31025,7 @@ mod tests {
             .push((&raw mut snap_slot) as usize);
         meta.compile_short_preamble_producer = Some((&raw mut producer) as usize);
         meta.compile_resume_memos
-            .push(std::rc::Rc::downgrade(&memo));
+            .push(std::rc::Rc::clone(&memo));
         meta.compile_target_tokens = Some(tokens_addr);
         meta.compile_vable_index = Some(vable_index);
         meta.compile_vable_root = vable_dead;

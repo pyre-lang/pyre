@@ -768,7 +768,7 @@ pub fn restore_walk_tls() {
     super::set_list_append_suspend_bookmark(parked.list_append_suspend_bookmark);
 }
 
-fn visit_pyobject_ref(
+pub(crate) fn visit_pyobject_ref(
     slot: &mut pyre_object::PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {

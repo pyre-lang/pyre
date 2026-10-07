@@ -2317,17 +2317,14 @@ fn seed_declared_funcptr_type(graph: &LegacyGraph, entry: &FunctionEntry) {
     }
 }
 
-/// Prefill a residual cachedgraph for a raw-storage impl method.
+/// Prefill a residual cachedgraph for a handle method with no upstream
+/// graph.
 ///
-/// `Lowering::impl_method_owner` declines `CallTarget::Method` for a raw
-/// ADT (`executioncontext.py` `ExecutionContext` is an address, not a GC
-/// instance), so callsites are `FunctionPath`.  Walking the body then
-/// getattr's sibling methods (`_trace`) off a classdef whose classdict
-/// was never seeded — Pass 3 requires `is_known_struct_root`, and a raw
-/// struct is not a GC class.  The annotator-only stub is the
-/// `register_external` analog (`extfunc.py`); the graph stays a dual-gate
-/// compile candidate.  `leave` / `return_trace` / `enter` have no
-/// `@jit.dont_look_inside`.
+/// `executioncontext.py` `ExecutionContext.enter` / `leave` /
+/// `return_trace` are ordinary annotated bodies; they are not
+/// `register_external` (`extfunc.py`) and carry no
+/// `@jit.dont_look_inside`.  A raw-storage receiver does not make those
+/// methods external.
 ///
 /// `PyError::pin` / `reload` getattr the tuple field `value` off a
 /// `PyErrorObject` classdef (the handle was interned as the object).
@@ -2338,12 +2335,6 @@ fn annotator_residual_raw_method(key: &FunctionPathKey) -> bool {
     let [.., owner, method] = segs else {
         return false;
     };
-    if owner == "ExecutionContext" {
-        return true;
-    }
-    if owner == "<Impl>" && segs.iter().any(|s| s == "executioncontext") {
-        return true;
-    }
     if matches!(method.as_str(), "pin" | "reload")
         && (owner == "PyError" || (owner == "<Impl>" && segs.iter().any(|s| s == "error")))
     {

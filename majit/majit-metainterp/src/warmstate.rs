@@ -5691,14 +5691,14 @@ mod tests {
         }));
         assert!(
             matches!(
-                ws.function_entry_step(cell_key, None, || false),
+                ws.function_entry_step(cell_key, None, || false, &[]),
                 FunctionEntryStep::NotHot
             ),
             "JC_TRACING returns before the temporary-cell tick"
         );
         assert!(
             matches!(
-                ws.function_entry_step(cell_key, None, || false),
+                ws.function_entry_step(cell_key, None, || false, &[]),
                 FunctionEntryStep::NotHot
             ),
             "the first probe must not have ticked toward bound_reached"

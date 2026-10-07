@@ -648,64 +648,6 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
     )
 }
 
-/// Residual stubs for inherent methods keyed the Type-split way
-/// `unspecialized_fun_segments` spells a `FunctionPath` callsite.
-///
-/// `Lowering::impl_method_owner` declines `CallTarget::Method` when the
-/// owner TypeDecl is opaque in the *caller's* LLBC (a dependency artefact
-/// has no ClassDef) or is raw storage.  The callsite then looks up
-/// `executioncontext::ExecutionContext::leave`.  A safe method is not
-/// harvested by [`collect_unsafe_fn_stubs_from_llbc`]; if its body also
-/// failed to lower (`leave`'s Result-shell rewrite declines),
-/// `function_graphs` holds no key.  The defining crate still sees a
-/// full TypeDecl with GC fields, so a raw-storage-only harvest misses
-/// it.  Same `register_external` analog as
-/// [`collect_marked_class_ctor_stubs_from_llbc`]: signature-only stub,
-/// non-overwriting so a lowered graph keeps the key.
-/// `executioncontext.py leave` has no `@jit.dont_look_inside`.
-pub fn collect_raw_storage_impl_method_stubs_from_llbc(
-    llbc: &Llbc,
-    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    error_carrier: crate::ErrorCarrierSpec<'_>,
-    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Vec<(
-    Vec<String>,
-    crate::flowspace::argument::Signature,
-    Option<String>,
-)> {
-    collect_fn_stubs_from_llbc_if(
-        llbc,
-        gc_struct_ids,
-        error_carrier,
-        |fd| fundecl_is_inherent_impl_method(fd),
-        false,
-        raw_alloc_flavor_structs,
-    )
-}
-
-/// True when `fd` is an inherent-impl item (`Impl` payload has `Ty`,
-/// not `Trait`).  The Type-split stub key is `[qualified_owner, leaf]`.
-fn fundecl_is_inherent_impl_method(fd: &FunDecl) -> bool {
-    let segs = &fd.item_meta.name;
-    let Some(last_idx) = segs
-        .iter()
-        .rposition(|s| matches!(s, NameSeg::Ident { .. }))
-    else {
-        return false;
-    };
-    if last_idx == 0 {
-        return false;
-    }
-    match &segs[last_idx - 1] {
-        NameSeg::Other(v) => v
-            .as_object()
-            .and_then(|o| o.get("Impl"))
-            .and_then(|p| p.get("Ty"))
-            .is_some(),
-        _ => false,
-    }
-}
-
 /// Collect signature-only residual stubs for every local function whose
 /// markers make it opaque to the JIT policy ([`hints_reject_body`]:
 /// `#[dont_look_inside]` and `#[elidable]` alike), including functions which
@@ -1147,10 +1089,11 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         // (raw-storage ADT, associated fn, field-name collision),
         // `unspecialized_fun_segments` emits the Type-split
         // `impl_method_owner_for_fundecl` path instead
-        // (`executioncontext::ExecutionContext::leave`).  Three-plus-
+        // (`executioncontext::ExecutionContext::settrace`).  Three-plus-
         // segment keys cannot leaf-match, so a stub keyed only on
-        // `name_path` (`…::<Impl>::leave`) misses that callsite —
-        // `register_external` analog of the unlowered body.  Emit both.
+        // `name_path` (`…::<Impl>::settrace`) misses that callsite.
+        // `ExecutionContext.settrace` is `@jit.dont_look_inside`; emit both
+        // so the FunctionPath the declined-Method arm emits resolves.
         let name_path: Vec<String> = fd
             .item_meta
             .name_path()
@@ -9480,8 +9423,8 @@ pub(in crate::front::mir) fn ref_return_is_single_word(ast: &str) -> bool {
         return true;
     }
     // `PyObjectRef` is the GC pointer word (`GCREF`). `Result<PyObjectRef,PyError>`
-    // projects to this payload (`dont_look_inside_return_token`), and a
-    // residual stub of `leave` / `return_trace` needs that one-word shell.
+    // projects to this payload (`dont_look_inside_return_token`); a residual
+    // `@jit.dont_look_inside` method that returns that word needs the shell.
     if ast == "PyObjectRef" {
         return true;
     }

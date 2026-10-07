@@ -7948,8 +7948,6 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
     let per_frame = pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
-    let saved_root =
-        majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref } as usize));
     let set_topframeref = |frame_ptr: i64| {
         if frame_ptr != 0 {
             unsafe {
@@ -7967,8 +7965,9 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
             })
             .collect::<Vec<_>>(),
     );
-    let finish_level = |frame_ptr: i64| {
-        pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
+    let portal_frame = per_frame.first().map(|&(p, _)| p).unwrap_or(0);
+    let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
+        crate::call_jit::finish_blackhole_level(frame_ptr, portal_frame, ec, exit);
         if frame_ptr != 0 {
             level_recursion.borrow_mut().pop();
         }
@@ -7978,12 +7977,13 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
         &mut builder,
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
-        Some(&finish_level as &dyn Fn(i64)),
+        Some(&finish_level as &dyn Fn(i64, majit_metainterp::blackhole::LevelExit)),
     );
-    unsafe {
-        (*ec).topframeref = majit_gc::shadow_stack::get(saved_root).0 as *mut PyFrame;
-    }
-    majit_gc::shadow_stack::pop_to(saved_root);
+    // `executioncontext.py leave` already stored `frame.f_backref`.
+    // `topframeref` is a GC-traced EC field; re-read the live chain.
+    // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` keeps no
+    // pre-drive local.
+    crate::call_jit::reload_live_topframeref_after_blackhole_drive(ec);
     outcome
 }
 
@@ -8011,6 +8011,9 @@ fn drive_portal_metatrace(
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
     let mut driver = NestedTraceGuard::enter(driver);
+    if driver.nested_flush_declined() {
+        return None;
+    }
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical =
         pyre_jit_trace::jitcode_runtime::portal_jitcode().expect("jd0 portal jitcode must resolve");
@@ -8418,6 +8421,9 @@ fn drive_generatorentry_trace(
         }
     }
     let _nested = NestedTracePark::enter();
+    if _nested.nested_flush_declined() {
+        return None;
+    }
 
     let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
     let gk = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
@@ -9023,6 +9029,9 @@ fn drive_unpack_iterable_trace(
         if dbg {
             eprintln!("[jd1] bail: cell JC_TRACING");
         }
+        return;
+    }
+    if _nested.nested_flush_declined() {
         return;
     }
 
@@ -12353,26 +12362,6 @@ fn handle_fail(
                 true,
             )
         };
-        if matches!(
-            &resolution,
-            crate::call_jit::BridgeResolution::ResumeBlackhole
-        ) {
-            let (driver, _) = driver_pair();
-            if !driver
-                .meta_interp_mut()
-                .last_quasi_immutable_deps
-                .is_empty()
-            {
-                majit_metainterp::mc_diag_bump(77);
-            }
-        }
-        // compile.py record_loop_or_bridge registers dependencies
-        // for every compiled bridge, independent of its next resolution.
-        if let Some((green_key, _, _)) =
-            crate::call_jit::bridge_source_identity_from_descr(descr_arc)
-        {
-            register_quasi_immutable_deps(green_key);
-        }
         match resolution {
             crate::call_jit::BridgeResolution::CompiledContinue => {
                 // compile.py:708: bridge compiled → ContinueRunningNormally.
@@ -13078,6 +13067,10 @@ struct NestedTraceGuard<'a> {
     /// unfinished walk) reaches `close_bound_reached_attempt`. The pair
     /// is the cell captured at entry and that driver's `jitdriver_sd.index`.
     close_attempt: Option<(u64, usize)>,
+    /// Outer `write_boxes` published every static and array item. A false
+    /// value declines this nested attempt: Drop restores the parked outer
+    /// and the inner `extract_live` never runs.
+    flush_ok: bool,
 }
 
 /// `warmstate.py bound_reached` builds a fresh `MetaInterp`; pyre reuses
@@ -13086,7 +13079,7 @@ struct NestedTraceGuard<'a> {
 /// unextracted `majit-metainterp` (no ClassDef, no CallRegistry graph) —
 /// the `register_external` analog of those foreign bodies.
 #[majit_macros::dont_look_inside]
-fn park_nested_trace_if_tracing(driver: &mut JitDriver<PyreJitState>) -> (bool, bool) {
+pub(crate) fn park_nested_trace_if_tracing(driver: &mut JitDriver<PyreJitState>) -> (bool, bool) {
     // `is_tracing()` is only History in the `tracing` slot.
     // `with_trace_ctx_and_framestack` moves that History into
     // `compile_tracing` for the walk, and `profiler_tracing_active` is
@@ -13103,9 +13096,10 @@ fn park_nested_trace_if_tracing(driver: &mut JitDriver<PyreJitState>) -> (bool, 
     let flush_ok = match driver.meta_interp_mut().live_history_mut() {
         Some(ctx) => {
             if !pyre_jit_trace::trace::walk_handed_to_blackhole() {
-                pyre_jit_trace::jitcode_dispatch::flush_live_virtualizable_before_nested_trace(ctx);
+                pyre_jit_trace::jitcode_dispatch::flush_live_virtualizable_before_nested_trace(ctx)
+            } else {
+                true
             }
-            true
         }
         None => true,
     };
@@ -13117,7 +13111,7 @@ fn park_nested_trace_if_tracing(driver: &mut JitDriver<PyreJitState>) -> (bool, 
 
 // dont_look_inside: nested-trace park; JIT-support, not interpreter code.
 #[majit_macros::dont_look_inside]
-fn park_outer_attempt(driver: &mut JitDriver<PyreJitState>) {
+fn park_outer_attempt(driver: &mut JitDriver<PyreJitState>) -> bool {
     // `warmstate.py bound_reached` builds a fresh MetaInterp that reads
     // the interpreter's real virtualizable. The outer walk's locals live
     // in boxes / the tracing snapshot until a residual flush; write them
@@ -13128,14 +13122,19 @@ fn park_outer_attempt(driver: &mut JitDriver<PyreJitState>) {
     // After the walk handed its frames to the blackhole
     // (`run_blackhole_interp_to_cancel_tracing`), the blackhole writes the
     // live frame and the walk's boxes are stale, so nothing is flushed.
-    if let Some(ctx) = driver.meta_interp_mut().trace_ctx() {
+    let flush_ok = if let Some(ctx) = driver.meta_interp_mut().trace_ctx() {
         if !pyre_jit_trace::trace::walk_handed_to_blackhole() {
-            pyre_jit_trace::jitcode_dispatch::flush_live_virtualizable_before_nested_trace(ctx);
+            pyre_jit_trace::jitcode_dispatch::flush_live_virtualizable_before_nested_trace(ctx)
+        } else {
+            true
         }
-    }
+    } else {
+        true
+    };
     pyre_jit_trace::jitcode_dispatch::park_walk_tls();
     pyre_jit_trace::trace::park_walk_end();
     driver.park_nested_trace();
+    flush_ok
 }
 
 // dont_look_inside: nested-trace restore; JIT-support, not interpreter code.
@@ -13150,12 +13149,17 @@ impl<'a> NestedTraceGuard<'a> {
     // dont_look_inside: nested-trace park; JIT-support, not interpreter code.
     #[majit_macros::dont_look_inside]
     fn enter(driver: &'a mut JitDriver<PyreJitState>) -> Self {
-        let (parked, _) = park_nested_trace_if_tracing(driver);
+        let (parked, flush_ok) = park_nested_trace_if_tracing(driver);
         Self {
             driver,
             parked,
             close_attempt: None,
+            flush_ok,
         }
+    }
+
+    fn nested_flush_declined(&self) -> bool {
+        !self.flush_ok
     }
 
     fn arm_close_on_drop(&mut self, starting_tracing_key: u64) {
@@ -13213,6 +13217,7 @@ impl Drop for NestedTraceGuard<'_> {
 /// attempt can open its own profiler TRACING.
 pub(crate) struct NestedTracePark {
     parked: bool,
+    flush_ok: bool,
 }
 
 impl NestedTracePark {
@@ -13221,10 +13226,20 @@ impl NestedTracePark {
     pub(crate) fn enter() -> Self {
         let (driver, _) = driver_pair();
         if !driver.has_live_metainterp_attempt() {
-            return Self { parked: false };
+            return Self {
+                parked: false,
+                flush_ok: true,
+            };
         }
-        park_outer_attempt(driver);
-        Self { parked: true }
+        let flush_ok = park_outer_attempt(driver);
+        Self {
+            parked: true,
+            flush_ok,
+        }
+    }
+
+    fn nested_flush_declined(&self) -> bool {
+        !self.flush_ok
     }
 }
 
@@ -13258,6 +13273,9 @@ fn compile_and_run_once(
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
     let mut driver = NestedTraceGuard::enter(driver);
+    if driver.nested_flush_declined() {
+        return None;
+    }
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     majit_metainterp::mc_diag_bump(match start {

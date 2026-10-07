@@ -422,7 +422,8 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
     raising_exception: bool,
     per_frame: Option<&[(i64, usize)]>,
     on_enter_level: Option<&dyn Fn(i64)>,
-    on_leave_level: Option<&dyn Fn(i64)>,
+    on_leave_level: Option<&dyn Fn(i64, crate::blackhole::LevelExit)>,
+    jitdrivers_sd: Option<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
     mut abort_banks: Option<&mut [crate::blackhole::BlackholeAbortBanks]>,
 ) -> MultiFrameBlackholeResult {
     bh_entry_stale_exc_report(last_exc_value, raising_exception, "multi-frame");
@@ -485,7 +486,9 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
             last_exc_value = packed_ref_roots[index];
         }
 
-        builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
+        builder.setup_jitdrivers_sd(
+            jitdrivers_sd.unwrap_or_else(|| std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd))),
+        );
     });
 
     let abort_banks_shared = abort_banks.as_deref();
@@ -3200,6 +3203,20 @@ impl<S: JitState> JitDriver<S> {
         self.is_recursive = value;
     }
 
+    /// Mark that the live bridge walk started at the failing guard
+    /// (`pyjitpl.py handle_guard_failure` /
+    /// `initialize_state_from_guard_failure`).
+    ///
+    /// [`Self::merge_point`]'s Abort arm stages `pending_abort_blackhole`
+    /// only when this is set, so `run_blackhole_interp_to_cancel_tracing`
+    /// can `convert_and_run_from_pyjitpl` the live framestack.
+    /// [`Self::bridge_from_guard_resume_position`] raises it around its
+    /// own walk; the Python portal's `trace_and_compile_from_bridge`
+    /// raises it around `jit_merge_point_keyed`.
+    pub fn set_bridge_entered_at_guard_resume(&mut self, entered: bool) {
+        self.bridge_entered_at_guard_resume = entered;
+    }
+
     /// PyPy warmspot.py set_param_max_unroll_recursion().
     pub fn set_max_unroll_recursion(&mut self, value: usize) {
         self.meta
@@ -3411,10 +3428,37 @@ impl<S: JitState> JitDriver<S> {
             .map(abort_counter_name)
     }
 
+    pub fn pending_abort_blackhole_mut(&mut self) -> Option<&mut crate::PendingAbortBlackhole> {
+        self.meta.pending_abort_blackhole.as_mut()
+    }
+
+    /// Drop a staged abort that will not be converted.
+    ///
+    /// `pyjitpl.py handle_guard_failure` converts once, on the live walker.
+    /// A walk that already flushed or adopted its end state must not leave
+    /// the framestack for a later `convert_and_run_from_pyjitpl`.
+    pub fn discard_pending_abort_blackhole(&mut self) {
+        if let Some(pending) = self.meta.pending_abort_blackhole.take() {
+            crate::pyjitpl::recycle_framestack(pending.framestack);
+        }
+    }
+
     pub fn run_pending_abort_blackhole(
         &mut self,
         state: &mut S,
         env: &S::Env,
+    ) -> Option<PortalResume> {
+        self.run_pending_abort_blackhole_configured(state, env, None, None, None, None)
+    }
+
+    pub fn run_pending_abort_blackhole_configured(
+        &mut self,
+        state: &mut S,
+        env: &S::Env,
+        jitdrivers_sd: Option<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
+        per_frame: Option<&[(i64, usize)]>,
+        on_enter_level: Option<&dyn Fn(i64)>,
+        on_leave_level: Option<&dyn Fn(i64, crate::blackhole::LevelExit)>,
     ) -> Option<PortalResume> {
         self.meta.interpret_bail_residual = None;
         let pending = self.meta.pending_abort_blackhole.take()?;
@@ -3527,9 +3571,10 @@ impl<S: JitState> JitDriver<S> {
             staticdata.as_ref(),
             last_exc_value,
             raising_exception,
-            None,
-            None,
-            None,
+            per_frame,
+            on_enter_level,
+            on_leave_level,
+            jitdrivers_sd,
             None,
         );
         let MultiFrameBlackholeResult { outcome, terminal } = outcome;
@@ -3551,10 +3596,18 @@ impl<S: JitState> JitDriver<S> {
                  the staged sym scalars"
             );
         }
-        // `warmspot.py handle_jitexception` reads the terminal frame's
-        // banks the same way the guard-failure resume does
-        // (`back_edge_structured`'s CRN arm).
+        // `warmspot.py handle_jitexception` raises `DoneWithThisFrame*` /
+        // `ExitFrameWithExceptionRef` or re-enters the portal; it never
+        // restores a nested jitcode's banks onto the portal virtualizable.
+        // State-field machines write the identity-slot slice back. A Python
+        // portal has none (`layout_has_no_scalar_identity`): the chain already
+        // ran vable ops against the live frame, and the terminal image of a
+        // function jitcode starts with an int that `restore_single_frame`
+        // would store as `PyreJitState.frame`.
         let writeback = |state: &mut S, resume_pc: usize| {
+            if layout_has_no_scalar_identity(&layout) {
+                return;
+            }
             let Some(terminal) = terminal.as_ref() else {
                 return;
             };
@@ -3715,6 +3768,11 @@ impl<S: JitState> JitDriver<S> {
                     terminal.as_ref(),
                 ));
                 let Some(resume_pc) = state.deliver_blackhole_exception(exc) else {
+                    // `convert_and_run_from_pyjitpl` raises
+                    // `ExitFrameWithExceptionRef`; PortalResume does not
+                    // carry the exception, so park it where a frontend
+                    // that returned None still reads residual-call raises.
+                    crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc.0 as i64));
                     eprintln!(
                         "[bh] abort-blackhole: exception escaped every converted frame and \
                          this interpreter has no `deliver_blackhole_exception` — ending the \
@@ -4091,24 +4149,7 @@ impl<S: JitState> JitDriver<S> {
     /// the bridge else-arm (pyjitpl.py) beside it without the two
     /// compiles pushing the shared handoff and blackhole tail apart.
     fn compile_segmented_loop(&mut self) {
-        let Some((green_key, install_token)) = self.meta.compile_simple_loop() else {
-            return;
-        };
-        // pyjitpl.py `_create_segmented_trace_and_blackhole` reads the greenkey
-        // from current_merge_points; without staging the key here, the
-        // segmented-loop abort hook reports key 0.
-        self.meta.pending_abort_green_key = Some(green_key);
-        // pyjitpl.py `_create_segmented_trace_and_blackhole` passes
-        // `target_token.targeting_jitcell_token` from `compile.compile_simple_loop`
-        // to `warmstate.attach_procedure_to_interp`. pyre's `compile_simple_loop`
-        // returns that minted `JitCellToken` (its `target_tokens` hold the new
-        // TargetToken). `compile.py send_loop_to_backend` still records the
-        // same token on `last_compiled_artifact_token` for other readers.
-        let jd_no = self.meta.active_jitdriver_sd.unwrap_or(0);
-        // `warmstate.py attach_procedure_to_interp` redirect+record_jump_to chain
-        // routed through MetaInterp's caller-side helper.
-        self.meta
-            .attach_procedure_with_redirect_on_driver(jd_no, green_key, None, install_token);
+        self.meta.compile_and_attach_segmented_loop();
     }
 
     /// RPython rlib.jit.current_trace_length().
@@ -5257,6 +5298,16 @@ impl<S: JitState> JitDriver<S> {
                     self.sym = None;
                 }
                 action @ (TraceAction::SegmentedLoop | TraceAction::SegmentedBridge { .. }) => {
+                    // FBW `try_adopt_*_blackhole` already ran
+                    // `aborted_tracing` then `convert_and_run_from_pyjitpl`
+                    // (`pyjitpl.py run_blackhole_interp_to_cancel_tracing`).
+                    // History is gone, so this arm cannot compile or abort again.
+                    if self.meta.live_history_mut().is_none() {
+                        self.sym = None;
+                        self.meta.leave_profiler_tracing();
+                        self.meta.clear_trace_session();
+                        break;
+                    }
                     // pyjitpl.py _create_segmented_trace_and_blackhole,
                     // compile half.  Upstream branches on whether the segmented
                     // trace owns a merge point and entered from the interpreter:
@@ -5389,6 +5440,14 @@ impl<S: JitState> JitDriver<S> {
                 action @ (TraceAction::RecursiveCallAssembler { .. }
                 | TraceAction::Abort
                 | TraceAction::SwitchToBlackhole(_)) => {
+                    // FBW `try_adopt_*_blackhole` already ran
+                    // `aborted_tracing` then `convert_and_run_from_pyjitpl`.
+                    if self.meta.live_history_mut().is_none() {
+                        self.sym = None;
+                        self.bridge_attempt_declined = false;
+                        self.meta.clear_trace_session();
+                        break;
+                    }
                     if self.meta.bridge_info().is_some() {
                         crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                     }
@@ -5538,6 +5597,8 @@ impl<S: JitState> JitDriver<S> {
                         // Standalone walks publish into `aborted_framestack`.
                         // `MetaInterp::interpret` keeps the same stack on the
                         // MetaInterp (`pyjitpl.py` `_interpret`).
+                        // `blackhole.py convert_and_run_from_pyjitpl` copies
+                        // every live frame.
                         let staged = aborted
                             .or_else(|| {
                                 (!self.meta.framestack.is_empty()).then(|| {
@@ -5547,6 +5608,7 @@ impl<S: JitState> JitDriver<S> {
                                     )
                                 })
                             })
+                            .filter(|framestack| !framestack.is_empty())
                             .map(|framestack| {
                                 let (virt_array_values, virtualizable_ptr) =
                                     virt_and_ptr.unwrap_or((None, 0));
@@ -5603,6 +5665,14 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.clear_trace_session();
                 }
                 TraceAction::AbortPermanent => {
+                    // FBW `try_adopt_*_blackhole` already ran
+                    // `aborted_tracing` then `convert_and_run_from_pyjitpl`.
+                    if self.meta.live_history_mut().is_none() {
+                        self.sym = None;
+                        self.bridge_attempt_declined = false;
+                        self.meta.clear_trace_session();
+                        break;
+                    }
                     // `pyjitpl.py aborted_tracing` does not set
                     // `JC_DONT_TRACE_HERE`. The only upstream writer of that
                     // flag from an abort is `blackhole_if_trace_too_long`
