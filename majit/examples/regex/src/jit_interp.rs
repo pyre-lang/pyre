@@ -207,20 +207,20 @@ pub struct Matcher {
 
 unsafe fn walk_match_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let driver = unsafe { &mut *(data as *mut JitDriver<MatchState>) };
-    driver.walk_rd_numb_refs(visitor);
+    driver.walk_const_ptr_holders(visitor);
 }
 
 impl Matcher {
-    /// Register this portal's `NUMBERING` walk. The area retires when
-    /// `self` drops. The published address is the heap driver, so moving
-    /// `self` leaves the callback's `data` pointer valid.
+    /// Register this portal's `ConstPtr` / `NUMBERING` walk. The area
+    /// retires when `self` drops. The published address is the heap
+    /// driver, so moving `self` leaves the callback's `data` pointer valid.
     pub fn register_gc_roots(&mut self) {
         let data = std::ptr::addr_of_mut!(*self.driver) as *const ();
         self.root_area = Some(unsafe {
             majit_gc::shadow_stack::MutatorExtraAreaGuard::permanent(
                 walk_match_roots,
                 data,
-                "rd_numb",
+                "const_ptr_holders",
             )
         });
     }

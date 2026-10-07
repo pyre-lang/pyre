@@ -3,11 +3,12 @@
 //! `ListRepr` is a list header (`length` + `items`) plus a `GcArray`.
 //! `_snapshot_data` and `_snapshot_array_data` are that pair: `encode_varint_signed`
 //! appends, so the list is resized (`_ll_list_resize_ge` / `_ll_list_resize_hint_really`),
-//! not a fixed `GcArray(Char)`. `_bigints` and `_floats` are `GcArray`s of
-//! plain words. `_refs` is a `GcArray` of `GCREF` (`items_have_gc_ptrs`),
-//! rooted by one `OwnerRootGuard`. `_descrs` stays a host `Vec`: `DescrRef`
-//! is `Arc<dyn Descr>` and is not a GC item until the descr objects themselves
-//! move (later stage).
+//! not a fixed `GcArray(Char)`. `_refs`, `_bigints`, and `_floats` use the
+//! same header: `opencoder.py` `Trace.__init__` builds ordinary resizable
+//! lists (`self._refs = [nullptr]`, `self._bigints = []`, `self._floats = []`).
+//! `_refs` items are `GCREF` (`items_have_gc_ptrs`). `_descrs` stays a host
+//! `Vec`: `DescrRef` is `Arc<dyn Descr>` and is not a GC item until the descr
+//! objects themselves move (later stage).
 
 use std::marker::PhantomData;
 
@@ -157,6 +158,7 @@ impl CharList {
         let mut scratch = GcRef(0);
         let hdr = unsafe {
             let mut needs = false;
+            majit_gc::stress_trace_pool_alloc(&mut scratch, 1);
             let fresh = majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                 list_hdr_type_id(),
                 std::mem::size_of::<ListHdr>(),
@@ -292,6 +294,7 @@ impl CharList {
         } else {
             let mut live = self.header_ref();
             let mut needs = false;
+            majit_gc::stress_trace_pool_alloc(&mut live, 1);
             let fresh = unsafe {
                 majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                     super::trace_ops_gc_type_id(),
@@ -365,14 +368,12 @@ impl Drop for CharList {
     }
 }
 
-/// `GcArray` of fixed-size items. Logical length sits on the host holder
-/// (`Trace` is still host). The array length word is the allocation, which
-/// is what a minor copies. One `OwnerRootGuard` roots the array.
+/// `ListRepr` of fixed-size items. One `OwnerRootGuard` holds the header;
+/// `items` is walked from the header. Logical length lives on the header
+/// (`ll_length`), capacity on the items `GcArray` length word.
 pub struct WordArray<T: Copy> {
     root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
-    host: *mut u8,
-    len: usize,
-    cap: usize,
+    host: *mut ListHdr,
     /// `Trace._refs`: items are `GCREF` (`items_have_gc_ptrs`).
     gc_ptrs: bool,
     type_id: fn() -> u32,
@@ -381,27 +382,84 @@ pub struct WordArray<T: Copy> {
 
 impl<T: Copy> WordArray<T> {
     pub fn empty(gc_ptrs: bool, type_id: fn() -> u32) -> Self {
-        Self {
-            root: None,
-            host: std::ptr::null_mut(),
-            len: 0,
-            cap: 0,
-            gc_ptrs,
-            type_id,
-            _ty: PhantomData,
-        }
+        Self::with_capacity(0, gc_ptrs, type_id)
     }
 
     pub fn with_capacity(cap: usize, gc_ptrs: bool, type_id: fn() -> u32) -> Self {
-        let mut arr = Self::empty(gc_ptrs, type_id);
-        if cap > 0 {
-            arr.realloc(cap);
+        if !gc_installed() {
+            return Self::host_with_capacity(cap, gc_ptrs, type_id);
         }
-        arr
+        let mut scratch = GcRef(0);
+        let hdr = unsafe {
+            let mut needs = false;
+            majit_gc::stress_trace_pool_alloc(&mut scratch, 1);
+            let fresh = majit_gc::alloc_fast_nursery_collecting_typed_rooted(
+                list_hdr_type_id(),
+                std::mem::size_of::<ListHdr>(),
+                &mut scratch,
+                &mut needs,
+            );
+            if fresh.0 == 0 {
+                majit_gc::gc_alloc_failed(std::mem::size_of::<ListHdr>());
+            }
+            let h = fresh.0 as *mut ListHdr;
+            (*h).length = 0;
+            (*h).items = 0;
+            let _ = needs;
+            fresh
+        };
+        let root = majit_gc::shadow_stack::OwnerRootGuard::new(hdr);
+        let mut list = Self {
+            root: Some(root),
+            host: std::ptr::null_mut(),
+            gc_ptrs,
+            type_id,
+            _ty: PhantomData,
+        };
+        if cap > 0 {
+            let _ = list.realloc_items(cap, None);
+        }
+        list
+    }
+
+    fn host_with_capacity(cap: usize, gc_ptrs: bool, type_id: fn() -> u32) -> Self {
+        let host = host_alloc(std::mem::size_of::<ListHdr>()) as *mut ListHdr;
+        unsafe {
+            (*host).length = 0;
+            (*host).items = 0;
+        }
+        let mut list = Self {
+            root: None,
+            host,
+            gc_ptrs,
+            type_id,
+            _ty: PhantomData,
+        };
+        if cap > 0 {
+            let _ = list.realloc_items(cap, None);
+        }
+        list
+    }
+
+    fn header_ref(&self) -> GcRef {
+        if let Some(guard) = &self.root {
+            guard.get()
+        } else {
+            GcRef(self.host as usize)
+        }
+    }
+
+    fn header(&self) -> *mut ListHdr {
+        self.header_ref().0 as *mut ListHdr
     }
 
     pub fn capacity(&self) -> usize {
-        self.cap
+        let items = unsafe { (*self.header()).items };
+        if items == 0 {
+            0
+        } else {
+            unsafe { *(items as *const usize) }
+        }
     }
 
     pub fn as_slice(&self) -> &[T] {
@@ -409,156 +467,163 @@ impl<T: Copy> WordArray<T> {
     }
 
     pub fn set(&mut self, index: usize, value: T) {
-        assert!(
-            index < self.len,
-            "word array index {index} len {}",
-            self.len
-        );
-        // Same barrier as `push`. A `GCREF` store into an old or
-        // external array has to be remembered; `set` is the other
-        // store on this array.
-        self.write_barrier_if_rooted();
+        let len = unsafe { (*self.header()).length };
+        assert!(index < len, "word array index {index} len {len}");
+        self.write_barrier_items();
         unsafe { *self.item_ptr().add(index) = value };
     }
 
-    fn write_barrier_if_rooted(&self) {
-        if self.gc_ptrs
-            && let Some(guard) = &self.root
-        {
-            majit_gc::gc_write_barrier(guard.get());
+    fn write_barrier_items(&self) {
+        if !self.gc_ptrs {
+            return;
         }
-    }
-
-    fn addr(&self) -> *mut u8 {
-        if let Some(guard) = &self.root {
-            guard.get().0 as *mut u8
-        } else {
-            self.host
+        let items = unsafe { (*self.header()).items };
+        if items != 0 && self.root.is_some() {
+            majit_gc::gc_write_barrier(GcRef(items));
         }
     }
 
     fn item_ptr(&self) -> *mut T {
-        unsafe { self.addr().add(items_offset::<T>()) as *mut T }
+        let items = unsafe { (*self.header()).items };
+        if items == 0 {
+            std::ptr::null_mut()
+        } else {
+            unsafe { (items as *mut u8).add(items_offset::<T>()) as *mut T }
+        }
     }
 
     /// Append. Returns the stored value: a `GCREF` may have been forwarded
     /// when growth collected.
     pub fn push(&mut self, value: T) -> T {
-        if self.len == self.cap {
+        let len = unsafe { (*self.header()).length };
+        if len == self.capacity() {
             return self.grow_push(value);
         }
-        self.write_barrier_if_rooted();
-        unsafe { *self.item_ptr().add(self.len) = value };
-        self.len += 1;
+        self.write_barrier_items();
+        unsafe {
+            *self.item_ptr().add(len) = value;
+            (*self.header()).length = len + 1;
+        }
         value
     }
 
     fn grow_push(&mut self, value: T) -> T {
-        let new_cap = if self.cap == 0 {
-            4
-        } else {
-            self.cap.saturating_mul(2)
-        };
-        let stored = self.realloc_keeping(new_cap, Some(value));
-        unsafe { *self.item_ptr().add(self.len) = stored };
-        self.len += 1;
+        let need = unsafe { (*self.header()).length } + 1;
+        let stored = self.realloc_items(list_overallocate(need), Some(value));
+        let h = self.header();
+        let len = unsafe { (*h).length };
+        self.write_barrier_items();
+        unsafe {
+            *self.item_ptr().add(len) = stored;
+            (*h).length = len + 1;
+        }
         stored
     }
 
-    fn realloc(&mut self, new_cap: usize) {
-        let _ = self.realloc_keeping(new_cap, None);
-    }
-
-    fn realloc_keeping(&mut self, new_cap: usize, extra: Option<T>) -> T {
+    fn realloc_items(&mut self, new_cap: usize, extra: Option<T>) -> T {
         let offset = items_offset::<T>();
         let align = host_align::<T>();
-        let payload = offset + new_cap * std::mem::size_of::<T>();
-        let old_len = self.len;
+        let item_size = std::mem::size_of::<T>();
+        let payload = offset + new_cap * item_size;
+        let old_len = unsafe { (*self.header()).length };
+        let copy_n = old_len.min(new_cap);
         let placeholder = extra.unwrap_or_else(|| unsafe { std::mem::zeroed() });
+        let old_items = unsafe { (*self.header()).items };
+
         if !gc_installed() {
             debug_assert!(
                 self.root.is_none(),
-                "host trace word array used while a GC is installed"
+                "host trace word list used while a GC is installed"
             );
-            let ptr = host_alloc_aligned(payload, align);
-            unsafe {
-                *(ptr as *mut usize) = new_cap;
-                if old_len > 0 {
-                    std::ptr::copy_nonoverlapping(
-                        self.item_ptr(),
-                        ptr.add(offset) as *mut T,
-                        old_len,
-                    );
+            let fresh_items = if new_cap == 0 {
+                0
+            } else {
+                let ptr = host_alloc_aligned(payload, align);
+                unsafe {
+                    *(ptr as *mut usize) = new_cap;
+                    if copy_n > 0 && old_items != 0 {
+                        std::ptr::copy_nonoverlapping(
+                            (old_items as *const u8).add(offset) as *const T,
+                            ptr.add(offset) as *mut T,
+                            copy_n,
+                        );
+                    }
                 }
+                ptr as usize
+            };
+            if old_items != 0 {
+                let old_cap = unsafe { *(old_items as *const usize) };
+                host_free_aligned(old_items as *mut u8, offset + old_cap * item_size, align);
             }
-            if !self.host.is_null() {
-                host_free_aligned(
-                    self.host,
-                    offset + self.cap * std::mem::size_of::<T>(),
-                    align,
-                );
+            unsafe {
+                (*self.header()).items = fresh_items;
             }
-            self.host = ptr;
-            self.cap = new_cap;
             return placeholder;
         }
+
         if self.gc_ptrs {
             assert_eq!(
-                std::mem::size_of::<T>(),
+                item_size,
                 std::mem::size_of::<usize>(),
                 "GCREF item must be pointer-sized"
             );
         }
-        let old = if let Some(guard) = &self.root {
-            guard.get()
-        } else {
-            GcRef(0)
-        };
         let extra_addr = if self.gc_ptrs {
             extra.as_ref().map(gc_addr_bits).unwrap_or(0)
         } else {
             0
         };
-        let mut roots = [old, GcRef(extra_addr)];
-        let root_count = if self.gc_ptrs { 2 } else { 1 };
-        let mut needs = false;
-        let fresh = unsafe {
-            majit_gc::alloc_fast_nursery_collecting_typed_roots(
-                (self.type_id)(),
-                payload,
-                roots.as_mut_ptr(),
-                root_count,
-                &mut needs,
-            )
+        let mut roots = [self.header_ref(), GcRef(extra_addr)];
+        let root_count = if self.gc_ptrs && extra.is_some() {
+            2
+        } else {
+            1
         };
-        if fresh.0 == 0 {
-            majit_gc::gc_alloc_failed(payload);
-        }
+        let fresh_items = if new_cap == 0 {
+            0
+        } else {
+            let mut needs = false;
+            majit_gc::stress_trace_pool_alloc(roots.as_mut_ptr(), root_count);
+            let fresh = unsafe {
+                majit_gc::alloc_fast_nursery_collecting_typed_roots(
+                    (self.type_id)(),
+                    payload,
+                    roots.as_mut_ptr(),
+                    root_count,
+                    &mut needs,
+                )
+            };
+            if fresh.0 == 0 {
+                majit_gc::gc_alloc_failed(payload);
+            }
+            unsafe {
+                *(fresh.0 as *mut usize) = new_cap;
+                if offset > WORD {
+                    std::ptr::write_bytes((fresh.0 as *mut u8).add(WORD), 0, offset - WORD);
+                }
+                std::ptr::write_bytes((fresh.0 as *mut u8).add(offset), 0, new_cap * item_size);
+            }
+            let _ = needs;
+            fresh.0
+        };
         let stored = if self.gc_ptrs && extra.is_some() {
             from_gc_addr(roots[1].0)
         } else {
             placeholder
         };
+        let h = self.header();
+        let old_items = unsafe { (*h).items };
         unsafe {
-            *(fresh.0 as *mut usize) = new_cap;
-            if offset > WORD {
-                std::ptr::write_bytes((fresh.0 as *mut u8).add(WORD), 0, offset - WORD);
+            if copy_n > 0 && old_items != 0 && fresh_items != 0 {
+                std::ptr::copy_nonoverlapping(
+                    (old_items as *const u8).add(offset) as *const T,
+                    (fresh_items as *mut u8).add(offset) as *mut T,
+                    copy_n,
+                );
             }
-            let dst = (fresh.0 as *mut u8).add(offset) as *mut T;
-            if roots[0].0 != 0 && old_len > 0 {
-                let src = (roots[0].0 as *const u8).add(offset) as *const T;
-                std::ptr::copy_nonoverlapping(src, dst, old_len);
-            }
-            if new_cap > old_len {
-                std::ptr::write_bytes(dst.add(old_len), 0, new_cap - old_len);
-            }
-            if needs {
-                majit_gc::gc_write_barrier(fresh);
-            }
+            majit_gc::gc_write_barrier(GcRef(h as usize));
+            (*h).items = fresh_items;
         }
-        self.root = Some(majit_gc::shadow_stack::OwnerRootGuard::new(fresh));
-        self.host = std::ptr::null_mut();
-        self.cap = new_cap;
         stored
     }
 }
@@ -566,10 +631,11 @@ impl<T: Copy> WordArray<T> {
 impl<T: Copy> std::ops::Deref for WordArray<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
-        if self.len == 0 {
+        let n = unsafe { (*self.header()).length };
+        if n == 0 {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.item_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.item_ptr(), n) }
     }
 }
 
@@ -578,11 +644,18 @@ impl<T: Copy> Drop for WordArray<T> {
         if self.root.is_some() || self.host.is_null() {
             return;
         }
-        host_free_aligned(
-            self.host,
-            items_offset::<T>() + self.cap * std::mem::size_of::<T>(),
-            host_align::<T>(),
-        );
+        unsafe {
+            let items = (*self.host).items;
+            if items != 0 {
+                let cap = *(items as *const usize);
+                host_free_aligned(
+                    items as *mut u8,
+                    items_offset::<T>() + cap * std::mem::size_of::<T>(),
+                    host_align::<T>(),
+                );
+            }
+        }
+        host_free(self.host as *mut u8, std::mem::size_of::<ListHdr>());
         self.host = std::ptr::null_mut();
     }
 }

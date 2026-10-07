@@ -294,17 +294,35 @@ pub fn gc_nursery_poison_enabled() -> bool {
     *ENABLED
 }
 
-/// `MAJIT_GC_STRESS_TRACE_ALLOC` — minor-collect before every
-/// `alloc_fast_nursery_collecting_typed_rooted`.
+/// `MAJIT_GC_STRESS_TRACE_ALLOC` — minor-collect before a Trace-pool malloc.
 ///
 /// Read once. The gate sits on the Trace pool allocator (`opencoder.py`
 /// `Trace._ops` and the other pools in `trace_bufs`), and
 /// `std::env::var_os` takes the environment lock on every call. Presence,
 /// matching [`gc_lifetime_log_enabled`]: any value, including empty, opts in.
+/// `malloc_fast` (`framework.py`, `inline=True`) does not consult this:
+/// rbigint digit arrays share that entry.
+#[inline]
 pub fn gc_stress_trace_alloc_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_STRESS_TRACE_ALLOC").is_some());
     *ENABLED
+}
+
+/// Minor before a Trace-pool malloc when [`gc_stress_trace_alloc_enabled`].
+///
+/// `opencoder.py` `Trace._ops` and `trace_bufs` are the callers. A young
+/// address copied into a Rust local and used after the append then dies
+/// at that use. `malloc_fast` does not take this call.
+#[inline]
+pub fn stress_trace_pool_alloc(roots: *mut GcRef, root_count: usize) {
+    if !gc_stress_trace_alloc_enabled() {
+        return;
+    }
+    if !gc_sync::is_initialized() || gc_sync::in_gc_op() {
+        return;
+    }
+    gc_sync::gc_op(|gc| gc.stress_trace_alloc_minor(roots, root_count));
 }
 
 /// `have_debug_prints_for("gc")` for the collector's own per-collection
@@ -2937,10 +2955,6 @@ pub fn minor_epoch() -> u64 {
 
 pub fn bump_minor_epoch() {
     MINOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // `Reader` caches `NUMBERING` payload bytes until this generation
-    // changes. Same publication point as `MINOR_EPOCH`: after the
-    // nursery reset, before the mutator resumes.
-    majit_ir::resumecode::bump_numbering_payload_epoch();
 }
 
 /// What an allocation answered, with the two non-pointer states kept apart.

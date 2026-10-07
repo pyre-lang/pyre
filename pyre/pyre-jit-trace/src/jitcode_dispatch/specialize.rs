@@ -5468,11 +5468,19 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
     if result_concrete.is_null() {
         return Ok(None);
     }
+    // `emit_object_tuple_inline` records NEW/SETFIELD ops and can
+    // minor-collect (`stress_trace_pool_alloc`). Pin the allocation the
+    // way `history.py *FrontendOp.value` keeps the execute result.
+    let _tuple_roots = pyre_object::gc_roots::push_roots();
+    let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(result_concrete);
 
     let tuple_op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &items);
     ctx.trace_ctx.set_opref_concrete(
         tuple_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(result_concrete as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(
+            pyre_object::gc_roots::shadow_stack_get(tuple_slot) as usize,
+        )),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple_op)?;
     Ok(Some(()))
@@ -13712,6 +13720,40 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
             )
         };
 
+    // The tuple (and the exception/traceback words copied into it) are
+    // nursery objects. `record_op*` / `emit_object_tuple_inline` below
+    // append to `opencoder.py Trace._ops` and can minor-collect
+    // (`stress_trace_pool_alloc`). Pin them the way a translated GCREF
+    // local (`history.py *FrontendOp.value`) would, and re-read the
+    // slot at every stamp.
+    let _tuple_roots = pyre_object::gc_roots::push_roots();
+    let mut live = vec![concrete_tuple];
+    let exc_off = (!concrete_exc.is_null()).then(|| {
+        live.push(concrete_exc);
+        live.len() - 1
+    });
+    let class_off = (!concrete_class.is_null()).then(|| {
+        live.push(concrete_class);
+        live.len() - 1
+    });
+    let tb_off = (!concrete_tb.is_null()).then(|| {
+        live.push(concrete_tb);
+        live.len() - 1
+    });
+    let tb_frame_off = (!concrete_tb_frame.is_null()).then(|| {
+        live.push(concrete_tb_frame as pyre_object::PyObjectRef);
+        live.len() - 1
+    });
+    let gen_off = (!concrete_gen.is_null()).then(|| {
+        live.push(concrete_gen);
+        live.len() - 1
+    });
+    let live_base = pyre_object::gc_roots::pin_roots(&live);
+    let live_at = |off: Option<usize>, fallback: pyre_object::PyObjectRef| {
+        off.map(|o| pyre_object::gc_roots::shadow_stack_get(live_base + o))
+            .unwrap_or(fallback)
+    };
+
     // commit: no declines below this point
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
 
@@ -13722,7 +13764,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     );
     ctx.trace_ctx.set_opref_concrete(
         exc,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_exc as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(live_at(exc_off, concrete_exc) as usize)),
     );
 
     if !slot_is_exception {
@@ -13736,14 +13778,16 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         );
         ctx.trace_ctx.set_opref_concrete(
             gen_head,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete_gen as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(live_at(gen_off, concrete_gen) as usize)),
         );
         walker_guard_stamped_isnull(ctx, op.pc, gen_head)?;
         let none = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
         let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &[none, none, none]);
         ctx.trace_ctx.set_opref_concrete(
             tuple,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(
+                pyre_object::gc_roots::shadow_stack_get(live_base) as usize,
+            )),
         );
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
         return Ok(Some(()));
@@ -13753,21 +13797,32 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     walker_guard_class(ctx, op.pc, exc, concrete_layout)?;
 
     let exc_class = walker_record_getfield_gc_r_uncached(ctx, exc, crate::descr::w_class_descr());
+    let concrete_class = live_at(class_off, concrete_class);
     ctx.trace_ctx.set_opref_concrete(
         exc_class,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_class as usize)),
     );
     walker_guard_stamped_ref_hold(ctx, op.pc, exc_class, concrete_class)?;
+    let concrete_tb = live_at(tb_off, concrete_tb);
     let tb_op = if include_traceback && !unsafe { pyre_object::is_none(concrete_tb) } {
         let raw_tb = walker_record_getfield_gc_r_uncached(
             ctx,
             exc,
             crate::descr::w_exception_traceback_descr_for(
                 kind.expect("handled exception has a kind"),
-                unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_exc) },
+                unsafe {
+                    pyre_object::interp_exceptions::exc_obj_is_user_layout(live_at(
+                        exc_off,
+                        concrete_exc,
+                    ))
+                },
             ),
         );
-        walker_guard_stamped_nonnull(ctx, op.pc, raw_tb, concrete_tb)?;
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[raw_tb])?;
+        ctx.trace_ctx.set_opref_concrete(
+            raw_tb,
+            majit_ir::Value::Ref(majit_ir::GcRef(live_at(tb_off, concrete_tb) as usize)),
+        );
         // `error.py OperationError.get_traceback` marks the node's frame
         // escaped so `ExecutionContext.leave` forces its vref. The bit has
         // to be set by the compiled loop, not only on this walk.
@@ -13776,12 +13831,14 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
             raw_tb,
             crate::descr::pytraceback_frame_descr(),
         );
-        walker_guard_stamped_nonnull(
-            ctx,
-            op.pc,
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[frame_ref])?;
+        ctx.trace_ctx.set_opref_concrete(
             frame_ref,
-            concrete_tb_frame as pyre_object::PyObjectRef,
-        )?;
+            majit_ir::Value::Ref(majit_ir::GcRef(live_at(
+                tb_frame_off,
+                concrete_tb_frame as pyre_object::PyObjectRef,
+            ) as usize)),
+        );
         let flags_descr = crate::descr::pyframe_flags_descr();
         let live_flags =
             crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame_ref, flags_descr.clone());
@@ -13798,7 +13855,9 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         );
         ctx.trace_ctx
             .heapcache_setfield_cached(frame_ref, flags_descr.index(), new_flags);
-        unsafe { pyre_interpreter::pytraceback::mark_traceback_escaped(concrete_tb) };
+        unsafe {
+            pyre_interpreter::pytraceback::mark_traceback_escaped(live_at(tb_off, concrete_tb))
+        };
         raw_tb
     } else {
         ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
@@ -13806,7 +13865,9 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &[exc_class, exc, tb_op]);
     ctx.trace_ctx.set_opref_concrete(
         tuple,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(
+            pyre_object::gc_roots::shadow_stack_get(live_base) as usize,
+        )),
     );
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
     Ok(Some(()))

@@ -3527,15 +3527,14 @@ impl<M: Clone> MetaInterp<M> {
     /// `NUMBERING` payload addresses. A minor moves the array until it is
     /// promoted, so this walk is not gated on the const-pool scan bit.
     pub fn walk_rd_numb_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
-        // `resumecode.py` `NUMBERING` is a field of `compile.py`
-        // `AbstractResumeGuardDescr`. After `register_trace_ops_gc_type`
-        // pins the payload, that address lives in an owner-root slot for
-        // the `NumberingRef` lifetime. `incminimark.py`
-        // `collect_roots_in_nursery` traces roots, not a second walk of
-        // every guard. `walk_roots` already forwards the slot; enumerating
-        // layouts and fail descrs here repeated the same edge on every
-        // collection, including numberings that had been promoted.
-        if majit_ir::resumecode::numbering_owner_rooted() {
+        // `resumecode.py` `NUMBERING` is `compile.py` `ResumeGuardDescr.rd_numb`.
+        // A minor forwards young payloads through `collect_young_numberings`
+        // (`incminimark.py` `collect_oldrefs_to_nursery`); the holder graph
+        // is not scanned. Major marking traces every live descr. The kind
+        // flag is the one `walk_rd_consts_refs` passes to its pool visit.
+        if majit_gc::shadow_stack::extra_root_walk_kind()
+            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
+        {
             return;
         }
         for entry in self.compiled_loops.values_mut() {
@@ -31245,6 +31244,82 @@ mod tests {
             vec![0x94_0000_4000],
             "a JUMP target kept only through keepalive_tokens is a root \
              the same way a previous_tokens predecessor is"
+        );
+    }
+
+    /// `ResumeDataDirectReader::decode_ref` reads `ConstPtr.getref_base`
+    /// off `ResumeGuardDescr.rd_consts`. A major that never
+    /// `trace_index`s that pool frees the slot (`sweep_untraced`).
+    /// `walk_rd_consts_refs` is the extra-root walk that stamps it.
+    #[test]
+    fn walk_rd_consts_refs_stamps_resume_storage_constptr() {
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+        use majit_ir::const_ptr_table::resolve;
+
+        let dead = GcRef(0x91_0000_C001);
+        let live = GcRef(0x91_0000_C002);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+        descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .set_rd_consts(Some(vec![majit_ir::Const::from_gcref(dead)]));
+        let stored = descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .rd_consts_arc()
+            .expect("pool")[0];
+        let majit_ir::Const::Ref(index) = stored else {
+            panic!("from_gcref interned a Ref");
+        };
+        let mut exit_layouts = crate::FxIndexMap::default();
+        exit_layouts.insert(
+            0,
+            StoredExitLayout {
+                source_op_index: None,
+                recovery_layout: None,
+                resume_layout: None,
+                descr: Some(descr.clone()),
+                op_arg_types_for_jump: None,
+            },
+        );
+        let mut traces = crate::FxIndexMap::default();
+        traces.insert(
+            1,
+            CompiledTrace {
+                inputargs: Vec::new(),
+                ops: Vec::new(),
+                constants: majit_ir::ConstMap::default(),
+                exit_layouts,
+                terminal_exit_layouts: crate::FxIndexMap::default(),
+            },
+        );
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.insert_compiled_loop(
+            7,
+            CompiledEntry {
+                token: std::sync::Weak::new(),
+                meta: std::sync::Arc::new(()),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces,
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        meta.walk_rd_consts_refs(|slot| {
+            if slot.0 == dead.0 {
+                *slot = live;
+            }
+        });
+        assert_eq!(
+            resolve(index),
+            live,
+            "walk_rd_consts_refs must trace_index the rd_consts holder"
         );
     }
 

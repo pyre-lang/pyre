@@ -1953,10 +1953,6 @@ def synth_perf_gate(path):
     A fixture states its ceiling and nothing else: the floor that goes with it
     is `perf_gate_floor`'s business, so a leftover `min-pypy-ratio` header is
     rejected rather than ignored.
-
-    One backend can carry its own ceiling (`synth_backend_perf_gate`). That
-    value replaces this one for that backend only; it is not read here, and a
-    `max-pypy-ratio-<backend>=` line does not match this prefix.
     """
     prefix = "# pyre-check: max-pypy-ratio="
     retired = "# pyre-check: min-pypy-ratio="
@@ -1972,25 +1968,6 @@ def synth_perf_gate(path):
                 line[len(prefix):].strip(), line, path, "synthetic performance gate"
             )
     return ratio
-
-
-def synth_backend_perf_gate(path, backend):
-    """Optional ceiling that replaces `synth_perf_gate` for one backend.
-
-        # pyre-check: max-pypy-ratio-dynasm=1.0
-
-    Absence means the shared ceiling. The only backend with a reader is
-    dynasm: its spread against cranelift on one fixture can exceed
-    `PERF_GATE_FLOOR_DIVISOR`, and lowering the shared ceiling to fit the
-    fast end would fail the slow end. A ceiling at or under parity still
-    has no floor (`perf_gate_floor`).
-    """
-    if backend != "dynasm":
-        return None
-    found = _header_directive(path, "# pyre-check: max-pypy-ratio-dynasm=")
-    if found is None:
-        return None
-    return _positive_float(*found, path, "dynasm synthetic performance gate")
 
 
 def wasm_ratio_gate(path):
@@ -2662,7 +2639,6 @@ def synth_fixture_headers(path):
         )
     else:
         headers["max_pypy_ratio"] = synth_perf_gate(path)
-        headers["max_pypy_ratio_dynasm"] = synth_backend_perf_gate(path, "dynasm")
         headers["max_rss_mb"] = synth_rss_gate(path)
         headers["skip_cpython"] = synth_skip_cpython(path)
         headers["no_cpython"] = synth_no_cpython(path)
@@ -6024,7 +6000,6 @@ class Check:
         name = f"synth/{Path(path).stem}"
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         max_pypy_ratio = headers["max_pypy_ratio"]
-        max_pypy_ratio_dynasm = headers["max_pypy_ratio_dynasm"]
         max_rss_mb = headers["max_rss_mb"]
         skip_backends = self._fixture_skips(headers)
         skip_cpython = headers["skip_cpython"]
@@ -6147,12 +6122,7 @@ class Check:
             # than the native backends a fixture's ratio is tuned for, so one
             # ratio cannot gate both — see WASM_TIMEOUT_SCALE. Its per-bench
             # timeout stays the hang guard.
-            if backend == "wasm":
-                vs_pypy = None
-            elif backend == "dynasm" and max_pypy_ratio_dynasm is not None:
-                vs_pypy = max_pypy_ratio_dynasm
-            else:
-                vs_pypy = max_pypy_ratio
+            vs_pypy = None if backend == "wasm" else max_pypy_ratio
             self._run_backend_bench(
                 backend, name, path, timeout,
                 None, vs_pypy, t_cpython, t_pypy, pypy_output,

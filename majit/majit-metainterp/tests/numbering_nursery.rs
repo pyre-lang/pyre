@@ -1,20 +1,16 @@
 //! `resumecode.py` `NUMBERING` is a nursery `GcArray` of `UCHAR`.
 //! A minor between `create_numbering` and the next read must leave
-//! `numb.code` intact when the payload address is a walked slot.
+//! `numb.code` intact. The young list is the minor edge
+//! (`incminimark.py` `collect_oldrefs_to_nursery`). A major before the
+//! descr is a `compile.py` `ResumeGuardDescr.rd_numb` holder still
+//! marks the payload.
 
 use majit_backend::jitframe::jitframe_type_info;
 use majit_gc::GcAllocator;
 use majit_gc::collector::MiniMarkGC;
 use majit_gc::gc_sync;
-use majit_gc::shadow_stack::MutatorExtraAreaGuard;
-use majit_ir::GcRef;
 use majit_ir::resumecode::{NumberingRef, Writer, unpack_numbering};
 use majit_metainterp::opencoder::register_trace_ops_gc_type;
-
-unsafe fn walk_numbering(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
-    let numb = unsafe { &*(data as *const NumberingRef) };
-    numb.visit_gc(visitor);
-}
 
 fn install() {
     gc_sync::store_singleton(Box::new(MiniMarkGC::new()));
@@ -37,31 +33,43 @@ fn fill(n: usize) -> (NumberingRef, Vec<i32>) {
     (w.create_numbering(), items)
 }
 
-fn roundtrip(n: usize, expect_move: bool) {
-    let (numb, items) = fill(n);
-    let before = numb.payload_addr();
-    let guard = unsafe {
-        MutatorExtraAreaGuard::new(
-            walk_numbering,
-            &numb as *const NumberingRef as *const (),
-            "rd_consts",
-        )
-    };
+fn survive(numb: &NumberingRef, before: usize, expect_move: bool) {
     gc_sync::gc_op(|gc| gc.do_collect_nursery());
-    assert_eq!(unpack_numbering(numb.as_slice()), items);
+    let after_minor = numb.payload_addr();
     if expect_move {
-        assert_ne!(numb.payload_addr(), before, "a young NUMBERING must move");
+        assert_ne!(after_minor, before, "a young NUMBERING must move");
+    } else {
+        assert_eq!(
+            after_minor, before,
+            "a young rawmalloc NUMBERING does not move"
+        );
     }
-    drop(guard);
+    // No holder yet. The major must still keep the payload.
+    gc_sync::gc_op(|gc| gc.do_collect_full());
+    assert_eq!(
+        numb.payload_addr(),
+        after_minor,
+        "an old NUMBERING does not move"
+    );
 }
 
 #[test]
 fn numbering_survives_minor_and_oversized_alloc() {
-    // The runner sets `PYPY_GC_NURSERY=65536` before this process starts.
     install();
-    roundtrip(400, true);
-    // Larger than the 64 KiB nursery: `malloc_varsize` births it old.
-    roundtrip(80_000, false);
+    let (numb, items) = fill(400);
+    let before = numb.payload_addr();
+    survive(&numb, before, true);
+    assert_eq!(unpack_numbering(numb.as_slice()), items);
+
+    // Past `malloc_varsize`'s large-object cutoff. `external_malloc`
+    // (`alloc_young=True`) births the array young and non-moving. The
+    // young-list walk has to visit it or this minor frees it.
+    let bytes = vec![0x11u8; 200_000];
+    let big = NumberingRef::from_bytes(&bytes);
+    let before = big.payload_addr();
+    survive(&big, before, false);
+    assert_eq!(big.as_slice(), bytes.as_slice());
+
     let (minors, _) = gc_sync::gc_op(|gc| gc.collection_counts());
     assert!(minors >= 2, "minors={minors}");
 }

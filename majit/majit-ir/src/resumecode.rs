@@ -195,16 +195,15 @@ impl Writer {
 }
 
 /// resumecode.py: Reader
+///
+/// Holds `numb` and an index. Each item re-reads `numb.code[index]`
+/// (`numb_next_item`): one plain load of the payload cell. The byte
+/// pointer is not cached across an item. The consumer of an item can
+/// allocate, and a minor forwards `compile.py` `ResumeGuardDescr.rd_numb`.
 pub struct Reader<'a> {
     code: &'a [u8],
     /// When set, reads come from this numbering's payload.
     numb: Option<&'a NumberingRef>,
-    /// Payload bytes of `numb` at `cached_epoch`. Null until the first load.
-    cached_ptr: *const u8,
-    cached_len: usize,
-    /// [`numbering_payload_epoch`] observed when `cached_ptr` was loaded.
-    /// `0` is never published, so a fresh reader always reloads.
-    cached_epoch: u64,
     pub cur_pos: usize,
     pub items_read: usize,
 }
@@ -214,9 +213,6 @@ impl<'a> Reader<'a> {
         Reader {
             code,
             numb: None,
-            cached_ptr: std::ptr::null(),
-            cached_len: 0,
-            cached_epoch: 0,
             cur_pos: 0,
             items_read: 0,
         }
@@ -225,80 +221,25 @@ impl<'a> Reader<'a> {
     /// Subsequent reads follow `numb` across a minor.
     ///
     /// `resumecode.py` `Reader.next_item` calls `numb_next_item`, which
-    /// loads `numb.code[index]` from the GC pointer. The pointer is
-    /// stable until a collection. Reload when
-    /// [`numbering_payload_epoch`] changes — that is
-    /// `bump_minor_epoch` — rather than on every item.
+    /// loads `numb.code[index]` from the GC pointer on every item.
     pub fn bind_numbering(&mut self, numb: &'a NumberingRef) {
         self.numb = Some(numb);
-        self.cached_ptr = std::ptr::null();
-        self.cached_len = 0;
-        self.cached_epoch = 0;
     }
 
     pub fn from_numbering(numb: &'a NumberingRef) -> Self {
         Reader {
             code: &[],
             numb: Some(numb),
-            cached_ptr: std::ptr::null(),
-            cached_len: 0,
-            cached_epoch: 0,
             cur_pos: 0,
             items_read: 0,
         }
     }
 
-    /// Payload for one `numb_next_item`. A matching epoch means no minor
-    /// has run since the pointer was loaded (`bump_minor_epoch` publishes
-    /// the new epoch before the mutator resumes).
-    #[inline]
-    fn ensure_cache(&mut self) {
-        if self.numb.is_none() {
-            return;
-        }
-        let epoch = numbering_payload_epoch();
-        if epoch == self.cached_epoch {
-            return;
-        }
-        let addr = self.numb.unwrap().payload_addr();
-        let (ptr, len) = if addr == 0 {
-            (std::ptr::null(), 0)
-        } else {
-            // Same header `as_slice` reads: length word, then bytes.
-            let len = unsafe { *(addr as *const usize) };
-            let ptr = unsafe { (addr as *const u8).add(numb_len_word()) };
-            (ptr, len)
-        };
-        self.cached_ptr = ptr;
-        self.cached_len = len;
-        self.cached_epoch = epoch;
-    }
-
-    #[inline]
-    fn buf(&mut self) -> &[u8] {
-        if self.numb.is_some() {
-            self.ensure_cache();
-            if self.cached_ptr.is_null() {
-                return &[];
-            }
-            // SAFETY: `ensure_cache` loaded this pointer at the current
-            // payload epoch. `next_item` / `jump` do not allocate, so a
-            // minor cannot move the payload before this slice is dropped.
-            unsafe { std::slice::from_raw_parts(self.cached_ptr, self.cached_len) }
-        } else {
-            self.code
-        }
-    }
-
+    /// One `numb_next_item` view. The slice dies with the call that
+    /// decodes it; the next item loads the cell again.
+    #[inline(always)]
     fn bytes(&self) -> &[u8] {
         if let Some(numb) = self.numb {
-            if self.cached_epoch == numbering_payload_epoch() {
-                if self.cached_ptr.is_null() {
-                    return &[];
-                }
-                // SAFETY: same epoch contract as `buf`.
-                return unsafe { std::slice::from_raw_parts(self.cached_ptr, self.cached_len) };
-            }
             numb.as_slice()
         } else {
             self.code
@@ -310,7 +251,7 @@ impl<'a> Reader<'a> {
     pub fn next_item(&mut self) -> i32 {
         let pos = self.cur_pos;
         let (result, new_pos) = {
-            let buf = self.buf();
+            let buf = self.bytes();
             decode_varint(buf, pos)
         };
         self.cur_pos = new_pos;
@@ -319,6 +260,7 @@ impl<'a> Reader<'a> {
     }
 
     /// resumecode.py: peek
+    #[inline]
     pub fn peek(&self) -> i32 {
         let (result, _) = decode_varint(self.bytes(), self.cur_pos);
         result
@@ -328,15 +270,13 @@ impl<'a> Reader<'a> {
     pub fn jump(&mut self, size: usize) {
         for _ in 0..size {
             let pos = self.cur_pos;
-            let (_, new_pos) = {
-                let buf = self.buf();
-                decode_varint(buf, pos)
-            };
+            let (_, new_pos) = decode_varint(self.bytes(), pos);
             self.cur_pos = new_pos;
         }
         self.items_read += size;
     }
 
+    #[inline]
     pub fn has_more(&self) -> bool {
         self.cur_pos < self.bytes().len()
     }
@@ -353,95 +293,6 @@ pub fn set_numbering_alloc(hook: Option<fn(&[u8]) -> usize>) {
     NUMBERING_ALLOC.store(bits, std::sync::atomic::Ordering::Release);
 }
 
-/// Owner-root slot for a nursery `NUMBERING`. `majit-ir` cannot name the
-/// guard type; `register_trace_ops_gc_type` installs these.
-/// `pin(addr) -> slot`, `read(slot) -> addr`, `write(slot, addr)`, `unpin(slot)`.
-static NUMBERING_PIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static NUMBERING_READ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static NUMBERING_WRITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static NUMBERING_UNPIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// `fn() -> u64`. `register_trace_ops_gc_type` still publishes
-/// `minor_epoch` here. Payload caching does not call it: the
-/// generation is [`numbering_payload_epoch`], advanced from
-/// `bump_minor_epoch` so a resume item is one relaxed load.
-#[allow(dead_code)]
-static NUMBERING_EPOCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Bumped with `minor_epoch`. `0` is reserved so a `Reader` whose
-/// `cached_epoch` is still 0 always reloads. The counter starts at 1
-/// and skips 0 if it wraps.
-static NUMBERING_PAYLOAD_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-pub fn set_numbering_root_hooks(
-    pin: fn(usize) -> usize,
-    read: fn(usize) -> usize,
-    write: fn(usize, usize),
-    unpin: fn(usize),
-) {
-    NUMBERING_PIN.store(pin as usize, std::sync::atomic::Ordering::Release);
-    NUMBERING_READ.store(read as usize, std::sync::atomic::Ordering::Release);
-    NUMBERING_WRITE.store(write as usize, std::sync::atomic::Ordering::Release);
-    NUMBERING_UNPIN.store(unpin as usize, std::sync::atomic::Ordering::Release);
-}
-
-pub fn set_numbering_epoch(hook: fn() -> u64) {
-    NUMBERING_EPOCH.store(hook as usize, std::sync::atomic::Ordering::Release);
-}
-
-/// Current numbering-payload generation. Matches `minor_epoch` in
-/// lockstep: `bump_minor_epoch` calls [`bump_numbering_payload_epoch`].
-#[inline]
-pub fn numbering_payload_epoch() -> u64 {
-    NUMBERING_PAYLOAD_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Invalidate cached numbering payload pointers. One minor, one bump.
-pub fn bump_numbering_payload_epoch() {
-    let prev = NUMBERING_PAYLOAD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if prev == u64::MAX - 1 {
-        // Wrapped to 0, which `Reader` treats as "not loaded".
-        NUMBERING_PAYLOAD_EPOCH.store(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// `true` after `register_trace_ops_gc_type` installed the owner-root
-/// pin. Each nursery `NUMBERING` then lives in that slot for its whole
-/// `NumberingRef` lifetime, and `walk_roots` is the minor edge.
-#[inline]
-pub fn numbering_owner_rooted() -> bool {
-    NUMBERING_PIN.load(std::sync::atomic::Ordering::Acquire) != 0
-}
-
-fn call_numbering_pin(addr: usize) -> Option<usize> {
-    let bits = NUMBERING_PIN.load(std::sync::atomic::Ordering::Acquire);
-    if bits == 0 {
-        return None;
-    }
-    let hook: fn(usize) -> usize = unsafe { std::mem::transmute(bits) };
-    Some(hook(addr))
-}
-
-fn call_numbering_read(slot: usize) -> usize {
-    let bits = NUMBERING_READ.load(std::sync::atomic::Ordering::Acquire);
-    let hook: fn(usize) -> usize = unsafe { std::mem::transmute(bits) };
-    hook(slot)
-}
-
-fn call_numbering_write(slot: usize, addr: usize) {
-    let bits = NUMBERING_WRITE.load(std::sync::atomic::Ordering::Acquire);
-    let hook: fn(usize, usize) = unsafe { std::mem::transmute(bits) };
-    hook(slot, addr);
-}
-
-fn call_numbering_unpin(slot: usize) {
-    let bits = NUMBERING_UNPIN.load(std::sync::atomic::Ordering::Acquire);
-    if bits == 0 {
-        return;
-    }
-    let hook: fn(usize) = unsafe { std::mem::transmute(bits) };
-    hook(slot);
-}
-
 fn call_numbering_alloc(bytes: &[u8]) -> Option<usize> {
     let bits = NUMBERING_ALLOC.load(std::sync::atomic::Ordering::Acquire);
     if bits == 0 {
@@ -451,29 +302,56 @@ fn call_numbering_alloc(bytes: &[u8]) -> Option<usize> {
     Some(hook(bytes))
 }
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 /// One address cell. Clones share it so a minor rewrites every holder
 /// when any of them is walked. Two cells with the same young address
 /// make the second root trace an already-forwarded object.
 struct NumSlot {
-    /// Host block, or the mirror of `root` when no pin hook is installed.
-    addr: std::cell::UnsafeCell<usize>,
-    /// `minor_epoch` observed when `addr` was last filled from `root`.
-    /// `u64::MAX` forces the first read through the owner-root slot:
-    /// `Box::new` below can collect after `pin` and move the array.
-    seen_epoch: std::sync::atomic::AtomicU64,
-    /// `acquire_owner_root` index. `usize::MAX` for a host block.
-    root: usize,
+    /// Payload address (length word, then bytes). Relaxed: a collection
+    /// is exclusive, and cross-thread readers must not race an `UnsafeCell`.
+    addr: AtomicUsize,
     host: bool,
-    refs: std::sync::atomic::AtomicUsize,
+    /// `NumberingRef` clones plus an in-flight list walk.
+    users: AtomicUsize,
+    /// Index in [`LIVE_NUMBERINGS`], or `usize::MAX` when absent.
+    live_index: AtomicUsize,
+    /// Index in [`YOUNG_NUMBERINGS`], or `usize::MAX` when absent.
+    young_index: AtomicUsize,
 }
+
+/// `NonNull` is `!Send`. The slot is shared across threads: the address
+/// cell is atomic, and list edits plus the last free run under
+/// [`LIVE_NUMBERINGS`] then [`YOUNG_NUMBERINGS`].
+struct SlotList {
+    slots: Vec<std::ptr::NonNull<NumSlot>>,
+}
+
+unsafe impl Send for SlotList {}
+
+/// Young `NUMBERING` slots. `incminimark.py` `collect_oldrefs_to_nursery`
+/// drains `old_objects_pointing_to_young` once per minor; this list is that
+/// remembered set for `compile.py` `ResumeGuardDescr.rd_numb`. A minor
+/// forwards each cell and clears the list. The payload is then old.
+static YOUNG_NUMBERINGS: parking_lot::Mutex<SlotList> =
+    parking_lot::Mutex::new(SlotList { slots: Vec::new() });
+
+/// Live `NUMBERING` slots until the last [`NumberingRef`] drops.
+///
+/// `collect_oldrefs_to_nursery` clears the young list at the minor, and the
+/// descr may not be in the holder graph yet (`ResumeGuardDescr.rd_numb` is
+/// stored before the loop is published). A major in that window still has
+/// to mark the payload. Holder walks mark the same object again once the
+/// descr is reachable; `GCFLAG_VISITED` makes the second mark a no-op.
+static LIVE_NUMBERINGS: parking_lot::Mutex<SlotList> =
+    parking_lot::Mutex::new(SlotList { slots: Vec::new() });
 
 /// One `NUMBERING` (`GcStruct` with inline `Array(UCHAR)`).
 ///
 /// `addr` is the payload (length word, then bytes). A minor rewrites
-/// that word when `visit_gc` hands the cell to the collector.
-/// GC-less tests use a process block with the same layout and a
-/// refcount in the word before the payload; that arm is not taken
-/// once `set_numbering_alloc` is installed.
+/// that word when the young list hands the cell to the collector.
+/// GC-less tests use a process block with the same layout; that arm
+/// is not taken once `set_numbering_alloc` is installed.
 pub struct NumberingRef {
     slot: std::ptr::NonNull<NumSlot>,
 }
@@ -485,22 +363,37 @@ fn numb_len_word() -> usize {
     std::mem::size_of::<usize>()
 }
 
+fn fresh_slot(addr: usize, host: bool) -> *mut NumSlot {
+    Box::into_raw(Box::new(NumSlot {
+        addr: AtomicUsize::new(addr),
+        host,
+        users: AtomicUsize::new(1),
+        live_index: AtomicUsize::new(usize::MAX),
+        young_index: AtomicUsize::new(usize::MAX),
+    }))
+}
+
+/// Lock order is [`LIVE_NUMBERINGS`] then [`YOUNG_NUMBERINGS`].
+fn register_gc_slot(slot: *mut NumSlot) {
+    let nn = std::ptr::NonNull::new(slot).expect("numb slot");
+    let mut live = LIVE_NUMBERINGS.lock();
+    let mut young = YOUNG_NUMBERINGS.lock();
+    let live_index = live.slots.len();
+    unsafe { (*slot).live_index.store(live_index, Ordering::Relaxed) };
+    live.slots.push(nn);
+    let young_index = young.slots.len();
+    unsafe { (*slot).young_index.store(young_index, Ordering::Relaxed) };
+    young.slots.push(nn);
+}
+
 impl NumberingRef {
-    fn from_slot(addr: usize, host: bool) -> Self {
-        // Pin before the `NumSlot` exists so a minor inside `Box::new`
-        // cannot collect the array. The owner-root slot is the walked cell.
-        let root = if host {
-            usize::MAX
-        } else {
-            call_numbering_pin(addr).unwrap_or(usize::MAX)
-        };
-        let slot = Box::into_raw(Box::new(NumSlot {
-            addr: std::cell::UnsafeCell::new(addr),
-            seen_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
-            root,
-            host,
-            refs: std::sync::atomic::AtomicUsize::new(1),
-        }));
+    fn from_gc_addr(addr: usize) -> Self {
+        // `Box::new` follows the allocating hook. It is the system
+        // allocator, not a collection point. The address store and the
+        // two list pushes then run with no safepoint between them.
+        let slot = fresh_slot(0, false);
+        unsafe { (*slot).addr.store(addr, Ordering::Relaxed) };
+        register_gc_slot(slot);
         Self {
             slot: std::ptr::NonNull::new(slot).expect("numb slot"),
         }
@@ -508,7 +401,7 @@ impl NumberingRef {
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
         if let Some(addr) = call_numbering_alloc(bytes) {
-            return Self::from_slot(addr, false);
+            return Self::from_gc_addr(addr);
         }
         Self::host_from_bytes(bytes)
     }
@@ -529,31 +422,22 @@ impl NumberingRef {
                     bytes.len(),
                 );
             }
-            Self::from_slot(body as usize, true)
-        }
-    }
-
-    pub fn payload_addr(&self) -> usize {
-        let slot = unsafe { self.slot.as_ref() };
-        if slot.root != usize::MAX {
-            // The owner-root cell changes only in a minor. `Reader`
-            // keeps the byte pointer across items; this cache is the
-            // reload those readers share. `numbering_payload_epoch`
-            // advances in `bump_minor_epoch`, so a match means the
-            // address last published is still the object's address.
-            let epoch = numbering_payload_epoch();
-            if slot.seen_epoch.load(std::sync::atomic::Ordering::Relaxed) == epoch {
-                return unsafe { *slot.addr.get() };
+            let slot = fresh_slot(body as usize, true);
+            Self {
+                slot: std::ptr::NonNull::new(slot).expect("numb slot"),
             }
-            let addr = call_numbering_read(slot.root);
-            unsafe { *slot.addr.get() = addr };
-            slot.seen_epoch
-                .store(epoch, std::sync::atomic::Ordering::Relaxed);
-            return addr;
         }
-        unsafe { *slot.addr.get() }
     }
 
+    /// Address of the `NUMBERING` payload. One relaxed load.
+    /// `incminimark.py` `collect_oldrefs_to_nursery` stores the
+    /// forwarded address back into this cell.
+    #[inline(always)]
+    pub fn payload_addr(&self) -> usize {
+        unsafe { self.slot.as_ref().addr.load(Ordering::Relaxed) }
+    }
+
+    #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         let addr = self.payload_addr();
         if addr == 0 {
@@ -563,34 +447,83 @@ impl NumberingRef {
         unsafe { std::slice::from_raw_parts((addr as *const u8).add(numb_len_word()), len) }
     }
 
-    /// Hand the payload address to a minor walk. Host blocks are not `GcRef`s.
+    /// Hand the payload address to a holder walk. Host blocks are not `GcRef`s.
     ///
-    /// The walked cell is the owner-root slot acquired at malloc
-    /// (`acquire_owner_root`), not a copy. A minor between `create_numbering`
-    /// and the descr joining the `rd_consts` area rewrites that slot.
+    /// The walked cell is this slot. A minor between `create_numbering`
+    /// and the descr joining the holder graph rewrites it from
+    /// [`collect_young_numberings`].
     pub fn visit_gc(&self, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
-        let slot = unsafe { self.slot.as_ref() };
-        if slot.host {
-            return;
-        }
-        if slot.root != usize::MAX {
-            let mut gc = crate::GcRef(call_numbering_read(slot.root));
-            if gc.0 == 0 {
-                return;
-            }
-            visitor(&mut gc);
-            call_numbering_write(slot.root, gc.0);
-            return;
-        }
-        let gc = unsafe { &mut *(slot.addr.get() as *mut crate::GcRef) };
-        if gc.0 == 0 {
-            return;
-        }
-        visitor(gc);
+        forward_slot(self.slot, visitor);
     }
 
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.payload_addr() == b.payload_addr() && a.payload_addr() != 0
+    }
+}
+
+fn forward_slot(slot: std::ptr::NonNull<NumSlot>, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+    let addr = unsafe { slot.as_ref().addr.load(Ordering::Relaxed) };
+    if unsafe { slot.as_ref().host } || addr == 0 {
+        return;
+    }
+    let mut gc = crate::GcRef(addr);
+    visitor(&mut gc);
+    unsafe { slot.as_ref().addr.store(gc.0, Ordering::Relaxed) };
+}
+
+/// Minor remembered-set drain. Forwards each young cell and clears the list.
+/// The payload is old afterwards and the old generation does not move it.
+pub fn collect_young_numberings(visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+    let taken = {
+        let mut young = YOUNG_NUMBERINGS.lock();
+        if young.slots.is_empty() {
+            return;
+        }
+        let taken = std::mem::take(&mut young.slots);
+        for &slot in &taken {
+            unsafe {
+                slot.as_ref().users.fetch_add(1, Ordering::Relaxed);
+                slot.as_ref()
+                    .young_index
+                    .store(usize::MAX, Ordering::Relaxed);
+            }
+        }
+        taken
+    };
+    visit_bumped(&taken, visitor);
+}
+
+/// Major root for every live `NUMBERING`, including one whose descr is
+/// not yet reachable from a holder. Does not clear [`YOUNG_NUMBERINGS`].
+pub fn trace_live_numberings(visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+    let taken = {
+        let live = LIVE_NUMBERINGS.lock();
+        if live.slots.is_empty() {
+            return;
+        }
+        let taken = live.slots.clone();
+        for &slot in &taken {
+            unsafe { slot.as_ref().users.fetch_add(1, Ordering::Relaxed) };
+        }
+        taken
+    };
+    visit_bumped(&taken, visitor);
+}
+
+fn visit_bumped(slots: &[std::ptr::NonNull<NumSlot>], visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+    let _release = ReleaseAll(slots);
+    for &slot in slots {
+        forward_slot(slot, visitor);
+    }
+}
+
+struct ReleaseAll<'a>(&'a [std::ptr::NonNull<NumSlot>]);
+
+impl Drop for ReleaseAll<'_> {
+    fn drop(&mut self) {
+        for &slot in self.0 {
+            release_user(slot);
+        }
     }
 }
 
@@ -602,9 +535,7 @@ fn host_layout(len: usize) -> std::alloc::Layout {
 impl Clone for NumberingRef {
     fn clone(&self) -> Self {
         unsafe {
-            (*self.slot.as_ptr())
-                .refs
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.slot.as_ref().users.fetch_add(1, Ordering::Relaxed);
         }
         Self { slot: self.slot }
     }
@@ -612,30 +543,81 @@ impl Clone for NumberingRef {
 
 impl Drop for NumberingRef {
     fn drop(&mut self) {
-        let slot = self.slot.as_ptr();
-        let prev = unsafe {
-            (*slot)
-                .refs
-                .fetch_sub(1, std::sync::atomic::Ordering::Release)
-        };
-        if prev != 1 {
+        release_user(self.slot);
+    }
+}
+
+fn release_user(slot: std::ptr::NonNull<NumSlot>) {
+    let prev = unsafe { slot.as_ref().users.fetch_sub(1, Ordering::Release) };
+    if prev != 1 {
+        return;
+    }
+    std::sync::atomic::fence(Ordering::Acquire);
+    if unsafe { slot.as_ref().host } {
+        free_slot(slot);
+        return;
+    }
+    {
+        // A walker may have bumped `users` while this drop waited.
+        let mut live = LIVE_NUMBERINGS.lock();
+        let mut young = YOUNG_NUMBERINGS.lock();
+        if unsafe { slot.as_ref().users.load(Ordering::Acquire) } != 0 {
             return;
         }
-        unsafe {
-            let root = (*slot).root;
-            if root != usize::MAX {
-                call_numbering_unpin(root);
-            }
-            if (*slot).host {
-                let addr = *(*slot).addr.get();
-                if addr != 0 {
-                    let len = *(addr as *const usize);
-                    let block = (addr as *mut u8).sub(numb_len_word());
-                    std::alloc::dealloc(block, host_layout(len));
-                }
-            }
-            drop(Box::from_raw(slot));
+        detach(&mut live.slots, slot, true);
+        detach(&mut young.slots, slot, false);
+    }
+    free_slot(slot);
+}
+
+fn detach(
+    list: &mut Vec<std::ptr::NonNull<NumSlot>>,
+    slot: std::ptr::NonNull<NumSlot>,
+    live: bool,
+) {
+    let index_ptr = unsafe {
+        if live {
+            &(*slot.as_ptr()).live_index
+        } else {
+            &(*slot.as_ptr()).young_index
         }
+    };
+    let index = index_ptr.load(Ordering::Relaxed);
+    let pos = if index < list.len() && list[index] == slot {
+        Some(index)
+    } else {
+        list.iter().position(|entry| *entry == slot)
+    };
+    index_ptr.store(usize::MAX, Ordering::Relaxed);
+    let Some(pos) = pos else {
+        return;
+    };
+    let last = list.len() - 1;
+    list.swap_remove(pos);
+    if pos != last {
+        let moved = list[pos];
+        let moved_index = unsafe {
+            if live {
+                &(*moved.as_ptr()).live_index
+            } else {
+                &(*moved.as_ptr()).young_index
+            }
+        };
+        moved_index.store(pos, Ordering::Relaxed);
+    }
+}
+
+fn free_slot(slot: std::ptr::NonNull<NumSlot>) {
+    unsafe {
+        if slot.as_ref().host {
+            let addr = slot.as_ref().addr.load(Ordering::Relaxed);
+            if addr != 0 {
+                let len = *(addr as *const usize);
+                let block = (addr as *mut u8).sub(numb_len_word());
+                std::alloc::dealloc(block, host_layout(len));
+            }
+        }
+        drop(Box::from_raw(slot.as_ptr()));
     }
 }
 
@@ -727,14 +709,11 @@ mod tests {
     }
 
     #[test]
-    fn reader_follows_numbering_across_a_payload_epoch() {
-        // Host block: a minor does not move it. The reader must still
-        // drop its cached pointer when the epoch bumps and read the
-        // same bytes afterwards. `resumecode.py` `numb_next_item`.
+    fn reader_reads_each_item_from_the_numbering() {
+        // `resumecode.py` `numb_next_item` loads `numb.code[index]` per item.
         let numb = create_numbering(&[1, -2, 3, 64]);
         let mut reader = Reader::from_numbering(&numb);
         assert_eq!(reader.next_item(), 1);
-        bump_numbering_payload_epoch();
         assert_eq!(reader.peek(), -2);
         assert_eq!(reader.next_item(), -2);
         assert_eq!(reader.next_item(), 3);

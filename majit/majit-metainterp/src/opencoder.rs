@@ -46,15 +46,6 @@ pub fn register_trace_ops_gc_type(gc: &mut dyn majit_gc::GcAllocator) -> u32 {
     ));
     NUMBERING_GC_TYPE_ID.store(numb_id, Ordering::Release);
     majit_ir::resumecode::set_numbering_alloc(Some(alloc_numbering_bytes));
-    // `acquire_owner_root`: the array is live from malloc, before the
-    // fail descr is published into the `rd_consts` walk.
-    majit_ir::resumecode::set_numbering_root_hooks(
-        pin_numbering,
-        read_numbering,
-        write_numbering,
-        unpin_numbering,
-    );
-    majit_ir::resumecode::set_numbering_epoch(majit_gc::minor_epoch);
     // List header, word arrays, and `Trace._refs`. Same registration pass.
     trace_bufs::register_trace_pool_gc_types(gc);
     id
@@ -75,6 +66,7 @@ fn alloc_numbering_bytes(bytes: &[u8]) -> usize {
     let payload = TRACE_OPS_CHARS + len;
     let mut live = majit_ir::GcRef(0);
     let mut needs_write_barrier = false;
+    majit_gc::stress_trace_pool_alloc(&mut live, 1);
     let fresh = unsafe {
         majit_gc::alloc_fast_nursery_collecting_typed_rooted(
             numbering_gc_type_id(),
@@ -99,22 +91,6 @@ fn alloc_numbering_bytes(bytes: &[u8]) -> usize {
     let _ = needs_write_barrier;
     let _ = live;
     fresh.0
-}
-
-fn pin_numbering(addr: usize) -> usize {
-    majit_gc::shadow_stack::acquire_owner_root(majit_ir::GcRef(addr))
-}
-
-fn read_numbering(slot: usize) -> usize {
-    majit_gc::shadow_stack::get_owner_root(slot).0
-}
-
-fn write_numbering(slot: usize, addr: usize) {
-    majit_gc::shadow_stack::set_owner_root(slot, majit_ir::GcRef(addr));
-}
-
-fn unpin_numbering(slot: usize) {
-    majit_gc::shadow_stack::release_owner_root(slot);
 }
 
 fn trace_ops_gc_type_id() -> u32 {
@@ -183,6 +159,7 @@ impl TraceOpsBuf {
         // (`alloc_with_type_rooted_body`), not at this caller.
         // `malloc_fast` + one live root. The public no-collect entry spills
         // instead of collecting; `Trace._double_ops` has to collect.
+        majit_gc::stress_trace_pool_alloc(&mut live, 1);
         let fresh = unsafe {
             majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                 trace_ops_gc_type_id(),

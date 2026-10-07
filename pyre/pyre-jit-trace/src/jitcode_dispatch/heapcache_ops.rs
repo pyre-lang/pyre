@@ -1711,12 +1711,7 @@ pub(crate) fn opimpl_newstr<Sym: WalkSym>(
         0,
     );
     let dst = code[op.pc + 2] as usize;
-    let concrete = match resvalue {
-        Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) => {
-            ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
-        }
-        _ => ConcreteValue::Null,
-    };
+    let concrete = concrete_from_recorded_opref(ctx, result);
     write_ref_reg(ctx, op.pc, dst, result, concrete)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }

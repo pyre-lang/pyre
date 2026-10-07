@@ -14781,25 +14781,16 @@ fn handle<Sym: WalkSym>(
                 });
             }
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, false);
-            // The `set_opref_concrete` below is what roots this object: it
-            // stamps the allocation onto the recorded op's `value` cell, which
-            // `MetaInterp::walk_active_trace_refs` forwards.  Nothing between
-            // here and there allocates from the GC heap, so no collection can
-            // observe the object before it is reachable from that root.
-            // pyjitpl.py `execute_new`.
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(OpCode::New, majit_metainterp::counters::OPS);
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(OpCode::New, majit_metainterp::counters::RECORDED_OPS);
-            let resbox = ctx.trace_ctx.record_op_with_descr(OpCode::New, &[], descr);
+            // pyjitpl.py `execute_new` → `execute_and_record(rop.NEW, typedescr)`.
+            // `_record_helper` pins the allocation across the Trace-pool
+            // append (`opencoder.py Trace._ops`) and stamps the forwarded
+            // address onto the recorded op.
+            let resbox =
+                ctx.trace_ctx
+                    .execute_and_record(None, OpCode::New, Some(descr), &[], concrete, 0);
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             let dst = code[op.pc + 3] as usize;
-            if let Some(value) = concrete {
-                ctx.trace_ctx.set_opref_concrete(resbox, value);
-            }
-            let concrete = match concrete {
+            let concrete = match ctx.trace_ctx.box_value(resbox) {
                 Some(Value::Ref(majit_ir::GcRef(ptr))) => {
                     ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
                 }
@@ -14829,7 +14820,6 @@ fn handle<Sym: WalkSym>(
                 });
             }
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, true);
-            // Rooted by the `set_opref_concrete` stamp below, as in `new/d>r`.
             if let Some(Value::Ref(majit_ir::GcRef(ptr))) = concrete
                 && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
             {
@@ -14838,24 +14828,21 @@ fn handle<Sym: WalkSym>(
                         w_class as pyre_object::PyObjectRef;
                 }
             }
-            // pyjitpl.py `execute_new_with_vtable`.
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(OpCode::NewWithVtable, majit_metainterp::counters::OPS);
-            ctx.trace_ctx.profiler().count_ops(
+            // pyjitpl.py `execute_new_with_vtable` →
+            // `execute_and_record(rop.NEW_WITH_VTABLE, descr)`. Same pin as
+            // `new/d>r`: the Trace-pool append can minor-collect.
+            let resbox = ctx.trace_ctx.execute_and_record(
+                None,
                 OpCode::NewWithVtable,
-                majit_metainterp::counters::RECORDED_OPS,
+                Some(descr.clone()),
+                &[],
+                concrete,
+                0,
             );
-            let resbox =
-                ctx.trace_ctx
-                    .record_op_with_descr(OpCode::NewWithVtable, &[], descr.clone());
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             crate::helpers::note_class_word_after_new(ctx.trace_ctx, resbox, &descr);
             let dst = code[op.pc + 3] as usize;
-            if let Some(value) = concrete {
-                ctx.trace_ctx.set_opref_concrete(resbox, value);
-            }
-            let concrete = match concrete {
+            let concrete = match ctx.trace_ctx.box_value(resbox) {
                 Some(Value::Ref(majit_ir::GcRef(ptr))) => {
                     ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
                 }

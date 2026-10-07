@@ -1313,18 +1313,19 @@ impl TraceCtx {
     /// so later residual calls and field operations observe a real pointer
     /// while the optimizer remains free to virtualize the recorded allocation.
     ///
-    /// Rooting contract: the result is returned unrooted, and the caller must
-    /// stamp it onto the op it records for this allocation
-    /// (`set_opref_concrete`) before performing any GC allocation.  The
-    /// result box is then written into `MIFrame.registers_r`; that live
-    /// box is what makes the object a root — `MetaInterp::walk_active_trace_refs`
+    /// Rooting contract: the result is returned unrooted.  The caller must
+    /// keep it reachable until it is stamped onto the op it records for this
+    /// allocation (`set_opref_concrete` / `execute_and_record`).  The result
+    /// box is then written into `MIFrame.registers_r`; that live box is what
+    /// makes the object a root — `MetaInterp::walk_active_trace_refs`
     /// forwards `RefFrontendOp._resref` of boxes still reachable from
     /// registers / heapcache, matching the `history.py` `*FrontendOp(pos,
-    /// value)` slot upstream reaches through the object graph.  Between the
-    /// `bh_new` here and that stamp there is no root at all, so the caller's
-    /// window must contain no GC allocation; recording the op and populating
-    /// the heapcache allocate from the Rust heap only, which is why the
-    /// existing call sites are sound.
+    /// value)` slot upstream reaches through the object graph.  `record_op*`
+    /// appends to `opencoder.py Trace._ops` and can minor-collect
+    /// (`stress_trace_pool_alloc` / `alloc_fast_nursery_collecting`), so a
+    /// bare Rust `Value::Ref` across that append is not enough —
+    /// `execute_and_record` / `_record_helper` pin it the way the translated
+    /// GCREF local would.
     ///
     /// A side list of executed allocations is NOT the way to widen that
     /// window: it duplicates a root the op graph already owns, and it hands

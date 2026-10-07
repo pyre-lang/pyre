@@ -9029,10 +9029,24 @@ impl<S: JitState> JitDriver<S> {
         self.meta.walk_rd_consts_refs(visitor);
     }
 
-    /// `NUMBERING` slots only. Regex registers this area; its const pool
-    /// holds addresses the collector does not trace.
+    /// `NUMBERING` payloads only. `walk_rd_consts_refs` includes this walk
+    /// and also stamps `ConstPtr` indexes (`ResumeGuardDescr.rd_consts`,
+    /// compiled-loop ops, descr tracers).
     pub fn walk_rd_numb_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
         self.meta.walk_rd_numb_refs(visitor);
+    }
+
+    /// Stamp every `ConstPtr` index this driver still holds.
+    ///
+    /// `history.py` `ConstPtr` is a GC object MiniMark traces from the
+    /// holder. `walk_rd_numb_refs` visits only `NUMBERING`. This walk
+    /// is `walk_rd_consts_refs` plus the in-flight recorder, partial
+    /// trace, and compile-snapshot walks.
+    pub fn walk_const_ptr_holders(&mut self, mut visitor: impl FnMut(&mut majit_ir::GcRef)) {
+        self.meta.walk_rd_consts_refs(&mut visitor);
+        self.meta.walk_active_trace_refs(&mut visitor);
+        self.meta.walk_partial_trace_refs(&mut visitor);
+        self.meta.walk_compile_snapshot_refs(&mut visitor);
     }
 
     /// framework.py `root_walker.walk_roots` parity: visit every

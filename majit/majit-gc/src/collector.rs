@@ -1848,10 +1848,6 @@ impl MiniMarkGC {
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         unsafe {
-            // Blackhole resume reaches `do_malloc_fixedsize_clear` through
-            // this entry (`GcLLDescr_framework._bh_malloc`). The same knob
-            // that minors before a Trace-pool bump minors here too.
-            self.stress_trace_alloc_minor(root, 1);
             self.alloc_with_type_rooted_body::<false>(
                 type_id,
                 payload_size,
@@ -1879,13 +1875,6 @@ impl MiniMarkGC {
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         unsafe {
-            // `MAJIT_GC_STRESS_TRACE_ALLOC`: every Trace-pool malloc is a
-            // minor, so a young address read into a Rust local and used
-            // after the append dies at that use. The caller's slot is the
-            // one root `malloc_fast` already publishes; register it the
-            // way `alloc_with_type_rooted_slow` does across
-            // `collect_and_reserve`.
-            self.stress_trace_alloc_minor(root, 1);
             self.alloc_with_type_rooted_body::<true>(
                 type_id,
                 payload_size,
@@ -1899,10 +1888,15 @@ impl MiniMarkGC {
     /// Minor-collect before a Trace-pool allocation when
     /// [`crate::gc_stress_trace_alloc_enabled`] is set.
     ///
+    /// `opencoder.py` `Trace._ops` and the other pools in `trace_bufs` call
+    /// this through [`crate::stress_trace_pool_alloc`]. `malloc_fast`
+    /// (`framework.py`, `inline=True`) does not: rbigint digit arrays share
+    /// that entry (`rlist.try_alloc_typed_items_block_nursery_rooted`).
+    ///
     /// A collection callback that allocates again must not re-enter: the
     /// flag is process-global because `gc_op` already serializes the
     /// collector.
-    fn stress_trace_alloc_minor(&mut self, roots: *mut GcRef, root_count: usize) {
+    pub(crate) fn stress_trace_alloc_minor(&mut self, roots: *mut GcRef, root_count: usize) {
         if !crate::gc_stress_trace_alloc_enabled() {
             return;
         }
@@ -1944,10 +1938,6 @@ impl MiniMarkGC {
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         unsafe {
-            // Same knob as `alloc_fast_with_type_rooted`. The plural-root
-            // Trace pools (`_refs`, `_bigints`, `_floats`) grow through
-            // this entry.
-            self.stress_trace_alloc_minor(roots, root_count);
             self.alloc_with_type_rooted_body::<true>(
                 type_id,
                 payload_size,
@@ -3660,6 +3650,16 @@ impl MiniMarkGC {
         }
         // Multi-registrar walker fan-out (rd_consts const-pool, etc.).
         crate::shadow_stack::walk_extra_roots(|gcref| {
+            self.drag_out_root(gcref);
+        });
+        // `incminimark.py` `collect_oldrefs_to_nursery`: a young
+        // `resumecode.py` `NUMBERING` stored into `compile.py`
+        // `ResumeGuardDescr.rd_numb` is forwarded here. The list is the
+        // remembered set. Clearing it is this minor's end for these cells.
+        // Always this minor, even when a pinned object announced a Major
+        // extra-root walk. Before the nursery reset and before
+        // `free_young_rawmalloced_objects`.
+        majit_ir::resumecode::collect_young_numberings(&mut |gcref| {
             self.drag_out_root(gcref);
         });
         // `history.py` `ConstPtr` intern-to-holder window. A minor before
@@ -6294,6 +6294,11 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
             result.push((*gcref, label));
         });
+        // Live `NUMBERING` cells. `seed_major_roots` marks the same set;
+        // a root omitted here is a white root at the marking check.
+        majit_ir::resumecode::trace_live_numberings(&mut |gcref| {
+            result.push((*gcref, "numbering"));
+        });
         majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
             result.push((*gcref, "young_const_ptrs"));
         });
@@ -6395,6 +6400,11 @@ impl MiniMarkGC {
         Self::walk_stack_shaped_roots(|gcref, site| seed(self, gcref, site, false));
         crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
             seed(self, *gcref, label, true);
+        });
+        // `ResumeGuardDescr.rd_numb` may still be off the holder graph.
+        // Mark the live `NUMBERING` list without clearing the young list.
+        majit_ir::resumecode::trace_live_numberings(&mut |gcref| {
+            seed(self, *gcref, "numbering", true);
         });
         // Intern during this major still sits in the young list. Do not
         // drain: `collect_young_const_ptrs` runs at pre-sweep.
@@ -7041,10 +7051,17 @@ impl MiniMarkGC {
             crate::shadow_stack::walk_extra_roots(|gcref| {
                 self.seed_major_extra_root(*gcref, "rescan_extra_root");
             });
+            // Same live `NUMBERING` set as `seed_major_roots`. A numbering
+            // allocated during marking is still white until this rescan.
+            // Do not clear the young list: `seed_major_extra_root` does not
+            // forward a nursery payload.
             // In test builds, serialize the rescan young-const-ptr trace
             // against intern tests. Compiles out in production.
             #[cfg(test)]
             let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
+            majit_ir::resumecode::trace_live_numberings(&mut |gcref| {
+                self.seed_major_extra_root(*gcref, "rescan_numbering");
+            });
             majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
                 self.seed_major_extra_root(*gcref, "rescan_young_const_ptrs");
             });

@@ -989,6 +989,21 @@ impl Trace {
         // slots. Resolve each ConstPtr in the encode loop, after the
         // previous argument's encode, so a prebuilt `Box::ConstPtr`
         // does not keep the from-space address.
+        // `history.py` `*FrontendOp.value` is a GC field of the op once
+        // `_make_op` attaches it. Until `value_slots` holds it, a Rust
+        // `Value::Ref` is not a root, and the reserve and encode below can
+        // minor-collect (`stress_trace_pool_alloc` /
+        // `alloc_fast_nursery_collecting`). Pin the referent across them
+        // and stamp the forwarded address. Skip the sentinel and addresses
+        // the collector does not own (test CPUs return a host buffer).
+        let value_pin = match value {
+            Some(Value::Ref(r))
+                if r != GcRef::NO_CONCRETE && !r.is_null() && majit_gc::gc_owns_object(r.0) =>
+            {
+                Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+            }
+            _ => None,
+        };
         let held = self.hold_const_indexes(args);
         // `quasiimmut.py QuasiImmutDescr` stores raw `struct` and
         // `constantfieldbox` words. Argument indexes do not rewrite
@@ -1047,6 +1062,10 @@ impl Trace {
             descr: if opcode.is_guard() { descr } else { None },
             descr_pos,
         });
+        let value = match value_pin {
+            Some(pin) => Some(Value::Ref(pin.get())),
+            None => value,
+        };
         let opref = if ty != Type::Void {
             self.value_slots.push(ValueSlot {
                 ty,

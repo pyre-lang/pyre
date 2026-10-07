@@ -7854,7 +7854,7 @@ pub fn cranelift_resumedata_deopt(
     // Keep the `NumberingRef`. The payload slice is taken immediately
     // before the reader is built: a minor in between would leave the
     // header decoded from from-space while `bind_numbering` reloads
-    // the rest from the owner root.
+    // `numb.code` per item (`resumecode.py` `numb_next_item`).
     let Some(numb) = rgd.payload.rd_numb_ref() else {
         return false;
     };

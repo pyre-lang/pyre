@@ -909,4 +909,23 @@ mod tests {
         );
         reclaim_unheld();
     }
+
+    /// A holder that copies the index (`OpRef` is `Copy`) and never calls
+    /// `trace_index` loses the slot. `ResumeDataDirectReader::decode_ref`
+    /// then sees `ConstPtr.getref_base` as null. `walk_rd_consts_refs` is
+    /// the extra-root walk that stamps `ResumeGuardDescr.rd_consts`.
+    #[test]
+    fn a_copied_index_without_trace_index_is_freed_at_major() {
+        let _serial = TEST_SERIAL.lock();
+        reclaim_unheld();
+        let addr = GcRef(0x6E6B_F210);
+        let holder = intern(addr);
+        begin_major_live();
+        sweep_untraced();
+        assert!(
+            resolve(holder).is_null(),
+            "unwalked holder must not keep the slot"
+        );
+        reclaim_unheld();
+    }
 }
