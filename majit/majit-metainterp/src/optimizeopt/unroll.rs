@@ -85,22 +85,18 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::ConstMap<majit_ir::V
 /// it to the header. Int/Float consts stay live-in: GuardTrue/False
 /// postprocess may install those after emit, and baking them as the
 /// first-iteration value is a 0-fill.
+///
+/// Walks the box at `opref` (`resoperation.py AbstractValue.get_box_replacement`).
+/// An InputArgRef is its own box (`InputArgRef` / `AbstractInputArg`); the
+/// Const, if any, lives on that InputArg (`op.set_forwarded(const)`). A
+/// sibling `RefOp` at the same raw is a different position class
+/// (`AbstractResOp`) and is not minted for a red inputarg.
 fn const_ref_replacement(ctx: &OptContext, opref: OpRef) -> Option<Operand> {
-    let as_const_ref = |term: Operand| match term.const_value() {
+    let term = ctx.get_box_replacement_operand(opref);
+    match term.const_value() {
         Some(Value::Ref(gcref)) if !gcref.is_null() => Some(term),
         _ => None,
-    };
-    if let Some(term) = as_const_ref(ctx.get_box_replacement_operand(opref)) {
-        return Some(term);
     }
-    // Compact remap keeps the InputArg variant when it repositions a
-    // folded Ref producer (`with_raw`). The Const lives on the ResOp
-    // at the same raw; `find_producer_op` is variant-aware and misses
-    // the InputArgRef use.
-    if matches!(opref, OpRef::InputArgRef(_)) {
-        return as_const_ref(ctx.get_box_replacement_operand(OpRef::ref_op(opref.raw())));
-    }
-    None
 }
 
 fn callee_rca_virtual_state_summary(
@@ -1044,9 +1040,16 @@ impl UnrollOptimizer {
             opt_p1.trace_inputarg_boxes = p1_iter.inputargs.clone();
             if let Some(recorder) = self.snapshot_recorder {
                 // SAFETY: the caller keeps the recorder alive across optimize.
+                let cache = std::mem::take(&mut p1_iter._cache);
+                crate::optimizeopt::attach_resume_snapshot_caches(
+                    &mut opt_p1.snapshot_boxes,
+                    &mut opt_p1.snapshot_vable_boxes,
+                    &mut opt_p1.snapshot_vref_boxes,
+                    &cache,
+                );
                 opt_p1.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
                     unsafe { &*recorder },
-                    std::mem::take(&mut p1_iter._cache),
+                    cache,
                 ));
             }
             // compile.py `PreambleCompileData(trace, jumpargs, ...)` —
@@ -1105,6 +1108,16 @@ impl UnrollOptimizer {
             opt_p1.explicit_input_ops_seed = Some(p1_ops_in.clone());
             let p1_ops =
                 opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false)?;
+            // unroll.py `UnrollOptimizer.optimize_preamble` after `export_state`:
+            // `self._clean_optimization_info(self._newoperations)`. Leftover
+            // PtrInfo on preamble result boxes (a GETFIELD of a residual that
+            // later leaves JUMP `end_args`) is otherwise visible to Phase 2
+            // after bind-at-alloc, and a leftover `FieldEntry::Value` folds
+            // the body GETFIELD without `force_op_from_preamble` / `use_box`.
+            crate::optimizeopt::optimizer::Optimizer::clean_optimization_info(&p1_ops);
+            crate::optimizeopt::optimizer::Optimizer::clean_optimization_info(
+                &opt_p1.phase1_emit_ops,
+            );
             merge_quasi_immutable_deps(
                 &mut self.quasi_immutable_deps,
                 &opt_p1.quasi_immutable_deps,
@@ -1475,16 +1488,23 @@ impl UnrollOptimizer {
         };
         for (frame, boxes) in opt_p2.snapshot_boxes.iter_mut().enumerate() {
             for r in boxes.iter_mut().flatten() {
+                // p2_cache is keyed by the Phase-1 recording position.
+                // Attach the Phase-2 iterator box before rewriting the OpRef
+                // into the Phase-2 namespace; a later producer-map lookup
+                // by that remapped raw would collide with Phase-1.
+                r.attach_iter_cache(&p2_cache);
                 *r = r.map_opref(|opref| translate_opref("snapshot_boxes", frame, opref));
             }
         }
         for (frame, boxes) in opt_p2.snapshot_vable_boxes.iter_mut().enumerate() {
             for r in boxes.iter_mut().flatten() {
+                r.attach_iter_cache(&p2_cache);
                 *r = r.map_opref(|opref| translate_opref("snapshot_vable_boxes", frame, opref));
             }
         }
         for (frame, boxes) in opt_p2.snapshot_vref_boxes.iter_mut().enumerate() {
             for r in boxes.iter_mut().flatten() {
+                r.attach_iter_cache(&p2_cache);
                 *r = r.map_opref(|opref| translate_opref("snapshot_vref_boxes", frame, opref));
             }
         }
@@ -1692,15 +1712,16 @@ impl UnrollOptimizer {
                         .iter()
                         .filter_map(|&arg| final_ctx.get_box_replacement_operand_opt(arg))
                         .collect();
-                    for arg in &resolved_jump_args {
-                        let _ = opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx);
-                    }
+                    let forced_boxes: Vec<majit_ir::operand::Operand> = resolved_jump_args
+                        .iter()
+                        .map(|arg| opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx))
+                        .collect();
                     let forced_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
                         .map(|&arg| final_ctx.get_replacement_opref(arg))
                         .collect();
-                    let current_vs = crate::optimizeopt::virtualstate::export_state(
-                        &forced_jump_args,
+                    let current_vs = crate::optimizeopt::virtualstate::export_state_operands(
+                        &forced_boxes,
                         &final_ctx,
                     );
                     let mut target_states: Vec<crate::optimizeopt::virtualstate::VirtualState> =
@@ -3410,52 +3431,48 @@ impl OptUnroll {
         // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...].
         // The preview path carried the exact Box objects used for this single
         // evaluation; their OpRefs are only the positional view of those boxes.
-        let end_args: Vec<OpRef> = preview_args_state.as_ref().map_or_else(
+        // Resolve boxes first so virtual-state export walks them
+        // (`VirtualStateConstructor.create_state`) instead of re-looking up
+        // each end_arg by OpRef.
+        let end_arg_boxes: Vec<Operand> = preview_args_state.as_ref().map_or_else(
             || {
-                ctx.preamble_end_args.clone().unwrap_or_else(|| {
+                let src = ctx.preamble_end_args.clone().unwrap_or_else(|| {
                     original_label_args
                         .iter()
                         .map(|&a| ctx.get_replacement_opref(a))
                         .collect()
-                })
+                });
+                src.iter()
+                    .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
+                        Some(o) => o,
+                        // The None arm fires only for an unregistered ResOp
+                        // position (Const / InputArg always resolve); #157
+                        // drained those fires to zero. Mint at this export-key
+                        // write so the key identity is stable.
+                        None => match a {
+                            OpRef::InputArgInt(_)
+                            | OpRef::InputArgFloat(_)
+                            | OpRef::InputArgRef(_) => ctx.materialize_operand_at(a),
+                            _ => ctx.mint_box_at(a),
+                        },
+                    })
+                    .collect()
             },
-            |(_, _, _, _, end_arg_boxes)| end_arg_boxes.iter().map(Operand::to_opref).collect(),
+            |(_, _, _, _, end_arg_boxes)| end_arg_boxes.clone(),
         );
+        let end_args: Vec<OpRef> = end_arg_boxes.iter().map(Operand::to_opref).collect();
         // unroll.py `virtual_state = self.get_virtual_state(end_args)`
         // — VS captured AFTER `force_box_for_end_of_preamble` and AFTER
         // `flush()`. The caller (`Optimizer::optimize_with_constants_and_inputs_at`)
         // already ran both passes before invoking us, so `end_args` is in
         // the same post-force, post-flush state RPython feeds in.
         let virtual_state = preview_args_state.as_ref().map_or_else(
-            || crate::optimizeopt::virtualstate::export_state(&end_args, ctx),
+            || crate::optimizeopt::virtualstate::export_state_operands(&end_arg_boxes, ctx),
             |(virtual_state, _, _, _, _)| virtual_state.clone(),
         );
         // unroll.py: infos = {}; for arg in end_args: _expand_info(arg, infos)
         let mut infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo> =
             indexmap::IndexMap::new();
-        // Resolve the ONE canonical box per end_arg up front: it is the
-        // exported_infos key AND (unroll.py:467 next_iteration_args = end_args)
-        // the carried import key, so they are the identical Rc and import_state's
-        // lookup is an identity hit for const / inputarg / resop alike. Computing
-        // it once keeps a single canonical Const cell per arg (Operand::Const
-        // compares by cell identity, so re-resolving is tolerable but one cell
-        // mirrors RPython's single Const box object).
-        let end_arg_boxes: Vec<Operand> = preview_args_state.as_ref().map_or_else(
-            || {
-                end_args
-                    .iter()
-                    .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
-                        Some(o) => o,
-                        // The None arm fires only for an unregistered ResOp
-                        // position (Const / InputArg always resolve); #157
-                        // drained those fires to zero. Materializing once keeps
-                        // the export/import key identity-stable.
-                        None => ctx.materialize_operand_at(a),
-                    })
-                    .collect()
-            },
-            |(_, _, _, _, end_arg_boxes)| end_arg_boxes.clone(),
-        );
         for (arg, arg_box) in end_args.iter().zip(end_arg_boxes.iter()) {
             self.expand_info(*arg, arg_box, ctx, exported_int_bounds, &mut infos);
         }
@@ -3506,7 +3523,12 @@ impl OptUnroll {
                 // unregistered ResOp position (drained to zero by #157) mints a
                 // canonical registered synthetic, keeping the exported_infos
                 // key identity-stable.
-                None => ctx.materialize_operand_at(arg),
+                None => match arg {
+                    OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                        ctx.materialize_operand_at(arg)
+                    }
+                    _ => ctx.mint_box_at(arg),
+                },
             };
             self.expand_info(arg, &arg_box, ctx, exported_int_bounds, &mut infos);
         }
@@ -3613,6 +3635,10 @@ impl OptUnroll {
                 self.expand_info(op, &produced_op.res, ctx, exported_int_bounds, &mut infos);
             }
         }
+
+        // unroll.py `UnrollOptimizer.export_state`:
+        // `self.optimizer._clean_optimization_info(end_args)`.
+        crate::optimizeopt::optimizer::Optimizer::clean_optimization_info_boxes(&end_arg_boxes);
 
         // RPython unroll.py:467: next_iteration_args = end_args (post-force).
         // Aliased boxes (same resolved OpRef) are handled by export_state's
@@ -3737,6 +3763,11 @@ impl OptUnroll {
         infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
         // unroll.py `_expand_info`:
+        //     arg1 = self.optimizer.as_operation(arg)
+        //     if arg1 is not None and rop.is_same_as(arg1.opnum):
+        //         info = self.optimizer.getinfo(arg1.getarg(0))
+        //     else:
+        //         info = self.optimizer.getinfo(arg)
         //     if arg in infos:
         //         return
         //     if info:
@@ -3744,73 +3775,98 @@ impl OptUnroll {
         //         if info.is_virtual():
         //             self._expand_infos_from_virtual(info, infos)
         //
-        // Keyed by `arg_box`, the ONE canonical Phase-1 box the caller resolved
-        // for this arg (shared verbatim with the `next_iteration_args` carry so
-        // the import lookup is a ptr_eq hit). The dual OpRef-key insert is gone:
-        // a ptr-stable operand key tracks its position through the shared
-        // set_position Cell across compaction, so there is no resolved-vs-original
-        // OpRef drift left to bridge.
+        // `getinfo` runs first (it lazily installs an unbounded IntBound),
+        // then the dict membership check. Keyed by `arg_box`, the same
+        // Phase-1 box `next_iteration_args` carries so the import lookup
+        // is a ptr_eq hit. `arg` is the OpRef view of `arg_box`; SAME_AS
+        // is decided on the box (`as_operation` / `bound_op`).
+        let _ = arg;
+        let info = self.getinfo_for_expand(arg_box, ctx, exported_int_bounds);
         if infos.contains_key(arg_box) {
             return;
         }
-        let resolved = ctx.get_replacement_opref(arg);
-        // RPython stores the entry only when `info` is truthy — a falsy
-        // `info` (None) simply skips the insert, so downstream
-        // `setinfo_from_preamble_list` at unroll.py sees "no entry"
-        // and drops any inherited forwarded via `item.set_forwarded(None)`.
-        let Some(info) = self.collect_exported_info(resolved, ctx, exported_int_bounds) else {
+        let Some(info) = info else {
             return;
         };
-        // `arg_box` is the canonical Phase-1 box, which can be position-only
-        // (a virtual field box), so read its PtrInfo directly off the box —
-        // exactly what `peek_ptr_info` does (`get_box_replacement(false)
-        // .ptr_info()`, `self`-independent) — without the `from_opref`
-        // position-only panic.
-        let arg_pi = arg_box
-            .get_box_replacement(false)
-            .ptr_info()
-            .map(|p| p.clone());
-        let has_fields = matches!(
-            arg_pi,
-            Some(pi) if pi.is_virtual() || !pi.all_items().is_empty()
-        );
-        infos.insert(arg_box.clone(), info);
-        if has_fields {
-            self.expand_infos_from_virtual(resolved, ctx, exported_int_bounds, infos);
+        let is_virtual = info.is_virtual();
+        infos.insert(arg_box.clone(), info.clone());
+        if is_virtual {
+            self.expand_infos_from_virtual(&info, ctx, exported_int_bounds, infos);
+        }
+    }
+
+    /// unroll.py `_expand_info` `getinfo` / SAME_AS arm.
+    ///
+    /// Reads `_forwarded` off the box via `optimizer.py Optimizer.getinfo`.
+    /// `as_operation(arg)` is the box itself when it is an emitted AbstractResOp
+    /// (`bound_op` + `_emittedoperations`); a SAME_AS result takes
+    /// `getinfo(arg0)` so the original's PtrInfo / IntBound is stored under
+    /// the SAME_AS key.
+    fn getinfo_for_expand(
+        &self,
+        arg_box: &Operand,
+        ctx: &OptContext,
+        exported_int_bounds: Option<
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+        >,
+    ) -> Option<crate::optimizeopt::info::OpInfo> {
+        use crate::optimizeopt::info::OpInfo;
+        // optimizer.py `as_operation(arg)`: emitted AbstractResOp only.
+        let info = if let Some(op_rc) = arg_box.bound_op()
+            && op_rc.opcode.is_same_as()
+            && ctx.emitted_operations.contains(arg_box)
+        {
+            ctx.getinfo(&op_rc.arg(0))
+        } else {
+            ctx.getinfo(arg_box)
+        };
+        // A live IntBound on the box wins. The `exported_int_bounds` side
+        // table is only a stand-in for tests that never wrote `_forwarded`.
+        match info {
+            Some(OpInfo::IntBound(b)) if b.borrow().is_unbounded() => {
+                if let Some(bound) = exported_int_bounds.and_then(|bounds| bounds.get(arg_box)) {
+                    Some(OpInfo::int_bound(bound.clone()))
+                } else {
+                    Some(OpInfo::IntBound(b))
+                }
+            }
+            None => exported_int_bounds
+                .and_then(|bounds| bounds.get(arg_box).cloned())
+                .map(OpInfo::int_bound),
+            other => other,
         }
     }
 
     /// unroll.py: _expand_infos_from_virtual
     fn expand_infos_from_virtual(
         &self,
-        opref: OpRef,
+        info: &crate::optimizeopt::info::OpInfo,
         ctx: &OptContext,
         exported_int_bounds: Option<
             &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
         infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
-        let opref_box = ctx.get_box_replacement_operand_opt(opref);
         // unroll.py `_expand_infos_from_virtual`:
         //     items = info.all_items()
         //     for item in items:
         //         if item is None: continue
         //         self._expand_info(item, infos)
-        // Key each field by its raw `all_items()` box, NOT a re-resolved OpRef.
-        // `peek_ptr_info` returns the SAME `Rc<RefCell<PtrInfo>>` cell whose
-        // handle `collect_exported_info` stores as the `exported_infos` value
-        // (its `ptr_info_handle()` read), so the import-side reader
-        // (`setinfo_from_preamble_list`) walks the same `v.fields` and the
-        // box-identity (`Rc::ptr_eq`) lookup hits.
-        let Some(info) = opref_box
-            .as_ref()
-            .and_then(|b| b.get_box_replacement(false).ptr_info().map(|p| p.clone()))
-        else {
+        // Walk the SAME `PtrInfo` cell `getinfo` stored as the
+        // `exported_infos` value, so import-side
+        // `setinfo_from_preamble_list` sees the same field boxes.
+        let Some(ptr) = info.get_ptr_info() else {
             return;
         };
-        for (_, entry) in info.all_items() {
-            let field_box = entry.as_seen_operand();
-            if field_box.to_opref().is_none() {
+        let items: Vec<Operand> = ptr
+            .borrow()
+            .all_items()
+            .iter()
+            .map(|(_, entry)| entry.as_seen_operand())
+            .collect();
+        for field_box in items {
+            // unroll.py: `if item is None: continue`
+            if field_box.is_none() {
                 continue;
             }
             self.expand_info(
@@ -4808,6 +4864,18 @@ impl OptUnroll {
                 "import_state: source is target (unroll.py:496 `assert source is not target`)"
             );
             ctx.register_carried_host(&b_target);
+            // unroll.py `import_state`: `source.set_forwarded(target)` overwrites
+            // leftover `_forwarded` on the Phase-2 source. `make_equal_to` would
+            // transfer that leftover PtrInfo onto the target
+            // (`optimizer.py Optimizer.make_equal_to`: `newop.set_forwarded(opinfo)`),
+            // which import_state does not do. Discard source leftover first so
+            // the subsequent `make_equal_to` is the `set_forwarded` write.
+            if !matches!(
+                b_source.get_forwarded(),
+                majit_ir::forwarding::Forwarded::None
+            ) {
+                b_source.clear_forwarded();
+            }
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
@@ -4916,7 +4984,7 @@ impl OptUnroll {
             let result = match produced.kind {
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
                 | crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant => {
-                    Some(ctx.alloc_op_position_typed(result_type))
+                    Some(ctx.reserve_virtual_box(result_type).0)
                 }
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Heap => {
                     match produced.preamble_op.opcode {
@@ -4925,7 +4993,7 @@ impl OptUnroll {
                         | OpCode::GetfieldGcF
                         | OpCode::GetarrayitemGcI
                         | OpCode::GetarrayitemGcR
-                        | OpCode::GetarrayitemGcF => Some(ctx.alloc_op_position_typed(result_type)),
+                        | OpCode::GetarrayitemGcF => Some(ctx.reserve_virtual_box(result_type).0),
                         _ => None,
                     }
                 }
@@ -4934,14 +5002,9 @@ impl OptUnroll {
             };
             if let Some(result) = result {
                 // shortpreamble.py:327: `self.res` is a Box object that
-                // exists from import time. The freshly allocated
-                // body-visible result slots (the `alloc_op_position_typed`
-                // arms above) have no producer yet; mint their canonical
-                // `SameAs*` stand-in here so a later `get_box_replacement`
+                // exists from import time. Bound at allocation via
+                // `reserve_virtual_box` so a later `get_box_replacement`
                 // resolves them instead of fabricating a position-only box.
-                if ctx.get_box_replacement_operand_opt(result).is_none() {
-                    ctx.mint_box_at(result);
-                }
                 result_map.insert(*source, result);
             }
         }
@@ -4986,9 +5049,9 @@ impl OptUnroll {
         // and that info is forwarded on the replay operation itself before
         // HeapOp.produce_op installs the PreambleOp in the heap cache.
         for (_, produced) in &const_short_boxes {
-            let info = self.collect_exported_info(produced.res.to_opref(), ctx, None);
+            let info = ctx.getinfo(&produced.res);
             if let Some(info) = &info {
-                ctx.set_preamble_forwarded_info(produced.preamble_op.pos().get(), info);
+                ctx.set_preamble_forwarded_info(&produced.preamble_op, info);
             }
         }
         // unroll.py:512-513 covers both groups upstream, because
@@ -5000,124 +5063,6 @@ impl OptUnroll {
             let _ =
                 produced.produce_op(ctx, optimizer, &exported_state.exported_infos, &result_map);
         }
-    }
-
-    /// unroll.py `_expand_info` + `unroll.py`
-    /// `ExportedState.exported_infos` entry producer. Returns the single
-    /// `OpInfo` variant RPython's dict would hold for this box, or `None`
-    /// for the RPython `if info:` falsy fall-through at unroll.py — the
-    /// caller must treat `None` as "no entry in the dict" so downstream
-    /// `setinfo_from_preamble_list` takes the `item.set_forwarded(None)`
-    /// branch at unroll.py:49.
-    ///
-    ///   - Ref-typed live box with PtrInfo → `Some(OpInfo::Ptr(...))`.
-    ///   - Constant OpRef (value-carrying) → `Some(OpInfo::Ptr(PtrInfo::Constant))`
-    ///     for Refs, `Some(OpInfo::FloatConstInfo(FloatConstInfo))` for floats,
-    ///     `Some(OpInfo::IntBound(IntBound::from_constant(v)))` for ints
-    ///     (mirroring RPython's `ConstPtrInfo` / `FloatConstInfo` /
-    ///     `IntBound` dispatch).
-    ///   - Int-typed box with a preamble-exported `IntBound` →
-    ///     `Some(OpInfo::IntBound(...))`.
-    ///   - No info → `None`. `OpInfo::Unknown` must not appear in
-    ///     `ExportedState.exported_infos`.
-    fn collect_exported_info(
-        &self,
-        opref: OpRef,
-        ctx: &OptContext,
-        exported_int_bounds: Option<
-            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
-        >,
-    ) -> Option<crate::optimizeopt::info::OpInfo> {
-        use crate::optimizeopt::info::{FloatConstInfo, OpInfo, PtrInfo};
-        let resolved = ctx.get_replacement_opref(opref);
-        // unroll.py `_expand_info` calls `self.optimizer.getinfo(arg)`
-        // which itself runs `get_box_replacement` first, so a non-constant
-        // OpRef forwarded to a Const surfaces the corresponding constant
-        // info class (ConstPtrInfo / FloatConstInfo / IntBound from_constant).
-        let synthesize_const_info = |value: Value| -> Option<OpInfo> {
-            match value {
-                // ConstPtrInfo parity: RPython stores Ref constants as
-                // ConstPtrInfo (a `PtrInfo` subclass). `setinfo_from_preamble`
-                // at unroll.py:65-68 dispatches through `is_constant()`.
-                Value::Ref(gcref) => Some(OpInfo::ptr(PtrInfo::Constant(gcref))),
-                // FloatConstInfo parity: unroll.py:97-98 handles
-                // `isinstance(preamble_info, info.FloatConstInfo)` with
-                // `op.set_forwarded(preamble_info._const)`.
-                Value::Float(f) => Some(OpInfo::FloatConstInfo(FloatConstInfo::new(f))),
-                // Int constants: RPython uses IntBound with lower==upper.
-                Value::Int(v) => Some(OpInfo::int_bound(
-                    crate::optimizeopt::intutils::IntBound::from_constant(v),
-                )),
-                Value::Void => None,
-            }
-        };
-        if resolved.is_constant()
-            && let Some(value) = ctx
-                .get_box_replacement_operand_opt(resolved)
-                .and_then(|cb| cb.const_value())
-        {
-            return synthesize_const_info(value);
-        }
-        // make_constant mirrors optimizer.py as `Forwarded::Const(constval)`.
-        // The walker has advanced to the constbox terminal — surface RPython's
-        // ConstPtrInfo / FloatConstInfo / IntBound dispatch via const_value().
-        let resolved_box = ctx.get_box_replacement_operand_opt(opref);
-        if let Some(b) = resolved_box.as_ref()
-            && b.is_constant()
-            && let Some(value) = b.const_value()
-        {
-            return synthesize_const_info(value);
-        }
-        // unroll.py _expand_info uses self.optimizer.getinfo(arg) which
-        // dispatches by op.type ('r' → getptrinfo, 'i' → getintbound). The Rust
-        // port stores int bounds in a separate table populated earlier by
-        // `OptIntBounds::export_arg_int_bounds`, which already filters by
-        // `opref_type(resolved) == Some(Int)`. We rely on that filter so the
-        // lookup here cannot pull a bound for a ref/float box.
-        if let Some(handle) = resolved_box.as_ref().and_then(|b| b.ptr_info_handle()) {
-            // RPython object identity: re-export the same Rc handle so
-            // downstream `setinfo_from_preamble` sees the live cell, not
-            // a snapshot. Matches PyPy `_forwarded` reference passing.
-            return Some(OpInfo::Ptr(handle));
-        }
-        // unroll.py `_expand_info` calls `self.optimizer.getinfo(arg)`
-        // for EVERY exported value with no jump-arg restriction, so an int-typed
-        // value's bound is read straight off its `_forwarded` slot
-        // (`getintbound`). Read the live bound from the still-alive Phase-1
-        // optimizer context; this recovers the `[0, mask]` bound of a masked
-        // short-preamble / loop-invariant pure result that is not a jump arg and
-        // therefore never entered the `exported_int_bounds` side table. Mirror
-        // `export_arg_int_bounds` (intbounds.rs): skip Const/non-Int values and
-        // unbounded bounds.
-        if let Some(box_op) = resolved_box.as_ref()
-            && !resolved.is_constant()
-            && matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int))
-            && let Some(bound) = ctx.peek_intbound_box(box_op)
-            && !bound.is_unbounded()
-        {
-            return Some(OpInfo::int_bound(bound));
-        }
-        // Fallback: read from `exported_int_bounds`
-        // side table.  RPython's `IntBound` flows through
-        // `OptInfo.IntBound` on the Box itself
-        // (`optimizeopt/info.py:580 IntBoundInfo`), so successive peeling
-        // iterations see the bound without an explicit hand-off.
-        // pyre's flat-OpRef `OptContext` is rebuilt per round so the
-        // preamble's bound must be exported by
-        // `intbounds.rs::export_arg_int_bounds` and re-imported here.
-        // Convergence: extend `setinfo_from_preamble_item` (`mod.rs`)
-        // to attach `OpInfo::IntBound` alongside `OpInfo::Ptr` so this
-        // branch becomes redundant and the side-table parameter
-        // disappears.
-        if let Some(bound) = exported_int_bounds.and_then(|bounds| {
-            // Same Phase-1 ctx as the export producer, so the canonical box for
-            // `opref` is the memoized `Rc` the bound was keyed under (ptr_eq).
-            ctx.get_box_replacement_operand_opt(opref)
-                .and_then(|o| bounds.get(&o).cloned())
-        }) {
-            return Some(OpInfo::int_bound(bound));
-        }
-        None
     }
 
     /// unroll.py `setinfo_from_preamble(op, preamble_info, exported_infos)`.
@@ -5899,8 +5844,15 @@ fn assemble_peeled_trace_with_jump_args(
             // producing op's type tag so downstream readers (`opref_type`
             // typed-first arm + variant-aware HashMap/HashSet lookups)
             // see the correct `box.type` instead of a default-int guess.
+            //
+            // OptUnroll's peel/body copy reserves with `reserve_virtual_box`
+            // (`ResOperation(...)` at allocation). Assembly uses a private
+            // `next_body_pos` to stay above preamble/label slots, so mint
+            // the box at that position (`mint_box_at`) instead of leaving a
+            // producer-less `*Op` for later `materialize_operand_at`.
             let fresh = OpRef::op_typed(next_body_pos, op.result_type());
             next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
+            ctx.mint_box_at(fresh);
             body_result_remap.insert(op.pos().get(), fresh);
         }
     }
@@ -6166,10 +6118,15 @@ fn assemble_peeled_trace_with_jump_args(
                 }
             }
             // unroll.py-style bulk replace: jump arity is finalized here.
+            // A remapped body result is the clone already pushed to
+            // `emitted_at`; mint-at-alloc stand-ins cover a forward ref.
             let mut jump_args_box: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
                 smallvec::SmallVec::with_capacity(jump_args.len());
             for a in &jump_args {
-                jump_args_box.push(ctx.materialize_operand_at(*a));
+                jump_args_box.push(match emitted_at.get(a) {
+                    Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
+                    None => ctx.materialize_operand_at(*a),
+                });
             }
             new_op.initarglist(jump_args_box);
         }
@@ -6260,6 +6217,11 @@ fn assemble_peeled_trace_with_jump_args(
         // post-process re-stamping is needed.
         let new_rc = OpRc::new(new_op);
         if new_rc.result_type() != Type::Void && !new_rc.pos().get().is_none() {
+            // `emit` adopts the mint-at-alloc stand-in onto the real
+            // producer (`adopt_live_synthetic`). Assembly writes a local
+            // clone rather than `ctx.emit`, so register it as the
+            // canonical box at this position.
+            ctx.register_extra_producer(&new_rc);
             emitted_at.insert(new_rc.pos().get(), new_rc.clone());
         }
         result.push(new_rc);
@@ -6448,10 +6410,13 @@ impl OptUnroll {
         // First pass: reserve peeled-iteration positions, tagged with each
         // source op's result type ( `OpRef.ty()`
         // matches RPython's `box.type` at allocation time).
+        // Args of later peeled ops read these positions (`remapped_producer_operand`);
+        // mint at allocation so a forward-reference consumer binds the SameAs
+        // stand-in `emit` later adopts (`resoperation.py ResOperation(...)`).
         let peeled_positions: Vec<OpRef> = self
             .buffer
             .iter()
-            .map(|op| ctx.reserve_pos_typed(op.result_type()))
+            .map(|op| ctx.reserve_virtual_box(op.result_type()).0)
             .collect();
         let mut ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
@@ -6501,7 +6466,7 @@ impl OptUnroll {
         let body_positions: Vec<OpRef> = self
             .buffer
             .iter()
-            .map(|op| ctx.reserve_pos_typed(op.result_type()))
+            .map(|op| ctx.reserve_virtual_box(op.result_type()).0)
             .collect();
         let mut orig_ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
@@ -6539,18 +6504,19 @@ impl OptUnroll {
     }
 }
 
-/// Resolve a remapped peel position to its canonical producer operand,
-/// mirroring the import-path binding (`get_box_replacement_operand_opt`, else
-/// `materialize_operand_at`). The peeled / body
-/// producer emitted at `new_ref` precedes its consumers' arg writes (SSA
-/// def-before-use), so the read resolves to the bound `Op`; the
-/// `materialize_operand_at` arm mints a registered stand-in that the producer's
-/// later `emit` catches up (mod.rs forward-reference path), never a
-/// position-only operand.
+/// Resolve a remapped peel position to its canonical producer operand.
+/// Peel / body positions are minted at allocation (`reserve_virtual_box`);
+/// `emit` adopts that stand-in. The None arm is a bind-at-alloc gap.
 fn remapped_producer_operand(ctx: &mut OptContext, new_ref: OpRef) -> Operand {
     match ctx.get_box_replacement_operand_opt(new_ref) {
         Some(o) => o,
-        None => ctx.materialize_operand_at(new_ref),
+        None => {
+            debug_assert!(
+                cfg!(test),
+                "remapped_producer_operand: {new_ref:?} was reserved without minting"
+            );
+            ctx.mint_box_at(new_ref)
+        }
     }
 }
 
@@ -7976,6 +7942,177 @@ mod tests {
             },
             Some((0, MASK)),
             "live [0, MASK] bound on a non-jump-arg short-box result must be exported"
+        );
+    }
+
+    #[test]
+    fn test_exported_state_reimports_known_class() {
+        // unroll.py `setinfo_from_preamble` + `make_constant_class`:
+        // InstancePtrInfo._known_class is exported through
+        // `exported_infos` and re-installed after
+        // `_clean_optimization_info(end_args)`.
+        use crate::optimizeopt::info::{OpInfo, PtrInfo};
+
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
+        ctx.materialize_operand_at(OpRef::ref_op(21));
+        let box21 = ctx
+            .get_box_replacement_operand_opt(OpRef::ref_op(21))
+            .expect("ref_op(21) bound to a box");
+        const CLASS: i64 = 0x1234;
+        ctx.set_ptr_info(&box21, PtrInfo::instance(None, Some(CLASS)));
+
+        let exported = export_state(&[OpRef::ref_op(21)], &[], &mut optimizer, &mut ctx, None);
+
+        match exported.exported_infos.get(&box21) {
+            Some(OpInfo::Ptr(rc)) => match &*rc.borrow() {
+                PtrInfo::Instance(iinfo) => assert_eq!(iinfo.known_class, Some(CLASS)),
+                other => panic!("expected InstancePtrInfo, got {other:?}"),
+            },
+            other => panic!("expected Ptr info for known_class, got {other:?}"),
+        }
+        assert!(
+            matches!(box21.get_forwarded(), majit_ir::forwarding::Forwarded::None),
+            "export_state must clean end_args after expanding infos"
+        );
+
+        let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
+        let _label_args = import_state(
+            &[OpRef::input_arg_ref(0)],
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
+        let imported = ctx2
+            .materialize_operand_at(OpRef::input_arg_ref(0))
+            .get_box_replacement(false);
+        assert_eq!(
+            ctx2.get_known_class(&imported),
+            Some(CLASS),
+            "setinfo_from_preamble must re-install known_class on the Phase-2 source"
+        );
+    }
+
+    #[test]
+    fn test_expand_info_reads_ptrinfo_from_operand_box() {
+        // unroll.py `_expand_info` calls `getinfo(arg)` on the box itself.
+        // A bound operand whose OpRef is not in the producer registry still
+        // exports its `_forwarded` PtrInfo.
+        use crate::optimizeopt::info::{OpInfo, PtrInfo};
+
+        let ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
+        let op = {
+            let mut o = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 0)]);
+            o.pos().set(OpRef::ref_op(99));
+            OpRc::new(o)
+        };
+        let box_ = Operand::from_bound_op(&op);
+        const CLASS: i64 = 0xBEEF;
+        ctx.set_ptr_info(&box_, PtrInfo::instance(None, Some(CLASS)));
+
+        let mut infos = indexmap::IndexMap::new();
+        OptUnroll::new().expand_info(OpRef::ref_op(99), &box_, &ctx, None, &mut infos);
+        match infos.get(&box_) {
+            Some(OpInfo::Ptr(rc)) => match &*rc.borrow() {
+                PtrInfo::Instance(iinfo) => assert_eq!(iinfo.known_class, Some(CLASS)),
+                other => panic!("expected InstancePtrInfo, got {other:?}"),
+            },
+            other => panic!("getinfo must read PtrInfo off the operand box, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_exported_state_reimports_virtual_field_infos() {
+        // unroll.py `_expand_info` + `_expand_infos_from_virtual` +
+        // `setinfo_from_preamble` virtual arm: the live virtual PtrInfo
+        // cell is stored in `exported_infos`, `all_items()` boxes get
+        // their own entries, then `_clean_optimization_info(end_args)`
+        // drops `_forwarded` on the virtual head. `import_state` does
+        // `op.set_forwarded(preamble_info)` and
+        // `setinfo_from_preamble_list(preamble_info.all_items(), ...)`.
+        use crate::optimizeopt::info::{AbstractVirtualPtrInfo, OpInfo, PtrInfo};
+        use crate::optimizeopt::intutils::IntBound;
+        use majit_ir::ptr_info::VirtualInfo;
+
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
+        ctx.materialize_operand_at(OpRef::ref_op(21));
+        ctx.materialize_operand_at(OpRef::int_op(22));
+        let obj = ctx
+            .get_box_replacement_operand_opt(OpRef::ref_op(21))
+            .expect("ref_op(21) bound to a box");
+        let field = ctx
+            .get_box_replacement_operand_opt(OpRef::int_op(22))
+            .expect("int_op(22) bound to a box");
+        ctx.setintbound(&field, &IntBound::bounded(0, 0));
+        let mut fields = majit_ir::ptr_info::VirtualFieldList::new();
+        fields.push((0, field.clone()));
+        ctx.set_ptr_info(
+            &obj,
+            PtrInfo::Virtual(VirtualInfo {
+                descr: majit_ir::descr::make_size_descr(16),
+                known_class: Some(0x1234),
+                ob_type_descr: None,
+                fields,
+                last_guard_pos: -1,
+                avpi: AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let exported = export_state(&[OpRef::ref_op(21)], &[], &mut optimizer, &mut ctx, None);
+
+        match exported.exported_infos.get(&obj) {
+            Some(info) => assert!(info.is_virtual(), "virtual head must be exported"),
+            other => panic!("expected virtual Ptr info, got {other:?}"),
+        }
+        match exported.exported_infos.get(&field) {
+            Some(OpInfo::IntBound(b)) => {
+                let b = b.borrow();
+                assert_eq!((b.lower, b.upper), (0, 0));
+            }
+            other => panic!("virtual field IntBound must be exported, got {other:?}"),
+        }
+        assert!(
+            matches!(obj.get_forwarded(), majit_ir::forwarding::Forwarded::None),
+            "export_state must clean end_args after expanding infos"
+        );
+        // Field boxes of a virtual are not in `end_args`. Production
+        // cleans them via `_clean_optimization_info(self._newoperations)`
+        // after export; simulate that so import cannot ride leftover
+        // `_forwarded`.
+        field.clear_forwarded();
+
+        let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
+        optimizer.imported_virtuals = super::build_imported_virtuals_from_state(&exported);
+        assert!(
+            !optimizer.imported_virtuals.is_empty(),
+            "VirtualState must export the virtual so install_imported_virtuals runs"
+        );
+        optimizer.imported_loop_state = Some(exported.clone());
+        let _label_args = import_state_full(
+            &[OpRef::input_arg_ref(0)],
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
+        let imported = ctx2
+            .materialize_operand_at(OpRef::input_arg_ref(0))
+            .get_box_replacement(false);
+        assert!(
+            ctx2.is_virtual(&imported),
+            "setinfo_from_preamble must re-install the virtual on the Phase-2 source"
+        );
+        let imported_field = imported
+            .ptr_info()
+            .and_then(|pi| pi.all_items().into_iter().next())
+            .map(|(_, e)| e.as_seen_operand())
+            .expect("virtual must still carry its field box");
+        let bound = ctx2.getintbound_handle(&imported_field).borrow().clone();
+        assert_eq!(
+            (bound.lower, bound.upper),
+            (0, 0),
+            "install_imported_virtuals must not replace the exported virtual \
+             cell; setinfo_from_preamble_list re-installs the field IntBound"
         );
     }
 
@@ -10525,6 +10662,347 @@ mod tests {
             bad.is_empty(),
             "peeled body must drop the invariant call, getfield and ovf, got {bad:?}"
         );
+    }
+
+    /// Analog of `test_optimizeopt.BaseTestOptimize.test_setgetfield_counter`:
+    /// a residual object is loop-carried and its field is incremented. The
+    /// preamble hoists `GETFIELD.intval` as a heap short box; the peeled JUMP
+    /// extra must be the body's stored field (`use_box` →
+    /// `inline_short_preamble`), not the LABEL's imported short box.
+    #[test]
+    fn peeled_setgetfield_counter_jump_extra_is_body_field() {
+        use majit_ir::descr::{SimpleFieldDescrSpec, make_simple_descr_group};
+        use majit_ir::{ArrayFlag, ConstMap, InputArg, Type, Value};
+
+        let obj = InputArg::from_type_rc(Type::Ref, 0);
+        let index = InputArg::from_type_rc(Type::Int, 1);
+        obj.set_value(Value::Ref(GcRef(0x1000)));
+        index.set_value(Value::Int(0));
+        let obj_arg = Operand::from_bound_inputarg(&obj);
+        let index_arg = Operand::from_bound_inputarg(&index);
+
+        let group = make_simple_descr_group(
+            1,
+            16,
+            1,
+            0x2000,
+            &[SimpleFieldDescrSpec {
+                is_class_word: Some(false),
+                index: 1,
+                field_key: "intval".to_string(),
+                name: "intval".to_string(),
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Int,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Signed,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        );
+        let field_descr = group.field_descrs[0].clone();
+
+        let getfield = Op::with_descr(
+            OpCode::GetfieldGcI,
+            std::slice::from_ref(&obj_arg),
+            field_descr.clone(),
+        );
+        let next_field = Op::new(
+            OpCode::IntAdd,
+            &[
+                rooted_resop_operand(Type::Int, 2),
+                Operand::const_from_value(Value::Int(1)),
+            ],
+        );
+        let setfield = Op::with_descr(
+            OpCode::SetfieldGc,
+            &[obj_arg.clone(), rooted_resop_operand(Type::Int, 3)],
+            field_descr,
+        );
+        let less_than = Op::new(
+            OpCode::IntLt,
+            &[
+                index_arg.clone(),
+                Operand::const_from_value(Value::Int(100)),
+            ],
+        );
+        let mut in_range = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 5)]);
+        in_range.set_rd_resume_position(0);
+        let next_index = Op::new(
+            OpCode::IntAdd,
+            &[index_arg, Operand::const_from_value(Value::Int(1))],
+        );
+        let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
+        future.set_rd_resume_position(1);
+        let jump = Op::new(OpCode::Jump, &[obj_arg, rooted_resop_operand(Type::Int, 7)]);
+        let mut ops = vec![
+            getfield, next_field, setfield, less_than, in_range, next_index, future, jump,
+        ];
+        assign_positions(&mut ops, 2);
+
+        let (ops, snapshots) = crate::optimizeopt::seed_empty_guard_snapshots(&ops);
+        let mut unroll = UnrollOptimizer::new();
+        unroll.trace_inputargs = OpRef::inputarg_refs(&[Type::Ref, Type::Int]);
+        unroll.trace_inputarg_boxes = vec![obj, index];
+        unroll.snapshot_boxes = snapshots;
+        let (optimized, _) =
+            unroll.optimize_trace_with_constants_and_inputs(&ops, &mut ConstMap::default(), 2);
+        drop(group);
+
+        let labels: Vec<usize> = optimized
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| (op.opcode == OpCode::Label).then_some(index))
+            .collect();
+        assert_eq!(
+            labels.len(),
+            2,
+            "expected preamble and peeled-body labels; ops={:?}",
+            optimized
+                .iter()
+                .map(|op| (
+                    op.opcode,
+                    op.pos().get(),
+                    op.args_slice()
+                        .iter()
+                        .map(|a| a.to_opref())
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>()
+        );
+        let body_label = &optimized[labels[1]];
+        let body = &optimized[labels[1] + 1..];
+        let jump = body.last().expect("body must end in Jump");
+        assert_eq!(jump.opcode, OpCode::Jump);
+        assert!(
+            body_label.num_args() > 2,
+            "heap short box must extend the body LABEL, got {:?}",
+            body_label
+                .args_slice()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            jump.num_args(),
+            body_label.num_args(),
+            "JUMP must match LABEL arity: label={:?} jump={:?}",
+            body_label
+                .args_slice()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            jump.args_slice()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>()
+        );
+
+        let stored = body
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::SetfieldGc)
+            .map(|op| op.arg(1).to_opref())
+            .expect("body must store the new field value");
+        let extra_start = 2;
+        let label_extras: Vec<OpRef> = (extra_start..body_label.num_args())
+            .map(|i| body_label.arg(i).to_opref())
+            .collect();
+        let jump_extras: Vec<OpRef> = (extra_start..jump.num_args())
+            .map(|i| jump.arg(i).to_opref())
+            .collect();
+        assert!(
+            !jump_extras.is_empty(),
+            "expected a heap short-box extra on JUMP, label={:?} jump={:?}",
+            label_extras,
+            jump_extras
+        );
+        assert_ne!(
+            jump_extras, label_extras,
+            "JUMP extra must not reuse the LABEL's imported short box; label={:?} jump={:?}",
+            label_extras, jump_extras
+        );
+        assert!(
+            jump_extras.contains(&stored),
+            "JUMP extra must be the body's new field value {stored:?}, got {jump_extras:?}; body={:?}",
+            body.iter()
+                .map(|op| (op.opcode, op.pos().get()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `a, b = b, new(a.intval + b.intval)`: the dropped residual's preamble
+    /// GETFIELD must not leak onto the peeled JUMP extra. LABEL extras come
+    /// from `used_boxes` and JUMP extras from `inline_short_preamble`
+    /// (`unroll.py UnrollableOptimizer.force_op_from_preamble` /
+    /// `ShortPreambleBuilder.add_preamble_op`).
+    #[test]
+    fn peeled_swap_new_object_jump_extra_is_body_field() {
+        use majit_ir::descr::{DescrRef, SimpleFieldDescrSpec, make_simple_descr_group};
+        use majit_ir::{ArrayFlag, ConstMap, InputArg, Type, Value};
+
+        let p1 = InputArg::from_type_rc(Type::Ref, 0);
+        let p2 = InputArg::from_type_rc(Type::Ref, 1);
+        p1.set_value(Value::Ref(GcRef(0x1000)));
+        p2.set_value(Value::Ref(GcRef(0x2000)));
+        let p1_arg = Operand::from_bound_inputarg(&p1);
+        let p2_arg = Operand::from_bound_inputarg(&p2);
+
+        let group = make_simple_descr_group(
+            1,
+            16,
+            1,
+            0x2000,
+            &[SimpleFieldDescrSpec {
+                is_class_word: Some(false),
+                index: 1,
+                field_key: "intval".to_string(),
+                name: "intval".to_string(),
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Int,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Signed,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        );
+        let field_descr = group.field_descrs[0].clone();
+        let size_descr: DescrRef = group.size_descr.clone();
+
+        let get_p1 = Op::with_descr(
+            OpCode::GetfieldGcI,
+            std::slice::from_ref(&p1_arg),
+            field_descr.clone(),
+        );
+        let get_p2 = Op::with_descr(
+            OpCode::GetfieldGcI,
+            std::slice::from_ref(&p2_arg),
+            field_descr.clone(),
+        );
+        let sum = Op::new(
+            OpCode::IntAdd,
+            &[
+                rooted_resop_operand(Type::Int, 2),
+                rooted_resop_operand(Type::Int, 3),
+            ],
+        );
+        let new_obj = Op::with_descr(OpCode::NewWithVtable, &[], size_descr);
+        let setfield = Op::with_descr(
+            OpCode::SetfieldGc,
+            &[
+                rooted_resop_operand(Type::Ref, 5),
+                rooted_resop_operand(Type::Int, 4),
+            ],
+            field_descr,
+        );
+        let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
+        future.set_rd_resume_position(0);
+        let jump = Op::new(OpCode::Jump, &[p2_arg, rooted_resop_operand(Type::Ref, 5)]);
+        let mut ops = vec![get_p1, get_p2, sum, new_obj, setfield, future, jump];
+        assign_positions(&mut ops, 2);
+
+        let (ops, snapshots) = crate::optimizeopt::seed_empty_guard_snapshots(&ops);
+        let mut unroll = UnrollOptimizer::new();
+        unroll.trace_inputargs = OpRef::inputarg_refs(&[Type::Ref, Type::Ref]);
+        unroll.trace_inputarg_boxes = vec![p1, p2];
+        unroll.snapshot_boxes = snapshots;
+        let (optimized, _) =
+            unroll.optimize_trace_with_constants_and_inputs(&ops, &mut ConstMap::default(), 2);
+        drop(group);
+
+        let dump: Vec<_> = optimized
+            .iter()
+            .map(|op| {
+                (
+                    op.opcode,
+                    op.pos().get(),
+                    op.args_slice()
+                        .iter()
+                        .map(|a| a.to_opref())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let labels: Vec<usize> = optimized
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| (op.opcode == OpCode::Label).then_some(index))
+            .collect();
+        assert_eq!(
+            labels.len(),
+            2,
+            "expected preamble and peeled-body labels; ops={dump:?}"
+        );
+        let body_label = &optimized[labels[1]];
+        let body = &optimized[labels[1] + 1..];
+        let jump = body.last().expect("body must end in Jump");
+        assert_eq!(jump.opcode, OpCode::Jump);
+        assert_eq!(
+            jump.num_args(),
+            body_label.num_args(),
+            "JUMP must match LABEL arity: label={:?} jump={:?}; ops={dump:?}",
+            body_label
+                .args_slice()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            jump.args_slice()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+        );
+
+        let stored = body
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::SetfieldGc)
+            .map(|op| op.arg(1).to_opref());
+        let new_obj_pos = body
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::NewWithVtable)
+            .map(|op| op.pos().get());
+        let jump_args: Vec<OpRef> = jump.args_slice().iter().map(|a| a.to_opref()).collect();
+        let label_args: Vec<OpRef> = body_label
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        if let Some(new_obj_pos) = new_obj_pos {
+            assert!(
+                jump_args.contains(&new_obj_pos),
+                "JUMP must carry the body's new object {new_obj_pos:?}, got {jump_args:?}; ops={dump:?}"
+            );
+        }
+        let extra_start = 2;
+        let body_has_getfield = body.iter().any(|op| {
+            matches!(
+                op.opcode,
+                OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF
+            )
+        });
+        if body_label.num_args() > extra_start {
+            let label_extras: Vec<OpRef> = label_args[extra_start..].to_vec();
+            let jump_extras: Vec<OpRef> = jump_args[extra_start..].to_vec();
+            assert_ne!(
+                jump_extras, label_extras,
+                "JUMP extra must not reuse the LABEL's imported short box; label={label_extras:?} jump={jump_extras:?}; ops={dump:?}"
+            );
+            if let Some(stored) = stored {
+                assert!(
+                    jump_extras.contains(&stored) || jump_args.contains(&stored),
+                    "body field {stored:?} must close on JUMP, extras={jump_extras:?} args={jump_args:?}; ops={dump:?}"
+                );
+            }
+        } else {
+            assert!(
+                body_has_getfield,
+                "without a short-box extra the body must re-read the field; ops={dump:?}"
+            );
+        }
     }
 
     /// `PureOp.add_op_to_short` rewrites a demoted CALL to `CALL_PURE` before

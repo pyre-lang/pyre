@@ -1918,9 +1918,7 @@ impl IntegerAnalysisLogger {
             if arg.is_constant() {
                 continue;
             }
-            let Some(arg_box) = ctx.get_box_replacement_operand_opt(arg.to_opref()) else {
-                continue;
-            };
+            let arg_box = arg.get_box_replacement(false);
             if arg_box.is_constant() {
                 continue;
             }

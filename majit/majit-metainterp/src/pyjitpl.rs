@@ -1702,6 +1702,10 @@ fn translate_trace_iter_box_map(
 ) -> SnapshotBoxes {
     for boxes in box_map.iter_mut().flatten() {
         for boxref in boxes.iter_mut() {
+            // Look up `_cache` by the recording position, then rewrite the
+            // OpRef. `attach_iter_cache` must run first: after the map the
+            // slot is in the fresh-iterator namespace.
+            boxref.attach_iter_cache(cache);
             *boxref = boxref.map_opref(|opref| translate_trace_iter_opref(opref, cache));
         }
     }
@@ -2858,11 +2862,6 @@ pub struct MetaInterp<M: Clone> {
     /// in-flight compile. `walk_compile_snapshot_refs` traces them.
     /// [`CompileSnapshotRootsGuard`] clears the lists on every exit.
     compile_live_op_roots: crate::optimizeopt::CompileLiveOpRoots,
-    /// Reused across sequential `compile_bridge` calls so the pass boxes
-    /// and `ResumeDataLoopMemo` scratch stay allocated. RPython
-    /// `BridgeCompileData.optimize` constructs a new `UnrollOptimizer`
-    /// per compile; nursery allocation is cheap there.
-    cached_optimizer: Option<crate::optimizeopt::optimizer::Optimizer>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
@@ -4608,7 +4607,6 @@ impl<M: Clone> MetaInterp<M> {
             compile_vable_index: None,
             compile_vable_root: GcRef::NULL,
             compile_live_op_roots: crate::optimizeopt::CompileLiveOpRoots::default(),
-            cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
             pending_frontend_boxes: None,
@@ -6290,9 +6288,9 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `optimizer.py Optimizer.__init__`: every Optimizer the metainterp
-    /// mints — `make_optimizer`, a recycled one, SimpleCompile, and the
-    /// unroll-cancel retry — gets `metainterp_sd.cpu` plus the host
-    /// resolvers `ConstPtrInfo.getstrlen1` / vstring read off that cpu.
+    /// mints — `make_optimizer`, SimpleCompile, and the unroll-cancel
+    /// retry — gets `metainterp_sd.cpu` plus the host resolvers
+    /// `ConstPtrInfo.getstrlen1` / vstring read off that cpu.
     /// `default_pipeline()` leaves those slots empty.
     fn pin_optimizer_host_state(&self, opt: &mut Optimizer) {
         opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
@@ -6331,39 +6329,6 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::build_opt_chain(&enable_opts, self.current_virtualizable_optimizer_config());
         self.pin_optimizer_host_state(&mut opt);
         opt
-    }
-
-    fn take_optimizer(&mut self) -> Optimizer {
-        match self.cached_optimizer.take() {
-            Some(mut opt) => {
-                let want_vable = self
-                    .current_virtualizable_optimizer_config()
-                    .map(|config| config.static_field_offsets.len() as i64)
-                    .unwrap_or(-1);
-                let jd = self.active_jitdriver_sd.unwrap_or(0);
-                let enable_opts = self
-                    .warm_state_ref_for_driver(jd)
-                    .expect("make_enter_function has not run for the active jitdriver_sd")
-                    .get_enable_opts()
-                    .to_vec();
-                let expected = Optimizer::build_opt_chain(
-                    &enable_opts,
-                    self.current_virtualizable_optimizer_config(),
-                )
-                .pass_names();
-                if opt.minimum_virtualizable_size != want_vable || opt.pass_names() != expected {
-                    return self.make_optimizer();
-                }
-                opt.recycle_for_next_compile();
-                self.pin_optimizer_host_state(&mut opt);
-                opt
-            }
-            None => self.make_optimizer(),
-        }
-    }
-
-    fn return_optimizer(&mut self, optimizer: Optimizer) {
-        self.cached_optimizer = Some(optimizer);
     }
 
     /// Install the host-runtime `getstrlen1` resolver. The closure must be
@@ -9507,10 +9472,18 @@ impl<M: Clone> MetaInterp<M> {
                         // are still the original trace.
                         let retry_ops: Vec<majit_ir::OpRc> =
                             preamble_data.base.operations().to_vec();
-                        simple_opt.byte_bridge_resume =
-                            snapshot_recorder.as_ref().map(|recorder| {
-                                recorder_self_feed(recorder, &trace.inputargs, &retry_ops)
-                            });
+                        let resume = snapshot_recorder.as_ref().map(|recorder| {
+                            recorder_self_feed(recorder, &trace.inputargs, &retry_ops)
+                        });
+                        if let Some(ref feed) = resume {
+                            crate::optimizeopt::attach_resume_snapshot_caches(
+                                &mut simple_opt.snapshot_boxes,
+                                &mut simple_opt.snapshot_vable_boxes,
+                                &mut simple_opt.snapshot_vref_boxes,
+                                feed.unique_cache(),
+                            );
+                        }
+                        simple_opt.byte_bridge_resume = resume;
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.run_optimize_from_inputs(
@@ -12509,9 +12482,18 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
         optimizer.trace_inputarg_boxes = trace.inputargs.clone();
-        optimizer.byte_bridge_resume = snapshot_recorder
+        let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
+        if let Some(ref feed) = resume {
+            crate::optimizeopt::attach_resume_snapshot_caches(
+                &mut optimizer.snapshot_boxes,
+                &mut optimizer.snapshot_vable_boxes,
+                &mut optimizer.snapshot_vref_boxes,
+                feed.unique_cache(),
+            );
+        }
+        optimizer.byte_bridge_resume = resume;
 
         // Dumped before the call, not after: `Optimizer::propagate_from_pass_range`
         // resolves each argument in place on the op it is handed
@@ -13065,9 +13047,18 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
         optimizer.trace_inputarg_boxes = trace.inputargs.clone();
-        optimizer.byte_bridge_resume = snapshot_recorder
+        let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
+        if let Some(ref feed) = resume {
+            crate::optimizeopt::attach_resume_snapshot_caches(
+                &mut optimizer.snapshot_boxes,
+                &mut optimizer.snapshot_vable_boxes,
+                &mut optimizer.snapshot_vref_boxes,
+                feed.unique_cache(),
+            );
+        }
+        optimizer.byte_bridge_resume = resume;
 
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
         let optimize_start = Instant::now();
@@ -17152,8 +17143,8 @@ impl<M: Clone> MetaInterp<M> {
         // `prepared_inputargs`, matching `trace.get_iter().inputargs`.
         let bridge_trace_data =
             TreeLoop::from_oprc(bridge_inputargs.to_vec(), prepared_ops, Vec::new());
-        // `enable_opts` must be owned before `take_optimizer` / compiled_loops
-        // borrows. CompileData.resumestorage is the same payload as
+        // `enable_opts` must be owned before compiled_loops borrows.
+        // CompileData.resumestorage is the same payload as
         // `pending_bridge_rd` (compile.py BridgeCompileData.resumestorage);
         // the flattened optimize_* call consumes that value, so the
         // CompileData constructor below cannot also borrow it.
@@ -17172,7 +17163,7 @@ impl<M: Clone> MetaInterp<M> {
         // optimize_bridge's generate_guards reads them in the re-minted space.
         let bridge_runtime_boxes = prepared_runtime_boxes.as_slice();
 
-        let mut optimizer = self.take_optimizer();
+        let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
@@ -17319,7 +17310,6 @@ impl<M: Clone> MetaInterp<M> {
                         inv.0, green_key, fail_index
                     );
                 }
-                self.return_optimizer(optimizer);
                 return false;
             }
         };
@@ -17378,7 +17368,6 @@ impl<M: Clone> MetaInterp<M> {
                 self.retrace_needed(green_key, optimized_ops.clone(), renamed_inputargs, es);
             }
             self.retrace_after_bridge = true;
-            self.return_optimizer(optimizer);
             return false;
         }
 
@@ -17576,7 +17565,6 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
                     hook(green_key, fail_index, num_optimized_ops);
                 }
-                self.return_optimizer(optimizer);
                 true
             }
             Err(e) => {
@@ -17595,7 +17583,6 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
-                self.return_optimizer(optimizer);
                 false
             }
         }

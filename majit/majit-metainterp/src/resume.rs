@@ -274,9 +274,11 @@ pub struct Snapshot {
 /// RPython carries `box.type` on the Box object itself. Pyre's typed
 /// `OpRef` enum (resoperation.py InputArgInt/727/739 InputArg{Int,Float,Ref},
 /// resoperation.py IntOp *Op mixin variants) carries the same type
-/// tag intrinsically. There is no parallel type word: a second field
-/// made a two-box snapshot 48 B.
-#[derive(Debug, Clone, Copy)]
+/// tag intrinsically. `cached` is the box object
+/// `opencoder.py SnapshotIterator._untag` / `TraceIterator._cache` holds
+/// for the slot; resume numbering walks that instead of resolving the
+/// OpRef through a producer map.
+#[derive(Debug, Clone)]
 pub struct SnapshotBox {
     /// The trace-position ref this snapshot slot references. A
     /// `Const{Ptr}` slot carries its gcref inline (history.py
@@ -284,15 +286,26 @@ pub struct SnapshotBox {
     /// (`walk_compile_snapshot_refs`) forwards it in place through a
     /// collected `*mut OpRef` slot address.
     pub opref: majit_ir::OpRef,
+    /// Box from `TraceIterator._cache` / `unique_cache` for this slot.
+    /// `None` when the iterator cache did not supply one (tests that
+    /// seed OpRefs only); `_number_one` then falls back to the
+    /// positional resolver.
+    pub cached: Option<Operand>,
 }
 
 impl SnapshotBox {
     pub fn untyped(opref: majit_ir::OpRef) -> Self {
-        SnapshotBox { opref }
+        SnapshotBox {
+            opref,
+            cached: None,
+        }
     }
 
     pub fn typed(opref: majit_ir::OpRef, _tp: majit_ir::Type) -> Self {
-        SnapshotBox { opref }
+        SnapshotBox {
+            opref,
+            cached: None,
+        }
     }
 
     /// The trace-position `OpRef` view of this slot.
@@ -308,6 +321,17 @@ impl SnapshotBox {
     pub fn map_opref(&self, f: impl FnOnce(majit_ir::OpRef) -> majit_ir::OpRef) -> Self {
         SnapshotBox {
             opref: f(self.opref),
+            cached: self.cached.clone(),
+        }
+    }
+
+    /// Bind the iterator-cache box for `self.opref` when this slot has
+    /// none yet. The cache is keyed by the recording / pre-remap
+    /// position (`opencoder.py TraceIterator._cache`); call this before
+    /// `map_opref` rewrites the OpRef into a later namespace.
+    pub fn attach_iter_cache(&mut self, cache: &[Option<Operand>]) {
+        if self.cached.is_none() && !self.opref.is_none() && !self.opref.is_constant() {
+            self.cached = cache.get(self.opref.raw() as usize).cloned().flatten();
         }
     }
 }
@@ -321,11 +345,12 @@ impl From<majit_ir::OpRef> for SnapshotBox {
 #[cfg(test)]
 mod snapshot_box_size {
     #[test]
-    fn snapshot_box_is_one_opref() {
-        assert_eq!(
-            std::mem::size_of::<super::SnapshotBox>(),
-            std::mem::size_of::<majit_ir::OpRef>(),
-            "SnapshotBox must stay one OpRef; box.type lives on the variant"
+    fn snapshot_box_carries_opref_and_cached_operand() {
+        assert!(
+            std::mem::size_of::<super::SnapshotBox>()
+                >= std::mem::size_of::<majit_ir::OpRef>()
+                    + std::mem::size_of::<Option<majit_ir::operand::Operand>>(),
+            "SnapshotBox carries OpRef next to the iterator-cache Operand"
         );
     }
 }
@@ -2978,23 +3003,6 @@ impl ResumeDataLoopMemo {
         }
     }
 
-    /// Drop per-compile caches (`resume.py ResumeDataLoopMemo.__init__`)
-    /// but keep the writer / livebox scratch capacities.
-    pub fn recycle_for_next_compile(&mut self) {
-        self.consts = majit_ir::SharedConstPool::new(Vec::new());
-        self.large_ints.clear();
-        self.refs.clear();
-        self.cached_boxes.clear();
-        self.cached_virtuals.clear();
-        self.nvirtuals = 0;
-        self.nvholes = 0;
-        self.nvreused = 0;
-        self.livebox_map_scratch.clear();
-        self.new_livebox_map_scratch.clear();
-        self.virtual_fields_scratch.clear();
-        self.virtual_worklist_scratch.clear();
-    }
-
     fn take_livebox_map(&mut self) -> LiveboxMap {
         let mut map = std::mem::take(&mut self.livebox_map_scratch);
         map.clear();
@@ -3716,7 +3724,12 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
         for snapshot_box in boxes {
-            self._number_one(*snapshot_box, None, numb_state, env)?;
+            self._number_one(
+                snapshot_box.clone(),
+                snapshot_box.cached.as_ref(),
+                numb_state,
+                env,
+            )?;
         }
         Ok(())
     }
@@ -3750,7 +3763,8 @@ impl ResumeDataLoopMemo {
             numb_state.append_short(self.getconst(bits, raw_opref.ty().unwrap())?);
             return Ok(());
         }
-        let b = match cached {
+        let held = cached.or(snapshot_box.cached.as_ref());
+        let b = match held {
             Some(cached) => {
                 let b = cached.get_box_replacement(false);
                 // An unregistered position mints a fresh box on every
@@ -3970,13 +3984,13 @@ impl ResumeDataLoopMemo {
         self.number_sections(
             vable_array.len() as i64,
             || {
-                let snap_box = vable_array[vable_i];
+                let snap_box = vable_array[vable_i].clone();
                 vable_i += 1;
                 (snap_box, None)
             },
             vref_array.len() as i64,
             || {
-                let snap_box = vref_array[vref_i];
+                let snap_box = vref_array[vref_i].clone();
                 vref_i += 1;
                 (snap_box, None)
             },
@@ -3986,7 +4000,7 @@ impl ResumeDataLoopMemo {
                     frame_i += 1;
                     box_i = 0;
                 }
-                let snap_box = frames[frame_i].2[box_i];
+                let snap_box = frames[frame_i].2[box_i].clone();
                 box_i += 1;
                 (snap_box, None)
             },

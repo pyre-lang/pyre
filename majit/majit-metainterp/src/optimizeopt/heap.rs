@@ -3348,9 +3348,9 @@ impl OptHeap {
         // Allocated objects are always non-null.
         if opcode.is_malloc() {
             self.seen_allocation.insert(op.pos().get().raw() as usize);
-            if let Some(new_box) = ctx.get_box_replacement_operand_opt(op.pos().get()) {
-                self.unescaped.insert(new_box);
-            }
+            // heapcache.py HeapCache.new: mark the malloc box unescaped.
+            let new_box = Operand::from_bound_op(op_rc).get_box_replacement(false);
+            self.unescaped.insert(new_box);
             return OptimizationResult::PassOn;
         }
 
@@ -3468,9 +3468,9 @@ impl OptHeap {
             // ── heap.py: Allocation tracking ──
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
                 self.seen_allocation.insert(op.pos().get().raw() as usize);
-                if let Some(new_box) = ctx.get_box_replacement_operand_opt(op.pos().get()) {
-                    self.unescaped.insert(new_box);
-                }
+                // heapcache.py HeapCache.new: mark the malloc box unescaped.
+                let new_box = Operand::from_bound_op(op_rc).get_box_replacement(false);
+                self.unescaped.insert(new_box);
                 OptimizationResult::PassOn
             }
 
