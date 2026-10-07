@@ -1075,7 +1075,7 @@ pub trait JitCodeRuntime {
     /// `get_assembler_token(greenargs)`).  The runtime hashes the greens
     /// to that key and resolves the production `Arc<JitCellToken>` — used
     /// both for the recorded descr's token identity (compile.py:187 via
-    /// `call_assembler_int_arc_typed`) and to drive the concrete loop
+    /// `call_assembler_int_arc_typed_with_value`) and to drive the concrete loop
     /// through [`Self::execute_recursive_assembler_int`].  The `u64` is the
     /// resolved green key (compile.py:186 `rd_loop_token`), returned so the
     /// concrete leg keys the same loop the descr names.  Returns `None` for
@@ -1901,6 +1901,31 @@ where
         resume_pc: usize,
         after_residual_call: bool,
     ) -> OpRef {
+        self.record_state_guard_with_value(
+            ctx,
+            sym,
+            opcode,
+            args,
+            resume_pc,
+            after_residual_call,
+            None,
+        )
+    }
+
+    /// Sibling of [`Self::record_state_guard`] that attaches `value` at
+    /// construction (`history.py History._make_op`).
+    /// `pyjitpl.py MetaInterp.generate_guard(GUARD_EXCEPTION)` records a
+    /// `RefFrontendOp` with the exception value.
+    fn record_state_guard_with_value(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        opcode: OpCode,
+        args: &[OpRef],
+        resume_pc: usize,
+        after_residual_call: bool,
+        value: Option<Value>,
+    ) -> OpRef {
         // pyjitpl.py generate_guard parity:
         //     if isinstance(box, Const):    # no need for a guard
         //         return
@@ -1920,7 +1945,7 @@ where
         // list (or type list) to decide whether the frame snapshot exists.
         // `resume.py ResumeDataVirtualAdder.finish` derives the final failargs
         // from that snapshot after optimization.
-        let guard_op = ctx.record_guard(opcode, args, 0);
+        let guard_op = ctx.record_guard_with_value(opcode, args, 0, value);
         self.publish_last_guard_resume_snapshot(
             ctx,
             sym,
@@ -3139,13 +3164,14 @@ where
         let class_is_const = self.class_of_last_exc_is_const;
         let typeptr = self.read_typeptr_from_exception(exc);
         let exc_class_box = ctx.const_int(typeptr);
-        let guard_op = self.record_state_guard(
+        let guard_op = self.record_state_guard_with_value(
             ctx,
             sym,
             OpCode::GuardException,
             &[exc_class_box],
             resume_pc,
             /* after_residual_call */ true,
+            Some(Value::Ref(majit_ir::GcRef(exc as usize))),
         );
         self.last_exception_box = Some(if class_is_const {
             ctx.const_ref(exc)
@@ -3189,13 +3215,14 @@ where
         let class_is_const = self.class_of_last_exc_is_const;
         let typeptr = self.read_typeptr_from_exception(exc);
         let exc_class_box = ctx.const_int(typeptr);
-        let guard_op = self.record_state_guard(
+        let guard_op = self.record_state_guard_with_value(
             ctx,
             sym,
             OpCode::GuardException,
             &[exc_class_box],
             resume_pc,
             /* after_residual_call */ true,
+            Some(Value::Ref(majit_ir::GcRef(exc as usize))),
         );
         self.last_exception_box = Some(if class_is_const {
             ctx.const_ref(exc)
@@ -3674,19 +3701,17 @@ where
                     Some(value),
                 );
                 portal_frame.int_regs[dst] = Some(value);
-                let _ = ctx.try_set_opref_concrete(value, Value::Int(concrete));
+                debug_assert_box_holds(ctx, value, Value::Int(concrete));
             }
             for (dst, &src) in greens_r.iter().chain(reds_r.iter()).enumerate() {
                 let (value, concrete) = self.read_ref_reg(ctx, src);
                 portal_frame.ref_regs[dst] = Some(value);
-                let _ = ctx
-                    .try_set_opref_concrete(value, Value::Ref(majit_ir::GcRef(concrete as usize)));
+                debug_assert_box_holds(ctx, value, Value::Ref(majit_ir::GcRef(concrete as usize)));
             }
             for (dst, &src) in greens_f.iter().chain(reds_f.iter()).enumerate() {
                 let (value, concrete) = self.read_float_reg(ctx, src);
                 portal_frame.float_regs[dst] = Some(value);
-                let _ = ctx
-                    .try_set_opref_concrete(value, Value::Float(f64::from_bits(concrete as u64)));
+                debug_assert_box_holds(ctx, value, Value::Float(f64::from_bits(concrete as u64)));
             }
             match result_kind {
                 Some(JitArgKind::Int) => portal_frame.return_i = result_dst,
@@ -3900,7 +3925,9 @@ where
                         None => return TraceAction::Abort,
                     };
                 ctx.vrefs_after_residual_call();
-                let traced = ctx.call_assembler_int_arc_typed(token_arc, &args, &arg_types);
+                let traced = ctx.call_assembler_int_arc_typed_with_value(
+                    token_arc, &args, &arg_types, concrete,
+                );
                 self.set_int_reg(
                     ctx,
                     result_dst.expect("int result kind requires a destination"),
@@ -3915,7 +3942,9 @@ where
                         None => return TraceAction::Abort,
                     };
                 ctx.vrefs_after_residual_call();
-                let traced = ctx.call_assembler_ref_arc_typed(token_arc, &args, &arg_types);
+                let traced = ctx.call_assembler_ref_arc_typed_with_value(
+                    token_arc, &args, &arg_types, concrete,
+                );
                 self.set_ref_reg(
                     ctx,
                     result_dst.expect("ref result kind requires a destination"),
@@ -3930,7 +3959,9 @@ where
                         None => return TraceAction::Abort,
                     };
                 ctx.vrefs_after_residual_call();
-                let traced = ctx.call_assembler_float_arc_typed(token_arc, &args, &arg_types);
+                let traced = ctx.call_assembler_float_arc_typed_with_value(
+                    token_arc, &args, &arg_types, concrete,
+                );
                 self.set_float_reg(
                     ctx,
                     result_dst.expect("float result kind requires a destination"),
@@ -4355,7 +4386,7 @@ where
         majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, reg, opref);
         frame.int_regs[reg] = opref;
         if let (Some(op), Some(v)) = (opref, value) {
-            let _ = ctx.try_set_opref_concrete(op, Value::Int(v));
+            debug_assert_box_holds(ctx, op, Value::Int(v));
         }
     }
 
@@ -4374,7 +4405,7 @@ where
         majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, slot, opref);
         frame.int_regs[slot] = opref;
         if let (Some(op), Some(v)) = (opref, value) {
-            let _ = ctx.try_set_opref_concrete(op, Value::Int(v));
+            debug_assert_box_holds(ctx, op, Value::Int(v));
         }
     }
 
@@ -4388,7 +4419,7 @@ where
         let frame = self.frames.current_mut();
         frame.ref_regs[slot] = opref;
         if let (Some(op), Some(v)) = (opref, value) {
-            let _ = ctx.try_set_opref_concrete(op, Value::Ref(majit_ir::GcRef(v as usize)));
+            debug_assert_box_holds(ctx, op, Value::Ref(majit_ir::GcRef(v as usize)));
         }
     }
 
@@ -4402,7 +4433,7 @@ where
         let frame = self.frames.current_mut();
         frame.float_regs[slot] = opref;
         if let (Some(op), Some(v)) = (opref, value) {
-            let _ = ctx.try_set_opref_concrete(op, Value::Float(f64::from_bits(v as u64)));
+            debug_assert_box_holds(ctx, op, Value::Float(f64::from_bits(v as u64)));
         }
     }
 
@@ -4456,7 +4487,7 @@ where
         let frame = self.frames.current_mut();
         frame.ref_regs[reg] = opref;
         if let (Some(op), Some(v)) = (opref, value) {
-            let _ = ctx.try_set_opref_concrete(op, Value::Ref(majit_ir::GcRef(v as usize)));
+            debug_assert_box_holds(ctx, op, Value::Ref(majit_ir::GcRef(v as usize)));
         }
     }
 
@@ -4480,7 +4511,7 @@ where
         let frame = self.frames.current_mut();
         frame.float_regs[reg] = opref;
         if let (Some(op), Some(v)) = (opref, value) {
-            let _ = ctx.try_set_opref_concrete(op, Value::Float(f64::from_bits(v as u64)));
+            debug_assert_box_holds(ctx, op, Value::Float(f64::from_bits(v as u64)));
         }
     }
 
@@ -5413,7 +5444,9 @@ where
                 majit_ir::Type::Float => Value::Float(f64::from_bits(reg.value as u64)),
                 _ => Value::Int(reg.value),
             };
-            let _ = ctx.try_set_opref_concrete(reg.opref, stamped);
+            // `resume.py consume_boxes` stores the box; the value was
+            // attached at `load_box_from_cpu` (`GuardResumeFrame.regs` producer).
+            debug_assert_box_holds(ctx, reg.opref, stamped);
         }
         // The walker reads from `code_cursor`; `pc` is what a snapshot taken
         // inside this frame reports. `setup_resume_at_op` is both.
@@ -5517,6 +5550,30 @@ where
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(header_pc);
     machine.run_to_end(ctx, sym, runtime)
+}
+
+/// `history.py *FrontendOp` / `resoperation.py InputArgInt(intval)`:
+/// a non-constant box is born with its value. Register writes only store
+/// the box (`pyjitpl.py MIFrame.make_result_of_lastop` / `setup_call`).
+///
+/// `None` from [`TraceCtx::lookup_opref_concrete`] is the documented
+/// residual-call / guard / unstamped family (plus test fixtures that
+/// mint OpRefs without `record_op*`): skip the check, matching that
+/// reader's contract. A present value that disagrees is a producer bug.
+fn debug_assert_box_holds(ctx: &TraceCtx, opref: OpRef, expected: Value) {
+    let _ = (ctx, opref, expected);
+    #[cfg(debug_assertions)]
+    {
+        if opref.is_constant() {
+            return;
+        }
+        if let Some(got) = ctx.lookup_opref_concrete(opref) {
+            debug_assert_eq!(
+                got, expected,
+                "box {opref:?} already holds {got:?}, register write supplied {expected:?}"
+            );
+        }
+    }
 }
 
 /// Write one merge-point argument into the register its bank owns.
@@ -5645,7 +5702,7 @@ pub fn setup_frame_from_merge_point(
                 JitArgKind::Ref => Value::Ref(majit_ir::GcRef(value as usize)),
                 JitArgKind::Float => Value::Float(f64::from_bits(value as u64)),
             };
-            let _ = ctx.try_set_opref_concrete(opref, concrete);
+            debug_assert_box_holds(ctx, opref, concrete);
         }
     }
     // The walker reads from `code_cursor`; `pc` is only the portal anchor.
@@ -6641,11 +6698,13 @@ mod tests {
             .jit_merge_point_offset
             .expect("builder recorded the marker offset");
 
-        let recorder = crate::recorder::Trace::new();
+        let mut recorder = crate::recorder::Trace::new();
+        let red_i = recorder.record_input_arg_with_value(Type::Int, Some(Value::Int(60)));
+        let red_r =
+            recorder.record_input_arg_with_value(Type::Ref, Some(Value::Ref(majit_ir::GcRef(40))));
+        let red_f = recorder
+            .record_input_arg_with_value(Type::Float, Some(Value::Float(f64::from_bits(50u64))));
         let mut ctx = TraceCtx::new(recorder, 0, Arc::new(crate::MetaInterpStaticData::new()));
-        let red_i = OpRef::input_arg_typed(0, Type::Int);
-        let red_r = OpRef::input_arg_typed(1, Type::Ref);
-        let red_f = OpRef::input_arg_typed(2, Type::Float);
         let mut frames = MIFrameStack::empty();
         let frame = setup_frame_from_merge_point(
             &mut ctx,

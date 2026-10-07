@@ -3090,10 +3090,17 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // CALL_ASSEMBLER, then emits GUARD_NOT_FORCED.  In particular,
     // VIRTUAL_REF_FINISH must precede the call so the call and guard remain
     // adjacent and the backend can arm the JIT frame's force descriptor.
+    let ca_value = match exec {
+        ResidualExecOutcome::Executed(Ok(result)) => {
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(result as usize)))
+        }
+        _ => None,
+    };
     let ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
         token,
         &[callee_frame, ec],
         &[Type::Ref, Type::Ref],
+        ca_value,
     );
     if let ResidualExecOutcome::Executed(Ok(result)) = exec {
         ctx.trace_ctx.set_opref_concrete(
@@ -3662,11 +3669,18 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // `do_residual_call` step 5 needs the CALL_MAY_FORCE extra_info after
     // `record_op_with_descr` takes `portal_descr`.
     let ei = portal_view.get_extra_info().clone();
+    let ca_value = match exec {
+        ResidualExecOutcome::Executed(Ok(result)) => {
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(result as usize)))
+        }
+        _ => None,
+    };
     let ca_result = if let Some(token) = token {
         ctx.trace_ctx.call_assembler_red_only_ref_arc(
             token,
             &[callee_frame, callee_ec],
             &[Type::Ref, Type::Ref],
+            ca_value,
         )
     } else {
         ctx.trace_ctx
@@ -15868,6 +15882,11 @@ fn descend_generatorentry<Sym: WalkSym>(
         token,
         &[iter_op, none_op],
         &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        if concrete != 0 {
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)))
+        } else {
+            None
+        },
     );
     // `execute_and_record` (`pyjitpl.py`) stamps the executed result on the
     // box before `opimpl_goto_if_not` reads `box.getint()`. `jit_next`

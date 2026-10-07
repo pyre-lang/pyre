@@ -6401,12 +6401,30 @@ impl<S: JitState> JitDriver<S> {
                                 return;
                             }
                             let (opref, value) = match &values[cursor] {
-                                RebuiltValue::Box(n, kind) => crate::jit_state::bridge_decode_red(
-                                    *n,
-                                    *kind,
-                                    raw_values,
-                                    &fail_types,
-                                ),
+                                RebuiltValue::Box(n, kind) => {
+                                    let (_opref, value) = crate::jit_state::bridge_decode_red(
+                                        *n,
+                                        *kind,
+                                        raw_values,
+                                        &fail_types,
+                                    );
+                                    // resume.py ResumeDataBoxReader.load_box_from_cpu:
+                                    // IntFrontendOp(num, cpu.get_int_value(deadframe, num)).
+                                    // with_input_layout reserved the failarg coordinate
+                                    // (`opencoder.py Trace.__init__(max_num_inputargs)`);
+                                    // the box is born here with the deadframe value.
+                                    let typed = match *kind {
+                                        majit_ir::Type::Ref => {
+                                            majit_ir::Value::Ref(majit_ir::GcRef(value as usize))
+                                        }
+                                        majit_ir::Type::Float => {
+                                            majit_ir::Value::Float(f64::from_bits(value as u64))
+                                        }
+                                        _ => majit_ir::Value::Int(value),
+                                    };
+                                    let opref = ctx.load_box_from_cpu(*n as u32, *kind, typed);
+                                    (opref, value)
+                                }
                                 RebuiltValue::Const(c) => {
                                     let bits = c.as_raw_i64();
                                     let opref = match bank {

@@ -11780,7 +11780,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
 
     let new = ctx
         .trace_ctx
-        .execute_new_with_vtable(crate::descr::w_range_size_descr());
+        .execute_new_with_vtable(crate::descr::w_range_size_descr(), None);
 
     let field_descrs = [
         crate::descr::range_start_descr(),

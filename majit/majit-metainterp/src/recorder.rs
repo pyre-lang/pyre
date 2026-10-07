@@ -1350,9 +1350,21 @@ impl Trace {
     /// Input arguments are numbered starting from 0; the OpRef index matches
     /// the input argument index.
     ///
-    /// resoperation.py/727/739 — InputArgInt/InputArgFloat/InputArgRef
-    /// each pin `type = 'i'/'f'/'r'` at construction.
+    /// resoperation.py InputArgInt/InputArgFloat/InputArgRef pin
+    /// `type = 'i'/'f'/'r'` at construction. The no-value form is
+    /// `InputArgInt()` (default 0 is not stamped here — tests and
+    /// `create_empty_history` attach the live value separately, or
+    /// [`Self::record_input_arg_with_value`] attaches it at birth).
     pub fn record_input_arg(&mut self, tp: Type) -> OpRef {
+        self.record_input_arg_with_value(tp, None)
+    }
+
+    /// `resoperation.py InputArgInt(intval)` / `InputArgRef(r)` /
+    /// `InputArgFloat(f)`: the box is born with its runtime value.
+    /// `resume.py ResumeDataBoxReader.load_box_from_cpu` builds
+    /// `IntFrontendOp(num, cpu.get_int_value(deadframe, num))` the same way.
+    /// `None` leaves `_res*` unstamped, matching `InputArgInt()`.
+    pub fn record_input_arg_with_value(&mut self, tp: Type, value: Option<Value>) -> OpRef {
         assert!(
             self.ops.is_empty() && self.slots.is_empty(),
             "input args must be registered before any operations"
@@ -1371,7 +1383,11 @@ impl Trace {
         );
         let index = self.max_num_inputargs;
         debug_assert!(self.inputargs.last().is_none_or(|prev| prev.index < index));
-        self.inputargs.push(InputArg::from_type_rc(tp, index));
+        let ia = InputArg::from_type_rc(tp, index);
+        if let Some(v) = value {
+            ia.set_value(v);
+        }
+        self.inputargs.push(ia);
         self.inputarg_heapc
             .push(majit_trace::heapcache::HeapcRecord::default());
         self.max_num_inputargs += 1;
@@ -1531,9 +1547,60 @@ impl Trace {
         args: &[OpRef],
         descr: Option<DescrRef>,
     ) -> OpRef {
+        self.record_guard_with_value(opcode, args, descr, None)
+    }
+
+    /// `history.py History.record1` / `_make_op(pos, value)` for a guard.
+    /// `pyjitpl.py MetaInterp.generate_guard(GUARD_EXCEPTION)` records a
+    /// `RefFrontendOp` whose result is the exception; pass that value
+    /// here so the box is born with it (`record_bytes` / `record_op_with_descr_value`
+    /// mechanism). `None` is the void-result / unstamped guard path.
+    pub fn record_guard_with_value(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: Option<DescrRef>,
+        value: Option<Value>,
+    ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         self.ensure_byte_buffer();
-        self.record_bytes(opcode, args, descr, None)
+        self.record_bytes(opcode, args, descr, value)
+    }
+
+    /// `resume.py ResumeDataBoxReader.load_box_from_cpu`: construct the
+    /// box at the reserved failarg coordinate with
+    /// `cpu.get_int_value(deadframe, num)`. `with_input_layout` is
+    /// `opencoder.py Trace.__init__(max_num_inputargs)` and may have
+    /// left an `InputArgInt()` placeholder; this replaces that
+    /// placeholder so the live box is born with `value`.
+    pub fn load_box_from_cpu(&mut self, num: u32, kind: Type, value: Value) -> OpRef {
+        assert!(
+            num < self.max_num_inputargs,
+            "load_box_from_cpu: failarg {num} is outside the reserved prefix {}",
+            self.max_num_inputargs
+        );
+        match self.inputargs.binary_search_by_key(&num, |ia| ia.index) {
+            Ok(i) => {
+                debug_assert_eq!(
+                    self.inputargs[i].tp.get(),
+                    kind,
+                    "load_box_from_cpu: reserved type != decoded kind"
+                );
+                if self.inputargs[i].get_value().is_none() {
+                    let ia = InputArg::from_type_rc(kind, num);
+                    ia.set_value(value);
+                    self.inputargs[i] = ia;
+                } else {
+                    debug_assert_eq!(self.inputargs[i].get_value(), Some(value));
+                }
+            }
+            Err(i) => {
+                let ia = InputArg::from_type_rc(kind, num);
+                ia.set_value(value);
+                self.inputargs.insert(i, ia);
+            }
+        }
+        OpRef::input_arg_typed(num, kind)
     }
 
     /// Set rd_resume_position on the last recorded op.
@@ -2700,6 +2767,39 @@ mod tests {
         assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
         assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
         assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
+    }
+
+    #[test]
+    fn test_record_input_arg_with_value_stamps_at_birth() {
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg_with_value(Type::Int, Some(Value::Int(42)));
+        let r0 = rec.record_input_arg(Type::Ref);
+        assert_eq!(rec.concrete_at(i0.raw()), Some(Value::Int(42)));
+        assert_eq!(rec.concrete_at(r0.raw()), None);
+    }
+
+    #[test]
+    fn test_record_guard_with_value_born_with_concrete() {
+        let mut rec = Trace::new();
+        let _i0 = rec.record_input_arg(Type::Int);
+        let g = rec.record_guard_with_value(
+            OpCode::GuardException,
+            &[OpRef::const_int(1)],
+            None,
+            Some(Value::Ref(GcRef(0xabc))),
+        );
+        assert_eq!(rec.concrete_at(g.raw()), Some(Value::Ref(GcRef(0xabc))));
+    }
+
+    #[test]
+    fn test_load_box_from_cpu_births_reserved_inputarg() {
+        let mut rec = Trace::with_input_layout(&[Type::Int, Type::Ref], &[true, true]);
+        let opref = rec.load_box_from_cpu(0, Type::Int, Value::Int(7));
+        assert_eq!(opref, OpRef::input_arg_int(0));
+        assert_eq!(rec.concrete_at(0), Some(Value::Int(7)));
+        let r = rec.load_box_from_cpu(1, Type::Ref, Value::Ref(GcRef(0xdef)));
+        assert_eq!(r, OpRef::input_arg_ref(1));
+        assert_eq!(rec.concrete_at(1), Some(Value::Ref(GcRef(0xdef))));
     }
 
     #[test]

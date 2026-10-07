@@ -1286,8 +1286,12 @@ where
             .count_ops(OpCode::GetfieldRawI, crate::counters::OPS);
         ctx.profiler()
             .count_ops(OpCode::GetfieldRawI, crate::counters::RECORDED_OPS);
-        let op = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[struct_opref], fielddescr);
-        ctx.set_opref_concrete(op, Value::Int(loaded));
+        let op = ctx.record_op_with_descr_value(
+            OpCode::GetfieldRawI,
+            &[struct_opref],
+            fielddescr,
+            Some(Value::Int(loaded)),
+        );
         self.set_int_reg(ctx, dest, Some(op), Some(loaded));
         TraceAction::Continue
     }
@@ -1426,8 +1430,12 @@ where
             .count_ops(OpCode::GetfieldRawF, crate::counters::OPS);
         ctx.profiler()
             .count_ops(OpCode::GetfieldRawF, crate::counters::RECORDED_OPS);
-        let op = ctx.record_op_with_descr(OpCode::GetfieldRawF, &[struct_opref], fielddescr);
-        ctx.set_opref_concrete(op, Value::Float(f64::from_bits(loaded_bits as u64)));
+        let op = ctx.record_op_with_descr_value(
+            OpCode::GetfieldRawF,
+            &[struct_opref],
+            fielddescr,
+            Some(Value::Float(f64::from_bits(loaded_bits as u64))),
+        );
         self.set_float_reg(ctx, dest, Some(op), Some(loaded_bits));
         TraceAction::Continue
     }
@@ -1818,17 +1826,14 @@ where
             ctx.profiler().count_ops(opcode, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(opcode, crate::counters::RECORDED_OPS);
-            let opref = ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-            // pyjitpl.py MIFrame._do_getarrayitem_gc_any `heapcache.getarrayitem_now_known`.
-            // Pair the recorded opref with the live `concrete`
-            // payload — mirrors RPython's `resbox` Box carrying
-            // both identity and value from `executor.execute`.
-            // `Box.value` parity: stamp the result OpRef's
-            // frontend value slot so `lookup_opref_concrete(opref)`
-            // returns the runtime concrete (RPython
-            // `IntFrontendOp(pos, intval)` construction-time
-            // field assignment).
-            ctx.set_opref_concrete(opref, majit_ir::Value::Int(concrete));
+            // pyjitpl.py MIFrame._do_getarrayitem_gc_any → execute_and_record
+            // → history.record(..., resvalue); heapcache.getarrayitem_now_known.
+            let opref = ctx.record_op_with_descr_value(
+                opcode,
+                &[array_opref, index_opref],
+                descr,
+                Some(majit_ir::Value::Int(concrete)),
+            );
             ctx.heapcache_getarrayitem_now_known(array_opref, index_opref, descr_index, opref);
             (opref, concrete)
         };
@@ -1948,10 +1953,11 @@ where
             ctx.profiler().count_ops(opcode, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(opcode, crate::counters::RECORDED_OPS);
-            let opref = ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-            ctx.set_opref_concrete(
-                opref,
-                majit_ir::Value::Float(f64::from_bits(concrete as u64)),
+            let opref = ctx.record_op_with_descr_value(
+                opcode,
+                &[array_opref, index_opref],
+                descr,
+                Some(majit_ir::Value::Float(f64::from_bits(concrete as u64))),
             );
             ctx.heapcache_getarrayitem_now_known(array_opref, index_opref, descr_index, opref);
             (opref, concrete)
@@ -2063,8 +2069,12 @@ where
                 ctx.profiler().count_ops(opcode, crate::counters::OPS);
                 ctx.profiler()
                     .count_ops(opcode, crate::counters::RECORDED_OPS);
-                let opref = ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-                ctx.set_opref_concrete(opref, Value::Ref(majit_ir::GcRef(concrete as usize)));
+                let opref = ctx.record_op_with_descr_value(
+                    opcode,
+                    &[array_opref, index_opref],
+                    descr,
+                    Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
+                );
                 ctx.heapcache_getarrayitem_now_known(array_opref, index_opref, descr_index, opref);
                 (opref, concrete)
             };
@@ -6006,12 +6016,14 @@ where
             } else {
                 None
             };
+            let result_value = majit_ir::Value::Int(concrete);
             let traced = if is_release_gil {
                 ctx.call_release_gil_int_typed_with_effect(
                     trace_ptr,
                     &args,
                     &arg_types,
                     effectinfo.clone(),
+                    result_value,
                 )
             } else if is_forces {
                 ctx.call_may_force_int_typed_with_effect(
@@ -6019,6 +6031,7 @@ where
                     &args,
                     &arg_types,
                     effectinfo.clone(),
+                    result_value,
                 )
             } else if is_loopinvariant {
                 ctx.call_loopinvariant_int_typed_with_effect(
@@ -6029,11 +6042,12 @@ where
                     concrete,
                 )
             } else {
-                ctx.record_call_with_descr(
+                ctx.record_call_with_descr_value(
                     majit_ir::OpCode::CallI,
                     trace_ptr,
                     &args,
                     trace_descr.clone(),
+                    Some(result_value),
                 )
             };
             // pyjitpl.py execute_varargs:
@@ -6060,30 +6074,18 @@ where
                         trace_descr,
                         patch_pos,
                         majit_ir::OpCode::CallI,
-                        majit_ir::Value::Int(concrete),
+                        result_value,
                     )
                 }
                 _ => traced,
             };
-            // RPython pyjitpl.py opimpl_residual_call_*_may_force_*
-            // writes the call result into the frame *before*
-            // vable_after_residual_call fires GUARD_NOT_FORCED
-            // (see legacy BC_CALL_MAY_FORCE_INT arm for rationale).
-            // `pyjitpl.py execute_and_record_varargs` runs the call
-            // through `executor.execute_varargs` and hands the result
-            // to `history.record_nospec`, so the recorded op carries
-            // the executed value on its own frontend slot -- every
-            // later `getvalue()` of that box answers it.  Writing the
-            // value into the destination register alone leaves
-            // `concrete_of_opref` answering `None` for the box, and
-            // the two readers then disagree: `_nonstandard_virtualizable`
-            // asks the box, so a residual that returns the standard
-            // virtualizable (the portal's `reload_top_root`) loses its
-            // PTR_EQ against `virtualizable_boxes[-1]` and every later
-            // vable access on that register takes the nonstandard leg.
-            // The full-body walker already stamps its own residual
-            // results this way (`jitcode_dispatch/residual_call.rs`).
-            ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
+            // pyjitpl.py opimpl_residual_call_*_may_force_* writes the
+            // call result into the frame *before* vable_after_residual_call
+            // fires GUARD_NOT_FORCED. The recorded box already carries
+            // the executed result (`execute_and_record_varargs` →
+            // `history.record(..., resvalue)` / `History._make_op`).
+            // `record_result_of_call_pure` returns a Const, the original
+            // box, or a CALL_PURE re-recorded with the same value.
             self.set_int_reg(ctx, dst, Some(traced), Some(concrete));
             if is_forces {
                 if crate::majit_log_enabled() {
@@ -6354,12 +6356,14 @@ where
             } else {
                 None
             };
+            let result_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize));
             let traced = if is_forces {
                 ctx.call_may_force_ref_typed_with_effect(
                     trace_ptr,
                     &args,
                     &arg_types,
                     effectinfo.clone(),
+                    result_value,
                 )
             } else if is_loopinvariant {
                 let concrete = residual_ref.word(concrete);
@@ -6371,16 +6375,18 @@ where
                     concrete,
                 )
             } else {
-                ctx.record_call_with_descr(
+                ctx.record_call_with_descr_value(
                     majit_ir::OpCode::CallR,
                     trace_ptr,
                     &args,
                     trace_descr.clone(),
+                    Some(result_value),
                 )
             };
             // pyjitpl.py MIFrame.execute_varargs gate (see int sibling for full cite).
             let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
             let concrete = residual_ref.word(concrete);
+            let result_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize));
             let traced = match patch_pos {
                 Some(patch_pos) if last_exc_value == 0 => {
                     let func_ref = ctx.const_int(trace_ptr as usize as i64);
@@ -6396,33 +6402,17 @@ where
                         trace_descr,
                         patch_pos,
                         majit_ir::OpCode::CallR,
-                        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                        result_value,
                     )
                 }
                 _ => traced,
             };
-            // `pyjitpl.py execute_and_record_varargs` runs the call
-            // through `executor.execute_varargs` and hands the result
-            // to `history.record_nospec`, so the recorded op carries
-            // the executed value on its own frontend slot -- every
-            // later `getvalue()` of that box answers it.  Writing the
-            // value into the destination register alone leaves
-            // `concrete_of_opref` answering `None` for the box, and
-            // the two readers then disagree: `_nonstandard_virtualizable`
-            // asks the box, so a residual that returns the standard
-            // virtualizable (the portal's `reload_top_root`) loses its
-            // PTR_EQ against `virtualizable_boxes[-1]` and every later
-            // vable access on that register takes the nonstandard leg.
-            // The full-body walker already stamps its own residual
-            // results this way (`jitcode_dispatch/residual_call.rs`).
             // Re-read after the record. `_double_ops` may have
             // forwarded the shadow slot while `concrete` above was
             // still the nursery address captured at the call.
+            // The recorded box is born with that executed result
+            // (`execute_and_record_varargs` → `history.record(..., resvalue)`).
             let concrete = residual_ref.word(concrete);
-            ctx.set_opref_concrete(
-                traced,
-                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-            );
             self.set_ref_reg(ctx, dst, Some(traced), Some(concrete));
             if is_forces {
                 let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -6644,12 +6634,14 @@ where
             } else {
                 None
             };
+            let result_value = majit_ir::Value::Float(concrete);
             let traced = if is_release_gil {
                 ctx.call_release_gil_float_typed_with_effect(
                     trace_ptr,
                     &args,
                     &arg_types,
                     effectinfo.clone(),
+                    result_value,
                 )
             } else if is_forces {
                 ctx.call_may_force_float_typed_with_effect(
@@ -6657,6 +6649,7 @@ where
                     &args,
                     &arg_types,
                     effectinfo.clone(),
+                    result_value,
                 )
             } else if is_loopinvariant {
                 ctx.call_loopinvariant_float_typed_with_effect(
@@ -6667,11 +6660,12 @@ where
                     concrete.to_bits() as i64,
                 )
             } else {
-                ctx.record_call_with_descr(
+                ctx.record_call_with_descr_value(
                     majit_ir::OpCode::CallF,
                     trace_ptr,
                     &args,
                     trace_descr.clone(),
+                    Some(result_value),
                 )
             };
             // pyjitpl.py MIFrame.execute_varargs gate (see int sibling for full cite).
@@ -6691,26 +6685,13 @@ where
                         trace_descr,
                         patch_pos,
                         majit_ir::OpCode::CallF,
-                        majit_ir::Value::Float(concrete),
+                        result_value,
                     )
                 }
                 _ => traced,
             };
-            // `pyjitpl.py execute_and_record_varargs` runs the call
-            // through `executor.execute_varargs` and hands the result
-            // to `history.record_nospec`, so the recorded op carries
-            // the executed value on its own frontend slot -- every
-            // later `getvalue()` of that box answers it.  Writing the
-            // value into the destination register alone leaves
-            // `concrete_of_opref` answering `None` for the box, and
-            // the two readers then disagree: `_nonstandard_virtualizable`
-            // asks the box, so a residual that returns the standard
-            // virtualizable (the portal's `reload_top_root`) loses its
-            // PTR_EQ against `virtualizable_boxes[-1]` and every later
-            // vable access on that register takes the nonstandard leg.
-            // The full-body walker already stamps its own residual
-            // results this way (`jitcode_dispatch/residual_call.rs`).
-            ctx.set_opref_concrete(traced, majit_ir::Value::Float(concrete));
+            // Recorded box is born with the executed result
+            // (`execute_and_record_varargs` → `history.record(..., resvalue)`).
             self.set_float_reg(ctx, dst, Some(traced), Some(concrete.to_bits() as i64));
             if is_forces {
                 let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -7047,23 +7028,11 @@ where
                         self.set_int_reg(ctx, dst as usize, Some(first_box), Some(first_val));
                     }
                 } else {
-                    let patch_pos = ctx.get_trace_position();
-                    let traced = ctx.cond_call_value_int_typed_with_descr(
-                        first_box,
-                        trace_ptr,
-                        &args,
-                        trace_descr.clone(),
-                    );
-                    let mut allboxes: CallOpRefs = SmallVec::new();
-                    allboxes.push(first_box);
-                    allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                    allboxes.extend_from_slice(&args);
-                    ctx.heapcache_invalidate_caches_varargs(
-                        OpCode::CondCallValueI,
-                        Some(&calldescr.extra_info),
-                        &allboxes,
-                    );
+                    // `execute_varargs` → `execute_and_record_varargs`:
+                    // clear, execute, then `_record_helper_varargs`
+                    // (`history.record(..., resvalue)`).
                     self.clear_exception();
+                    let patch_pos = ctx.get_trace_position();
                     let concrete_result = if first_val == 0 {
                         if let Some(action) = refuse_walk_local_ref_args(
                             ctx,
@@ -7107,6 +7076,22 @@ where
                     } else {
                         first_val
                     };
+                    let mut allboxes: CallOpRefs = SmallVec::new();
+                    allboxes.push(first_box);
+                    allboxes.push(ctx.const_int(trace_ptr as usize as i64));
+                    allboxes.extend_from_slice(&args);
+                    ctx.heapcache_invalidate_caches_varargs(
+                        OpCode::CondCallValueI,
+                        Some(&calldescr.extra_info),
+                        &allboxes,
+                    );
+                    let traced = ctx.cond_call_value_int_typed_with_descr(
+                        first_box,
+                        trace_ptr,
+                        &args,
+                        trace_descr.clone(),
+                        concrete_result,
+                    );
                     // `do_conditional_call(is_value=True)` →
                     // `execute_varargs(..., pure=True)`.
                     // Skip the fold when the helper raised.
@@ -7163,23 +7148,11 @@ where
                         self.set_ref_reg(ctx, dst as usize, Some(first_box), Some(first_val));
                     }
                 } else {
-                    let patch_pos = ctx.get_trace_position();
-                    let traced = ctx.cond_call_value_ref_typed_with_descr(
-                        first_box,
-                        trace_ptr,
-                        &args,
-                        trace_descr.clone(),
-                    );
-                    let mut allboxes: CallOpRefs = SmallVec::new();
-                    allboxes.push(first_box);
-                    allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                    allboxes.extend_from_slice(&args);
-                    ctx.heapcache_invalidate_caches_varargs(
-                        OpCode::CondCallValueR,
-                        Some(&calldescr.extra_info),
-                        &allboxes,
-                    );
+                    // `execute_varargs` → `execute_and_record_varargs`:
+                    // clear, execute, then `_record_helper_varargs`
+                    // (`history.record(..., resvalue)`).
                     self.clear_exception();
+                    let patch_pos = ctx.get_trace_position();
                     let concrete_result = if first_val == 0 {
                         if let Some(action) = refuse_walk_local_ref_args(
                             ctx,
@@ -7223,6 +7196,22 @@ where
                     } else {
                         first_val
                     };
+                    let mut allboxes: CallOpRefs = SmallVec::new();
+                    allboxes.push(first_box);
+                    allboxes.push(ctx.const_int(trace_ptr as usize as i64));
+                    allboxes.extend_from_slice(&args);
+                    ctx.heapcache_invalidate_caches_varargs(
+                        OpCode::CondCallValueR,
+                        Some(&calldescr.extra_info),
+                        &allboxes,
+                    );
+                    let traced = ctx.cond_call_value_ref_typed_with_descr(
+                        first_box,
+                        trace_ptr,
+                        &args,
+                        trace_descr.clone(),
+                        concrete_result,
+                    );
                     let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     let traced = if last_exc == 0 {
                         let mut call_args: CallOpRefs = SmallVec::new();
@@ -7465,19 +7454,8 @@ where
                         self.set_int_reg(ctx, dst as usize, Some(first_box), Some(first_val));
                     }
                 } else {
-                    let patch_pos = ctx.get_trace_position();
-                    let traced = ctx
-                        .cond_call_value_int_typed(first_box, trace_ptr, &args, &arg_types, slot);
-                    let mut allboxes: CallOpRefs = SmallVec::new();
-                    allboxes.push(first_box);
-                    allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                    allboxes.extend_from_slice(&args);
-                    ctx.heapcache_invalidate_caches_varargs(
-                        OpCode::CondCallValueI,
-                        Some(&extra_info),
-                        &allboxes,
-                    );
                     self.clear_exception();
+                    let patch_pos = ctx.get_trace_position();
                     let concrete_result = if first_val == 0 {
                         if let Some(action) = refuse_walk_local_ref_args(
                             ctx,
@@ -7519,6 +7497,23 @@ where
                     } else {
                         first_val
                     };
+                    let mut allboxes: CallOpRefs = SmallVec::new();
+                    allboxes.push(first_box);
+                    allboxes.push(ctx.const_int(trace_ptr as usize as i64));
+                    allboxes.extend_from_slice(&args);
+                    ctx.heapcache_invalidate_caches_varargs(
+                        OpCode::CondCallValueI,
+                        Some(&extra_info),
+                        &allboxes,
+                    );
+                    let traced = ctx.cond_call_value_int_typed(
+                        first_box,
+                        trace_ptr,
+                        &args,
+                        &arg_types,
+                        slot,
+                        concrete_result,
+                    );
                     let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     let traced = if last_exc == 0 {
                         let mut call_args: CallOpRefs = SmallVec::new();
@@ -7570,19 +7565,8 @@ where
                         self.set_ref_reg(ctx, dst as usize, Some(first_box), Some(first_val));
                     }
                 } else {
-                    let patch_pos = ctx.get_trace_position();
-                    let traced = ctx
-                        .cond_call_value_ref_typed(first_box, trace_ptr, &args, &arg_types, slot);
-                    let mut allboxes: CallOpRefs = SmallVec::new();
-                    allboxes.push(first_box);
-                    allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                    allboxes.extend_from_slice(&args);
-                    ctx.heapcache_invalidate_caches_varargs(
-                        OpCode::CondCallValueR,
-                        Some(&extra_info),
-                        &allboxes,
-                    );
                     self.clear_exception();
+                    let patch_pos = ctx.get_trace_position();
                     let concrete_result = if first_val == 0 {
                         if let Some(action) = refuse_walk_local_ref_args(
                             ctx,
@@ -7624,6 +7608,23 @@ where
                     } else {
                         first_val
                     };
+                    let mut allboxes: CallOpRefs = SmallVec::new();
+                    allboxes.push(first_box);
+                    allboxes.push(ctx.const_int(trace_ptr as usize as i64));
+                    allboxes.extend_from_slice(&args);
+                    ctx.heapcache_invalidate_caches_varargs(
+                        OpCode::CondCallValueR,
+                        Some(&extra_info),
+                        &allboxes,
+                    );
+                    let traced = ctx.cond_call_value_ref_typed(
+                        first_box,
+                        trace_ptr,
+                        &args,
+                        &arg_types,
+                        slot,
+                        concrete_result,
+                    );
                     let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     let traced = if last_exc == 0 {
                         let mut call_args: CallOpRefs = SmallVec::new();
@@ -7877,7 +7878,7 @@ where
             return action;
         }
         ctx.vrefs_after_residual_call();
-        let traced = ctx.call_assembler_int_arc_typed(arc, &args, &arg_types);
+        let traced = ctx.call_assembler_int_arc_typed_with_value(arc, &args, &arg_types, concrete);
         self.set_int_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
         let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -8023,7 +8024,7 @@ where
             return action;
         }
         ctx.vrefs_after_residual_call();
-        let traced = ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types);
+        let traced = ctx.call_assembler_ref_arc_typed_with_value(arc, &args, &arg_types, concrete);
         self.set_ref_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
         let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -8169,7 +8170,8 @@ where
             return action;
         }
         ctx.vrefs_after_residual_call();
-        let traced = ctx.call_assembler_float_arc_typed(arc, &args, &arg_types);
+        let traced =
+            ctx.call_assembler_float_arc_typed_with_value(arc, &args, &arg_types, concrete);
         self.set_float_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
         let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -8841,12 +8843,12 @@ where
         ctx.profiler().count_ops(kind, crate::counters::OPS);
         ctx.profiler()
             .count_ops(kind, crate::counters::RECORDED_OPS);
+        let array_value = Value::Ref(majit_ir::GcRef(array_ptr as usize));
         let abox_op = if clear {
-            ctx.record_new_array_clear(length_opref, array_descr)
+            ctx.record_new_array_clear(length_opref, array_descr, array_value)
         } else {
-            ctx.record_new_array(length_opref, array_descr)
+            ctx.record_new_array(length_opref, array_descr, array_value)
         };
-        ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
         ctx.heap_cache_mut()
             .new_array(abox_op, length_opref, length_opref.is_constant());
         self.set_ref_reg(ctx, dest, Some(abox_op), Some(array_ptr));
@@ -8967,8 +8969,10 @@ where
         ctx.profiler().count_ops(OpCode::New, crate::counters::OPS);
         ctx.profiler()
             .count_ops(OpCode::New, crate::counters::RECORDED_OPS);
-        let sbox_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr);
-        ctx.set_opref_concrete(sbox_op, Value::Ref(majit_ir::GcRef(struct_ptr as usize)));
+        let sbox_op = ctx.record_new(
+            struct_descr,
+            Value::Ref(majit_ir::GcRef(struct_ptr as usize)),
+        );
         // `opimpl_newlist_clear` composes `opimpl_new`,
         // `_opimpl_setfield_gc_any`, `opimpl_new_array_clear` and a
         // second `_opimpl_setfield_gc_any`; each carries the heapcache
@@ -9029,8 +9033,11 @@ where
             .count_ops(OpCode::NewArrayClear, crate::counters::OPS);
         ctx.profiler()
             .count_ops(OpCode::NewArrayClear, crate::counters::RECORDED_OPS);
-        let abox_op = ctx.record_new_array_clear(length_opref, array_descr);
-        ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
+        let abox_op = ctx.record_new_array_clear(
+            length_opref,
+            array_descr,
+            Value::Ref(majit_ir::GcRef(array_ptr as usize)),
+        );
         // `execute_new_array_clear`'s `heapcache.new_array`. Only a
         // constant length makes the array a virtual candidate, which is
         // the `isinstance(lengthbox, Const)` the flag stands for.

@@ -2775,6 +2775,12 @@ impl TraceCtx {
         }
     }
 
+    /// `resume.py ResumeDataBoxReader.load_box_from_cpu`: the bridge
+    /// InputArg is born with `cpu.get_int_value(deadframe, num)`.
+    pub fn load_box_from_cpu(&mut self, num: u32, kind: Type, value: Value) -> OpRef {
+        self.recorder.load_box_from_cpu(num, kind, value)
+    }
+
     /// Like [`Self::set_opref_concrete`] but returns `false` instead of
     /// panicking when no frontend op/inputarg is recorded at `opref`'s
     /// position.  The full-body walker's speculative residual-call

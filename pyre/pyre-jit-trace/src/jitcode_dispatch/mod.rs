@@ -1770,7 +1770,7 @@ fn emit_traceback_node<Sym: WalkSym>(
 ) -> Result<OpRef, DispatchError> {
     let traceback = ctx
         .trace_ctx
-        .execute_new_with_vtable(crate::descr::pytraceback_size_descr());
+        .execute_new_with_vtable(crate::descr::pytraceback_size_descr(), None);
     let w_code = site
         .w_code_pin
         .as_ref()
@@ -4439,22 +4439,26 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         }
     };
     // The CALL_ASSEMBLER op and the guards after it append to
-    // `opencoder.py Trace._ops` and can minor-collect; the stamp and the
+    // `opencoder.py Trace._ops` and can minor-collect; the pin and the
     // raise take the forwarded result and exception.
     let result_pin = (dst_bank == 'r' && raised == 0)
         .then(|| residual_call::owner_root_if_gc(concrete as usize))
         .flatten();
     let raised_pin = residual_call::owner_root_if_gc(raised as usize);
     let recorded = match dst_bank {
-        'r' => ctx
-            .trace_ctx
-            .call_assembler_ref_arc_typed(token, &red_ops, &red_types),
+        'r' => {
+            let concrete = result_pin
+                .as_ref()
+                .map_or(concrete, |pin| pin.get().0 as i64);
+            ctx.trace_ctx
+                .call_assembler_ref_arc_typed_with_value(token, &red_ops, &red_types, concrete)
+        }
         'i' => ctx
             .trace_ctx
-            .call_assembler_int_arc_typed(token, &red_ops, &red_types),
+            .call_assembler_int_arc_typed_with_value(token, &red_ops, &red_types, concrete),
         'f' => ctx
             .trace_ctx
-            .call_assembler_float_arc_typed(token, &red_ops, &red_types),
+            .call_assembler_float_arc_typed_with_value(token, &red_ops, &red_types, concrete),
         'v' => {
             ctx.trace_ctx
                 .call_assembler_void_arc_typed(token, &red_ops, &red_types);
@@ -4470,21 +4474,12 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         &allboxes,
     );
     // `make_result_of_lastop(resbox)`: the executed result is the op's
-    // value whatever its bits (zero, +0.0 and null included).
-    if recorded != OpRef::NONE && raised == 0 {
-        let concrete = result_pin
-            .as_ref()
-            .map_or(concrete, |pin| pin.get().0 as i64);
-        let value = match dst_bank {
-            'i' => majit_ir::Value::Int(concrete),
-            'f' => majit_ir::Value::Float(f64::from_bits(concrete as u64)),
-            _ => majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-        };
-        ctx.trace_ctx.set_opref_concrete(recorded, value);
-    }
+    // value whatever its bits (zero, +0.0 and null included). The
+    // CALL_ASSEMBLER box is born with it (`history.py History._make_op`).
     if recorded != OpRef::NONE {
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
     }
+    drop(result_pin);
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     // `direct_assembler_call` returns the target driver's virtualizable red

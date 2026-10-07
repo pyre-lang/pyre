@@ -1591,28 +1591,16 @@ pub struct OptContext {
     // counterpart (upstream keys producers on `box._forwarded`, not a
     // positional map).
     pub(crate) resop_refs: OpRefFxIndexMap<majit_ir::resoperation::OpRc>,
-    /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
-    /// products) that have NOT been superseded by an `emit` at their
-    /// position. The end-of-Phase-1 orphan-binding pass drains this into
-    /// `phase1_emit_ops` so retrace sees them in `partial_trace_operations`; an
-    /// `emit` that rebinds a position's box off its synthetic removes the
-    /// synthetic here (it stays strongly held by `resop_refs` for lookup,
-    /// but is no longer an orphan needing carry). Tracking liveness
-    /// incrementally by `OpRc` identity sidesteps the flat-OpRef raw/type
-    /// collision that makes the final `new_operations` state ambiguous
-    /// about which type-tagged value won a shared raw slot.
+    /// Live `mint_synthetic_resop` / `install_canonical_producer` stand-ins
+    /// that have NOT been superseded by an `emit` at their position. Recorder
+    /// ops from `bind_input_resops` are the iterator box itself
+    /// (`opencoder.py TraceIterator.next` `_cache`); they stay in `resop_refs`
+    /// and are not listed here. The Phase-1 drain walks remaining entries
+    /// into `phase1_emit_ops` so retrace sees them in
+    /// `partial_trace_operations`. At most one live entry per position
+    /// (emit invariant). A Vec scan is enough: this set is only synthetics
+    /// and extra producers, not the whole trace.
     pub(crate) live_synthetics: Vec<majit_ir::resoperation::OpRc>,
-    /// `pos -> index into live_synthetics`, kept in lockstep with the vector so
-    /// the three supersession sites (`install_canonical_producer`, `emit`'s
-    /// reuse path, `bind_input_resops`) resolve a position's live stand-in in
-    /// O(1) instead of an `iter().position()` scan. At most one live entry
-    /// exists per position (the emit invariant asserted throughout this file),
-    /// so the map is unambiguous. Maintained via `live_synthetics_push` /
-    /// `live_synthetics_swap_remove_pos`; without it the scan is O(n^2) over a
-    /// vector that grows to the whole trace length (tens of thousands of ops
-    /// on a whole-program loop),
-    /// the same producer-resolution cost `phase1_emit_ops_index` removes.
-    pub(crate) live_synthetics_index: FxHashMap<OpRef, usize>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
@@ -2545,11 +2533,7 @@ impl OptContext {
                 estimated_ops,
                 Default::default(),
             ),
-            live_synthetics: Vec::with_capacity(estimated_ops),
-            live_synthetics_index: FxHashMap::with_capacity_and_hasher(
-                estimated_ops,
-                Default::default(),
-            ),
+            live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::with_capacity(estimated_ops),
@@ -2785,29 +2769,20 @@ impl OptContext {
         }
     }
 
-    /// Append `op` to `live_synthetics`, keeping `live_synthetics_index`
-    /// (pos -> vector index) in lockstep. At most one live entry per position
-    /// (emit invariant), so a plain insert replaces any stale mapping.
+    /// Append `op` to `live_synthetics`. Recorder ops are not stored here
+    /// (`bind_input_resops` keeps them in `resop_refs` only); this set is
+    /// `mint_synthetic_resop` / extra-producer stand-ins.
     pub(crate) fn live_synthetics_push(&mut self, op: majit_ir::OpRc) {
-        let pos = op.pos().get();
-        let idx = self.live_synthetics.len();
         self.live_synthetics.push(op);
-        self.live_synthetics_index.insert(pos, idx);
     }
 
-    /// Remove the live entry at position `pos` (if any) via `swap_remove`,
-    /// keeping `live_synthetics_index` in lockstep. Returns the removed `OpRc`.
-    /// `swap_remove` moves the last element into the freed slot, so that
-    /// element's index mapping is repointed here.
+    /// Remove the live synthetic/extra at position `pos` (if any).
     pub(crate) fn live_synthetics_swap_remove_pos(&mut self, pos: OpRef) -> Option<majit_ir::OpRc> {
-        let i = self.live_synthetics_index.remove(&pos)?;
-        let removed = self.live_synthetics.swap_remove(i);
-        if i < self.live_synthetics.len() {
-            // The element formerly at the tail now lives at `i`.
-            let moved_pos = self.live_synthetics[i].pos().get();
-            self.live_synthetics_index.insert(moved_pos, i);
-        }
-        Some(removed)
+        let i = self
+            .live_synthetics
+            .iter()
+            .position(|op| op.pos().get() == pos)?;
+        Some(self.live_synthetics.swap_remove(i))
     }
 
     /// Mint a `SameAsI/F/R` (or `Jump` for `Void`) synthetic
@@ -2887,11 +2862,14 @@ impl OptContext {
         }
         // Drop the superseded stand-in at this position and carry its
         // accumulated `_forwarded` onto `op` (replace_op_with's `opinfo`
-        // hand-off). At most one live stand-in exists per position
-        // (mod.rs::emit invariant), so a single removal is sufficient. The
-        // `ptr_eq` guard skips the self-clone — and its `RefCell` double-borrow
-        // — when `op` is already the registered stand-in.
-        if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos)
+        // hand-off). The current box is a live synthetic if one was minted,
+        // otherwise the recorder `OpRc` in `resop_refs` (`optimizer.py`
+        // `replace_op_with` / `op.set_forwarded(newop)`). The `ptr_eq`
+        // guard skips the self-clone — and its `RefCell` double-borrow —
+        // when `op` is already the registered stand-in.
+        if let Some(superseded) = self
+            .live_synthetics_swap_remove_pos(pos)
+            .or_else(|| self.resop_refs.get(&pos).cloned())
             && !OpRc::ptr_eq(&superseded, op)
         {
             let carried = superseded.forwarded().borrow().clone();
@@ -3049,10 +3027,9 @@ impl OptContext {
     /// unbound terminal and a subsequent `set_forwarded_info` write
     /// trips `write_forwarded`'s bound-precondition assert.
     ///
-    /// The producer `OpRc` is stashed in `resop_refs[pos]` so `emit()`'s
-    /// `bound_is_synthetic` check (`mod.rs::emit` rebind path) later
-    /// upgrades the binding to the emitted post-pass producer `OpRc`
-    /// via `bind_op`'s carry-over (forwarded state preserved).
+    /// The producer `OpRc` is stashed in `resop_refs[pos]` so `emit()`
+    /// reuses that same box (`optimizer.py Optimizer._emit_operation`
+    /// appends `op`).
     ///
     /// InputArg slots are skipped (handled by `ensure_inputarg_bindings`);
     /// only resop positions land here. Each phase's input `ops` carry that
@@ -3061,9 +3038,9 @@ impl OptContext {
     /// the `resop_refs[opref]` dedup covers intra-`ops` repeats.
     pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
         // The loop over the caller-threaded `ops` self-guards (no-op on an
-        // empty slice) and records each resop producer into `resop_refs` /
-        // `live_synthetics` — the collision-safe stores `find_producer_op`
-        // consults.
+        // empty slice) and records each resop producer into `resop_refs` —
+        // the iterator object is the box (`opencoder.py TraceIterator.next`
+        // `_cache`; `optimizer.py Optimizer._emit_operation` appends it).
         for op in ops {
             // Bridge / Phase-2 reminted InputArgs live on the op
             // (`inputarg_from_tp`). `inputarg_base != 0` is that reminted
@@ -3101,12 +3078,11 @@ impl OptContext {
             if self.resop_refs.contains_key(&pos) {
                 continue;
             }
-            // Record the caller-threaded `OpRc` so the iterated input op,
-            // `resop_refs`, and `live_synthetics` share one `Op` identity
-            // (no second private copy).
-            let op_rc = op.clone();
-            self.resop_refs.insert(pos, op_rc.clone());
-            self.live_synthetics_push(op_rc);
+            // Record the caller-threaded `OpRc` so the iterated input op
+            // and `resop_refs` share one `Op` identity (no second private
+            // copy). Not pushed to `live_synthetics`: that set is only
+            // synthetics / extra producers.
+            self.resop_refs.insert(pos, op.clone());
         }
     }
 
@@ -3229,11 +3205,7 @@ impl OptContext {
                 estimated_ops,
                 Default::default(),
             ),
-            live_synthetics: Vec::with_capacity(estimated_ops),
-            live_synthetics_index: FxHashMap::with_capacity_and_hasher(
-                estimated_ops,
-                Default::default(),
-            ),
+            live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::with_capacity(estimated_ops),
@@ -3321,9 +3293,6 @@ impl OptContext {
             self.resop_refs.reserve(estimated_ops);
         }
         self.live_synthetics.clear();
-        self.live_synthetics.reserve(estimated_ops);
-        self.live_synthetics_index.clear();
-        self.live_synthetics_index.reserve(estimated_ops);
         self.phase1_emit_ops.clear();
         self.phase1_emit_ops_index.clear();
         self.input_ops.clear();
@@ -3719,8 +3688,13 @@ impl OptContext {
     ///
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
     /// so the backend's variable numbering stays consistent.
+    ///
+    /// `optimizer.py Optimizer._emit_operation` appends the same `op`
+    /// object it was handed. A recorder / extra / synthetic `OpRc` already
+    /// registered at this position is reused; a genuinely new
+    /// `ResOperation` (`emit_extra`, `copy_and_change`) is cloned.
     pub fn emit(&mut self, op: Op) -> OpRef {
-        self.emit_impl(op, false)
+        self.emit_impl(op)
     }
 
     /// Append an already-allocated `OpRc` without a second `ResOperation()`.
@@ -3766,7 +3740,17 @@ impl OptContext {
     /// one-node cycle.
     fn adopt_live_synthetic(&mut self, op_rc: &majit_ir::OpRc) {
         let op_pos = op_rc.pos().get();
-        let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) else {
+        // A live SameAs/extra stand-in, else the recorder box in
+        // `resop_refs`. `optimizer.py replace_op_with` forwards the old
+        // box (`op.set_forwarded(newop)`) when emit clones a new
+        // ResOperation (`copy_and_change`). `ptr_eq` with the recorder
+        // itself is a no-op carry.
+        let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos).or_else(|| {
+            self.resop_refs
+                .get(&op_pos)
+                .cloned()
+                .filter(|old| !OpRc::ptr_eq(old, op_rc))
+        }) else {
             return;
         };
         let carried = synth.forwarded().borrow().clone();
@@ -3802,20 +3786,13 @@ impl OptContext {
         dst.pos().set(src.pos().get());
     }
 
-    /// `emit` variant that REUSES the recorder input op (the `live_synthetics`
-    /// entry at this position) as the emitted producer instead of cloning into
-    /// a fresh `Rc<Op>`. The input op is the object later ops' operands already
-    /// wrap; making it the producer collapses the two-Op-per-position
-    /// duplication that the `live_synthetics` catch-up otherwise bridges by
-    /// copying `_forwarded` and linking input -> clone. One box per value, the
-    /// op IS the box (resoperation.py AbstractResOpOrInputArg). Falls back to the clone path when
-    /// no structurally-matching input op is live at this position.
+    /// Same as [`emit`]: recorder ops reuse the registered `OpRc`.
     #[allow(dead_code)] // resoperation.py AbstractResOp emit reuse
     pub(crate) fn emit_reusing(&mut self, op: Op) -> OpRef {
-        self.emit_impl(op, true)
+        self.emit_impl(op)
     }
 
-    fn emit_impl(&mut self, mut op: Op, reuse: bool) -> OpRef {
+    fn emit_impl(&mut self, mut op: Op) -> OpRef {
         if op.pos().get().is_none() || op.pos().get().is_constant() {
             // Tag the freshly allocated position with the producer op's
             // result type so the variant-tag readers
@@ -3935,65 +3912,25 @@ impl OptContext {
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
         let op_pos = op.pos().get();
-        // Reuse path: when an unchanged op flows through to final emission, reuse
-        // the recorder input op (the `live_synthetics` entry at this position) as
-        // the emitted producer rather than cloning. The input op is what later
-        // ops' operands already wrap, and the passes already wrote its
-        // `_forwarded` host via `find_producer_op`, so overwriting its args with
-        // the resolved operands and copying the descr makes it the single box per
-        // value (resoperation.py AbstractResOpOrInputArg the op IS the box). This is the structural
-        // collapse the clone path's catch-up only approximates by copying
-        // `_forwarded` onto a fresh clone and redirecting input -> clone.
-        // Guards used to be excluded because emit_guard_operation mutates
-        // the owned `op` (failargs / descr / rd_resume_position) before
-        // we get here. Stamp that same state onto the live recorder op
-        // instead of `Rc::new` — the opcode/num_args match still rejects
-        // a stand-in that is no longer the same guard.
-        if reuse {
-            // At most one live entry per position (emit invariant), so the
-            // O(1) index resolves the reuse candidate; the opcode/num_args
-            // predicate then guards against reusing a non-matching stand-in
-            // (fall through to the clone path on mismatch).
-            let reuse_match = self
-                .live_synthetics_index
-                .get(&op_pos)
-                .copied()
-                .is_some_and(|i| {
-                    let s = &self.live_synthetics[i];
-                    s.opcode == op.opcode && s.num_args() == op.num_args()
-                });
-            if reuse_match {
-                let reused = self
-                    .live_synthetics_swap_remove_pos(op_pos)
-                    .expect("index pointed at a live entry");
-                for k in 0..op.num_args() {
-                    reused.setarg(k, op.arg(k));
-                }
-                match op.getdescr() {
-                    Some(d) => reused.setdescr(d),
-                    None => reused.cleardescr(),
-                }
-                if op.opcode.is_guard() {
-                    if let Some(fa) = op.guard_fail_args() {
-                        reused.setfailargs(fa.iter().cloned().collect());
-                    } else {
-                        reused.clearfailargs();
-                    }
-                    match op.get_fail_arg_types() {
-                        Some(ts) => reused.set_fail_arg_types(ts),
-                        None => reused.clear_fail_arg_types(),
-                    }
-                    reused.set_rd_resume_position(op.rd_resume_position());
-                }
-                // optimizer.py `self._emittedoperations[op] = None`. The
-                // clone path below records this too; `get_producing_op` only
-                // admits producers present here, so the reused op must be
-                // marked emitted or it stays invisible to producer matching.
-                self.emitted_operations
-                    .insert(majit_ir::operand::Operand::from_bound_op(&reused));
-                self.push_new_operation(reused);
-                return op_pos;
-            }
+        // optimizer.py Optimizer._emit_operation appends the same `op`
+        // object (`TraceIterator.next` `_cache`). Reuse the registered
+        // `OpRc` when opcode and arity still match — the recorder box, an
+        // extra producer, or a SameAs synthetic being emitted as itself.
+        // Guard emit mutates failargs/descr on the owned `op` first
+        // (`emit_guard_operation`); stamp that state onto the registered
+        // box. Opcode/arity mismatch is `copy_and_change`: clone, and
+        // `adopt_live_synthetic` / `link_replaced_producer` forward the
+        // old box.
+        if let Some(reused) = self.resop_refs.get(&op_pos).cloned()
+            && reused.opcode == op.opcode
+            && reused.num_args() == op.num_args()
+        {
+            Self::stamp_emitted_op(&op, &reused);
+            self.adopt_live_synthetic(&reused);
+            self.emitted_operations
+                .insert(majit_ir::operand::Operand::from_bound_op(&reused));
+            self.push_new_operation(reused);
+            return op_pos;
         }
         let op_rc = OpRc::new(op);
         // Catch up any operand placeholder that `materialize_operand_at` created for
@@ -4002,8 +3939,8 @@ impl OptContext {
         // object; late binding establishes that connection so
         // subsequent `box.set_forwarded` reaches `op.forwarded`.
         //
-        // The synthetic stand-in registered for `op_pos` by `materialize_operand_at` /
-        // `bind_input_resops` is the `live_synthetics` entry at this position.
+        // The synthetic stand-in registered for `op_pos` by `materialize_operand_at`
+        // is the `live_synthetics` entry at this position.
         // `adopt_live_synthetic` migrates its `_forwarded` onto the real producer
         // and drops it from `live_synthetics` so the superseded stand-in is not
         // drained into `phase1_emit_ops`. Each `op_pos` has at most one live
@@ -10344,7 +10281,7 @@ mod boxref_forwarding_tests {
         ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
 
         // pos 2 = an INT_LT result not yet emitted; mint the stand-in the
-        // recorder / `bind_input_resops` seeds into resop_refs + live_synthetics.
+        // recorder / `bind_input_resops` seeds into resop_refs.
         let pos2 = OpRef::int_op(2);
         let _standin = ctx.mint_synthetic_resop(pos2, Type::Int);
 
