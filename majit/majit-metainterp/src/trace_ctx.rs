@@ -667,6 +667,15 @@ pub struct TraceCtx {
     /// jitdriver's Abort arm to convert.  `None` on every non-aborting walk and
     /// once the arm has taken it.
     pub aborted_framestack: Option<crate::pyjitpl::MIFrameStack>,
+    /// `pyjitpl.py` `metainterp.last_exc_value` of an FBW latch published
+    /// onto [`Self::aborted_framestack`]. Set and cleared with that stack.
+    /// A GCREF; the TraceCtx walker forwards it. `0` is a published null,
+    /// not "absent": `convert_and_run_from_pyjitpl` (`blackhole.py`)
+    /// converts this with the stack as one image.
+    pub aborted_last_exc_value: i64,
+    /// `SwitchToBlackhole.raising_exception` (`history.py`) of the same
+    /// latch. `false` is a published value, not "absent".
+    pub aborted_raising_exception: bool,
     /// Single-pass tracing: the walk-final concrete RED values captured from
     /// the closing merge point's red operands (their live register boxes),
     /// in operand order (slot 3 ints, slot 4 refs, slot 5 floats). The
@@ -2475,6 +2484,8 @@ impl TraceCtx {
             symbolic_residual_abort: false,
             deterministic_bridge_abort: false,
             aborted_framestack: None,
+            aborted_last_exc_value: 0,
+            aborted_raising_exception: false,
             walk_final_reds: Vec::new(),
             close_jump_boxes: None,
             close_scalar_values: None,
@@ -2577,6 +2588,8 @@ impl TraceCtx {
             symbolic_residual_abort: false,
             deterministic_bridge_abort: false,
             aborted_framestack: None,
+            aborted_last_exc_value: 0,
+            aborted_raising_exception: false,
             walk_final_reds: Vec::new(),
             close_jump_boxes: None,
             close_scalar_values: None,

@@ -1020,25 +1020,21 @@ fn current_inline_vable_target<Sym: WalkSym>(
     }
 }
 
-/// The concrete frame `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable`
-/// plus `synchronize_virtualizable_at` write when that frame is this walk's.
+/// The concrete frame whose `locals_cells_stack_w` a `setarrayitem_vable` on
+/// `vable` writes.  `_opimpl_setarrayitem_vable` sends a non-standard box
+/// through `_opimpl_setarrayitem_gc_any` → `execute_setarrayitem_gc`, and
+/// `execute_and_record` performs the store (`executor.py do_setarrayitem_gc`
+/// → `cpu.bh_setarrayitem_gc_r`) while recording it, so the array holds the
+/// value `heapcache.setarrayitem` publishes and a later
+/// `_do_getarrayitem_gc_any` sanity load reads it back.
 ///
-/// RPython's metainterp executes, so `virtualizable.py write_box_at` lands on
-/// the live virtualizable. pyre's walker is record-only and
-/// `virtualizable_heap_ptr` names the `snapshot_for_tracing` copy. The walk's
-/// own frame is the forward-inline callee published by
+/// The walk's own frame is either the forward-inline callee published by
 /// `InlineConcreteFrameGuard`, or, for a bridge-resume level, the frame
 /// `setup_reconstructed_callee_frame` built and left in `callee_shadow`
-/// without publishing it (`drive_bridge_frame_subwalk`).
-///
-/// The portal interpreter frame is written at nested-trace / residual
-/// boundaries (`flush_live_virtualizable_before_nested_trace`, matching
-/// `vable_and_vrefs_before_residual_call` / `force_now` on
-/// `TOKEN_TRACING_RESCALL`), not per-op. A record-only `setarrayitem_vable` of
-/// `pyframe.py popvalue` None onto that portal leaves `valuestackdepth`
-/// behind, and interpreter FOR_ITER then reads a NULL iterator
-/// (`shortcut_fallback_next`).
-fn own_frame_vable_store_target<Sym: WalkSym>(
+/// without publishing it (see `drive_bridge_frame_subwalk`).  Both are
+/// allocated by the walk; the strict-fold arm above already writes the
+/// second.
+fn own_frame_array_store_target<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable: OpRef,
 ) -> Option<usize> {
@@ -1051,44 +1047,30 @@ fn own_frame_vable_store_target<Sym: WalkSym>(
         .callee_shadow
         .as_ref()
         .map_or(0, |shadow| shadow.concrete_frame);
-    if frame == 0 {
-        return None;
+    if frame != 0 {
+        match ctx.trace_ctx.lookup_opref_concrete(vable) {
+            Some(Value::Ref(value)) if value.as_usize() == frame => return Some(frame),
+            _ => {}
+        }
     }
-    match ctx.trace_ctx.lookup_opref_concrete(vable) {
-        Some(Value::Ref(value)) if value.as_usize() == frame => Some(frame),
-        _ => None,
+    // Standard virtualizable: `_opimpl_setarrayitem_vable` +
+    // `synchronize_virtualizable` write the real object. pyre's
+    // `virtualizable_heap_ptr` names the `snapshot_for_tracing` copy
+    // (abort-safety), so the live interpreter frame would otherwise lag
+    // until a residual flush. Nested `compile_and_run_once` reads that
+    // live frame (`warmstate.py bound_reached`).
+    if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if !sym.is_null() {
+            // `TraceRoots` rewrites this cell across a minor
+            // (`virtualizable.py` the live virtualizable is a GC pointer).
+            let live = unsafe { (*sym).live_vable_frame_addr() };
+            if live != 0 {
+                return Some(live);
+            }
+        }
     }
-}
-
-/// Journal a walk-time static vable store so a declined walk restores the
-/// frame the interpreter will resume.
-///
-/// Fresh inlined callees are discarded on decline. A resumed generator's
-/// own frame is not: `pyframe.py popvalue` stores None then writes
-/// `valuestackdepth`, and the None store is already mirrored onto that
-/// walk-owned frame, so the depth has to come back with it
-/// (`MetaInterp.synchronize_virtualizable_at`).
-fn note_vable_static_store_undo<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, frame: usize) {
-    if let Some(durable) = durable_resume_frame(ctx, frame) {
-        fbw_arm_durable_frame_undo(durable);
-        return;
-    }
-    fbw_note_frame_vsd_undo(frame);
-}
-
-/// `virtualizable.py write_box_at` for an Int static field (`last_instr` /
-/// `valuestackdepth`) on the frame [`own_frame_vable_store_target`] names.
-fn mirror_vable_static_int<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    vable: OpRef,
-    field_index: usize,
-    value: i64,
-) {
-    let Some(frame) = own_frame_vable_store_target(ctx, vable) else {
-        return;
-    };
-    note_vable_static_store_undo(ctx, frame);
-    crate::state::store_live_frame_static_int(frame, field_index, value);
+    None
 }
 
 pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
@@ -1154,7 +1136,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     // `virtualizable_boxes[index] = valuebox` then
     // `synchronize_virtualizable_at` → `write_box_at`. pyre also writes
     // Int statics of the walk's own frame through
-    // `mirror_vable_static_int` when `own_frame_vable_store_target` hits.
+    // `own_frame_array_store_target` + `store_live_frame_static_int`.
     // A nonstandard store records `setfield_gc` only
     // (`vable_setfield_checked`); that arm does not unwrap the box.
     //
@@ -1176,12 +1158,22 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     let write =
         ctx.trace_ctx
             .vable_setfield_checked(nonstandard, obj, descr.clone(), value, captured);
-    // `_opimpl_setfield_vable` + `synchronize_virtualizable_at` write the
-    // virtualizable the metainterp executes (`write_box_at`). This walk
-    // mirrors that onto the frame [`own_frame_vable_store_target`] names;
-    // an outer/nonstandard virtualizable is not this walk's frame.
-    if let (Value::Int(int_value), Some(field_index)) = (captured, inline_field_index) {
-        mirror_vable_static_int(ctx, obj, field_index, int_value);
+    // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
+    // authoritative for optimization, while the matching concrete frame is
+    // its blackhole-resume image. `_opimpl_setfield_gc_any` executes the
+    // store (`execute_and_record` → `cpu.bh_setfield_gc`); pyre records
+    // only, so the live `last_instr` / `valuestackdepth` write uses the same
+    // own-frame target as `setarrayitem_vable` (published inline frame,
+    // reconstructed `callee_shadow`, or the standard virtualizable).
+    if let (Some(frame), Value::Int(value), Some(field_index)) = (
+        own_frame_array_store_target(ctx, obj),
+        captured,
+        inline_field_index,
+    ) {
+        if let Some(frame) = durable_resume_frame(ctx, frame) {
+            fbw_arm_durable_frame_undo(frame);
+        }
+        crate::state::store_live_frame_static_int(frame, field_index, value);
     }
     let _ = write;
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -1238,8 +1230,13 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
             concrete,
         ))
     })?;
-    if let Some(field_index) = inline_field_index {
-        mirror_vable_static_int(ctx, obj, field_index, imm);
+    if let (Some(frame), Some(field_index)) =
+        (own_frame_array_store_target(ctx, obj), inline_field_index)
+    {
+        if let Some(frame) = durable_resume_frame(ctx, frame) {
+            fbw_arm_durable_frame_undo(frame);
+        }
+        crate::state::store_live_frame_static_int(frame, field_index, imm);
     }
     let _ = write;
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -1817,7 +1814,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // `virtualizable_boxes[index] = valuebox` then
     // `synchronize_virtualizable_at` → `write_box_at`. pyre also writes
     // the walk's own frame through `store_live_frame_array_slot` when
-    // `own_frame_vable_store_target` hits. A nonstandard store with no
+    // `own_frame_array_store_target` hits. A nonstandard store with no
     // own-frame target records `getfield_gc_r` + `setarrayitem_gc` only
     // (`vable_setarrayitem_impl`).
     //
@@ -1825,7 +1822,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // `GUARD_VALUE` on the PendingEq path (`begin_nonstandard_virtualizable`
     // + `walker_implement_guard_value`), so refuse a reconstructable-concrete
     // hole before that call when the store will write the live frame.
-    let own_frame_write = index_value >= 0 && own_frame_vable_store_target(ctx, vable).is_some();
+    let own_frame_write = index_value >= 0 && own_frame_array_store_target(ctx, vable).is_some();
     if own_frame_write && let Some(err) = vable_store_unreconstructable(op.pc, value, concrete) {
         return Err(err);
     }
@@ -1865,7 +1862,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         VableArrayStore::OutOfVable => None,
     };
     if index_value >= 0
-        && let Some(frame) = own_frame_vable_store_target(ctx, vable)
+        && let Some(frame) = own_frame_array_store_target(ctx, vable)
     {
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);
@@ -2263,6 +2260,62 @@ mod callee_ref_owner_tests {
         );
         assert_eq!(read.0, Ok(DispatchOutcome::Continue));
         assert_eq!(read.1, Some(Value::Int(42)));
+    }
+
+    #[test]
+    fn standard_vable_setarrayitem_stamps_the_unstamped_box() {
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let info = install_portal(&mut tc);
+        let standard = tc
+            .standard_virtualizable_box()
+            .expect("init_virtualizable_boxes pushes the identity");
+        let raw_pool = array_pool(&info);
+        let value = OpRef::input_arg_ref(1);
+        assert_eq!(tc.concrete_of_opref(value), None);
+        let none = Value::Ref(majit_ir::GcRef(pyre_object::w_none() as usize));
+        let index = tc.const_int(0);
+        let array_slot = info.num_static_extra_boxes;
+        // `riXdd`: opcode, vable r0, index i1, value r2, fdescr 0, adescr 1.
+        let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+        let op = DecodedOp {
+            key: "setarrayitem_vable_r/rirdd",
+            opname: "setarrayitem_vable_r",
+            argcodes: "rirdd",
+            pc: 0,
+            next_pc: code.len(),
+        };
+        let regs_r = [standard, OpRef::NONE, value];
+        let regs_i = [index, index];
+        let mut concrete_r = vec![ConcreteValue::Null; 3];
+        concrete_r[2] = ConcreteValue::Ref(pyre_object::w_none());
+        with_ctx(
+            &mut tc,
+            None,
+            &regs_r,
+            &regs_i,
+            concrete_r,
+            &raw_pool,
+            |wc| {
+                let outcome =
+                    setarrayitem_vable_via_metainterp(&code, &op, wc, 'r').map(|(out, _)| out);
+                assert_eq!(outcome, Ok(DispatchOutcome::Continue));
+                assert_eq!(
+                    wc.trace_ctx.virtualizable_box_at(array_slot),
+                    Some(value),
+                    "standard arm stores valuebox into virtualizable_boxes[index]"
+                );
+                assert!(
+                    (0..wc.trace_ctx.opcode_at_len())
+                        .all(|i| wc.trace_ctx.opcode_at(i) != Some(OpCode::SetarrayitemGc)),
+                    "standard arm does not record SETARRAYITEM_GC"
+                );
+            },
+        );
+        assert_eq!(
+            tc.concrete_of_opref(value),
+            Some(none),
+            "the standard arm stamps the box before any collecting call"
+        );
     }
 
     #[test]

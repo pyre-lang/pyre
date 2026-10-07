@@ -1699,10 +1699,13 @@ pub(crate) fn helper_resume_reaches_blocker(
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return true;
     };
+    // Runtime-installed payloads (`install_codeless_jitcode`) live in
+    // `MetaInterpStaticData.jitcodes`, not the build-time `JITCODE_CELLS`
+    // table `get_jitcode_ref_by_index` reads. The payload already in
+    // hand is the body to scan.
+    let payload = std::sync::Arc::clone(&pjc);
     let scan = || {
-        let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-            return true;
-        };
+        let jitcode = &payload.jitcode;
         let descrs = crate::jitcode_runtime::descr_ref_table();
         let entry_array_lengths: Vec<(usize, usize)> =
             entry_array_len.map(|len| (0, len)).into_iter().collect();
@@ -11753,6 +11756,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             state.current_exception_seed_concrete = parent_state.current_exception_seed_concrete;
             state.outer_active_boxes = inline_outer_active_boxes;
         }
+        // Capture before `sub_wc` takes `ctx.trace_ctx`. The CALL lives in
+        // this walk's jitcode; the callee sub-walk's `inline_callee_consts`
+        // names the body being entered, not the caller.
+        let walk_jc_index = ctx.walk_jitcode_index();
+        let caller_resume_pc = op.next_pc;
         let mut sub_wc = WalkContext {
             frame_state: callee_state,
             // Path-1: resolve scalar static-field reads off this callee's own
@@ -12019,25 +12027,59 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `can_inline_callable` never found, the same callee was re-inlined on
         // the next attempt, and the root took neither the disable nor
         // `prepare_trace_segmenting`'s permanent stamp.
-        // pyjitpl.py `perform_call` → `newframe` then `ChangeFrame`, then
-        // `_interpret` runs `blackhole_if_trace_too_long` after that step.
-        // The log entry must exist before the abort: a too-long check that
-        // ran first left `portal_trace_positions` empty, so
-        // `find_biggest_function` named no callee and
+        // pyjitpl.py `perform_call` → `newframe` then `setup_call` then
+        // `ChangeFrame`; `_interpret` runs `blackhole_if_trace_too_long`
+        // after that step. The log entry must exist before the abort: a
+        // too-long check that ran first left `portal_trace_positions`
+        // empty, so `find_biggest_function` named no callee and
         // `prepare_trace_segmenting` wrote `JC_DONT_TRACE_HERE` on the portal.
+        // `allboxes` is greens then reds (`interp_jit.py`
+        // `['next_instr', 'is_being_profiled', 'pycode']` + `['frame', 'ec']`).
+        let w_code_ptr = pyre_object::gc_roots::shadow_stack_get(inline_code_slot);
+        let next_instr_box = sub_wc.trace_ctx.const_int(0);
+        let profiled_box = sub_wc.trace_ctx.const_int(is_being_profiled as i64);
+        let pycode_box = sub_wc.trace_ctx.const_ref(w_code_ptr as i64);
+        let mut argboxes = vec![
+            (majit_metainterp::JitArgKind::Int, next_instr_box, 0),
+            (
+                majit_metainterp::JitArgKind::Int,
+                profiled_box,
+                is_being_profiled as i64,
+            ),
+            (
+                majit_metainterp::JitArgKind::Ref,
+                pycode_box,
+                w_code_ptr as i64,
+            ),
+        ];
+        if callee_frame_seeded {
+            let frame_bits = match sub_wc.trace_ctx.concrete_of_opref(ca_callee_frame) {
+                Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+                _ => 0,
+            };
+            let ec_bits = match sub_wc.trace_ctx.concrete_of_opref(ca_callee_ec) {
+                Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+                _ => 0,
+            };
+            argboxes.push((
+                majit_metainterp::JitArgKind::Ref,
+                ca_callee_frame,
+                frame_bits,
+            ));
+            argboxes.push((majit_metainterp::JitArgKind::Ref, ca_callee_ec, ec_bits));
+        }
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
                 callee_green_key.get_uhash(),
                 // The callee's greens are in scope here, so the log carries
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.
-                crate::driver::make_green_key_typed(
-                    pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                    0,
-                    is_being_profiled,
-                ),
+                crate::driver::make_green_key_typed(w_code_ptr as *const (), 0, is_being_profiled),
             ),
             None,
+            &argboxes,
+            walk_jc_index,
+            caller_resume_pc,
         );
         // `_interpret` checks `blackhole_if_trace_too_long` after the
         // `run_one_step` that `newframe`s, before the callee's first
@@ -22904,7 +22946,7 @@ fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
     }
     let frames_materialized = frames[n - 1].fbw_mode.inline_subwalk
         && residual_call::current_inline_concrete_frame() != 0;
-    if !abort_image_latchable_for(error, frames_materialized) {
+    if !abort_image_latchable_for(error, frames_materialized, false) {
         return false;
     }
     let parent = &frames[n - 2];

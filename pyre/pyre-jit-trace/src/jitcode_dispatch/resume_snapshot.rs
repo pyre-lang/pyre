@@ -515,7 +515,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 ctx,
                 op_pc,
                 after_residual_call,
-                scope.clone(),
+                &scope,
                 parent_frames,
             )? {
                 NumberedHelperGuard::Frames(frames) => {
@@ -2012,6 +2012,17 @@ pub(in crate::jitcode_dispatch) fn refresh_paused_parent_blackhole(parent: &mut 
     }
 }
 
+/// Forward captured parent Ref banks immediately before they become MIFrames.
+pub(in crate::jitcode_dispatch) fn refresh_framestack_parent_blackholes(
+    framestack: &mut [InlineFrame],
+) {
+    for frame in framestack {
+        for parent in &mut frame.parents {
+            refresh_paused_parent_blackhole(parent);
+        }
+    }
+}
+
 /// Re-read the paused caller's concrete image immediately before
 /// [`super::InlineFrameGuard`] publishes it. See
 /// [`refresh_paused_parent_blackhole`].
@@ -2122,6 +2133,9 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     // gated on `fbw_debug_abort_enabled` like the rest of the walk's build
     // reporting, so a build without the flag pays three counter bumps and one
     // predictable branch.
+    //
+    // A missing live table is an empty live pass, not a declined capture:
+    // the sweep still fills remaining concretes.
     let mut swept = [0usize; 3];
     let paused = paused_python_live(ctx);
     let paused_regs_i = paused.as_ref().map(|live| live.registers_i.clone());
@@ -3235,7 +3249,7 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
-    scope: GuardCaptureScope,
+    scope: &GuardCaptureScope,
     mut parent_frames: Vec<InlineParentFrame>,
 ) -> Result<NumberedHelperGuard, DispatchError> {
     parent_frames.push(helper_innermost_resume_frame(
@@ -3335,7 +3349,7 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
-    scope: GuardCaptureScope,
+    scope: &GuardCaptureScope,
 ) -> Result<InlineParentFrame, DispatchError> {
     let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
@@ -4057,20 +4071,6 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
                 }
             }
         }
-        // A dense fallthrough marker can name the NEXT Python opcode's result
-        // color before that opcode has executed.  RPython's sparse stream has
-        // no opcode-entry marker at this seam; the translated Ref bank slot is
-        // still its empty/null value and the next opcode overwrites it before
-        // any read.  Admit exactly that metadata-proven result color as NULL;
-        // every other missing live color still declines below.
-        if after_residual_call {
-            let marker_result = usize::try_from(callee_jitcode_pc)
-                .ok()
-                .and_then(|coord| callee_pjc.result_color_trivia_for_jitcode_pc(coord))
-                .filter(|&color| color != u16::MAX);
-            let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-            seed_missing_fallthrough_result(&mut recovered_regs_r, marker_result, null_ref);
-        }
     }
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
@@ -4144,27 +4144,4 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             ),
     }
     Ok(())
-}
-
-/// Seed only the not-yet-defined result color carried by pyre's dense
-/// fallthrough marker.  Returns whether a hole was filled.
-pub(crate) fn seed_missing_fallthrough_result(
-    registers_r: &mut [OpRef],
-    marker_result: Option<u16>,
-    null_ref: OpRef,
-) -> bool {
-    let Some(dst) = marker_result
-        .filter(|&color| color != u16::MAX)
-        .map(usize::from)
-    else {
-        return false;
-    };
-    let Some(slot) = registers_r.get_mut(dst) else {
-        return false;
-    };
-    if !slot.is_none() {
-        return false;
-    }
-    *slot = null_ref;
-    true
 }

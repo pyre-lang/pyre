@@ -81,11 +81,11 @@
 //! The level is only ever *resumed*, never entered from the top:
 //! `blackhole_from_resumedata` sets each level's `position` from its resume
 //! section, and `run_this_frame` dispatches forward from there.  The
-//! `inline_call` before the anchor therefore never decodes — it exists because
-//! `_setup_return_value_r` reads `code[position-1]`, the call's result
-//! register. Its callee operand is a placeholder for the same reason: the
-//! instruction is never executed, and the real callee varies per class while
-//! this jitcode is shared.
+//! `inline_call` before the anchor therefore never decodes — it exists
+//! because `_setup_return_value_r` reads `code[position-1]`, the call's
+//! result register. Its callee operand is a placeholder for the same reason:
+//! the instruction is never executed, and the real callee varies per class
+//! while this jitcode is shared.
 
 use crate::PyJitCode;
 use majit_metainterp::jitcode::{JitCallArg, JitCodeBuilder};
@@ -114,10 +114,10 @@ const PLACEHOLDER_CALLEE: u16 = 0;
 /// would be a signature mismatch.  A refusal publishes through
 /// `ResidualError::publish_residual` (`jit_publish_residual_error`):
 /// `BH_LAST_EXC_VALUE` for the blackhole handler and the compiled
-/// `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` cell.  The walker records this
-/// helper after a loop-callee `CALL_ASSEMBLER` so a non-None `__init__`
-/// result raises as `descr_call`'s outcome instead of aborting into an
-/// entry replay.
+/// `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` cell.  After a loop-callee
+/// `CALL_ASSEMBLER` the walker records this helper as a residual in the
+/// caller so a non-None `__init__` result raises as `descr_call`'s
+/// outcome instead of aborting into an entry replay.
 pub extern "C" fn bh_check_init_returned_none(result: pyre_object::PyObjectRef) {
     if let Err(err) = pyre_interpreter::call::check_init_returned_none(result) {
         use majit_ir::helper_fnaddr::ResidualError;
@@ -198,13 +198,16 @@ fn build() -> Option<(i32, usize, usize)> {
     builder.patch_live_offset(assembler_live_patch, assembler_liveness);
 
     let funcptr = pyre_interpreter::residual_word_addr!(1, bh_check_init_returned_none) as i64;
-    let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
-        // One `Ref` argument, no result: the same signature
-        // `bh_check_init_returned_none` is declared with.
-        arg_classes: "r".to_string(),
-        result_type: 'v',
-        ..Default::default()
-    };
+    // `descr_call` can raise TypeError on a non-None `__init__` result
+    // (`check_can_raise`) and does not force a virtualizable
+    // (`check_forces_virtual_or_virtualizable` is false). Blackhole
+    // resume runs this residual from the resume `-live-`; the EffectInfo
+    // matches `handle_possible_exception` after `get_and_call_args`.
+    let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr::from_arg_classes(
+        "r".to_string(),
+        'v',
+        majit_metainterp::can_raise_effect_info(),
+    );
     builder.residual_call_void_canonical_typed_args(
         funcptr,
         &[JitCallArg {

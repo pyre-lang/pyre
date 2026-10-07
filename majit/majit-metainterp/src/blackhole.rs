@@ -674,6 +674,35 @@ impl BlackholeAbortBanks {
         }
     }
 
+    /// Reverse of [`Self::from_miframe_const_boxes`]: mint ConstInt /
+    /// ConstPtr / ConstFloat onto the MIFrame from the typed bank words.
+    /// `_copy_data_from_miframe` (`blackhole.py`) reads those boxes.
+    /// A slot stays `None` where the bank has no word.
+    pub fn write_into_miframe_const_boxes(&self, miframe: &mut MIFrame) {
+        for (slot, word) in miframe.int_regs.iter_mut().zip(self.registers_i.iter()) {
+            if let Some(value) = *word {
+                *slot = Some(OpRef::const_int(value));
+            }
+        }
+        for (slot, word) in miframe.ref_regs.iter_mut().zip(self.registers_r.iter()) {
+            if let Some(value) = *word {
+                // Pin across intern so a nursery object survives
+                // `const_ptr_table` growth.
+                let addr = majit_gc::gc_current_object_address(value as usize);
+                let pin = (addr != 0 && majit_gc::gc_owns_object(addr))
+                    .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(addr)));
+                *slot = Some(OpRef::const_ptr(
+                    pin.as_ref().map(|p| p.get()).unwrap_or(GcRef(addr)),
+                ));
+            }
+        }
+        for (slot, word) in miframe.float_regs.iter_mut().zip(self.registers_f.iter()) {
+            if let Some(value) = *word {
+                *slot = Some(OpRef::const_float(f64::from_bits(value as u64)));
+            }
+        }
+    }
+
     pub fn ref_word(&self, index: usize) -> Option<i64> {
         self.registers_r.get(index).copied().flatten()
     }
@@ -3454,6 +3483,55 @@ impl BlackholeTerminalImage {
     }
 }
 
+/// How one blackhole level left `_run_forever` / `_handle_jitexception`.
+///
+/// `pyframe.py execute_frame` passes `w_exitvalue` (the dispatch result) to
+/// `return_trace` and `leave`. A Python portal returns a ref
+/// (`bhimpl_ref_return` / `_setup_return_value_r` / `get_tmpreg_r`). Unwind
+/// is `got_exception=True` with `w_exitvalue = space.w_None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelExit {
+    /// `_done_with_this_frame` / `_setup_return_value_r`: the interpreter
+    /// return register (`get_tmpreg_r`).
+    Return(i64),
+    /// `_handle_jitexception` abandoned this non-portal level, or
+    /// `_resume_mainloop` returned a live exception to the caller.
+    Exception,
+}
+
+/// `execute_frame`'s `w_exitvalue` after `_resume_mainloop` returned.
+///
+/// A live `current_exc` is the unwind path. A ref return is `get_tmpreg_r`.
+/// Int/float/void kinds do not invent `w_None`; a Python portal returns a ref.
+fn level_exit_after_resume(bh: &mut BlackholeInterpreter, current_exc: i64) -> LevelExit {
+    if current_exc != 0 {
+        LevelExit::Exception
+    } else {
+        match bh.return_type {
+            BhReturnType::Ref => LevelExit::Return(bh.get_tmpreg_r()),
+            BhReturnType::Int | BhReturnType::Float | BhReturnType::Void => LevelExit::Return(0),
+        }
+    }
+}
+
+fn root_jitexception_payload(exc: &mut JitException) -> crate::resume::ResumeRefRootsScope {
+    let scope = crate::resume::ResumeRefRootsScope::enter();
+    match exc {
+        JitException::DoneWithThisFrameRef(r) | JitException::ExitFrameWithExceptionRef(r) => unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
+                std::ptr::addr_of_mut!(r.0).cast::<i64>(),
+                1,
+            ));
+        },
+        JitException::ContinueRunningNormally(args) => unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(&mut args.green_ref);
+            majit_gc::shadow_stack::push_resume_ref_roots(&mut args.red_ref);
+        },
+        _ => {}
+    }
+    scope
+}
+
 /// blackhole.py _handle_jitexception
 ///
 /// Route a JitException through the blackhole frame chain.
@@ -3467,11 +3545,11 @@ impl BlackholeTerminalImage {
 fn handle_jitexception<P: BlackholeInterpPool>(
     builder: &mut P,
     mut bh: Box<BlackholeInterpreter>,
-    exc: JitException,
+    mut exc: JitException,
     portal_runner: Option<
         &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
     >,
-    on_leave_level: Option<&dyn Fn(i64)>,
+    on_leave_level: Option<&dyn Fn(i64, LevelExit) -> Option<i64>>,
     terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> Result<(Box<BlackholeInterpreter>, i64), JitException> {
     // A bail is not an outcome any portal level can absorb — there is no
@@ -3487,6 +3565,9 @@ fn handle_jitexception<P: BlackholeInterpPool>(
         builder.release_chain(Some(bh));
         return Err(exc);
     }
+    // The leave callback runs return_trace/leave, which can collect; the pending
+    // exception payload is a GC-traced local of `_handle_jitexception` (`blackhole.py`).
+    let mut exc_roots = root_jitexception_payload(&mut exc);
     // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
     while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
@@ -3500,7 +3581,14 @@ fn handle_jitexception<P: BlackholeInterpPool>(
         // this is where each one leaves. Without the callback a traceback
         // that retains such a frame refuses `frame.clear()`.
         if let Some(on_leave_level) = on_leave_level {
-            on_leave_level(bh.virtualizable_ptr);
+            if let Some(e) = on_leave_level(bh.virtualizable_ptr, LevelExit::Exception) {
+                // pyframe.py execute_frame: return_trace/leave replace the
+                // pending outcome. blackhole.py _handle_jitexception then
+                // propagates ExitFrameWithExceptionRef.
+                drop(exc_roots);
+                exc = JitException::ExitFrameWithExceptionRef(GcRef(e as usize));
+                exc_roots = root_jitexception_payload(&mut exc);
+            }
         }
         builder.release_interp(bh);
         match next {
@@ -3511,6 +3599,7 @@ fn handle_jitexception<P: BlackholeInterpPool>(
                 if let Some(terminal_out) = terminal_out {
                     *terminal_out = None;
                 }
+                drop(exc_roots);
                 return Err(exc);
             }
         }
@@ -3523,6 +3612,7 @@ fn handle_jitexception<P: BlackholeInterpPool>(
             BlackholeTerminalImage::store_into(terminal_out, &mut bh);
         }
         builder.release_interp(bh);
+        drop(exc_roots);
         return Err(exc);
     }
 
@@ -3550,6 +3640,7 @@ fn handle_jitexception<P: BlackholeInterpPool>(
         ) -> Result<(BhReturnType, i64), PortalRunnerFailure>
     });
     let caller = bh.nextblackholeinterp.as_mut().unwrap();
+    drop(exc_roots);
     let portal_outcome =
         handle_jitexception_in_portal(caller, exc, own_runner.or(portal_runner), result_kind);
     let current_exc = match portal_outcome {
@@ -3603,7 +3694,7 @@ pub fn resume_in_blackhole<P: BlackholeInterpPool>(
     blackholeinterp: Box<BlackholeInterpreter>,
     deadframe_exc: i64,
     on_enter_level: Option<&dyn Fn(i64)>,
-    on_leave_level: Option<&dyn Fn(i64)>,
+    on_leave_level: Option<&dyn Fn(i64, LevelExit) -> Option<i64>>,
     terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> JitException {
     let current_exc = BlackholeInterpreter::prepare_resume_from_failure(deadframe_exc);
@@ -3658,7 +3749,7 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
         &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
     >,
     on_enter_level: Option<&dyn Fn(i64)>,
-    on_leave_level: Option<&dyn Fn(i64)>,
+    on_leave_level: Option<&dyn Fn(i64, LevelExit) -> Option<i64>>,
     mut terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> JitException {
     // `_run_forever`'s `current_exc` is a traced `OBJECTPTR` local: the level
@@ -3728,7 +3819,14 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
         // returning never arrives here; `handle_jitexception` calls the same
         // callback for each level it abandons on its walk.
         if let Some(on_leave_level) = on_leave_level {
-            on_leave_level(bh.virtualizable_ptr);
+            // `blackhole.py _run_forever`: `current_exc` after `_resume_mainloop`.
+            let exit = level_exit_after_resume(&mut bh, current_exc_slot[0]);
+            if let Some(e) = on_leave_level(bh.virtualizable_ptr, exit) {
+                // pyframe.py execute_frame: return_trace/leave replace the
+                // pending outcome; the next `_resume_mainloop(current_exc)`
+                // raises it at the call site.
+                current_exc_slot[0] = e;
+            }
         }
         builder.release_interp(bh);
         // blackhole.py:1760
@@ -3764,7 +3862,9 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     /// stores `frame_finished_execution` in the jitcode this interpreter
     /// replays; `handle_operation_error` has no such op, so the embedder's
     /// callback finishes that propagation. Called once per level that
-    /// returns to its caller, with that level's `virtualizable_ptr`.
+    /// returns to its caller, with that level's `virtualizable_ptr` and
+    /// [`LevelExit`] (`execute_frame`'s `w_exitvalue` / `got_exception`).
+    /// `Some(exc)` replaces the pending outcome (`pyframe.py execute_frame`).
     /// Threaded from the interpreter side for the same reason as
     /// [`Self::on_enter_level`].
     ///
@@ -3772,7 +3872,7 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     /// pointer name the level's OWN frame.  Without it every level shares the
     /// portal's virtualizable, and a nested level would hand back the frame
     /// ABOVE it — marking a caller that is still running as finished.
-    pub on_leave_level: Option<&'a dyn Fn(i64)>,
+    pub on_leave_level: Option<&'a dyn Fn(i64, LevelExit) -> Option<i64>>,
     /// FBW abort handoff: per-frame raw banks aligned with `framestack`.
     /// When present, `_copy_data_from_miframe` `setarg_*` reads these instead
     /// of MIFrame Const boxes. MetaInterp freeze-then-abort leaves this `None`.
@@ -3814,6 +3914,11 @@ pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
                 cur_bh.virtualizable_stack_base = config.virtualizable_stack_base;
                 if let Some(per_frame) = config.per_frame {
                     let (frame_ptr, frame_stack_base) = per_frame[frame_index];
+                    // `blackhole.py convert_and_run_from_pyjitpl` copies each
+                    // MIFrame independently (`_copy_data_from_miframe`). A helper
+                    // jitcode has no portal red; its `(0, 0)` is this level's own
+                    // virtualizable, so `on_enter_level` / `on_leave_level` use
+                    // that level's frame.
                     cur_bh.virtualizable_ptr = frame_ptr;
                     cur_bh.virtualizable_stack_base = frame_stack_base;
                 }
@@ -4854,6 +4959,60 @@ mod tests {
             assert_eq!(
                 outcome,
                 crate::jitexc::JitException::DoneWithThisFrameInt(42)
+            );
+        }
+
+        fn nested_ref_call_framestack() -> crate::pyjitpl::MIFrameStack {
+            use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_ir::{GcRef, OpRef};
+
+            let mut caller_b = JitCodeBuilder::default();
+            caller_b.inline_call_r_r(0, &[], Some(7));
+            let post_call = caller_b.current_pos();
+            caller_b.ref_return(7);
+            let caller_jc = std::sync::Arc::new(caller_b.finish());
+            assert_eq!(
+                caller_jc.code[post_call - 1],
+                7,
+                "inline call must end on the ref result register",
+            );
+
+            let mut callee_b = JitCodeBuilder::default();
+            callee_b.ref_return(0);
+            let callee_jc = std::sync::Arc::new(callee_b.finish());
+
+            let caller = MIFrame::new(caller_jc, post_call);
+            let mut callee = MIFrame::new(callee_jc, 0);
+            callee.ref_regs[0] = Some(OpRef::const_ptr(GcRef(0x1234)));
+            let mut framestack = MIFrameStack::new(caller);
+            framestack.push(callee);
+            framestack
+        }
+
+        fn nested_ref_call_builder() -> BlackholeInterpBuilder {
+            use majit_jitcode::insns;
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            entries.insert("ref_return/r".to_string(), insns::BC_REF_RETURN);
+            builder.setup_insns(&entries);
+            wire_bhimpl_handlers(&mut builder);
+            builder
+        }
+
+        /// `blackhole.py` `_copy_data_from_miframe` / `setposition(jitcode,
+        /// miframe.pc)` then `_setup_return_value_r` reads `code[position-1]`.
+        /// The caller's pc must already be past the call's result operand,
+        /// the way pyjitpl.py `_opimpl_recursive_call` leaves it before
+        /// `perform_call`.
+        #[test]
+        fn convert_nested_frames_writes_ref_return_into_caller_call_dest() {
+            let framestack = nested_ref_call_framestack();
+            let mut builder = nested_ref_call_builder();
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameRef(majit_ir::GcRef(0x1234))
             );
         }
 
@@ -6176,7 +6335,10 @@ mod tests {
             leaf.nextblackholeinterp = Some(portal_bh);
 
             let left = std::cell::RefCell::new(Vec::new());
-            let on_leave_level = |ptr: i64| left.borrow_mut().push(ptr);
+            let on_leave_level = |ptr: i64, exit: super::LevelExit| -> Option<i64> {
+                left.borrow_mut().push((ptr, exit));
+                None
+            };
             let outcome = super::handle_jitexception(
                 &mut builder,
                 leaf,
@@ -6189,10 +6351,213 @@ mod tests {
             assert!(outcome.is_err(), "the portal frame here is bottommost");
             assert_eq!(
                 left.into_inner(),
-                vec![0x1000],
-                "the unwound non-portal level is finished; the portal one leaves \
-                 through the propagating arm, whose caller owns the store",
+                vec![(0x1000, super::LevelExit::Exception)],
+                "the unwound non-portal level is finished with got_exception; \
+                 the portal one leaves through the propagating arm, whose caller \
+                 owns the store",
             );
+        }
+
+        /// `_run_forever`'s post-return leave carries `get_tmpreg_r`, the
+        /// word `bhimpl_ref_return` stored (`_setup_return_value_r`).
+        #[test]
+        fn run_forever_leave_carries_the_ref_return_register() {
+            const INNER_VABLE: i64 = 0x1111;
+            const CALLER_VABLE: i64 = 0x2222;
+            const RET_REF: i64 = 0xBEEF;
+
+            let mut inner_b = JitCodeBuilder::default();
+            inner_b.load_const_r_value(0, RET_REF);
+            inner_b.ref_return(0);
+            let inner_jitcode = inner_b.finish();
+
+            let mut caller_b = JitCodeBuilder::default();
+            // Last operand byte is the ref dest `_setup_return_value_r` writes.
+            caller_b.inline_call_r_r(0, &[], Some(0));
+            let caller_resume = caller_b.current_pos();
+            caller_b.load_const_i_value(0, 1);
+            caller_b.int_return(0);
+            let caller_jitcode = caller_b.finish();
+            caller_jitcode.set_jitdriver_sd(0);
+
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
+            let mut caller = builder.acquire_interp();
+            caller.setposition(std::sync::Arc::new(caller_jitcode), caller_resume);
+            caller.virtualizable_ptr = CALLER_VABLE;
+            let mut inner = builder.acquire_interp();
+            inner.setposition(std::sync::Arc::new(inner_jitcode), 0);
+            inner.virtualizable_ptr = INNER_VABLE;
+            inner.nextblackholeinterp = Some(caller);
+
+            let left = std::cell::RefCell::new(Vec::new());
+            let on_leave_level = |ptr: i64, exit: super::LevelExit| -> Option<i64> {
+                left.borrow_mut().push((ptr, exit));
+                None
+            };
+            let outcome = super::run_forever_with_portal(
+                &mut builder,
+                inner,
+                0,
+                None,
+                None,
+                Some(&on_leave_level),
+                None,
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    crate::jitexc::JitException::DoneWithThisFrameInt(1)
+                ),
+                "the portal caller returns its own int, got {outcome:?}",
+            );
+            assert_eq!(
+                left.into_inner(),
+                vec![(INNER_VABLE, super::LevelExit::Return(RET_REF))],
+                "the per-code level's leave carries ref_return's tmpreg",
+            );
+        }
+
+        /// `pyframe.py execute_frame`: a raising `return_trace`/`leave`
+        /// replaces the pending outcome. `blackhole.py _run_forever` then
+        /// feeds that word to the caller as `current_exc`.
+        #[test]
+        fn leave_callback_exception_replaces_the_level_outcome() {
+            const INNER_VABLE: i64 = 0x1111;
+            const CALLER_VABLE: i64 = 0x2222;
+            const RET_REF: i64 = 0xBEEF;
+            const HOOK_EXC: i64 = 0xDEAD;
+
+            let mut inner_b = JitCodeBuilder::default();
+            inner_b.load_const_r_value(0, RET_REF);
+            inner_b.ref_return(0);
+            let inner_jitcode = inner_b.finish();
+
+            let mut caller_b = JitCodeBuilder::default();
+            caller_b.inline_call_r_r(0, &[], Some(0));
+            let caller_resume = caller_b.current_pos();
+            caller_b.load_const_i_value(0, 1);
+            caller_b.int_return(0);
+            let caller_jitcode = caller_b.finish();
+            caller_jitcode.set_jitdriver_sd(0);
+
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
+            let mut caller = builder.acquire_interp();
+            caller.setposition(std::sync::Arc::new(caller_jitcode), caller_resume);
+            caller.virtualizable_ptr = CALLER_VABLE;
+            let mut inner = builder.acquire_interp();
+            inner.setposition(std::sync::Arc::new(inner_jitcode), 0);
+            inner.virtualizable_ptr = INNER_VABLE;
+            inner.nextblackholeinterp = Some(caller);
+
+            let left = std::cell::RefCell::new(Vec::new());
+            let on_leave_level = |ptr: i64, exit: super::LevelExit| -> Option<i64> {
+                left.borrow_mut().push((ptr, exit));
+                if ptr == INNER_VABLE {
+                    Some(HOOK_EXC)
+                } else {
+                    None
+                }
+            };
+            let outcome = super::run_forever_with_portal(
+                &mut builder,
+                inner,
+                0,
+                None,
+                None,
+                Some(&on_leave_level),
+                None,
+            );
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::ExitFrameWithExceptionRef(GcRef(HOOK_EXC as usize)),
+                "the caller _resume_mainloop raises the hook exception",
+            );
+            assert_eq!(
+                left.into_inner(),
+                vec![(INNER_VABLE, super::LevelExit::Return(RET_REF))],
+                "the inner leave still sees the body's normal return",
+            );
+        }
+
+        /// `_handle_jitexception` holds `exc` across `on_leave_level`. A
+        /// collecting leave must rewrite the pending exception payload to the
+        /// forwarded address (`blackhole.py` traced local).
+        #[test]
+        fn leave_callback_collection_forwards_the_pending_exception_payload() {
+            use majit_gc::collector::MiniMarkGC;
+            use majit_gc::{GcAllocator, TypeInfo};
+
+            let mut gc = MiniMarkGC::new();
+            let tid = gc.register_type(TypeInfo::simple(16));
+            let obj = gc.alloc_with_type(tid, 16);
+            let original = obj.0;
+            assert_ne!(original, 0, "nursery allocation must succeed");
+            unsafe {
+                *(original as *mut u64) = 0xC0FFEE;
+            }
+            let mut expected = GcRef(original);
+            unsafe {
+                gc.add_root(&mut expected);
+            }
+            let gc = std::cell::RefCell::new(gc);
+
+            let build = |portal: bool| {
+                let mut b = JitCodeBuilder::default();
+                b.load_const_i_value(0, 1);
+                b.int_return(0);
+                let jitcode = b.finish();
+                jitcode.set_index(0);
+                if portal {
+                    jitcode.set_jitdriver_sd(0);
+                }
+                jitcode
+            };
+
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
+            let mut portal_bh = builder.acquire_interp();
+            portal_bh.setposition(std::sync::Arc::new(build(true)), 0);
+            portal_bh.virtualizable_ptr = 0x2000;
+            let mut leaf = builder.acquire_interp();
+            leaf.setposition(std::sync::Arc::new(build(false)), 0);
+            leaf.virtualizable_ptr = 0x1000;
+            leaf.nextblackholeinterp = Some(portal_bh);
+
+            let on_leave_level = |_ptr: i64, _exit: super::LevelExit| -> Option<i64> {
+                gc.borrow_mut().do_collect_nursery();
+                None
+            };
+            let outcome = super::handle_jitexception(
+                &mut builder,
+                leaf,
+                crate::jitexc::JitException::ExitFrameWithExceptionRef(GcRef(original)),
+                None,
+                Some(&on_leave_level),
+                None,
+            );
+            let forwarded = match outcome {
+                Err(crate::jitexc::JitException::ExitFrameWithExceptionRef(r)) => r.0,
+                Err(other) => panic!("expected ExitFrameWithExceptionRef, got {other:?}"),
+                Ok(_) => panic!("expected ExitFrameWithExceptionRef, got Ok"),
+            };
+            assert_eq!(
+                forwarded, expected.0,
+                "the pending exception must be the forwarded address after a collecting leave"
+            );
+            assert_ne!(
+                forwarded, original,
+                "a rooted nursery payload must move during the leave callback"
+            );
+            assert_eq!(unsafe { *(forwarded as *const u64) }, 0xC0FFEE);
+            gc.borrow_mut().remove_root(&mut expected);
         }
 
         #[test]
@@ -6383,7 +6748,10 @@ mod tests {
             inner.nextblackholeinterp = Some(caller);
 
             let left = std::cell::RefCell::new(Vec::new());
-            let on_leave_level = |ptr: i64| left.borrow_mut().push(ptr);
+            let on_leave_level = |ptr: i64, exit: super::LevelExit| -> Option<i64> {
+                left.borrow_mut().push((ptr, exit));
+                None
+            };
             let portal_runner =
                 |_exc: &crate::jitexc::JitException| Ok((super::BhReturnType::Int, 999));
             let outcome = super::run_forever_with_portal(
@@ -6412,7 +6780,10 @@ mod tests {
             // unit.
             assert_eq!(
                 left.into_inner(),
-                vec![INNER_VABLE, CALLER_VABLE],
+                vec![
+                    (INNER_VABLE, super::LevelExit::Return(0)),
+                    (CALLER_VABLE, super::LevelExit::Exception),
+                ],
                 "one leave per level, none twice",
             );
         }
