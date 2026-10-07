@@ -5458,43 +5458,27 @@ where
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
                 .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
-            let target = frame
-                .jitcode
-                .exec
-                .call_descr_to_call_target
-                .get(&calldescr_idx)
+            let func = frame
+                .int_regs
+                .get(funcptr_reg as usize)
                 .copied()
+                .flatten()
+                .and_then(|op| ctx.box_bits(op))
                 .unwrap_or_else(|| {
-                    let func = frame
-                        .int_regs
-                        .get(funcptr_reg as usize)
-                        .copied()
-                        .flatten()
-                        .and_then(|op| ctx.box_bits(op))
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BC_RESIDUAL_CALL_*_V: funcptr slot \
-                             {funcptr_reg} is uninitialized"
-                            )
-                        });
-                    JitCallTarget::from_fnaddr(func)
+                    panic!(
+                        "BC_RESIDUAL_CALL_*_V: funcptr slot \
+                     {funcptr_reg} is uninitialized"
+                    )
                 });
+            let target = JitCallTarget::from_fnaddr(func);
             (target, args_i, args_r, args_f, calldescr, trace_descr)
         };
 
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
 
-        let trace_ptr = if target.trace_ptr.is_null() {
-            target.concrete_ptr
-        } else {
-            target.trace_ptr
-        };
-        let concrete_ptr = if target.concrete_ptr.is_null() {
-            trace_ptr
-        } else {
-            target.concrete_ptr
-        };
+        let trace_ptr = target.trace_ptr;
+        let concrete_ptr = target.concrete_ptr;
         let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
         if let Some(action) = refuse_walk_local_ref_args(
             ctx,
@@ -5829,43 +5813,27 @@ where
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
                 .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
-            let target = frame
-                .jitcode
-                .exec
-                .call_descr_to_call_target
-                .get(&calldescr_idx)
+            let func = frame
+                .int_regs
+                .get(funcptr_reg as usize)
                 .copied()
+                .flatten()
+                .and_then(|op| ctx.box_bits(op))
                 .unwrap_or_else(|| {
-                    let func = frame
-                        .int_regs
-                        .get(funcptr_reg as usize)
-                        .copied()
-                        .flatten()
-                        .and_then(|op| ctx.box_bits(op))
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BC_RESIDUAL_CALL_*_I: funcptr slot \
-                                 {funcptr_reg} is uninitialized"
-                            )
-                        });
-                    JitCallTarget::from_fnaddr(func)
+                    panic!(
+                        "BC_RESIDUAL_CALL_*_I: funcptr slot \
+                         {funcptr_reg} is uninitialized"
+                    )
                 });
+            let target = JitCallTarget::from_fnaddr(func);
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
 
-        let trace_ptr = if target.trace_ptr.is_null() {
-            target.concrete_ptr
-        } else {
-            target.trace_ptr
-        };
-        let concrete_ptr = if target.concrete_ptr.is_null() {
-            trace_ptr
-        } else {
-            target.concrete_ptr
-        };
+        let trace_ptr = target.trace_ptr;
+        let concrete_ptr = target.concrete_ptr;
         let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
         if let Some(action) = refuse_walk_local_ref_args(
             ctx,
@@ -6204,43 +6172,27 @@ where
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
                 .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
-            let target = frame
-                .jitcode
-                .exec
-                .call_descr_to_call_target
-                .get(&calldescr_idx)
+            let func = frame
+                .int_regs
+                .get(funcptr_reg as usize)
                 .copied()
+                .flatten()
+                .and_then(|op| ctx.box_bits(op))
                 .unwrap_or_else(|| {
-                    let func = frame
-                        .int_regs
-                        .get(funcptr_reg as usize)
-                        .copied()
-                        .flatten()
-                        .and_then(|op| ctx.box_bits(op))
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BC_RESIDUAL_CALL_*_R: funcptr slot \
-                                 {funcptr_reg} is uninitialized"
-                            )
-                        });
-                    JitCallTarget::from_fnaddr(func)
+                    panic!(
+                        "BC_RESIDUAL_CALL_*_R: funcptr slot \
+                         {funcptr_reg} is uninitialized"
+                    )
                 });
+            let target = JitCallTarget::from_fnaddr(func);
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
 
-        let trace_ptr = if target.trace_ptr.is_null() {
-            target.concrete_ptr
-        } else {
-            target.trace_ptr
-        };
-        let concrete_ptr = if target.concrete_ptr.is_null() {
-            trace_ptr
-        } else {
-            target.concrete_ptr
-        };
+        let trace_ptr = target.trace_ptr;
+        let concrete_ptr = target.concrete_ptr;
         let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
         if let Some(action) = refuse_walk_local_ref_args(
             ctx,
@@ -6535,43 +6487,27 @@ where
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
                 .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
-            let target = frame
-                .jitcode
-                .exec
-                .call_descr_to_call_target
-                .get(&calldescr_idx)
+            let func = frame
+                .int_regs
+                .get(funcptr_reg as usize)
                 .copied()
+                .flatten()
+                .and_then(|op| ctx.box_bits(op))
                 .unwrap_or_else(|| {
-                    let func = frame
-                        .int_regs
-                        .get(funcptr_reg as usize)
-                        .copied()
-                        .flatten()
-                        .and_then(|op| ctx.box_bits(op))
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BC_RESIDUAL_CALL_IRF_F: funcptr slot \
-                                 {funcptr_reg} is uninitialized"
-                            )
-                        });
-                    JitCallTarget::from_fnaddr(func)
+                    panic!(
+                        "BC_RESIDUAL_CALL_IRF_F: funcptr slot \
+                         {funcptr_reg} is uninitialized"
+                    )
                 });
+            let target = JitCallTarget::from_fnaddr(func);
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
 
-        let trace_ptr = if target.trace_ptr.is_null() {
-            target.concrete_ptr
-        } else {
-            target.trace_ptr
-        };
-        let concrete_ptr = if target.concrete_ptr.is_null() {
-            trace_ptr
-        } else {
-            target.concrete_ptr
-        };
+        let trace_ptr = target.trace_ptr;
+        let concrete_ptr = target.concrete_ptr;
         let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
         if let Some(action) = refuse_walk_local_ref_args(
             ctx,
@@ -6959,7 +6895,11 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        let (first_reg, target, args_i, args_r, calldescr, dst) = {
+        // `pyjitpl.py MIFrame.opimpl_conditional_call_ir_v` /
+        // `_opimpl_conditional_call_value` / `opimpl_record_known_result_*`:
+        // callee from the `i` funcbox, descr (with EffectInfo) from `d`.
+        let call_jitcode = self.frames.current_mut().jitcode.clone();
+        let (first_reg, target, args_i, args_r, calldescr, trace_descr, dst) = {
             let frame = self.frames.current_mut();
             let first_reg = frame.next_reg() as u16;
             let funcptr_reg = frame.next_reg() as u16;
@@ -6974,34 +6914,30 @@ where
                 args_r.push(JitCallArg::reference(frame.next_reg() as u16));
             }
             let calldescr_idx = frame.next_u16();
-            let calldescr = frame
-                .jitcode
+            let calldescr = call_jitcode
                 .descr_at(calldescr_idx as usize)
                 .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                 .expect("canonical cond/record descr is not BhDescr")
-                .as_calldescr()
-                .clone();
-            let target = frame
+                .as_calldescr();
+            let trace_descr = frame
                 .jitcode
-                .exec
-                .call_descr_to_call_target
-                .get(&calldescr_idx)
+                .descr_at(calldescr_idx as usize)
+                .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
+                .cloned()
+                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
+            let func = frame
+                .int_regs
+                .get(funcptr_reg as usize)
                 .copied()
+                .flatten()
+                .and_then(|op| ctx.box_bits(op))
                 .unwrap_or_else(|| {
-                    let func = frame
-                        .int_regs
-                        .get(funcptr_reg as usize)
-                        .copied()
-                        .flatten()
-                        .and_then(|op| ctx.box_bits(op))
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "canonical cond/record: funcptr slot {funcptr_reg} \
+                    panic!(
+                        "canonical cond/record: funcptr slot {funcptr_reg} \
                              is uninitialized"
-                            )
-                        });
-                    JitCallTarget::from_fnaddr(func)
+                    )
                 });
+            let target = JitCallTarget::from_fnaddr(func);
             let dst = if matches!(
                 bytecode,
                 jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I
@@ -7011,22 +6947,21 @@ where
             } else {
                 None
             };
-            (first_reg, target, args_i, args_r, calldescr, dst)
+            (
+                first_reg,
+                target,
+                args_i,
+                args_r,
+                calldescr,
+                trace_descr,
+                dst,
+            )
         };
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
             self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &[]);
-        let trace_ptr = if target.trace_ptr.is_null() {
-            target.concrete_ptr
-        } else {
-            target.trace_ptr
-        };
-        let concrete_ptr = if target.concrete_ptr.is_null() {
-            trace_ptr
-        } else {
-            target.concrete_ptr
-        };
+        let trace_ptr = target.trace_ptr;
+        let concrete_ptr = target.concrete_ptr;
         let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
-        let slot = target.effect_info_slot;
         match bytecode {
             jitcode::insns::BC_CONDITIONAL_CALL_IR_V => {
                 // `_opimpl_conditional_call_*`: skip only when the
@@ -7040,13 +6975,18 @@ where
                 if first_box.is_constant() && first_val == 0 {
                     // skip
                 } else {
-                    ctx.cond_call_void_typed(first_box, trace_ptr, &args, &arg_types, slot);
+                    ctx.cond_call_void_typed_with_descr(
+                        first_box,
+                        trace_ptr,
+                        &args,
+                        trace_descr.clone(),
+                    );
                     let mut allboxes: CallOpRefs = SmallVec::new();
                     allboxes.push(first_box);
                     allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                     allboxes.extend_from_slice(&args);
                     // `_record_helper_varargs` invalidates before it
-                    // appends. `cond_call_void_typed` only records.
+                    // appends. `cond_call_void_typed_with_descr` only records.
                     ctx.heapcache_invalidate_caches_varargs(
                         OpCode::CondCallN,
                         Some(&calldescr.extra_info),
@@ -7108,8 +7048,12 @@ where
                     }
                 } else {
                     let patch_pos = ctx.get_trace_position();
-                    let traced = ctx
-                        .cond_call_value_int_typed(first_box, trace_ptr, &args, &arg_types, slot);
+                    let traced = ctx.cond_call_value_int_typed_with_descr(
+                        first_box,
+                        trace_ptr,
+                        &args,
+                        trace_descr.clone(),
+                    );
                     let mut allboxes: CallOpRefs = SmallVec::new();
                     allboxes.push(first_box);
                     allboxes.push(ctx.const_int(trace_ptr as usize as i64));
@@ -7220,8 +7164,12 @@ where
                     }
                 } else {
                     let patch_pos = ctx.get_trace_position();
-                    let traced = ctx
-                        .cond_call_value_ref_typed(first_box, trace_ptr, &args, &arg_types, slot);
+                    let traced = ctx.cond_call_value_ref_typed_with_descr(
+                        first_box,
+                        trace_ptr,
+                        &args,
+                        trace_descr.clone(),
+                    );
                     let mut allboxes: CallOpRefs = SmallVec::new();
                     allboxes.push(first_box);
                     allboxes.push(ctx.const_int(trace_ptr as usize as i64));

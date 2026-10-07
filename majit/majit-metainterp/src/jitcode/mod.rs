@@ -609,17 +609,6 @@ pub(crate) fn global_build_jitcodes() -> &'static [std::sync::Arc<JitCode>] {
 pub struct JitCodeExecState {
     /// Descriptor pool — indexed by the 2-byte `j`/`d` argcode operand.
     pub descrs: Vec<RuntimeBhDescr>,
-    /// Sidetable mapping the canonical-call `d` argcode descriptor slot
-    /// back to pyre's full `JitCallTarget` (`{trace_ptr, concrete_ptr}`).
-    /// RPython stores the callable address in the `i` operand and the
-    /// signature/effect policy in the `d` operand. Pyre's runtime emitter
-    /// still has a trace/concrete pointer split, so this is the minimal
-    /// adaptation needed for trace recording while preserving the
-    /// RPython-shaped `residual_call_*_v` payload. Keying by descriptor
-    /// slot keeps the bridge per callsite; keying by int-const pool slot
-    /// would collapse distinct trace targets that share a concrete
-    /// pointer.
-    pub call_descr_to_call_target: indexmap::IndexMap<u16, JitCallTarget>,
     /// Bytecode offset of the `BC_JIT_MERGE_POINT(_C)` opcode byte for
     /// the dispatch JitCode emitted by `lower_dispatch_body`.  `None`
     /// for non-dispatch JitCodes (helpers, sub-arms). The LLBC route

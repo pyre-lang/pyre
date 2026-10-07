@@ -9070,16 +9070,16 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = RESIDUAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         let mut builder = JitCodeBuilder::new();
-        builder.load_const_i_value(0, 47);
+        let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
+            "symbolic_residual_after_concrete_residual",
+        ]);
+        builder.load_const_i_value(0, symbolic);
         let concrete_idx = builder.add_fn_ptr(residual_count_prefix as *const ());
         builder.residual_call_void_canonical_via_target_with_effect_info(
             concrete_idx,
             &[],
             residual_effect(majit_ir::descr::ExtraEffect::CannotRaise),
         );
-        let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
-            "symbolic_residual_after_concrete_residual",
-        ]);
         let symbolic_idx = builder.add_fn_ptr(symbolic as usize as *const ());
         builder.residual_call_void_canonical_via_target_with_effect_info(
             symbolic_idx,
@@ -9104,8 +9104,8 @@ mod tests {
             .nth(1)
             .expect("the second residual call is the symbolic target");
         // Make the funcptr operand dynamic from the static scan's point of
-        // view. The per-callsite target bridge still supplies the symbolic
-        // concrete pointer when the instruction executes.
+        // view. Register 0 carries the symbolic fnaddr when the instruction
+        // executes.
         jitcode.body_mut().code[symbolic_pc + 1] = 0;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Int]);

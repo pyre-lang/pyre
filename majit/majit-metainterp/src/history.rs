@@ -3808,14 +3808,14 @@ impl TraceCtx {
         )
     }
 
-    // ── conditional_call / record_known_result (jtransform.py _rewrite_op_cond_call, 292) ──
+    // ── conditional_call / record_known_result (jtransform.py _rewrite_op_cond_call) ──
 
     /// RPython pyjitpl.py opimpl_conditional_call_ir_v: emit CondCallN.
     ///
-    /// `slot` carries the per-callee `EffectInfo` classification produced
-    /// by the macro-time analyzer-equivalent at
-    /// `pyre-jit/src/jit/codewriter.rs::register_helper_fn_pointers`,
-    /// mirroring `call.py getcalldescr`'s analyzer chain output.
+    /// Leftover `opimpl_cond_call_void` still classifies the callee through
+    /// `JitCallTarget.effect_info_slot` (`call.py getcalldescr` extraeffect
+    /// without a decoded `d` operand). Canonical `opimpl_conditional_call_ir_v`
+    /// records the pool descr via [`Self::cond_call_void_typed_with_descr`].
     pub fn cond_call_void_typed(
         &mut self,
         condition: OpRef,
@@ -3824,16 +3824,32 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) {
+        let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
+        self.cond_call_void_typed_with_descr(condition, func_ptr, args, descr);
+    }
+
+    /// `pyjitpl.py MIFrame.opimpl_conditional_call_ir_v` records `condbox`
+    /// plus the `d` calldescr (`do_conditional_call` → `execute_varargs`).
+    pub fn cond_call_void_typed_with_descr(
+        &mut self,
+        condition: OpRef,
+        func_ptr: *const (),
+        args: &[OpRef],
+        descr: DescrRef,
+    ) {
         // `pyjitpl.py opimpl_conditional_call_ir_v` records `condbox`
         // itself, not a ConstInt snapshot of this iteration's value.
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
         let call_args = call_arg_boxes_prefixed(condition, func_ref, args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallN, &call_args, descr);
     }
 
     /// RPython pyjitpl.py opimpl_conditional_call_value_ir_i: emit CondCallValueI.
+    ///
+    /// Leftover `BC_COND_CALL_VALUE_INT` still rebuilds the descr from a
+    /// target slot. Canonical `BC_CONDITIONAL_CALL_VALUE_IR_I` records the
+    /// pool descr via [`Self::cond_call_value_int_typed_with_descr`].
     pub fn cond_call_value_int_typed(
         &mut self,
         value: OpRef,
@@ -3842,8 +3858,20 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Int, slot);
+        self.cond_call_value_int_typed_with_descr(value, func_ptr, args, descr)
+    }
+
+    /// `pyjitpl.py MIFrame.opimpl_conditional_call_value_ir_i` records
+    /// `valuebox` plus the `d` calldescr.
+    pub fn cond_call_value_int_typed_with_descr(
+        &mut self,
+        value: OpRef,
+        func_ptr: *const (),
+        args: &[OpRef],
+        descr: DescrRef,
+    ) -> OpRef {
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let call_args = call_arg_boxes_prefixed(value, func_ref, args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallValueI, &call_args, descr)
@@ -3857,8 +3885,12 @@ impl TraceCtx {
     /// arg must be a `ConstPtr` rather than a `ConstInt`.  Routing the
     /// raw pointer-as-i64 through `get_or_insert` would produce a
     /// `ConstInt` slot that aliases with any int constant of the same
-    /// numeric value (`history.py` `ConstInt` vs `:307 ConstPtr`
+    /// numeric value (`history.py` `ConstInt` vs `ConstPtr`
     /// pin distinct types at construction).
+    ///
+    /// Leftover `BC_COND_CALL_VALUE_REF` still rebuilds the descr from a
+    /// target slot. Canonical `BC_CONDITIONAL_CALL_VALUE_IR_R` records the
+    /// pool descr via [`Self::cond_call_value_ref_typed_with_descr`].
     pub fn cond_call_value_ref_typed(
         &mut self,
         value: OpRef,
@@ -3867,11 +3899,21 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        // `pyjitpl.py _opimpl_conditional_call_value` records `valuebox`
-        // (a Ref box). The caller must pass that box, not a ConstInt of
-        // this iteration's pointer bits.
-        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Ref, slot);
+        self.cond_call_value_ref_typed_with_descr(value, func_ptr, args, descr)
+    }
+
+    /// `pyjitpl.py MIFrame._opimpl_conditional_call_value` records `valuebox`
+    /// (a Ref box) plus the `d` calldescr. The caller must pass that box,
+    /// not a ConstInt of this iteration's pointer bits.
+    pub fn cond_call_value_ref_typed_with_descr(
+        &mut self,
+        value: OpRef,
+        func_ptr: *const (),
+        args: &[OpRef],
+        descr: DescrRef,
+    ) -> OpRef {
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let call_args = call_arg_boxes_prefixed(value, func_ref, args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallValueR, &call_args, descr)
