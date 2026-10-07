@@ -3064,6 +3064,17 @@ impl<S: JitState> JitDriver<S> {
         self.meta.is_tracing()
     }
 
+    /// True when this driver holds a `compile_and_run_once` /
+    /// `handle_guard_failure` attempt, including the walk window that
+    /// parks History in `compile_tracing` (`with_trace_ctx_and_framestack`).
+    /// Nested `bound_reached` parks through [`Self::park_nested_trace`]
+    /// when this is true (`warmstate.py bound_reached` builds a fresh
+    /// MetaInterp).
+    #[inline]
+    pub fn has_live_metainterp_attempt(&self) -> bool {
+        self.meta.has_live_metainterp_attempt()
+    }
+
     /// warmstate.py `cell.flags & JC_TRACING` for this green key.
     ///
     /// `maybe_compile_and_run` skips only a cell that is already being
@@ -6079,6 +6090,8 @@ impl<S: JitState> JitDriver<S> {
         _env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<DetailedDriverRunOutcome> {
+        // `maybe_compile_and_run`: `cell.flags & JC_TRACING` returns before
+        // `get_procedure_token()`.
         if self.cell_is_tracing(green_key) {
             return None;
         }
@@ -6893,12 +6906,9 @@ impl<S: JitState> JitDriver<S> {
         //
         // The cell-owned half of the entry decision is taken from that same
         // resolution rather than from later walks back to the cell it already
-        // found: `resolve_cell_key`, the token read and the `JC_TEMPORARY` test
-        // are three questions about ONE cell, and upstream asks all three off
-        // the single `cell` its chain walk bound
-        // (`WarmEnterState.maybe_compile_and_run` — "these few lines inline
-        // some logic that is also on the JitCell class, to avoid computing the
-        // hash several times"). The `compiled_loops` conjunct is still taken
+        // found. `warmstate.py maybe_compile_and_run` tests
+        // `JC_TRACING | JC_TEMPORARY` on that cell before
+        // `get_procedure_token()`. The `compiled_loops` conjunct is still taken
         // below, where the metadata's value is wanted anyway.
         //
         // Which shape the gate below takes, recorded before the token is moved
@@ -6911,6 +6921,10 @@ impl<S: JitState> JitDriver<S> {
             Some(token) => (green_key_hash, Some(token)),
             None => self.resolved_entry_procedure_token(green_key_hash, greenargs),
         };
+        // `warmstate.py maybe_compile_and_run`: `if cell.flags & JC_TRACING:
+        // return`. `opimpl_jit_merge_point` records the loop being traced;
+        // those back edges never reach `maybe_compile_and_run`. A sibling
+        // still ticks on the occupied door below.
         if self.cell_is_tracing(green_key) {
             return None;
         }
@@ -8460,7 +8474,9 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<DetailedDriverRunOutcome> {
-        if self.meta.is_tracing() {
+        // `warmstate.py maybe_compile_and_run`: only this cell's `JC_TRACING`
+        // returns. A live session on another key still ticks.
+        if self.cell_is_tracing(green_key) {
             return None;
         }
         if let Some(handled) =
@@ -8533,15 +8549,16 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
-        // Precondition: not entered while `is_tracing`.  The caller decides
-        // that a trace starts here, and one cannot start inside another.  So
-        // `sync_before` finds no recording context, writes no trace pointer,
-        // and the returns below have none to put back; the two
+        // Nested `compile_and_run_once` parks the outer attempt first
+        // (`NestedTraceGuard` / `park_nested_trace`; `warmstate.py`
+        // `bound_reached` constructs a new MetaInterp). Incremental
+        // `function_entry_internal` has no such park: `MetaInterp::force_start_tracing`
+        // refuses the start so the outer attempt is not clobbered.
+        // After a park, `sync_before` finds no recording context, writes no
+        // trace pointer, and the returns below have none to put back; the two
         // `run_compiled_detailed_*` runners carry the save/restore instead,
         // because a walk does reach those.  `initialize_virtualizable` seeds
         // the cell on the context this call is about to build.
-        // Nested `compile_and_run_once` parks the outer attempt first
-        // (`warmstate.py` `bound_reached` constructs a new MetaInterp).
         let saved_vable_ptr = self
             .meta
             .tracing
@@ -8658,6 +8675,10 @@ impl<S: JitState> JitDriver<S> {
             (state.code_ptr(), target_pc),
         ) {
             HotResult::StartTracing => {
+                // Overflow of a sibling while another trace is live. Incremental
+                // drivers have no `NestedTraceGuard`; `bound_reached` refuses
+                // the start so the outer attempt is not clobbered. The tick
+                // already ran in `on_back_edge_typed_decision`.
                 self.commit_start_tracing(green_key, greenargs, target_pc, state, env)
             }
             _ => false,
@@ -10822,6 +10843,9 @@ impl<S: JitState> JitDriver<S> {
                 if majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full() {
                     return None;
                 }
+                // `function_entry_step` already ticked. Incremental drivers
+                // have no `NestedTraceGuard`; `MetaInterp::force_start_tracing`
+                // refuses the start when an outer attempt is live.
                 self.force_start_tracing(
                     cell_key,
                     Some((green_values, green_types)),
@@ -12492,6 +12516,38 @@ mod tests {
         assert!(driver.last_bridge_is_exception_guard);
         assert_eq!(driver.meta.last_exc_value, 0xA000);
         assert_eq!(driver.meta.portal_call_depth, 3);
+    }
+
+    /// `with_trace_ctx_and_framestack` parks History in `compile_tracing`
+    /// while `profiler_tracing_active` stays set (`pyjitpl.py`
+    /// `compile_and_run_once` keeps `start_tracing` open across
+    /// `interpret`). Nested `bound_reached` still parks that attempt.
+    #[test]
+    fn park_nested_trace_parks_compile_tracing_walk_window() {
+        let mut driver = JitDriver::<CountingDoorState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = CountingDoorState::default();
+        driver.force_start_tracing(2166, None, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(driver.meta.profiler_tracing_active);
+        driver.meta.compile_tracing = driver.meta.tracing.take();
+        assert!(!driver.is_tracing());
+        assert!(driver.has_live_metainterp_attempt());
+
+        driver.park_nested_trace();
+        assert!(!driver.has_live_metainterp_attempt());
+        assert!(!driver.meta.profiler_tracing_active);
+        assert!(driver.meta.compile_tracing.is_none());
+
+        driver.force_start_tracing(2167, None, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(driver.meta.profiler_tracing_active);
+
+        driver.close_bound_reached_attempt(2167);
+        driver.restore_nested_trace();
+        assert!(driver.meta.compile_tracing.is_some());
+        assert!(driver.meta.profiler_tracing_active);
+        assert!(!driver.is_tracing());
     }
 
     /// `warmstate.py bound_reached` finally drops the throwaway MetaInterp.
@@ -16719,6 +16775,172 @@ mod tests {
                 .is_none(),
             "an unenterable cell reports the same `None` as a cell with no code at all",
         );
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: `JC_TRACING` returns before
+    /// `get_procedure_token()`. A compiled cell that is already being traced
+    /// is not entered.
+    #[test]
+    fn back_edge_does_not_enter_compiled_code_while_cell_is_tracing() {
+        let (mut driver, hash, key, mut state) = compiled_structured_back_edge_fixture();
+        {
+            let cell = driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key_mut(hash)
+                .expect("fixture installed a compiled cell");
+            cell.flags
+                .set(cell.flags.get() | crate::warmstate::JcFlags::JC_TRACING);
+        }
+        assert!(driver.cell_is_tracing(hash));
+        assert!(driver.has_compiled_loop(hash));
+
+        let compiled_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_entries = Arc::clone(&compiled_entries);
+        driver.set_on_compiled_entry(move |_, _| {
+            counted_entries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let outcome = driver.back_edge_structured(
+            hash,
+            &key.values,
+            (GreenSlotInt, GreenSlotInt, GreenSlotRef),
+            19,
+            &mut state,
+            &(),
+            || panic!("JC_TRACING must not reach the compiled pre-run"),
+        );
+        assert!(
+            outcome.is_none(),
+            "JC_TRACING returns before get_procedure_token"
+        );
+        assert_eq!(
+            compiled_entries.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a tracing cell must not enter its procedure token"
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: only this cell's `JC_TRACING`
+    /// returns. A compiled sibling is still entered while a live session
+    /// occupies a different key.
+    #[test]
+    fn back_edge_or_run_compiled_is_per_cell_not_global_tracing() {
+        let (mut driver, hash, _key, mut state) = compiled_structured_back_edge_fixture();
+        let other = hash.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        driver.force_start_tracing(other, None, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(driver.cell_is_tracing(other));
+        assert!(!driver.cell_is_tracing(hash));
+        assert!(driver.has_runnable_compiled_loop(hash));
+
+        let compiled_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_entries = Arc::clone(&compiled_entries);
+        driver.set_on_compiled_entry(move |_, _| {
+            counted_entries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let outcome = driver.back_edge_or_run_compiled_keyed(hash, 19, &mut state, &(), || {});
+        assert!(
+            outcome.is_some() || compiled_entries.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "global is_tracing must not suppress a compiled sibling cell"
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: a sibling cell still ticks while
+    /// another cell traces. Occupied (ii) path: `back_edge_or_run_compiled`
+    /// → `maybe_start_tracing` → `on_back_edge_typed_decision`. Incremental
+    /// drivers have no `NestedTraceGuard`, so overflow refuses the start.
+    #[test]
+    fn back_edge_or_run_compiled_ticks_a_sibling_while_another_cell_traces() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = GreenKey::new(vec![0x51C2]);
+        let sibling = key.get_uhash();
+        attach_tmp_callback_cell_for_key(&mut driver, &key);
+        let mut state = TypedRestoreState::default();
+        let other = sibling.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        driver.force_start_tracing(other, None, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(driver.cell_is_tracing(other));
+        assert!(!driver.cell_is_tracing(sibling));
+
+        let increment = driver
+            .meta
+            .warm_state_for_driver(0)
+            .counter
+            .compute_threshold(2);
+        assert!(
+            !driver
+                .meta
+                .warm_state_for_driver(0)
+                .counter
+                .would_tick_fire(sibling, increment),
+            "fixture: sibling has not been counted yet"
+        );
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(sibling, 19, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .counter
+                .would_tick_fire(sibling, increment),
+            "a sibling tmp cell must tick while another cell is tracing"
+        );
+        assert!(driver.is_tracing());
+        assert!(driver.cell_is_tracing(other));
+        assert!(
+            !driver.cell_is_tracing(sibling),
+            "incremental commit_start_tracing has no NestedTraceGuard; refuse the start"
+        );
+    }
+
+    /// Same (ii) occupied tick as the `back_edge_or_run_compiled` sibling,
+    /// through `can_enter_jit!` / `back_edge_keyed`.
+    #[test]
+    fn back_edge_keyed_ticks_a_sibling_while_another_cell_traces() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = GreenKey::new(vec![0x51C3]);
+        let sibling = key.get_uhash();
+        attach_tmp_callback_cell_for_key(&mut driver, &key);
+        let mut state = TypedRestoreState::default();
+        let other = sibling.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        driver.force_start_tracing(other, None, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(!driver.cell_is_tracing(sibling));
+
+        let increment = driver
+            .meta
+            .warm_state_for_driver(0)
+            .counter
+            .compute_threshold(2);
+        assert!(
+            !driver
+                .meta
+                .warm_state_for_driver(0)
+                .counter
+                .would_tick_fire(sibling, increment)
+        );
+        assert!(
+            driver
+                .back_edge_keyed(sibling, 0, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .counter
+                .would_tick_fire(sibling, increment),
+            "a sibling tmp cell must tick while another cell is tracing"
+        );
+        assert!(driver.cell_is_tracing(other));
+        assert!(!driver.cell_is_tracing(sibling));
     }
 }
 
