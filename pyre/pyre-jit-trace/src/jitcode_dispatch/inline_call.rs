@@ -3738,7 +3738,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         )
     } else {
         ctx.trace_ctx
-            .record_op_with_descr(OpCode::CallMayForceR, &allboxes, portal_descr)
+            .record_op_with_descr(OpCode::CallMayForceR, &allboxes, portal_descr.clone())
     };
     if let ResidualExecOutcome::Executed(Ok(result)) = exec {
         ctx.trace_ctx.set_opref_concrete(
@@ -16009,10 +16009,11 @@ fn descend_generatorentry<Sym: WalkSym>(
     // route `emit_walker_loop_callee_call_assembler` takes). A raw call
     // left the callee's frame seeded as this walk's vable, and the next
     // snapshot wrote that frame's slot count into the caller's array.
+    let allboxes = [funcptr, iter_op];
     let exec = try_execute_residual_call_via_executor(
         ctx,
         OpCode::CallMayForceR,
-        &[funcptr, iter_op],
+        &allboxes,
         call_descr,
         OpRef::NONE,
         op.pc,

@@ -17813,6 +17813,436 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
     assert_eq!(&live[2..], initial_boxes.as_slice());
 }
 
+/// An inlined callee's first `jit_merge_point` with
+/// `seen_loop_header_for_jdindex < 0` continues tracing
+/// (`opimpl_jit_merge_point`: `if portal_call_depth: return`). The recursive
+/// `finishframe` + `do_recursive_call(assembler_call=True)` arm waits for a
+/// `loop_header` stamp. Cutting at this first visit residualizes the callee
+/// body (`f_locals` as a may-force call) and aborts `ABORT_ESCAPE`.
+#[test]
+fn jit_merge_point_inlined_first_visit_continues_before_loop_header() {
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte, 0x00, // c: jdindex
+        0x01, 0x00, // gi: len=1, [i0 = next_instr]
+        0x01, 0x00, // gr: len=1, [r0 = pycode]
+        0x00, // gf: len=0
+        0x00, // ri: len=0
+        0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
+        0x00, // rf: len=0
+    ];
+    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    let next_instr = tc.const_int(42);
+    let pycode = tc.const_ref(0x1_0000);
+    let red0 = tc.const_ref(0x2_0000);
+    let red1 = tc.const_ref(0x3_0000);
+    let regs_i = vec![next_instr];
+    let regs_r = vec![pycode, red0, red1];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().framestack.push(InlineFrame {
+        is_portal: false,
+        w_code: 0x1_0000,
+        recursion_greenkey: true,
+        call_id: 1,
+        debug_merge_point_py_pc: None,
+        parents: Vec::new(),
+        entry_executed_effects: 0,
+        live: None,
+    });
+    let mut mode = test_fbw_mode();
+    mode.inline_subwalk = true;
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    let (outcome, next) = step(&code, 0, &mut wc).expect("inlined jit_merge_point must dispatch");
+    assert_eq!(next, code.len());
+    assert_eq!(
+        wc.trace_ctx.seen_loop_header_for_jdindex, -1,
+        "first visit must not auto-stamp a loop_header under portal_call_depth"
+    );
+    match outcome {
+        DispatchOutcome::Continue => {}
+        other => panic!("inlined first visit must continue tracing, got {other:?}"),
+    }
+}
+
+/// After a `loop_header` stamp, inlined `opimpl_jit_merge_point` always
+/// `do_recursive_call(assembler_call=True)` (`get_assembler_token`,
+/// `compile_tmp_callback` if the cell has no loop yet).
+#[test]
+fn inlined_loop_header_call_assembler_uses_tmp_callback_without_compiled_loop() {
+    let code_ptr = 0x1_0000 as *const ();
+    let header_py = 13;
+    match inlined_loop_header_call_assembler(code_ptr, header_py, false) {
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            assert_eq!(target_pc, header_py);
+            // No driver in this harness: `get_assembler_token` has nothing
+            // to install, so the token is `None` and the drain still
+            // residualizes the portal runner. With a driver the same
+            // helper returns a `compile_tmp_callback` token.
+            let _ = token;
+        }
+        other => panic!("after loop_header the inlined merge point CALL_ASSEMBLERs, got {other:?}"),
+    }
+}
+
+/// `opimpl_jit_merge_point` inlined branch: `should_unroll_one_iteration`
+/// (`interp_jit.py`) plus `MIFrame.unroll_iterations`. A generator at
+/// `portal_call_depth > 0` follows once then cuts; a plain function cuts
+/// immediately; depth 0 never consumes.
+#[test]
+fn inlined_should_unroll_one_iteration_follows_once_then_cuts() {
+    use pyre_interpreter::{CodeFlags, ConstantData, Mode, compile_source};
+
+    fn first_function_code(src: &str) -> pyre_interpreter::CodeObject {
+        let module = compile_source(src, Mode::Exec).expect("compile");
+        module
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("source should contain a function")
+    }
+
+    let generator = first_function_code("def g():\n    yield 1\n");
+    assert!(
+        generator
+            .flags
+            .intersects(CodeFlags::COROUTINE | CodeFlags::GENERATOR),
+        "yield body must set CO_GENERATOR"
+    );
+    let plain = first_function_code("def f():\n    return 1\n");
+    assert!(
+        !plain
+            .flags
+            .intersects(CodeFlags::COROUTINE | CodeFlags::GENERATOR),
+        "plain function must not unroll"
+    );
+
+    let pair = crate::state::ensure_trace_test_driver();
+    let jitcode = std::sync::Arc::new(majit_metainterp::JitCodeBuilder::default().finish());
+    {
+        let meta = pair.0.meta_interp_mut();
+        meta.framestack.frames.clear();
+        meta.framestack
+            .push(majit_metainterp::MIFrame::new(jitcode, 0));
+        meta.portal_call_depth = 0;
+        assert_eq!(meta.framestack.frames.last().unwrap().unroll_iterations, 1);
+    }
+
+    assert!(
+        !inlined_should_unroll_one_iteration(&generator),
+        "depth 0 never consumes"
+    );
+    {
+        let meta = pair.0.meta_interp_mut();
+        assert_eq!(
+            meta.framestack.frames.last().unwrap().unroll_iterations,
+            1,
+            "depth 0 must leave MIFrame.unroll_iterations"
+        );
+        meta.portal_call_depth = 1;
+    }
+
+    assert!(
+        !inlined_should_unroll_one_iteration(&plain),
+        "plain function cuts immediately"
+    );
+    {
+        let meta = pair.0.meta_interp_mut();
+        assert_eq!(
+            meta.framestack.frames.last().unwrap().unroll_iterations,
+            1,
+            "plain function must not consume unroll_iterations"
+        );
+    }
+
+    assert!(
+        inlined_should_unroll_one_iteration(&generator),
+        "generator at portal_call_depth > 0 follows once"
+    );
+    {
+        let meta = pair.0.meta_interp_mut();
+        assert_eq!(meta.framestack.frames.last().unwrap().unroll_iterations, 0);
+    }
+    assert!(
+        !inlined_should_unroll_one_iteration(&generator),
+        "second generator crossing cuts"
+    );
+    {
+        let meta = pair.0.meta_interp_mut();
+        assert_eq!(meta.framestack.frames.last().unwrap().unroll_iterations, 0);
+        meta.portal_call_depth = 0;
+        meta.framestack.frames.clear();
+    }
+}
+
+/// `opimpl_jit_merge_point` inlined arm: stamp clear + unroll test before
+/// `get_assembler_token`. A generator that still has `unroll_iterations`
+/// continues without minting a cell token.
+#[test]
+fn inlined_merge_point_recursive_call_unrolls_without_minting_token() {
+    use pyre_interpreter::{
+        CodeFlags, ConstantData, Mode, compile_source, w_code_get_ptr, w_code_new,
+    };
+
+    fn first_function_code(src: &str) -> pyre_interpreter::CodeObject {
+        let module = compile_source(src, Mode::Exec).expect("compile");
+        module
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("source should contain a function")
+    }
+
+    let generator = first_function_code("def g():\n    yield 1\n");
+    assert!(
+        generator
+            .flags
+            .intersects(CodeFlags::COROUTINE | CodeFlags::GENERATOR)
+    );
+    let w_code = w_code_new(Box::into_raw(Box::new(generator)) as *const ()) as *const ();
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    // `compiled_jitcode_lookup` drops empty-`code` skeletons. A `-live-`
+    // body makes the payload visible to the unroll test.
+    let mut builder = majit_metainterp::JitCodeBuilder::default();
+    let live_patch = builder.live_placeholder();
+    builder.patch_live_offset(live_patch, 0);
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(builder.finish());
+    pyjit.metadata.is_drained = true;
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit));
+    assert!(!installed.is_null());
+    let pjc = crate::state::pyjitcode_for_code(w_code).expect("installed PyJitCode");
+    assert!(!pjc.code_ptr.is_null());
+
+    let pair = crate::state::ensure_trace_test_driver();
+    let jitcode = std::sync::Arc::new(majit_metainterp::JitCodeBuilder::default().finish());
+    {
+        let meta = pair.0.meta_interp_mut();
+        meta.framestack.frames.clear();
+        meta.framestack
+            .push(majit_metainterp::MIFrame::new(jitcode, 0));
+        meta.portal_call_depth = 1;
+        assert_eq!(meta.framestack.frames.last().unwrap().unroll_iterations, 1);
+    }
+
+    let header_py = 13;
+    let green_key = crate::driver::make_green_key(w_code, header_py, false);
+    assert!(
+        pair.0.get_loop_token_arc(green_key).is_none(),
+        "harness starts with no procedure token"
+    );
+
+    let mut tc = fresh_trace_ctx();
+    tc.seen_loop_header_for_jdindex = 0;
+    tc.seen_loop_header_jit_pc = Some(7);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let op = crate::jitcode_runtime::DecodedOp {
+        key: "jit_merge_point/cIRFIRF",
+        opname: "jit_merge_point",
+        argcodes: "cIRFIRF",
+        pc: 0,
+        next_pc: 11,
+    };
+
+    let (outcome, next) =
+        inlined_merge_point_recursive_call(&mut wc, w_code as usize, header_py, false, false, &op)
+            .expect("unroll path must return an outcome");
+    assert_eq!(next, op.next_pc);
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    assert!(wc.trace_ctx.seen_loop_header_jit_pc.is_none());
+    match outcome {
+        DispatchOutcome::Continue => {}
+        other => panic!("generator unroll must continue tracing, got {other:?}"),
+    }
+    {
+        let meta = pair.0.meta_interp_mut();
+        assert_eq!(meta.framestack.frames.last().unwrap().unroll_iterations, 0);
+        meta.portal_call_depth = 0;
+        meta.framestack.frames.clear();
+    }
+    assert!(
+        pair.0.get_loop_token_arc(green_key).is_none(),
+        "unroll must not mint a procedure token"
+    );
+}
+
+/// `opimpl_jit_merge_point` inlined arm: after the unroll test fails,
+/// `do_recursive_call(assembler_call=True)` still runs when
+/// `get_assembler_token` has no cell (`compile_tmp_callback` is a later
+/// side effect). `None` residualizes the portal runner.
+#[test]
+fn inlined_merge_point_recursive_call_transitions_with_none_token() {
+    use pyre_interpreter::{ConstantData, Mode, compile_source, w_code_new};
+
+    fn first_function_code(src: &str) -> pyre_interpreter::CodeObject {
+        let module = compile_source(src, Mode::Exec).expect("compile");
+        module
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("source should contain a function")
+    }
+
+    // Live W_Code, no installed PyJitCode: unroll lookup is None and the
+    // recursive-call arm still surfaces. A fake pointer would fault in
+    // `pyjitcode_for_code` (`w_code_get_ptr`).
+    let plain = first_function_code("def f():\n    return 1\n");
+    let w_code = w_code_new(Box::into_raw(Box::new(plain)) as *const ()) as *const ();
+
+    let mut tc = fresh_trace_ctx();
+    tc.seen_loop_header_for_jdindex = 0;
+    tc.seen_loop_header_jit_pc = Some(7);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let op = crate::jitcode_runtime::DecodedOp {
+        key: "jit_merge_point/cIRFIRF",
+        opname: "jit_merge_point",
+        argcodes: "cIRFIRF",
+        pc: 3,
+        next_pc: 11,
+    };
+    let header_py = 13;
+    let (outcome, next) =
+        inlined_merge_point_recursive_call(&mut wc, w_code as usize, header_py, false, false, &op)
+            .expect("inlined merge point must transition even without a token");
+    assert_eq!(next, op.next_pc);
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    assert!(wc.trace_ctx.seen_loop_header_jit_pc.is_none());
+    match outcome {
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            assert_eq!(target_pc, header_py);
+            // `get_assembler_token` may still be None here (no portal
+            // runner / failed `compile_tmp_callback`). The drain
+            // residualizes the portal runner either way.
+            let _ = token;
+        }
+        other => panic!("expected SubLoopCalleeCallAssembler, got {other:?}"),
+    }
+}
+
 /// `loop_header/i` stamps `seen_loop_header_for_jdindex` from its
 /// int-constant operand and records nothing (pyjitpl.py).
 #[test]
