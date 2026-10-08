@@ -7,7 +7,8 @@
 //! so those calls stay `Ref`. An integer cast to a non-byte raw scalar
 //! stays in the int bank.
 //!
-//! A byte pointer stays `Ref`: pyre erases a GC reference to `*mut u8`.
+//! A byte pointer is `int`: `*mut u8` is `rffi.CCHARP`, and
+//! `history.py` `getkind` banks every raw `Ptr` as `int`.
 //!
 //! A call that passes `&` / `&mut` of a primitive into a raw
 //! scalar-pointer parameter materializes an address first
@@ -410,7 +411,7 @@ fn sizehint_i64_cast_stays_gcarray_write() {
 }
 
 #[test]
-fn call_returned_byte_pointer_stays_ref() {
+fn call_returned_byte_pointer_stays_int() {
     let llbc = load_llbc(OBJECT_LLBC);
     let graph = lower_named(llbc, "gc_hook::try_gc_alloc_young_nonmoving_raw")
         .expect("lower try_gc_alloc_young_nonmoving_raw");
@@ -425,8 +426,10 @@ fn call_returned_byte_pointer_stays_ref() {
         graph.name
     );
     assert!(
-        byte_calls.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
-        "*mut u8 call result stays Ref, got {byte_calls:?} in {}",
+        byte_calls
+            .iter()
+            .all(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
+        "*mut u8 call result is int (`rffi.CCHARP`), got {byte_calls:?} in {}",
         graph.name
     );
 }

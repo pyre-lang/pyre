@@ -9447,11 +9447,10 @@ fn pygraph_initial_block(
         // so `&i64` is not a GC ref: `Rvalue::Ref` aliases the scalar
         // and `history.py` `getkind` banks it as `int`. Recording
         // `Ref(None)` makes `FUNC.ARGS` disagree with that caller.
-        // A raw pointer to a wider scalar is `int` (`getkind` of a raw
-        // `Ptr`). A byte pointer stays `Ref`: pyre erases a GC
-        // reference to `*mut u8`. A nested `Ref` of a primitive (`&&i64`,
-        // `PartialOrd<&B> for &A`) is the same scalar. See
-        // [`tyref_scalar_pointee_value_type`] /
+        // A raw pointer to a scalar is `int` (`getkind` of a raw
+        // `Ptr`), including `*mut u8` (`rffi.CCHARP`). A nested `Ref`
+        // of a primitive (`&&i64`, `PartialOrd<&B> for &A`) is the same
+        // scalar. See [`tyref_scalar_pointee_value_type`] /
         // [`tyref_nested_ref_to_scalar_value_type`].
         //
         // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
@@ -9712,8 +9711,8 @@ impl<'a> Lowering<'a> {
             // `Arg<T>` stays Void (`tyref_is_bytecode_arg_marker`).
             // Same banks as [`pygraph_initial_block`]: a reference to a
             // primitive is the scalar word (`history.py` `getkind` of
-            // `&i64` is `int`), and a raw pointer to a wider scalar is
-            // `int`. A byte pointer stays `Ref`.
+            // `&i64` is `int`), and a raw pointer to a scalar is
+            // `int`, including `*mut u8` (`rffi.CCHARP`).
             //
             // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
             // (the same kind as a GC impl in the family). See
@@ -13152,7 +13151,7 @@ impl<'a> Lowering<'a> {
     /// [`attach_aliasing_raw_arguments`] passes the spill address when
     /// that pointer names the spilled place. An `&mut i64` parameter
     /// is the word on both sides and is left alone. A byte pointer
-    /// stays `Ref`.
+    /// (`*mut u8`, `rffi.CCHARP`) is `int`.
     /// A by-value multi-word argument is the address of its storage.
     /// RPython never passes a struct by value: a GcStruct is a pointer
     /// (`'r'`), a non-GC Struct is `Ptr` (`'i'`). Kind comes from
@@ -15197,14 +15196,33 @@ impl<'a> Lowering<'a> {
                                 {
                                     self.cast_ptr_to_int_src.insert(res.clone(), arg.clone());
                                 }
-                                (
-                                    Some(OpKind::Call {
-                                        target: CallTarget::function_path(segments),
-                                        args: crate::model::call_args(vec![arg]),
-                                        result_ty: dst_kind,
-                                    }),
-                                    res,
-                                )
+                                let bank = OpKind::Call {
+                                    target: CallTarget::function_path(segments),
+                                    args: crate::model::call_args(vec![arg.clone()]),
+                                    result_ty: dst_kind.clone(),
+                                };
+                                // Address → GC struct is `lltype.cast_adr_to_ptr`.
+                                // `cast_int_to_ptr` is an opaque ref; paint
+                                // the dest class so a following `ptr::write`
+                                // finds the layout (`jtransform.py`
+                                // `rewrite_op_cast_opaque_ptr` already
+                                // folded `p as usize as *mut T` above).
+                                if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                                    && matches!(dst_kind, ValueType::Ref(_))
+                                    && let Some(kind) = self.instance_narrow_for_type(dest_ty, &res)
+                                {
+                                    self.graph.push_op_with_result_var(
+                                        self.block_id[mir_bb],
+                                        bank,
+                                        res,
+                                    );
+                                    let painted = self.graph.alloc_value_var_with_type(
+                                        crate::model::ConcreteType::Unknown,
+                                    );
+                                    (Some(kind), painted)
+                                } else {
+                                    (Some(bank), res)
+                                }
                             }
                             // Same bank (or a bank pair with no host cast
                             // callable): alias the operand — except a
@@ -15437,11 +15455,15 @@ impl<'a> Lowering<'a> {
             // change the JIT-visible kind collapse this way.
             Rvalue::Cast(kind, operand, ty) => {
                 // Classify the source BEFORE `resolve_operand` consumes
-                // `operand` (mirrors the `UnaryOp::Cast` twin above): only a
-                // Ref source may narrow or erase below.
+                // `operand` (mirrors the `UnaryOp::Cast` twin above). A
+                // Ref source may narrow or erase; a raw scalar pointer
+                // (`*mut u8`, `rffi.CCHARP`) is Int and still narrows
+                // (`lltype.cast_adr_to_ptr`).
                 let src_kind = self.operand_value_kind(&operand);
                 let src_root = self.operand_class_root(&operand);
                 let src_raw_addr = operand_is_declared_raw(&operand, self.llbc, self.gc_struct_ids);
+                let src_raw_scalar = operand_tyref(&operand)
+                    .is_some_and(|src| raw_scalar_address_value_type(src, self.llbc).is_some());
                 let src_int = operand_tyref(&operand).and_then(|src| self.literal_int_width(src));
                 let dst_int = self.literal_int_width(&ty);
                 let v = self.resolve_operand(mir_bb, operand)?;
@@ -15479,8 +15501,10 @@ impl<'a> Lowering<'a> {
                     return Ok((Some(op), res));
                 }
                 // `*mut Raw as *mut u8` / a GC pointer, and the reverse, cross
-                // the int and ref banks. Aliasing would reuse one variable in
-                // both argument lists.
+                // the int and ref banks. A scalar raw pointer (`*mut u8`,
+                // `rffi.CCHARP`) is the same Address word (`history.py`
+                // `getkind` of a raw `Ptr` is `'int'`). Aliasing would
+                // reuse one variable in both argument lists.
                 let dst_kind = tyref_to_value_type_with(
                     &ty,
                     self.llbc,
@@ -15488,8 +15512,11 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                 );
                 let dest_raw_addr = ty_is_raw_address(&ty, self.llbc, self.gc_struct_ids);
-                let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
-                    || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_raw_addr);
+                let dest_raw_scalar = raw_scalar_address_value_type(&ty, self.llbc).is_some();
+                let src_is_raw_addr = src_raw_addr || src_raw_scalar;
+                let dest_is_raw_addr = dest_raw_addr || dest_raw_scalar;
+                let crosses_raw_ref = (src_is_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
+                    || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_is_raw_addr);
                 if crosses_raw_ref
                     && let Some(src) = src_kind.as_ref()
                     && let Some(segments) = cast_call_segments(src, &dst_kind)
@@ -15535,24 +15562,22 @@ impl<'a> Lowering<'a> {
                         ));
                     }
                     // `cast_int_to_ptr` is an opaque ref. A following field
-                    // read needs the destination owner's class.
-                    if src_raw_addr
+                    // read needs the destination owner's class. A scalar
+                    // Address (`*mut u8` as `*mut PyFrame`) is the same
+                    // `lltype.cast_adr_to_ptr` as a raw-struct pointer.
+                    if src_is_raw_addr
                         && !matches!(src, ValueType::Ref(_))
-                        && let Some(dest_root) =
-                            tyref_class_root_with(&ty, self.llbc, self.tombstoned_leaves)
+                        && let Some(kind) = self.instance_narrow_for_type(&ty, &converted)
                     {
                         self.graph.push_op_with_result_var(
                             self.emit_bb(mir_bb),
                             bank,
-                            converted.clone(),
+                            converted,
                         );
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        return Ok((
-                            Some(crate::model::cast_instance_call(dest_root, converted)),
-                            res,
-                        ));
+                        return Ok((Some(kind), res));
                     }
                     return Ok((Some(bank), converted));
                 }
@@ -22410,6 +22435,7 @@ impl<'a> Lowering<'a> {
             owner_path,
             ctor_name,
             fields,
+            raw: tyref_is_raw_struct_value(dest_ty, self.llbc, self.gc_struct_ids),
         }))
     }
 
@@ -24792,13 +24818,12 @@ impl<'a> Lowering<'a> {
         // site's `FUNC.RESULT` matches (`call.rs`,
         // `ExecutionContext.force_all_frames`).
         //
-        // A raw pointer to a non-byte scalar is the address word.
-        // `history.py` `getkind` banks every raw `Ptr` as `int`, and
+        // A raw pointer to a scalar is the address word.
+        // `history.py` `getkind` banks every raw `Ptr` as `int`,
+        // including `*mut u8` (`rffi.CCHARP`), and
         // [`pygraph_initial_block`] already records that parameter as
         // `Int`. The call that produced the pointer uses the same bank.
-        // A byte pointer stays the `Ref` erasure of
-        // [`tyref_to_value_type_with`]: pyre erases a GC reference to
-        // `*mut u8`. A reference stays an address. Naming its pointee
+        // A reference stays an address. Naming its pointee
         // here would retype a call-returned `&T` to the scalar, and
         // `*dest` is `rewrite_op_raw_load`.
         //
@@ -28564,6 +28589,16 @@ impl<'a> Lowering<'a> {
                             op,
                             result_ty,
                         );
+                    }
+                    // A raw scalar pointer is already `int` (`history.py`
+                    // `getkind` of a raw `Ptr`). `cast_ptr_to_int` /
+                    // `cast_int_to_ptr` of that word is identity.
+                    if host_lltype_cast_is_int_identity(&path, src.as_ref(), &dst) {
+                        self.local_var[dest_local] = Some(LocalValue::One(args[0].clone()));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
                     }
                 }
                 // `llop.threadlocalref_get` / `threadlocalref_store`
@@ -44702,6 +44737,7 @@ impl<'a> Lowering<'a> {
                     ty: ValueType::Ref(None),
                 })
                 .collect(),
+            raw: false,
         };
         let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items);
         if self.multi_assigned_locals.contains(&dest_local) {
@@ -58478,11 +58514,11 @@ fn tyref_is_raw_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
 /// aliases the scalar, so a reference's flow value is that word and
 /// `history.py` `getkind` banks it as `int` or `float`. A raw pointer is
 /// the address: `getkind` banks every raw `Ptr` as `int`, including
-/// `*mut f64`. A byte pointer stays `None` (the caller keeps `Ref`):
-/// pyre erases a GC reference to `*mut u8` (`gc_hook::try_gc_write_barrier`,
-/// frame and dict storage). Returns `None` for a pointer to an ADT
-/// (`*mut PyObject`), a pointer to a pointer, and every non-pointer type.
-/// 128-bit primitives stay `None`: `getkind` rejects them.
+/// `*mut u8` (`rffi.CCHARP`) and `*mut f64`. The pointee's type decl
+/// decides gckind: `u8` is not a GC struct. Returns `None` for a
+/// pointer to an ADT (`*mut PyObject`), a pointer to a pointer, and
+/// every non-pointer type. 128-bit primitives stay `None`: `getkind`
+/// rejects them.
 fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let obj = node.as_object()?;
@@ -58510,15 +58546,6 @@ fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType>
         return None;
     }
     if is_raw {
-        let tag = scalar
-            .as_object()
-            .and_then(|obj| obj.get("Integer"))
-            .and_then(serde_json::Value::as_object)
-            .and_then(|int| int.get("Signed").or_else(|| int.get("Unsigned")))
-            .and_then(serde_json::Value::as_str);
-        if matches!(tag, Some("I8" | "U8")) {
-            return None;
-        }
         return Some(ValueType::Int);
     }
     Some(pointee_vt)
@@ -58657,9 +58684,9 @@ fn pointer_elem_pointee_is_gc(
 
 /// `history.py` `getkind`: a raw `Ptr` whose `TO` is itself a `Ptr` /
 /// `Ref` is the address of a slot (`rffi.CArray` of GCREF / Unsigned),
-/// hence `'int'`. A GC ADT pointer (`*mut PyObject`) and a byte pointer
-/// (`*mut u8`) stay off this arm so [`tyref_to_value_type_with`] keeps
-/// `Ref`.
+/// hence `'int'`. A GC ADT pointer (`*mut PyObject`) stays off this
+/// arm so [`tyref_to_value_type_with`] keeps `Ref`. A byte pointer
+/// (`*mut u8`) is the scalar-address arm (`rffi.CCHARP`).
 fn tyref_raw_ptr_points_at_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(mut pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
         return false;
@@ -58694,9 +58721,11 @@ fn tyref_raw_ptr_points_at_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
     false
 }
 
-/// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
+/// `getkind` of a raw `Ptr` whose pointee is a primitive.
 ///
-/// References return `None`. Their flow value stays the address;
+/// A raw pointer is the address word (`history.py` `getkind` of a raw
+/// `Ptr` is `'int'`), including `*mut u8` (`rffi.CCHARP`). References
+/// return `None`. Their flow value stays the address;
 /// [`tyref_scalar_pointee_value_type`] names the pointee for a parameter
 /// or a `Rvalue::Ref`, not for a call result.
 fn raw_scalar_address_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
@@ -64308,12 +64337,21 @@ fn adt_def_is_raw_storage(
     if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
         return false;
     }
-    // Same predicate `tyref_is_raw_struct_value` uses: RootScope is a
-    // class instance, so a field of that type is not a raw word. A
-    // container (`RootedItems`) that stores the guard would otherwise
-    // inherit Int and stamp FUNC.RESULT `i` while its `new` CFG
-    // constructs the instance (`r`).
+    // Type-decl lowleveltype (`rtyper.py` `getrepr` → `lowleveltype`).
+    // RootScope is a class instance, so a field of that type is not a
+    // raw word. Peel, field-layout spelling, and
+    // `tyref_is_raw_struct_value` read this. A container (`RootedItems`)
+    // that stores the guard would otherwise inherit Int and stamp
+    // FUNC.RESULT `i` while its `new` CFG constructs the instance (`r`).
     if gc_root_scope_type_path(&td.item_meta.name_path()) {
+        return false;
+    }
+    // A closure env is the callable (`tyref_keeps_callable_identity`),
+    // even when it has no fields or only captures another callable.
+    // Classifying it raw makes `call_once` `self` an Int and a captured
+    // callable field `getfield_raw_r` (`jtransform.py`
+    // `rewrite_op_getfield`).
+    if type_decl_is_closure_env(td) {
         return false;
     }
     let carrier = llbc.exception_carrier();
@@ -64334,6 +64372,14 @@ fn adt_def_is_raw_storage(
         TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
             .and_then(adt_node_def_id)
             .is_some_and(|id| adt_def_is_raw_storage(id, llbc, gc_struct_ids, stack)),
+        // A foreign `Opaque` decl has no field list. The linked scalar
+        // kind is that missing layout (`link_transparent_scalar_types`):
+        // peel and field-layout spelling consult this the same way a
+        // defining-crate `Struct` does (`rtyper.py` `getrepr` →
+        // `lowleveltype`).
+        TypeDeclKind::Opaque => llbc
+            .transparent_scalar_kind(&td.item_meta.name_path())
+            .is_some(),
         _ => false,
     };
     stack.pop();
@@ -64364,6 +64410,7 @@ fn tyref_is_raw_value(
 /// (`Ref`), and `pin_root` / `publish` dispatch on that instance. A
 /// defining-crate `Int` token against an opaque `Ref` dest is the
 /// `getcalldescr` `RESULT != FUNC.RESULT` wall on `push_roots`.
+/// `adt_def_is_raw_storage` is that type-decl classification.
 fn tyref_is_raw_struct_value(
     ty: &TyRef,
     llbc: &Llbc,
@@ -64378,10 +64425,9 @@ fn tyref_is_raw_struct_value(
     let Some(def_id) = adt_node_def_id(node) else {
         return false;
     };
-    llbc.type_by_id(def_id).is_some_and(|td| {
-        matches!(td.kind, TypeDeclKind::Struct(_))
-            && !gc_root_scope_type_path(&td.item_meta.name_path())
-    }) && declared_raw_adt_node(node, llbc, gc_struct_ids).is_some()
+    llbc.type_by_id(def_id)
+        .is_some_and(|td| matches!(td.kind, TypeDeclKind::Struct(_)))
+        && declared_raw_adt_node(node, llbc, gc_struct_ids).is_some()
 }
 
 fn field_ty_is_raw_word(
@@ -64396,11 +64442,26 @@ fn field_ty_is_raw_word(
     if node.get("Scalar").is_some() {
         return true;
     }
+    // A ZST occupies no GC storage. The empty tuple is unit
+    // (`is_unit_type`) even when Charon left no TypeDecl for it
+    // (`id: 0` null slot), so `tyref_is_zero_sized` cannot see a layout.
+    if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
+        return true;
+    }
     if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
         return pointee_is_raw_word(pointee, llbc, gc_struct_ids, stack);
     }
     if let Some(def_id) = adt_node_def_id(node) {
         if adt_path_is_gc_container(llbc, def_id) {
+            return false;
+        }
+        // A payload-carrying enum is a tagged instance (`getkind` ref).
+        // A field of that type is not a raw word: classifying the owner
+        // raw makes the read `getfield_raw_r` (`jtransform.py`
+        // `rewrite_op_getfield`). A fieldless enum stays the discriminant
+        // integer. `&mut RawEnum` still uses `adt_def_is_raw_storage`
+        // on the enum itself (`borrowed_pointee_is_raw_enum`).
+        if tyref_payload_enum_class_root_with(ty, llbc, no_tombstoned_leaves()).is_some() {
             return false;
         }
         return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, stack);
@@ -64762,6 +64823,13 @@ fn tyref_to_value_type_with(
     // int`).  `match self { .. }` on a C-like enum is the shape that hits it.
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
+    }
+    // `history.py` `getkind` of a raw `Ptr` is `int`. The pointee's
+    // type decl decides gckind: a scalar (`*mut u8`, `rffi.CCHARP`)
+    // is raw memory, a raw struct is an address, a GC struct stays
+    // `Ref` via the fallback below.
+    if let Some(raw) = raw_scalar_address_value_type(ty, llbc) {
+        return raw;
     }
     if ty_is_raw_address(ty, llbc, gc_struct_ids) {
         return ValueType::Int;
@@ -65786,9 +65854,9 @@ fn dont_look_inside_return_token(
     if is_unit_type(kind_src, llbc) {
         return None;
     }
-    // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
+    // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut u8`
+    // (`rffi.CCHARP`) and `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
-    // A byte pointer stays on the `ref` arm below.
     if raw_scalar_address_value_type(kind_src, llbc).is_some() {
         return Some("i64".to_string());
     }
@@ -67144,14 +67212,6 @@ fn tyref_transparent_inner_value_type(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(id)?;
-    // Same predicate `tyref_is_raw_struct_value` uses: RootScope is a
-    // class instance (`Ref`), not the word its one non-ZST field stores.
-    // Peeling it to `usize` stamps FUNC.RESULT `i` while the CFG
-    // constructs the instance (`r`). One lowleveltype per type
-    // (`rtyper` `getrepr` → `lowleveltype`; `getkind`).
-    if gc_root_scope_type_path(&decl.item_meta.name_path()) {
-        return None;
-    }
     // A foreign `Opaque` decl keeps `repr.transparent: false`: the defining
     // crate is outside the extraction set, so the layout does not record the
     // wrapper. The linked kind is that missing field.
@@ -67164,6 +67224,14 @@ fn tyref_transparent_inner_value_type(
         return Some(transparent_scalar_value_type(kind));
     }
     if !decl.is_repr_transparent() {
+        return None;
+    }
+    // A class instance keeps its lowleveltype (`rtyper.py` `getrepr` →
+    // `lowleveltype`; `getkind`). `adt_def_is_raw_storage` is that
+    // type-decl classification: peeling a non-raw owner to its inner
+    // word stamps FUNC.RESULT `i` while the CFG constructs the instance
+    // (`r`).
+    if !adt_def_is_raw_storage(id, llbc, gc_struct_ids, &mut Vec::new()) {
         return None;
     }
     match &decl.kind {
@@ -70622,12 +70690,13 @@ fn tyref_to_field_layout_string(
     let Some(decl) = llbc.type_by_id(id) else {
         return tyref_to_ast_string(ty, llbc);
     };
-    // Same predicate as `tyref_is_raw_struct_value` / the value-type
-    // peel: RootScope is the instance, not its `usize` save_point.
-    if gc_root_scope_type_path(&decl.item_meta.name_path()) {
+    if !decl.is_repr_transparent() {
         return tyref_to_ast_string(ty, llbc);
     }
-    if !decl.is_repr_transparent() {
+    // A class instance keeps its lowleveltype (`rtyper.py` `getrepr` →
+    // `lowleveltype`; `getkind`). `adt_def_is_raw_storage` is that
+    // type-decl classification: the instance is not its inner word.
+    if !adt_def_is_raw_storage(id, llbc, gc_struct_ids, &mut Vec::new()) {
         return tyref_to_ast_string(ty, llbc);
     }
     if let TypeDeclKind::Struct(fields) = &decl.kind
@@ -71650,8 +71719,8 @@ fn tyref_tuple_arity(ty: &TyRef, llbc: &Llbc) -> usize {
 
 /// Register kind of one aggregate field (`history.py` `getkind` of the
 /// field lltype). A raw `Ptr` whose `TO._gckind` is `raw` is `'int'`:
-/// `*mut usize` is the address word, `*mut *mut T` is a slot address.
-/// A byte pointer and a GC ADT pointer stay `Ref`.
+/// `*mut usize` and `*mut u8` (`rffi.CCHARP`) are address words,
+/// `*mut *mut T` is a slot address. A GC ADT pointer stays `Ref`.
 fn tyref_aggregate_field_value_type(ty: &TyRef, llbc: &Llbc, spelling: &str) -> ValueType {
     if let Some(raw) = raw_scalar_address_value_type(ty, llbc) {
         return raw;
@@ -72736,6 +72805,16 @@ pub(crate) fn host_rthread_threadlocalref_llop(path: &str) -> Option<ThreadLocal
         "majit_rlib::rthread::threadlocalref_store_int" => Some(ThreadLocalRefLlop::Store),
         _ => None,
     }
+}
+
+/// `cast_ptr_to_int` / `cast_int_to_ptr` of a word that is already
+/// `int`. `history.py` `getkind` banks a raw scalar `Ptr` (`*mut i64`,
+/// `*mut u8` / `rffi.CCHARP`) as `'int'`, so both sides of the host
+/// call share that bank.
+fn host_lltype_cast_is_int_identity(path: &str, src: Option<&ValueType>, dst: &ValueType) -> bool {
+    let is_cast = path_ends_with_segments(path, "lltype::cast_ptr_to_int")
+        || path_ends_with_segments(path, "lltype::cast_int_to_ptr");
+    is_cast && src.is_some_and(value_type_is_int_bank) && value_type_is_int_bank(dst)
 }
 
 #[cfg(test)]
@@ -76791,6 +76870,12 @@ pub(crate) struct AggregateCtor {
     ctor_name: String,
     /// One row per operand.
     fields: Vec<AggregateField>,
+    /// The destination is a by-value raw struct
+    /// (`tyref_is_raw_struct_value`). `history.py` `getkind` of that
+    /// `Ptr` is `'int'`, so the constructor result is Int. A `Ref`
+    /// result is `malloc(GcStruct)` and disagrees with FUNC.RESULT `i`
+    /// (`func_result_kind`).
+    raw: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76810,6 +76895,24 @@ struct AggregateField {
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
 /// values `args`, returning the constructed value.
 
+fn aggregate_ctor_result_bank(
+    ctor: &AggregateCtor,
+) -> (ValueType, crate::model::ConcreteType, Option<bool>) {
+    if ctor.raw {
+        (
+            ValueType::Int,
+            crate::model::ConcreteType::Signed,
+            Some(false),
+        )
+    } else {
+        (
+            ValueType::Ref(Some(ctor.result_owner.clone())),
+            crate::model::ConcreteType::Unknown,
+            None,
+        )
+    }
+}
+
 fn emit_aggregate_ctor_with_pairs(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -76820,13 +76923,14 @@ fn emit_aggregate_ctor_with_pairs(
     if pair_lens.iter().all(Option::is_none) {
         return emit_aggregate_ctor(graph, block, ctor, args);
     }
-    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let (result_ty, concrete, owner_declared_gc) = aggregate_ctor_result_bank(ctor);
+    let res = graph.alloc_value_var_with_type(concrete);
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::Call {
             target: ctor.target.clone(),
             args: Vec::new(),
-            result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+            result_ty,
         },
     });
     for (i, field) in ctor.fields.iter().enumerate() {
@@ -76848,7 +76952,8 @@ fn emit_aggregate_ctor_with_pairs(
                             Some(ctor.result_owner.clone()),
                         )
                         .with_owner_id(ctor.owner_id)
-                        .with_base_is_deref(false),
+                        .with_base_is_deref(false)
+                        .with_owner_declared_gc(owner_declared_gc),
                         value: crate::model::LinkArg::Value(value),
                         ty: ValueType::Unsigned,
                     },
@@ -76886,7 +76991,7 @@ fn emit_aggregate_ctor_with_pairs(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
-                    owner_declared_gc: None,
+                    owner_declared_gc,
                     host_index: None,
                     scalar_word: None,
                 },
@@ -76904,13 +77009,14 @@ fn emit_aggregate_ctor(
     ctor: &AggregateCtor,
     args: &[Variable],
 ) -> Variable {
-    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let (result_ty, concrete, owner_declared_gc) = aggregate_ctor_result_bank(ctor);
+    let res = graph.alloc_value_var_with_type(concrete);
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::Call {
             target: ctor.target.clone(),
             args: Vec::new(),
-            result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+            result_ty,
         },
     });
     for (field, value) in ctor.fields.iter().zip(args) {
@@ -76947,7 +77053,7 @@ fn emit_aggregate_ctor(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
-                    owner_declared_gc: None,
+                    owner_declared_gc,
                     host_index: None,
                     scalar_word: None,
                 },
@@ -83962,18 +84068,19 @@ mod tests {
     use super::{
         DecodedConst, FnPtrFamily, adt_field_read_value_type, bitflags_trait_empty_const,
         cast_call_segments, cast_kind_is_raw_ptr, cast_pointer_marker_op,
-        charon_type_value_to_ast_string, decode_literal, dont_look_inside_return_token,
-        fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
-        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        charon_type_value_to_ast_string, container_declared_gc, decode_literal,
+        dont_look_inside_return_token, fn_ptr_family_for, int_binop_needs_ptr_to_int,
+        is_class_pytype_assoc_const, is_core_result_map_err_path, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, no_tombstoned_leaves, positional_aggregate_field_rows,
         primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
         scalar_replace_named_struct_aggregates, scalar_to_const_value, shaped_array_parts,
         simplify_lowered_graph, static_key_segments, type_decl_is_closure_env,
         tyref_aggregate_field_value_type, tyref_array_suffix,
         tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-        tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type,
-        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
+        tyref_is_raw_byte_ptr, tyref_is_raw_struct_value, tyref_positional_aggregate_root,
+        tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
+        tyref_to_attr_value_type, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+        tyref_tuple_suffix,
     };
     use crate::flowspace::model::{ConstValue, Variable};
     use crate::model::{
@@ -93428,8 +93535,8 @@ mod tests {
         }));
         assert_eq!(
             tyref_aggregate_field_value_type(&byte, &llbc, ""),
-            ValueType::Ref(None),
-            "*mut u8 stays the GC-erasure Ref"
+            ValueType::Int,
+            "*mut u8 getkind is int (`rffi.CCHARP`)"
         );
     }
 
@@ -96247,8 +96354,8 @@ mod tests {
         let graph = super::lower_function(&llbc, "default_mut_ptr").expect("lower ptr default");
         let ops = graph_ops(&graph);
         assert!(
-            ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
-            "*mut T::default must become ConstRefNull; ops={ops:?}"
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+            "*mut T::default of a scalar pointee is the int-bank null (`rffi` raw `Ptr`); ops={ops:?}"
         );
         assert!(
             !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
@@ -99081,27 +99188,6 @@ mod tests {
         );
     }
 
-    fn assert_lltype_cast_call(ops: &[&SpaceOperation], name: &str) {
-        assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.last().is_some_and(|leaf| leaf == name)
-                    && segments.windows(2).any(|w| w[0] == "lltype" && w[1] == name)
-            )),
-            "{name} host call missing; ops={ops:?}"
-        );
-        assert!(
-            !ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::UnaryOp { op, .. } if op == name
-            )),
-            "{name} must not be a UnaryOp; ops={ops:?}"
-        );
-    }
-
     #[test]
     fn host_scalar_calls_project_to_llops() {
         let ptr_ty =
@@ -99162,7 +99248,21 @@ mod tests {
             let graph = super::lower_function(&llbc, func).expect(&lowered);
             let ops = graph_ops(&graph);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                assert_lltype_cast_call(&ops, name);
+                // `*mut i64` is already `int` (`history.py` `getkind`
+                // of a raw `Ptr`). `jtransform.py rewrite_op_cast_ptr_to_int`
+                // returns None (alias) when the arg is not GC.
+                assert!(
+                    !ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, .. }
+                            if *op == "cast_ptr_to_int" || *op == "cast_int_to_ptr"
+                    )),
+                    "{name} of a raw scalar pointer is identity; ops={ops:?}"
+                );
+                assert!(
+                    !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+                    "{name} of a raw scalar pointer must not residualize; ops={ops:?}"
+                );
             }));
             if let Err(payload) = result {
                 panic!("case {name}: {}", panic_payload_mir(&payload));
@@ -99969,9 +100069,10 @@ mod tests {
     }
 
     /// RootScope is a class instance (`Ref`) even when Charon records
-    /// `repr.transparent` over its `usize` save_point. The peel and
-    /// `tyref_is_raw_struct_value` share `gc_root_scope_type_path`
-    /// (`rtyper` `getrepr` → `lowleveltype`; `getkind`).
+    /// `repr.transparent` over its `usize` save_point. Peel, field-layout
+    /// spelling, and `tyref_is_raw_struct_value` read
+    /// `adt_def_is_raw_storage` (`rtyper.py` `getrepr` → `lowleveltype`;
+    /// `getkind`).
     #[test]
     fn root_scope_is_ref_even_when_layout_is_transparent_usize() {
         let decls = vec![(
@@ -100055,6 +100156,142 @@ mod tests {
         assert!(
             matches!(super::tyref_to_value_type(&items, &llbc), ValueType::Ref(_)),
             "RootedItems stores a RootScope instance; getkind is ref"
+        );
+    }
+
+    /// A by-value struct of raw words is that struct's address
+    /// (`history.py` `getkind` of a raw `Ptr` is `'int'`). The CFG
+    /// constructor (`emit_aggregate_ctor`) uses the same bank, so
+    /// `FUNC.RESULT` and `graph_result_kind` agree (`func_result_kind`).
+    #[test]
+    fn all_scalar_struct_is_raw_int() {
+        let decls = vec![(
+            1,
+            struct_decl(
+                1,
+                ident_path(&["fixture", "Cookie"]),
+                serde_json::json!([
+                    {
+                        "name": "a",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+                        "attr_info": null
+                    },
+                    {
+                        "name": "b",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+                        "attr_info": null
+                    }
+                ]),
+                false,
+            ),
+        )];
+        let (llbc, ty) = load_handle(decls, serde_json::json!([]), 1);
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
+        assert!(
+            super::tyref_is_raw_struct_value(&ty, &llbc, &std::collections::HashSet::new()),
+            "all-scalar struct is raw storage"
+        );
+    }
+
+    /// A payload-carrying enum is a tagged instance, so a struct that
+    /// stores one is not raw storage (`jtransform.py`
+    /// `rewrite_op_getfield` refuses `getfield_raw_r`).
+    #[test]
+    fn struct_storing_payload_enum_is_not_raw() {
+        let decls = vec![
+            (
+                1,
+                serde_json::json!({
+                    "def_id": 1,
+                    "item_meta": fixture_item_meta(ident_path(&["fixture", "Code"])),
+                    "kind": {"Enum": [
+                        {"name": "Pad", "fields": []},
+                        {"name": "Int", "fields": [{
+                            "name": "signed",
+                            "ty": {"Scalar": "Bool"},
+                            "attr_info": null
+                        }]}
+                    ]}
+                }),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["fixture", "Fmt"]),
+                    serde_json::json!([
+                        {
+                            "name": "code",
+                            "ty": {"Adt": {"id": 1, "generics": {"types": []}}},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "size",
+                            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                            "attr_info": null
+                        }
+                    ]),
+                    false,
+                ),
+            ),
+        ];
+        let (llbc, ty) = load_handle(decls, serde_json::json!([]), 2);
+        assert!(
+            matches!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)),
+            "struct storing a payload enum is a class instance"
+        );
+        assert!(
+            !super::tyref_is_raw_struct_value(&ty, &llbc, &std::collections::HashSet::new()),
+            "payload-enum field is not a raw word"
+        );
+    }
+
+    /// A raw pointer's gckind comes from the pointee type decl.
+    /// `*mut u8` is `rffi.CCHARP` (`history.py` `getkind` of a raw
+    /// `Ptr` is `'int'`), so a wrapper around it is raw storage and
+    /// the store is `setfield_raw_i`. A Ref field would be
+    /// `setfield_raw_r` (`jtransform.py` `rewrite_op_setfield`).
+    #[test]
+    fn struct_storing_byte_pointer_is_raw_int() {
+        let byte = serde_json::json!({
+            "RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]
+        });
+        let decls = vec![(
+            1,
+            struct_decl(
+                1,
+                ident_path(&["fixture", "FreeCharp"]),
+                serde_json::json!([{
+                    "name": "__pos_0",
+                    "ty": byte,
+                    "attr_info": null
+                }]),
+                false,
+            ),
+        )];
+        let (llbc, ty) = load_handle(decls, serde_json::json!([]), 1);
+        let byte_ty = TyRef::Other(serde_json::json!({
+            "RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]
+        }));
+        assert_eq!(
+            super::tyref_to_value_type(&byte_ty, &llbc),
+            ValueType::Int,
+            "*mut u8 getkind is int (`rffi.CCHARP`)"
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Int,
+            "wrapper of a raw byte pointer is that address"
+        );
+        assert!(
+            super::tyref_is_raw_struct_value(&ty, &llbc, &std::collections::HashSet::new()),
+            "byte-pointer field is a raw word"
         );
     }
 
@@ -105684,6 +105921,88 @@ mod tests {
         );
         assert!(!tyref_is_closure_env(&adt_ty(0), &llbc));
         assert!(tyref_is_closure_env(&adt_ty(1), &llbc));
+    }
+
+    fn llbc_with_nested_closure_envs() -> Llbc {
+        // def_id 0: capture-free env (`too_large`). def_id 1: env that
+        // stores that callable (` |_| too_large()`).
+        let file = serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": type_decl_meta(&["fixture", "index_c_int_w", "closure"]),
+                        "kind": {"Struct": []},
+                        "src": {"Closure": {"info": {"kind": "FnOnce"}}},
+                        "layout": [{
+                            "key": "fixture-target",
+                            "value": {
+                                "size": 8,
+                                "align": 8,
+                                "variant_layouts": [{"field_offsets": []}],
+                                "repr": {"repr_algo": "Rust", "transparent": false}
+                            }
+                        }]
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": type_decl_meta(&["fixture", "index_c_int_w", "closure#1"]),
+                        "kind": {"Struct": [{
+                            "name": null,
+                            "ty": {"Adt": {"id": 0, "generics": {"types": []}}},
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                        }]},
+                        "src": {"Closure": {"info": {"kind": "FnOnce"}}},
+                        "layout": [{
+                            "key": "fixture-target",
+                            "value": {
+                                "size": 8,
+                                "align": 8,
+                                "variant_layouts": [{"field_offsets": [0]}],
+                                "repr": {"repr_algo": "Rust", "transparent": false}
+                            }
+                        }]
+                    }
+                ],
+                "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    /// A closure env is the callable, not a raw struct. Capturing one
+    /// must not make the outer env `getfield_raw_r`
+    /// (`jtransform.py` `rewrite_op_getfield`; `rtyper.py` `getrepr` →
+    /// `lowleveltype`; `getkind`).
+    #[test]
+    fn closure_env_capturing_callable_is_ref_not_raw() {
+        let llbc = llbc_with_nested_closure_envs();
+        let empty = std::collections::HashSet::new();
+        let free = adt_ty(0);
+        let capturing = adt_ty(1);
+        assert!(
+            matches!(tyref_to_value_type(&free, &llbc), ValueType::Ref(_)),
+            "capture-free closure env is a callable, getkind ref"
+        );
+        assert!(
+            matches!(tyref_to_value_type(&capturing, &llbc), ValueType::Ref(_)),
+            "closure env storing a callable is a class instance, getkind ref"
+        );
+        assert!(
+            !tyref_is_raw_struct_value(&free, &llbc, &empty),
+            "capture-free closure env is not raw storage"
+        );
+        assert!(
+            !tyref_is_raw_struct_value(&capturing, &llbc, &empty),
+            "closure env storing a callable is not raw storage"
+        );
+        assert_eq!(
+            container_declared_gc(&capturing, &llbc, &empty),
+            Some(true),
+            "owner of a callable field is a GC instance"
+        );
     }
 
     #[test]
@@ -122957,6 +123276,7 @@ mod tests {
                 narrow_root: None,
                 ty: ValueType::Int,
             }],
+            raw: false,
         })
     }
 
@@ -123090,6 +123410,7 @@ mod tests {
                 narrow_root: None,
                 ty: ValueType::Int,
             }],
+            raw: false,
         })
     }
 
