@@ -441,6 +441,10 @@ pub fn root_stack_depth() -> usize {
 /// living across the bracketed allocation call. Dropping the scope
 /// executes the equivalent of `pop_roots(hop, livevars)` by rewinding
 /// the shadow stack to the length captured at construction time.
+/// The guard is its `save_point` word. `#[repr(transparent)]` is that
+/// declaration: the only sized field is the depth, and a borrow of the
+/// guard is that word (`history.py` `getkind` of a raw `Ptr` is `'int'`).
+#[repr(transparent)]
 #[must_use = "RootScope is the live-roots guard; dropping it pops the roots — \
               binding it to `_roots` makes the scope explicit, while binding \
               to `_` would pop immediately and defeat the bracket"]
@@ -466,11 +470,6 @@ impl RootScope {
     }
 
     /// First slot owned by this root bracket.
-    ///
-    /// Residual like every other `RootScope` method: a jitcode holds the
-    /// guard as its `save_point` word (see `root_scope_base_jit_abi`), so an
-    /// inlined body reading `self.save_point` would dereference that word.
-    #[majit_macros::dont_look_inside_cannot_raise]
     #[inline]
     pub fn base(&self) -> usize {
         self.save_point
@@ -650,11 +649,17 @@ pub fn root_scope_close(scope: &RootScope) {
 
 /// [`push_roots`]: the opened guard's `save_point`, handed out without a
 /// `Drop` — the jitcode's close is what rewinds it.
+///
+/// The body is the `save_point` [`RootScope::new`] captures. Constructing a
+/// `RootScope` here would `Drop` (or `ManuallyDrop::new`) in a looked-inside
+/// graph.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn push_roots_jit_abi() -> usize {
-    std::mem::ManuallyDrop::new(push_roots()).save_point
+    shadow_stack_len()
 }
 
 /// [`root_scope_close`] over the guard word.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn root_scope_close_jit_abi(save_point: usize) {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
@@ -663,6 +668,7 @@ pub extern "C" fn root_scope_close_jit_abi(save_point: usize) {
 
 /// Charon's `RootScope::drop_in_place` glue over the guard word; the same
 /// rewind as [`root_scope_close_jit_abi`].
+#[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn root_scope_drop_in_place_jit_abi(save_point: usize) {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
@@ -670,46 +676,46 @@ pub extern "C" fn root_scope_drop_in_place_jit_abi(save_point: usize) {
 }
 
 /// [`RootScope::base`] over the guard word.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn root_scope_base_jit_abi(save_point: usize) -> usize {
     save_point
 }
 
-/// Rebuild the guard a `&self` bridge forwards to.  `ManuallyDrop` keeps the
-/// borrowed word from rewinding the stack when the bridge returns.
-fn root_scope_from_word(save_point: usize) -> std::mem::ManuallyDrop<RootScope> {
-    std::mem::ManuallyDrop::new(RootScope {
-        save_point,
-        _not_send: PhantomData,
-    })
-}
-
-/// [`RootScope::pin_root`] over the guard word.
-pub extern "C" fn root_scope_pin_root_jit_abi(save_point: usize, root: PyObjectRef) -> PyObjectRef {
-    root_scope_from_word(save_point).pin_root(root)
+/// [`RootScope::pin_root`] over the guard word. The method uses the thread
+/// cell, not the save_point; forwarding to the free helper keeps a
+/// reconstructed `RootScope` (and its `ManuallyDrop`) out of the graph.
+pub extern "C" fn root_scope_pin_root_jit_abi(
+    _save_point: usize,
+    root: PyObjectRef,
+) -> PyObjectRef {
+    pin_root(root)
 }
 
 /// [`RootScope::get`] over the guard word.
-pub extern "C" fn root_scope_get_jit_abi(save_point: usize, index: usize) -> PyObjectRef {
-    root_scope_from_word(save_point).get(index)
+pub extern "C" fn root_scope_get_jit_abi(_save_point: usize, index: usize) -> PyObjectRef {
+    shadow_stack_get(index)
 }
 
 /// [`RootScope::set`] over the guard word.
-pub extern "C" fn root_scope_set_jit_abi(save_point: usize, index: usize, root: PyObjectRef) {
-    root_scope_from_word(save_point).set(index, root)
+pub extern "C" fn root_scope_set_jit_abi(_save_point: usize, index: usize, root: PyObjectRef) {
+    shadow_stack_set(index, root)
 }
 
 /// [`RootScope::normalize`] over the guard word.
-pub extern "C" fn root_scope_normalize_jit_abi(save_point: usize, base: usize, len: usize) {
-    root_scope_from_word(save_point).normalize(base, len)
+pub extern "C" fn root_scope_normalize_jit_abi(_save_point: usize, base: usize, len: usize) {
+    normalize_roots(base, len)
 }
 
-/// [`RootScope::normalize_moved`] over the guard word.
-pub extern "C" fn root_scope_normalize_moved_jit_abi(
-    save_point: usize,
-    base: usize,
-    len: usize,
-) -> usize {
-    usize::from(root_scope_from_word(save_point).normalize_moved(base, len))
+/// [`RootScope::normalize_moved`] over the published run. The method
+/// uses the thread cell, not the save_point; the desugar drops the
+/// receiver and names this bridge with the remaining `(base, len)`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_normalize_moved_jit_abi(base: usize, len: usize) -> usize {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    usize::from(with_shadow_stack(|stack| {
+        normalize_published_run(stack, base, len)
+    }))
 }
 
 // A `&[PyObjectRef]` argument reaches a residual call as its `(ptr, len)`
@@ -730,27 +736,23 @@ unsafe fn pair_items<'a>(items: *const PyObjectRef, len: usize) -> &'a [PyObject
 
 /// [`RootScope::publish`] over the guard word and the slice pair.
 pub extern "C" fn root_scope_publish_jit_abi(
-    save_point: usize,
+    _save_point: usize,
     items: *const PyObjectRef,
     len: usize,
 ) -> usize {
-    root_scope_from_word(save_point).publish(unsafe { pair_items(items, len) })
+    publish_roots(unsafe { pair_items(items, len) })
 }
 
 /// [`RootScope::pin_roots`] over the guard word and the slice pair.
 pub extern "C" fn root_scope_pin_roots_jit_abi(
-    save_point: usize,
+    _save_point: usize,
     items: *const PyObjectRef,
     len: usize,
 ) -> usize {
-    let scope = root_scope_from_word(save_point);
-    let base = scope.publish(unsafe { pair_items(items, len) });
-    scope.normalize(base, len);
-    base
+    pin_roots(unsafe { pair_items(items, len) })
 }
 
 /// Push one root on the cell `stack_slot` names; returns its index.
-#[majit_macros::dont_look_inside_cannot_raise]
 pub fn publish_one_at(stack_slot: *const RootStack, root: PyObjectRef) -> usize {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
@@ -764,14 +766,12 @@ pub fn publish_one_at(stack_slot: *const RootStack, root: PyObjectRef) -> usize 
 }
 
 /// Word-ABI residual for [`RootScope::get`].
-#[majit_macros::dont_look_inside_cannot_raise]
 pub fn get_at(stack_slot: *const RootStack, index: usize) -> PyObjectRef {
     // SAFETY: same cell; `slot` bounds-checks `index`.
     unsafe { *(*stack_slot).slot(index) }
 }
 
 /// Word-ABI residual for [`RootScope::normalize`].
-#[majit_macros::dont_look_inside_cannot_raise]
 pub fn normalize_at(stack_slot: *const RootStack, base: usize, len: usize) {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
@@ -1052,9 +1052,8 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
 /// ignores that copy and answers the slot, which a collection forwards in
 /// place.
 ///
-/// The call stays a real residual, bound in `jit_trace_fnaddrs()`: aliasing it
-/// to its argument would leave a trace carrying the pre-move word, and nothing
-/// else forwards a value the trace holds.
+/// The translator erases this call the way gctransform drops `push_roots` /
+/// `pop_roots`: a jitcode already roots the live word on the jitframe gcmap.
 #[inline]
 #[must_use = "a top root may have moved; use the reloaded live word"]
 #[majit_macros::dont_look_inside_cannot_raise]

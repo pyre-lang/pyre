@@ -54,7 +54,7 @@ pub fn str2charp(s: &[u8], track_allocation: bool) -> Result<CCHARP, MemoryError
     let bytes = s.len().checked_add(1).ok_or(MemoryError)?;
     unsafe {
         let array = raw_malloc_or_memory_error(bytes)?.cast::<super::CHAR>();
-        copy_bytes(s.as_ptr(), array.cast(), s.len());
+        copy_string_to_raw(s, array, s.len());
         *array.add(s.len()) = 0;
         Ok(array)
     }
@@ -77,7 +77,7 @@ pub unsafe fn free_charp(cp: CCHARP, track_allocation: bool) {
 /// `array` has room for `min(s.len(), maxsize)` bytes.
 pub unsafe fn str2chararray(s: &[u8], array: CCHARP, maxsize: usize) -> usize {
     let length = s.len().min(maxsize);
-    unsafe { copy_bytes(s.as_ptr(), array.cast(), length) };
+    unsafe { copy_string_to_raw(s, array, length) };
     length
 }
 
@@ -87,7 +87,7 @@ pub unsafe fn str2chararray(s: &[u8], array: CCHARP, maxsize: usize) -> usize {
 /// `array` has room for `length` bytes.
 pub unsafe fn str2rawmem(s: &[u8], array: CCHARP, start: usize, length: usize) {
     let src = &s[start..start + length];
-    unsafe { copy_bytes(src.as_ptr(), array.cast(), length) };
+    unsafe { copy_string_to_raw(src, array, length) };
 }
 
 /// `charp2str`. Reads up to the first NUL. Does not free `cp`.
@@ -126,7 +126,7 @@ pub unsafe fn charp2strn(cp: CCHARP, maxlen: usize) -> Result<Vec<u8>, MemoryErr
 /// `cp` is readable for `size` bytes.
 pub unsafe fn charpsize2str(cp: CCHARP, size: usize) -> Result<Vec<u8>, MemoryError> {
     let mut out = mallocfn(size)?;
-    unsafe { copy_bytes(cp.cast(), out.as_mut_ptr(), size) };
+    unsafe { copy_raw_to_string(cp, out.as_mut_slice(), size) };
     Ok(out)
 }
 
@@ -166,10 +166,10 @@ pub fn str2constcharp(s: &[u8], track_allocation: bool) -> Result<CONST_CCHARP, 
 pub fn get_nonmovingbuffer_ll(
     llobj: majit_ir::GcRef,
 ) -> Result<(CCHARP, majit_ir::GcRef, u8), MemoryError> {
-    let count = unsafe {
+    let chars = unsafe {
         crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const crate::lltypesystem::rstr::STR)
-            .len()
     };
+    let count = chars.len();
     let flag = if !majit_gc::can_move(llobj) {
         FLAG_INSIDE_NONMOVABLE
     } else if majit_gc::pin(llobj) {
@@ -182,11 +182,7 @@ pub fn get_nonmovingbuffer_ll(
         let bytes = count.checked_add(1).ok_or(MemoryError)?;
         unsafe {
             let buf = raw_malloc_or_memory_error(bytes)?.cast::<super::CHAR>();
-            copy_bytes(
-                (llobj.as_usize() as *const u8).add(STR_CHARS_OFFSET),
-                buf.cast(),
-                count,
-            );
+            copy_string_to_raw(chars, buf, count);
             Ok((buf, llobj, FLAG_RAW_COPY))
         }
     } else {
@@ -339,11 +335,11 @@ pub unsafe fn str_from_buffer(
     }
     if case_num == CASE_RAW {
         unsafe {
-            copy_bytes(
-                raw_buf.cast(),
+            let dest = std::slice::from_raw_parts_mut(
                 (gc_buf.0 as *mut u8).add(STR_CHARS_OFFSET),
                 needed_size,
             );
+            copy_raw_to_string(raw_buf, dest, needed_size);
         }
     }
     Ok(gc_buf)
@@ -865,15 +861,27 @@ unsafe fn wchar_ord(w: CWCHARP, index: usize) -> u32 {
     unsafe { *w.add(index) as u32 }
 }
 
-/// `llmemory.raw_memcopy` (`llmemory.py ann_raw_memcopy`): a void memcpy.
-/// The body is `ptr::copy_nonoverlapping`; residualizing the helper keeps
-/// that std leaf as the `ExtRegistryEntry` already registered for it,
-/// matching `ll_raw_free`'s `dont_look_inside_cannot_raise` around
-/// `raw_free`.
+/// `rstr.py copy_string_to_raw`. Residual: the body is `_get_raw_buf`
+/// / `cast_ptr_to_adr` then `llmemory.raw_memcopy`, and
+/// `jtransform.py rewrite_op_cast_ptr_to_adr` rejects a GC source.
+/// Looked-inside callers (`rffi.py str2charp`) therefore residual-call
+/// this with the GC string and the raw `CCHARP`. An inlined
+/// `as_ptr() as usize` is a same-bank alias of the GC array
+/// (`<[T]>::as_ptr` identity; `*const u8` is already CCHARP Int).
 #[majit_macros::dont_look_inside_cannot_raise]
-unsafe fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) {
+unsafe fn copy_string_to_raw(src: &[u8], dst: CCHARP, n: usize) {
     if n > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(src, dst, n) };
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n) };
+    }
+}
+
+/// `rstr.py copy_raw_to_string` (`@jit.dont_look_inside`). The Address
+/// conversion stays inside the residual, same reason as
+/// [`copy_string_to_raw`].
+#[majit_macros::dont_look_inside_cannot_raise]
+unsafe fn copy_raw_to_string(src: CCHARP, dst: &mut [u8], n: usize) {
+    if n > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), n) };
     }
 }
 
