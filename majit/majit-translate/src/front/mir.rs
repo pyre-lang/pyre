@@ -68403,14 +68403,124 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
             poisoned.insert(storage);
         }
     }
+    // `shadowstack.py push_roots` emits `gc_push_roots` on the livevars
+    // themselves. A `[T; N]` that exists only to feed `pin_roots` /
+    // `publish_roots` is that livevar list, not a data array: leave it
+    // off the entry-malloc buffer so the pin pass writes each GCREF.
+    let mut push_roots_only = bit_set::BitSet::with_capacity(n_locals);
+    for &storage in &storages {
+        if poisoned.contains(storage) || !borrowed_as_slice.contains(storage) {
+            continue;
+        }
+        if raw_array_slice_is_push_roots_only(body, llbc, &roles, storage) {
+            push_roots_only.insert(storage);
+        }
+    }
     for local in 0..n_locals {
         if let Some(storage) = storage_of(&roles, local)
-            && (poisoned.contains(storage) || !borrowed_as_slice.contains(storage))
+            && (poisoned.contains(storage)
+                || !borrowed_as_slice.contains(storage)
+                || push_roots_only.contains(storage))
         {
             roles[local] = None;
         }
     }
     roles
+}
+
+/// Whether every slice of `storage` is the argument of `pin_roots` /
+/// `publish_roots` (`gc_roots`). `install_range_state(&[i64; N])` and
+/// other data slices stay on the raw-buffer path.
+fn raw_array_slice_is_push_roots_only(
+    body: &Unstructured,
+    llbc: &Llbc,
+    roles: &[Option<RawArrayRole>],
+    storage: usize,
+) -> bool {
+    let mut slices = bit_set::BitSet::with_capacity(body.locals.locals.len());
+    for (dest, _, rvalue) in body.body.iter().flat_map(|bb| {
+        bb.statements
+            .iter()
+            .filter_map(|stmt| match stmt.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => match place.kind {
+                    PlaceKind::Local(d) => Some((d as usize, place, rvalue)),
+                    _ => None,
+                },
+                _ => None,
+            })
+    }) {
+        match &rvalue {
+            Rvalue::UnaryOp(op, Operand::Copy(src) | Operand::Move(src))
+            | Rvalue::Cast(op, Operand::Copy(src) | Operand::Move(src), _)
+                if (cast_kind_is_unsize(op) || op.get("Unsize").is_some())
+                    && matches!(
+                        src.kind,
+                        PlaceKind::Local(b)
+                            if roles[b as usize] == Some(RawArrayRole::Borrow(storage))
+                    ) =>
+            {
+                slices.insert(dest);
+            }
+            _ => {}
+        }
+    }
+    if slices.is_empty() {
+        return false;
+    }
+    loop {
+        let mut changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Use(op, _))) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = place.kind else {
+                    continue;
+                };
+                if slices.contains(dest as usize) {
+                    continue;
+                }
+                if operand_mentions_any_local(&op, &slices) {
+                    slices.insert(dest as usize);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut seen_push = false;
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            if mentions_local_outside_raw_array_items(bb.terminator.kind_value(), &slices, roles) {
+                return false;
+            }
+            continue;
+        };
+        let mentions_slice = call
+            .args
+            .iter()
+            .any(|op| operand_mentions_any_local(op, &slices));
+        if !mentions_slice {
+            continue;
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            return false;
+        };
+        let Some(path) = regular_call_name_path(reg, llbc) else {
+            return false;
+        };
+        let leaf = path.rsplit("::").next();
+        if matches!(leaf, Some("pin_roots") | Some("publish_roots"))
+            && path.split("::").any(|s| s == ROOT_SCOPE_MODULE)
+        {
+            seen_push = true;
+            continue;
+        }
+        return false;
+    }
+    seen_push
 }
 
 /// The method name of an `alloc::vec::Vec` inherent-method callee path:
