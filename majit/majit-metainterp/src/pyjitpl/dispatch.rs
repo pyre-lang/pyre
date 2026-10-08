@@ -222,6 +222,26 @@ pub fn field_offset_from_bh(descr: &crate::blackhole::BhDescr, site: &str) -> us
     }
 }
 
+/// `descr.py` `FieldDescr.field_size`. A non-Field descr is a bug, same
+/// as a missing descrs slot.
+pub fn field_size_from_bh(descr: &crate::blackhole::BhDescr, site: &str) -> usize {
+    match descr {
+        crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
+        other => panic!("{site}: descriptor is not a Field: {other:?}"),
+    }
+}
+
+/// `descr.py` `FieldDescr.is_field_signed()`. A non-Field descr is a bug,
+/// same as a missing descrs slot.
+pub fn is_field_signed_from_bh(descr: &crate::blackhole::BhDescr, site: &str) -> bool {
+    match descr {
+        crate::blackhole::BhDescr::Field {
+            is_field_signed, ..
+        } => *is_field_signed,
+        other => panic!("{site}: descriptor is not a Field: {other:?}"),
+    }
+}
+
 /// The heapcache's field key, or `None` for a descr that has none.
 ///
 /// `heapcache.get_field_updater(box, fielddescr)` keys the per-box field
