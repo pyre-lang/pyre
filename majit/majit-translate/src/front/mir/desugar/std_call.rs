@@ -1751,6 +1751,7 @@ impl<'a> Lowering<'a> {
             Some(ty),
             crate::model::LinkArg::Value(value),
         );
+        let value = field_store_link_arg(value, ty);
         let kind = OpKind::FieldWrite {
             base: base.clone(),
             field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
@@ -1802,12 +1803,13 @@ impl<'a> Lowering<'a> {
                     pure: false,
                 },
             });
+            let value = field_store_value(read, &leaf.ty);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: dest.clone(),
                     field: container_leaf_descriptor(container_field, at_offset_zero, &leaf),
-                    value: LinkArg::Value(read),
+                    value: LinkArg::Value(value),
                     ty: leaf.ty,
                 },
             });
@@ -7063,6 +7065,47 @@ impl<'a> Lowering<'a> {
             return;
         }
         stamp_as_ccharp(value);
+    }
+
+    /// `<[T]>::as_ptr` / `as_mut_ptr` dest is `*mut T`. `history.py`
+    /// `getkind` of a raw `Ptr` (`*mut u8` / `rffi.CCHARP`) is `'int'`;
+    /// of a GCREF is `'ref'`. A GC slice in the erased array-pointer
+    /// model is the array itself (`'ref'`). Crossing into the address
+    /// bank is `rbuiltin.py` `rtype_cast_ptr_to_int`.
+    ///
+    /// `unknown_is_gc_array` is the identity-path receiver (`<[T]>` in
+    /// that erased model). An untyped cell there is still the array;
+    /// `rewrite_op_cast_ptr_to_int` keeps a Ref/Unknown source as
+    /// `cast_ptr_to_int/r>i` so the FieldWrite names a fresh Signed
+    /// result across `same_as` identity folding. A pair-path pointer
+    /// word may already be an untyped int, so it stays GcRef-only.
+    pub(in crate::front::mir) fn slice_as_ptr_word(
+        &mut self,
+        mir_bb: usize,
+        dest_ty: &TyRef,
+        data: Variable,
+        unknown_is_gc_array: bool,
+    ) -> Variable {
+        let dest_kind = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        if !matches!(dest_kind, ValueType::Int | ValueType::Unsigned) {
+            return data;
+        }
+        let src_kind = crate::model::FunctionGraph::concretetype_of(&data);
+        let needs_cast = src_kind == crate::model::ConcreteType::GcRef
+            || (unknown_is_gc_array && src_kind == crate::model::ConcreteType::Unknown);
+        if !needs_cast {
+            return data;
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let word = push_cast_ptr_to_int(&mut self.graph, bb_id, data.clone());
+        self.cast_ptr_to_int_src.insert(word.clone(), data);
+        word
     }
 
     /// `core::hint::must_use(value)` — the identity wrapper

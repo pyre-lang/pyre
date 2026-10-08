@@ -11818,17 +11818,12 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[4].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "pyre_object".into(),
-                        "rordereddict".into(),
-                        "RDict".into(),
-                        "insert".into(),
-                    ],
-                    fun_decl_id: None,
-                    generic_rust_args: Vec::new(),
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "rordereddict",
+                    "RDict",
+                    "insert",
+                ]),
                 args: crate::model::call_args(vec![
                     vars[1].clone(),
                     vars[2].clone(),
@@ -12086,12 +12081,9 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: segments.clone(),
-                    fun_decl_id: None,
-                    generic_rust_args: Vec::new(),
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
+                // HOST_ENV builtin fixture: no FunDecl/generics.types.
+                // Production constructs this path with `function_path`.
+                target: crate::model::CallTarget::function_path(segments.clone()),
                 args: crate::model::call_args(vars[..3].iter().cloned()),
                 result_ty: ValueType::Ref(None),
             },

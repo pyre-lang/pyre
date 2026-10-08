@@ -711,6 +711,11 @@ impl<'a> Lowering<'a> {
     /// Charon leaves the declaration generic (`monomorphize:false`), so
     /// `fn f<T>(x: &T)` is a `TypeVar` and does not name the wrapper. The
     /// operand's place type is the type the call actually passes.
+    ///
+    /// An inherent method of that wrapper is the other case: `&self` *is*
+    /// the word (`history.py` `getkind` of a raw `Ptr`), and the residual
+    /// ABI takes it by value. A generic that merely instantiates `T` with
+    /// the wrapper still has no such ABI.
     pub(in crate::front::mir) fn refuse_borrowed_transparent_scalar_residual(
         &self,
         mir_bb: usize,
@@ -726,6 +731,13 @@ impl<'a> Lowering<'a> {
         if !fun_decl_is_residual(fd, self.dont_look_inside) {
             return Ok(());
         }
+        let inherent = scalar_inherent_method_path(
+            reg,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
             let passed = arg_tys.get(index).and_then(Option::as_ref);
             if std::iter::once(declared).chain(passed).any(|ty| {
@@ -737,6 +749,12 @@ impl<'a> Lowering<'a> {
                     &self.raw_alloc_flavor_structs,
                 )
             }) {
+                // `&self` of the wrapper is the word the jit_abi already
+                // takes. A later argument that is also a borrowed wrapper
+                // is the generic case this refuse still catches.
+                if index == 0 && inherent.is_some() {
+                    continue;
+                }
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: residual `{}` argument {index} borrows a \
                      repr(transparent) scalar; the word is not an address",
@@ -4136,6 +4154,11 @@ pub fn harvest_published_structs(llbc: &Llbc) -> Vec<PublishedStructBody> {
 /// stripping applies to the declaration path, not to `::` inside
 /// generic arguments. An existing `Struct` is left alone. A path that does not
 /// resolve to a destination decl stays a `{"Path": ...}` id.
+///
+/// A destination already classified by `transparent_scalar_kind` or
+/// `is_raw_struct_path` stays `Opaque`: the linked `getkind` is the
+/// defining crate's layout, and a copied field list would be walked as
+/// if it were that layout.
 pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
     if rows.is_empty() {
         return;
@@ -4175,6 +4198,14 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
         std::collections::HashMap::new();
     for td in llbc.iter_type_decls() {
         if !matches!(td.kind, TypeDeclKind::Opaque | TypeDeclKind::Unknown) {
+            continue;
+        }
+        // A linked raw / transparent path already has `getkind`. Copying
+        // fields onto that hole makes `adt_def_is_raw_storage` walk a
+        // remap that can leave a GC field in a raw owner (`jtransform.py`
+        // `rewrite_op_getfield` refuses `getfield_raw_r`).
+        let path = td.item_meta.name_path();
+        if llbc.transparent_scalar_kind(&path).is_some() || llbc.is_raw_struct_path(&path) {
             continue;
         }
         let Some(key) = dest_key_by_id.get(&td.def_id) else {
@@ -5053,12 +5084,12 @@ pub fn shadow_stack_erase_status(
     llbc: &Llbc,
     fd: &FunDecl,
     body: &Unstructured,
-) -> Result<bool, &'static str> {
+) -> Result<bool, String> {
     shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
     match shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
-        Err(reason) => Err(reason),
+        Err(reason) => Err(reason.into_owned()),
     }
 }
 

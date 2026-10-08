@@ -752,11 +752,10 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         // so `&i64` is not a GC ref: `Rvalue::Ref` aliases the scalar
         // and `history.py` `getkind` banks it as `int`. Recording
         // `Ref(None)` makes `FUNC.ARGS` disagree with that caller.
-        // A raw pointer to a wider scalar is `int` (`getkind` of a raw
-        // `Ptr`). A byte pointer stays `Ref`: pyre erases a GC
-        // reference to `*mut u8`. A nested `Ref` of a primitive (`&&i64`,
-        // `PartialOrd<&B> for &A`) is the same scalar. See
-        // [`tyref_scalar_pointee_value_type`] /
+        // A raw pointer to a scalar is `int` (`getkind` of a raw
+        // `Ptr`), including `*mut u8` (`rffi.CCHARP`). A nested `Ref`
+        // of a primitive (`&&i64`, `PartialOrd<&B> for &A`) is the same
+        // scalar. See [`tyref_scalar_pointee_value_type`] /
         // [`tyref_nested_ref_to_scalar_value_type`].
         //
         // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
@@ -1457,8 +1456,8 @@ impl<'a> Lowering<'a> {
             // `Arg<T>` stays Void (`tyref_is_bytecode_arg_marker`).
             // Same banks as [`pygraph_initial_block`]: a reference to a
             // primitive is the scalar word (`history.py` `getkind` of
-            // `&i64` is `int`), and a raw pointer to a wider scalar is
-            // `int`. A byte pointer stays `Ref`.
+            // `&i64` is `int`), and a raw pointer to a scalar is
+            // `int`, including `*mut u8` (`rffi.CCHARP`).
             //
             // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
             // (the same kind as a GC impl in the family). See
@@ -2352,7 +2351,6 @@ impl<'a> Lowering<'a> {
             })?;
         }
     }
-
 
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
     /// actually materialises in the model graph.  This EXCLUDES

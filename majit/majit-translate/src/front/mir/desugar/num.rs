@@ -1369,6 +1369,7 @@ impl<'a> Lowering<'a> {
                     ty: ValueType::Ref(Some("RBigInt".to_string())),
                 })
                 .collect(),
+            raw: false,
         };
         let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items)?;
         let disc = push_op(&mut self.graph, OpKind::ConstInt(0));

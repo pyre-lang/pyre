@@ -11,7 +11,7 @@ use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
-use pyre_jit::eval::{eval_with_jit, init_jit_hooks, reset_gc_fresh_for_test};
+use pyre_jit::eval::{eval_with_jit, init_jit_hooks};
 
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -22,7 +22,6 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
         .map_err(|_| "set_recursion_limit failed".to_string())?;
     pyre_module::register();
     init_jit_hooks();
-    reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     importing::init_sys_path(&cwd, cwd.as_os_str());

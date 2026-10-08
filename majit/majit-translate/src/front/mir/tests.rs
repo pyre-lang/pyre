@@ -3375,7 +3375,7 @@ fn window_param_to_vec_is_charpsize2str() {
                         CallTarget::FunctionPath {
                             segments,
                             fun_decl_id,
-                        ..
+                            ..
                         },
                     args,
                     ..
@@ -8030,8 +8030,8 @@ fn pointer_default_is_a_null_constant() {
         crate::test_support::lower_function(&llbc, "default_mut_ptr").expect("lower ptr default");
     let ops = graph_ops(&graph);
     assert!(
-        ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
-        "*mut T::default must become ConstRefNull; ops={ops:?}"
+        ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+        "*mut T::default of a scalar pointee is the int-bank null (`rffi` raw `Ptr`); ops={ops:?}"
     );
     assert!(
         !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
@@ -11342,27 +11342,6 @@ fn assert_unary_llop(ops: &[&SpaceOperation], name: &str, result_ty: ValueType) 
     );
 }
 
-fn assert_lltype_cast_call(ops: &[&SpaceOperation], name: &str) {
-    assert!(
-        ops.iter().any(|op| matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments.last().is_some_and(|leaf| leaf == name)
-                && segments.windows(2).any(|w| w[0] == "lltype" && w[1] == name)
-        )),
-        "{name} host call missing; ops={ops:?}"
-    );
-    assert!(
-        !ops.iter().any(|op| matches!(
-            &op.kind,
-            OpKind::UnaryOp { op, .. } if op == name
-        )),
-        "{name} must not be a UnaryOp; ops={ops:?}"
-    );
-}
-
 #[test]
 fn host_scalar_calls_project_to_llops() {
     let ptr_ty = serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]});
@@ -11422,7 +11401,21 @@ fn host_scalar_calls_project_to_llops() {
         let graph = crate::test_support::lower_function(&llbc, func).expect(&lowered);
         let ops = graph_ops(&graph);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert_lltype_cast_call(&ops, name);
+            // `*mut i64` is already `int` (`history.py` `getkind`
+            // of a raw `Ptr`). `jtransform.py rewrite_op_cast_ptr_to_int`
+            // returns None (alias) when the arg is not GC.
+            assert!(
+                !ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. }
+                        if *op == "cast_ptr_to_int" || *op == "cast_int_to_ptr"
+                )),
+                "{name} of a raw scalar pointer is identity; ops={ops:?}"
+            );
+            assert!(
+                !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+                "{name} of a raw scalar pointer must not residualize; ops={ops:?}"
+            );
         }));
         if let Err(payload) = result {
             panic!("case {name}: {}", panic_payload_mir(&payload));
@@ -27163,6 +27156,120 @@ fn generic_ref_field_keeps_ref_wrapper() {
     assert!(saw, "g reads Holder.p; graph={}", graph.dump());
 }
 
+/// `rlist.py` `ll_setitem_fast` over a GC-pointer item is kind `'r'`.
+/// The `_r` helper's item is `llmemory.GCREF`, not `rffi.CCHARP`.
+#[test]
+fn ll_vec_setitem_fast_r_item_is_gcref() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/majit-rlib.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
+    let graph =
+        super::lower_function(&llbc, "ll_vec_setitem_fast_r").expect("lower ll_vec_setitem_fast_r");
+    let start = graph.block(graph.startblock);
+    let tys: Vec<ValueType> = start
+        .inputargs
+        .iter()
+        .map(|arg| {
+            start
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::Input { ty, .. } if op.result.as_ref() == Some(arg) => Some(ty.clone()),
+                    _ => None,
+                })
+                .unwrap_or(ValueType::Unknown)
+        })
+        .collect();
+    assert_eq!(tys.len(), 3, "l, index, item, got {tys:?}");
+    assert!(
+        matches!(tys[0], ValueType::Int | ValueType::Unsigned),
+        "Vec header is int, got {tys:?}"
+    );
+    assert!(
+        matches!(tys[1], ValueType::Int | ValueType::Unsigned),
+        "index is int, got {tys:?}"
+    );
+    assert!(
+        matches!(tys[2], ValueType::Ref(_)),
+        "item is GCREF (rlist.py kind 'r'), got {tys:?}"
+    );
+}
+
+/// `rlist.py ll_extend`: `_ll_resize_ge` then `ll_arraycopy`. A
+/// per-item loop would be declined by `look_inside_graph` and
+/// residualize with only a symbolic path hash.
+#[test]
+fn ll_vec_extend_r_is_resize_then_arraycopy() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/majit-rlib.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
+    let graph = super::lower_function(&llbc, "ll_vec_extend_r").expect("lower ll_vec_extend_r");
+    let leaves: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().cloned(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leaves.iter().any(|leaf| leaf == "ll_slice_arraycopy_r"),
+        "ll_extend copies with ll_arraycopy; leaves={leaves:?}"
+    );
+    assert!(
+        !leaves.iter().any(|leaf| leaf == "ll_vec_setitem_fast_r"),
+        "item-at-a-time copy is the loopy residual; leaves={leaves:?}"
+    );
+}
+
+/// `jtransform.py rewrite_op_setfield` / `history.py getkind`: a GCREF
+/// field and the empty-storage null stored into it are both `'ref'`.
+/// `W_DictObject.dstorage` is erased GC storage (`llmemory.GCREF`).
+#[test]
+fn newdict_empty_dstorage_setfield_is_ref() {
+    use crate::model::{LinkArg, OpKind, ValueType};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-object.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-object.ullbc");
+    let graph = super::lower_function(&llbc, "newdict_empty").expect("lower newdict_empty");
+    let writes: Vec<&OpKind> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            kind @ OpKind::FieldWrite { field, .. } if field.name == "dstorage" => Some(kind),
+            _ => None,
+        })
+        .collect();
+    assert!(!writes.is_empty(), "newdict_empty must setfield dstorage");
+    for kind in writes {
+        let OpKind::FieldWrite { ty, value, .. } = kind else {
+            unreachable!("filtered FieldWrite");
+        };
+        assert!(
+            matches!(ty, ValueType::Ref(_)),
+            "dstorage field is GCREF (`llmemory.GCREF`), got {ty:?}"
+        );
+        if let LinkArg::Value(v) = value {
+            assert_ne!(
+                crate::model::FunctionGraph::concretetype_of(v),
+                crate::model::ConcreteType::Signed,
+                "dstorage stored value must not be Signed (`history.py` getkind)"
+            );
+        }
+    }
+}
+
 /// `rbigint.py` `ptwotable` is a prebuilt list. `_x_mul` must read that
 /// array, not a residual accessor named `PTWOTABLE`.
 #[test]
@@ -27801,6 +27908,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             str_value: false,
             ty: ValueType::Int,
         }],
+        raw: false,
     })
 }
 
@@ -27850,33 +27958,34 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             str_value: false,
             ty: ValueType::Int,
         }],
+        raw: false,
     })
 }
 
-    pub(in crate::front::mir) fn push_fn_const(
-        graph: &mut FunctionGraph,
-        block: crate::model::BlockId,
-        path: &[&str],
-    ) -> Variable {
-        let mut segments = vec![crate::model::FN_CONST_HEAD.to_string()];
-        segments.extend(path.iter().map(|s| s.to_string()));
-        graph
-            .push_op_var(
-                block,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments,
-                        fun_decl_id: None,
-                        generic_rust_args: Vec::new(),
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
-                    args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Int,
+pub(in crate::front::mir) fn push_fn_const(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    path: &[&str],
+) -> Variable {
+    let mut segments = vec![crate::model::FN_CONST_HEAD.to_string()];
+    segments.extend(path.iter().map(|s| s.to_string()));
+    graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
-                true,
-            )
-            .unwrap()
-    }
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Int,
+            },
+            true,
+        )
+        .unwrap()
+}
 
 #[test]
 fn desugar_mix_result_question_mark_lowers_to_result_switch() {
@@ -27948,9 +28057,11 @@ fn opaque_bitflags_empty_global_read_stays_residual() {
 
 /// `Gc` from a majit-gc `GcType` impl, from field 0 of that type
 /// (and that field's own field 0), from a struct whose field 0 is
-/// already `Gc` (`Struct._note_inlined_into`), and `Raw` for a type
-/// with no impl, for a struct headed by a raw field 0, and for an
-/// impl of another crate's trait that is also named `GcType`.
+/// already `Gc` (`Struct._note_inlined_into`), from a struct that
+/// stores a GC pointer (`adt_def_is_raw_storage` is false), and
+/// `Raw` for a type with no impl, for a struct headed by a raw
+/// field 0, and for an impl of another crate's trait that is also
+/// named `GcType`.
 #[test]
 fn declared_gckind_follows_gctype_impl_and_field0_parent() {
     use crate::translator::rtyper::lltypesystem::lltype::GcKind;
@@ -28005,6 +28116,13 @@ fn declared_gckind_follows_gctype_impl_and_field0_parent() {
                 struct_decl(5, &["fixture", "HeadedByImpl"], Some(0)),
                 struct_decl(6, &["fixture", "HeadedByInner"], Some(2)),
                 struct_decl(7, &["fixture", "HeadedByRaw"], Some(3)),
+                {
+                    "def_id": 8,
+                    "item_meta": meta(&["fixture", "RaiseCause"]),
+                    "kind": {"Struct": [
+                        {"name": "w_cause", "ty": {"RawPtr": [adt(0), "Mut"]}}
+                    ]}
+                },
             ],
             "fun_decls": [],
             "global_decls": [],
@@ -28026,6 +28144,10 @@ fn declared_gckind_follows_gctype_impl_and_field0_parent() {
     assert_eq!(kinds.get("HeadedByImpl"), Some(&GcKind::Gc));
     assert_eq!(kinds.get("HeadedByInner"), Some(&GcKind::Gc));
     assert_eq!(kinds.get("HeadedByRaw"), Some(&GcKind::Raw));
+    // Holds a GC pointer and is not on the field-0 chain.
+    // `Struct.__init__` cannot inline a gc container; `Ptr._is_atomic`
+    // is false unless `TO._gckind == 'raw'`.
+    assert_eq!(kinds.get("RaiseCause"), Some(&GcKind::Gc));
 }
 
 /// Layout gckind follows a `GcType` impl, including a generic template

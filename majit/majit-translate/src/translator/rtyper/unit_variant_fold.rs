@@ -538,7 +538,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        fold_unit_variant_ctors(&mut graph, None);
+        // Interning a headerless `Array<ITEM;0>` needs the session
+        // bookkeeper (`rclass.InstanceRepr.get_reusable_prebuilt_instance`).
+        fold_unit_variant_ctors(&mut graph, Some(&Rc::new(Bookkeeper::new())));
         graph
     }
 

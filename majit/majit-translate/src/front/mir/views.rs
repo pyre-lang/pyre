@@ -2868,7 +2868,7 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr" => {
-                    let data = args[0].clone();
+                    let data = self.slice_as_ptr_word(mir_bb, &dest_ty, args[0].clone(), false);
                     self.stamp_pair_window_as_ptr_ccharp(&dest_ty, &data);
                     data
                 }
@@ -4196,12 +4196,43 @@ pub(in crate::front::mir) fn tyref_is_rust_vec_header(ty: &TyRef, llbc: &Llbc) -
 /// behind a borrow, or behind a raw pointer, all of which the translator
 /// represents as the address of the raw `{ptr, len, cap}` header
 /// (`RustVecRepr`).  `None` for every other type.
-pub(in crate::front::mir) fn tyref_rust_vec_item_kind(
-    ty: &TyRef,
+///
+/// A pointer item is classified by `history.py` `getkind` of that item
+/// (`GCREF` / a GC pointee is `Ref`; `*mut u8` / `rffi.CCHARP` is `Int`).
+pub(in crate::front::mir) fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    let node = tyref_rust_vec_adt_node(ty, llbc)?;
+    let item = node
+        .get("Adt")?
+        .get("generics")?
+        .get("types")?
+        .as_array()?
+        .first()?;
+    rust_vec_item_kind_of_item_node(item, llbc)
+}
+
+/// Register kind of a one-word `Vec` / slice item type node.
+pub(in crate::front::mir) fn rust_vec_item_kind_of_item_node(
+    item: &serde_json::Value,
     llbc: &Llbc,
 ) -> Option<majit_ir::rvec::VecItemKind> {
-    let ast = tyref_one_word_vec_ast(ty, llbc)?;
-    majit_ir::rvec::rust_vec_item_kind_for_spelling(&ast, crate::layout::target_word_size())
+    let spelling = charon_type_value_to_ast_string(item, llbc, 0);
+    if json_ty_is_objectptr(item, llbc)
+        || object_pointer_item_spelling(&spelling)
+        || spelling == "GCREF"
+        || spelling.ends_with("::GCREF")
+    {
+        return Some(majit_ir::rvec::VecItemKind::Ref);
+    }
+    let item_ty = TyRef::Other(item.clone());
+    if tyref_is_raw_pointer(&item_ty, llbc) {
+        return match tyref_to_value_type(&item_ty, llbc) {
+            ValueType::Ref(_) => Some(majit_ir::rvec::VecItemKind::Ref),
+            ValueType::Int | ValueType::Unsigned => Some(majit_ir::rvec::VecItemKind::Int),
+            ValueType::Float => Some(majit_ir::rvec::VecItemKind::Float),
+            _ => None,
+        };
+    }
+    majit_ir::rvec::vec_item_kind_for_spelling(&spelling, crate::layout::target_word_size())
 }
 
 /// Item spelling of [`tyref_rust_vec_item_kind`]'s `Vec` (`usize`, `i64`, …).
@@ -4501,10 +4532,7 @@ pub(in crate::front::mir) fn pair_item_kind_of_node(
     if object_pointer_item_spelling(&spelling) {
         return None;
     }
-    if let Some(kind) = majit_ir::rvec::rust_slice_item_kind_for_spelling(
-        &format!("[{spelling}]"),
-        crate::layout::target_word_size(),
-    ) {
+    if let Some(kind) = rust_vec_item_kind_of_item_node(item, llbc) {
         return Some(kind);
     }
     let node = strip_ty_indirections(item, llbc)?;
@@ -4868,7 +4896,14 @@ pub(in crate::front::mir) fn pair_len_shadows(
     // those formals splices the key and harvests `equivalent` (`PartialEq::eq`).
     mark_dict_method_str_view_keys(graph_name, body, llbc, &mut str_views);
     (
-        pair_len_shadows_of(graph_name, &body.locals, llbc, &views, &str_views, &list_views),
+        pair_len_shadows_of(
+            graph_name,
+            &body.locals,
+            llbc,
+            &views,
+            &str_views,
+            &list_views,
+        ),
         str_views,
         list_views,
         list_view_fixed,

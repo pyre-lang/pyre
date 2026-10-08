@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+use majit_gc::GCREF;
+
 pub type PyResult<T> = Result<T, &'static str>;
 
 // 1. Straight-line
@@ -160,7 +162,11 @@ pub fn bool_then_some(c: bool, x: i64) -> Option<i64> {
 
 #[inline(never)]
 fn option_source(keep: bool, value: i64) -> Option<i64> {
-    if keep { Some(value) } else { None }
+    if keep {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 #[inline(never)]
@@ -178,6 +184,21 @@ pub fn option_raw_c_void_from_int(addr: isize) -> Option<*mut core::ffi::c_void>
         return None;
     }
     Some(addr as *mut core::ffi::c_void)
+}
+
+/// `rffi.VOIDP` is `Ptr(Array(Char, render_as_void))` (`rffi.py VOIDP`):
+/// `getkind` `'int'`. The Rust spelling is `*mut c_void`. A trait-method
+/// return of that pointer stamps FUNC.RESULT the same way
+/// `CastInto::cast_into` does.
+pub trait CastCcharpToVoidP {
+    fn ccharp_to_voidp(self) -> *mut core::ffi::c_void;
+}
+
+impl CastCcharpToVoidP for *const u8 {
+    #[inline(never)]
+    fn ccharp_to_voidp(self) -> *mut core::ffi::c_void {
+        self as *mut core::ffi::c_void
+    }
 }
 
 /// Raw struct whose pointer is an address (`lltype.Signed`).
@@ -490,7 +511,11 @@ pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
 #[inline(never)]
 pub fn char_unwrap_or_join(align: Option<char>) -> i64 {
     let a = align.unwrap_or('>');
-    if a == '^' { 1 } else { 0 }
+    if a == '^' {
+        1
+    } else {
+        0
+    }
 }
 
 /// The shape `bitflags!` expands to: a `repr(transparent)` public flag type
@@ -805,22 +830,22 @@ pub fn sum_of_array_literal(x: i64) -> i64 {
     sum_two_items(moved)
 }
 
-/// Reverses a slice of raw pointer items, then reads its first item.
+/// Reverses a slice of GCREF items, then reads its first item.
 #[inline(never)]
-pub fn reverse_then_first_ref(items: &mut [*mut u8]) -> *mut u8 {
+pub fn reverse_then_first_ref(items: &mut [GCREF]) -> GCREF {
     items.reverse();
     items[0]
 }
 
 /// A range subslice of a pointer array local, passed on as a slice.
 #[inline(never)]
-pub fn first_of_array_prefix(a: *mut u8, b: *mut u8, n: usize) -> *mut u8 {
+pub fn first_of_array_prefix(a: GCREF, b: GCREF, n: usize) -> GCREF {
     let buf = [a, b];
     first_ref(&buf[..n])
 }
 
 #[inline(never)]
-pub fn first_ref(items: &[*mut u8]) -> *mut u8 {
+pub fn first_ref(items: &[GCREF]) -> GCREF {
     items[0]
 }
 
@@ -832,7 +857,7 @@ pub fn extend_vec_from_slice(v: &mut Vec<usize>, items: &[usize]) {
 
 /// Reads an item of a slice carried in a tuple, or null past its end.
 #[inline(never)]
-pub fn item_of_tupled_slice(t: (&[*mut u8], usize)) -> *mut u8 {
+pub fn item_of_tupled_slice(t: (&[GCREF], usize)) -> GCREF {
     let items = t.0;
     if t.1 < items.len() {
         items[t.1]
@@ -843,27 +868,27 @@ pub fn item_of_tupled_slice(t: (&[*mut u8], usize)) -> *mut u8 {
 
 /// Builds the tuple [`item_of_tupled_slice`] reads.
 #[inline(never)]
-pub fn tuple_a_slice(items: &[*mut u8], i: usize) -> *mut u8 {
+pub fn tuple_a_slice(items: &[GCREF], i: usize) -> GCREF {
     item_of_tupled_slice((items, i))
 }
 
 /// A closure that captures a slice by reference and returns it.
 #[inline(never)]
-pub fn slice_through_a_closure(items: &[*mut u8]) -> *mut u8 {
-    let get = || -> &[*mut u8] { items };
+pub fn slice_through_a_closure(items: &[GCREF]) -> GCREF {
+    let get = || -> &[GCREF] { items };
     first_ref(get())
 }
 
 /// A closure indexing a slice it captures by reference.
 #[inline(never)]
-pub fn index_through_a_closure(items: &[*mut u8], i: usize) -> *mut u8 {
+pub fn index_through_a_closure(items: &[GCREF], i: usize) -> GCREF {
     let get = |j: usize| items[j];
     get(i)
 }
 
 /// The item an `Option<&T>` names, or null.
 #[inline(never)]
-pub fn item_or_null(item: Option<&*mut u8>) -> *mut u8 {
+pub fn item_or_null(item: Option<&GCREF>) -> GCREF {
     match item {
         Some(p) => *p,
         None => core::ptr::null_mut(),
@@ -872,14 +897,14 @@ pub fn item_or_null(item: Option<&*mut u8>) -> *mut u8 {
 
 /// `Option<&T>` of a pointer item passed on as a value.
 #[inline(never)]
-pub fn get_item_or_null(items: &[*mut u8], i: usize) -> *mut u8 {
+pub fn get_item_or_null(items: &[GCREF], i: usize) -> GCREF {
     item_or_null(items.get(i))
 }
 
 /// Copies a slice of pointer items into another. The lengths are equal;
 /// that check is an assertion.
 #[inline(never)]
-pub fn copy_slice_from_slice(dst: &mut [*mut u8], src: &[*mut u8]) {
+pub fn copy_slice_from_slice(dst: &mut [GCREF], src: &[GCREF]) {
     dst.copy_from_slice(src);
 }
 
@@ -889,21 +914,21 @@ pub fn repeat_vec_i64(item: i64, count: usize) -> Vec<i64> {
     vec![item; count]
 }
 
-/// `vec![item; count]` of pointer items.
+/// `vec![item; count]` of GCREF items.
 #[inline(never)]
-pub fn repeat_vec_ptr(item: *mut u8, count: usize) -> Vec<*mut u8> {
+pub fn repeat_vec_ptr(item: GCREF, count: usize) -> Vec<GCREF> {
     vec![item; count]
 }
 
 /// The data pointer of a shared slice of pointer items.
 #[inline(never)]
-pub fn ptr_of_slice(items: &[*mut u8]) -> *const *mut u8 {
+pub fn ptr_of_slice(items: &[GCREF]) -> *const GCREF {
     items.as_ptr()
 }
 
 /// The data pointer of a mutable slice of pointer items.
 #[inline(never)]
-pub fn mut_ptr_of_slice(items: &mut [*mut u8]) -> *mut *mut u8 {
+pub fn mut_ptr_of_slice(items: &mut [GCREF]) -> *mut GCREF {
     items.as_mut_ptr()
 }
 

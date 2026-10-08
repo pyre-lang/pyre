@@ -406,6 +406,33 @@ pub(in crate::front::mir) fn concretetype_for_field(ty: &ValueType) -> crate::mo
     }
 }
 
+/// `rtyper.py` `setconcretetype` writes `v.concretetype =
+/// bindingrepr(v).lowleveltype` before `jtransform.py`
+/// `rewrite_op_setfield` reads `RESULT = v_value.concretetype`. An
+/// `Unknown` cell has not been through that step; paint it from the
+/// field lltype, which is the stored value's binding at this site.
+pub(in crate::front::mir) fn field_store_value(value: Variable, ty: &ValueType) -> Variable {
+    let want = concretetype_for_field(ty);
+    if want == crate::model::ConcreteType::Unknown {
+        return value;
+    }
+    let have = FunctionGraph::concretetype_of(&value);
+    if have == want {
+        return value;
+    }
+    if have == crate::model::ConcreteType::Unknown {
+        FunctionGraph::set_concretetype_of_inline(&value, want);
+    }
+    value
+}
+
+pub(in crate::front::mir) fn field_store_link_arg(value: LinkArg, ty: &ValueType) -> LinkArg {
+    match value {
+        LinkArg::Value(var) => LinkArg::Value(field_store_value(var, ty)),
+        other => other,
+    }
+}
+
 /// Typed zero, matching `emit_zero_constant_of_ty`. `Ref` is null.
 pub(in crate::front::mir) fn zero_field_cur(ty: &ValueType) -> FieldCur {
     match ty {

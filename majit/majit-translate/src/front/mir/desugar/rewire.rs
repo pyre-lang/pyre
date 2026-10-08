@@ -340,6 +340,12 @@ pub(crate) struct AggregateCtor {
     pub(in crate::front::mir) ctor_name: String,
     /// One row per operand.
     pub(in crate::front::mir) fields: Vec<AggregateField>,
+    /// The destination is a by-value raw struct
+    /// (`tyref_is_raw_struct_value`). `history.py` `getkind` of that
+    /// `Ptr` is `'int'`, so the constructor result is Int. A `Ref`
+    /// result is `malloc(GcStruct)` and disagrees with FUNC.RESULT `i`
+    /// (`func_result_kind`).
+    pub(in crate::front::mir) raw: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -368,6 +374,25 @@ pub(in crate::front::mir) struct AggregateField {
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
 /// values `args`, returning the constructed value.
+
+pub(in crate::front::mir) fn aggregate_ctor_result_bank(
+    ctor: &AggregateCtor,
+) -> (ValueType, crate::model::ConcreteType, Option<bool>) {
+    if ctor.raw {
+        (
+            ValueType::Int,
+            crate::model::ConcreteType::Signed,
+            Some(false),
+        )
+    } else {
+        (
+            ValueType::Ref(Some(ctor.result_owner.clone())),
+            crate::model::ConcreteType::Unknown,
+            None,
+        )
+    }
+}
+
 pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -378,13 +403,14 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
     if pair_lens.iter().all(Option::is_none) {
         return emit_aggregate_ctor(graph, block, ctor, args);
     }
-    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let (result_ty, concrete, owner_declared_gc) = aggregate_ctor_result_bank(ctor);
+    let res = graph.alloc_value_var_with_type(concrete);
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::Call {
             target: ctor.target.clone(),
             args: Vec::new(),
-            result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+            result_ty,
         },
     });
     for (i, field) in ctor.fields.iter().enumerate() {
@@ -429,6 +455,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
             }
             let len_name = pair_len_field_name(&field.name);
             for (name, value) in [(field.name.clone(), value.clone()), (len_name, len.clone())] {
+                let value = field_store_value(value, &ValueType::Unsigned);
                 graph.block_mut(block).operations.push(SpaceOperation {
                     result: None,
                     kind: OpKind::FieldWrite {
@@ -438,7 +465,8 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
                             Some(ctor.result_owner.clone()),
                         )
                         .with_owner_id(ctor.owner_id)
-                        .with_base_is_deref(false),
+                        .with_base_is_deref(false)
+                        .with_owner_declared_gc(owner_declared_gc),
                         value: crate::model::LinkArg::Value(value),
                         ty: ValueType::Unsigned,
                     },
@@ -447,6 +475,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
             continue;
         }
         let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
+        let value = field_store_value(value, &ty);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -461,7 +490,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
-                    owner_declared_gc: None,
+                    owner_declared_gc,
                     host_index: None,
                     scalar_word: None,
                 },
@@ -479,13 +508,14 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
     ctor: &AggregateCtor,
     args: &[Variable],
 ) -> Result<Variable, LowerError> {
-    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let (result_ty, concrete, owner_declared_gc) = aggregate_ctor_result_bank(ctor);
+    let res = graph.alloc_value_var_with_type(concrete);
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::Call {
             target: ctor.target.clone(),
             args: Vec::new(),
-            result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+            result_ty,
         },
     });
     for (field, value) in ctor.fields.iter().zip(args) {
@@ -493,6 +523,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
             continue;
         }
         let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
+        let value = field_store_value(value, &ty);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -507,7 +538,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
-                    owner_declared_gc: None,
+                    owner_declared_gc,
                     host_index: None,
                     scalar_word: None,
                 },

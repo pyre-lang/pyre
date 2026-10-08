@@ -14,7 +14,8 @@
 //!   `ll_vec_newlist_hint_*` and `ll_vec_newemptylist_*` carry the upstream
 //!   oopspecs (`list.len`, `list.getitem`, `list.setitem`, `newlist_hint`,
 //!   `newlist`), which jtransform rewrites into raw header and item accesses.
-//! * `ll_vec_append_*` and `ll_vec_resize_ge_*` are looked inside;
+//! * `ll_vec_append_*`, `ll_vec_extend_from_slice_*`, `ll_vec_extend_r`
+//!   and `ll_vec_resize_ge_*` are looked inside;
 //!   `ll_vec_resize_hint_really_*` and `ll_vec_reverse_*` are looked inside
 //!   only under their upstream `look_inside_iff` predicates.
 //! * Item buffers have one allocator. [`vec_buf_alloc`], [`vec_buf_realloc`]
@@ -153,8 +154,8 @@ const GCARRAY_ITEMS_OFFSET: usize = WORD;
 
 const ITEM_SIZE_I: usize = std::mem::size_of::<usize>();
 const ITEM_ALIGN_I: usize = std::mem::align_of::<usize>();
-const ITEM_SIZE_R: usize = std::mem::size_of::<*mut u8>();
-const ITEM_ALIGN_R: usize = std::mem::align_of::<*mut u8>();
+const ITEM_SIZE_R: usize = std::mem::size_of::<GCREF>();
+const ITEM_ALIGN_R: usize = std::mem::align_of::<GCREF>();
 const ITEM_SIZE_F: usize = std::mem::size_of::<f64>();
 const ITEM_ALIGN_F: usize = std::mem::align_of::<f64>();
 
@@ -781,7 +782,10 @@ fn ll_vec_zero_or_null_r(item: GCREF) -> bool {
     item.is_null()
 }
 
-/// `rgc.ll_arrayclear`. Writes null into each of the `count` slots.
+/// `rgc.ll_arrayclear`. Raw memory is not zero-filled. Upstream skips this
+/// for a `Ptr` item because `ll_newlist` already ran
+/// `zero_gc_pointers_inside`; this raw header does not, so null slots are
+/// cleared here too.
 #[majit_macros::dont_look_inside_cannot_raise]
 fn ll_vec_arrayclear_r(l: &mut Vec<GCREF>, count: usize) {
     let mut i = 0;
@@ -838,6 +842,13 @@ fn ll_vec_alloc_and_set_jit_r(count: usize, item: GCREF) -> Vec<GCREF> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
+///
+/// Residual for now: upstream traces into this body, but these helper graphs
+/// are never prepass subjects, so the calls inside carry no `RustVec` result
+/// type and the list-oopspec rewrite cannot tell their header from a GC
+/// list.  Tracing it waits on rtyping the helper bodies the way
+/// `annlowlevel` annotates low-level helpers.
+#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_r(count: usize, item: GCREF) -> Vec<GCREF> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_r(count, item)
@@ -971,13 +982,11 @@ fn gcarray_length_r(l2: GCREF) -> usize {
     raw_read_ptr(raw_ptradd(l2 as usize, GCARRAY_LEN_OFFSET))
 }
 
-/// Item `index` of a length-prefixed object GcArray, read from the array
-/// word so a collection that moves `l2` is visible on the next index.
-fn gcarray_getitem_r(l2: GCREF, index: usize) -> GCREF {
-    raw_read_ptr(raw_ptradd(
-        l2 as usize,
-        GCARRAY_ITEMS_OFFSET + index * ITEM_SIZE_R,
-    )) as GCREF
+/// Item pointer of a length-prefixed object GcArray, the first of the
+/// `(items, length)` pair `ll_arraycopy` takes. Re-read from `l2` after
+/// a collection.
+fn gcarray_items_r(l2: GCREF) -> usize {
+    raw_ptradd(l2 as usize, GCARRAY_ITEMS_OFFSET)
 }
 
 /// First item of a length-prefixed GcArray. `array_items_base` rounds
@@ -1017,9 +1026,9 @@ pub fn ll_copy_list_to_raw_array_r(ll_list: GCREF, dst_ptr: usize) {
 }
 
 /// `rlist.ll_extend(l1, l2)` when `l2` is a one-word object slice: the
-/// GcArray word, not a `(items, length)` pair. Length is the array's
-/// header; each item is read by index from `l2` after `_ll_resize_ge`,
-/// which may collect.
+/// GcArray word, not a `(items, length)` pair. `_ll_resize_ge` then
+/// `ll_arraycopy`; the helper stays loop-free so `look_inside_graph`
+/// admits it as Regular (`inline_call_*`).
 ///
 /// `ovfcheck(len1 + len2)`: a wrapping sum would undersize the resize.
 /// Overflow is MemoryError, the same `Vec capacity overflow` panic as
@@ -1031,12 +1040,7 @@ pub fn ll_vec_extend_r(l: &mut Vec<GCREF>, l2: GCREF) {
         .checked_add(len2)
         .unwrap_or_else(|| panic!("Vec capacity overflow"));
     ll_vec_resize_ge_r(l, newlength);
-    let mut i = 0;
-    while i < len2 {
-        let item = gcarray_getitem_r(l2, i);
-        ll_vec_setitem_fast_r(l, len1 + i, item);
-        i += 1;
-    }
+    ll_slice_arraycopy_r(gcarray_items_r(l2), ll_vec_items_r(l), 0, len1, len2);
 }
 
 /// `rgc.ll_arraycopy` over raw items. The items hold no GC pointer, so the
@@ -1517,6 +1521,22 @@ pub fn ll_slice_rotate_left_f(items: usize, length: usize, k: usize) {
 mod tests {
     use super::super::rffi::raw_malloc_varsize_char;
     use super::*;
+
+    /// `rlist.py` `ll_setitem_fast` over a GC-pointer item: the `_r` family
+    /// takes `GCREF`, not `*mut u8` (`rffi.CCHARP`).
+    #[test]
+    fn ref_item_helpers_take_gcref() {
+        fn assert_setitem(_: fn(&mut Vec<GCREF>, usize, GCREF)) {}
+        fn assert_getitem(_: fn(&mut Vec<GCREF>, usize) -> GCREF) {}
+        fn assert_slice_setitem(_: fn(usize, usize, GCREF)) {}
+        fn assert_slice_getitem(_: fn(usize, usize) -> GCREF) {}
+        assert_setitem(ll_vec_setitem_fast_r);
+        assert_getitem(ll_vec_getitem_fast_r);
+        assert_slice_setitem(ll_slice_setitem_fast_r);
+        assert_slice_getitem(ll_slice_getitem_fast_r);
+        assert_eq!(ITEM_SIZE_R, std::mem::size_of::<GCREF>());
+        assert_eq!(ITEM_ALIGN_R, std::mem::align_of::<GCREF>());
+    }
 
     /// The oopspec helpers are callable residuals: a by-value `Vec` result
     /// comes back as the address of a header `ll_vec_free_*` releases, and a

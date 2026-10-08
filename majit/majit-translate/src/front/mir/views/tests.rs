@@ -646,6 +646,11 @@ fn fat_box_len_and_index_keep_the_field_read() {
         );
         assert_eq!(
             super::spelling_pair_field_kind("[*mut u8]"),
+            Some(VecItemKind::Int),
+            "*mut u8 is rffi.CCHARP, a word"
+        );
+        assert_eq!(
+            super::spelling_pair_field_kind("[GCREF]"),
             Some(VecItemKind::Ref)
         );
         assert!(super::gcref_item_spelling("GCREF"));
@@ -693,7 +698,8 @@ fn fat_box_len_and_index_keep_the_field_read() {
         let slice_of = |item: serde_json::Value| serde_json::json!({ "Ref": ["'_", { "Slice": [item, null] }, "Shared"] });
         assert_eq!(
             super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection.clone())), &unique),
-            Some(VecItemKind::Ref)
+            Some(VecItemKind::Int),
+            "unique-impl *mut usize is a word (`rffi.CCHARP` / Address)"
         );
         let ambiguous = llbc_with_trait_impls(serde_json::json!([row.clone(), row]));
         assert_eq!(

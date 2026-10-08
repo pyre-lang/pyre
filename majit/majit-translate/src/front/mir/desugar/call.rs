@@ -119,13 +119,12 @@ impl<'a> Lowering<'a> {
         // site's `FUNC.RESULT` matches (`call.rs`,
         // `ExecutionContext.force_all_frames`).
         //
-        // A raw pointer to a non-byte scalar is the address word.
-        // `history.py` `getkind` banks every raw `Ptr` as `int`, and
+        // A raw pointer to a scalar is the address word.
+        // `history.py` `getkind` banks every raw `Ptr` as `int`,
+        // including `*mut u8` (`rffi.CCHARP`), and
         // [`pygraph_initial_block`] already records that parameter as
         // `Int`. The call that produced the pointer uses the same bank.
-        // A byte pointer stays the `Ref` erasure of
-        // [`tyref_to_value_type_with`]: pyre erases a GC reference to
-        // `*mut u8`. A reference stays an address. Naming its pointee
+        // A reference stays an address. Naming its pointee
         // here would retype a call-returned `&T` to the scalar, and
         // `*dest` is `rewrite_op_raw_load`.
         //
@@ -652,24 +651,18 @@ impl<'a> Lowering<'a> {
                 self.expand_object_gcarray_header_to_items_len(mir_bb, args[0].clone());
             args = vec![items, length];
         }
-        // `v.extend_from_slice(s)` on a `Vec` of one-word items is
+        // `v.extend_from_slice(s)` on a pair-spliced `&[T]` is
         // `ll_extend` from the pair (`rlist.py ll_extend` /
         // `rrustvec.rs` `VecOp::ExtendFromSlice`). An object-pointer
-        // `&[PyObjectRef]` is the length-prefixed GcArray, not a pair:
-        // expand to `(items = header + ITEMS_BLOCK_ITEMS_OFFSET,
-        // length = arraylen_gc)` so the helper sees the same three
-        // words a pair splice would.
+        // `&[PyObjectRef]` is the length-prefixed GcArray word, not a
+        // pair: that case is `vec_extend_gcarray_kind` below
+        // (`rlist.py ll_extend` with `l2` the GcArray).
         let vec_extend_kind = match &call.func {
             CallFunc::Regular(reg)
                 if regular_call_name_path(reg, self.llbc)
                     .as_deref()
                     .is_some_and(path_is_vec_extend_from_slice)
-                    && (matches!(pair_lens.as_slice(), [(1, _)])
-                        || (pair_lens.is_empty()
-                            && args.len() == 2
-                            && second_arg_ty.as_ref().is_some_and(|ty| {
-                                tyref_is_object_pointer_slice(ty, self.llbc)
-                            }))) =>
+                    && matches!(pair_lens.as_slice(), [(1, _)]) =>
             {
                 first_arg_ty
                     .as_ref()
@@ -4324,6 +4317,16 @@ impl<'a> Lowering<'a> {
                             result_ty,
                         );
                     }
+                    // A raw scalar pointer is already `int` (`history.py`
+                    // `getkind` of a raw `Ptr`). `cast_ptr_to_int` /
+                    // `cast_int_to_ptr` of that word is identity.
+                    if host_lltype_cast_is_int_identity(&path, src.as_ref(), &dst) {
+                        self.local_var[dest_local] = Some(LocalValue::One(args[0].clone()));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `llop.threadlocalref_get` / `threadlocalref_store`
                 // (`rthread.py ThreadLocalField.getraw` / `setraw`).
@@ -5265,9 +5268,12 @@ impl<'a> Lowering<'a> {
                 // `<[T]>::as_ptr` — the slice's data pointer is the receiver
                 // value in the erased array-pointer model.  Alias the result to
                 // the receiver (twin of the `as_slice` identity above and
-                // `NonNull::as_ptr`).  A `Vec::as_ptr` is deliberately excluded
-                // (its items live behind a getfield, not the receiver) — see
-                // `is_container_as_ptr_identity`.
+                // `NonNull::as_ptr`) when dest getkind is still `ref`. Dest
+                // `*mut u8` is `rffi.CCHARP` (`history.py` `getkind` of a
+                // raw `Ptr` is `'int'`), so a GC receiver is
+                // `rbuiltin.py` `rtype_cast_ptr_to_int`. A `Vec::as_ptr` is
+                // deliberately excluded (its items live behind a getfield,
+                // not the receiver) — see `is_container_as_ptr_identity`.
                 // A window's `as_ptr` is `FatData` only; it does not mark
                 // `string_byte_view`. A W1 `as_bytes()` view keeps the mark
                 // via `alias_dest_to_arg0_inherit`.
@@ -5281,6 +5287,7 @@ impl<'a> Lowering<'a> {
                     } else {
                         args[0].clone()
                     };
+                    let data = self.slice_as_ptr_word(mir_bb, &call.dest.ty, data, true);
                     self.stamp_pair_window_as_ptr_ccharp(&call.dest.ty, &data);
                     self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
                     let target_bb = self.block_id[target];
@@ -5722,30 +5729,36 @@ impl<'a> Lowering<'a> {
                 // `&mut vec[..]` of `Vec<PyObjectRef>` is the header address.
                 // Write the shadow-stack range into that vec. The codewriter
                 // sends the call back when that argument is not a signed word.
-                // Method `RootScope::pin_roots(&self, slice)` is two Ref
-                // words (scope, GcArray). The bound helper is the 3-word
-                // pair ABI `root_scope_pin_roots_jit_abi`. Free `pin_roots`
-                // takes the same length-prefixed GcArray (`pin_roots_jit_abi`,
-                // `rlist.py` `GcArray(OBJECTPTR)`).
-                let (segments, method_hint) = if args.len() == 2
-                    && original_segments.last().map(String::as_str) == Some("pin_roots")
+                // Method `RootScope::pin_roots(&self, slice)`: the guard is
+                // the save_point word, the slice is the length-prefixed
+                // GcArray (`rlist.py` `GcArray(OBJECTPTR)`). Free `pin_roots`
+                // takes that one GcArray (`pin_roots_jit_abi`). Drop the
+                // receiver when it is still present.
+                let (segments, method_hint) = if original_segments.last().map(String::as_str)
+                    == Some("pin_roots")
                     && original_segments.iter().any(|s| s == "gc_roots")
                 {
-                    args.remove(0);
-                    arg_locals.remove(0);
-                    (
-                        vec![
-                            "pyre_object".to_string(),
-                            "gc_roots".to_string(),
-                            "pin_roots".to_string(),
-                        ],
-                        None,
-                    )
+                    if args.len() == 2 {
+                        args.remove(0);
+                        arg_locals.remove(0);
+                    }
+                    if args.len() == 1 {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "pin_roots".to_string(),
+                            ],
+                            None,
+                        )
+                    } else {
+                        (segments, method_hint)
+                    }
                 } else {
                     (segments, method_hint)
                 };
                 // Method `RootScope::publish(&self, slice)` is the same
-                // two-Ref graph / 3-word pair split (`root_scope_publish_jit_abi`).
+                // guard-word / GcArray split (`root_scope_publish_jit_abi`).
                 // `get_and_call_function` publishes then normalizes; a pair
                 // helper with the GcArray in rdi and leftover `len` in rdx
                 // copies the length word as slot 0 (`pair_items`). Free
@@ -6618,13 +6631,19 @@ impl<'a> Lowering<'a> {
                         abstract_trait_call_target(&reg, self.llbc)
                     {
                         CallTarget::indirect(trait_root, method_name)
-                    } else if let Some(path) = scalar_inherent_method_path(
-                        &reg,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ) {
+                    } else if segments == original_segments
+                        && let Some(path) = scalar_inherent_method_path(
+                            &reg,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                    {
+                        // A prior retarget (`pin_roots` / `publish` → the
+                        // free helper) already rewrote `segments`. The
+                        // inherent-method path would stamp the wrapper
+                        // method back over that helper.
                         CallTarget::FunctionPath {
                             segments: path,
                             fun_decl_id: None,
@@ -9559,7 +9578,6 @@ impl<'a> Lowering<'a> {
         }
         Some(vec![name])
     }
-
 
     pub(in crate::front::mir) fn enqueue_spec(&self, fd: &FunDecl, generics: &serde_json::Value) -> Option<Vec<String>> {
         let spec = self.spec?;

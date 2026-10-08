@@ -664,19 +664,21 @@ impl<'a> Lowering<'a> {
             let list_place = peel_nested_storage_place(inner);
             let base = self.resolve_place(mir_bb, list_place)?;
             let bb_id = self.emit_bb(mir_bb);
+            let ty = tyref_to_value_type_with(
+                dest_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            );
+            let value = field_store_link_arg(value, &ty);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base,
                     field: FieldDescriptor::new(flat_name, Some(owner)).with_owner_id(owner_id),
                     value,
-                    ty: tyref_to_value_type_with(
-                        dest_ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ),
+                    ty,
                 },
             });
             return Ok(());
@@ -1250,6 +1252,7 @@ impl<'a> Lowering<'a> {
                     );
                     value =
                         self.coerce_signed_int_store(bb_id, &ty, Some(field.name.as_str()), value);
+                    value = field_store_link_arg(value, &ty);
                     OpKind::FieldWrite {
                         base,
                         field,
@@ -2320,6 +2323,12 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         return Ok((Some(unichr_call(arg)), res));
                     }
+                    // Dest attr of a raw `Ptr` is also Int (`history.py`
+                    // `getkind`); that is not a signedness flip.
+                    // `usize as *const usize` stays in the int bank and
+                    // the dest-kind override below aliases it.
+                    // `rtype_intmask` is the unsigned→Signed retype
+                    // (`w_tuple_len as i64`).
                     if matches!(src_attr, Some(ValueType::Unsigned))
                         && matches!(
                             tyref_to_attr_value_type_with(
@@ -2331,6 +2340,7 @@ impl<'a> Lowering<'a> {
                             ),
                             ValueType::Int
                         )
+                        && self.dest_is_plain_signed_int(dest_ty)
                     {
                         let (kind, res) = signedness_retype_op(&mut self.graph, arg, true);
                         return Ok((Some(kind), res));
@@ -2367,6 +2377,25 @@ impl<'a> Lowering<'a> {
                             return Ok((None, signed));
                         }
                     }
+                    // `*mut u8 as usize` is `rbuiltin.py gen_cast` of
+                    // `llmemory.Address` / `rffi.CCHARP`: Signed
+                    // `cast_ptr_to_int` then `r_uint`. getkind of a raw
+                    // `Ptr` is already `'int'`, so this is not the
+                    // Int-banked pointer origin (`Ptr(FuncType)` /
+                    // `RustVec`) and not a GC Ref.
+                    let src_is_raw_scalar = operand_tyref(&operand)
+                        .is_some_and(|ty| raw_scalar_address_value_type(ty, self.llbc).is_some());
+                    if src_is_raw_scalar {
+                        if let Some((op, res)) =
+                            self.raw_ptr_to_unsigned(mir_bb, true, dest_ty, &arg)
+                        {
+                            return Ok((Some(op), res));
+                        }
+                        if let Some((op, res)) = self.raw_ptr_to_signed(mir_bb, true, dest_ty, &arg)
+                        {
+                            return Ok((Some(op), res));
+                        }
+                    }
                     // The opposite signedness flip is RPython's
                     // `rarithmetic.r_uint(v)`: it keeps the machine word
                     // bits but changes the annotation/repr to Unsigned.
@@ -2388,12 +2417,14 @@ impl<'a> Lowering<'a> {
                         // that address to `Ptr(GCREF)`; record the source the
                         // same way the Ref arm does.
                         let source_is_raw_address = match &operand {
-                            Operand::Copy(place) | Operand::Move(place) => ty_is_raw_address(
-                                &place.ty,
-                                self.llbc,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            ),
+                            Operand::Copy(place) | Operand::Move(place) => {
+                                ty_is_raw_address(
+                                    &place.ty,
+                                    self.llbc,
+                                    self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
+                                ) || raw_scalar_address_value_type(&place.ty, self.llbc).is_some()
+                            }
                             Operand::Const(_) => false,
                         };
                         if source_is_raw_address {
@@ -2839,8 +2870,10 @@ impl<'a> Lowering<'a> {
             // change the JIT-visible kind collapse this way.
             Rvalue::Cast(kind, operand, ty) => {
                 // Classify the source BEFORE `resolve_operand` consumes
-                // `operand` (mirrors the `UnaryOp::Cast` twin above): only a
-                // Ref source may narrow or erase below.
+                // `operand` (mirrors the `UnaryOp::Cast` twin above). A
+                // Ref source may narrow or erase; a raw scalar pointer
+                // (`*mut u8`, `rffi.CCHARP`) is Int and still narrows
+                // (`lltype.cast_adr_to_ptr`).
                 let src_kind = self.operand_value_kind(&operand);
                 let src_root = self.operand_class_root(&operand);
                 let src_raw_addr = operand_is_declared_raw(
@@ -2849,6 +2882,8 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 );
+                let src_raw_scalar = operand_tyref(&operand)
+                    .is_some_and(|src| raw_scalar_address_value_type(src, self.llbc).is_some());
                 let src_int = operand_tyref(&operand).and_then(|src| self.literal_int_width(src));
                 let dst_int = self.literal_int_width(&ty);
                 let src_is_pointer_from_ty = operand_tyref(&operand).map(|src_ty| {
@@ -2934,15 +2969,21 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok(lowered);
                 }
-                if let Some((op, res)) = self.raw_ptr_to_signed(mir_bb, src_raw_addr, &ty, &v) {
+                if let Some((op, res)) =
+                    self.raw_ptr_to_signed(mir_bb, src_raw_addr || src_raw_scalar, &ty, &v)
+                {
                     return Ok((Some(op), res));
                 }
-                if let Some((op, res)) = self.raw_ptr_to_unsigned(mir_bb, src_raw_addr, &ty, &v) {
+                if let Some((op, res)) =
+                    self.raw_ptr_to_unsigned(mir_bb, src_raw_addr || src_raw_scalar, &ty, &v)
+                {
                     return Ok((Some(op), res));
                 }
                 // `*mut Raw as *mut u8` / a GC pointer, and the reverse, cross
-                // the int and ref banks. Aliasing would reuse one variable in
-                // both argument lists.
+                // the int and ref banks. A scalar raw pointer (`*mut u8`,
+                // `rffi.CCHARP`) is the same Address word (`history.py`
+                // `getkind` of a raw `Ptr` is `'int'`). Aliasing would
+                // reuse one variable in both argument lists.
                 let dst_kind = tyref_to_value_type_with(
                     &ty,
                     self.llbc,
@@ -2956,8 +2997,11 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 );
-                let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
-                    || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_raw_addr);
+                let dest_raw_scalar = raw_scalar_address_value_type(&ty, self.llbc).is_some();
+                let src_is_raw_addr = src_raw_addr || src_raw_scalar;
+                let dest_is_raw_addr = dest_raw_addr || dest_raw_scalar;
+                let crosses_raw_ref = (src_is_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
+                    || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_is_raw_addr);
                 if crosses_raw_ref
                     && let Some(src) = src_kind.as_ref()
                     && let Some(segments) = cast_call_segments(src, &dst_kind)
@@ -3004,24 +3048,20 @@ impl<'a> Lowering<'a> {
                         ));
                     }
                     // `cast_int_to_ptr` is an opaque ref. A following field
-                    // read needs the destination owner's class.
-                    if src_raw_addr
+                    // read needs the destination owner's class. A scalar
+                    // Address (`*mut u8` as `*mut PyFrame`) is the same
+                    // `lltype.cast_adr_to_ptr` as a raw-struct pointer.
+                    if src_is_raw_addr
                         && !matches!(src, ValueType::Ref(_))
-                        && let Some(dest_root) =
-                            tyref_class_root_with(&ty, self.llbc, self.tombstoned_leaves)
+                        && let Some(kind) =
+                            self.instance_narrow_for_type(&ty, &converted, src_root.as_deref())
                     {
-                        self.graph.push_op_with_result_var(
-                            self.emit_bb(mir_bb),
-                            bank,
-                            converted.clone(),
-                        );
+                        self.graph
+                            .push_op_with_result_var(self.emit_bb(mir_bb), bank, converted);
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        return Ok((
-                            Some(crate::model::cast_instance_call(dest_root, converted)),
-                            res,
-                        ));
+                        return Ok((Some(kind), res));
                     }
                     return Ok((Some(bank), converted));
                 }
@@ -7939,6 +7979,7 @@ impl<'a> Lowering<'a> {
             owner_path,
             ctor_name,
             fields,
+            raw: tyref_is_raw_struct_value(dest_ty, self.llbc, self.gc_struct_ids),
         }))
     }
 

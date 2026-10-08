@@ -59,7 +59,6 @@ impl SpecQueue {
         }
     }
 
-
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
         // `FunctionDesc.cachedgraph` keys one graph per specializer key
         // inside one desc. The leaf is that key's name; `fn_id` is the

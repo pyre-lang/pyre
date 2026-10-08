@@ -1704,6 +1704,21 @@ pub(crate) fn attach_foldable_const_lits(llbc: &Llbc, entries: &[(String, OpKind
     }
 }
 
+/// `usize` as a field type: Address-width unsigned, getkind `'int'`.
+pub(in crate::front::mir) fn field_ty_is_usize(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let value = strip_ty_indirections(node, llbc).unwrap_or(node);
+    value
+        .as_object()
+        .and_then(|obj| obj.get("Scalar"))
+        .and_then(|scalar| scalar.get("Integer"))
+        .and_then(|int| int.get("Unsigned"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Usize")
+}
+
 /// Link complete transparent-scalar declarations to opaque dependency views.
 ///
 /// Charon keeps `repr(transparent)` in an external declaration's layout but
@@ -1728,8 +1743,18 @@ pub(crate) fn discover_transparent_scalar_kinds(
         let Some(field) = fields.get(index) else {
             continue;
         };
-        let kind = match tyref_to_value_type(&field.ty, llbc) {
+        let inner = tyref_to_value_type(&field.ty, llbc);
+        // A pointer-width unsigned field of a raw transparent wrapper is
+        // Address (`history.py` `getkind` `'int'`). The defining crate
+        // types that wrapper as Int via `tyref_is_raw_struct_value`; the
+        // linked kind has to match, or an Opaque dependent peels the
+        // `usize` as Unsigned. Narrower unsigned (u32 `CodeFlags`) stays
+        // Unsigned.
+        let kind = match inner {
             ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
+            ValueType::Unsigned if field_ty_is_usize(&field.ty, llbc) => {
+                majit_charon_reader::TransparentScalarKind::Signed
+            }
             ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
             ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
             ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
@@ -1744,6 +1769,39 @@ pub(crate) fn discover_transparent_scalar_kinds(
     discovered
 }
 
+/// By-value raw structs in this artefact. An `Opaque` dependent has no
+/// field list; the path is that missing layout so `getkind` of the raw
+/// `Ptr` stays `'int'` after [`link_transparent_scalar_types`].
+///
+/// `gc_struct_ids` is the linked `DeclaredGcFacts` field-0 fixpoint
+/// (`GcType` impl / first-field ancestor). `adt_def_is_raw_storage`
+/// is the rest of that pointee-decl rule: a type absent from the set
+/// is raw when every field is a raw word. Evaluate against the whole
+/// linked input so a GC owner in a dependent crate is not published
+/// as an address.
+pub(crate) fn discover_raw_struct_paths(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    for decl in llbc.iter_type_decls() {
+        if !matches!(decl.kind, TypeDeclKind::Struct(_)) {
+            continue;
+        }
+        // One-field wrappers peel through `transparent_scalar_kind`.
+        // This set is the multi-field all-raw remainder.
+        if decl.is_repr_transparent() {
+            continue;
+        }
+        let mut stack = Vec::new();
+        if adt_def_is_raw_storage(decl.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
+            paths.push(decl.item_meta.name_path());
+        }
+    }
+    paths
+}
+
 /// Transparent scalars whose defining crate is not in the extraction set.
 ///
 /// `rustpython_compiler_core::bytecode::CodeFlags` is the `bitflags!`
@@ -1756,16 +1814,24 @@ pub(in crate::front::mir) fn external_transparent_scalar_kinds()
     )]
 }
 
-pub(in crate::front::mir) fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(
-    llbcs: &[L],
-) {
+pub fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) {
     let llbc_refs: Vec<&Llbc> = llbcs.iter().map(std::borrow::Borrow::borrow).collect();
     let llbcs: &[&Llbc] = &llbc_refs;
+    let mut declared_gc = DeclaredGcFacts::default();
+    for llbc in llbcs {
+        declared_gc.absorb(harvest_declared_gc_facts(llbc));
+    }
+    let gc_struct_ids = declared_gc.gc_struct_ids();
     let mut discovered = Vec::new();
+    let mut raw_structs = Vec::new();
     let mut foldable_cross = Vec::new();
     let mut foldable_impl: Vec<Vec<(String, OpKind)>> = Vec::new();
     for llbc in llbcs {
         discovered.extend(discover_transparent_scalar_kinds(llbc));
+        let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
+            std::slice::from_ref(*llbc),
+        );
+        raw_structs.extend(discover_raw_struct_paths(llbc, &gc_struct_ids, &ranks));
         let mut impl_folds = Vec::new();
         for (path, op) in discover_foldable_const_lits(llbc) {
             if path.contains('<') {
@@ -1778,9 +1844,12 @@ pub(in crate::front::mir) fn link_transparent_scalar_types<L: std::borrow::Borro
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();
+    raw_structs.sort();
+    raw_structs.dedup();
     let foldable_cross = register_foldable_const_lits(foldable_cross);
     for (llbc, impl_folds) in llbcs.iter().zip(foldable_impl) {
         llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+        llbc.register_raw_struct_paths(raw_structs.iter().cloned());
         attach_foldable_const_lits(llbc, &foldable_cross);
         attach_foldable_const_lits(llbc, &impl_folds);
     }

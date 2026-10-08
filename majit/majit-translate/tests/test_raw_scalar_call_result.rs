@@ -3,11 +3,14 @@
 //! `pygraph_initial_block` already records that parameter as `Int`.
 //! `CallControl::getcalldescr` compares the two.
 //!
-//! `IntArray::base` and `FloatArray::base` return the GC block header,
-//! so those calls stay `Ref`. An integer cast to a non-byte raw scalar
-//! stays in the int bank.
+//! `IntArray::base` and `FloatArray::base` return an interior
+//! `*mut i64` / `*mut f64` (`rffi` raw `Ptr`, `getkind` `'int'`). The
+//! GC block is `IntArray.block` / `FloatArray.block`. An integer cast
+//! to a non-byte raw scalar stays in the int bank.
 //!
-//! A byte pointer stays `Ref`: pyre erases a GC reference to `*mut u8`.
+//! A byte pointer is `int`: `*mut u8` is `rffi.CCHARP`, and
+//! `history.py` `getkind` banks every raw `Ptr` as `int`.
+//! `llmemory.GCREF` (`*mut GCREFOpaque`) is `ref`.
 //!
 //! A call that passes `&` / `&mut` of a primitive into a raw
 //! scalar-pointer parameter materializes an address first
@@ -57,12 +60,15 @@
 
 mod common;
 
-use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_named};
+use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_named, rlib_llbc};
 use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
+use majit_translate::codewriter::call::CallControl;
+use majit_translate::codewriter::codewriter::CodeWriter;
+use majit_translate::codewriter::jitcode::JitCode;
+use majit_translate::front::mir::build_semantic_program_from_llbc;
 use majit_translate::{
-    ErrorCarrierSpec, HostStaticAddrs,
-    call::CallControl,
+    CallPath, ErrorCarrierSpec, HostStaticAddrs,
     codewriter::jtransform::{GraphTransformConfig, Transformer},
     flowspace::model::ConstValue,
     front::llbc_hints::harvest_immutable_fields_from_llbcs,
@@ -71,6 +77,8 @@ use majit_translate::{
     translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, PtrTarget},
 };
 use serde_json::{Value, json};
+
+const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
 
 fn defining_op<'a>(
     graph: &'a FunctionGraph,
@@ -274,7 +282,7 @@ fn mapdict_get_reads_slots_map_pointer_as_int() {
 }
 
 #[test]
-fn typed_array_base_call_stays_ref() {
+fn typed_array_base_call_stays_int() {
     let llbc = load_llbc(OBJECT_LLBC);
     common::with_shared_lowering(llbc, |context| {
         for path in [
@@ -291,8 +299,10 @@ fn typed_array_base_call_stays_ref() {
                 graph.name
             );
             assert!(
-                bases.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
-                "{path} base() stays the GC block Ref, got {bases:?}"
+                bases
+                    .iter()
+                    .all(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
+                "{path} base() is an interior raw Ptr (`getkind` int), got {bases:?}"
             );
         }
     });
@@ -349,25 +359,26 @@ fn integer_cast_to_raw_scalar_stays_int() {
 #[test]
 fn hashlib_copy_repeat_fill_matches_words_item_kind() {
     let llbc = load_llbc(MODULE_LLBC);
-    let context = lower_context_for(llbc);
-    let graph = lower_fun_decl(&context, find_method(&llbc, "copy", "W_HashState"))
-        .expect("lower W_HashState::copy");
-    let word_writes: Vec<&ValueType> = ops(&graph)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldWrite { field, ty, .. } if field.name == "words" => Some(ty),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        !word_writes.is_empty(),
-        "copy writes HashStateStorage.words"
-    );
-    assert!(
-        word_writes
-            .iter()
-            .all(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
-        "words is a scalar FixedSizeArray item, got {word_writes:?}"
-    );
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_fun_decl(context, find_method(llbc, "copy", "W_HashState"))
+            .expect("lower W_HashState::copy");
+        let word_writes: Vec<&ValueType> = ops(&graph)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, ty, .. } if field.name == "words" => Some(ty),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !word_writes.is_empty(),
+            "copy writes HashStateStorage.words"
+        );
+        assert!(
+            word_writes
+                .iter()
+                .all(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
+            "words is a scalar FixedSizeArray item, got {word_writes:?}"
+        );
+    });
 }
 
 #[test]
@@ -403,23 +414,23 @@ fn sizehint_i64_cast_stays_gcarray_write() {
 }
 
 #[test]
-fn call_returned_byte_pointer_stays_ref() {
+fn call_returned_gcref_stays_ref() {
     let llbc = load_llbc(OBJECT_LLBC);
     let graph = lower_named(llbc, "gc_hook::try_gc_alloc_young_nonmoving_raw")
         .expect("lower try_gc_alloc_young_nonmoving_raw");
-    let byte_calls: Vec<_> = ops(&graph)
+    let gcref_calls: Vec<_> = ops(&graph)
         .filter_map(|op| call_result(&op.kind))
         .filter(|(_, leaf)| *leaf == Some("try_gc_alloc_stable_raw"))
         .map(|(ty, _)| ty.clone())
         .collect();
     assert!(
-        !byte_calls.is_empty(),
+        !gcref_calls.is_empty(),
         "try_gc_alloc_young_nonmoving_raw must call try_gc_alloc_stable_raw, ops in {}",
         graph.name
     );
     assert!(
-        byte_calls.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
-        "*mut u8 call result stays Ref, got {byte_calls:?} in {}",
+        gcref_calls.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
+        "GCREF call result is ref (`llmemory.GCREF`), got {gcref_calls:?} in {}",
         graph.name
     );
 }
@@ -701,6 +712,145 @@ fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
             "_get_mapdict_map must keep a word-operand MapNode cast in at least one graph"
         );
     });
+}
+
+fn residual_input_types(graph: &FunctionGraph) -> Vec<&ValueType> {
+    let start = graph.block(graph.startblock);
+    start
+        .inputargs
+        .iter()
+        .filter_map(|arg| {
+            start.operations.iter().find_map(|op| match &op.kind {
+                OpKind::Input { ty, .. } if op.result.as_ref() == Some(arg) => Some(ty),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+fn is_int_bank(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Int | ValueType::Unsigned)
+}
+
+#[test]
+fn copy_string_to_raw_residual_keeps_gc_src_and_ccharp_dst() {
+    // `rstr.py copy_string_to_raw` is residual (`oopspec` /
+    // `copy_raw_to_string` `@jit.dont_look_inside`): GC string + raw
+    // `CCHARP`. `jtransform.py rewrite_op_cast_ptr_to_adr` rejects a GC
+    // source, so the Address conversion stays inside the residual.
+    let Some(llbc) = rlib_llbc() else {
+        return;
+    };
+    let copy = lower_named(llbc, "copy_string_to_raw").expect("lower copy_string_to_raw");
+    let tys = residual_input_types(&copy);
+    assert_eq!(tys.len(), 3, "copy_string_to_raw takes src, dst, length");
+    assert!(
+        matches!(tys[0], ValueType::Ref(_)),
+        "src is the GC string (`rstr.py copy_string_to_raw`), got {:?}",
+        tys[0]
+    );
+    assert!(
+        is_int_bank(tys[1]),
+        "dst is raw CCHARP (`getkind` int), got {:?}",
+        tys[1]
+    );
+    assert!(is_int_bank(tys[2]), "length is Signed, got {:?}", tys[2]);
+
+    let back = lower_named(llbc, "copy_raw_to_string").expect("lower copy_raw_to_string");
+    let back_tys = residual_input_types(&back);
+    assert_eq!(
+        back_tys.len(),
+        3,
+        "copy_raw_to_string takes src, dst, length"
+    );
+    assert!(
+        is_int_bank(back_tys[0]),
+        "src is raw CCHARP (`rstr.py copy_raw_to_string`), got {:?}",
+        back_tys[0]
+    );
+    assert!(
+        matches!(back_tys[1], ValueType::Ref(_)),
+        "dst is the GC string, got {:?}",
+        back_tys[1]
+    );
+    assert!(
+        is_int_bank(back_tys[2]),
+        "length is Signed, got {:?}",
+        back_tys[2]
+    );
+
+    let graph = lower_named(llbc, "str2charp").expect("str2charp must lower");
+    assert!(
+        ops(&graph).any(|op| match &op.kind {
+            OpKind::Call { target, .. } => call_leaf(target) == Some("copy_string_to_raw"),
+            _ => false,
+        }),
+        "str2charp residual-calls copy_string_to_raw (`rffi.py str2charp`)"
+    );
+
+    let from_raw = lower_named(llbc, "charpsize2str").expect("charpsize2str must lower");
+    assert!(
+        ops(&from_raw).any(|op| match &op.kind {
+            OpKind::Call { target, .. } => call_leaf(target) == Some("copy_raw_to_string"),
+            _ => false,
+        }),
+        "charpsize2str residual-calls copy_raw_to_string (`rffi.py charpsize2str`)"
+    );
+}
+
+#[test]
+fn set_strategy_add_key_ptr_returns_gcref() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
+    let graph = lower_function(&llbc, "setobject::set_strategy_add_key_ptr")
+        .expect("lower set_strategy_add_key_ptr");
+    let ret = returned_var(&graph);
+    let ty = match defining_op(&graph, &ret) {
+        Some(OpKind::Call { result_ty, .. }) => result_ty,
+        Some(OpKind::Input { ty, .. }) => ty,
+        other => panic!(
+            "set_strategy_add_key_ptr must return a GCREF word, got {other:?} in {}",
+            graph.name
+        ),
+    };
+    assert!(
+        matches!(ty, ValueType::Ref(_)),
+        "SetStrategy.add residual is GCREF (`llmemory.GCREF`), got {ty:?} in {}",
+        graph.name
+    );
+}
+
+#[test]
+fn cast_into_ccharp_to_voidp_stays_int() {
+    let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+    let program = build_semantic_program_from_llbc(&llbc).expect("build corpus SemanticProgram");
+    let func = program
+        .functions
+        .iter()
+        .find(|func| func.name == "ccharp_to_voidp" && func.trait_root.is_some())
+        .expect("CastCcharpToVoidP::ccharp_to_voidp in SemanticProgram");
+    assert_eq!(
+        func.return_type.as_deref(),
+        Some("i64"),
+        "rffi.VOIDP is int (`rffi.py VOIDP`); trait-method FUNC.RESULT must stamp i64, got {:?} trait_root={:?}",
+        func.return_type,
+        func.trait_root
+    );
+    let mut graph = func.graph().clone();
+    graph.return_type = func.return_type.clone();
+    let path = CallPath::from_segments(["charon_corpus", "ccharp_to_voidp"]);
+    let mut callcontrol = CallControl::new();
+    callcontrol.register_function_graph(path.clone(), graph.clone());
+    let mut codewriter = CodeWriter::new();
+    let jitcode = std::sync::Arc::new(JitCode::new("ccharp_to_voidp"));
+    codewriter.transform_graph_to_jitcode(
+        &graph,
+        &path,
+        &mut callcontrol,
+        &GraphTransformConfig::default(),
+        &jitcode,
+        false,
+        0,
+    );
 }
 
 fn i64_ty() -> Value {
@@ -1131,7 +1281,7 @@ fn shared_borrow_of_i64_into_const_pointer_is_not_copied_out() {
 #[test]
 fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
     let i64_ty = i64_ty();
-    let cases: [(&str, &str, Value, Value, Pass); 5] = [
+    let cases: [(&str, &str, Value, Value, Pass); 4] = [
         (
             "&mut i64 parameter",
             "keyhash",
@@ -1148,16 +1298,6 @@ fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
             raw_ptr(&i64_ty, "Mut"),
             raw_ptr(&i64_ty, "Mut"),
             Pass::Direct { ret_local: 2 },
-        ),
-        (
-            "&mut u8 into *mut u8",
-            "byte",
-            u8_ty(),
-            raw_ptr(&u8_ty(), "Mut"),
-            Pass::Borrow {
-                kind: "Mut",
-                ret_local: 1,
-            },
         ),
         (
             "i64 passed by value",
@@ -1193,6 +1333,37 @@ fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
             op_lines(&graph)
         );
     }
+    // `*mut u8` is `rffi.CCHARP`: `&mut u8` into that parameter is an
+    // address, so the byte is spilled and `flag` stays the other word.
+    let graph = lower_probe(
+        "byte",
+        &u8_ty(),
+        &raw_ptr(&u8_ty(), "Mut"),
+        Pass::Borrow {
+            kind: "Mut",
+            ret_local: 1,
+        },
+    );
+    let mallocs = raw_ops(&graph, |kind| matches!(kind, OpKind::RawMalloc { .. }));
+    assert_eq!(
+        mallocs.len(),
+        1,
+        "&mut u8 into *mut u8 spills the byte\n{}",
+        op_lines(&graph)
+    );
+    let ptr = mallocs[0].result.as_ref().expect("RawMalloc result");
+    let call = sink_call(&graph);
+    assert_eq!(
+        call_arg(call, 0),
+        input_var(&graph, "flag"),
+        "&mut u8 into *mut u8: flag stays the word"
+    );
+    assert_eq!(
+        call_arg(call, 1),
+        ptr,
+        "&mut u8 into *mut u8: the raw parameter receives the address\n{}",
+        op_lines(&graph)
+    );
 }
 
 enum BorrowAlias {

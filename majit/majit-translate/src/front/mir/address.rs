@@ -520,7 +520,7 @@ impl<'a> Lowering<'a> {
     /// [`attach_aliasing_raw_arguments`] passes the spill address when
     /// that pointer names the spilled place. An `&mut i64` parameter
     /// is the word on both sides and is left alone. A byte pointer
-    /// stays `Ref`.
+    /// (`*mut u8`, `rffi.CCHARP`) is `int`.
     /// A by-value multi-word argument is the address of its storage.
     /// RPython never passes a struct by value: a GcStruct is a pointer
     /// (`'r'`), a non-GC Struct is `Ptr` (`'i'`). Kind comes from

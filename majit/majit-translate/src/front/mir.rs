@@ -3750,7 +3750,7 @@ fn annotation_struct_field_type(
                 tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
             format!("*mut Vec<{item}>")
         }
-        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
+        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<GCREF>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
         None => {
             let layout =
@@ -5178,11 +5178,12 @@ impl DeclaredGcFacts {
         self.field0.extend(other.field0);
     }
 
-    /// `StructId`s whose declared kind is `Gc`.
+    /// `StructId`s on the `GcType` field-0 chain.
     ///
     /// (a) a majit-gc `GcType` impl, (b) field 0 of a `Gc` type, (c) a
     /// type whose field 0 is `Gc`. (b) and (c) run to a fixpoint over
-    /// the field-0 edges. Every other analysed struct or enum is `Raw`.
+    /// the field-0 edges. A type absent from this set is `Raw` only
+    /// when [`adt_def_is_raw_storage`] holds (`declared_gckind_by_name`).
     pub(crate) fn gc_struct_ids(&self) -> std::collections::HashSet<majit_ir::descr::StructId> {
         let mut children: std::collections::HashMap<
             majit_ir::descr::StructId,
@@ -5320,17 +5321,21 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
 
 /// Declared `GcKind` of every struct and enum in `llbcs`, keyed by the
 /// crate-stripped type path. `Gc` follows [`DeclaredGcFacts::gc_struct_ids`]
-/// (the field-0 fixpoint); every other analysed struct or enum is `Raw`.
+/// (the field-0 fixpoint) or a type that is not raw storage
+/// ([`adt_def_is_raw_storage`]): a GC pointer field cannot sit in a raw
+/// `Struct` (`lltype.py` `Struct.__init__` "cannot inline %s container";
+/// `Ptr._is_atomic` is only true when `TO._gckind == 'raw'`). Every other
+/// analysed struct or enum is `Raw`.
 #[cfg(test)]
 pub(crate) fn declared_gckind_by_name(
     llbcs: &[Llbc],
 ) -> std::collections::HashMap<String, crate::translator::rtyper::lltypesystem::lltype::GcKind> {
-    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
     let mut facts = DeclaredGcFacts::default();
     for llbc in llbcs {
         facts.absorb(harvest_declared_gc_facts(llbc));
     }
     let gc = facts.gc_struct_ids();
+    let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(llbcs);
     let mut out = std::collections::HashMap::new();
     for llbc in llbcs {
         for td in llbc.iter_type_decls() {
@@ -5344,15 +5349,27 @@ pub(crate) fn declared_gckind_by_name(
                 continue;
             }
             let canon = strip_crate_prefix(&td.item_meta.name_path());
-            let kind = if struct_id_is_declared_gc(&gc, struct_id_for_type_decl(td), &canon) {
-                GcKind::Gc
-            } else {
-                GcKind::Raw
-            };
+            let kind = declared_gckind_of_type_decl(td, llbc, &gc, &immutable_fields);
             out.insert(canon, kind);
         }
     }
     out
+}
+
+/// One `GcKind` for `td`: the field-0 `Gc` set, else [`adt_def_is_raw_storage`].
+fn declared_gckind_of_type_decl(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    let mut stack = Vec::new();
+    if adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
+        GcKind::Raw
+    } else {
+        GcKind::Gc
+    }
 }
 
 /// Per-LLBC fragment of the duplicate-leaf verdict. The streaming frontend
@@ -5947,8 +5964,9 @@ pub struct LowerContext<'a> {
     /// Single-function entry points paint with this set, the same one the
     /// whole-program loop computes from `struct_origins`.
     tombstoned_leaves: std::collections::HashSet<String>,
-    /// Structs and enums declared Gc across this one artefact.
-    /// Absence is Raw (`DeclaredGcFacts::gc_struct_ids`).
+    /// Structs and enums on the `GcType` field-0 chain for this artefact.
+    /// A type absent from this set is still `Gc` when it is not raw
+    /// storage (`adt_def_is_raw_storage`).
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
@@ -5970,13 +5988,19 @@ impl<'a> LowerContext<'a> {
     ) -> Self {
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         // Single-function lowering does not run
-        // [`link_transparent_scalar_types`]. Publish the same external
-        // scalar the link pass adds, so a `CodeFlags` borrow is the word.
-        llbc.register_transparent_scalar_kinds(external_transparent_scalar_kinds());
+        // [`link_transparent_scalar_types`]. Discover this artefact's
+        // transparent scalars (and the external `CodeFlags` word the
+        // link pass also adds) so a defining-crate `RootScope` peels.
+        llbc.register_transparent_scalar_kinds(discover_transparent_scalar_kinds(llbc));
         let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
         );
+        llbc.register_raw_struct_paths(discover_raw_struct_paths(
+            llbc,
+            &gc_struct_ids,
+            &immutable_fields,
+        ));
         let mut raw_alloc_flavor_structs =
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 llbc,
@@ -6328,10 +6352,11 @@ use self::simplify::*;
 use self::strformat::*;
 use self::views::*;
 
+pub use self::consteval::link_transparent_scalar_types;
 pub(crate) use self::consteval::{
-    attach_foldable_const_lits, discover_foldable_const_lits, discover_transparent_scalar_kinds,
-    harvest_immutable_fields_from_immutable_statics, harvest_named_const_folds,
-    push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
+    attach_foldable_const_lits, discover_foldable_const_lits, discover_raw_struct_paths,
+    discover_transparent_scalar_kinds, harvest_immutable_fields_from_immutable_statics,
+    harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
     register_foldable_const_lits,
 };
 pub(crate) use self::desugar::callee::{
