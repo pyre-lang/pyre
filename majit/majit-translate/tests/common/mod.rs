@@ -368,6 +368,10 @@ pub fn jit_llbc() -> &'static Llbc {
     load_llbc(JIT_LLBC)
 }
 
+pub fn rlib_llbc() -> Option<&'static Llbc> {
+    load_llbc_if_present(RLIB_LLBC)
+}
+
 /// rbigint bodies live in `majit-rlib.ullbc`; their callers live in
 /// `pyre-object.ullbc`. Owner first, matching the front-end merge.
 pub fn rbigint_llbcs() -> &'static [&'static Llbc] {

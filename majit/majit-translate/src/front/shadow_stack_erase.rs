@@ -13,16 +13,10 @@
 //! synthetic MIR local.  A pin writes the slot local and answers the value it
 //! was handed, a read-back answers the slot local, a `set` rewrites it, and the
 //! opener, `base()`, `shadow_stack_len()`, the normalize calls and the close
-//! all disappear.  The cached-slot family (`cache_root_stack_slot`,
-//! `slot_from_cached`, `shadow_stack_slot`, `slot_top_ref`, the portal
-//! wrappers `reload_entered` / `reload_cached` / `cached_root_raw`) is the
-//! same machinery `gc_enter_roots_frame` runs after `make_jitcodes`: a reload
-//! of the top slot answers the frame value the body already holds (the
-//! jitframe gcmap roots it), and the cached-slot word read/cache is dead.
-//! The flow-graph builder then carries each slot through the body's blocks
-//! like any other local, so a merge or a loop needs nothing of its own.  The
-//! references the slots held stay rooted by the jitcode's own root sets (the
-//! jitframe gcmap, the blackhole's `registers_r`, the recorder).
+//! all disappear.  The flow-graph builder then carries each slot through the
+//! body's blocks like any other local, so a merge or a loop needs nothing of
+//! its own.  The references the slots held stay rooted by the jitcode's own
+//! root sets (the jitframe gcmap, the blackhole's `registers_r`, the recorder).
 //!
 //! The rewrite needs every slot index to be a compile-time offset from the
 //! depth the body was entered at, so it runs an abstract interpretation of the
@@ -110,13 +104,6 @@ enum Leaf {
     GuardNew,
     /// `DictOperationGuard::root(k)`: Get of the k-th slot this guard published.
     GuardRoot,
-    /// `cache_root_stack_slot`: write the TLS slot into a Cell. Dead in jitcode.
-    CacheSlot,
-    /// `slot_from_cached` / `shadow_stack_slot`: the slot handle. Dead once
-    /// a reload answers the frame the body already holds.
-    ResolveSlot,
-    /// `cached_root_raw`: Cell word of the cached slot. Dead in jitcode.
-    CachedRaw,
     /// Touches the stack in a way this pass does not model.
     Unmodeled,
 }
@@ -137,28 +124,6 @@ fn classify_call(
     let path = fd.item_meta.name_path_str();
     let segments: Vec<&str> = path.split("::").collect();
     let leaf = *segments.last()?;
-    // Portal wrappers of `gc_enter_roots_frame` live on the dispatch loop,
-    // not in `gc_roots`. Keyed the same way as the module leaves: last
-    // path segment.
-    match leaf {
-        "reload_cached" | "reload_entered" => return Some((Leaf::ReloadTop, false)),
-        "cached_root_raw" => return Some((Leaf::CachedRaw, false)),
-        _ => {}
-    }
-    // Cached-slot family of `gc_enter_roots_frame`. Other `shadow_stack`
-    // callees (walkers, jitframe stack, `push` / `pop_to`) stay unclassified:
-    // this module is not the RootScope bracket, and treating an unknown
-    // leaf as Unmodeled would refuse a body that also reloads the frame.
-    if segments.contains(&"shadow_stack") {
-        let kind = match leaf {
-            "cache_root_stack_slot" => Leaf::CacheSlot,
-            "slot_from_cached" | "shadow_stack_slot" => Leaf::ResolveSlot,
-            "slot_top_ref" | "top_ref" => Leaf::ReloadTop,
-            _ => return None,
-        };
-        let method = segments.iter().any(|s| s.starts_with('<'));
-        return Some((kind, method));
-    }
     let names_type = |ty: &majit_charon_reader::ullbc::TyRef, name: &str| {
         super::tyref_class_root(ty, llbc).is_some_and(|root| root.rsplit("::").next() == Some(name))
     };
@@ -223,28 +188,34 @@ fn classify_call(
             return Some((Leaf::Unmodeled, false));
         }
         let kind = match leaf {
-            "base" => Leaf::Base,
-            "pin_root" => Leaf::Pin,
-            "get" => Leaf::Get,
-            "publish" | "pin_roots" => Leaf::Publish,
-            "normalize" => Leaf::Normalize,
-            "normalize_moved" => Leaf::NormalizeMoved,
-            "set" => Leaf::Set,
-            "drop" | "drop_in_place" => Leaf::Close,
+            "base" | "root_scope_base_jit_abi" => Leaf::Base,
+            "pin_root" | "root_scope_pin_root_jit_abi" => Leaf::Pin,
+            "get" | "root_scope_get_jit_abi" => Leaf::Get,
+            "publish"
+            | "pin_roots"
+            | "root_scope_publish_jit_abi"
+            | "root_scope_pin_roots_jit_abi" => Leaf::Publish,
+            "normalize" | "root_scope_normalize_jit_abi" => Leaf::Normalize,
+            "normalize_moved" | "root_scope_normalize_moved_jit_abi" => Leaf::NormalizeMoved,
+            "set" | "root_scope_set_jit_abi" => Leaf::Set,
+            "drop" | "drop_in_place" | "root_scope_drop_in_place_jit_abi" => Leaf::Close,
             _ => Leaf::Unmodeled,
         };
         return Some((kind, true));
     }
     let kind = match leaf {
-        "push_roots" => Leaf::Open,
-        "root_scope_close" => return Some((Leaf::Close, true)),
-        "pin_root" => Leaf::Pin,
-        "pin_roots" | "publish_roots" => Leaf::Publish,
-        "normalize_roots" => Leaf::Normalize,
+        "push_roots" | "push_roots_jit_abi" => Leaf::Open,
+        "root_scope_close" | "root_scope_close_word" | "root_scope_close_jit_abi" => return Some((Leaf::Close, true)),
+        "pin_root" | "root_scope_pin_root_jit_abi" => Leaf::Pin,
+        "pin_roots"
+        | "publish_roots"
+        | "root_scope_pin_roots_jit_abi"
+        | "root_scope_publish_jit_abi" => Leaf::Publish,
+        "normalize_roots" | "root_scope_normalize_jit_abi" => Leaf::Normalize,
         "normalize_roots_moved" => Leaf::NormalizeMoved,
         "shadow_stack_len" => Leaf::Len,
-        "shadow_stack_get" => Leaf::Get,
-        "shadow_stack_set" => Leaf::Set,
+        "shadow_stack_get" | "root_scope_get_jit_abi" => Leaf::Get,
+        "shadow_stack_set" | "root_scope_set_jit_abi" => Leaf::Set,
         "reload_top_root" | "reload_top_root_at" => Leaf::ReloadTop,
         "shadow_stack_copy_range" | "shadow_stack_copy_range_into_vec" => Leaf::CopyRange,
         "mark_prebuilt_roots_dirty"
@@ -834,37 +805,6 @@ fn local_place_json(local: usize, ty: &Value) -> Value {
 fn assign_json(dest: Value, rvalue: Value) -> Value {
     json!({ "Assign": [dest, rvalue] })
 }
-
-/// The frame/root operand a reload was given, skipping a cached-slot handle.
-fn reload_held_operand(
-    args_json: &Value,
-    arg0: usize,
-    specials: &HashMap<usize, Special>,
-) -> Option<Value> {
-    let args = args_json.as_array()?;
-    for i in (arg0..args.len()).rev() {
-        let op = &args[i];
-        if json_operand_local(op)
-            .is_some_and(|l| matches!(specials.get(&l), Some(Special::SlotHandle)))
-        {
-            continue;
-        }
-        return Some(op.clone());
-    }
-    None
-}
-
-/// Last function argument: the frame value a depth-0 reload answers when the
-/// call itself only named the slot handle (`slot_top_ref`).
-fn function_held_root(body: &Unstructured) -> Option<usize> {
-    let n = body.locals.arg_count as usize;
-    (n >= 1).then_some(n)
-}
-
-fn zero_use(ty: &Value) -> Value {
-    json!({ "Use": [{ "Const": [{ "Scalar": { "Unsigned": ["Usize", "0"] } }, ty] }, "Yes"] })
-}
-
 
 fn specials_in_json(v: &Value, specials: &HashMap<usize, Special>) -> Vec<Special> {
     let mut out = Vec::new();
@@ -3519,14 +3459,12 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
 
     // Every surviving mention of a guard, borrow or index has to be one of the
     // shapes rewritten above; anything else would read a local no block binds.
-    // A SlotHandle dest is assigned 0, so a later copy (the if-else merge of
-    // `slot_from_cached` / `shadow_stack_slot`) is a defined word.
     let mut watched = bit_set::BitSet::new();
     for (local, special) in &plan.specials {
         // Slice bases stay assigned (`dest = 0`) and their `base + k`
         // arithmetic is kept, so a surviving mention is a use of a
         // bound local. Guard / Alias / Index defs are stripped.
-        if !is_slice_special(*special) && !matches!(special, Special::SlotHandle) {
+        if !is_slice_special(*special) {
             watched.insert(*local);
         }
     }
@@ -4682,9 +4620,7 @@ pub(super) fn erase_shadow_stack(
     }
     // The root-stack runtime itself implements the leaves this pass removes;
     // its bodies stay as written for the callers that keep their brackets.
-    let name = fd.item_meta.name_path_str();
-    if name.contains("::gc_roots::")
-        || name.contains("::shadow_stack::")
+    if fd.item_meta.name_path_str().contains("::gc_roots::")
         || super::frame_anchor::is_helper(fd, llbc)
     {
         return Ok(None);
@@ -5890,10 +5826,7 @@ fn stack_walk(
                             | Leaf::NormalizeMoved
                             | Leaf::ItemsNop
                             | Leaf::ItemsLen
-                            | Leaf::ItemsIsEmpty
-                            | Leaf::CacheSlot
-                            | Leaf::ResolveSlot
-                            | Leaf::CachedRaw => {}
+                            | Leaf::ItemsIsEmpty => {}
                             Leaf::Get | Leaf::Set | Leaf::CopyRange => {
                                 if !call
                                     .args

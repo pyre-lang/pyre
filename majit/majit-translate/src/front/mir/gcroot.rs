@@ -1183,6 +1183,9 @@ pub(in crate::front::mir) const ROOTED_ITEMS_TYPE: &str = "RootedItems";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
 /// that takes the guard's save_point word.
 pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close_word";
+/// Word-ABI residual of [`ROOT_SCOPE_CLOSE`]. Jitcode holds the guard as its
+/// save_point word, so the emitted close names this leaf.
+pub(crate) const ROOT_SCOPE_CLOSE_JIT_ABI: &str = "root_scope_close_jit_abi";
 
 /// True for the root-bracket guard's own type path.
 pub(in crate::front::mir) fn gc_root_scope_type_path(name: &str) -> bool {
@@ -1321,6 +1324,7 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     let in_gc_roots = segments.iter().any(|s| s == "gc_roots");
     (leaf == Some("drop_in_place") && in_gc_roots && segments.iter().any(|s| s == "RootScope"))
         || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
+        || (leaf == Some(ROOT_SCOPE_CLOSE_JIT_ABI) && in_gc_roots)
 }
 
 /// Guard releases that an exceptional Result rewrite must replay on the
@@ -7220,7 +7224,7 @@ pub(in crate::front::mir) fn gc_root_scope_open_path(name: &str) -> bool {
     if !segments.contains(&"gc_roots") {
         return false;
     }
-    matches!(segments.last(), Some(&"push_roots"))
+    matches!(segments.last(), Some(&"push_roots" | &"push_roots_jit_abi"))
         || (matches!(segments.last(), Some(&"new"))
             && segments.iter().any(|s| s.contains(ROOT_SCOPE_TYPE)))
 }
