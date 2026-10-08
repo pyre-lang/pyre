@@ -24722,12 +24722,17 @@ fn contains_bytes_like(
 /// `dictmultiobject.py descr_contains` — `getitem(w_key) is not None`.
 #[inline(never)]
 fn contains_dict(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    // `dictmultiobject.py W_DictMultiObject.descr_contains` →
+    // `self.getitem(w_key) is not None`. `getitem` / `descr_getitem` pin
+    // both the dict and the key across the collecting probe
+    // (`gc_restore_root`); this arm is that same lookup without the
+    // `__missing__` miss path.
     let _roots = pyre_object::gc_roots::push_roots();
-    let needle_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(needle);
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[haystack, needle]);
+    let needle_slot = obj_slot + 1;
     match unsafe {
         pyre_object::dictmultiobject::w_dict_lookup_checked(
-            haystack,
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
             pyre_object::gc_roots::shadow_stack_get(needle_slot),
         )
     } {
