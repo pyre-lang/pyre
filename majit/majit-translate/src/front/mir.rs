@@ -9859,10 +9859,11 @@ impl<'a> Lowering<'a> {
                 self.block_entry_local_var[bb] = PackedLocalRow::pack(&self.link_words());
             }
             self.lower_block(bb)?;
-            // A whole-enum move closes this MIR block's head with a
-            // discriminant switch and leaves the real terminator on the
-            // join. Successors are that join's exits.
-            let bb_id = self.block_id[bb];
+            // A bounds fork or whole-enum move closes this MIR block's
+            // head and leaves the real terminator on the tail / join.
+            // Incoming edges still target `block_id`; successors are the
+            // emit cursor's exits.
+            let bb_id = self.emit_bb(bb);
             let mut ex = self.getstate();
             // Scrub phantom locals before threading.  A slot bound to a
             // Variable that is neither an inputarg nor an op result of this
@@ -9977,14 +9978,14 @@ impl<'a> Lowering<'a> {
 
         // Pass 2 — re-argument the goto / branch links from framestates.
         for &bb in &rpo {
-            let bb_id = self.block_id[bb];
             // A block Pass 1 stubbed dead (empty-entry const-fold orphan)
             // has no exit state and a bare-raise body — its links carry no
             // framestate args to re-argument.  Skip it; the final guard
             // and the real-path dead-block prune both ignore it too.
-            if self.graph.block(bb_id).dead {
+            if self.graph.block(self.block_id[bb]).dead {
                 continue;
             }
+            let bb_id = self.emit_bb(bb);
             let ex = exit_state[bb]
                 .as_ref()
                 .map(PackedFrameState::unpack)
@@ -10082,10 +10083,10 @@ impl<'a> Lowering<'a> {
         // path consumes exactly as today; the decline is drain-neutral
         // because a Match is impossible while the orphan operand stands.
         for &bb in &rpo {
-            let bb_id = self.block_id[bb];
-            if self.graph.block(bb_id).dead {
+            if self.graph.block(self.block_id[bb]).dead {
                 continue;
             }
+            let bb_id = self.emit_bb(bb);
             let undefined: Option<u64> = self
                 .graph
                 .block(bb_id)
@@ -13335,7 +13336,7 @@ impl<'a> Lowering<'a> {
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: crate::model::cast_instance_call(root, base),
@@ -14229,7 +14230,7 @@ impl<'a> Lowering<'a> {
                         )
                     {
                         self.graph.push_op_with_result_var(
-                            self.block_id[mir_bb],
+                            self.emit_bb(mir_bb),
                             bank,
                             converted.clone(),
                         );
@@ -14253,7 +14254,7 @@ impl<'a> Lowering<'a> {
                             tyref_class_root_with(&ty, self.llbc, self.tombstoned_leaves)
                     {
                         self.graph.push_op_with_result_var(
-                            self.block_id[mir_bb],
+                            self.emit_bb(mir_bb),
                             bank,
                             converted.clone(),
                         );
@@ -14756,7 +14757,7 @@ impl<'a> Lowering<'a> {
                 if let Some(kind) = nonzero_kind {
                     let unsigned = kind == ValueType::Unsigned;
                     let base = self.resolve_place(mir_bb, place)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let none = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -14881,14 +14882,14 @@ impl<'a> Lowering<'a> {
     }
 
     fn emit_i64(&mut self, mir_bb: usize, value: i64) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         self.graph
             .push_op_var(bb_id, OpKind::ConstInt(value), true)
             .expect("ConstInt produces a value")
     }
 
     fn emit_binop(&mut self, mir_bb: usize, op: &str, lhs: Variable, rhs: Variable) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         self.graph
             .push_op_var(
                 bb_id,
@@ -14912,7 +14913,7 @@ impl<'a> Lowering<'a> {
         offset: Variable,
         itemsize: usize,
     ) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         self.graph
             .push_op_var(
                 bb_id,
@@ -15714,12 +15715,46 @@ impl<'a> Lowering<'a> {
         self.emit_block[mir_bb]
     }
 
+    /// Copy variable-keyed provenance onto the in-bounds tail's fresh
+    /// inputargs. Locals are remapped separately through [`LocalValue::remap_words`].
+    fn remap_forwarded_provenance(&mut self, remap: &std::collections::HashMap<u64, Variable>) {
+        if remap.is_empty() {
+            return;
+        }
+        let rewrite = |var: &Variable| remap.get(&var.id()).cloned().unwrap_or_else(|| var.clone());
+        let ptr_src = std::mem::take(&mut self.cast_ptr_to_int_src);
+        self.cast_ptr_to_int_src = ptr_src
+            .into_iter()
+            .map(|(k, v)| (rewrite(&k), rewrite(&v)))
+            .collect();
+        let raw_src = std::mem::take(&mut self.raw_address_uint_src);
+        self.raw_address_uint_src = raw_src
+            .into_iter()
+            .map(|(k, v)| (rewrite(&k), rewrite(&v)))
+            .collect();
+        let pointer_word = std::mem::take(&mut self.pointer_word_vars);
+        self.pointer_word_vars = pointer_word.into_iter().map(|v| rewrite(&v)).collect();
+        let guard_word = std::mem::take(&mut self.guard_word_vars);
+        self.guard_word_vars = guard_word.into_iter().map(|v| rewrite(&v)).collect();
+        let pointer_arrays = std::mem::take(&mut self.pointer_word_arrays);
+        self.pointer_word_arrays = pointer_arrays.into_iter().map(|v| rewrite(&v)).collect();
+        let niche = std::mem::take(&mut self.niche_disc_vars);
+        self.niche_disc_vars = niche
+            .into_iter()
+            .map(|id| remap.get(&id).map(Variable::id).unwrap_or(id))
+            .collect();
+        for (_, var) in &mut self.string_array_view_locals {
+            if let Some(copy) = remap.get(&var.id()) {
+                *var = copy.clone();
+            }
+        }
+    }
+
     /// Split the current block on `cond`. The true arm is in bounds and
-    /// becomes the emit cursor for `mir_bb`; the false arm calls
-    /// `ll_slice_bounds_panic` and raises. Incoming edges still target
-    /// [`Self::block_id`]. Locals defined in the head, and every `carry`
-    /// word, are forwarded onto the true arm. Returns `carry` as those
-    /// forwarded copies.
+    /// becomes the emit cursor for `mir_bb`; the false arm raises
+    /// `IndexError`. Incoming edges still target [`Self::block_id`].
+    /// Locals defined in the head, and every `carry` word, are forwarded
+    /// onto the true arm. Returns `carry` as those forwarded copies.
     fn fork_in_bounds(
         &mut self,
         mir_bb: usize,
@@ -15766,20 +15801,8 @@ impl<'a> Lowering<'a> {
                 value.remap_words(&remap);
             }
         }
+        self.remap_forwarded_provenance(&remap);
         let fail = self.graph.create_block();
-        self.graph.block_mut(fail).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::function_path([
-                    "majit_rlib",
-                    "lltypesystem",
-                    "rvec",
-                    "ll_slice_bounds_panic",
-                ]),
-                args: crate::model::call_args(Vec::<Variable>::new()),
-                result_ty: ValueType::Void,
-            },
-        });
         self.graph.set_raise_implicit(fail, "IndexError");
         self.graph
             .set_branch(head, cond, tail, forwarded, fail, Vec::new());
@@ -17560,7 +17583,7 @@ impl<'a> Lowering<'a> {
         if !src_is_raw || !self.dest_is_plain_unsigned(dest_ty) {
             return None;
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let signed = push_cast_ptr_to_int(&mut self.graph, bb_id, arg.clone());
         self.cast_ptr_to_int_src.insert(signed.clone(), arg.clone());
         let word = self
@@ -17600,7 +17623,7 @@ impl<'a> Lowering<'a> {
         // `u64` are longlong, so the 64-bit box identity does not apply.
         // `longlongmask` / `ulonglongmask` coerce through `inputargs`.
         if dst_bits > 64 {
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(word.clone()),
                 kind: word_op,
@@ -17644,7 +17667,7 @@ impl<'a> Lowering<'a> {
             );
         }
         if dst_bits > src_bits {
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(word.clone()),
                 kind: word_op,
@@ -17693,7 +17716,7 @@ impl<'a> Lowering<'a> {
         if !matches!(action, IntCastAction::And(_) | IntCastAction::SignExt(_)) {
             return (word_op, word);
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(word.clone()),
             kind: word_op,
@@ -19011,7 +19034,7 @@ impl<'a> Lowering<'a> {
                     {
                         let list_place = peel_nested_storage_place(clone_place(&inner));
                         let base = self.resolve_place(mir_bb, list_place)?;
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         let ty = tyref_to_value_type_with(
                             &place_ty,
                             self.llbc,

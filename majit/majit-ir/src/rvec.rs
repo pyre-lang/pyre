@@ -102,14 +102,15 @@ pub fn vec_item_kind_for_spelling(item: &str, word: usize) -> Option<VecItemKind
     if item.ends_with("::GCREF") {
         return Some(VecItemKind::Ref);
     }
-    if raw_pointer_pointee_is_dyn(item) {
+    if raw_pointer_pointee_is_fat(item) {
         return None;
     }
     (item.starts_with("*mut ") || item.starts_with("*const ")).then_some(VecItemKind::Ref)
 }
 
-/// `*mut dyn T`, `*const dyn T`, and parenthesized `*mut (dyn T + Send)`.
-fn raw_pointer_pointee_is_dyn(item: &str) -> bool {
+/// Two-word raw pointers: `dyn Trait`, `[T]`, `str`, and the parenthesized
+/// forms `*mut (dyn T + Send)` / `*const ([u8])`.
+fn raw_pointer_pointee_is_fat(item: &str) -> bool {
     let item = item.trim();
     let Some(rest) = item
         .strip_prefix("*mut ")
@@ -123,7 +124,7 @@ fn raw_pointer_pointee_is_dyn(item: &str) -> bool {
         .and_then(|s| s.strip_suffix(')'))
         .unwrap_or(rest)
         .trim();
-    inner.starts_with("dyn ")
+    inner.starts_with("dyn ") || inner.starts_with('[') || inner == "str"
 }
 
 /// The item spelling of a `Vec<item>` spelling (`Vec<T>`, `alloc::vec::Vec<T>`,
@@ -654,6 +655,10 @@ mod tests {
             "*const dyn Foo",
             "*mut (dyn AsyncActionOps)",
             "*const (dyn Foo + Send)",
+            "*const [u8]",
+            "*mut [usize]",
+            "*const str",
+            "*mut str",
         ] {
             assert_eq!(vec_item_kind_for_spelling(other, 8), None, "{other}");
         }
