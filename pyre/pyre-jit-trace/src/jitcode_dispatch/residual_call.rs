@@ -5422,15 +5422,22 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // point, so a pin opened inside it does not reach `set_opref_concrete`.
     // Reserve the slot first; `RootScope::set` publishes the word after the
     // call returns, and the Ok arm re-reads it.
-    let (residual_result_scope, residual_result_index) =
-        if !is_void && call_descr.result_type() == majit_ir::Type::Ref {
-            let scope = pyre_object::gc_roots::push_roots();
-            let index = scope.base();
-            let _reserved = scope.pin_root(pyre_object::PY_NULL);
-            (Some(scope), Some(index))
-        } else {
-            (None, None)
-        };
+    //
+    // A rewindable root-bracket residual (`pin_root`, `push_roots`, ...) grows
+    // this stack itself, and the slot it publishes has to survive the call. A
+    // scope opened before it would rewind past that slot on close, so its
+    // result is pinned after the call instead.
+    let (mut residual_result_scope, mut residual_result_index) = if !is_void
+        && call_descr.result_type() == majit_ir::Type::Ref
+        && !is_rewindable_root_bracket
+    {
+        let scope = pyre_object::gc_roots::push_roots();
+        let index = scope.base();
+        let _reserved = scope.pin_root(pyre_object::PY_NULL);
+        (Some(scope), Some(index))
+    } else {
+        (None, None)
+    };
     // The live frame's locals as they stood before the residual ran.  A
     // residual that writes fastlocals writes THIS object while the walk reads
     // its own copy, so the diff taken afterwards names exactly the slots the
@@ -5608,7 +5615,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 scope.set(index, obj);
                 Ok(scope.get(index) as i64)
             } else {
-                Ok(result_i64)
+                let scope = pyre_object::gc_roots::push_roots();
+                let index = scope.base();
+                let live = scope.pin_root(obj);
+                residual_result_scope = Some(scope);
+                residual_result_index = Some(index);
+                Ok(live as i64)
             }
         }
         other => other,

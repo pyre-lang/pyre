@@ -62,6 +62,32 @@ pub fn is_type_static_const_sentinel(bits: u64) -> bool {
     bits & HIGH == (TYPE_STATIC_CONST_SENTINEL_BASE as u64) & HIGH
 }
 
+/// Non-canonical tag marking a deferred zero-length array constant in
+/// `constants_r`, disjoint from the type-static base. The low 48 bits
+/// carry the [`super::jitcode::EmptyArrayConstDescriptor`] ordinal.
+///
+/// `Assembler.emit_const` puts the `lltype` pointer of a prebuilt
+/// zero-length `GcArray` in `constants_r` (`ListRepr.convert_const` /
+/// `_ll_prebuilt_empty_array`). The translator cannot allocate that
+/// block, so the slot holds this sentinel until the load pass writes
+/// the immortal empty array.
+pub const EMPTY_ARRAY_CONST_SENTINEL_BASE: i64 = 0x7E5B_0000_0000_0000u64 as i64;
+
+/// `EMPTY_ARRAY_CONST_SENTINEL_BASE | ordinal`.
+pub fn empty_array_const_sentinel(ordinal: usize) -> i64 {
+    debug_assert!(
+        (ordinal as u64) < (1u64 << 48),
+        "too many empty-array constants"
+    );
+    EMPTY_ARRAY_CONST_SENTINEL_BASE | ordinal as i64
+}
+
+/// Whether `bits` is an [`empty_array_const_sentinel`] rather than an address.
+pub fn is_empty_array_const_sentinel(bits: u64) -> bool {
+    const HIGH: u64 = 0xFFFF_0000_0000_0000;
+    bits & HIGH == (EMPTY_ARRAY_CONST_SENTINEL_BASE as u64) & HIGH
+}
+
 /// RPython `class AssemblerError(Exception)` (assembler.py).
 ///
 /// Upstream raises this for unsupported constant kinds while assembling
