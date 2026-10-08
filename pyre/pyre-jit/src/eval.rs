@@ -5969,75 +5969,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // residual actually calls so interpret emits wrapint
     // (`new_with_vtable` + `setfield_gc`) with a concrete pointer.
     {
-        majit_metainterp::register_identity_ref_residual(majit_metainterp::IdentityRefResidual {
-            fnaddrs: {
-                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| {
-                        (name.contains("reload_top_root")
-                            || name.contains("try_gc_current_object_address"))
-                        .then_some(addr)
-                    })
-                    .collect();
-                addrs.push(pyre_object::gc_roots::reload_top_root as *const () as i64);
-                addrs.push(pyre_object::gc_roots::reload_top_root_jit_abi as *const () as i64);
-                addrs.push(pyre_object::gc_hook::try_gc_current_object_address as *const () as i64);
-                addrs
-            },
-        });
-        majit_metainterp::register_elidable_int_residual(majit_metainterp::ElidableIntResidual {
-            fnaddrs: {
-                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| {
-                        (name.ends_with("::enabled")
-                            || name.contains("gc_interp::enabled")
-                            || name.contains("binary_op_arg")
-                            || name.contains("comparison_op_arg")
-                            || name.contains("jump_target_forward")
-                            || name.contains("jump_target_backward")
-                            || name.ends_with("::nlocals")
-                            || name.ends_with("::ncells")
-                            || name.contains("ll_issubclass")
-                            || name.contains("raise_kind_arg")
-                            || name.contains("label_arg_to_usize")
-                            || name.contains("exception_match")
-                            || name.contains("is_valid_check_exc_match_class"))
-                        .then_some(addr)
-                    })
-                    .collect();
-                addrs.push(pyre_object::gc_interp::enabled as *const () as i64);
-                addrs.push(pyre_object::ll_issubclass as *const () as i64);
-                addrs.push(
-                    pyre_object::pyobject::__majit_call_target_ll_issubclass as *const () as i64,
-                );
-                addrs.push(pyre_interpreter::baseobjspace::exception_match as *const () as i64);
-                addrs.push(
-                    pyre_interpreter::eval::is_valid_check_exc_match_class as *const () as i64,
-                );
-                addrs
-            },
-        });
-        majit_metainterp::register_frame_anchor_live_residual(
-            majit_metainterp::FrameAnchorLiveResidual {
-                fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| name.contains("frame_anchor_live").then_some(addr))
-                    .collect(),
-            },
-        );
-        majit_metainterp::register_void_skip_residual(majit_metainterp::VoidSkipResidual {
-            fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
-                .into_iter()
-                .filter_map(|(name, addr)| {
-                    // `frame_anchor_push` is a recorded `CallI` whose depth
-                    // word the trace keeps, so its release is recorded too.
-                    // `set_in_flight_exception` is not here: it publishes the
-                    // propagating exception as a GC root and must stay emitted.
-                    name.contains("stack_check").then_some(addr)
-                })
-                .collect(),
-        });
         majit_metainterp::register_exception_trace_residual(
             majit_metainterp::ExceptionTraceResidual {
                 load_global_fnaddrs: Vec::new(),
@@ -11405,10 +11336,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                         // asynchronously injected exception must be catchable by
                         // the target frame's surrounding try/except.
                         f = reload_loop_frame!(f, root_slot);
-                        let next_instr = pyre_interpreter::eval::handle_exception(
-                            unsafe { &mut *f },
-                            &mut err,
-                        );
+                        let next_instr =
+                            pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
                         if next_instr >= 0 {
                             f = reload_loop_frame!(f, root_slot);
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);

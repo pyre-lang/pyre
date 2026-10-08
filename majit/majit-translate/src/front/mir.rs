@@ -3300,7 +3300,7 @@ fn annotation_struct_field_type(
 ) -> String {
     match tyref_rust_vec_item_kind(ty, llbc) {
         Some(majit_ir::rvec::VecItemKind::Int) => "*mut Vec<usize>".to_string(),
-        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
+        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<GCREF>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
         None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids),
     }
@@ -4305,11 +4305,12 @@ impl DeclaredGcFacts {
         self.field0.extend(other.field0);
     }
 
-    /// `StructId`s whose declared kind is `Gc`.
+    /// `StructId`s on the `GcType` field-0 chain.
     ///
     /// (a) a majit-gc `GcType` impl, (b) field 0 of a `Gc` type, (c) a
     /// type whose field 0 is `Gc`. (b) and (c) run to a fixpoint over
-    /// the field-0 edges. Every other analysed struct or enum is `Raw`.
+    /// the field-0 edges. A type absent from this set is `Raw` only
+    /// when [`adt_def_is_raw_storage`] holds (`declared_gckind_by_name`).
     pub(crate) fn gc_struct_ids(&self) -> std::collections::HashSet<majit_ir::descr::StructId> {
         let mut children: std::collections::HashMap<
             majit_ir::descr::StructId,
@@ -4427,12 +4428,15 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
 
 /// Declared `GcKind` of every struct and enum in `llbcs`, keyed by the
 /// crate-stripped type path. `Gc` follows [`DeclaredGcFacts::gc_struct_ids`]
-/// (the field-0 fixpoint); every other analysed struct or enum is `Raw`.
+/// (the field-0 fixpoint) or a type that is not raw storage
+/// ([`adt_def_is_raw_storage`]): a GC pointer field cannot sit in a raw
+/// `Struct` (`lltype.py` `Struct.__init__` "cannot inline %s container";
+/// `Ptr._is_atomic` is only true when `TO._gckind == 'raw'`). Every other
+/// analysed struct or enum is `Raw`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn declared_gckind_by_name(
     llbcs: &[Llbc],
 ) -> std::collections::HashMap<String, crate::translator::rtyper::lltypesystem::lltype::GcKind> {
-    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
     let mut facts = DeclaredGcFacts::default();
     for llbc in llbcs {
         facts.absorb(harvest_declared_gc_facts(llbc));
@@ -4451,15 +4455,26 @@ pub(crate) fn declared_gckind_by_name(
                 continue;
             }
             let canon = strip_crate_prefix(&td.item_meta.name_path());
-            let kind = if gc.contains(&struct_id_for_type_decl(td)) {
-                GcKind::Gc
-            } else {
-                GcKind::Raw
-            };
+            let kind = declared_gckind_of_type_decl(td, llbc, &gc);
             out.insert(canon, kind);
         }
     }
     out
+}
+
+/// One `GcKind` for `td`: the field-0 `Gc` set, else [`adt_def_is_raw_storage`].
+fn declared_gckind_of_type_decl(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    let mut stack = Vec::new();
+    if adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, &mut stack) {
+        GcKind::Raw
+    } else {
+        GcKind::Gc
+    }
 }
 
 /// Per-LLBC fragment of the duplicate-leaf verdict. The streaming frontend
@@ -4977,8 +4992,9 @@ pub struct LowerContext<'a> {
     /// Single-function entry points paint with this set, the same one the
     /// whole-program loop computes from `struct_origins`.
     tombstoned_leaves: std::collections::HashSet<String>,
-    /// Structs and enums declared Gc across this one artefact.
-    /// Absence is Raw (`DeclaredGcFacts::gc_struct_ids`).
+    /// Structs and enums on the `GcType` field-0 chain for this artefact.
+    /// A type absent from this set is still `Gc` when it is not raw
+    /// storage (`adt_def_is_raw_storage`).
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
@@ -4990,10 +5006,12 @@ impl<'a> LowerContext<'a> {
     pub fn new(llbc: &'a Llbc) -> Self {
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         // Single-function lowering does not run
-        // [`link_transparent_scalar_types`]. Publish the same external
-        // scalar the link pass adds, so a `CodeFlags` borrow is the word.
-        llbc.register_transparent_scalar_kinds(external_transparent_scalar_kinds());
+        // [`link_transparent_scalar_types`]. Discover this artefact's
+        // transparent scalars (and the external `CodeFlags` word the
+        // link pass also adds) so a defining-crate `RootScope` peels.
+        llbc.register_transparent_scalar_kinds(discover_transparent_scalar_kinds(llbc));
         let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
+        llbc.register_raw_struct_paths(discover_raw_struct_paths(llbc, &gc_struct_ids));
         let (_, _, struct_fields, _, _, struct_field_attrs, _, _) =
             derive_program_metadata(llbc, &gc_struct_ids);
         Self {
@@ -7223,6 +7241,33 @@ fn concretetype_for_field(ty: &ValueType) -> crate::model::ConcreteType {
         | ValueType::SingleFloat
         | ValueType::Int128
         | ValueType::UInt128 => crate::model::ConcreteType::Signed,
+    }
+}
+
+/// `rtyper.py` `setconcretetype` writes `v.concretetype =
+/// bindingrepr(v).lowleveltype` before `jtransform.py`
+/// `rewrite_op_setfield` reads `RESULT = v_value.concretetype`. An
+/// `Unknown` cell has not been through that step; paint it from the
+/// field lltype, which is the stored value's binding at this site.
+fn field_store_value(value: Variable, ty: &ValueType) -> Variable {
+    let want = concretetype_for_field(ty);
+    if want == crate::model::ConcreteType::Unknown {
+        return value;
+    }
+    let have = FunctionGraph::concretetype_of(&value);
+    if have == want {
+        return value;
+    }
+    if have == crate::model::ConcreteType::Unknown {
+        FunctionGraph::set_concretetype_of_inline(&value, want);
+    }
+    value
+}
+
+fn field_store_link_arg(value: LinkArg, ty: &ValueType) -> LinkArg {
+    match value {
+        LinkArg::Value(var) => LinkArg::Value(field_store_value(var, ty)),
+        other => other,
     }
 }
 
@@ -10464,7 +10509,6 @@ impl<'a> Lowering<'a> {
         }
     }
 
-
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
     /// actually materialises in the model graph.  This EXCLUDES
     /// `on_unwind` (dropped by `lower_call` and the `Assert` / `Drop`
@@ -12082,18 +12126,20 @@ impl<'a> Lowering<'a> {
             let list_place = peel_nested_storage_place(inner);
             let base = self.resolve_place(mir_bb, list_place)?;
             let bb_id = self.emit_bb(mir_bb);
+            let ty = tyref_to_value_type_with(
+                dest_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+            );
+            let value = field_store_link_arg(value, &ty);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base,
                     field: FieldDescriptor::new(flat_name, Some(owner)).with_owner_id(owner_id),
                     value,
-                    ty: tyref_to_value_type_with(
-                        dest_ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                    ),
+                    ty,
                 },
             });
             return Ok(());
@@ -12598,6 +12644,7 @@ impl<'a> Lowering<'a> {
                     );
                     value =
                         self.coerce_signed_int_store(bb_id, &ty, Some(field.name.as_str()), value);
+                    value = field_store_link_arg(value, &ty);
                     OpKind::FieldWrite {
                         base,
                         field,
@@ -14990,6 +15037,12 @@ impl<'a> Lowering<'a> {
                             res,
                         ));
                     }
+                    // Dest attr of a raw `Ptr` is also Int (`history.py`
+                    // `getkind`); that is not a signedness flip.
+                    // `usize as *const usize` stays in the int bank and
+                    // the dest-kind override below aliases it.
+                    // `rtype_intmask` is the unsigned→Signed retype
+                    // (`w_tuple_len as i64`).
                     if matches!(src_attr, Some(ValueType::Unsigned))
                         && matches!(
                             tyref_to_attr_value_type_with(
@@ -15000,6 +15053,7 @@ impl<'a> Lowering<'a> {
                             ),
                             ValueType::Int
                         )
+                        && self.dest_is_plain_signed_int(dest_ty)
                     {
                         let res = self
                             .graph
@@ -15052,6 +15106,25 @@ impl<'a> Lowering<'a> {
                             return Ok((None, signed));
                         }
                     }
+                    // `*mut u8 as usize` is `rbuiltin.py gen_cast` of
+                    // `llmemory.Address` / `rffi.CCHARP`: Signed
+                    // `cast_ptr_to_int` then `r_uint`. getkind of a raw
+                    // `Ptr` is already `'int'`, so this is not the
+                    // Int-banked pointer origin (`Ptr(FuncType)` /
+                    // `RustVec`) and not a GC Ref.
+                    let src_is_raw_scalar = operand_tyref(&operand)
+                        .is_some_and(|ty| raw_scalar_address_value_type(ty, self.llbc).is_some());
+                    if src_is_raw_scalar {
+                        if let Some((op, res)) =
+                            self.raw_ptr_to_unsigned(mir_bb, true, dest_ty, &arg)
+                        {
+                            return Ok((Some(op), res));
+                        }
+                        if let Some((op, res)) = self.raw_ptr_to_signed(mir_bb, true, dest_ty, &arg)
+                        {
+                            return Ok((Some(op), res));
+                        }
+                    }
                     // The opposite signedness flip is RPython's
                     // `rarithmetic.r_uint(v)`: it keeps the machine word
                     // bits but changes the annotation/repr to Unsigned.
@@ -15077,6 +15150,7 @@ impl<'a> Lowering<'a> {
                         let source_is_raw_address = match &operand {
                             Operand::Copy(place) | Operand::Move(place) => {
                                 ty_is_raw_address(&place.ty, self.llbc, self.gc_struct_ids)
+                                    || raw_scalar_address_value_type(&place.ty, self.llbc).is_some()
                             }
                             Operand::Const(_) => false,
                         };
@@ -15494,10 +15568,14 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok(lowered);
                 }
-                if let Some((op, res)) = self.raw_ptr_to_signed(mir_bb, src_raw_addr, &ty, &v) {
+                if let Some((op, res)) =
+                    self.raw_ptr_to_signed(mir_bb, src_raw_addr || src_raw_scalar, &ty, &v)
+                {
                     return Ok((Some(op), res));
                 }
-                if let Some((op, res)) = self.raw_ptr_to_unsigned(mir_bb, src_raw_addr, &ty, &v) {
+                if let Some((op, res)) =
+                    self.raw_ptr_to_unsigned(mir_bb, src_raw_addr || src_raw_scalar, &ty, &v)
+                {
                     return Ok((Some(op), res));
                 }
                 // `*mut Raw as *mut u8` / a GC pointer, and the reverse, cross
@@ -15569,11 +15647,8 @@ impl<'a> Lowering<'a> {
                         && !matches!(src, ValueType::Ref(_))
                         && let Some(kind) = self.instance_narrow_for_type(&ty, &converted)
                     {
-                        self.graph.push_op_with_result_var(
-                            self.emit_bb(mir_bb),
-                            bank,
-                            converted,
-                        );
+                        self.graph
+                            .push_op_with_result_var(self.emit_bb(mir_bb), bank, converted);
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -18537,7 +18612,7 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr" => {
-                    args[0].clone()
+                    self.slice_as_ptr_word(mir_bb, &dest_ty, args[0].clone(), false)
                 }
                 "core::slice::<Impl>::contains" => {
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
@@ -24680,6 +24755,11 @@ impl<'a> Lowering<'a> {
     /// Charon leaves the declaration generic (`monomorphize:false`), so
     /// `fn f<T>(x: &T)` is a `TypeVar` and does not name the wrapper. The
     /// operand's place type is the type the call actually passes.
+    ///
+    /// An inherent method of that wrapper is the other case: `&self` *is*
+    /// the word (`history.py` `getkind` of a raw `Ptr`), and the residual
+    /// ABI takes it by value. A generic that merely instantiates `T` with
+    /// the wrapper still has no such ABI.
     fn refuse_borrowed_transparent_scalar_residual(
         &self,
         mir_bb: usize,
@@ -24695,6 +24775,8 @@ impl<'a> Lowering<'a> {
         if !fun_decl_is_residual(fd, self.dont_look_inside) {
             return Ok(());
         }
+        let inherent =
+            scalar_inherent_method_path(reg, self.llbc, self.tombstoned_leaves, self.gc_struct_ids);
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
             let passed = arg_tys.get(index).and_then(Option::as_ref);
             if std::iter::once(declared).chain(passed).any(|ty| {
@@ -24705,6 +24787,12 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                 )
             }) {
+                // `&self` of the wrapper is the word the jit_abi already
+                // takes. A later argument that is also a borrowed wrapper
+                // is the generic case this refuse still catches.
+                if index == 0 && inherent.is_some() {
+                    continue;
+                }
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: residual `{}` argument {index} borrows a \
                      repr(transparent) scalar; the word is not an address",
@@ -25218,24 +25306,18 @@ impl<'a> Lowering<'a> {
                 self.expand_object_gcarray_header_to_items_len(mir_bb, args[0].clone());
             args = vec![items, length];
         }
-        // `v.extend_from_slice(s)` on a `Vec` of one-word items is
+        // `v.extend_from_slice(s)` on a pair-spliced `&[T]` is
         // `ll_extend` from the pair (`rlist.py ll_extend` /
         // `rrustvec.rs` `VecOp::ExtendFromSlice`). An object-pointer
-        // `&[PyObjectRef]` is the length-prefixed GcArray, not a pair:
-        // expand to `(items = header + ITEMS_BLOCK_ITEMS_OFFSET,
-        // length = arraylen_gc)` so the helper sees the same three
-        // words a pair splice would.
+        // `&[PyObjectRef]` is the length-prefixed GcArray word, not a
+        // pair: that case is `vec_extend_gcarray_kind` below
+        // (`rlist.py ll_extend` with `l2` the GcArray).
         let vec_extend_kind = match &call.func {
             CallFunc::Regular(reg)
                 if regular_call_name_path(reg, self.llbc)
                     .as_deref()
                     .is_some_and(path_is_vec_extend_from_slice)
-                    && (matches!(pair_lens.as_slice(), [(1, _)])
-                        || (pair_lens.is_empty()
-                            && args.len() == 2
-                            && second_arg_ty.as_ref().is_some_and(|ty| {
-                                tyref_is_object_pointer_slice(ty, self.llbc)
-                            }))) =>
+                    && matches!(pair_lens.as_slice(), [(1, _)]) =>
             {
                 first_arg_ty
                     .as_ref()
@@ -29479,9 +29561,12 @@ impl<'a> Lowering<'a> {
                 // `<[T]>::as_ptr` — the slice's data pointer is the receiver
                 // value in the erased array-pointer model.  Alias the result to
                 // the receiver (twin of the `as_slice` identity above and
-                // `NonNull::as_ptr`).  A `Vec::as_ptr` is deliberately excluded
-                // (its items live behind a getfield, not the receiver) — see
-                // `is_container_as_ptr_identity`.
+                // `NonNull::as_ptr`) when dest getkind is still `ref`. Dest
+                // `*mut u8` is `rffi.CCHARP` (`history.py` `getkind` of a
+                // raw `Ptr` is `'int'`), so a GC receiver is
+                // `rbuiltin.py` `rtype_cast_ptr_to_int`. A `Vec::as_ptr` is
+                // deliberately excluded (its items live behind a getfield,
+                // not the receiver) — see `is_container_as_ptr_identity`.
                 // `<[u8]>::as_ptr` is the byte string's `chars` pointer
                 // (`rstr.py` `STR`). Mark it so `*p.add(i)` becomes
                 // `strgetitem`. Any other slice keeps the receiver's mark.
@@ -29493,9 +29578,13 @@ impl<'a> Lowering<'a> {
                     let byte_slice = first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_shared_u8_slice(ty, self.llbc));
-                    if let Some(data) =
-                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData)
-                    {
+                    let fat =
+                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData);
+                    let data = fat.clone().unwrap_or_else(|| args[0].clone());
+                    let word = self.slice_as_ptr_word(mir_bb, &call.dest.ty, data.clone(), true);
+                    if word != data {
+                        self.alias_dest_to_arg0(dest_local, word, byte_slice);
+                    } else if let Some(data) = fat {
                         self.alias_dest_to_arg0(dest_local, data, byte_slice);
                     } else if byte_slice {
                         self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
@@ -29870,30 +29959,36 @@ impl<'a> Lowering<'a> {
                 // `&mut vec[..]` of `Vec<PyObjectRef>` is the header address.
                 // Write the shadow-stack range into that vec. The codewriter
                 // sends the call back when that argument is not a signed word.
-                // Method `RootScope::pin_roots(&self, slice)` is two Ref
-                // words (scope, GcArray). The bound helper is the 3-word
-                // pair ABI `root_scope_pin_roots_jit_abi`. Free `pin_roots`
-                // takes the same length-prefixed GcArray (`pin_roots_jit_abi`,
-                // `rlist.py` `GcArray(OBJECTPTR)`).
-                let (segments, method_hint) = if args.len() == 2
-                    && original_segments.last().map(String::as_str) == Some("pin_roots")
+                // Method `RootScope::pin_roots(&self, slice)`: the guard is
+                // the save_point word, the slice is the length-prefixed
+                // GcArray (`rlist.py` `GcArray(OBJECTPTR)`). Free `pin_roots`
+                // takes that one GcArray (`pin_roots_jit_abi`). Drop the
+                // receiver when it is still present.
+                let (segments, method_hint) = if original_segments.last().map(String::as_str)
+                    == Some("pin_roots")
                     && original_segments.iter().any(|s| s == "gc_roots")
                 {
-                    args.remove(0);
-                    arg_locals.remove(0);
-                    (
-                        vec![
-                            "pyre_object".to_string(),
-                            "gc_roots".to_string(),
-                            "pin_roots".to_string(),
-                        ],
-                        None,
-                    )
+                    if args.len() == 2 {
+                        args.remove(0);
+                        arg_locals.remove(0);
+                    }
+                    if args.len() == 1 {
+                        (
+                            vec![
+                                "pyre_object".to_string(),
+                                "gc_roots".to_string(),
+                                "pin_roots".to_string(),
+                            ],
+                            None,
+                        )
+                    } else {
+                        (segments, method_hint)
+                    }
                 } else {
                     (segments, method_hint)
                 };
                 // Method `RootScope::publish(&self, slice)` is the same
-                // two-Ref graph / 3-word pair split (`root_scope_publish_jit_abi`).
+                // guard-word / GcArray split (`root_scope_publish_jit_abi`).
                 // `get_and_call_function` publishes then normalizes; a pair
                 // helper with the GcArray in rdi and leftover `len` in rdx
                 // copies the length word as slot 0 (`pair_items`). Free
@@ -30742,12 +30837,18 @@ impl<'a> Lowering<'a> {
                         abstract_trait_call_target(&reg, self.llbc)
                     {
                         CallTarget::indirect(trait_root, method_name)
-                    } else if let Some(path) = scalar_inherent_method_path(
-                        &reg,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                    ) {
+                    } else if segments == original_segments
+                        && let Some(path) = scalar_inherent_method_path(
+                            &reg,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        )
+                    {
+                        // A prior retarget (`pin_roots` / `publish` → the
+                        // free helper) already rewrote `segments`. The
+                        // inherent-method path would stamp the wrapper
+                        // method back over that helper.
                         CallTarget::FunctionPath {
                             segments: path,
                             fun_decl_id: None,
@@ -33446,7 +33547,6 @@ impl<'a> Lowering<'a> {
         Some(vec![name])
     }
 
-
     fn enqueue_spec(&self, fd: &FunDecl, generics: &serde_json::Value) -> Option<Vec<String>> {
         let spec = self.spec?;
         if !crate::front::clause_spec::decl_is_generic(fd) {
@@ -35572,6 +35672,7 @@ impl<'a> Lowering<'a> {
             Some(ty),
             crate::model::LinkArg::Value(value),
         );
+        let value = field_store_link_arg(value, ty);
         let kind = OpKind::FieldWrite {
             base: base.clone(),
             field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
@@ -35616,12 +35717,13 @@ impl<'a> Lowering<'a> {
                     pure: false,
                 },
             });
+            let value = field_store_value(read, &leaf_ty);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: dest.clone(),
                     field: leaf,
-                    value: LinkArg::Value(read),
+                    value: LinkArg::Value(value),
                     ty: leaf_ty,
                 },
             });
@@ -39066,6 +39168,46 @@ impl<'a> Lowering<'a> {
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr"
             )
         })
+    }
+
+    /// `<[T]>::as_ptr` / `as_mut_ptr` dest is `*mut T`. `history.py`
+    /// `getkind` of a raw `Ptr` (`*mut u8` / `rffi.CCHARP`) is `'int'`;
+    /// of a GCREF is `'ref'`. A GC slice in the erased array-pointer
+    /// model is the array itself (`'ref'`). Crossing into the address
+    /// bank is `rbuiltin.py` `rtype_cast_ptr_to_int`.
+    ///
+    /// `unknown_is_gc_array` is the identity-path receiver (`<[T]>` in
+    /// that erased model). An untyped cell there is still the array;
+    /// `rewrite_op_cast_ptr_to_int` keeps a Ref/Unknown source as
+    /// `cast_ptr_to_int/r>i` so the FieldWrite names a fresh Signed
+    /// result across `same_as` identity folding. A pair-path pointer
+    /// word may already be an untyped int, so it stays GcRef-only.
+    fn slice_as_ptr_word(
+        &mut self,
+        mir_bb: usize,
+        dest_ty: &TyRef,
+        data: Variable,
+        unknown_is_gc_array: bool,
+    ) -> Variable {
+        let dest_kind = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        );
+        if !matches!(dest_kind, ValueType::Int | ValueType::Unsigned) {
+            return data;
+        }
+        let src_kind = crate::model::FunctionGraph::concretetype_of(&data);
+        let needs_cast = src_kind == crate::model::ConcreteType::GcRef
+            || (unknown_is_gc_array && src_kind == crate::model::ConcreteType::Unknown);
+        if !needs_cast {
+            return data;
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let word = push_cast_ptr_to_int(&mut self.graph, bb_id, data.clone());
+        self.cast_ptr_to_int_src.insert(word.clone(), data);
+        word
     }
 
     /// `core::hint::must_use(value)` — the identity wrapper
@@ -53942,6 +54084,11 @@ pub fn harvest_published_structs(llbc: &Llbc) -> Vec<PublishedStructBody> {
 /// stripping applies to the declaration path, not to `::` inside
 /// generic arguments. An existing `Struct` is left alone. A path that does not
 /// resolve to a destination decl stays a `{"Path": ...}` id.
+///
+/// A destination already classified by `transparent_scalar_kind` or
+/// `is_raw_struct_path` stays `Opaque`: the linked `getkind` is the
+/// defining crate's layout, and a copied field list would be walked as
+/// if it were that layout.
 pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
     if rows.is_empty() {
         return;
@@ -53981,6 +54128,14 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
         std::collections::HashMap::new();
     for td in llbc.iter_type_decls() {
         if !matches!(td.kind, TypeDeclKind::Opaque | TypeDeclKind::Unknown) {
+            continue;
+        }
+        // A linked raw / transparent path already has `getkind`. Copying
+        // fields onto that hole makes `adt_def_is_raw_storage` walk a
+        // remap that can leave a GC field in a raw owner (`jtransform.py`
+        // `rewrite_op_getfield` refuses `getfield_raw_r`).
+        let path = td.item_meta.name_path();
+        if llbc.transparent_scalar_kind(&path).is_some() || llbc.is_raw_struct_path(&path) {
             continue;
         }
         let Some(key) = dest_key_by_id.get(&td.def_id) else {
@@ -54814,12 +54969,12 @@ pub fn shadow_stack_erase_status(
     llbc: &Llbc,
     fd: &FunDecl,
     body: &Unstructured,
-) -> Result<bool, &'static str> {
+) -> Result<bool, String> {
     shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
     match shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
-        Err(reason) => Err(reason),
+        Err(reason) => Err(reason.into_owned()),
     }
 }
 
@@ -58729,11 +58884,38 @@ fn tyref_raw_ptr_points_at_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
 /// [`tyref_scalar_pointee_value_type`] names the pointee for a parameter
 /// or a `Rvalue::Ref`, not for a call result.
 fn raw_scalar_address_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
-    if tyref_is_raw_pointer(ty, llbc) {
-        tyref_scalar_pointee_value_type(ty, llbc)
+    if !tyref_is_raw_pointer(ty, llbc) {
+        return None;
+    }
+    if let Some(vt) = tyref_scalar_pointee_value_type(ty, llbc) {
+        return Some(vt);
+    }
+    // `rffi.VOIDP` is `Ptr(Array(Char, render_as_void))` (`rffi.py VOIDP`):
+    // `getkind` `'int'`, the same bank as CCHARP. The Rust spelling is
+    // `*mut c_void`. `c_void` is a fieldless (or empty) enum, so the
+    // scalar-pointee arm above does not see it, and `declared_raw_adt_node`
+    // skips zero-sized pointees. A raw pointer to that enum is still a
+    // raw `Ptr`.
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    let pointee = one_level_pointer_pointee(node, llbc)?;
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    let pointee_ty = TyRef::Other(pointee.clone());
+    if tyref_is_fieldless_enum_free(&pointee_ty, llbc) || tyref_is_empty_enum(&pointee_ty, llbc) {
+        Some(ValueType::Int)
     } else {
         None
     }
+}
+
+/// Uninhabited enum (`enum c_void {}` in some libcores). Fieldless-enum
+/// classification requires at least one variant; an empty enum is still
+/// the VOIDP pointee.
+fn tyref_is_empty_enum(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(def_id) = tyref_adt_def_id_of(ty, llbc) else {
+        return false;
+    };
+    llbc.type_by_id(def_id)
+        .is_some_and(|td| matches!(&td.kind, TypeDeclKind::Enum(variants) if variants.is_empty()))
 }
 
 /// `ty` is one `&` / `&mut` of a primitive. A raw pointer is not a borrow.
@@ -64262,6 +64444,9 @@ fn declared_adt_struct_id(
         TypeDeclKind::Alias(_) if type_decl_struct_fields(td, llbc).is_some() => {
             Some(struct_id_for_type_decl(td))
         }
+        TypeDeclKind::Opaque if llbc.is_raw_struct_path(&td.item_meta.name_path()) => {
+            Some(struct_id_for_type_decl(td))
+        }
         _ => None,
     }
 }
@@ -64337,15 +64522,6 @@ fn adt_def_is_raw_storage(
     if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
         return false;
     }
-    // Type-decl lowleveltype (`rtyper.py` `getrepr` → `lowleveltype`).
-    // RootScope is a class instance, so a field of that type is not a
-    // raw word. Peel, field-layout spelling, and
-    // `tyref_is_raw_struct_value` read this. A container (`RootedItems`)
-    // that stores the guard would otherwise inherit Int and stamp
-    // FUNC.RESULT `i` while its `new` CFG constructs the instance (`r`).
-    if gc_root_scope_type_path(&td.item_meta.name_path()) {
-        return false;
-    }
     // A closure env is the callable (`tyref_keeps_callable_identity`),
     // even when it has no fields or only captures another callable.
     // Classifying it raw makes `call_once` `self` an Int and a captured
@@ -64376,10 +64552,12 @@ fn adt_def_is_raw_storage(
         // kind is that missing layout (`link_transparent_scalar_types`):
         // peel and field-layout spelling consult this the same way a
         // defining-crate `Struct` does (`rtyper.py` `getrepr` →
-        // `lowleveltype`).
-        TypeDeclKind::Opaque => llbc
-            .transparent_scalar_kind(&td.item_meta.name_path())
-            .is_some(),
+        // `lowleveltype`). A multi-field all-raw struct is the same
+        // fact without a one-field peel (`is_raw_struct_path`).
+        TypeDeclKind::Opaque => {
+            let path = td.item_meta.name_path();
+            llbc.transparent_scalar_kind(&path).is_some() || llbc.is_raw_struct_path(&path)
+        }
         _ => false,
     };
     stack.pop();
@@ -64400,17 +64578,13 @@ fn tyref_is_raw_value(
     field_ty_is_raw_word(ty, llbc, gc_struct_ids, &mut Vec::new())
 }
 
-/// A by-value raw struct (`Fmt`, `Position`): the translator's value is
-/// that struct's address (`history.py` `getkind` of a raw `Ptr` is
-/// `'int'`). Enums stay out: a payload `Option` is still a tagged
-/// instance even when every payload word is raw.
+/// A by-value raw struct (`Fmt`, `Position`, a depth-word guard): the
+/// translator's value is that struct's address (`history.py` `getkind` of
+/// a raw `Ptr` is `'int'`). Enums stay out: a payload `Option` is still a
+/// tagged instance even when every payload word is raw.
 ///
-/// The root-bracket guard is a class instance (`Ref`) even though its
-/// fields are raw words: dependents see it as `TypeDeclKind::Opaque`
-/// (`Ref`), and `pin_root` / `publish` dispatch on that instance. A
-/// defining-crate `Int` token against an opaque `Ref` dest is the
-/// `getcalldescr` `RESULT != FUNC.RESULT` wall on `push_roots`.
-/// `adt_def_is_raw_storage` is that type-decl classification.
+/// `adt_def_is_raw_storage` is that type-decl classification: a GC pointee
+/// is `Ref`, every other declared word is `Int`.
 fn tyref_is_raw_struct_value(
     ty: &TyRef,
     llbc: &Llbc,
@@ -64425,9 +64599,11 @@ fn tyref_is_raw_struct_value(
     let Some(def_id) = adt_node_def_id(node) else {
         return false;
     };
-    llbc.type_by_id(def_id)
-        .is_some_and(|td| matches!(td.kind, TypeDeclKind::Struct(_)))
-        && declared_raw_adt_node(node, llbc, gc_struct_ids).is_some()
+    llbc.type_by_id(def_id).is_some_and(|td| {
+        matches!(td.kind, TypeDeclKind::Struct(_))
+            || (matches!(td.kind, TypeDeclKind::Opaque)
+                && llbc.is_raw_struct_path(&td.item_meta.name_path()))
+    }) && declared_raw_adt_node(node, llbc, gc_struct_ids).is_some()
 }
 
 fn field_ty_is_raw_word(
@@ -64446,6 +64622,11 @@ fn field_ty_is_raw_word(
     // (`is_unit_type`) even when Charon left no TypeDecl for it
     // (`id: 0` null slot), so `tyref_is_zero_sized` cannot see a layout.
     if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
+        return true;
+    }
+    if let Some(def_id) = adt_node_def_id(node)
+        && adt_path_is_phantom_data(llbc, def_id)
+    {
         return true;
     }
     if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
@@ -64481,13 +64662,49 @@ fn pointee_is_raw_word(
     if node.get("Scalar").is_some() {
         return true;
     }
+    // `()` is not a GC pointee. A pointer to it is a raw address
+    // (`history.py` `getkind` of a raw `Ptr` is `'int'`).
+    if adt_node_is_unit_tuple(node, llbc) {
+        return true;
+    }
     if let Some(def_id) = adt_node_def_id(node) {
         if adt_path_is_gc_container(llbc, def_id) {
             return false;
         }
+        if adt_path_is_phantom_data(llbc, def_id) {
+            return true;
+        }
+        let target = std::env::var("TARGET").unwrap_or_default();
+        if llbc
+            .type_by_id(def_id)
+            .and_then(|td| td.layout_for_target(llbc, &target))
+            .is_some_and(|layout| layout.size == Some(0))
+        {
+            return true;
+        }
         return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, stack);
     }
     false
+}
+
+/// `()`: Charon's empty `Tuple` builtin. It has no nominal owner.
+fn adt_node_is_unit_tuple(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(adt) = node.as_object().and_then(|m| m.get("Adt")) else {
+        return false;
+    };
+    type_decl_ref_builtin(adt) == Some("Tuple")
+        && adt.as_object().is_some_and(|map| {
+            type_decl_ref_generics(map, llbc)
+                .and_then(|g| g.get("types"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|types| types.is_empty())
+        })
+}
+
+/// `PhantomData<T>` occupies no GC storage. `T` is not a field.
+fn adt_path_is_phantom_data(llbc: &Llbc, def_id: u64) -> bool {
+    llbc.type_by_id(def_id)
+        .is_some_and(|td| td.item_meta.name_path().ends_with("::PhantomData"))
 }
 
 /// `Vec` / `String` / `Rc` and the object header. A pointer cycle through
@@ -64512,8 +64729,8 @@ fn adt_path_is_gc_container(llbc: &Llbc, def_id: u64) -> bool {
 /// Whether `ty` is one pointer word to a Raw struct or enum.
 ///
 /// `history.getkind` classifies `Ptr(TO)` from `TO._gckind`
-/// (`rewrite_op_getfield`). Absence from [`DeclaredGcFacts::gc_struct_ids`]
-/// is Raw, and the word is an address.
+/// (`rewrite_op_getfield`). Raw storage is [`adt_def_is_raw_storage`],
+/// not mere absence from [`DeclaredGcFacts::gc_struct_ids`].
 fn operand_is_declared_raw(
     operand: &Operand,
     llbc: &Llbc,
@@ -64539,18 +64756,16 @@ fn ty_is_raw_address(
     if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids) {
         return true;
     }
-    // `NonNull<Raw>` / thin `Box<Raw>` is one address word. A `Ref` of a
-    // raw struct stays `Ref` (`RootScope::get`).
+    // `NonNull<Raw>` / thin `Box<Raw>` / `&Raw` is one address word
+    // (`history.py` `getkind` of a raw `Ptr` is `'int'`). A GC pointee
+    // stays `Ref`; every other declared pointee is `Int`.
     let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
-    if !is_borrow
-        && let Some(pointee) = one_level_pointer_pointee(node, llbc)
+    if let Some(pointee) = one_level_pointer_pointee(node, llbc)
         && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
     {
         return true;
     }
-    // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
-    // struct borrow stays `Ref`. Classifying it as an address makes
-    // `RootScope::get` a `[Ref, Int]` signature called with `[Int, Int]`.
+    // `&mut Enum` / `&Enum` of raw storage is one address word.
     // A fieldless enum is the tag integer (`type_decl_is_fieldless_enum`);
     // `Rvalue::Ref` is the identity on that word, so the borrow is not
     // an address (`rclass.py` has no `cast_pointer` of an int).
@@ -64724,6 +64939,13 @@ fn tyref_to_value_type_with(
     // impossible `int_guard_value/r` and gives every following residual call
     // a Ref funcptr operand (`residual_call_*/r...`).
     if type_node_is_fn_ptr(value, llbc) {
+        return ValueType::Int;
+    }
+    // A borrow of a function pointer is the same machine address.
+    // `lltype.Ptr` of a `FuncType` is already that word (`history.py`
+    // `getkind` `'int'`); `&fn` has no extra representation, and a
+    // closure that captures `fn(PyObjectRef)` stores the address.
+    if tyref_is_borrowed_fn_ptr(ty, llbc) {
         return ValueType::Int;
     }
     // A `Vec<T>` is the address of its raw `{ptr, len, cap}` header
@@ -66185,6 +66407,12 @@ fn tyref_to_attr_value_type_with(
     if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned, gc_struct_ids) {
         return inner;
     }
+    // Matching [`tyref_to_value_type`]: a raw `Ptr` of a primitive
+    // (`*mut u8`, `rffi.CCHARP`) is the address word (`history.py`
+    // `getkind` `'int'`), not a GC reference.
+    if let Some(raw) = raw_scalar_address_value_type(ty, llbc) {
+        return raw;
+    }
     if ty_is_raw_address(ty, llbc, gc_struct_ids) {
         return ValueType::Int;
     }
@@ -66238,7 +66466,10 @@ fn tyref_to_attr_value_type_with(
     // must use the same classifier as a value site. Leaving it
     // `Ref(Some(root))` below colors the field Ref while the place is
     // Int, and the join copies Ref into an Int inputarg.
-    if type_node_is_fn_ptr(value, llbc) || tyref_option_payload_is_fn_ptr(ty, llbc) {
+    if type_node_is_fn_ptr(value, llbc)
+        || tyref_option_payload_is_fn_ptr(ty, llbc)
+        || tyref_is_borrowed_fn_ptr(ty, llbc)
+    {
         return tyref_to_value_type_with(ty, llbc, tombstoned, gc_struct_ids);
     }
     // `Option<NonZero*>` and a fieldless-enum niche are integers at every
@@ -68087,6 +68318,21 @@ pub(crate) fn attach_foldable_const_lits(llbc: &Llbc, entries: &[(String, OpKind
     }
 }
 
+/// `usize` as a field type: Address-width unsigned, getkind `'int'`.
+fn field_ty_is_usize(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let value = strip_ty_indirections(node, llbc).unwrap_or(node);
+    value
+        .as_object()
+        .and_then(|obj| obj.get("Scalar"))
+        .and_then(|scalar| scalar.get("Integer"))
+        .and_then(|int| int.get("Unsigned"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Usize")
+}
+
 /// Link complete transparent-scalar declarations to opaque dependency views.
 ///
 /// Charon keeps `repr(transparent)` in an external declaration's layout but
@@ -68111,8 +68357,18 @@ pub(crate) fn discover_transparent_scalar_kinds(
         let Some(field) = fields.get(index) else {
             continue;
         };
-        let kind = match tyref_to_value_type(&field.ty, llbc) {
+        let inner = tyref_to_value_type(&field.ty, llbc);
+        // A pointer-width unsigned field of a raw transparent wrapper is
+        // Address (`history.py` `getkind` `'int'`). The defining crate
+        // types that wrapper as Int via `tyref_is_raw_struct_value`; the
+        // linked kind has to match, or an Opaque dependent peels the
+        // `usize` as Unsigned. Narrower unsigned (u32 `CodeFlags`) stays
+        // Unsigned.
+        let kind = match inner {
             ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
+            ValueType::Unsigned if field_ty_is_usize(&field.ty, llbc) => {
+                majit_charon_reader::TransparentScalarKind::Signed
+            }
             ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
             ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
             ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
@@ -68127,6 +68383,38 @@ pub(crate) fn discover_transparent_scalar_kinds(
     discovered
 }
 
+/// By-value raw structs in this artefact. An `Opaque` dependent has no
+/// field list; the path is that missing layout so `getkind` of the raw
+/// `Ptr` stays `'int'` after [`link_transparent_scalar_types`].
+///
+/// `gc_struct_ids` is the linked `DeclaredGcFacts` field-0 fixpoint
+/// (`GcType` impl / first-field ancestor). `adt_def_is_raw_storage`
+/// is the rest of that pointee-decl rule: a type absent from the set
+/// is raw when every field is a raw word. Evaluate against the whole
+/// linked input so a GC owner in a dependent crate is not published
+/// as an address.
+pub(crate) fn discover_raw_struct_paths(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    for decl in llbc.iter_type_decls() {
+        if !matches!(decl.kind, TypeDeclKind::Struct(_)) {
+            continue;
+        }
+        // One-field wrappers peel through `transparent_scalar_kind`.
+        // This set is the multi-field all-raw remainder.
+        if decl.is_repr_transparent() {
+            continue;
+        }
+        let mut stack = Vec::new();
+        if adt_def_is_raw_storage(decl.def_id, llbc, gc_struct_ids, &mut stack) {
+            paths.push(decl.item_meta.name_path());
+        }
+    }
+    paths
+}
+
 /// Transparent scalars whose defining crate is not in the extraction set.
 ///
 /// `rustpython_compiler_core::bytecode::CodeFlags` is the `bitflags!`
@@ -68139,14 +68427,21 @@ fn external_transparent_scalar_kinds() -> Vec<(String, majit_charon_reader::Tran
     )]
 }
 
-fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) {
+pub fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) {
     let llbc_refs: Vec<&Llbc> = llbcs.iter().map(std::borrow::Borrow::borrow).collect();
     let llbcs: &[&Llbc] = &llbc_refs;
+    let mut declared_gc = DeclaredGcFacts::default();
+    for llbc in llbcs {
+        declared_gc.absorb(harvest_declared_gc_facts(llbc));
+    }
+    let gc_struct_ids = declared_gc.gc_struct_ids();
     let mut discovered = Vec::new();
+    let mut raw_structs = Vec::new();
     let mut foldable_cross = Vec::new();
     let mut foldable_impl: Vec<Vec<(String, OpKind)>> = Vec::new();
     for llbc in llbcs {
         discovered.extend(discover_transparent_scalar_kinds(llbc));
+        raw_structs.extend(discover_raw_struct_paths(llbc, &gc_struct_ids));
         let mut impl_folds = Vec::new();
         for (path, op) in discover_foldable_const_lits(llbc) {
             if path.contains('<') {
@@ -68159,9 +68454,12 @@ fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) {
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();
+    raw_structs.sort();
+    raw_structs.dedup();
     let foldable_cross = register_foldable_const_lits(foldable_cross);
     for (llbc, impl_folds) in llbcs.iter().zip(foldable_impl) {
         llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+        llbc.register_raw_struct_paths(raw_structs.iter().cloned());
         attach_foldable_const_lits(llbc, &foldable_cross);
         attach_foldable_const_lits(llbc, &impl_folds);
     }
@@ -69022,6 +69320,23 @@ fn type_node_is_fn_ptr(node: &serde_json::Value, llbc: &Llbc) -> bool {
     type_node_peel_aliases(node, llbc)
         .and_then(serde_json::Value::as_object)
         .is_some_and(|obj| obj.get("FnPtr").is_some())
+}
+
+/// `&fn(…)` / `&mut fn(…)`: the captured word is the function pointer
+/// itself (`Ptr(FuncType)`), not a GC reference to one.
+fn tyref_is_borrowed_fn_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = node
+        .as_object()
+        .and_then(|obj| obj.get("Ref"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+    else {
+        return false;
+    };
+    type_node_is_fn_ptr(pointee, llbc)
 }
 
 /// The `FnDef` payload of a function-item type, after following
@@ -76943,6 +77258,7 @@ fn emit_aggregate_ctor_with_pairs(
         if let Some(Some(len)) = pair_lens.get(i) {
             let len_name = pair_len_field_name(&field.name);
             for (name, value) in [(field.name.clone(), value.clone()), (len_name, len.clone())] {
+                let value = field_store_value(value, &ValueType::Unsigned);
                 graph.block_mut(block).operations.push(SpaceOperation {
                     result: None,
                     kind: OpKind::FieldWrite {
@@ -76972,11 +77288,9 @@ fn emit_aggregate_ctor_with_pairs(
             }
             None => value.clone(),
         };
-        let ty = positional_ctor_field_value_type(
-            &ctor.result_owner,
-            &field.name,
-            field.ty.clone(),
-        );
+        let ty =
+            positional_ctor_field_value_type(&ctor.result_owner, &field.name, field.ty.clone());
+        let value = field_store_value(value, &ty);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -77034,11 +77348,9 @@ fn emit_aggregate_ctor(
             }
             None => value.clone(),
         };
-        let ty = positional_ctor_field_value_type(
-            &ctor.result_owner,
-            &field.name,
-            field.ty.clone(),
-        );
+        let ty =
+            positional_ctor_field_value_type(&ctor.result_owner, &field.name, field.ty.clone());
+        let value = field_store_value(value, &ty);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -79474,12 +79786,43 @@ fn tyref_is_rust_vec_header(ty: &TyRef, llbc: &Llbc) -> bool {
 /// represents as the address of the raw `{ptr, len, cap}` header
 /// (`RustVecRepr`).  `None` when `ty` is not a Vec or the item is not
 /// one word.
+///
+/// A pointer item is classified by `history.py` `getkind` of that item
+/// (`GCREF` / a GC pointee is `Ref`; `*mut u8` / `rffi.CCHARP` is `Int`).
 fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
     let node = tyref_rust_vec_adt_node(ty, llbc)?;
-    majit_ir::rvec::rust_vec_item_kind_for_spelling(
-        &charon_type_value_to_ast_string(node, llbc, 0),
-        crate::layout::target_word_size(),
-    )
+    let item = node
+        .get("Adt")?
+        .get("generics")?
+        .get("types")?
+        .as_array()?
+        .first()?;
+    rust_vec_item_kind_of_item_node(item, llbc)
+}
+
+/// Register kind of a one-word `Vec` / slice item type node.
+fn rust_vec_item_kind_of_item_node(
+    item: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<majit_ir::rvec::VecItemKind> {
+    let spelling = charon_type_value_to_ast_string(item, llbc, 0);
+    if json_ty_is_objectptr(item, llbc)
+        || object_pointer_item_spelling(&spelling)
+        || spelling == "GCREF"
+        || spelling.ends_with("::GCREF")
+    {
+        return Some(majit_ir::rvec::VecItemKind::Ref);
+    }
+    let item_ty = TyRef::Other(item.clone());
+    if tyref_is_raw_pointer(&item_ty, llbc) {
+        return match tyref_to_value_type(&item_ty, llbc) {
+            ValueType::Ref(_) => Some(majit_ir::rvec::VecItemKind::Ref),
+            ValueType::Int | ValueType::Unsigned => Some(majit_ir::rvec::VecItemKind::Int),
+            ValueType::Float => Some(majit_ir::rvec::VecItemKind::Float),
+            _ => None,
+        };
+    }
+    majit_ir::rvec::vec_item_kind_for_spelling(&spelling, crate::layout::target_word_size())
 }
 
 /// `Vec<PyObjectRef>` / `Vec<*mut PyObject>`, by value or behind one
@@ -79738,10 +80081,7 @@ fn pair_item_kind_of_node(
     if object_pointer_item_spelling(&spelling) {
         return None;
     }
-    if let Some(kind) = majit_ir::rvec::rust_slice_item_kind_for_spelling(
-        &format!("[{spelling}]"),
-        crate::layout::target_word_size(),
-    ) {
+    if let Some(kind) = rust_vec_item_kind_of_item_node(item, llbc) {
         return Some(kind);
     }
     let node = strip_ty_indirections(item, llbc)?;
@@ -100068,13 +100408,11 @@ mod tests {
         (llbc, ty)
     }
 
-    /// RootScope is a class instance (`Ref`) even when Charon records
-    /// `repr.transparent` over its `usize` save_point. Peel, field-layout
-    /// spelling, and `tyref_is_raw_struct_value` read
-    /// `adt_def_is_raw_storage` (`rtyper.py` `getrepr` → `lowleveltype`;
-    /// `getkind`).
+    /// RootScope is its `save_point` word (`history.py` `getkind` of a
+    /// raw `Ptr` is `'int'`). `repr.transparent` over `usize` is that
+    /// declaration; peel and `adt_def_is_raw_storage` agree.
     #[test]
-    fn root_scope_is_ref_even_when_layout_is_transparent_usize() {
+    fn root_scope_transparent_usize_is_int() {
         let decls = vec![(
             1,
             struct_decl(
@@ -100089,9 +100427,10 @@ mod tests {
             ),
         )];
         let (llbc, ty) = load_handle(decls, serde_json::json!([]), 1);
-        assert!(
-            matches!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)),
-            "RootScope getkind is ref; peel must not yield the save_point word"
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Int,
+            "RootScope getkind is the save_point word"
         );
         let word = vec![(
             1,
@@ -100101,12 +100440,64 @@ mod tests {
         assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
     }
 
-    /// A container that stores a RootScope is an instance (`Ref`). The
-    /// guard is not raw storage, so `RootedItems { scope, base, len }`
-    /// does not inherit Int (`rtyper` `getrepr` → `lowleveltype`;
-    /// `getkind`).
+    /// `PhantomData<*const ()>` is a ZST marker. It must not poison the
+    /// guard's raw-storage classification: `*const ()` is a raw address,
+    /// and the marker occupies no GC slot.
     #[test]
-    fn rooted_items_containing_root_scope_is_ref() {
+    fn root_scope_with_phantomdata_marker_is_int() {
+        let unit = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {"types": []}
+        }});
+        let decls = vec![
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["core", "marker", "PhantomData"]),
+                    serde_json::json!([{
+                        "name": null,
+                        "ty": {"RawPtr": [unit, "Const"]},
+                        "attr_info": null
+                    }]),
+                    false,
+                ),
+            ),
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["pyre_object", "gc_roots", "RootScope"]),
+                    serde_json::json!([
+                        {
+                            "name": "save_point",
+                            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "_not_send",
+                            "ty": {"Adt": {"id": 2, "generics": {"types": []}}},
+                            "attr_info": null
+                        }
+                    ]),
+                    true,
+                ),
+            ),
+        ];
+        let (llbc, ty) = load_handle(decls, serde_json::json!([]), 1);
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Int,
+            "RootScope getkind is the save_point word"
+        );
+    }
+
+    /// `RootedItems { scope, base, len }` is three raw words, so the
+    /// container is Int with the guard (`rtyper` `getrepr` →
+    /// `lowleveltype`; `getkind`).
+    #[test]
+    fn rooted_items_containing_root_scope_is_int() {
         let decls = vec![
             (
                 1,
@@ -100148,14 +100539,100 @@ mod tests {
             ),
         ];
         let (llbc, scope) = load_handle(decls.clone(), serde_json::json!([]), 1);
-        assert!(
-            matches!(super::tyref_to_value_type(&scope, &llbc), ValueType::Ref(_)),
-            "RootScope getkind is ref"
+        assert_eq!(
+            super::tyref_to_value_type(&scope, &llbc),
+            ValueType::Int,
+            "RootScope getkind is the save_point word"
         );
         let (llbc, items) = load_handle(decls, serde_json::json!([]), 2);
+        assert_eq!(
+            super::tyref_to_value_type(&items, &llbc),
+            ValueType::Int,
+            "RootedItems stores a depth-word guard; getkind is int"
+        );
+    }
+
+    /// An Opaque dependent has no field list. Linking the defining crate's
+    /// all-raw struct path makes `getkind` the same Int as the Struct view.
+    #[test]
+    fn opaque_rooted_items_links_as_int() {
+        let defining_decls = vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["pyre_object", "gc_roots", "RootScope"]),
+                    serde_json::json!([{
+                        "name": "save_point",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                        "attr_info": null
+                    }]),
+                    true,
+                ),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["pyre_object", "gc_roots", "RootedItems"]),
+                    serde_json::json!([
+                        {
+                            "name": "scope",
+                            "ty": {"Adt": {"id": 1, "generics": {"types": []}}},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "base",
+                            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "len",
+                            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                            "attr_info": null
+                        }
+                    ]),
+                    false,
+                ),
+            ),
+        ];
+        let (defining, _) = load_handle(defining_decls, serde_json::json!([]), 2);
+        let opaque_file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "dependent",
+                "type_decls": indexed_rows(vec![(
+                    2,
+                    serde_json::json!({
+                        "def_id": 2,
+                        "item_meta": fixture_item_meta(ident_path(&[
+                            "pyre_object", "gc_roots", "RootedItems"
+                        ])),
+                        "kind": "Opaque"
+                    }),
+                )]),
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let opaque =
+            Llbc::from_slice(opaque_file.to_string().as_bytes()).expect("opaque fixture parses");
+        let ty = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9002, adt_body(2)]
+        }))
+        .expect("query TyRef parses");
         assert!(
-            matches!(super::tyref_to_value_type(&items, &llbc), ValueType::Ref(_)),
-            "RootedItems stores a RootScope instance; getkind is ref"
+            !matches!(super::tyref_to_value_type(&ty, &opaque), ValueType::Int),
+            "unlinked Opaque RootedItems is not yet the defining-crate word"
+        );
+        super::link_transparent_scalar_types(&[&defining, &opaque]);
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &opaque),
+            ValueType::Int,
+            "linked Opaque RootedItems getkind matches the defining crate"
         );
     }
 
@@ -100292,6 +100769,144 @@ mod tests {
         assert!(
             super::tyref_is_raw_struct_value(&ty, &llbc, &std::collections::HashSet::new()),
             "byte-pointer field is a raw word"
+        );
+    }
+
+    /// A GCREF's gckind comes from the pointee type decl.
+    /// `*mut GCREFOpaque` is `llmemory.GCREF` (`history.py` `getkind` of
+    /// `Ptr(GcOpaqueType)` is `'ref'`), so a wrapper around it is not
+    /// raw storage. `*mut u8` stays `rffi.CCHARP` (`'int'`).
+    #[test]
+    fn struct_storing_gcref_is_ref() {
+        let gcref = serde_json::json!({
+            "RawPtr": [
+                {"Adt": {"id": 1, "generics": {"types": []}}},
+                "Mut"
+            ]
+        });
+        let decls = vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["majit_gc", "header", "GCREFOpaque"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["fixture", "GcRefHolder"]),
+                    serde_json::json!([{
+                        "name": "obj",
+                        "ty": gcref,
+                        "attr_info": null
+                    }]),
+                    false,
+                ),
+            ),
+        ];
+        let (llbc, ty) = load_handle(decls, serde_json::json!([gctype_impl_for_adt(1)]), 2);
+        let gcref_ty = TyRef::Other(serde_json::json!({
+            "RawPtr": [
+                {"Adt": {"id": 1, "generics": {"types": []}}},
+                "Mut"
+            ]
+        }));
+        assert!(
+            matches!(
+                super::tyref_to_value_type(&gcref_ty, &llbc),
+                ValueType::Ref(_)
+            ),
+            "*mut GCREFOpaque getkind is ref (`llmemory.GCREF`)"
+        );
+        let byte_ty = TyRef::Other(serde_json::json!({
+            "RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]
+        }));
+        assert_eq!(
+            super::tyref_to_value_type(&byte_ty, &llbc),
+            ValueType::Int,
+            "*mut u8 getkind is int (`rffi.CCHARP`)"
+        );
+        assert!(
+            matches!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)),
+            "wrapper of a GCREF is a GC instance"
+        );
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        assert!(
+            !super::tyref_is_raw_struct_value(&ty, &llbc, &gc_struct_ids),
+            "GCREF field is not a raw word"
+        );
+    }
+
+    /// A Ref-item `Vec` is `Vec<GCREF>` (`rlist.py` item kind `'r'`).
+    /// `Vec<*mut u8>` is a vector of CCHARP words (`Int`).
+    #[test]
+    fn rust_vec_ref_item_is_gcref_not_ccharp() {
+        use majit_ir::rvec::VecItemKind;
+        let gcref = serde_json::json!({
+            "RawPtr": [
+                {"Adt": {"id": 1, "generics": {"types": []}}},
+                "Mut"
+            ]
+        });
+        let ccharp = serde_json::json!({
+            "RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]
+        });
+        let decls = vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["majit_gc", "header", "GCREFOpaque"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                3,
+                struct_decl(
+                    3,
+                    ident_path(&["alloc", "vec", "Vec"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+        ];
+        let (llbc, _) = load_handle(decls, serde_json::json!([gctype_impl_for_adt(1)]), 1);
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let vec_of = |item: serde_json::Value| {
+            TyRef::Other(serde_json::json!({
+                "Adt": {"id": 3, "generics": {"types": [item]}}
+            }))
+        };
+        let gcref_vec = vec_of(gcref);
+        let ccharp_vec = vec_of(ccharp);
+        assert_eq!(
+            super::tyref_rust_vec_item_kind(&gcref_vec, &llbc),
+            Some(VecItemKind::Ref),
+            "Vec<GCREF> is the Ref-item list"
+        );
+        assert_eq!(
+            super::annotation_struct_field_type(&gcref_vec, &llbc, &gc_struct_ids),
+            "*mut Vec<GCREF>"
+        );
+        assert_eq!(
+            super::tyref_rust_vec_item_kind(&ccharp_vec, &llbc),
+            Some(VecItemKind::Int),
+            "Vec<*mut u8> is a CCHARP vector, kind int"
+        );
+        assert_eq!(
+            super::annotation_struct_field_type(&ccharp_vec, &llbc, &gc_struct_ids),
+            "*mut Vec<usize>"
         );
     }
 
@@ -106720,6 +107335,16 @@ mod tests {
             &TyRef::Other(mut_u8_ty_json()),
             &llbc
         ));
+        assert_eq!(
+            tyref_to_value_type(&TyRef::Other(mut_u8_ty_json()), &llbc),
+            ValueType::Int,
+            "*mut u8 getkind is int (`rffi.CCHARP`)"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type(&TyRef::Other(mut_u8_ty_json()), &llbc),
+            ValueType::Int,
+            "*mut u8 attr getkind is int (`rffi.CCHARP`)"
+        );
     }
 
     /// The pointer-to-int origin is a function pointer or a pointer /
@@ -106793,6 +107418,34 @@ mod tests {
             &TyRef::Other(usize_ty()),
             &llbc
         ));
+    }
+
+    /// A closure that captures `fn(PyObjectRef)` stores the address
+    /// (`Ptr(FuncType)`). The env field is `&fn(…)`; that borrow is still
+    /// the int-banked pointer (`history.py` `getkind`).
+    #[test]
+    fn shared_borrow_of_fn_ptr_is_int() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let fn_ptr = serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [],
+                    "output": {
+                        "Adt": {
+                            "id": 0,
+                            "builtin": "Tuple",
+                            "generics": {"types": []}
+                        }
+                    },
+                    "is_unsafe": false
+                }
+            }
+        });
+        let borrowed = TyRef::Other(serde_json::json!({
+            "Ref": ["_", fn_ptr, "Shared"]
+        }));
+        assert_eq!(tyref_to_value_type(&borrowed, &llbc), ValueType::Int);
+        assert_eq!(tyref_to_attr_value_type(&borrowed, &llbc), ValueType::Int);
     }
 
     /// Only a byte pointee spells the type-erased address; a pointee-typed
@@ -116365,6 +117018,11 @@ mod tests {
         );
         assert_eq!(
             super::spelling_pair_field_kind("[*mut u8]"),
+            Some(VecItemKind::Int),
+            "*mut u8 is rffi.CCHARP, a word"
+        );
+        assert_eq!(
+            super::spelling_pair_field_kind("[GCREF]"),
             Some(VecItemKind::Ref)
         );
         assert!(super::gcref_item_spelling("GCREF"));
@@ -116412,7 +117070,8 @@ mod tests {
         let slice_of = |item: serde_json::Value| serde_json::json!({ "Ref": ["'_", { "Slice": [item, null] }, "Shared"] });
         assert_eq!(
             super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection.clone())), &unique),
-            Some(VecItemKind::Ref)
+            Some(VecItemKind::Int),
+            "unique-impl *mut usize is a word (`rffi.CCHARP` / Address)"
         );
         let ambiguous = llbc_with_trait_impls(serde_json::json!([row.clone(), row]));
         assert_eq!(
@@ -122221,6 +122880,122 @@ mod tests {
         );
     }
 
+    /// `rlist.py` `ll_setitem_fast` over a GC-pointer item is kind `'r'`.
+    /// The `_r` helper's item is `llmemory.GCREF`, not `rffi.CCHARP`.
+    #[test]
+    fn ll_vec_setitem_fast_r_item_is_gcref() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/majit-rlib.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
+        let graph = super::lower_function(&llbc, "ll_vec_setitem_fast_r")
+            .expect("lower ll_vec_setitem_fast_r");
+        let start = graph.block(graph.startblock);
+        let tys: Vec<ValueType> = start
+            .inputargs
+            .iter()
+            .map(|arg| {
+                start
+                    .operations
+                    .iter()
+                    .find_map(|op| match &op.kind {
+                        OpKind::Input { ty, .. } if op.result.as_ref() == Some(arg) => {
+                            Some(ty.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(ValueType::Unknown)
+            })
+            .collect();
+        assert_eq!(tys.len(), 3, "l, index, item, got {tys:?}");
+        assert!(
+            matches!(tys[0], ValueType::Int | ValueType::Unsigned),
+            "Vec header is int, got {tys:?}"
+        );
+        assert!(
+            matches!(tys[1], ValueType::Int | ValueType::Unsigned),
+            "index is int, got {tys:?}"
+        );
+        assert!(
+            matches!(tys[2], ValueType::Ref(_)),
+            "item is GCREF (rlist.py kind 'r'), got {tys:?}"
+        );
+    }
+
+    /// `rlist.py ll_extend`: `_ll_resize_ge` then `ll_arraycopy`. A
+    /// per-item loop would be declined by `look_inside_graph` and
+    /// residualize with only a symbolic path hash.
+    #[test]
+    fn ll_vec_extend_r_is_resize_then_arraycopy() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/majit-rlib.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
+        let graph = super::lower_function(&llbc, "ll_vec_extend_r").expect("lower ll_vec_extend_r");
+        let leaves: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            leaves.iter().any(|leaf| leaf == "ll_slice_arraycopy_r"),
+            "ll_extend copies with ll_arraycopy; leaves={leaves:?}"
+        );
+        assert!(
+            !leaves.iter().any(|leaf| leaf == "ll_vec_setitem_fast_r"),
+            "item-at-a-time copy is the loopy residual; leaves={leaves:?}"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_setfield` / `history.py getkind`: a GCREF
+    /// field and the empty-storage null stored into it are both `'ref'`.
+    /// `W_DictObject.dstorage` is erased GC storage (`llmemory.GCREF`).
+    #[test]
+    fn newdict_empty_dstorage_setfield_is_ref() {
+        use crate::model::{LinkArg, OpKind, ValueType};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object.ullbc");
+        let graph = super::lower_function(&llbc, "newdict_empty").expect("lower newdict_empty");
+        let writes: Vec<&OpKind> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                kind @ OpKind::FieldWrite { field, .. } if field.name == "dstorage" => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert!(!writes.is_empty(), "newdict_empty must setfield dstorage");
+        for kind in writes {
+            let OpKind::FieldWrite { ty, value, .. } = kind else {
+                unreachable!("filtered FieldWrite");
+            };
+            assert!(
+                matches!(ty, ValueType::Ref(_)),
+                "dstorage field is GCREF (`llmemory.GCREF`), got {ty:?}"
+            );
+            if let LinkArg::Value(v) = value {
+                assert_ne!(
+                    crate::model::FunctionGraph::concretetype_of(v),
+                    crate::model::ConcreteType::Signed,
+                    "dstorage stored value must not be Signed (`history.py` getkind)"
+                );
+            }
+        }
+    }
+
     /// `rbigint.py` `ptwotable` is a prebuilt list. `_x_mul` must read that
     /// array, not a residual accessor named `PTWOTABLE`.
     #[test]
@@ -124277,9 +125052,11 @@ mod tests {
 
     /// `Gc` from a majit-gc `GcType` impl, from field 0 of that type
     /// (and that field's own field 0), from a struct whose field 0 is
-    /// already `Gc` (`Struct._note_inlined_into`), and `Raw` for a type
-    /// with no impl, for a struct headed by a raw field 0, and for an
-    /// impl of another crate's trait that is also named `GcType`.
+    /// already `Gc` (`Struct._note_inlined_into`), from a struct that
+    /// stores a GC pointer (`adt_def_is_raw_storage` is false), and
+    /// `Raw` for a type with no impl, for a struct headed by a raw
+    /// field 0, and for an impl of another crate's trait that is also
+    /// named `GcType`.
     #[test]
     fn declared_gckind_follows_gctype_impl_and_field0_parent() {
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
@@ -124333,6 +125110,13 @@ mod tests {
                     struct_decl(5, &["fixture", "HeadedByImpl"], Some(0)),
                     struct_decl(6, &["fixture", "HeadedByInner"], Some(2)),
                     struct_decl(7, &["fixture", "HeadedByRaw"], Some(3)),
+                    {
+                        "def_id": 8,
+                        "item_meta": meta(&["fixture", "RaiseCause"]),
+                        "kind": {"Struct": [
+                            {"name": "w_cause", "ty": {"RawPtr": [adt(0), "Mut"]}}
+                        ]}
+                    },
                 ],
                 "fun_decls": [],
                 "global_decls": [],
@@ -124354,6 +125138,10 @@ mod tests {
         assert_eq!(kinds.get("HeadedByImpl"), Some(&GcKind::Gc));
         assert_eq!(kinds.get("HeadedByInner"), Some(&GcKind::Gc));
         assert_eq!(kinds.get("HeadedByRaw"), Some(&GcKind::Raw));
+        // Holds a GC pointer and is not on the field-0 chain.
+        // `Struct.__init__` cannot inline a gc container; `Ptr._is_atomic`
+        // is false unless `TO._gckind == 'raw'`.
+        assert_eq!(kinds.get("RaiseCause"), Some(&GcKind::Gc));
     }
 
     /// A transparent handle wrapping an alias of `*mut Header` is a GC

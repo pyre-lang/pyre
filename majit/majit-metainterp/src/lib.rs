@@ -99,12 +99,7 @@ pub(crate) static CONST_PTR_TABLE_TEST_LOCK: parking_lot::Mutex<()> = parking_lo
 
 pub mod blackhole;
 pub mod box_trace;
-pub use box_trace::{
-    ElidableIntResidual, ExceptionTraceResidual, FrameAnchorLiveResidual, IdentityRefResidual,
-    VoidSkipResidual, register_elidable_int_residual, register_exception_trace_residual,
-    register_frame_anchor_live_residual, register_identity_ref_residual,
-    register_void_skip_residual,
-};
+pub use box_trace::{ExceptionTraceResidual, register_exception_trace_residual};
 pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;
@@ -1635,57 +1630,6 @@ pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
 // pyre-interpreter directly — pyre depends on majit, not the other way
 // — so the interpreter publishes the two hooks on [`HostHooks`] at
 // setup (`warmspot.py` fills `MetaInterpStaticData` once).
-
-static ALLOW_SMALL_REF_RESIDUAL_FN: std::sync::OnceLock<fn(usize) -> bool> =
-    std::sync::OnceLock::new();
-static SYMBOLIC_RESIDUAL_FNADDR_FN: std::sync::OnceLock<fn(i64) -> i64> = std::sync::OnceLock::new();
-static BH_PORTAL_FRAME_FN: std::sync::OnceLock<fn() -> i64> = std::sync::OnceLock::new();
-
-/// Residuals whose `Ref` argument is a small integer word (a shadow-stack
-/// depth), not a heap pointer. `refuse_walk_local_ref_args` would otherwise
-/// abort every `FrameAnchor::live` whose depth is `<= 0x1000`.
-pub fn register_allow_small_ref_residual(f: fn(usize) -> bool) {
-    let _ = ALLOW_SMALL_REF_RESIDUAL_FN.set(f);
-}
-
-/// Whether the host marked `addr` as a small-word residual. Unregistered
-/// means no — the walk-local refuse stays in force.
-#[must_use]
-pub fn allow_small_ref_residual(addr: usize) -> bool {
-    ALLOW_SMALL_REF_RESIDUAL_FN
-        .get()
-        .copied()
-        .is_some_and(|f| f(addr))
-}
-
-/// Residuals the codewriter must keep as `symbolic_fnaddr_for_path`
-/// hashes so the walker can fold them, while blackhole resume still
-/// needs a real address. Returns 0 when `fnaddr` is not one of those
-/// hashes.
-pub fn register_symbolic_residual_fnaddr(f: fn(i64) -> i64) {
-    let _ = SYMBOLIC_RESIDUAL_FNADDR_FN.set(f);
-}
-
-/// Host rewrite of a symbolic residual hash to a callable address, or 0.
-#[must_use]
-pub fn resolve_symbolic_residual_fnaddr(fnaddr: i64) -> i64 {
-    SYMBOLIC_RESIDUAL_FNADDR_FN
-        .get()
-        .copied()
-        .map_or(0, |f| f(fnaddr))
-}
-
-/// Fallback frame when a blackhole level has no virtualizable.
-/// Used only if `virtualizable_ptr` is 0 (cffi/libffi callbacks).
-pub fn register_bh_portal_frame(f: fn() -> i64) {
-    let _ = BH_PORTAL_FRAME_FN.set(f);
-}
-
-/// Live TLS frame pointer, or 0 when the host has not registered one.
-#[must_use]
-pub fn bh_portal_frame() -> i64 {
-    BH_PORTAL_FRAME_FN.get().copied().map_or(0, |f| f())
-}
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values

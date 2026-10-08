@@ -2442,8 +2442,10 @@ impl AssemblerEncode for Assembler {
                 if !is_gc && value_kind == 'r' {
                     panic!(
                         "setfield_raw_r not supported (jtransform.py rewrite_op_setfield) \
-                         — graph {:?}",
+                         — graph {:?} field {}.{}",
                         self.current_graph_name,
+                        field.owner_root.as_deref().unwrap_or("?"),
+                        field.name,
                     );
                 }
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol, is_gc));
@@ -10435,8 +10437,8 @@ mod tests {
                 ) if name == "p" => {
                     assert_eq!(
                         ty,
-                        &ValueType::Ref(None),
-                        "a borrowed raw struct stays a reference"
+                        &ValueType::Int,
+                        "a borrowed raw struct is the address integer"
                     );
                     assert_eq!(class_root.as_deref(), Some("S"));
                     Some(result.clone())

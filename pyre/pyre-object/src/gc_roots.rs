@@ -441,6 +441,10 @@ pub fn root_stack_depth() -> usize {
 /// living across the bracketed allocation call. Dropping the scope
 /// executes the equivalent of `pop_roots(hop, livevars)` by rewinding
 /// the shadow stack to the length captured at construction time.
+/// The guard is its `save_point` word. `#[repr(transparent)]` is that
+/// declaration: the only sized field is the depth, and a borrow of the
+/// guard is that word (`history.py` `getkind` of a raw `Ptr` is `'int'`).
+#[repr(transparent)]
 #[must_use = "RootScope is the live-roots guard; dropping it pops the roots — \
               binding it to `_roots` makes the scope explicit, while binding \
               to `_` would pop immediately and defeat the bracket"]
@@ -1052,9 +1056,8 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
 /// ignores that copy and answers the slot, which a collection forwards in
 /// place.
 ///
-/// The call stays a real residual, bound in `jit_trace_fnaddrs()`: aliasing it
-/// to its argument would leave a trace carrying the pre-move word, and nothing
-/// else forwards a value the trace holds.
+/// The translator erases this call the way gctransform drops `push_roots` /
+/// `pop_roots`: a jitcode already roots the live word on the jitframe gcmap.
 #[inline]
 #[must_use = "a top root may have moved; use the reloaded live word"]
 #[majit_macros::dont_look_inside_cannot_raise]

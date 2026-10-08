@@ -43,6 +43,7 @@ use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::front::mir::{
     LowerContext, erased_root_bracket_guards, lower_fun_decl, lower_fun_decl_with_static_addrs,
+    shadow_stack_erase_status,
 };
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -1117,5 +1118,39 @@ fn isinstance_bracket_is_scalar_replaced() {
             0,
             "isinstance still calls {leaf} after the bracket was scalar-replaced"
         );
+    }
+}
+
+/// The portal's cached-slot handle is gctransform-level (`gc_enter_roots_frame`
+/// after `warmspot.py` `make_jitcodes`). The erase pass takes it out of
+/// `eval_loop_jit` by looking through wrapper bodies, without naming them.
+#[test]
+fn eval_loop_jit_erases_the_cached_slot_handle() {
+    let path = format!(
+        "{}/../../build/llbc/pyre-jit.ullbc",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if !std::path::Path::new(&path).is_file() {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py pyre-jit`");
+        return;
+    }
+    let llbc = Llbc::load(&path).expect("load pyre-jit");
+    let named = |leaf: &str| {
+        llbc.iter_fun_decls()
+            .find(|fd| fd.item_meta.name_path().ends_with(leaf))
+            .unwrap_or_else(|| panic!("{leaf} present in pyre-jit.ullbc"))
+    };
+    for leaf in ["::reload_entered", "::eval_loop_jit"] {
+        let fd = named(leaf);
+        let body = fd
+            .unstructured()
+            .unwrap_or_else(|| panic!("{} has an unstructured body", fd.item_meta.name_path()));
+        match shadow_stack_erase_status(&llbc, fd, &body) {
+            Ok(true) => {}
+            other => panic!(
+                "{} must erase the cached-slot handle, got {other:?}",
+                fd.item_meta.name_path()
+            ),
+        }
     }
 }

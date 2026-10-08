@@ -55,7 +55,6 @@ impl SpecQueue {
         }
     }
 
-
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
         // The leaf carries the hash of the rendered key, so a second request
         // under it is the same instantiation even when its JSON spells a type

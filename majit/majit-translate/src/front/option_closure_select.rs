@@ -870,6 +870,52 @@ mod tests {
         })
     }
 
+    /// `RaiseCause` holds a GC pointer, so the args-tuple field and the
+    /// stored value are both Ref (`Struct.__init__` cannot inline a gc
+    /// container; `history.py` `getkind` of `Ptr(Gc)` is `'ref'`).
+    #[test]
+    fn call_once_tuple_field_kind_matches_stored_value_kind() {
+        use crate::model::ConcreteType;
+        let mut g = FunctionGraph::new("test_call_once_kind");
+        let block = g.startblock;
+        let env = g.push_op_var(block, OpKind::ConstInt(7), true).unwrap();
+        // `ConstRefNull` is a GCREF `_ptr`; stamp it so the stored value's
+        // `getkind` is `'ref'` the same way rtyper stamps `Ptr(GcStruct)`.
+        let payload = g.alloc_value_var_with_type(ConcreteType::GcRef);
+        g.push_op_with_result_var(block, OpKind::ConstRefNull, payload.clone());
+
+        emit_call_once(
+            &mut g,
+            block,
+            env,
+            Some((payload.clone(), ValueType::Ref(None), None)),
+            "test::closure",
+            ValueType::Int,
+            "<RaiseCause>",
+        );
+
+        let write = g.blocks[block.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    field, ty, value, ..
+                } if field.owner_root.as_deref() == Some("Tuple<RaiseCause>") => {
+                    Some((ty.clone(), value.clone()))
+                }
+                _ => None,
+            })
+            .expect("closure Args tuple payload write");
+        assert_eq!(write.0, ValueType::Ref(None));
+        match write.1 {
+            LinkArg::Value(var) => assert_eq!(
+                FunctionGraph::concretetype_of(&var),
+                crate::model::ConcreteType::GcRef
+            ),
+            other => panic!("expected stored value, got {other:?}"),
+        }
+    }
+
     #[test]
     fn call_once_tuple_write_preserves_reference_payload_class() {
         let mut g = FunctionGraph::new("test_call_once_payload_class");

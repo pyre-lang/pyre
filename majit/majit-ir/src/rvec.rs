@@ -87,9 +87,11 @@ impl VecItemKind {
 /// spelling and the target word size.
 ///
 /// Items are one word: `usize` / `isize` (and `u64` / `i64` on a 64-bit
-/// target) are `Int`, `f64` is `Float`, and a raw pointer (`*mut T` /
-/// `*const T`, the spelling of a managed object reference) is `Ref`. Every
-/// other item type, including every type with drop glue, answers `None`.
+/// target) are `Int`, `f64` is `Float`, and `GCREF` (`*mut GCREFOpaque`,
+/// `llmemory.GCREF`) is `Ref`. A pointer to a primitive (`*mut u8`,
+/// `rffi.CCHARP`) is `Int`. A pointer to any other type is `Ref` (a
+/// managed object reference). Every other item type, including every type
+/// with drop glue, answers `None`.
 pub fn vec_item_kind_for_spelling(item: &str, word: usize) -> Option<VecItemKind> {
     let item = item.trim();
     match item {
@@ -105,7 +107,40 @@ pub fn vec_item_kind_for_spelling(item: &str, word: usize) -> Option<VecItemKind
     if raw_pointer_pointee_is_fat(item) {
         return None;
     }
-    (item.starts_with("*mut ") || item.starts_with("*const ")).then_some(VecItemKind::Ref)
+    let Some(pointee) = item
+        .strip_prefix("*mut ")
+        .or_else(|| item.strip_prefix("*const "))
+    else {
+        return None;
+    };
+    let pointee = pointee.trim();
+    if pointee.ends_with("GCREFOpaque") {
+        return Some(VecItemKind::Ref);
+    }
+    // `rffi.CCHARP` / `llmemory.Address`: a pointer to a primitive is int.
+    if primitive_scalar_spelling(pointee) {
+        return Some(VecItemKind::Int);
+    }
+    Some(VecItemKind::Ref)
+}
+
+fn primitive_scalar_spelling(ty: &str) -> bool {
+    matches!(
+        ty,
+        "u8" | "i8"
+            | "u16"
+            | "i16"
+            | "u32"
+            | "i32"
+            | "u64"
+            | "i64"
+            | "usize"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+    )
 }
 
 /// Two-word raw pointers: `dyn Trait`, `[T]`, `str`, and the parenthesized
@@ -657,6 +692,15 @@ mod tests {
             vec_item_kind_for_spelling("*mut majit_gc::header::GCREFOpaque", 8),
             Some(VecItemKind::Ref)
         );
+        assert_eq!(
+            vec_item_kind_for_spelling("*mut u8", 8),
+            Some(VecItemKind::Int),
+            "*mut u8 is rffi.CCHARP, a word"
+        );
+        assert_eq!(
+            vec_item_kind_for_spelling("*const u8", 8),
+            Some(VecItemKind::Int)
+        );
         for other in [
             "u8",
             "u32",
@@ -711,6 +755,11 @@ mod tests {
             Some(VecItemKind::Ref)
         );
         assert_eq!(
+            rust_vec_item_kind_for_spelling("Vec<*mut u8>", 8),
+            Some(VecItemKind::Int)
+        );
+        assert_eq!(rust_vec_item_kind_for_spelling("Vec<u8>", 8), None);
+        assert_eq!(
             rust_vec_item_kind_for_spelling("&mut Vec<PyObjectRef>", 8),
             Some(VecItemKind::Ref)
         );
@@ -741,6 +790,10 @@ mod tests {
         assert_eq!(
             rust_slice_item_kind_for_spelling("&[GCREF]", 8),
             Some(VecItemKind::Ref)
+        );
+        assert_eq!(
+            rust_slice_item_kind_for_spelling("&[*mut u8]", 8),
+            Some(VecItemKind::Int)
         );
         assert_eq!(
             rust_slice_item_kind_for_spelling("&[PyObjectRef]", 8),

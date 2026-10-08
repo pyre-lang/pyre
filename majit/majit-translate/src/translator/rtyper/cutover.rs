@@ -6795,14 +6795,12 @@ mod tests {
                 crate::model::SpaceOperation {
                     result: Some(v_fn.clone()),
                     kind: crate::model::OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath {
-                            segments: vec![
-                                crate::model::FN_CONST_HEAD.into(),
-                                "dummy_compute".into(),
-                            ],
-                            fun_decl_id: None,
-                            generic_rust_args: Vec::new(),
-                        },
+                        // Dummy fn-const: no FunDecl, so
+                        // `call_site_generic_rust_args` has no types to stamp.
+                        target: crate::model::CallTarget::function_path([
+                            crate::model::FN_CONST_HEAD,
+                            "dummy_compute",
+                        ]),
                         args: vec![],
                         result_ty: ValueType::Int,
                     },
@@ -6810,15 +6808,13 @@ mod tests {
                 crate::model::SpaceOperation {
                     result: Some(v_out.clone()),
                     kind: crate::model::OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath {
-                            segments: vec![
-                                "majit_rlib".into(),
-                                "jit".into(),
-                                "conditional_call_elidable1".into(),
-                            ],
-                            fun_decl_id: None,
-                            generic_rust_args: Vec::new(),
-                        },
+                        // HOST_ENV builtin: not a generic Rust item.
+                        // `attach_call_generic_instance` needs a FunDecl.
+                        target: crate::model::CallTarget::function_path([
+                            "majit_rlib",
+                            "jit",
+                            "conditional_call_elidable1",
+                        ]),
                         args: crate::model::call_args(vec![
                             v_value.clone(),
                             v_fn.clone(),

@@ -3,15 +3,15 @@
 
 mod common;
 
-use common::{INTERPRETER_LLBC, MODULE_LLBC, load_llbc};
+use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc};
 use majit_charon_reader::Llbc;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, transform_graph};
 use majit_translate::front::mir::{
     LowerContext, erased_root_bracket_guards, function_touches_root_stack,
-    lower_fun_decl_with_static_addrs, lower_function_with_static_addrs, pin_roots_published_locals,
-    shadow_stack_erase_status,
+    link_transparent_scalar_types, lower_fun_decl_with_static_addrs,
+    lower_function_with_static_addrs, pin_roots_published_locals, shadow_stack_erase_status,
 };
-use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind};
+use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
 use std::sync::{Mutex, MutexGuard};
 
@@ -82,7 +82,15 @@ fn lower_function_to_runtime_edges(
 }
 
 fn interp() -> &'static Llbc {
-    load_llbc(INTERPRETER_LLBC)
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    static LINK: std::sync::Once = std::sync::Once::new();
+    LINK.call_once(|| {
+        if std::path::Path::new(OBJECT_LLBC).is_file() {
+            let object = load_llbc(OBJECT_LLBC);
+            link_transparent_scalar_types(&[llbc, object]);
+        }
+    });
+    llbc
 }
 
 /// `Llbc::set_root_stack_effects` writes the shared OnceLock artefact.
@@ -2468,7 +2476,7 @@ fn argument_factory_extend_from_slice_is_ll_vec_extend() {
                 CallTarget::FunctionPath { segments, .. }
                     if segments
                         .last()
-                        .is_some_and(|leaf| leaf.starts_with("ll_vec_extend_from_slice")) =>
+                        .is_some_and(|leaf| leaf.starts_with("ll_vec_extend")) =>
                 {
                     helpers.push((segments.join("::"), args.len()));
                 }
@@ -2478,14 +2486,18 @@ fn argument_factory_extend_from_slice_is_ll_vec_extend() {
     }
     assert!(
         leftover.is_empty(),
-        "{path}: extend_from_slice must retarget to ll_vec_extend_from_slice_*:\n{}",
+        "{path}: extend_from_slice must retarget to ll_vec_extend_*:\n{}",
         leftover.join("\n")
     );
+    // Object-slice `extend_from_slice` is `rlist.py ll_extend` with `l2`
+    // the GcArray word (`VecOp::Extend`, two args). A pair-spliced `&[T]`
+    // is `VecOp::ExtendFromSlice` (three args).
     assert!(
-        helpers
-            .iter()
-            .any(|(name, n)| name.ends_with("ll_vec_extend_from_slice_r") && *n == 3),
-        "{path}: expected 3-arg ll_vec_extend_from_slice_r, got {helpers:?}"
+        helpers.iter().any(|(name, n)| {
+            (name.ends_with("ll_vec_extend_r") && *n == 2)
+                || (name.ends_with("ll_vec_extend_from_slice_r") && *n == 3)
+        }),
+        "{path}: expected ll_vec_extend_r/2 or ll_vec_extend_from_slice_r/3, got {helpers:?}"
     );
 }
 
@@ -2760,6 +2772,77 @@ fn fileio_writebuf_u8_slice_tuple_field_is_not_int_into_ref() {
     let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
 }
 
+/// `WritableBuffer::acquire` constructs a struct of depth-word / slot /
+/// address scalars. A Ref stored into that Int base is `setfield_raw_r`
+/// (`jtransform.py` `rewrite_op_setfield`).
+#[test]
+fn acquire_does_not_store_ref_into_raw_struct() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg};
+    let path = "pyre_interpreter::builtins::<Impl>::acquire";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut raw_r = Vec::new();
+    for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+        let OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } = &op.kind
+        else {
+            continue;
+        };
+        let base_kind = FunctionGraph::concretetype_of(base);
+        let value_kind = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+            LinkArg::Const(_) => continue,
+        };
+        let value_is_ref = matches!(value_kind, ConcreteType::GcRef | ConcreteType::Unknown)
+            || matches!(ty, ValueType::Ref(_) | ValueType::Str);
+        if base_kind == ConcreteType::Signed && value_is_ref {
+            raw_r.push(format!(
+                "{}.{} base={base_kind:?} ty={ty:?} value={value_kind:?}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name,
+            ));
+        }
+    }
+    assert!(
+        raw_r.is_empty(),
+        "{path} setfield_raw_r candidates: {raw_r:?}"
+    );
+    let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    let mut raw_r = Vec::new();
+    for op in transformed.blocks.iter().flat_map(|b| b.operations.iter()) {
+        let OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } = &op.kind
+        else {
+            continue;
+        };
+        let base_kind = FunctionGraph::concretetype_of(base);
+        let value_kind = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+            LinkArg::Const(_) => continue,
+        };
+        let value_is_ref = matches!(value_kind, ConcreteType::GcRef | ConcreteType::Unknown)
+            || matches!(ty, ValueType::Ref(_) | ValueType::Str);
+        if base_kind == ConcreteType::Signed && value_is_ref {
+            raw_r.push(format!(
+                "{}.{} base={base_kind:?} ty={ty:?} value={value_kind:?}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name,
+            ));
+        }
+    }
+    assert!(
+        raw_r.is_empty(),
+        "{path} post-transform setfield_raw_r candidates: {raw_r:?}"
+    );
+}
+
 /// `_orig_parse_format` pushes `(Fmt, usize)` units. `Fmt` stores the
 /// payload enum `Code`, so it is a class instance (`getkind` ref), not
 /// a raw `Ptr`. `Tuple<Fmt,usize>::__pos_0` must use that bank;
@@ -2804,6 +2887,56 @@ fn orig_parse_format_fmt_tuple_field_is_not_int_into_ref() {
     let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
 }
 
+/// `pyopcode.py RAISE_VARARGS` maps over `Option<RaiseCause>`. The
+/// `call_once` args-tuple field kind equals the stored value's `getkind`,
+/// both Ref: `RaiseCause` holds a GC pointer, so it is a `GcStruct`
+/// (`lltype.py` `Struct.__init__` "cannot inline %s container";
+/// `Ptr._is_atomic` is false unless `TO._gckind == 'raw'`).
+#[test]
+fn raise_varargs_option_map_tuple_field_kind_matches_value_kind() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg, ValueType};
+    let path = "pyre_interpreter::eval::<Impl>::raise_varargs";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut writes = 0usize;
+    for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+        let OpKind::FieldWrite {
+            field, ty, value, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if field.name != "__pos_0" {
+            continue;
+        }
+        let Some(owner) = field.owner_root.as_deref() else {
+            continue;
+        };
+        if !(owner.contains("Tuple") && owner.contains("RaiseCause")) {
+            continue;
+        }
+        writes += 1;
+        let value_kind = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+            _ => ConcreteType::Unknown,
+        };
+        assert!(
+            matches!(ty, ValueType::Ref(_) | ValueType::Str),
+            "{path} {owner}.__pos_0 ty={ty:?} value={value:?} value_kind={value_kind:?}; \
+             RaiseCause field getkind is ref"
+        );
+        assert!(
+            value_kind == ConcreteType::GcRef || value_kind == ConcreteType::Unknown,
+            "{path} {owner}.__pos_0 ty={ty:?} value={value:?} value_kind={value_kind:?}; \
+             RaiseCause stored value getkind is ref"
+        );
+    }
+    assert!(
+        writes >= 1,
+        "{path}: expected Tuple<RaiseCause>::__pos_0 FieldWrite from Option::map"
+    );
+    let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+}
+
 fn call_targets_push_roots(target: &CallTarget) -> bool {
     match target {
         CallTarget::FunctionPath { segments, .. } => {
@@ -2813,12 +2946,11 @@ fn call_targets_push_roots(target: &CallTarget) -> bool {
     }
 }
 
-/// `push_roots` returns `RootScope`. Dependents see that type as Opaque
-/// (`Ref`); `pin_root` / `publish` dispatch on the instance. FUNC.RESULT
-/// and the call dest must share that bank (`call.py` `RESULT ==
-/// FUNC.RESULT`). A raw-struct Int token is the `getcalldescr` wall.
+/// `push_roots` returns `RootScope`, the save_point word (`history.py`
+/// `getkind` of a raw `Ptr` is `'int'`). FUNC.RESULT and any remaining
+/// call dest share that bank (`call.py` `RESULT == FUNC.RESULT`).
 #[test]
-fn push_roots_result_is_ref_not_int() {
+fn push_roots_result_is_int() {
     use majit_translate::model::ValueType;
     let callers = [
         "pyre_interpreter::call::call_function_impl_result",
@@ -2840,9 +2972,9 @@ fn push_roots_result_is_ref_not_int() {
             }
             calls += 1;
             assert!(
-                matches!(result_ty, ValueType::Ref(_)),
+                matches!(result_ty, ValueType::Int),
                 "{path} push_roots result_ty={result_ty:?}; \
-                 RootScope is the root-bracket instance, getkind ref"
+                 RootScope getkind is the save_point word"
             );
         }
         let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
@@ -2851,12 +2983,12 @@ fn push_roots_result_is_ref_not_int() {
     if let Ok(graph) = lower_function(interp(), callee) {
         let token = graph.return_type.as_deref().unwrap_or("");
         assert!(
-            !(token == "i64"
+            token == "i64"
                 || token == "u64"
                 || token == "isize"
                 || token == "usize"
-                || token.starts_with("raw:")),
-            "{callee} return_type={token:?}; RootScope FUNC.RESULT is ref"
+                || token.starts_with("raw:"),
+            "{callee} return_type={token:?}; RootScope FUNC.RESULT is int"
         );
         calls += 1;
         let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
@@ -2870,37 +3002,68 @@ fn push_roots_result_is_ref_not_int() {
 fn call_targets_root_scope_new(target: &CallTarget) -> bool {
     match target {
         CallTarget::FunctionPath { segments, .. } => {
-            segments.last().is_some_and(|s| s == "new") && segments.iter().any(|s| s == "gc_roots")
+            segments.last().is_some_and(|s| s == "new") && segments.iter().any(|s| s == "RootScope")
+        }
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => {
+            name == "new"
+                && receiver_root
+                    .as_deref()
+                    .is_some_and(|root| root.ends_with("::RootScope") || root == "RootScope")
         }
         _ => false,
     }
 }
 
-/// `RootScope::new` constructs the instance (`CFG r`). FUNC.RESULT must
-/// share that bank (`call.py` `get_jitcode_calldescr`; `rtyper` `getrepr`
-/// → `lowleveltype`; `getkind`). Peeling the guard through `PhantomData`
-/// to `usize` stamps `i`.
+/// `local_fn("…gc_roots::<Impl>::new")` returns the first inherent `new`
+/// in the module (`RootStack::new`). The save_point constructor is the
+/// one whose body writes that field.
+fn root_scope_new_decl(llbc: &Llbc) -> Option<&majit_charon_reader::ullbc::FunDecl> {
+    llbc.iter_fun_decls().find(|fd| {
+        fd.item_meta.name_path().ends_with("::new")
+            && fd
+                .item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|s| s.contains("save_point: shadow_stack_len()"))
+    })
+}
+
+fn lower_root_scope_new(llbc: &Llbc) -> Option<majit_translate::model::FunctionGraph> {
+    let fd = root_scope_new_decl(llbc)?;
+    let context = LowerContext::new(llbc);
+    let static_addrs = HostStaticAddrs {
+        error_carrier: ERROR_CARRIER,
+        ..Default::default()
+    };
+    Some(
+        lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
+            .unwrap_or_else(|e| panic!("lower RootScope::new: {e}")),
+    )
+}
+
+/// `RootScope::new` constructs the save_point word (`CFG i`). FUNC.RESULT
+/// shares that bank (`call.py` `get_jitcode_calldescr`; `rtyper` `getrepr`
+/// → `lowleveltype`; `getkind`).
 #[test]
-fn gc_roots_new_result_is_ref_not_int() {
+fn gc_roots_new_result_is_int() {
     use majit_translate::model::ValueType;
-    let callee = "pyre_object::gc_roots::<Impl>::new";
     let mut graphs = 0usize;
-    if let Ok(graph) = lower_function(interp(), callee) {
-        assert_root_scope_new_func_result(callee, &graph);
+    if let Some(graph) = lower_root_scope_new(interp()) {
+        assert_root_scope_new_func_result(&graph.name, &graph);
         graphs += 1;
         let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
     }
-    const OBJECT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc",
-    );
-    if std::path::Path::new(OBJECT).is_file() {
-        let object = Llbc::load(OBJECT).expect("load pyre-object.ullbc");
-        let graph =
-            lower_function(&object, callee).unwrap_or_else(|e| panic!("lower {callee}: {e}"));
-        assert_root_scope_new_func_result(callee, &graph);
-        graphs += 1;
-        let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    if std::path::Path::new(OBJECT_LLBC).is_file() {
+        let object = load_llbc(OBJECT_LLBC);
+        if let Some(graph) = lower_root_scope_new(object) {
+            assert_root_scope_new_func_result(&graph.name, &graph);
+            graphs += 1;
+            let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+        }
     }
     let callers = [
         "pyre_object::gc_roots::push_roots",
@@ -2922,9 +3085,9 @@ fn gc_roots_new_result_is_ref_not_int() {
             }
             graphs += 1;
             assert!(
-                matches!(result_ty, ValueType::Ref(_)),
+                matches!(result_ty, ValueType::Int),
                 "{path} RootScope::new result_ty={result_ty:?}; \
-                 RootScope is the root-bracket instance, getkind ref"
+                 RootScope getkind is the save_point word"
             );
         }
     }
@@ -2936,13 +3099,27 @@ fn gc_roots_new_result_is_ref_not_int() {
 
 fn assert_root_scope_new_func_result(callee: &str, graph: &majit_translate::model::FunctionGraph) {
     let token = graph.return_type.as_deref().unwrap_or("");
+    if token == "i64"
+        || token == "u64"
+        || token == "isize"
+        || token == "usize"
+        || token.starts_with("raw:")
+    {
+        return;
+    }
+    // look-inside: FUNC.RESULT is the CFG save_point word (`shadow_stack_len`).
+    let word = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                result_ty: ValueType::Int | ValueType::Unsigned,
+                ..
+            }
+        )
+    });
     assert!(
-        !(token == "i64"
-            || token == "u64"
-            || token == "isize"
-            || token == "usize"
-            || token.starts_with("raw:")),
-        "{callee} return_type={token:?}; RootScope FUNC.RESULT is ref"
+        word,
+        "{callee} return_type={token:?}; RootScope FUNC.RESULT is int"
     );
 }
 

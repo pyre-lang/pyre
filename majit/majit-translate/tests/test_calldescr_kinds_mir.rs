@@ -218,11 +218,16 @@ fn scalar_pointer_params_match_int_callers() {
         lower_function(&llbc, "gc_hook::try_gc_write_barrier").expect("lower try_gc_write_barrier");
     let barrier_tys = input_types(&barrier);
     assert!(
-        matches!(
-            barrier_tys.first(),
-            Some(ValueType::Int | ValueType::Unsigned)
-        ),
-        "*mut u8 is int (`rffi.CCHARP`), got {barrier_tys:?}"
+        matches!(barrier_tys.first(), Some(ValueType::Ref(_))),
+        "try_gc_write_barrier param is ref (`llmemory.GCREF`), got {barrier_tys:?}"
+    );
+
+    let hash_str =
+        lower_function(&llbc, "dict_eq_hook::hash_str_hooked").expect("lower hash_str_hooked");
+    let hash_str_tys = input_types(&hash_str);
+    assert!(
+        int_family(hash_str_tys.first().expect("hash_str_hooked has a param")),
+        "*const u8 is int (`rffi.CCHARP`), got {hash_str_tys:?}"
     );
 
     let caller = lower_function(

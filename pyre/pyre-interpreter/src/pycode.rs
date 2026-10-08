@@ -1502,7 +1502,8 @@ fn w_code_new_owned(
     if realize_consts {
         for index in 0..consts_len {
             let realized = unsafe { realize_code_constant(obj_slot, index) };
-            let table = pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
+            let table =
+                pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
             unsafe { (*table).set_ref(index, realized) };
         }
     }

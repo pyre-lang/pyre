@@ -799,7 +799,6 @@ fn bridge_materialize_once(msg: &str) {
     }
 }
 
-
 pub fn materialize_bridge_virtual(
     ctx: &mut crate::TraceCtx,
     vidx: usize,

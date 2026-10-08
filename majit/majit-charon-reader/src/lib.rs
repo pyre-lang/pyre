@@ -80,6 +80,11 @@ pub struct Llbc {
     /// retain layout attributes but may expose the type body as `Opaque`; the
     /// defining crate supplies the missing one-field scalar shape.
     transparent_scalar_kinds: parking_lot::RwLock<Vec<(String, TransparentScalarKind)>>,
+    /// Qualified paths of by-value raw structs harvested from a defining
+    /// crate (`adt_def_is_raw_storage`). An `Opaque` dependent has no field
+    /// list; membership here is that missing layout, so `getkind` of the
+    /// raw `Ptr` stays `'int'` across the linked input.
+    raw_struct_paths: parking_lot::RwLock<Vec<String>>,
     /// Folded initializer of one global, keyed by that global's `def_id`
     /// inside this artefact. The encoded literal is owned by the global
     /// the lowering already loads with `global_by_id`; it is not a path
@@ -322,6 +327,7 @@ impl Llbc {
             dedup_layout,
             span_bodies,
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
+            raw_struct_paths: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
@@ -592,6 +598,26 @@ impl Llbc {
             .binary_search_by(|(known, _)| known.as_str().cmp(path))
             .ok()?;
         Some(kinds[index].1)
+    }
+
+    /// Merge all-raw struct paths discovered across the linked LLBC set.
+    /// Entries are kept sorted for deterministic, allocation-free lookup.
+    pub fn register_raw_struct_paths(&self, entries: impl IntoIterator<Item = String>) {
+        let mut paths = self.raw_struct_paths.write();
+        for path in entries {
+            if let Err(index) = paths.binary_search(&path) {
+                paths.insert(index, path);
+            }
+        }
+    }
+
+    /// Whether `path` is a by-value raw struct in some artefact of the
+    /// linked translation input.
+    pub fn is_raw_struct_path(&self, path: &str) -> bool {
+        self.raw_struct_paths
+            .read()
+            .binary_search_by(|known| known.as_str().cmp(path))
+            .is_ok()
     }
 
     /// Resolve a Charon `Deduplicated: <id>` type reference to the

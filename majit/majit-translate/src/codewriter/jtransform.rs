@@ -13864,7 +13864,6 @@ fn fixed_repeat_identity(
     })
 }
 
-
 /// High-level `newlist(item0, …, itemN)` (`OpKind::NewList`).
 ///
 /// `rtype_newlist` (`rlist.py`) expands this to `LIST.ll_newlist(n)` plus

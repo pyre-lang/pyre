@@ -291,11 +291,9 @@ impl Drop for FrameAnchor {
     }
 }
 
-/// Shadow-stack slot publication behind [`FrameAnchor`].  The slot ops live
-/// in `majit_gc`, which has no jitcode graphs, so a walked handler graph
-/// reaching them found only a symbolic path hash.  First-party
-/// `dont_look_inside` wrappers with word-sized signatures keep each op a
-/// bound residual the tracer can execute (`jit_trace_fnaddrs()` rows).
+/// Shadow-stack slot publication behind [`FrameAnchor`]. The translator
+/// erases these the way gctransform drops `push_roots` / `pop_roots`;
+/// the bodies remain for native execution.
 #[majit_macros::dont_look_inside]
 pub fn frame_anchor_push(frame: *mut PyFrame) -> usize {
     majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize))
@@ -305,16 +303,7 @@ pub fn frame_anchor_push(frame: *mut PyFrame) -> usize {
 /// between push and read leaves the forwarded address here.
 #[majit_macros::dont_look_inside]
 pub fn frame_anchor_live(depth: usize) -> *mut PyFrame {
-    // Interpret records `push` as the frame OpRef (the red vable), not
-    // the tracing-time slot index. Blackhole resume then hands that
-    // pointer to `live`. A slot index is always in range; a frame
-    // pointer is not — treat an out-of-range word as the frame.
-    // `interp_jit.py` has no shadow-stack slot.
-    if depth < majit_gc::shadow_stack::depth() {
-        majit_gc::shadow_stack::get(depth).0 as *mut PyFrame
-    } else {
-        depth as *mut PyFrame
-    }
+    majit_gc::shadow_stack::get(depth).0 as *mut PyFrame
 }
 
 /// Release the anchor's slot (and any deeper ones) on drop.

@@ -10590,16 +10590,10 @@ fn debug_assert_constant_slot_untouched(index: usize, num_regs: usize, who: &str
     }
 }
 
-/// Rewrite a `symbolic_fnaddr_for_path` hash the host published for
-/// blackhole-only execute. An address that stays unresolved is not a
-/// callable.
+/// An address that is not a callable code pointer is not a finish.
 fn require_callable_fnaddr(bh: &mut BlackholeInterpreter, func: i64) -> Result<i64, DispatchError> {
     if is_callable_fnaddr(func) {
         return Ok(func);
-    }
-    let resolved = crate::resolve_symbolic_residual_fnaddr(func);
-    if is_callable_fnaddr(resolved) {
-        return Ok(resolved);
     }
     Err(reject_unresolved_call(bh, func))
 }
@@ -14064,44 +14058,6 @@ fn reject_unresolved_inline_call(
     DispatchError::LeaveFrame
 }
 
-/// `front::mir` aliases `&FrameAnchor` to the depth word. A tracing-time
-/// slot index is always `< 0x1000`; a live frame pointer is not.
-fn is_stale_frame_anchor_word(word: i64) -> bool {
-    word > 0 && (word as u64) < 0x1000
-}
-
-fn is_frame_anchor_self_callee(name: &str) -> bool {
-    name == "push_anchored" || name == "push_on_self" || name == "frame_anchor_live"
-}
-
-/// Interpret folds `live` to the red vable (`FrameAnchorLiveResidual`).
-/// Resume still has the slot index. Replace that word with this
-/// blackhole level's virtualizable — the same red frame the parent
-/// `MIFrame` / `BlackholeInterpreter` is interpreting, not the portal
-/// TLS `CURRENT_FRAME`. An inlined callee has its own virtualizable.
-fn rewrite_stale_frame_anchor_self(callee: &mut BlackholeInterpreter, name: &str) {
-    if !is_frame_anchor_self_callee(name) {
-        return;
-    }
-    // Prefer this level's virtualizable (the inlined callee's own
-    // frame). Fall back to the TLS current frame only when this
-    // blackhole has no vable — libffi callbacks resume without one.
-    let frame = if callee.virtualizable_ptr != 0 {
-        callee.virtualizable_ptr
-    } else {
-        crate::bh_portal_frame()
-    };
-    if frame == 0 {
-        return;
-    }
-    if is_stale_frame_anchor_word(callee.registers_r[0]) {
-        callee.registers_r[0] = frame;
-    }
-    if is_stale_frame_anchor_word(callee.registers_i[0]) {
-        callee.registers_i[0] = frame;
-    }
-}
-
 /// Byte-interpret a canonical `inline_call_*` whose `fnaddr` is symbolic.
 ///
 /// Upstream `bhimpl_inline_call_*` (`blackhole.py`) calls
@@ -14155,7 +14111,6 @@ fn interpret_unresolved_inline_call(
             sub_jitcode.name,
         );
     }
-    let callee_name = sub_jitcode.name.clone();
     let mut callee = bh
         .inline_callee_scratch
         .take()
@@ -14193,12 +14148,6 @@ fn interpret_unresolved_inline_call(
             callee.registers_f[index] = value;
         }
     }
-    // `front::mir` aliases `&FrameAnchor` to the depth word. Interpret
-    // folds `live` to the red vable (`FrameAnchorLiveResidual`); resume
-    // still has the tracing-time slot. Replace that word with this
-    // level's virtualizable (`clone_context_from` copies the parent's).
-    rewrite_stale_frame_anchor_self(&mut callee, callee_name.as_str());
-
 
     let outcome = 'callee: {
         match callee.run() {

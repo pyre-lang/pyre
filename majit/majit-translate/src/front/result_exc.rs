@@ -11946,6 +11946,7 @@ mod static_result_shell_tests {
         assert!(result_spelling_ok_is_scalar(
             "Result<alloc::vec::Vec<*mut u8>, E>"
         ));
+        assert!(result_spelling_ok_is_scalar("Result<Vec<GCREF>, E>"));
         assert!(result_spelling_ok_is_scalar("Result<Vec<u8>, PyError>"));
         assert!(!result_spelling_ok_is_scalar(
             "Result<PyObjectRef, PyError>"

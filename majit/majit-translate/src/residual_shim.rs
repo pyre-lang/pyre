@@ -517,6 +517,9 @@ fn instantiated_callable_path(callable: &str, generic_rust_args: &[String]) -> S
 pub struct Nameability {
     pub reachable_crates: BTreeSet<String>,
     pub public_modules: BTreeSet<String>,
+    /// `pub struct` / `enum` / `type` / `trait` paths from the same sources.
+    /// Empty in unit-test fixtures that only populate modules.
+    pub public_types: BTreeSet<String>,
 }
 
 impl Nameability {
@@ -526,10 +529,11 @@ impl Nameability {
         source_paths: &[String],
     ) -> Self {
         let reachable_crates = rustc_dep_crate_names(cargo_toml, enabled_features);
-        let public_modules = public_modules_from_sources(source_paths);
+        let (public_modules, public_types) = public_items_from_sources(source_paths);
         Self {
             reachable_crates,
             public_modules,
+            public_types,
         }
     }
 
@@ -662,12 +666,17 @@ fn optional_dep_enabled(dep_name: &str, enabled_features: &BTreeSet<String>) -> 
 }
 
 fn public_modules_from_sources(source_paths: &[String]) -> BTreeSet<String> {
-    let mut public = BTreeSet::new();
+    public_items_from_sources(source_paths).0
+}
+
+fn public_items_from_sources(source_paths: &[String]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut public_modules = BTreeSet::new();
+    let mut public_types = BTreeSet::new();
     for path in source_paths {
         let Some(crate_name) = crate_name_from_source_path(path) else {
             continue;
         };
-        public.insert(crate_name.clone());
+        public_modules.insert(crate_name.clone());
         let module = crate::module_path::module_path_from_source_file(path);
         let parent = if module.is_empty() {
             crate_name
@@ -681,16 +690,32 @@ fn public_modules_from_sources(source_paths: &[String]) -> BTreeSet<String> {
             continue;
         };
         for item in file.items {
-            let syn::Item::Mod(module_item) = item else {
-                continue;
-            };
-            if !matches!(module_item.vis, syn::Visibility::Public(_)) {
-                continue;
+            match item {
+                syn::Item::Mod(module_item)
+                    if matches!(module_item.vis, syn::Visibility::Public(_)) =>
+                {
+                    public_modules.insert(format!("{parent}::{}", module_item.ident));
+                }
+                syn::Item::Struct(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    public_types.insert(format!("{parent}::{}", item.ident));
+                }
+                syn::Item::Enum(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    public_types.insert(format!("{parent}::{}", item.ident));
+                }
+                syn::Item::Union(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    public_types.insert(format!("{parent}::{}", item.ident));
+                }
+                syn::Item::Type(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    public_types.insert(format!("{parent}::{}", item.ident));
+                }
+                syn::Item::Trait(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    public_types.insert(format!("{parent}::{}", item.ident));
+                }
+                _ => {}
             }
-            public.insert(format!("{parent}::{}", module_item.ident));
         }
     }
-    public
+    (public_modules, public_types)
 }
 
 fn crate_name_from_source_path(path: &str) -> Option<String> {
@@ -737,17 +762,117 @@ pub fn emit_residual_shim_source(
 }
 
 fn target_types_nameable(target: &ResidualShimTarget, nameability: &Nameability) -> bool {
-    target
-        .arg_rust_types
+    // `residual_word_to_value` / `residual_value_to_word` take `T` from the
+    // callee signature (`getfunctionptr` of the function itself). A Ref
+    // argument whose TypeDecl lives in another crate (`CodeObject`) is
+    // unnameable here and must not refuse the shim. Pair-slice rebuilds
+    // and object-GcArray helpers still write the item type.
+    target.arg_rust_types.iter().all(|ty| {
+        if rust_ty_written_in_shim(ty) {
+            rust_type_nameable(ty, nameability)
+        } else {
+            true
+        }
+    }) && target
+        .generic_rust_args
         .iter()
-        .chain(std::iter::once(&target.ret_rust_type))
         .all(|ty| rust_type_nameable(ty, nameability))
 }
 
+fn rust_ty_written_in_shim(ty: &str) -> bool {
+    rust_ty_abi_words(ty) == 2 || is_object_pointer_slice_ty(ty)
+}
+
 fn rust_type_nameable(ty: &str, nameability: &Nameability) -> bool {
-    named_paths_in_type(ty)
-        .into_iter()
-        .all(|path| nameability.can_name(&path, true))
+    named_paths_in_type(ty).into_iter().all(|path| {
+        if !nameability.can_name(&path, true) {
+            return false;
+        }
+        let crate_name = path.split("::").next().unwrap_or("");
+        if matches!(crate_name, "core" | "std" | "alloc") {
+            return std_type_path_writable(&path);
+        }
+        if !nameability.public_types.is_empty()
+            && nameability.public_modules.contains(crate_name)
+            && !nameability.public_types.contains(&path)
+        {
+            return false;
+        }
+        true
+    })
+}
+
+/// Charon spells `std::hash::RandomState` as `std::hash::random::RandomState`
+/// (the defining module is private). A turbofish has to name the public path.
+fn std_type_path_writable(path: &str) -> bool {
+    let mut segs: Vec<&str> = path.split("::").collect();
+    if segs.len() < 2 {
+        return false;
+    }
+    segs.pop();
+    let prefix = segs.join("::");
+    matches!(
+        prefix.as_str(),
+        "std"
+            | "std::hash"
+            | "std::collections"
+            | "std::collections::hash_map"
+            | "std::vec"
+            | "std::boxed"
+            | "std::rc"
+            | "std::sync"
+            | "std::sync::atomic"
+            | "std::cell"
+            | "std::mem"
+            | "std::ptr"
+            | "std::ops"
+            | "std::cmp"
+            | "std::fmt"
+            | "std::io"
+            | "std::iter"
+            | "std::slice"
+            | "std::str"
+            | "std::marker"
+            | "std::any"
+            | "std::borrow"
+            | "std::alloc"
+            | "std::ffi"
+            | "std::path"
+            | "std::convert"
+            | "std::default"
+            | "std::clone"
+            | "std::option"
+            | "std::result"
+            | "core"
+            | "core::hash"
+            | "core::cell"
+            | "core::mem"
+            | "core::ptr"
+            | "core::ops"
+            | "core::cmp"
+            | "core::fmt"
+            | "core::iter"
+            | "core::slice"
+            | "core::str"
+            | "core::marker"
+            | "core::any"
+            | "core::borrow"
+            | "core::alloc"
+            | "core::option"
+            | "core::result"
+            | "core::convert"
+            | "core::default"
+            | "core::clone"
+            | "core::num"
+            | "core::sync"
+            | "core::sync::atomic"
+            | "alloc"
+            | "alloc::vec"
+            | "alloc::boxed"
+            | "alloc::rc"
+            | "alloc::sync"
+            | "alloc::collections"
+    )
 }
 
 fn named_paths_in_type(ty: &str) -> Vec<String> {
@@ -919,7 +1044,7 @@ fn shim_body(target: &ResidualShimTarget) -> String {
             let word = format!("__a{word_i}");
             word_i += 1;
             let conv = from_word_expr(rust_ty, class, &word);
-            lines.push_str(&format!("    let __p{i}: {rust_ty} = {conv};\n"));
+            lines.push_str(&format!("    let __p{i} = {conv};\n"));
         }
         args.push(format!("__p{i}"));
     }
@@ -977,9 +1102,7 @@ fn from_word_expr(rust_ty: &str, class: char, word: &str) -> String {
         'f' | 'L' => format!(
             "<{rust_ty} as ::majit_ir::helper_fnaddr::ResidualFromF64>::from_residual_f64({word})"
         ),
-        _ => format!(
-            "unsafe {{ ::majit_ir::helper_fnaddr::residual_word_to_value::<{rust_ty}>({word}) }}"
-        ),
+        _ => format!("unsafe {{ ::majit_ir::helper_fnaddr::residual_word_to_value({word}) }}"),
     }
 }
 
@@ -988,7 +1111,7 @@ fn into_word_expr(rust_ty: &str, class: char, value: &str) -> String {
         'f' | 'L' => format!(
             "<{rust_ty} as ::majit_ir::helper_fnaddr::ResidualIntoF64>::into_residual_f64({value})"
         ),
-        _ => format!("::majit_ir::helper_fnaddr::residual_value_to_word::<{rust_ty}>({value})"),
+        _ => format!("::majit_ir::helper_fnaddr::residual_value_to_word({value})"),
     }
 }
 
@@ -1173,14 +1296,17 @@ fn shim_adt(
         }
         return None;
     }
-    if !args.is_empty() {
-        return None;
-    }
     if name.contains('<') {
         return None;
     }
     if !td.item_meta.attr_info.public {
         return None;
+    }
+    // `CodeObject<C>` is one ABI word behind a Ref. Spelling the
+    // instantiation lets the catalog keep the argument; the shim
+    // infers `T` from the callee and does not write this path.
+    if !args.is_empty() {
+        return Some(format!("{name}<{}>", args.join(", ")));
     }
     // A residual-call argument is one ABI word. A value that fits in a
     // word is copied; a larger public ADT is the address of its storage
@@ -1380,7 +1506,8 @@ fn is_pair_slice_item(ty: &str) -> bool {
     }
     ty.starts_with("*mut ")
         || ty.starts_with("*const ")
-        || matches!(ty, "i64" | "u64" | "isize" | "usize")
+        || matches!(ty, "i64" | "u64" | "isize" | "usize" | "GCREF")
+        || ty.rsplit("::").next() == Some("GCREF")
         || ty.rsplit("::").next() == Some("GcRef")
 }
 
@@ -1736,6 +1863,88 @@ mod tests {
             src.contains("residual_value_to_word"),
             "tuple result is packed as one residual word: {src}"
         );
+        assert!(
+            !src.contains("residual_value_to_word::<"),
+            "tuple T is inferred from the callee: {src}"
+        );
+    }
+
+    /// The shim crate names the function; rustc infers `&CodeObject` from
+    /// that signature. The TypeDecl lives in `rustpython_compiler_core`,
+    /// which `pyre-jit-trace` does not name.
+    #[test]
+    fn emit_infers_unnameable_arg_types_from_the_callee() {
+        let target = ResidualShimTarget {
+            path: "pyre_interpreter::pyopcode::decode_instruction_forward_dispatch".into(),
+            rust_path: "pyre_interpreter::pyopcode::decode_instruction_forward_dispatch".into(),
+            arg_classes: "ri".into(),
+            result_type: 'r',
+            arg_rust_types: vec![
+                "&rustpython_compiler_core::bytecode::CodeObject".into(),
+                "usize".into(),
+            ],
+            ret_rust_type: "(usize, u64)".into(),
+            result_is_exc: false,
+            is_unsafe: false,
+            is_generic: false,
+            is_method: false,
+            public: true,
+            crate_name: "pyre_interpreter".into(),
+            unsupported_type: false,
+            generic_rust_args: Vec::new(),
+            impl_callable: true,
+        };
+        let nameability = Nameability {
+            reachable_crates: BTreeSet::from(["pyre_interpreter".into()]),
+            public_modules: BTreeSet::from(["pyre_interpreter::pyopcode".into()]),
+            public_types: BTreeSet::new(),
+        };
+        let (src, census) = emit_residual_shim_source(&[target], &nameability);
+        assert_eq!(census.emitted, 1, "{census:?} {src}");
+        assert_eq!(census.unnameable, 0);
+        assert!(src.contains("decode_instruction_forward_dispatch"), "{src}");
+        assert!(
+            !src.contains("rustpython_compiler_core"),
+            "arg T is inferred, not written: {src}"
+        );
+        assert!(src.contains("residual_value_to_word"), "{src}");
+    }
+
+    #[test]
+    fn catalog_harvests_decode_instruction_forward_dispatch_from_llbc() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = majit_charon_reader::Llbc::load(path)
+            .unwrap_or_else(|err| panic!("load {path}: {err}"));
+        let catalog = catalog_from_llbc(&llbc);
+        let entry = catalog
+            .iter()
+            .find(|e| {
+                e.path.ends_with("::decode_instruction_forward_dispatch")
+                    || e.path == "decode_instruction_forward_dispatch"
+            })
+            .unwrap_or_else(|| panic!("catalog missing decode_instruction_forward_dispatch"));
+        assert!(entry.public, "{entry:?}");
+        assert!(entry.impl_callable, "{entry:?}");
+        let ret = entry
+            .ret_rust_type
+            .as_ref()
+            .unwrap_or_else(|| panic!("ret missing: {entry:?}"));
+        assert_eq!(ret.rust_type, "(usize, u64)", "{entry:?}");
+        assert!(!ret.is_exc);
+        let args = entry
+            .arg_rust_types
+            .as_ref()
+            .unwrap_or_else(|| panic!("args missing: {entry:?}"));
+        assert_eq!(args.len(), 2, "{args:?}");
+        assert!(
+            args[0].contains("CodeObject") && rust_ty_convertible(&args[0]),
+            "arg0 {} is not a convertible CodeObject ref",
+            args[0]
+        );
+        assert_eq!(args[1], "usize", "{args:?}");
     }
 
     #[test]
@@ -1798,6 +2007,7 @@ mod tests {
                 "pyre_object::function".into(),
                 "pyre_object::pyobject".into(),
             ]),
+            public_types: BTreeSet::new(),
         };
         let (_src, census) = emit_residual_shim_source(
             &[generic, method, unnameable, unsupported, sample_target()],
@@ -1818,6 +2028,7 @@ mod tests {
         let nameability = Nameability {
             reachable_crates: BTreeSet::from(["pyre_interpreter".into()]),
             public_modules: BTreeSet::from(["pyre_interpreter::eval".into()]),
+            public_types: BTreeSet::new(),
         };
         let (_src, census) = emit_residual_shim_source(&[target], &nameability);
         assert_eq!(census.unnameable, 1);
@@ -1870,11 +2081,52 @@ mod tests {
                 "pyre_object::function".into(),
                 "pyre_object::pyobject".into(),
             ]),
+            public_types: BTreeSet::new(),
         };
         let (src, census) = emit_residual_shim_source(&[generic], &nameability);
         assert_eq!(census.generic, 0);
         assert_eq!(census.emitted, 1);
         assert!(src.contains("w_method_new::<pyre_object::pyobject::PyObject>"));
+    }
+
+    #[test]
+    fn emit_skips_a_private_std_module_and_a_private_struct_in_turbofish() {
+        let mut random_state = sample_target();
+        random_state.path = "pyre_object::rordereddict::ll_dict_del_trampoline".into();
+        random_state.rust_path = "pyre_object::rordereddict::ll_dict_del_trampoline::<pyre_object::identitydict::IdentityKey, *mut pyre_object::pyobject::PyObject, std::hash::random::RandomState>".into();
+        random_state.generic_rust_args = vec![
+            "pyre_object::identitydict::IdentityKey".into(),
+            "*mut pyre_object::pyobject::PyObject".into(),
+            "std::hash::random::RandomState".into(),
+        ];
+        random_state.is_generic = true;
+        let mut private_struct = sample_target();
+        private_struct.path = "pyre_object::rordereddict::ll_dict_lookup_trampoline".into();
+        private_struct.rust_path = "pyre_object::rordereddict::ll_dict_lookup_trampoline::<pyre_object::dictmultiobject::StrLookupKey>".into();
+        private_struct.generic_rust_args =
+            vec!["pyre_object::dictmultiobject::StrLookupKey".into()];
+        private_struct.is_generic = true;
+        let nameability = Nameability {
+            reachable_crates: BTreeSet::from(["pyre_object".into()]),
+            public_modules: BTreeSet::from([
+                "pyre_object".into(),
+                "pyre_object::rordereddict".into(),
+                "pyre_object::identitydict".into(),
+                "pyre_object::pyobject".into(),
+                "pyre_object::dictmultiobject".into(),
+            ]),
+            public_types: BTreeSet::from([
+                "pyre_object::identitydict::IdentityKey".into(),
+                "pyre_object::pyobject::PyObject".into(),
+            ]),
+        };
+        let (_src, census) =
+            emit_residual_shim_source(&[random_state, private_struct], &nameability);
+        assert_eq!(census.emitted, 0, "{census:?}");
+        assert_eq!(census.unnameable, 2);
+        assert!(!std_type_path_writable("std::hash::random::RandomState"));
+        assert!(std_type_path_writable("std::hash::RandomState"));
+        assert!(std_type_path_writable("core::hash::BuildHasherDefault"));
     }
 
     #[test]

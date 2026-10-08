@@ -1941,12 +1941,6 @@ fn make_portal_quasi_immut_descr(
     pyre_jit_trace::state::quasi_immut_descr_for_struct(struct_ptr, field, None)
 }
 
-fn resolve_host_symbolic_residual_fnaddr(fnaddr: i64) -> i64 {
-    pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path(fnaddr)
-        .and_then(pyre_jit_trace::runtime_fnaddr_patch::runtime_fnaddr_by_path)
-        .unwrap_or(0)
-}
-
 pub fn publish_pyre_host_hooks() {
     fn criticalcode_start_adapter() {
         pyre_interpreter::stack_check::pyre_stack_criticalcode_start();
@@ -1978,7 +1972,6 @@ pub fn publish_pyre_host_hooks() {
         assertion_error_typeptr: Some(assertion_error_typeptr_adapter),
         make_quasi_immut_descr: Some(make_portal_quasi_immut_descr),
     });
-    majit_metainterp::register_symbolic_residual_fnaddr(resolve_host_symbolic_residual_fnaddr);
 }
 
 pub fn install_jit_call_bridge() {
@@ -2028,12 +2021,6 @@ pub fn install_jit_call_bridge() {
             pyre_object::interp_exceptions::memory_error_singleton() as i64
         });
         publish_pyre_host_hooks();
-        majit_metainterp::register_allow_small_ref_residual(
-            pyre_interpreter::is_one_word_guard_residual,
-        );
-        majit_metainterp::register_bh_portal_frame(|| {
-            pyre_interpreter::eval::current_frame() as i64
-        });
         #[cfg(feature = "cranelift")]
         {
             majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);

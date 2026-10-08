@@ -3744,8 +3744,10 @@ pub struct StructLayout {
     pub align: usize,
     /// `Struct._gckind` / `GcStruct._gckind`. `Gc` when the type implements
     /// majit-gc `GcType`, is field 0 of a `Gc` type, or its own field 0 is
-    /// `Gc` (`Struct._note_inlined_into`). The three clauses are a fixpoint
-    /// on the field-0 chain. `Raw` otherwise. Set when the layout is
+    /// `Gc` (`Struct._note_inlined_into`), or when it is not raw storage
+    /// (`adt_def_is_raw_storage`: a GC pointer field cannot sit in a raw
+    /// `Struct`, `lltype.py` `Struct.__init__` / `Ptr._is_atomic`). `Raw`
+    /// when the fields are only raw words. Set when the layout is
     /// registered; readers must not treat a missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     /// Per-field layout: (field_name, offset, size, type).

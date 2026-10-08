@@ -367,6 +367,19 @@ pub struct StructFieldRegistry {
     pub(crate) raw_word_owners: std::collections::HashSet<String>,
 }
 
+impl StructFieldRegistry {
+    /// Harvested `adt_def_is_raw_storage` decision for `name`.
+    /// `None` when this registry never harvested owners (a hand-built
+    /// fixture keeps the field-0 `Gc` / else-`Raw` gate).
+    pub(crate) fn harvested_raw_storage(&self, name: &str) -> Option<bool> {
+        if self.raw_word_owners.is_empty() {
+            return None;
+        }
+        let lookup = name.split_once('<').map(|(bare, _)| bare).unwrap_or(name);
+        Some(self.raw_word_owners.contains(name) || self.raw_word_owners.contains(lookup))
+    }
+}
+
 /// `struct_name → [FieldRow]`, with an O(1) key-set fingerprint. `insert` /
 /// `remove` / `entry` update the xor of the keys' hashes; a lookup compares
 /// that word and `len` and does not rescan the map. Reads deref to the inner

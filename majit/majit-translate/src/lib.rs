@@ -248,6 +248,7 @@ fn build_semantic_program_via_active_frontend(
             // the `GraphBodyProvider`, which keeps it and the state its
             // decls were lowered with.
             let mut discovered = Vec::new();
+            let mut raw_structs = Vec::new();
             let mut foldable_cross = Vec::new();
             let mut foldable_impl_by_ord = Vec::new();
             let mut duplicate_leaf_facts = front::mir::DuplicateLeafFacts::default();
@@ -365,17 +366,25 @@ fn build_semantic_program_via_active_frontend(
             let gc_struct_ids = declared_gc.gc_struct_ids();
             published_structs.sort_by(|a, b| a.path.cmp(&b.path));
             published_structs.dedup_by(|a, b| a.path == b.path);
+            for p in &paths {
+                let llbc = majit_charon_reader::Llbc::load(p)
+                    .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                raw_structs.extend(front::mir::discover_raw_struct_paths(&llbc, &gc_struct_ids));
+            }
+            raw_structs.sort();
+            raw_structs.dedup();
             for (ord, p) in paths.iter().enumerate() {
                 let mut llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 llbc.set_exception_carrier(static_addrs.error_carrier.carrier_path);
                 front::mir::mark_foreign_scope_owners(&llbc, &scope_owning_identities);
+                llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+                llbc.register_raw_struct_paths(raw_structs.iter().cloned());
                 front::mir::apply_published_structs(&mut llbc, &published_structs);
                 if !eval_hook_graphs.is_empty() {
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
                 }
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
-                llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
@@ -2059,10 +2068,13 @@ fn analyze_pipeline_from_module_paths(
             if let Some(host) = exact.and_then(|item| item.host.clone()) {
                 layout.host = Some(host);
             }
-            layout.gckind = if declared_gc.contains(&sid) {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
-            } else {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+            layout.gckind = match program.struct_fields.harvested_raw_storage(struct_name) {
+                Some(true) => crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                Some(false) => crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                None if declared_gc.contains(&sid) => {
+                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+                }
+                None => crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
             };
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();

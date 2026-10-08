@@ -350,6 +350,13 @@ override_enum_arg!(
     MulPair,
     IMul
 );
+#[cfg(target_arch = "wasm32")]
+override_enum_arg!(
+    context_source_arg,
+    crate::eval::ContextSource,
+    GeneratorChain,
+    ResumedFrameOnly
+);
 
 macro_rules! override_call_stub {
     ($stub:ident, $helper:ident, $($arg:ident => $value:expr),+ $(,)?) => {
@@ -525,6 +532,16 @@ pub mod word_publish {
             unsafe { std::mem::transmute::<Self, u32>(self) as i64 }
         }
     }
+    impl WordAbi for rustpython_compiler_core::bytecode::oparg::LoadAttr {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            Self::from_u32(reg as u32)
+        }
+        fn into_reg(self) -> i64 {
+            self.as_u32() as i64
+        }
+    }
     impl<T: rustpython_compiler_core::bytecode::OpArgType> WordAbi
         for rustpython_compiler_core::bytecode::Arg<T>
     {
@@ -570,6 +587,16 @@ pub mod word_publish {
         const IS_WORD: bool = false;
         fn from_reg(reg: i64) -> Self {
             super::repeat_dunder_arg(reg)
+        }
+        fn into_reg(self) -> i64 {
+            self as i64
+        }
+    }
+    impl WordAbi for crate::eval::ContextSource {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            super::context_source_arg(reg)
         }
         fn into_reg(self) -> i64 {
             self as i64
@@ -1711,72 +1738,6 @@ const MAP_BUILD_HELPER_PATHS: &[(&str, &str)] = &[
 /// activate (still as a SAFE leave-symbolic decline) only if those accessors
 /// are later registered; an unregistered helper is already declined upstream
 /// by the funcptr-hash gate, so registering them is unnecessary for soundness.
-/// True when `addr` is a [`FrameAnchor`] slot op whose `Ref` argument is
-/// the one-word depth, not a heap pointer.
-///
-/// `front::mir` aliases `&FrameAnchor` to the depth word, so
-/// `FrameAnchor::live` residualizes as `classes=r` with that depth in a
-/// Ref register. `refuse_walk_local_ref_args` treats `addr <= 0x1000` as a
-/// walk-local `Dynamic`; a live shadow-stack depth is also that small and
-/// must still run (`frame_anchor_live_method_jit_abi`).
-pub fn is_frame_anchor_word_residual(addr: usize) -> bool {
-    use std::sync::OnceLock;
-    static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
-    let addrs = ADDRS.get_or_init(|| {
-        jit_trace_fnaddrs()
-            .into_iter()
-            .filter(|(path, _)| {
-                path.ends_with("::FrameAnchor::live")
-                    || path.ends_with("::FrameAnchor::drop_in_place")
-                    || path.ends_with("::FrameAnchor::drop")
-                    || path.ends_with("::frame_anchor_live")
-                    || path.ends_with("::frame_anchor_release")
-                    || *path == "eval::FrameAnchor::live"
-                    || *path == "eval::FrameAnchor::drop_in_place"
-                    || *path == "eval::FrameAnchor::drop"
-            })
-            .map(|(_, fnaddr)| fnaddr)
-            .collect()
-    });
-    addrs.contains(&(addr as i64))
-}
-
-/// True when `addr` is a `RootScope` bracket op whose `Ref` argument is the
-/// guard's one-word `save_point`, not a heap pointer — the same aliasing
-/// [`is_frame_anchor_word_residual`] describes for `FrameAnchor`.  A save
-/// point is a shadow-stack depth, so it is as small as a walk-local index.
-pub fn is_root_scope_word_residual(addr: usize) -> bool {
-    use std::sync::OnceLock;
-    static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
-    let addrs = ADDRS.get_or_init(|| {
-        jit_trace_fnaddrs()
-            .into_iter()
-            .filter(|(path, _)| {
-                path.ends_with("::RootScope::pin_root")
-                    || path.ends_with("::RootScope::get")
-                    || path.ends_with("::RootScope::base")
-                    || path.ends_with("::RootScope::set")
-                    || path.ends_with("::RootScope::normalize")
-                    || path.ends_with("::RootScope::normalize_moved")
-                    || path.ends_with("::RootScope::publish")
-                    || path.ends_with("::RootScope::pin_roots")
-                    || path.ends_with("::RootScope::drop_in_place")
-                    || path.ends_with("::gc_roots::root_scope_close")
-                    || *path == "pyre_object::root_scope_close"
-            })
-            .map(|(_, fnaddr)| fnaddr)
-            .collect()
-    });
-    addrs.contains(&(addr as i64))
-}
-
-/// A residual whose `Ref` argument is a one-word guard rather than a heap
-/// pointer: [`is_frame_anchor_word_residual`] or
-/// [`is_root_scope_word_residual`].
-pub fn is_one_word_guard_residual(addr: usize) -> bool {
-    is_frame_anchor_word_residual(addr) || is_root_scope_word_residual(addr)
-}
-
 pub fn is_pyframe_operand_stack_accessor(addr: usize) -> bool {
     use std::sync::OnceLock;
     static ACCESSOR_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
@@ -7349,13 +7310,13 @@ mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
         dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
-        is_abi_unsound_argument_residual, is_frame_anchor_word_residual, is_list_write_barrier,
-        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
-        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs, pyre_class_pytype_addrs,
-        pyre_class_pytype_by_struct_addrs, shadow_stack_get_word, shadow_stack_push_word,
-        shadow_stack_try_pop_to_word, w_dict_lookup_bytes_strategy_word,
-        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
-        w_list_pop_end_inner_word, w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
+        is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
+        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
+        jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
+        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_pop_end_inner_word, w_list_pop_end_word,
+        w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -8638,13 +8599,6 @@ mod tests {
         ];
         for (path, bridge) in word_bridges {
             assert_eq!(bindings[path], bridge as usize as i64, "{path}");
-            // The guard word is a small integer in a Ref register; the walk
-            // must still run the bridges that take it.
-            assert_eq!(
-                super::is_one_word_guard_residual(bridge as usize),
-                !path.ends_with("::push_roots"),
-                "{path}"
-            );
         }
     }
 
@@ -9138,14 +9092,6 @@ mod tests {
             clear_references as usize
         ));
         assert!(!is_pyframe_operand_stack_accessor(0));
-    }
-
-    #[test]
-    fn is_frame_anchor_word_residual_matches_live() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let live = bindings["eval::FrameAnchor::live"];
-        assert!(is_frame_anchor_word_residual(live as usize));
-        assert!(!is_frame_anchor_word_residual(0));
     }
 
     #[test]
