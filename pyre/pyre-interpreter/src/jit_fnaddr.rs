@@ -2205,6 +2205,13 @@ pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
                     || path.ends_with("::RootScope::set")
                     || path.ends_with("::RootScope::get")
                     || path.ends_with("::RootScope::base")
+                    || path.ends_with("::root_scope_pin_root_jit_abi")
+                    || path.ends_with("::root_scope_pin_roots_jit_abi")
+                    || path.ends_with("::root_scope_publish_jit_abi")
+                    || path.ends_with("::root_scope_normalize_jit_abi")
+                    || path.ends_with("::root_scope_normalize_moved_jit_abi")
+                    || path.ends_with("::root_scope_set_jit_abi")
+                    || path.ends_with("::root_scope_get_jit_abi")
                     || path.ends_with("::gc_roots::shadow_stack_cell")
                     || *path == "pyre_object::shadow_stack_cell"
                     || path.ends_with("::gc_roots::shadow_stack_cell_len")
@@ -2213,10 +2220,15 @@ pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
                     || *path == "pyre_object::shadow_stack_cell_truncate"
                     || path.ends_with("::gc_roots::root_scope_close")
                     || *path == "pyre_object::root_scope_close"
+                    || path.ends_with("::root_scope_close_jit_abi")
                     || path.ends_with("::gc_roots::shadow_stack_len")
                     || *path == "pyre_object::shadow_stack_len"
                     || path.ends_with("::gc_roots::shadow_stack_get")
                     || *path == "pyre_object::shadow_stack_get"
+                    || path.ends_with("::gc_roots::shadow_stack_set")
+                    || *path == "pyre_object::shadow_stack_set"
+                    || path.ends_with("::gc_roots::normalize_roots")
+                    || *path == "pyre_object::normalize_roots"
                     || path.ends_with("::gc_roots::pin_root")
                     || *path == "pyre_object::pin_root"
                     || path.ends_with("::gc_roots::pin_roots")
@@ -2395,6 +2407,18 @@ fn jit_stringbuilder_new() -> i64 {
     pyre_object::rbuilder::rbuilder_runtime::ll_new(100, 1)
 }
 
+/// Residual of the front `__majit_stringbuilder_append` marker
+/// (`AbstractStringBuilderRepr.rtype_method_append`). Two GCREF words:
+/// the builder and the STR piece. `ll_append_res0` is the bound leaf
+/// `jtransform` retargets the marker onto; this name covers jitcode that
+/// still spells the marker.
+fn jit_stringbuilder_append(
+    builder: pyre_object::PyObjectRef,
+    piece: *mut pyre_object::unicodeobject::Utf8Str,
+) {
+    pyre_object::rbuilder::rbuilder_runtime::jit_ll_append_res0(builder, piece);
+}
+
 /// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
 /// which the publication sites fill in one pass.
 fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
@@ -2437,6 +2461,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "__majit_stringbuilder_new",
         jit_stringbuilder_new,
+    );
+    p2!(
+        &mut entries,
+        "__majit_stringbuilder_append",
+        jit_stringbuilder_append,
     );
     pa1!(
         &mut entries,
@@ -2986,17 +3015,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::shadow_stack_cell_truncate",
         pyre_object::gc_roots::shadow_stack_cell_truncate,
     );
-    // The bracket's close, which a lowered `Drop` of the guard calls with the
-    // guard itself: one word in, nothing out, and the truncate above behind
-    // it.  A crate that carries no declaration of the guard's fields cannot
-    // spell the close as those two reads, so it names this instead.  The
-    // jitcode passes the guard's value, not its address (`front::mir` aliases
-    // `&guard` to the guard's own Variable), so the close is bound to the
-    // word bridge, as is every other `RootScope` residual below.
+    // The bracket's close.  `root_scope_close` keeps main's
+    // `dont_look_inside_cannot_raise`, so the macro trampoline occupies that
+    // path (pointer-receiver).  Jitcode holds the guard as its save_point
+    // word (`front::mir` aliases `&guard` to the guard's own Variable) and
+    // names the word bridge under the bridge's own path, the
+    // `box_str_constant_jit_abi` routing.
     cpa1!(
         &mut entries,
-        "pyre_object::gc_roots::root_scope_close",
-        "pyre_object::root_scope_close",
+        "pyre_object::gc_roots::root_scope_close_jit_abi",
+        "pyre_object::root_scope_close_jit_abi",
         pyre_object::gc_roots::root_scope_close_jit_abi,
     );
     cpa0!(
@@ -3088,6 +3116,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::pin_root",
         pyre_object::gc_roots::pin_root,
     );
+    pa2!(
+        &mut entries,
+        "pyre_object::gc_roots::normalize_roots",
+        "pyre_object::normalize_roots",
+        pyre_object::gc_roots::normalize_roots,
+    );
     // `reload_top_root` re-reads the top entry of the `majit_gc` shadow stack
     // (a different structure from `pin_root`'s root stack) after a call that
     // may have moved what was published there.  A trace that kept the pre-move
@@ -3144,20 +3178,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::box_str_constant_jit_abi",
         pyre_object::unicodeobject::box_str_constant_jit_abi,
     );
-    // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
-    // `roots.get(slot)`: the same pin through the cached cell, and its
-    // read-back half.  The codewriter names an inherent method by its
-    // crate-stripped path, so that spelling is the alias.
+    // Word bridges for the scope-local pair a bracket body spells as
+    // `roots.pin_root(w)` / `roots.get(slot)`.  The methods keep main's
+    // `dont_look_inside_cannot_raise`, so each method path is the pointer-
+    // receiver trampoline; jitcode that passes the save_point word names
+    // these bridges under the bridges' own paths.
     cpa2!(
         &mut entries,
-        "pyre_object::gc_roots::RootScope::pin_root",
-        "gc_roots::RootScope::pin_root",
+        "pyre_object::gc_roots::root_scope_pin_root_jit_abi",
+        "pyre_object::root_scope_pin_root_jit_abi",
         pyre_object::gc_roots::root_scope_pin_root_jit_abi,
     );
     cpa2!(
         &mut entries,
-        "pyre_object::gc_roots::RootScope::get",
-        "gc_roots::RootScope::get",
+        "pyre_object::gc_roots::root_scope_get_jit_abi",
+        "pyre_object::root_scope_get_jit_abi",
         pyre_object::gc_roots::root_scope_get_jit_abi,
     );
     cpa1!(
@@ -3168,35 +3203,35 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa3!(
         &mut entries,
-        "pyre_object::gc_roots::RootScope::set",
-        "gc_roots::RootScope::set",
+        "pyre_object::gc_roots::root_scope_set_jit_abi",
+        "pyre_object::root_scope_set_jit_abi",
         pyre_object::gc_roots::root_scope_set_jit_abi,
     );
     cpa3!(
         &mut entries,
-        "pyre_object::gc_roots::RootScope::normalize",
-        "gc_roots::RootScope::normalize",
+        "pyre_object::gc_roots::root_scope_normalize_jit_abi",
+        "pyre_object::root_scope_normalize_jit_abi",
         pyre_object::gc_roots::root_scope_normalize_jit_abi,
     );
-    cpa3!(
+    cpa2!(
         &mut entries,
-        "pyre_object::gc_roots::RootScope::normalize_moved",
-        "gc_roots::RootScope::normalize_moved",
+        "pyre_object::gc_roots::root_scope_normalize_moved_jit_abi",
+        "pyre_object::root_scope_normalize_moved_jit_abi",
         pyre_object::gc_roots::root_scope_normalize_moved_jit_abi,
     );
-    // The run normalize and slot write take word arguments. The slice-taking
-    // `publish` / `pin_roots` bridges are the `(save_point, ptr, len)` pair
-    // registered below.
+    // The slice-taking `publish` / `pin_roots` bridges are the
+    // `(save_point, ptr, len)` pair. Same own-path routing as the pin/get
+    // bridges above.
     cpa3!(
         &mut entries,
-        "pyre_object::gc_roots::RootScope::publish",
-        "gc_roots::RootScope::publish",
+        "pyre_object::gc_roots::root_scope_publish_jit_abi",
+        "pyre_object::root_scope_publish_jit_abi",
         pyre_object::gc_roots::root_scope_publish_jit_abi,
     );
     cpa3!(
         &mut entries,
-        "pyre_object::gc_roots::RootScope::pin_roots",
-        "gc_roots::RootScope::pin_roots",
+        "pyre_object::gc_roots::root_scope_pin_roots_jit_abi",
+        "pyre_object::root_scope_pin_roots_jit_abi",
         pyre_object::gc_roots::root_scope_pin_roots_jit_abi,
     );
     pa2!(
@@ -3220,17 +3255,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_list_lock_release",
         pyre_object::listobject::w_list_lock_release,
     );
-    upa4!(
+    // Word-ABI residuals of the `&str` hashed helpers. The functions stay
+    // `dont_look_inside` so interpret does not walk the `DictStrategy` trait
+    // object; bind the descr-word trampoline, the
+    // `w_dict_unicode_lookup_index` routing.
+    cpa4!(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w",
         "pyre_object::w_dict_setitem_str_hashed_w",
-        pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w,
+        pyre_object::dictmultiobject::__majit_call_target_w_dict_setitem_str_hashed_w,
     );
-    upa3!(
+    cpa3!(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w",
         "pyre_object::w_dict_getitem_str_hashed_w",
-        pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w,
+        pyre_object::dictmultiobject::__majit_call_target_w_dict_getitem_str_hashed_w,
     );
     pa2!(
         &mut entries,
@@ -4289,6 +4328,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pycode::w_code_const",
         crate::pycode::w_code_const,
     );
+    // `pyopcode.py getname_w` is look-inside. Same residual-address reason
+    // as `w_code_const`.
+    up2!(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_getname_w",
+        crate::pycode::w_code_getname_w,
+    );
     // `pycode.py lookup_exceptiontable` is `@jit.elidable`. The wrapper
     // returns a packed i64 so the residual ABI is one word.
     cpa2!(
@@ -4661,7 +4707,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     upa1!(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::obj_has_binop_shortcut",
-        "pyre_interpreter::objspace::descroperation::obj_has_binop_shortcut",
+        "pyre_interpreter::obj_has_binop_shortcut",
         crate::objspace::descroperation::obj_has_binop_shortcut,
     );
     cpa1!(
@@ -5375,6 +5421,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::object_array::jit_ll_arraycopy",
         "pyre_object::jit_ll_arraycopy",
         pyre_object::object_array::jit_ll_arraycopy,
+    );
+    // `llmemory.raw_memcopy` is not a jitcode op (`misc.py
+    // _raw_memcopy_opaque`). Skip-spine `copy_nonoverlapping` of a
+    // non-one-word item residual-calls this helper.
+    cpa3!(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_raw_memcopy",
+        "pyre_object::jit_raw_memcopy",
+        pyre_object::lowlevel_string::jit_raw_memcopy,
     );
     // BINARY_SLICE list arm: locked wrapper, lock-free inner, and
     // per-strategy copy leaves. Word ABI `(i64, i64, i64) -> i64` so a
@@ -10197,8 +10252,8 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_w_code_get_w_globals() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w as *const () as usize as i64;
+        let expected = pyre_object::dictmultiobject::__majit_call_target_w_dict_setitem_str_hashed_w
+            as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w"],
             expected,
@@ -10209,22 +10264,25 @@ mod tests {
             bindings["gc_roots::RootScope::drop_in_place"],
             drop_expected,
         );
-        // Every `RootScope` residual takes the guard as its one word.
+        // Word bridges sit on the adapters' own paths. Methods that keep
+        // main's `dont_look_inside*` leave that path to the trampoline.
+        // Adapters that carry the attribute publish the descr-word
+        // trampoline on the occupied slot (`occupied_published_addr`).
         let word_bridges: [(&str, *const ()); 5] = [
             (
                 "pyre_object::gc_roots::push_roots",
                 pyre_object::gc_roots::push_roots_jit_abi as *const (),
             ),
             (
-                "pyre_object::gc_roots::root_scope_close",
+                "pyre_object::gc_roots::root_scope_close_jit_abi",
                 pyre_object::gc_roots::root_scope_close_jit_abi as *const (),
             ),
             (
-                "gc_roots::RootScope::pin_root",
+                "pyre_object::gc_roots::root_scope_pin_root_jit_abi",
                 pyre_object::gc_roots::root_scope_pin_root_jit_abi as *const (),
             ),
             (
-                "gc_roots::RootScope::get",
+                "pyre_object::gc_roots::root_scope_get_jit_abi",
                 pyre_object::gc_roots::root_scope_get_jit_abi as *const (),
             ),
             (
@@ -10233,7 +10291,7 @@ mod tests {
             ),
         ];
         for (path, bridge) in word_bridges {
-            assert_eq!(bindings[path], bridge as usize as i64, "{path}");
+            assert_occupied_binding(&bindings, path, bridge as usize as i64);
         }
         assert_occupied_binding(
             &bindings,
@@ -10265,8 +10323,8 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_dict_getitem_str_hashed_w() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w as *const () as usize as i64;
+        let expected = pyre_object::dictmultiobject::__majit_call_target_w_dict_getitem_str_hashed_w
+            as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w"],
             expected,

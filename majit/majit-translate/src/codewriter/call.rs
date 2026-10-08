@@ -27074,6 +27074,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert!(
             !descriptor

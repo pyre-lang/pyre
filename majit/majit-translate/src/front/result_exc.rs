@@ -14410,7 +14410,9 @@ pub(crate) fn retarget_gc_erasure_identity_args(graph: &mut FunctionGraph) {
 
 fn is_root_bracket_close(kind: &OpKind) -> bool {
     matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-        if segments.last().is_some_and(|s| s == super::mir::ROOT_SCOPE_CLOSE))
+    if segments.last().is_some_and(|s| {
+        s == super::mir::ROOT_SCOPE_CLOSE || s == super::mir::ROOT_SCOPE_CLOSE_JIT_ABI
+    }))
 }
 
 /// A frame-exit cleanup a raise path runs after its materialisation: a
@@ -14731,6 +14733,8 @@ fn is_forwarding_restore_op(kind: &OpKind) -> bool {
             let leaf = segments.last().map(String::as_str);
             leaf == Some("__cast_instance_intrinsic")
                 || (leaf == Some("get") && segments.iter().any(|s| s == "RootScope"))
+                || leaf == Some("root_scope_get_jit_abi")
+                || leaf == Some("shadow_stack_get")
                 || leaf == Some("pin_roots")
                 || leaf == Some("push_roots")
                 || leaf == Some("ll_slice_setitem_fast_r")

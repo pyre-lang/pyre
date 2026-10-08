@@ -88,7 +88,15 @@ fn lower_named_with_pytypes(
     })
 }
 
+/// True for either residual that rewinds a root bracket: the reference
+/// close, and the word-ABI bridge whose argument is the guard's save_point
+/// word.
+fn is_close_leaf(s: &str) -> bool {
+    s == "root_scope_close" || s == "root_scope_close_jit_abi"
+}
+
 /// Count calls whose path ends with `leaf`, over every block of the graph.
+/// A request for `root_scope_close` also counts the word-ABI close leaf.
 fn calls_to(graph: &FunctionGraph, leaf: &str) -> usize {
     graph
         .blocks
@@ -98,7 +106,13 @@ fn calls_to(graph: &FunctionGraph, leaf: &str) -> usize {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } => segments.last().is_some_and(|s| s == leaf),
+            } => segments.last().is_some_and(|s| {
+                if leaf == "root_scope_close" {
+                    is_close_leaf(s)
+                } else {
+                    s == leaf
+                }
+            }),
             _ => false,
         })
         .count()
@@ -608,7 +622,7 @@ fn reachable_closes(graph: &FunctionGraph) -> usize {
             .filter(|op| {
                 matches!(&op.kind,
                     OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                        if segments.last().is_some_and(|s| s == "root_scope_close"))
+                        if segments.last().is_some_and(|s| is_close_leaf(s)))
             })
             .count();
         stack.extend(graph.blocks[b].exits.iter().map(|e| e.target.0));
@@ -1333,40 +1347,43 @@ fn body_calls_vec_rangefrom_index(llbc: &Llbc, body: &Unstructured) -> bool {
 /// An Int-banked header must not remain a residual `Vec::index` RangeFrom.
 #[test]
 fn object_vec_rangefrom_index_is_getslice_not_residual() {
-    let programs: Vec<_> = [object_llbc(), interpreter_llbc()]
+    let llbcs: Vec<&'static Llbc> = [object_llbc(), interpreter_llbc()]
         .into_iter()
         .flatten()
-        .map(|llbc| (llbc, lower_context_for(llbc)))
         .collect();
     assert!(
-        !programs.is_empty(),
+        !llbcs.is_empty(),
         "object or interpreter LLBC must be present"
     );
-    let mut work: Vec<(&LowerContext<'_>, &majit_charon_reader::ullbc::FunDecl)> = Vec::new();
-    for (llbc, context) in &programs {
-        for fd in llbc.iter_local_fns() {
-            let Some(body) = fd.unstructured() else {
-                continue;
-            };
-            let path = fd.item_meta.name_path();
-            let known = path.contains("new_for_call_with_closure_and_globals_obj")
-                || path.contains("try_new_for_call_with_closure_and_globals_obj");
-            if known || body_calls_vec_rangefrom_index(llbc, &body) {
-                work.push((context, fd));
+    with_shared_lowering_many(&llbcs, |ctxs| {
+        let mut work: Vec<(
+            &'static LowerContext<'static>,
+            &majit_charon_reader::ullbc::FunDecl,
+        )> = Vec::new();
+        for (i, llbc) in llbcs.iter().enumerate() {
+            let context = ctxs[i];
+            for fd in llbc.iter_local_fns() {
+                let Some(body) = fd.unstructured() else {
+                    continue;
+                };
+                let path = fd.item_meta.name_path();
+                let known = path.contains("new_for_call_with_closure_and_globals_obj")
+                    || path.contains("try_new_for_call_with_closure_and_globals_obj");
+                if known || body_calls_vec_rangefrom_index(llbc, &body) {
+                    work.push((context, fd));
+                }
             }
         }
-    }
-    assert!(
-        !work.is_empty(),
-        "no Vec::index RangeFrom callsite in object/interpreter LLBC"
-    );
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(work.len().max(1));
-    let chunk = work.len().div_ceil(threads).max(1);
-    let hits =
-        std::thread::scope(|scope| {
+        assert!(
+            !work.is_empty(),
+            "no Vec::index RangeFrom callsite in object/interpreter LLBC"
+        );
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(work.len().max(1));
+        let chunk = work.len().div_ceil(threads).max(1);
+        let hits = std::thread::scope(|scope| {
             let handles: Vec<_> =
                 work.chunks(chunk)
                     .map(|slice| {
@@ -1394,10 +1411,11 @@ fn object_vec_rangefrom_index_is_getslice_not_residual() {
                 .flat_map(|h| h.join().expect("rangefrom worker"))
                 .collect::<Vec<_>>()
         });
-    assert!(
-        hits.is_empty(),
-        "Vec::index RangeFrom of an object-pointer Vec must lower to a suffixed getslice, residual in {hits:?}"
-    );
+        assert!(
+            hits.is_empty(),
+            "Vec::index RangeFrom of an object-pointer Vec must lower to a suffixed getslice, residual in {hits:?}"
+        );
+    });
 }
 
 /// jtransform mints `ll_listslice_startonly` from the suffixed marker.
@@ -1463,29 +1481,30 @@ fn dict_operation_guard_ctor_is_not_a_residual_fnaddr() {
     let Some(llbc) = object_llbc() else {
         return;
     };
-    let context = lower_context_for(llbc);
-    let mut hits = Vec::new();
-    for fd in llbc.iter_local_fns() {
-        let path = fd.item_meta.name_path();
-        if !path.contains("DictOperationGuard") {
-            continue;
+    with_shared_lowering(llbc, |context| {
+        let mut hits = Vec::new();
+        for fd in llbc.iter_local_fns() {
+            let path = fd.item_meta.name_path();
+            if !path.contains("DictOperationGuard") {
+                continue;
+            }
+            let Ok(graph) = lower_fun_decl(context, fd) else {
+                continue;
+            };
+            if graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| residual_dict_operation_guard_ctor(&op.kind))
+            {
+                hits.push(path.to_string());
+            }
         }
-        let Ok(graph) = lower_fun_decl(context, fd) else {
-            continue;
-        };
-        if graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| residual_dict_operation_guard_ctor(&op.kind))
-        {
-            hits.push(path.to_string());
-        }
-    }
-    assert!(
-        hits.is_empty(),
-        "DictOperationGuard ctor must not remain a residual call: {hits:?}"
-    );
+        assert!(
+            hits.is_empty(),
+            "DictOperationGuard ctor must not remain a residual call: {hits:?}"
+        );
+    });
 }
 
 /// `int_ll_newlist` is `@oopspec("newlist(length)")`. After jtransform the
@@ -2119,22 +2138,21 @@ fn eval_loop_jit_erases_the_cached_slot_handle() {
         return;
     }
     let llbc = Llbc::load(&path).expect("load pyre-jit");
-    let named = |leaf: &str| {
-        llbc.iter_fun_decls()
-            .find(|fd| fd.item_meta.name_path().ends_with(leaf))
-            .unwrap_or_else(|| panic!("{leaf} present in pyre-jit.ullbc"))
-    };
-    for leaf in ["::reload_entered", "::eval_loop_jit"] {
-        let fd = named(leaf);
-        let body = fd
-            .unstructured()
-            .unwrap_or_else(|| panic!("{} has an unstructured body", fd.item_meta.name_path()));
-        match shadow_stack_erase_status(&llbc, fd, &body) {
-            Ok(true) => {}
-            other => panic!(
-                "{} must erase the cached-slot handle, got {other:?}",
-                fd.item_meta.name_path()
-            ),
-        }
+    // The portal body is `eval_loop_jit`. The erase pass looks through
+    // wrapper bodies (`FrameView::reload`, `reload_loop_frame`) without
+    // naming them (`warmspot.py` `gc_enter_roots_frame`).
+    let fd = llbc
+        .iter_fun_decls()
+        .find(|fd| fd.item_meta.name_path().ends_with("::eval_loop_jit"))
+        .unwrap_or_else(|| panic!("eval_loop_jit present in pyre-jit.ullbc"));
+    let body = fd
+        .unstructured()
+        .unwrap_or_else(|| panic!("{} has an unstructured body", fd.item_meta.name_path()));
+    match shadow_stack_erase_status(&llbc, fd, &body) {
+        Ok(true) => {}
+        other => panic!(
+            "{} must erase the cached-slot handle, got {other:?}",
+            fd.item_meta.name_path()
+        ),
     }
 }

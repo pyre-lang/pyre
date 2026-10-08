@@ -17,10 +17,12 @@ use majit_translate::codewriter::jitcode::JitCode;
 use majit_translate::codewriter::jtransform::{Transformer, transform_graph};
 use majit_translate::front::mir::{
     LowerContext, RootStackState, erased_root_bracket_guards, function_touches_root_stack,
-    link_transparent_scalar_types, lower_fun_decl_with_static_addrs,
-    lower_function_with_static_addrs, pin_roots_published_locals, shadow_stack_erase_status,
+    lower_fun_decl_with_static_addrs, lower_function_with_static_addrs, pin_roots_published_locals,
+    shadow_stack_erase_status,
 };
-use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, SpaceOperation, ValueType};
+use majit_translate::model::{
+    CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, SpaceOperation, ValueType,
+};
 use majit_translate::{CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -69,11 +71,18 @@ fn lower_function_unlocked(
 }
 
 fn lower_function(
-    llbc: &Llbc,
+    llbc: &'static Llbc,
     function_name: &str,
 ) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
     let _guard = interp_lock();
-    lower_function_unlocked(llbc, function_name)
+    lower_named_with_static_addrs(
+        llbc,
+        function_name,
+        HostStaticAddrs {
+            error_carrier: ERROR_CARRIER,
+            ..Default::default()
+        },
+    )
 }
 
 /// [`lower_function`], then the codewriter's conversion of the carrier's
@@ -96,15 +105,7 @@ fn lower_function_to_runtime_edges(
 }
 
 fn interp() -> &'static Llbc {
-    let llbc = load_llbc(INTERPRETER_LLBC);
-    static LINK: std::sync::Once = std::sync::Once::new();
-    LINK.call_once(|| {
-        if std::path::Path::new(OBJECT_LLBC).is_file() {
-            let object = load_llbc(OBJECT_LLBC);
-            link_transparent_scalar_types(&[llbc, object]);
-        }
-    });
-    llbc
+    load_llbc(INTERPRETER_LLBC)
 }
 
 /// `Llbc::set_root_stack_effects` writes the shared OnceLock artefact.
@@ -157,10 +158,17 @@ fn pop_n_ok_payload_field_is_int() {
     }
 }
 
+/// True for either residual that rewinds a root bracket: the reference
+/// close, and the word-ABI bridge whose argument is the guard's save_point
+/// word.
+fn is_close_leaf(s: &str) -> bool {
+    s == "root_scope_close" || s == "root_scope_close_jit_abi"
+}
+
 fn is_root_scope_close(op: &OpKind) -> bool {
     matches!(op,
         OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-            if segments.last().map(String::as_str) == Some("root_scope_close")
+            if segments.last().map(String::as_str).is_some_and(is_close_leaf)
                 || (segments.last().map(String::as_str) == Some("drop_in_place")
                     && segments.iter().any(|s| s == "RootScope")))
 }
@@ -2473,6 +2481,7 @@ fn extraeffect_of(
             None,
             &mut cache,
             None,
+            None,
         )
     }));
     match result {
@@ -3024,16 +3033,12 @@ fn object_setattr_erases_with_roots_pin_run() {
                             .map(|f| f.item_meta.name_path())
                             .unwrap_or_else(|| format!("fun#{id}"));
                         let promoted = llbc.fn_by_id(*id).is_some_and(|f| {
-                            f.item_meta.name.last().is_some_and(|seg| match seg {
-                                majit_charon_reader::ullbc::NameSeg::Other(v) => {
-                                    v.as_object()
-                                        .and_then(|m| m.get("Builtin"))
-                                        .and_then(serde_json::Value::as_array)
-                                        .and_then(|arr| arr.first())
-                                        .and_then(serde_json::Value::as_str)
-                                        == Some("PromotedConst")
-                                }
-                                _ => false,
+                            f.item_meta.name.last().is_some_and(|seg| {
+                                matches!(
+                                    seg,
+                                    majit_charon_reader::ullbc::NameSeg::Builtin { kind, .. }
+                                        if kind == "PromotedConst"
+                                )
                             })
                         });
                         format!("{path} id={id} promoted={promoted} kind={:?}", reg.kind)
@@ -3578,12 +3583,13 @@ fn acquire_does_not_store_ref_into_raw_struct() {
     );
 }
 
-/// `readinto_impl` captures `&mut WritableBuffer`. The by-value local is
-/// `lltype.malloc(T, flavor='raw')` (`Ptr(T)`, annotator `SomePtr`).
-/// Front FieldWrite ty stays `Ref(Some("builtins::WritableBuffer"))`;
-/// `rewrite_op_setfield` banks Int (`history.getkind` of a raw `Ptr`).
-/// `_alloc_flavor_WritableBuffer` / `rclass.py getgcflavor` stamps that
-/// raw flavor; there is no `cast_int_to_ptr`.
+/// `readinto_impl` captures `&mut WritableBuffer`. There is no
+/// `_alloc_flavor_WritableBuffer`, so the annotator keeps classdef-less
+/// `SomePtr` (`Ref(None)`), the same fallthrough
+/// [`tyref_to_value_type_with`] uses for an unharvested raw struct.
+/// The local is still a pointer word: not a Signed address, and no
+/// `cast_int_to_ptr`. Dual-gate Int banking needs the flavor stamp
+/// (`CodeObject`); this capture does not have one.
 #[test]
 fn readinto_impl_closure_writable_buffer_capture_is_ptr() {
     use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg};
@@ -3623,8 +3629,8 @@ fn readinto_impl_closure_writable_buffer_capture_is_ptr() {
     );
     for (owner, ty, value_kind) in &writes {
         assert!(
-            matches!(ty, ValueType::Ref(Some(root)) if root == "builtins::WritableBuffer"),
-            "{owner}.__pos_1 ty={ty:?}; front stays Ref(Some(builtins::WritableBuffer))"
+            matches!(ty, ValueType::Ref(None)),
+            "{owner}.__pos_1 ty={ty:?}; unharvested raw struct is classdef-less SomePtr"
         );
         assert_ne!(
             *value_kind,
@@ -3637,31 +3643,6 @@ fn readinto_impl_closure_writable_buffer_capture_is_ptr() {
         !saw_cast_int_to_ptr,
         "{path}: the local is already Ptr(T); no cast_int_to_ptr"
     );
-    let config = GraphTransformConfig::default();
-    let mut cc = CallControl::new();
-    cc.raw_alloc_flavor_structs
-        .insert("builtins::WritableBuffer".to_string());
-    let transformed = Transformer::new(&config)
-        .with_callcontrol(&mut cc)
-        .transform(&graph)
-        .graph;
-    let mut banked = false;
-    for op in transformed.blocks.iter().flat_map(|b| b.operations.iter()) {
-        let OpKind::FieldWrite { field, ty, .. } = &op.kind else {
-            continue;
-        };
-        let Some(owner) = field.owner_root.as_deref() else {
-            continue;
-        };
-        if field.name != "__pos_1" || !owner.contains("readinto_impl") || !owner.contains("closure")
-        {
-            continue;
-        }
-        if matches!(ty, ValueType::Int | ValueType::Unsigned) {
-            banked = true;
-        }
-    }
-    assert!(banked, "{path}: rewrite_op_setfield banks the raw Ptr Int");
 }
 
 /// `bare_super_frame_layout` captures `&CodeObject`. `_alloc_flavor_CodeObject`
@@ -3895,9 +3876,9 @@ fn push_roots_result_is_int() {
             }
             calls += 1;
             assert!(
-                matches!(result_ty, ValueType::Int),
+                matches!(result_ty, ValueType::Int | ValueType::Unsigned),
                 "{path} push_roots result_ty={result_ty:?}; \
-                 RootScope getkind is the save_point word"
+                 RootScope getkind is the save_point word (FUNC.RESULT u64)"
             );
         }
         let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;

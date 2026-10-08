@@ -769,8 +769,12 @@ pub fn get_recursion_limit() -> i32 {
 /// return`. On miss, dispatch to [`pyre_stack_too_big_slowpath`] which
 /// applies the 4-case logic (first-time capture, thread switch,
 /// underflow revision, or real overflow).
+///
+/// `stack_check._always_inline_ = True` (`rstack.py`): the translator
+/// inlines the body into the caller rather than residualizing a `CallN`.
+/// The slow path stays opaque (`stack_check_slowpath._dont_inline_`).
 #[inline]
-#[majit_macros::dont_look_inside]
+#[majit_macros::always_inline]
 pub fn stack_check() -> Result<(), PyError> {
     // CPython 3.14 checks `py_recursion_remaining`, i.e. Python interpreter
     // depth, independently of native stack protection.  pyre's matching

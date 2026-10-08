@@ -4430,7 +4430,7 @@ pub(in crate::front::mir) fn rust_vec_header_ptr_spelling(
                 tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
             Some(format!("*mut Vec<{item}>"))
         }
-        Some(majit_ir::rvec::VecItemKind::Ref) => Some("*mut Vec<GCREF>".to_string()),
+        Some(majit_ir::rvec::VecItemKind::Ref) => Some("*mut Vec<*mut u8>".to_string()),
         Some(majit_ir::rvec::VecItemKind::Float) => Some("*mut Vec<f64>".to_string()),
         None => None,
     }
@@ -6588,7 +6588,6 @@ pub(crate) fn declared_gckind(
 }
 
 pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
-
     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&td.item_meta.name_path()))
 }
 
@@ -7841,14 +7840,15 @@ pub use self::gcroot::{
     shadow_stack_erase_status,
 };
 pub(crate) use self::gcroot::{
-    ROOT_SCOPE_CLOSE, RootStackAnalyzer, harvest_root_stack_touching_paths_with,
-    harvest_scope_owning_identities_with, is_root_scope_drop_glue_call, is_rust_vec_free_call,
-    is_shadow_stack_bracket_close, is_slice_buffer_free_call,
+    ROOT_SCOPE_CLOSE, ROOT_SCOPE_CLOSE_JIT_ABI, RootStackAnalyzer,
+    harvest_root_stack_touching_paths_with, harvest_scope_owning_identities_with,
+    is_root_scope_drop_glue_call, is_rust_vec_free_call, is_shadow_stack_bracket_close,
+    is_slice_buffer_free_call,
 };
 pub(crate) use self::lltype::{
-    NullableStrEnum, RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
-    adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
-    charon_literal_to_ast_string, charon_type_value_to_ast_string,
+    NullableStrEnum, RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS,
+    ThreadLocalRefLlop, adt_head_instantiation_suffix, cached_global_marker_str,
+    charon_array_len_to_string, charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     fixed_array_index_identity, fixed_array_lowers_to_gcarray, fixed_list_reader,
     fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
@@ -7860,10 +7860,13 @@ pub(crate) use self::lltype::{
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling,
     resolve_trait_assoc_type, same_nominal_adt,
     seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
-    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    struct_item_flexible_gcarray_block_annotation, type_decl_adt_tyref, type_decl_ref_adt_id,
+    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, tyref_nullable_str_enum,
+    tyref_to_value_type, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
+#[cfg(test)]
+pub(crate) use self::lltype::{stamp_fn_ptr_spelling, type_decl_nullable_str_enum};
 pub(crate) use self::malloc::forward_identity;
 pub(crate) use self::operation::{
     cast_int_to_ptr_call, cast_ptr_to_int_call, lltype_for_direct_ptradd_pointer, value_type_bank,

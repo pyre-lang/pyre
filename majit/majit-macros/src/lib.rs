@@ -2062,16 +2062,11 @@ fn emit_helper_call_target_fn(
     let mut has_float_arg = false;
     for (index, arg) in func.sig.inputs.iter().enumerate() {
         let arg_ident = format_ident!("__majit_arg_{index}");
-        if let syn::FnArg::Receiver(recv) = arg {
+        if let FnArg::Receiver(recv) = arg {
+            let Some(converted) = helper_arg_from_i64(&arg_ident, &recv.ty) else {
+                return Ok(None);
+            };
             wrapper_params.push(quote! { #arg_ident: i64 });
-            let self_ty = match &recv.reference {
-                Some(_) if recv.mutability.is_some() => quote! { &mut Self },
-                Some(_) => quote! { &Self },
-                None => quote! { Self },
-            };
-            let converted = quote! {
-                unsafe { ::majit_ir::helper_fnaddr::residual_word_to_value::<#self_ty>(#arg_ident) }
-            };
             converted_args.push(converted.clone());
             fnaddr_params.push(quote! { #arg_ident: i64 });
             fnaddr_args.push(converted);
@@ -2131,11 +2126,11 @@ fn emit_helper_call_target_fn(
     };
     // An `unsafe fn` helper must be called inside an `unsafe` block from the
     // generated `extern "C"` trampoline; a safe helper is called bare (an
-    // `unsafe` wrapper there would be an unused-unsafe warning). A method
-    // is `Self::name` so the trampoline, emitted next to it in the impl,
-    // finds the associated function (`getfunctionptr` of that graph).
-    // `rlib/jit.py elidable_promote` passes `self` as the first ordinary argument.
-    let call_target = if func.sig.receiver().is_some() {
+    // `unsafe` wrapper there would be an unused-unsafe warning). A `&self`
+    // method is called through UFCS so the trampoline can live in the impl
+    // (`Self` names the receiver type). `rlib/jit.py elidable_promote` passes
+    // `self` as the first ordinary argument.
+    let call_target = if in_impl {
         quote! { Self::#helper_name }
     } else {
         quote! { #helper_name }
@@ -6554,6 +6549,7 @@ mod tests {
                 .any(|name| name == "oopspec_lookup_trampoline")
         );
     }
+
     #[test]
     fn jit_llop_emits_body_local_marker_and_free_function_sibling() {
         let func = parse_fn(

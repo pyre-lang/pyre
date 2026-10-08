@@ -6,11 +6,10 @@ impl<'a> Lowering<'a> {
     /// Close a root bracket at the guard's `Drop`, by calling the same rewind
     /// the destructor body calls. A non-guard drop is a no-op.
     ///
-    /// The call takes the guard by reference rather than the two words the
-    /// rewind needs, so this arm reads no field of it. A crate that only
-    /// imports the guard sees an opaque stub with no fields, and a
-    /// field-keyed close would silently confine itself to the crate that
-    /// defines one.
+    /// Jitcode holds the guard as its save_point word, so the residual is
+    /// the word bridge. A crate that only imports the guard sees an opaque
+    /// stub with no fields, and a field-keyed close would silently confine
+    /// itself to the crate that defines one.
     pub(in crate::front::mir) fn emit_root_scope_close(&mut self, mir_bb: usize, place: &Place) {
         let Some(class_root) = self.tyref_adt_class_root(&place.ty) else {
             return;
@@ -45,9 +44,11 @@ impl<'a> Lowering<'a> {
         };
         // The helper is a sibling of the guard's own type, so its path is the
         // guard's with the leaf replaced. Nothing here names an owning crate.
+        // Jitcode passes the guard's save_point word, so the residual is the
+        // word bridge under that bridge's own path.
         let mut segments: Vec<String> = class_root.split("::").map(str::to_string).collect();
         segments.pop();
-        segments.push(ROOT_SCOPE_CLOSE.to_string());
+        segments.push(ROOT_SCOPE_CLOSE_JIT_ABI.to_string());
         let bb_id = self.emit_bb(mir_bb);
         let void = self
             .graph
@@ -1004,6 +1005,9 @@ pub(in crate::front::mir) const ROOT_SCOPE_TYPE: &str = "RootScope";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
 /// that takes the guard by reference.
 pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
+/// Word-ABI residual of [`ROOT_SCOPE_CLOSE`]. Jitcode holds the guard as its
+/// save_point word, so the emitted close names this leaf.
+pub(crate) const ROOT_SCOPE_CLOSE_JIT_ABI: &str = "root_scope_close_jit_abi";
 
 /// True for the root-bracket guard's own type path.
 pub(in crate::front::mir) fn gc_root_scope_type_path(name: &str) -> bool {
@@ -1182,6 +1186,7 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     let in_gc_roots = segments.iter().any(|s| s == "gc_roots");
     (leaf == Some("drop_in_place") && in_gc_roots && segments.iter().any(|s| s == "RootScope"))
         || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
+        || (leaf == Some(ROOT_SCOPE_CLOSE_JIT_ABI) && in_gc_roots)
 }
 
 /// Match the bound [`frame_anchor_release`] residual emitted for a
@@ -7069,7 +7074,7 @@ pub(in crate::front::mir) fn gc_root_scope_open_path(name: &str) -> bool {
     if !segments.contains(&"gc_roots") {
         return false;
     }
-    matches!(segments.last(), Some(&"push_roots"))
+    matches!(segments.last(), Some(&"push_roots" | &"push_roots_jit_abi"))
         || (matches!(segments.last(), Some(&"new"))
             && segments.iter().any(|s| s.contains(ROOT_SCOPE_TYPE)))
 }

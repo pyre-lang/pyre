@@ -22003,10 +22003,6 @@ pub(crate) fn frozendict_structural_hash(obj: PyObjectRef) -> Result<i64, crate:
     Ok(_hash_frozenset(&pair_hashes))
 }
 
-/// `space.hash` for interpreter-level dict and set probes.  The exact-type
-/// scan and the `__hash__` protocol it falls back to are not traced; the call
-/// stays a residual.
-#[majit_macros::dont_look_inside]
 pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
