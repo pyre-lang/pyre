@@ -3824,7 +3824,7 @@ unsafe fn fbw_reorder_call_kw_args(
         return None;
     }
     let n_pos = nargs - nkw;
-    let mut extras = Vec::new();
+    let extras = Vec::new();
     let mut slot_args: Vec<Option<OpRef>> = vec![None; nparams];
     let mut slot_conc: Vec<Option<ConcreteValue>> = vec![None; nparams];
     if let Some((receiver_arg, receiver_concrete)) = receiver {
@@ -18463,6 +18463,35 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     }
 }
 
+/// After a looked-inside `list_extend_value` (`LIST_EXTEND` /
+/// `ListStrategy._extend_from_tuple`), apply the extend once when the
+/// concrete list did not grow. The sub-walk records `setarrayitem` against
+/// the `BUILD_LIST` items array (`len.max(1)`); `ArrayPtrInfo._setitem_index`
+/// does not grow a virtual array, so `list_to_tuple` residual /
+/// `CALL_FUNCTION_EX` unpack miss the extra positional. Same contract as
+/// `finish_recorded_list_append`.
+fn sync_recorded_list_extend(
+    list: pyre_object::PyObjectRef,
+    iterable: pyre_object::PyObjectRef,
+    len_before: usize,
+    allocated_before: isize,
+) {
+    if unsafe { pyre_object::w_list_len(list) } != len_before {
+        return;
+    }
+    if pyre_interpreter::opcode_ops::list_extend_value(list, iterable).is_err() {
+        return;
+    }
+    let len_after = unsafe { pyre_object::w_list_len(list) };
+    for i in len_before..len_after {
+        fbw_list_journal_push_append(list, i, allocated_before);
+    }
+}
+
+fn list_extend_value_jitcode_matches(name: &str) -> bool {
+    name == "list_extend_value" || name.ends_with("::list_extend_value")
+}
+
 /// Operand layout `dR>X`:
 ///   2B descr index + 1B varlen + N×1B Ref args + 1B `>X` dst.
 ///
@@ -18616,6 +18645,32 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
+    let list_extend_sync = if ctx.is_authoritative_executor
+        && dst_bank == 'v'
+        && args.len() == 2
+        && arg_concretes.len() >= 2
+        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
+            jc.code.as_ptr() == sub_body.code.as_ptr()
+                && list_extend_value_jitcode_matches(&jc.name)
+        }) {
+        match (&arg_concretes[0], &arg_concretes[1]) {
+            (ConcreteValue::Ref(list), ConcreteValue::Ref(iterable))
+                if !list.is_null()
+                    && !iterable.is_null()
+                    && unsafe { pyre_object::is_list(*list) } =>
+            {
+                Some((
+                    *list,
+                    *iterable,
+                    unsafe { pyre_object::w_list_len(*list) },
+                    unsafe { pyre_object::listobject::w_list_allocated(*list) },
+                ))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let exc_before_subwalk = ctx.last_exc_value();
     let callee_result = run_inline_call_subwalk(
         ctx,
@@ -18674,6 +18729,9 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 if dst_bank == 'v' {
                     // `inline_call_r_v/dR` expects exactly this — callee
                     // exits via `void_return/`, no SubReturn writeback.
+                    if let Some((list, iterable, len_before, allocated_before)) = list_extend_sync {
+                        sync_recorded_list_extend(list, iterable, len_before, allocated_before);
+                    }
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // Same shape contract as `_r_r`: a `_r_<X>` variant promises
