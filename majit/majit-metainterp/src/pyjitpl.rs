@@ -15556,6 +15556,19 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0)
     }
 
+    /// Integer key `must_compile` mixes into the GUARD_VALUE jitcounter hash
+    /// for a TY_REF fail value.
+    ///
+    /// Root across the call: `minimark.find_shadow` may collect while it
+    /// reserves the old-gen shadow (`optimizeopt/util.rs` ArgsKey).
+    fn ty_ref_jitcounter_intval(intval: i64) -> i64 {
+        if intval == 0 {
+            return 0;
+        }
+        let root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(intval as usize));
+        majit_gc::gc_id_or_identityhash(root.get().0) as i64
+    }
+
     pub fn must_compile_with_owning_key(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -15652,6 +15665,21 @@ impl<M: Clone> MetaInterp<M> {
             // from `fail_values` here.
             let intval: i64 = guard_value_operand
                 .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
+            // compile.py hashes TY_REF with `lltype.cast_ptr_to_int` (the live
+            // address). A nursery heap type that a minor copies young→old
+            // between failures of the same GUARD_VALUE then lands in a second
+            // jitcounter bucket, so the bridge never reaches eagerness
+            // (classmethod_type_dispatch_hot 201+64, inheritance_dispatch
+            // t1/10 and t2/0). `history.py ConstPtr._get_hash_` and
+            // `incminimark.py id_or_identityhash` hash the old-gen shadow
+            // instead; ArgsKey (`optimizeopt/util.rs`) does the same. Old
+            // objects keep identity==address, so the formula matches
+            // compile.py once the type has tenured.
+            let intval = if typetag == Self::TY_REF {
+                Self::ty_ref_jitcounter_intval(intval)
+            } else {
+                intval
+            };
             // compile.py:780-781: current_object_addr_as_int(self) * 777767777
             //   + intval * 1442968193
             (descr_addr as u64)
@@ -33507,6 +33535,38 @@ mod tests {
             meta.warm_state_for_driver(0).ensure_cell_key(&closed),
             green_key,
             "compile_loop ensure_cell_key must not mint a sibling"
+        );
+    }
+
+    #[test]
+    fn ty_ref_guard_value_hashes_by_identity_not_moving_address() {
+        // Two nursery addresses of one type must share the jitcounter bucket
+        // once `id_or_identityhash` has assigned the old-gen shadow.
+        fn identity_of_moved_type(addr: usize) -> usize {
+            match addr {
+                0x100 | 0x200 => 0xABC,
+                other => other,
+            }
+        }
+        struct RestoreIdentityHash;
+        impl Drop for RestoreIdentityHash {
+            fn drop(&mut self) {
+                majit_gc::set_active_gc_id_or_identityhash(None);
+            }
+        }
+        majit_gc::set_active_gc_id_or_identityhash(Some(identity_of_moved_type));
+        let _restore = RestoreIdentityHash;
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.set_trace_eagerness(2);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        fd.make_a_counter_per_value(0, MetaInterp::<()>::TY_REF);
+
+        assert!(!meta.must_compile_with_values(&descr, &[], Some(0x100), 1).0);
+        assert!(
+            meta.must_compile_with_values(&descr, &[], Some(0x200), 1).0,
+            "young and moved addresses of one type share the jitcounter bucket"
         );
     }
 
