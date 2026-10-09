@@ -2857,76 +2857,6 @@ impl<S: JitState> JitDriver<S> {
             .front_target_inputarg_types_on_driver(self.index().unwrap_or(0), green_key)
     }
 
-    /// resume.py blackhole_from_resumedata parity: get the
-    /// recovery slot types for building typed Value array from raw fail_values.
-    pub fn get_recovery_slot_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<Type>> {
-        self.meta
-            .get_recovery_slot_types(green_key, trace_id, fail_index)
-    }
-
-    /// compile.py `ResumeGuardDescr` storage handle forwarder.
-    pub fn get_resume_storage(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<std::sync::Arc<crate::resume::ResumeStorage>> {
-        self.meta
-            .get_resume_storage(green_key, trace_id, fail_index)
-    }
-
-    /// The storage and the fail-argument types of one and the same exit
-    /// layout — see `MetaInterp::get_resume_storage_with_slot_types`.
-    pub fn get_resume_storage_with_slot_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<(std::sync::Arc<crate::resume::ResumeStorage>, Vec<Type>)> {
-        self.meta
-            .get_resume_storage_with_slot_types(green_key, trace_id, fail_index)
-    }
-
-    /// Descr-first form of [`Self::get_resume_storage_with_slot_types`]
-    /// (`ResumeGuardDescr.get_resumestorage`): a bridge guard has no
-    /// frontend record, so the storage is read off the descr itself.
-    pub fn get_resume_storage_with_slot_types_for_descr(
-        &self,
-        descr: &dyn majit_ir::FailDescr,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<(std::sync::Arc<crate::resume::ResumeStorage>, Vec<Type>)> {
-        self.meta
-            .get_resume_storage_with_slot_types_for_descr(descr, green_key, trace_id, fail_index)
-    }
-
-    pub fn get_exit_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<Type>> {
-        self.meta.get_exit_types(green_key, trace_id, fail_index)
-    }
-
-    /// compile.py recovery_layout header_pc parity: get the merge point
-    /// PC for blackhole resume from a guard exit.
-    pub fn get_merge_point_pc(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<u64> {
-        self.meta
-            .get_merge_point_pc(green_key, trace_id, fail_index)
-    }
-
     /// Attach a GC allocator to the active backend.
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
         self.meta.backend_mut().set_gc_allocator(gc);
@@ -6093,19 +6023,10 @@ impl<S: JitState> JitDriver<S> {
         let Some(descr_fd) = descr_arc.as_fail_descr() else {
             return false;
         };
-        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
-            return false;
-        };
-        self.meta
-            .get_compiled_exit_layout_in_trace(
-                jct.green_key(),
-                descr_fd.trace_id(),
-                descr_fd.fail_index_per_trace(),
-            )
-            .and_then(|layout| layout.storage)
-            .is_some_and(|storage| {
-                !storage.rd_pendingfields().is_empty() && storage.rd_virtuals().len() > 1
-            })
+        // `ResumeGuardDescr.get_resumestorage()`: the payload is the descr's.
+        crate::resume::ResumeStorage::from_fail_descr(descr_fd).is_some_and(|storage| {
+            !storage.rd_pendingfields().is_empty() && storage.rd_virtuals().len() > 1
+        })
     }
 
     /// `compile.py handle_fail`'s bridging arm.
@@ -7617,7 +7538,7 @@ impl<S: JitState> JitDriver<S> {
             eprintln!(
                 "@@@FAILVALS fail_index={} resume_pc={} raw_values={:?}",
                 fail_index,
-                self.get_merge_point_pc(green_key, trace_id, fail_index)
+                crate::compile::guard_resume_pc(fd)
                     .map(|p| p as i64)
                     .unwrap_or(-1),
                 raw_values
@@ -8210,17 +8131,16 @@ impl<S: JitState> JitDriver<S> {
         // which resumes at the loop entry against state the recovery has
         // already rewound. The failing guard's own layout carries the same
         // header pc, so reading it first also answers without a lookup.
-        // A bridge guard carries no frontend recovery layout
-        // (`compile.py send_bridge_to_backend`); the backend stamped
-        // its trace's header pc on the descr (`CompiledTraceInfo`), so
-        // that is read next.
+        // The backend may have stamped its trace's header pc on the
+        // descr (`CompiledTraceInfo`); otherwise the pc is the one the
+        // guard's own `rd_numb` encodes for its outermost frame.
         let guard_resume_pc = fd
             .trace_info_any()
             .and_then(|info| {
                 info.downcast_ref::<majit_backend::CompiledTraceInfo>()
                     .map(|info| info.header_pc)
             })
-            .or_else(|| self.get_merge_point_pc(owning_key, trace_id, fail_index))
+            .or_else(|| crate::compile::guard_resume_pc(fd))
             .map(|pc| pc as usize)
             .unwrap_or(target_pc);
         state.recover_after_compiled_run();

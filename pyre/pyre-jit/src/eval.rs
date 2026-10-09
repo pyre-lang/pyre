@@ -12077,24 +12077,17 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // resume frame, so it reconstructs the full inline framestack.
     // exit_layout already carries (rd_loop_token, trace_id, fail_index,
     // storage), mirroring the CALL_ASSEMBLER caller
-    // `jit_blackhole_resume_from_guard` (call_jit.rs) without the
-    // green_key recovery that path needs.
+    // `jit_blackhole_resume_from_guard` (call_jit.rs).
     if let Some(storage) = exit_layout.storage.as_deref() {
         // The failing guard's own `exit_types`, not a re-lookup of them:
-        // `get_recovery_slot_types` is `exit_types.to_vec()` off a
-        // `(green_key, trace_id, fail_index)` re-resolution of *this*
-        // layout, and that resolution starts at `compiled_loops.get(&
-        // green_key)`, which `handle_fail` may have just emptied
-        // (`remove_compiled_loop` on the range-FOR_ITER demotion) before
-        // returning `ResumeInBlackhole`.  A miss produced `None`, which
-        // disarms both `ResumeDeadframeRoots::register` and the Ref/Int
-        // discrimination in `decode_ref` — an unrooted, mistyped raw word
-        // reaching the resume as a GCREF.  Upstream never retires metadata a
-        // pending resume is about to read: `compile.py handle_fail`
-        // and `resume.py blackhole_from_resumedata` read every slot's
-        // kind out of the self-describing deadframe+descr it was handed.
-        // The sibling resume paths already pass this slice directly
-        // (`jitdriver.rs`).
+        // `compile.py handle_fail` and `resume.py blackhole_from_resumedata`
+        // read every slot's kind out of the self-describing deadframe+descr
+        // they were handed, so no metadata a pending resume is about to
+        // read can be retired under it (`remove_compiled_loop` on the
+        // range-FOR_ITER demotion runs before `ResumeInBlackhole` returns).
+        // A missing slice would disarm both `ResumeDeadframeRoots::register`
+        // and the Ref/Int discrimination in `decode_ref` — an unrooted,
+        // mistyped raw word reaching the resume as a GCREF.
         let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
         let _savedata_root = unsafe {
             majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| {

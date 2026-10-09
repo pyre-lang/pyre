@@ -223,6 +223,41 @@ pub struct CompiledExitLayout {
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
 }
 
+/// `compile.py AbstractResumeGuardDescr.handle_fail`: the failing exit is
+/// described by the descr the deadframe named and by nothing else —
+/// `ResumeGuardDescr.get_resumestorage()` for the `rd_*` payload,
+/// `fail_arg_types` for the slot types, `rd_loop_token` for the owning
+/// loop. No frontend record is consulted: `send_bridge_to_backend` keeps
+/// none for a bridge, and a loop's guard answers the same way.
+///
+/// `storage` is `None` for a descr with no resume payload (the
+/// `_DoneWithThisFrameDescr` family and `ExitFrameWithExceptionDescrRef`).
+pub fn exit_layout_for_descr(descr: &dyn majit_ir::FailDescr) -> CompiledExitLayout {
+    CompiledExitLayout {
+        rd_loop_token: majit_backend::descr_owning_green_key(descr).unwrap_or(0),
+        trace_id: descr.trace_id(),
+        fail_index: descr.fail_index_per_trace(),
+        source_op_index: descr.source_op_index(),
+        exit_types: ExitTypes::from_slice(descr.fail_arg_types()),
+        is_finish: descr.is_finish(),
+        is_exception_exit: descr.is_exit_frame_with_exception(),
+        recovery_layout: None,
+        resume_layout: None,
+        storage: crate::resume::ResumeStorage::from_fail_descr(descr).map(Arc::new),
+    }
+}
+
+/// The pc the outermost frame of `descr`'s resume data resumes at.
+/// `resume.py ResumeDataVirtualAdder.number` writes each frame as
+/// `jitcode_index, pc, values...` after the vable and vref sections, and
+/// `rebuild_from_resumedata` / `blackhole_from_resumedata` set every
+/// rebuilt frame at its pc. `None` for a descr with no resume payload or
+/// no frame section.
+pub fn guard_resume_pc(descr: &dyn majit_ir::FailDescr) -> Option<u64> {
+    let rd_numb = descr.rd_numb_arc()?;
+    crate::resume::outermost_frame_pc(rd_numb.as_ref()).map(|pc| pc as u64)
+}
+
 impl CompiledExitLayout {
     /// Whether the collector traces exit slot `slot`.
     ///

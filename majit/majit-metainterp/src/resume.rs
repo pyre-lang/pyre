@@ -785,6 +785,32 @@ pub fn exit_source_from_tagged(
     }
 }
 
+/// The `pc` of the first frame section of `rd_numb`, the frame
+/// `rebuild_from_resumedata` builds first. The numbering is laid out as
+/// `resume.py ResumeDataVirtualAdder.number` writes it and
+/// `rebuild_from_numbering` reads it: `total_size, num_failargs, vable_len,
+/// vable..., vref_len, vref pairs..., (jitcode_index, pc, values...)...`.
+pub fn outermost_frame_pc(rd_numb: &[u8]) -> Option<i32> {
+    let mut reader = crate::resumecode::Reader::new(rd_numb);
+    if !reader.has_more() {
+        return None;
+    }
+    let total_size = reader.next_item();
+    let _num_failargs = reader.next_item();
+    let vable_len = reader.next_item();
+    reader.jump(vable_len.max(0) as usize);
+    let vref_len = reader.next_item();
+    reader.jump((vref_len.max(0) * 2) as usize);
+    if reader.items_read >= total_size as usize || !reader.has_more() {
+        return None;
+    }
+    let _jitcode_index = reader.next_item();
+    if !reader.has_more() {
+        return None;
+    }
+    Some(reader.next_item())
+}
+
 // Pyre is single-threaded; UnsafeCell prevents auto-Send/Sync so
 // provide them explicitly (matches RPython's non-thread-safe
 // ResumeGuardDescr).
