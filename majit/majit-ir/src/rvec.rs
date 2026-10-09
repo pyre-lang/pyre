@@ -154,6 +154,7 @@ pub fn vec_item_spelling(ty: &str) -> Option<&str> {
     }
     let rest = ty
         .strip_prefix("alloc::vec::Vec<")
+        .or_else(|| ty.strip_prefix("vec::Vec<"))
         .or_else(|| ty.strip_prefix("Vec<"))?;
     let rest = rest.strip_suffix('>')?;
     // `Vec<T, A = Global>`: the allocator is a second type argument.
@@ -721,6 +722,11 @@ mod tests {
         assert_eq!(
             rust_vec_item_kind_for_spelling("alloc::vec::Vec<usize>", 4),
             Some(VecItemKind::Int)
+        );
+        assert_eq!(vec_item_spelling("vec::Vec<usize>"), Some("usize"));
+        assert_eq!(
+            vec_item_spelling("Vec<module::marshal::Rooted>"),
+            Some("module::marshal::Rooted")
         );
         assert_eq!(rust_vec_item_kind_for_spelling("Vec<String>", 8), None);
         assert_eq!(rust_vec_item_kind_for_spelling("[usize]", 8), None);

@@ -2094,8 +2094,14 @@ enum StorePass {
     ReplaceForceVirtualizable,
 }
 
-/// `(trait_root, method_name) -> impl owner roots`.
-type TraitMethodImpls = HashMap<(String, String), Vec<String>>;
+/// `(trait_root, method_name) -> family member CallPaths`.
+///
+/// Concrete trait-impls are stored under [`CallPath::for_trait_impl_method`]
+/// (`<Impl#{id}>`) so a `dyn Trait` family lists that graph even when
+/// owner-leaf names an inherent of the same leaf. Tests that register
+/// via [`CallControl::register_trait_family_member`] keep the owner-leaf
+/// spelling.
+type TraitMethodImpls = HashMap<(String, String), Vec<CallPath>>;
 
 impl GraphSlot {
     fn built(graph: std::rc::Rc<FunctionGraph>) -> Self {
@@ -3327,7 +3333,8 @@ pub struct CallControl {
     /// the graph itself (`graph.func`); see [`Self::func_effects`].
     external_funcobjs: HashMap<CallPath, crate::model::FuncEffects>,
 
-    /// Trait bindings: `(trait_root, method_name)` → `Vec<impl_type>`.
+    /// Trait bindings: `(trait_root, method_name)` → family member
+    /// [`CallPath`]s.
     ///
     /// Keyed by the *declaring trait* (impl's `TraitImplInfo::trait_name`),
     /// so two traits exposing the same method name do
@@ -3335,7 +3342,10 @@ pub struct CallControl {
     /// `op.args[-1].value` = exact candidate graph list, not a
     /// method-name global).  Inherent impls do not populate this map;
     /// they use `function_graphs` directly via `[impl_type, method_name]`.
-    trait_method_impls: HashMap<(String, String), Vec<String>>,
+    /// Concrete trait-impls are stored under
+    /// [`CallPath::for_trait_impl_method`] so owner-leaf can name an
+    /// inherent of the same leaf without stealing the `dyn Trait` family.
+    trait_method_impls: HashMap<(String, String), Vec<CallPath>>,
 
     /// O(1) index over `trait_method_impls` keyed by method name alone:
     /// `method_name → [impl_type, …]` across every declaring trait.
@@ -3820,7 +3830,7 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Box<")
         || type_name.starts_with("Arc<")
         || type_name.starts_with("Rc<")
-        || type_name.starts_with("Vec<")
+        || crate::vec_layout::field_layout_is_inline_vec(type_name)
         || type_name.starts_with("Option<")
         || type_name == "String"
         || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
@@ -4512,6 +4522,17 @@ impl CallControl {
     pub fn struct_layout_for(&self, name: &str) -> Option<std::rc::Rc<StructLayout>> {
         let sid = majit_ir::descr::struct_id_for_name(name)?;
         self.layout_of(sid, name)
+    }
+
+    /// The layout stored under `sid`. No template fallback and no
+    /// positional synthesis: a missing instance is missing, matching
+    /// `descr.py` `get_field_descr(STRUCT, fieldname)` keyed on that
+    /// STRUCT object.
+    pub fn struct_layout_for_id(
+        &self,
+        sid: majit_ir::descr::StructId,
+    ) -> Option<std::rc::Rc<StructLayout>> {
+        self.struct_layouts.borrow().get(&sid).cloned()
     }
 
     /// The layout stored under `sid`, whose spelling is `name`. A
@@ -5250,7 +5271,12 @@ impl CallControl {
             })
         };
         let concrete_offset = owner_id.and_then(offset_of);
-        let template_offset = if concrete_offset.is_none() {
+        // `get_field_descr(STRUCT, fieldname)` does not reuse another
+        // STRUCT's token. A distinct `owner_id` is its own STRUCT; the
+        // template spelling's offset is that other type.
+        let template_offset = if concrete_offset.is_none()
+            && owner_id.is_none_or(|id| registry_struct_id == Some(id))
+        {
             registry_struct_id.and_then(offset_of)
         } else {
             None
@@ -5932,12 +5958,8 @@ impl CallControl {
                 };
                 let family = trait_method_impls
                     .get(&(trait_root.clone(), method_name.clone()))
-                    .into_iter()
-                    .flatten()
-                    .map(|impl_type| {
-                        CallPath::for_impl_method(impl_type.as_str(), method_name.as_str())
-                    })
-                    .collect::<Vec<_>>();
+                    .cloned()
+                    .unwrap_or_default();
                 if !family.is_empty() {
                     *graphs = Some(family);
                 }
@@ -6245,29 +6267,122 @@ impl CallControl {
         }
     }
 
+    /// Register an inherent method under the owner-leaf CallPath.
+    ///
+    /// rustc's method-call rule (Reference, "Method-call expressions"):
+    /// `Type::method(..)` / `value.method()` picks the inherent method
+    /// before any trait method of the same name. Owner-leaf therefore
+    /// binds the inherent graph; a trait-impl that occupied the slot is
+    /// replaced. Upstream `codewriter/call.py CallControl.get_jitcode(graph)`
+    /// keys by the graph object; the CallPath must be injective over the
+    /// graphs a direct call can name.
+    pub fn register_inherent_method(
+        &mut self,
+        impl_type: &str,
+        method_name: &str,
+        graph: impl Into<GraphSource>,
+    ) {
+        self.register_function_graph(CallPath::for_impl_method(impl_type, method_name), graph);
+    }
+
+    /// Register a concrete trait-impl method under its trait-impl identity
+    /// (`CallPath::for_trait_impl_method`, `<Impl#{id}>`).
+    ///
+    /// When `fill_owner_leaf` is set, owner-leaf is filled only if vacant:
+    /// an inherent of this leaf on this owner already occupies it. The
+    /// `dyn Trait` PBC family lists the identity path, never the inherent
+    /// that may sit at owner-leaf. Primitive `Self` (no ADT owner) leaves
+    /// owner-leaf unset so two widths do not collapse onto one path.
+    pub fn register_trait_impl_method(
+        &mut self,
+        impl_type: &str,
+        impl_id: u64,
+        method_name: &str,
+        trait_root: Option<&str>,
+        fill_owner_leaf: bool,
+        graph: impl Into<GraphSource>,
+    ) {
+        let graph = graph.into();
+        let identity = CallPath::for_trait_impl_method(impl_type, impl_id, method_name);
+        self.register_function_graph(identity.clone(), graph.clone());
+        if let Some(trait_root) = trait_root {
+            self.register_trait_family_member_path(method_name, trait_root, identity);
+        }
+        if fill_owner_leaf {
+            let owner_leaf = CallPath::for_impl_method(impl_type, method_name);
+            if !self.function_graphs.names_funcobj(&owner_leaf) {
+                self.register_function_graph(owner_leaf, graph);
+            }
+        }
+    }
+
     /// Add one concrete graph to the PBC row for an indirect trait call,
     /// without also making it a name-based concrete-method candidate.
     ///
     /// RPython keeps these two relations separate: `FunctionReprBase.call`
     /// obtains `c_graphs` from `row_of_graphs.values()`, while concrete
-    /// method lookup follows the receiver's class/MRO.  Pyre's concrete
-    /// trait-impl methods are registered through the inherent-method path to
-    /// preserve that receiver lookup, but they still belong to the PBC row
-    /// used by a `dyn Trait` vtable call.  Required trait methods have no
-    /// default graph, so omitting this membership makes their otherwise
-    /// closed family look unknown to every graph analyzer.
+    /// method lookup follows the receiver's class/MRO.  Required trait
+    /// methods have no default graph, so omitting this membership makes
+    /// their otherwise closed family look unknown to every graph analyzer.
     pub fn register_trait_family_member(
         &mut self,
         method_name: &str,
         trait_root: &str,
         impl_type: &str,
     ) {
+        self.register_trait_family_member_path(
+            method_name,
+            trait_root,
+            CallPath::for_impl_method(impl_type, method_name),
+        );
+    }
+
+    /// Record `path` as a member of the `(trait_root, method_name)` PBC
+    /// family. Concrete trait-impls pass [`CallPath::for_trait_impl_method`]
+    /// so the family lists Fun 18817 and never the inherent that may occupy
+    /// owner-leaf (`SharedOpcodeHandler::peek_at`).
+    pub fn register_trait_family_member_path(
+        &mut self,
+        method_name: &str,
+        trait_root: &str,
+        path: CallPath,
+    ) {
         let members = self
             .trait_method_impls
             .entry((trait_root.to_string(), method_name.to_string()))
             .or_default();
-        if !members.iter().any(|member| member == impl_type) {
-            members.push(impl_type.to_string());
+        if !members.iter().any(|member| member == &path) {
+            members.push(path);
+        }
+    }
+
+    /// After inherent owner-leaf registration, collapse a trait-impl family
+    /// member onto owner-leaf when that slot still names the same graph.
+    ///
+    /// Vacant owner-leaf (no inherent) is the trait-impl itself; ICT
+    /// matching keys rustc vtable slots by the owner-leaf spelling
+    /// (`IntDictStrategy::length`). A collision keeps the `<Impl#{id}>`
+    /// identity so the family lists the trait-impl graph, never the
+    /// inherent.
+    pub fn prefer_owner_leaf_aliases_in_trait_families(&mut self) {
+        let mut rewrites: Vec<((String, String), usize, CallPath)> = Vec::new();
+        for (key, members) in &self.trait_method_impls {
+            for (index, path) in members.iter().enumerate() {
+                let Some(owner_leaf) = owner_leaf_of_trait_impl_path(path) else {
+                    continue;
+                };
+                let identity_key = self.function_graphs.key_for(path);
+                if identity_key.is_some()
+                    && identity_key == self.function_graphs.key_for(&owner_leaf)
+                {
+                    rewrites.push((key.clone(), index, owner_leaf));
+                }
+            }
+        }
+        for (key, index, owner_leaf) in rewrites {
+            if let Some(members) = self.trait_method_impls.get_mut(&key) {
+                members[index] = owner_leaf;
+            }
         }
     }
 
@@ -6940,6 +7055,10 @@ impl CallControl {
     /// and the recursive effect analyzers inspect the registered source graph
     /// first and would read `graphs: None` as an unknown family/top result.
     fn materialize_deferred_indirect_families(&mut self) {
+        // Collapse vacant `<Impl#{id}>` family members onto owner-leaf
+        // before the pass clones the map. Collision families keep the
+        // identity path (`prefer_owner_leaf_aliases_in_trait_families`).
+        self.prefer_owner_leaf_aliases_in_trait_families();
         let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
         self.function_graphs
             .run_pass(StorePass::MaterializeIndirectFamilies(trait_method_impls));
@@ -8419,6 +8538,24 @@ impl CallControl {
     }
 }
 
+/// Owner-leaf spelling of a [`CallPath::for_trait_impl_method`] path:
+/// drop the `<Impl#{id}>` segment. `None` when the path is not that shape.
+fn owner_leaf_of_trait_impl_path(path: &CallPath) -> Option<CallPath> {
+    let segments = &path.segments;
+    if segments.len() < 2 {
+        return None;
+    }
+    let impl_seg = segments[segments.len() - 2].as_str();
+    if !impl_seg.starts_with("<Impl#") || !impl_seg.ends_with('>') {
+        return None;
+    }
+    let mut owner_leaf = segments[..segments.len() - 2].to_vec();
+    owner_leaf.push(segments[segments.len() - 1].clone());
+    Some(CallPath {
+        segments: owner_leaf,
+    })
+}
+
 /// `CallPath`s of the impls `trait_method_impls` records for
 /// `(trait_root, method_name)`.
 fn impls_for_indirect(
@@ -8428,10 +8565,8 @@ fn impls_for_indirect(
 ) -> Vec<CallPath> {
     trait_method_impls
         .get(&(trait_root.to_string(), method_name.to_string()))
-        .into_iter()
-        .flatten()
-        .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name))
-        .collect()
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The result type every registered member of an indirect-call family
@@ -8487,10 +8622,8 @@ fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: 
         };
         let family = trait_method_impls
             .get(&(trait_root.clone(), method_name.clone()))
-            .into_iter()
-            .flatten()
-            .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name.as_str()))
-            .collect::<Vec<_>>();
+            .cloned()
+            .unwrap_or_default();
         *graphs = (!family.is_empty()).then_some(family);
     }
 }
@@ -13180,7 +13313,7 @@ pub(crate) fn get_type_flag(
         // `{cap, ptr, len}`. The field is the three-word value, so
         // `&mut vec_field` is the address of that value. A one-word
         // pointer load reads `cap`.
-        s if s.starts_with("Vec<") => (
+        s if crate::vec_layout::field_layout_is_inline_vec(s) => (
             ArrayFlag::Struct,
             majit_ir::value::Type::Ref,
             3 * crate::layout::target_word_size(),
@@ -23622,6 +23755,153 @@ mod tests {
             cc.target_to_path(&bare),
             None,
             "a name leaf must not pick either impl"
+        );
+    }
+
+    /// One type with an inherent `bits` that calls an inner type's inherent
+    /// `bits`, and a trait impl `bits` whose body is `Self::bits(self)`.
+    /// rustc picks the inherent at owner-leaf; the trait-impl stays on
+    /// `for_trait_impl_method`. Both registration orders must agree.
+    fn bits_collision_graphs() -> (FunctionGraph, FunctionGraph, FunctionGraph) {
+        let inner_path = CallPath::for_impl_method("InnerFlags", "bits");
+        let inherent_path = CallPath::for_impl_method("OwnerFlags", "bits");
+        let inner = FunctionGraph::new("bits")
+            .with_owner_root("InnerFlags")
+            .with_source_identity("InnerFlags::bits");
+        let inherent_call =
+            CallTarget::method("bits", Some("InnerFlags".into())).with_resolved_path(inner_path);
+        let inherent = graph_calling("bits", inherent_call)
+            .with_owner_root("OwnerFlags")
+            .with_source_identity("OwnerFlags::bits");
+        let trait_call =
+            CallTarget::method("bits", Some("OwnerFlags".into())).with_resolved_path(inherent_path);
+        let trait_impl = graph_calling("bits", trait_call)
+            .with_owner_root("OwnerFlags")
+            .with_source_identity("OwnerFlags::<impl Flags>::bits");
+        (inner, inherent, trait_impl)
+    }
+
+    fn assert_bits_collision_bindings(cc: &mut CallControl) {
+        // The production post-pass must not steal a collision family
+        // onto the inherent owner-leaf.
+        cc.prefer_owner_leaf_aliases_in_trait_families();
+        let inner_path = CallPath::for_impl_method("InnerFlags", "bits");
+        let inherent_path = CallPath::for_impl_method("OwnerFlags", "bits");
+        let trait_path = CallPath::for_trait_impl_method("OwnerFlags", 18817, "bits");
+        assert_ne!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs.key_for(&trait_path),
+            "owner-leaf and trait-impl identity name distinct graphs"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs
+                .get(&inherent_path)
+                .map(|g| g.graph_key()),
+        );
+        let inherent_graph = cc
+            .function_graphs
+            .get(&inherent_path)
+            .expect("inherent owner-leaf");
+        assert_eq!(
+            inherent_graph.source_identity.as_deref(),
+            Some("OwnerFlags::bits"),
+            "owner-leaf must bind the inherent method"
+        );
+        let trait_graph = cc
+            .function_graphs
+            .get(&trait_path)
+            .expect("trait-impl identity");
+        assert_eq!(
+            trait_graph.source_identity.as_deref(),
+            Some("OwnerFlags::<impl Flags>::bits"),
+        );
+        let family = cc.all_impls_for_indirect("Flags", "bits");
+        assert_eq!(
+            family,
+            vec![trait_path.clone()],
+            "dyn Trait family lists the trait-impl identity, never the inherent"
+        );
+        let call_target =
+            |graph: &FunctionGraph| match &graph.block(graph.startblock).operations[0].kind {
+                OpKind::Call { target, .. } => target.clone(),
+                other => panic!("expected a Call, got {other:?}"),
+            };
+        assert_eq!(
+            cc.target_to_path(&call_target(&inherent_graph)),
+            Some(inner_path.clone()),
+            "inherent bits targets the inner type's bits"
+        );
+        assert_eq!(
+            cc.target_to_path(&call_target(&trait_graph)),
+            Some(inherent_path.clone()),
+            "trait-impl body Self::bits targets the inherent, not itself"
+        );
+        let jc_inner = cc.get_jitcode(&inner_path);
+        let jc_inherent = cc.get_jitcode(&inherent_path);
+        let jc_trait = cc.get_jitcode(&trait_path);
+        assert!(
+            !std::sync::Arc::ptr_eq(&jc_inner, &jc_inherent)
+                && !std::sync::Arc::ptr_eq(&jc_inherent, &jc_trait)
+                && !std::sync::Arc::ptr_eq(&jc_inner, &jc_trait),
+            "each of the three graphs gets its own jitcode"
+        );
+    }
+
+    #[test]
+    fn inherent_bits_wins_owner_leaf_when_trait_impl_registers_first() {
+        let mut cc = CallControl::new();
+        let (inner, inherent, trait_impl) = bits_collision_graphs();
+        cc.register_trait_impl_method("OwnerFlags", 18817, "bits", Some("Flags"), true, trait_impl);
+        cc.register_inherent_method("OwnerFlags", "bits", inherent);
+        cc.register_inherent_method("InnerFlags", "bits", inner);
+        assert_bits_collision_bindings(&mut cc);
+    }
+
+    #[test]
+    fn inherent_bits_wins_owner_leaf_when_inherent_registers_first() {
+        let mut cc = CallControl::new();
+        let (inner, inherent, trait_impl) = bits_collision_graphs();
+        cc.register_inherent_method("InnerFlags", "bits", inner);
+        cc.register_inherent_method("OwnerFlags", "bits", inherent);
+        cc.register_trait_impl_method("OwnerFlags", 18817, "bits", Some("Flags"), true, trait_impl);
+        assert_bits_collision_bindings(&mut cc);
+    }
+
+    /// Vacant owner-leaf (no inherent of this leaf) is the trait-impl
+    /// itself. ICT matching keys rustc vtable slots by that spelling
+    /// (`IntDictStrategy::length`), so the family rewrites off `<Impl#{id}>`.
+    #[test]
+    fn vacant_trait_impl_family_rewrites_to_owner_leaf() {
+        let mut cc = CallControl::new();
+        let identity = CallPath::for_trait_impl_method("IntDictStrategy", 42, "length");
+        let owner_leaf = CallPath::for_impl_method("IntDictStrategy", "length");
+        let graph = FunctionGraph::new("length")
+            .with_owner_root("IntDictStrategy")
+            .with_source_identity("IntDictStrategy::<impl DictStrategy>::length");
+        cc.register_trait_impl_method(
+            "IntDictStrategy",
+            42,
+            "length",
+            Some("DictStrategy"),
+            true,
+            graph,
+        );
+        assert_eq!(
+            cc.all_impls_for_indirect("DictStrategy", "length"),
+            vec![identity.clone()],
+            "family starts on the trait-impl identity"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&identity),
+            cc.function_graphs.key_for(&owner_leaf),
+            "vacant owner-leaf aliases the trait-impl graph"
+        );
+        cc.prefer_owner_leaf_aliases_in_trait_families();
+        assert_eq!(
+            cc.all_impls_for_indirect("DictStrategy", "length"),
+            vec![owner_leaf],
+            "ICT vtable matching reads the owner-leaf spelling"
         );
     }
 

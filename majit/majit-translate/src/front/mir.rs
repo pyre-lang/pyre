@@ -710,11 +710,12 @@ fn concrete_adt_struct_id(
     template: majit_ir::descr::StructId,
     adt: Option<&serde_json::Map<String, serde_json::Value>>,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> majit_ir::descr::StructId {
     let Some(adt) = adt else {
         return template;
     };
-    let args = render_adt_type_args(adt, llbc, 0);
+    let args = render_adt_type_args(adt, llbc, 0, tombstoned);
     if args.is_empty() {
         template
     } else {
@@ -731,14 +732,15 @@ fn ref_enum_instantiation_of_adt(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<RefEnumInst> {
-    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    let suffix = adt_head_instantiation_suffix(adt, llbc, tombstoned)?;
     let def_id = type_decl_ref_adt_id(adt)?;
     let name_path = llbc.type_by_id(def_id)?.item_meta.name_path();
     // Payload rows, not the `<…>` class suffix. The suffix stays the
     // rendered argument (`PyError`); a handle's row is `*mut` of its
     // `Deref::Target` class so the payload attr and the cast agree.
-    let args = render_adt_payload_type_args(adt, llbc, 0, gc_struct_ids);
+    let args = render_adt_payload_type_args(adt, llbc, 0, gc_struct_ids, tombstoned);
     Some(RefEnumInst {
         def_id,
         name_path,
@@ -772,6 +774,7 @@ fn collect_ref_enum_instantiations(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<RefEnumInst> {
     let mut found: std::collections::HashSet<RefEnumInst> = std::collections::HashSet::new();
     let filtered = module_filter.is_some() || function_filter.is_some();
@@ -808,7 +811,8 @@ fn collect_ref_enum_instantiations(
                     .and_then(serde_json::Value::as_array)
                     .and_then(|adt| adt.first())
                     .and_then(serde_json::Value::as_object)
-                    && let Some(pair) = ref_enum_instantiation_of_adt(head, llbc, gc_struct_ids)
+                    && let Some(pair) =
+                        ref_enum_instantiation_of_adt(head, llbc, gc_struct_ids, tombstoned)
                 {
                     found.insert(pair);
                 }
@@ -817,7 +821,8 @@ fn collect_ref_enum_instantiations(
                 // instantiated ADT, the same source constructors and
                 // field reads use for the ClassDef key.
                 if let Some(adt) = tyref_adt_map(&place.ty, llbc)
-                    && let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids)
+                    && let Some(pair) =
+                        ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids, tombstoned)
                 {
                     found.insert(pair);
                 }
@@ -832,7 +837,8 @@ fn collect_ref_enum_instantiations(
             else {
                 continue;
             };
-            if let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids) {
+            if let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids, tombstoned)
+            {
                 found.insert(pair);
             }
         }
@@ -1053,6 +1059,7 @@ struct EntryInstantiationScan<'a> {
     gc_entries_id: Option<u64>,
     seen_dedup: std::collections::HashSet<u64>,
     seen_suffix: std::collections::HashSet<String>,
+    tombstoned: &'a std::collections::HashSet<String>,
     found: Vec<Vec<String>>,
 }
 
@@ -1088,7 +1095,7 @@ impl EntryInstantiationScan<'_> {
                 if let Some(id) = type_decl_ref_adt_id(adt)
                     && (id == self.entry_id || self.gc_entries_id == Some(id))
                 {
-                    let args = render_adt_type_args(adt, self.llbc, depth);
+                    let args = render_adt_type_args(adt, self.llbc, depth, self.tombstoned);
                     if !args.is_empty()
                         && args
                             .iter()
@@ -1151,6 +1158,7 @@ fn register_ordereddict_i64_entry_rows(
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    tombstoned: &std::collections::HashSet<String>,
 ) {
     let mut entry: Option<(u64, String)> = None;
     let mut gc_entries_id = None;
@@ -1174,6 +1182,7 @@ fn register_ordereddict_i64_entry_rows(
         gc_entries_id,
         seen_dedup: std::collections::HashSet::new(),
         seen_suffix: std::collections::HashSet::new(),
+        tombstoned,
         found: Vec::new(),
     };
     for fd in llbc.iter_local_fns() {
@@ -1688,8 +1697,13 @@ impl CrateLoweringState {
         // per-instantiation roots) and numbers the variant subclasses before
         // `assign_inheritance_ids`, so the split classes drain rather than
         // landing unnumbered (per-graph Skip).
-        let ref_enum_insts =
-            collect_ref_enum_instantiations(llbc, gc_struct_ids, module_filter, function_filter);
+        let ref_enum_insts = collect_ref_enum_instantiations(
+            llbc,
+            gc_struct_ids,
+            module_filter,
+            function_filter,
+            &tombstoned_leaves,
+        );
         for inst in &ref_enum_insts {
             let leaf = inst
                 .name_path
@@ -1730,6 +1744,7 @@ impl CrateLoweringState {
             &mut known_struct_names,
             &mut struct_fields,
             gc_struct_ids,
+            &tombstoned_leaves,
         );
 
         // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
@@ -1742,6 +1757,23 @@ impl CrateLoweringState {
         // collide only across input LLBCs are absent from this file; the
         // caller computed that verdict before lowering.
         tombstoned_leaves.extend(cross_tombstoned_leaves.iter().cloned());
+        // FieldRead keys the instantiated STRUCT with this same set
+        // (`resolve_adt_field` → `concrete_adt_struct_id`). Derive ran
+        // with an empty set so a single-crate test still sees the
+        // unsuffixed hasher; re-register so a withdrawn `RandomState` /
+        // `PyObjectRef` leaf paints the identity FieldRead actually uses.
+        register_alias_instantiation_layouts(
+            llbc,
+            &std::env::var("TARGET").unwrap_or_default(),
+            &mut struct_fields,
+            &mut struct_ids,
+            &mut exact_layouts,
+            &tombstoned_leaves,
+            gc_struct_ids,
+            &mut struct_origins,
+            &mut struct_field_attrs,
+            &mut known_struct_names,
+        );
 
         // ── Pass 2: lower every function body and build SemanticFunctions ─
         // `@jit.dont_look_inside` (`rlib/jit.py`) callees declare a
@@ -3237,7 +3269,7 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
         && !ty.starts_with("Box<")
         && !ty.starts_with("Arc<")
         && !ty.starts_with("Rc<")
-        && !ty.starts_with("Vec<")
+        && !crate::vec_layout::field_layout_is_inline_vec(ty)
         && !ty.starts_with("Option<")
         && ty != "String"
     {
@@ -3440,6 +3472,267 @@ fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
 /// to `None` (ambiguous) if the same name already mapped to a different
 /// identity — i.e. two distinct type definitions share that spelling
 /// (only possible for a bare leaf across modules).
+/// Charon's resolved field offsets for one struct body. Field index `i`
+/// matches the declaration order Charon offsets by. Used for both the
+/// defining TypeDecl and a type-alias whose layout is one concrete
+/// monomorphization of that body (`descr.py` `get_field_descr(STRUCT, fieldname)`).
+fn exact_layout_from_charon(
+    fields: &[majit_charon_reader::ullbc::FieldDecl],
+    layout: &majit_charon_reader::ullbc::TypeLayout,
+    llbc: &Llbc,
+) -> crate::front::semantic::ExactLayout {
+    let mut field_offsets = std::collections::HashMap::new();
+    for (i, f) in fields.iter().enumerate() {
+        let fname = f
+            .name
+            .clone()
+            .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
+        let Some(off) = layout.struct_field_offset(i) else {
+            continue;
+        };
+        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+            let words = crate::vec_layout::slice_probe();
+            field_offsets.insert(pair_len_field_name(&fname), off + words.len_offset as u64);
+            field_offsets.insert(fname, off + words.ptr_offset as u64);
+        } else {
+            field_offsets.insert(fname, off);
+        }
+    }
+    crate::front::semantic::ExactLayout {
+        size: layout.size,
+        align: layout.align,
+        field_offsets,
+        host: Some(crate::front::host_layout::host_layout_from_type(layout)),
+    }
+}
+
+/// The `Adt` node a type-alias body names, after hash-cons / nested-alias peels.
+fn alias_target_adt<'a>(
+    body: &'a serde_json::Value,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let ty = body.get("aliased_ty").unwrap_or(body);
+    type_node_peel_aliases(ty, llbc)?
+        .as_object()?
+        .get("Adt")?
+        .as_object()
+}
+
+/// A type alias to a generic struct is rustc's layout of one monomorphization.
+/// Register that layout under the instantiated STRUCT identity so
+/// `get_field_descr(STRUCT, fieldname)` does not reuse another instance's
+/// offsets. The alias TypeDecl is not itself a Struct.
+///
+/// Field rows belong to this instance: the template FieldDecl names with
+/// the alias type arguments substituted (`substitute_field_type`). The
+/// template STRUCT's registry rows stay on the template.
+///
+/// `tombstoned` must be the same set FieldRead uses
+/// (`CrateLoweringState.tombstoned_leaves`): `render_adt_type_args`
+/// paints a withdrawn leaf as a qualified path, and that spelling is
+/// part of the STRUCT identity (`concrete_adt_struct_id`). The template
+/// identity is `decl_path_for_tombstone` of the aliased struct, matching
+/// `tyref_adt_layout_id`.
+///
+/// Alias name / canonical / leaf are extra keys of this same sid
+/// (`descr.py` has no alias identity). `struct_origins`,
+/// `struct_field_attrs`, `known_struct_names`, and the leaf-collision
+/// guard stay attached to it.
+fn register_alias_instantiation_layouts(
+    llbc: &Llbc,
+    target: &str,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    struct_origins: &mut std::collections::HashMap<String, String>,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    known_struct_names: &mut std::collections::HashSet<String>,
+) {
+    for td in llbc.iter_type_decls() {
+        let TypeDeclKind::Alias(body) = &td.kind else {
+            continue;
+        };
+        let Some(fields) = type_decl_struct_fields(td, llbc) else {
+            continue;
+        };
+        if fields.is_empty() {
+            continue;
+        }
+        let Some(layout) = td.layout_for_target(llbc, target) else {
+            continue;
+        };
+        let Some(adt) = alias_target_adt(body, llbc) else {
+            continue;
+        };
+        let Some(target_id) = type_decl_ref_adt_id(adt) else {
+            continue;
+        };
+        let Some(target_td) = llbc.type_by_id(target_id) else {
+            continue;
+        };
+        let TypeDeclKind::Struct(_) = &target_td.kind else {
+            continue;
+        };
+        let args = render_adt_type_args(adt, llbc, 0, tombstoned);
+        let target_path = target_td.item_meta.name_path();
+        let canonical = strip_crate_prefix(&target_path);
+        let identity_path = decl_path_for_tombstone(&target_path, tombstoned);
+        let template = majit_ir::descr::StructId::from_canonical(&identity_path);
+        let sid = concrete_adt_struct_id(template, Some(adt), llbc, tombstoned);
+        if sid != template {
+            let exact = exact_layout_from_charon(fields, &layout, llbc);
+            // `layout_for_target` may have taken a foreign triple's sole
+            // entry. `llmemory.offsetof` is the target STRUCT
+            // (`rordereddict.rtype_len` reads `num_live_items`, WORD-sized
+            // `lltype.Signed`); do not publish host offsets as this
+            // instance.
+            if !exact.field_offsets.is_empty() && td.has_layout_entry_for(target) {
+                exact_layouts.entry(sid).or_insert(exact);
+            }
+        }
+        let rows = alias_instance_field_rows(fields, &args, llbc, gc_struct_ids);
+        if !rows.is_empty() && sid != template {
+            let suffix = format!("<{}>", args.join(","));
+            let leaf = target_path.rsplit("::").next().unwrap_or(&target_path);
+            for key in [
+                format!("{leaf}{suffix}"),
+                format!("{canonical}{suffix}"),
+                format!("{identity_path}{suffix}"),
+            ] {
+                struct_fields
+                    .fields
+                    .entry(key.clone())
+                    .or_insert_with(|| rows.clone());
+                record_struct_id(struct_ids, key, sid);
+            }
+        }
+        publish_alias_spelling_keys(
+            td,
+            sid,
+            &rows,
+            sid != template,
+            struct_fields,
+            struct_ids,
+            struct_origins,
+            struct_field_attrs,
+            known_struct_names,
+            llbc,
+            gc_struct_ids,
+        );
+    }
+}
+
+/// Bind the alias TypeDecl's name spellings to `sid` without minting a
+/// second STRUCT. A later tombstoned re-register uses `or_insert` so it
+/// does not poison the alias key onto a second sid.
+fn publish_alias_spelling_keys(
+    td: &TypeDecl,
+    sid: majit_ir::descr::StructId,
+    rows: &[crate::front::semantic::FieldRow],
+    bind_instance_rows: bool,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    struct_origins: &mut std::collections::HashMap<String, String>,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    known_struct_names: &mut std::collections::HashSet<String>,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) {
+    let name = td.item_meta.name_path();
+    let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    let canonical_name = strip_crate_prefix(&name);
+    if bind_instance_rows && !rows.is_empty() {
+        struct_fields
+            .fields
+            .entry(name.clone())
+            .or_insert_with(|| rows.to_vec());
+        struct_fields
+            .fields
+            .entry(canonical_name.clone())
+            .or_insert_with(|| rows.to_vec());
+    }
+    struct_ids.entry(name.clone()).or_insert(Some(sid));
+    struct_ids
+        .entry(canonical_name.clone())
+        .or_insert(Some(sid));
+    // A later Struct/Enum with the same leaf keeps that leaf. Poisoning the
+    // resolver slot would drop both layouts; skip the alias leaf instead.
+    let leaf_free = match struct_ids.get(&leaf) {
+        None => true,
+        Some(existing) => *existing == Some(sid),
+    };
+    if leaf_free {
+        if bind_instance_rows && !rows.is_empty() {
+            struct_fields
+                .fields
+                .entry(leaf.clone())
+                .or_insert_with(|| rows.to_vec());
+        }
+        struct_ids.entry(leaf.clone()).or_insert(Some(sid));
+        known_struct_names.insert(leaf.clone());
+    }
+    let segs: Vec<&str> = name.split("::").collect();
+    let module = if segs.len() >= 2 {
+        segs[1..segs.len() - 1].join("::")
+    } else {
+        String::new()
+    };
+    struct_origins.entry(leaf).or_insert(module);
+    if bind_instance_rows && let Some(fields) = type_decl_struct_fields(td, llbc) {
+        let attr_rows: Vec<(String, ValueType)> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let fname = field_decl_name(i, f);
+                let attr_ty =
+                    tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc, gc_struct_ids);
+                (fname, attr_ty)
+            })
+            .collect();
+        struct_field_attrs
+            .entry(canonical_name.clone())
+            .or_insert(attr_rows);
+    }
+    known_struct_names.insert(name);
+    known_struct_names.insert(canonical_name);
+}
+
+/// Field rows of one alias monomorphization: template field names with
+/// this instance's type arguments substituted into type-variable
+/// positions (`substitute_field_type`). Pair-slice fields split into
+/// pointer and length words the same way the defining TypeDecl does.
+fn alias_instance_field_rows(
+    fields: &[majit_charon_reader::ullbc::FieldDecl],
+    args: &[String],
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Vec<crate::front::semantic::FieldRow> {
+    fields
+        .iter()
+        .enumerate()
+        .flat_map(|(i, f)| {
+            let fname = field_decl_name(i, f);
+            if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+                let len = pair_len_field_name(&fname);
+                return vec![
+                    field_decl_row(i, f, "usize"),
+                    crate::front::semantic::FieldRow::named(len, "usize"),
+                ];
+            }
+            vec![field_decl_row(
+                i,
+                f,
+                substitute_field_type(&f.ty, args, llbc, gc_struct_ids),
+            )]
+        })
+        .collect()
+}
+
 fn record_struct_id(
     table: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
     name: String,
@@ -3455,87 +3748,74 @@ fn record_struct_id(
         .or_insert(Some(id));
 }
 
-/// Publish a `type T = Struct<…>` alias as its own layout identity.
-///
-/// Charon records the monomorph's rustc field offsets on the alias
-/// TypeDecl, while the generic struct declaration keeps symbolic
-/// `OffsetOf`. A field read of the alias must use those offsets.
-fn register_type_alias_struct(
+/// Crate-stripped leaves shared by two or more distinct type declarations
+/// in this LLBC (Struct, Enum, Opaque, or Union). RPython keys ClassDef
+/// by the class object (`bookkeeper.py` `getuniqueclassdef(cls)`), so two
+/// declarations can never share one; the string-carrier intern is injective
+/// only while a leaf names one declaration. Alias / Unknown / builtin ADTs
+/// are not identities.
+fn ambiguous_adt_leaves(llbc: &Llbc) -> std::collections::HashSet<String> {
+    let mut by_leaf: std::collections::HashMap<
+        String,
+        std::collections::HashSet<majit_ir::descr::StructId>,
+    > = std::collections::HashMap::new();
+    for td in llbc.iter_type_decls() {
+        if type_decl_is_builtin_adt(td) {
+            continue;
+        }
+        if matches!(td.kind, TypeDeclKind::Alias(_) | TypeDeclKind::Unknown) {
+            continue;
+        }
+        let name = td.item_meta.name_path();
+        let leaf = name
+            .rsplit("::")
+            .next()
+            .unwrap_or(name.as_str())
+            .to_string();
+        let sid = majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name));
+        by_leaf.entry(leaf).or_default().insert(sid);
+    }
+    by_leaf
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= 2)
+        .map(|(leaf, _)| leaf)
+        .collect()
+}
+
+/// Identity rows for an Opaque or Union whose crate-stripped leaf is
+/// ambiguous. Empty rows are enough for [`harden_duplicate_leaf_metadata`]
+/// to see two identities; a resolved Charon layout also publishes one
+/// `__pos_N` Unsigned word per field slot (or per pointer-word of `size`)
+/// so a parameter ClassDef getattr-resolves the same positional aggregate
+/// a constructor setattr would have installed (`rclass.py`
+/// `InstanceRepr.getfieldrepr`). Unique Opaque types are not registered:
+/// intern stays the leaf (`Vec`, core enums).
+fn register_ambiguous_opaque_or_union_identity(
     td: &TypeDecl,
     llbc: &Llbc,
     target: &str,
-    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    struct_origins: &mut std::collections::HashMap<String, String>,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
     exact_layouts: &mut std::collections::HashMap<
         majit_ir::descr::StructId,
         crate::front::semantic::ExactLayout,
     >,
-    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
-    struct_origins: &mut std::collections::HashMap<String, String>,
-    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
     known_struct_names: &mut std::collections::HashSet<String>,
 ) {
-    let Some(fields) = type_decl_struct_fields(td, llbc) else {
-        return;
-    };
-    if fields.is_empty() {
-        return;
-    }
-    let Some(layout) = td.layout_for_target(llbc, target) else {
-        return;
-    };
     let name = td.item_meta.name_path();
     let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
     let canonical_name = strip_crate_prefix(&name);
-    let rows: Vec<crate::front::semantic::FieldRow> = fields
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let fname = field_decl_name(i, f);
-            let field_ty = published_struct_field_layout(&name, &fname, &f.ty, llbc, gc_struct_ids);
-            field_decl_row(i, f, field_ty)
-        })
-        .collect();
+    let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
+    let (rows, attr_rows, field_offsets) = opaque_or_union_positional_rows(td, llbc, target);
     struct_fields.fields.insert(name.clone(), rows.clone());
     struct_fields
         .fields
         .insert(canonical_name.clone(), rows.clone());
-    let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
     record_struct_id(struct_ids, name.clone(), sid);
     record_struct_id(struct_ids, canonical_name.clone(), sid);
-    // A later Struct/Enum with the same leaf keeps that leaf. Poisoning the
-    // resolver slot would drop both layouts; skip the alias leaf instead.
-    let leaf_free = match struct_ids.get(&leaf) {
-        None => true,
-        Some(existing) => *existing == Some(sid),
-    };
-    if leaf_free {
-        struct_fields.fields.insert(leaf.clone(), rows);
-        record_struct_id(struct_ids, leaf.clone(), sid);
-    }
-    let mut field_offsets = std::collections::HashMap::new();
-    for (i, f) in fields.iter().enumerate() {
-        let fname = f
-            .name
-            .clone()
-            .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
-        let Some(off) = layout.struct_field_offset(i) else {
-            continue;
-        };
-        field_offsets.insert(fname, off);
-    }
-    if field_offsets.is_empty() {
-        return;
-    }
-    exact_layouts.insert(
-        sid,
-        crate::front::semantic::ExactLayout {
-            size: layout.size,
-            align: layout.align,
-            field_offsets,
-            host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
-        },
-    );
+    record_struct_id(struct_ids, leaf.clone(), sid);
     let segs: Vec<&str> = name.split("::").collect();
     let module = if segs.len() >= 2 {
         segs[1..segs.len() - 1].join("::")
@@ -3543,21 +3823,67 @@ fn register_type_alias_struct(
         String::new()
     };
     struct_origins.entry(leaf.clone()).or_insert(module);
-    let attr_rows: Vec<(String, ValueType)> = fields
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let fname = field_decl_name(i, f);
-            let attr_ty = tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc, gc_struct_ids);
-            (fname, attr_ty)
-        })
-        .collect();
-    struct_field_attrs.insert(canonical_name.clone(), attr_rows);
+    struct_field_attrs
+        .entry(canonical_name.clone())
+        .or_insert(attr_rows);
+    if !field_offsets.is_empty()
+        && let Some(layout) = td.layout_for_target(llbc, target)
+    {
+        exact_layouts.insert(
+            sid,
+            crate::front::semantic::ExactLayout {
+                size: layout.size,
+                align: layout.align,
+                field_offsets,
+                host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
+            },
+        );
+    }
     known_struct_names.insert(name);
     known_struct_names.insert(canonical_name);
-    if leaf_free {
-        known_struct_names.insert(leaf);
+    known_struct_names.insert(leaf);
+}
+
+fn opaque_or_union_positional_rows(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    target: &str,
+) -> (
+    Vec<(String, String)>,
+    Vec<(String, ValueType)>,
+    std::collections::HashMap<String, u64>,
+) {
+    let word = u64::from(llbc.target_pointer_size().unwrap_or(8));
+    let mut offsets: Vec<u64> = td
+        .layout_for_target(llbc, target)
+        .and_then(|layout| {
+            let variant = layout.variant_layouts.first()?;
+            (!variant.field_offsets.is_empty()).then(|| variant.field_offsets.clone())
+        })
+        .unwrap_or_default();
+    if offsets.is_empty() {
+        let size = td
+            .layout_for_target(llbc, target)
+            .and_then(|layout| layout.size)
+            .or_else(|| {
+                td.size_align_for_target(llbc, target)
+                    .and_then(|(size, _)| size)
+            })
+            .unwrap_or(0);
+        if size > 0 && word > 0 {
+            offsets = (0..size.div_ceil(word)).map(|i| i * word).collect();
+        }
     }
+    let mut field_offsets = std::collections::HashMap::new();
+    let mut rows = Vec::with_capacity(offsets.len());
+    let mut attrs = Vec::with_capacity(offsets.len());
+    for (i, off) in offsets.into_iter().enumerate() {
+        let fname = majit_charon_reader::ullbc::positional_field_name(i);
+        field_offsets.insert(fname.clone(), off);
+        rows.push((fname.clone(), "usize".to_string()));
+        attrs.push((fname, ValueType::Unsigned));
+    }
+    (rows, attrs, field_offsets)
 }
 
 /// Record every spelling of an ADT whose fields are raw words.
@@ -3634,6 +3960,7 @@ fn derive_program_metadata(
         std::collections::HashMap::new();
     let mut struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>> =
         std::collections::HashMap::new();
+    let ambiguous_leaves = ambiguous_adt_leaves(llbc);
 
     for td in llbc.iter_type_decls() {
         if type_decl_is_builtin_adt(td) {
@@ -3747,30 +4074,7 @@ fn derive_program_metadata(
                 // the heuristic provider covers it.  Keyed by the identity
                 // token — one entry per type definition.
                 if let Some(layout) = layout_td.layout_for_target(llbc, &target) {
-                    let mut field_offsets = std::collections::HashMap::new();
-                    for (i, f) in row_fields.iter().enumerate() {
-                        let fname = f.name.clone().unwrap_or_else(|| {
-                            majit_charon_reader::ullbc::positional_field_name(i)
-                        });
-                        let Some(off) = layout.struct_field_offset(i) else {
-                            continue;
-                        };
-                        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
-                            let words = crate::vec_layout::slice_probe();
-                            field_offsets
-                                .insert(pair_len_field_name(&fname), off + words.len_offset as u64);
-                            field_offsets.insert(fname, off + words.ptr_offset as u64);
-                        } else {
-                            field_offsets.insert(fname, off);
-                        }
-                    }
-                    let exact = crate::front::semantic::ExactLayout {
-                        size: layout.size,
-                        align: layout.align,
-                        field_offsets,
-                        host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
-                    };
-                    exact_layouts.insert(sid, exact);
+                    exact_layouts.insert(sid, exact_layout_from_charon(row_fields, &layout, llbc));
                 }
                 // `bytecode::CodeObject` is `repr(Rust)` and Charon leaves
                 // its offsets unresolved. A real layout, even an empty
@@ -4251,29 +4555,45 @@ fn derive_program_metadata(
                     enum_variant_by_discriminant.insert(leaf, by_discr);
                 }
             }
-            // A union's fields all start at offset 0 and only one is live,
-            // so there is no field-offset row to project; the declarations
-            // that reach here are foreign (`windows-sys`' `IN_ADDR_0`).
             TypeDeclKind::Alias(_) => {
-                // Charon keeps `type T = Struct<…>` as its own TypeDecl with
-                // the monomorph's rustc layout. Generic struct offsets are
-                // symbolic `OffsetOf`. Publish the alias under its own StructId.
-                register_type_alias_struct(
-                    td,
-                    llbc,
-                    &target,
-                    gc_struct_ids,
-                    &mut struct_fields,
-                    &mut exact_layouts,
-                    &mut struct_ids,
-                    &mut struct_origins,
-                    &mut struct_field_attrs,
-                    &mut known_struct_names,
-                );
+                // Published after the loop by `register_alias_instantiation_layouts`
+                // under the aliased struct's instance STRUCT, with the alias
+                // name as another key of that same sid.
             }
-            TypeDeclKind::Union(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+            // Opaque / Union still occupy a declaration identity: a leaf
+            // they share with a Struct (`Layout`) must enter the census so
+            // intern stays injective (`bookkeeper.py` `getuniqueclassdef`).
+            TypeDeclKind::Union(_) | TypeDeclKind::Opaque => {
+                let leaf = name.rsplit("::").next().unwrap_or(&name);
+                if ambiguous_leaves.contains(leaf) {
+                    register_ambiguous_opaque_or_union_identity(
+                        td,
+                        llbc,
+                        &target,
+                        &mut struct_fields,
+                        &mut struct_ids,
+                        &mut struct_origins,
+                        &mut struct_field_attrs,
+                        &mut exact_layouts,
+                        &mut known_struct_names,
+                    );
+                }
+            }
+            TypeDeclKind::Unknown => {}
         }
     }
+    register_alias_instantiation_layouts(
+        llbc,
+        &target,
+        &mut struct_fields,
+        &mut struct_ids,
+        &mut exact_layouts,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        &mut struct_origins,
+        &mut struct_field_attrs,
+        &mut known_struct_names,
+    );
 
     // RustPython compiler-core declares this exact source type as
     // `pub struct Constants<C: Constant>(Box<[C]>)`.  It is a dependency
@@ -22335,11 +22655,16 @@ impl<'a> Lowering<'a> {
                 // can drop the ZST (`rordereddict.py` has no hasher field).
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let inst_adt = match head_adt {
-                    Some(h) if !render_adt_type_args(h, self.llbc, 0).is_empty() => Some(h),
+                    Some(h)
+                        if !render_adt_type_args(h, self.llbc, 0, self.tombstoned_leaves)
+                            .is_empty() =>
+                    {
+                        Some(h)
+                    }
                     _ => dest_adt.or(head_adt),
                 };
                 let inst_args = inst_adt
-                    .map(|h| render_adt_type_args(h, self.llbc, 0))
+                    .map(|h| render_adt_type_args(h, self.llbc, 0, self.tombstoned_leaves))
                     .unwrap_or_default();
                 let field_rows: Vec<(String, String, Option<TyRef>)> = fields
                     .iter()
@@ -22375,14 +22700,22 @@ impl<'a> Lowering<'a> {
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
                 let type_leaf = inst_adt
-                    .and_then(|h| struct_instantiation_suffix(&name_path, h, self.llbc))
+                    .and_then(|h| {
+                        struct_instantiation_suffix(
+                            &name_path,
+                            h,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        )
+                    })
                     .map(|suffix| majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix))
                     .unwrap_or(type_leaf);
+
                 Some((
                     owner_path,
                     type_leaf,
                     field_rows,
-                    concrete_adt_struct_id(template, inst_adt, self.llbc),
+                    concrete_adt_struct_id(template, inst_adt, self.llbc, self.tombstoned_leaves),
                     true,
                     None,
                 ))
@@ -22407,7 +22740,10 @@ impl<'a> Lowering<'a> {
                 // and union every payload onto one `__pos_0`.
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
-                let suffix = inst_adt.and_then(|h| adt_head_instantiation_suffix(h, self.llbc));
+                let suffix = inst_adt.and_then(|h| {
+                    adt_head_instantiation_suffix(h, self.llbc, self.tombstoned_leaves)
+                });
+
                 let leaf = match suffix {
                     Some(suffix) => majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix),
                     None => type_leaf,
@@ -22436,7 +22772,7 @@ impl<'a> Lowering<'a> {
                     variant_owner,
                     v.name.clone(),
                     field_rows,
-                    concrete_adt_struct_id(template, inst_adt, self.llbc),
+                    concrete_adt_struct_id(template, inst_adt, self.llbc, self.tombstoned_leaves),
                     false,
                     Some(idx as i64),
                 ))
@@ -22568,7 +22904,13 @@ impl<'a> Lowering<'a> {
         &'s self,
         base_ty: &'s TyRef,
     ) -> Option<&'s serde_json::Map<String, serde_json::Value>> {
-        strip_ty_wrappers(tyref_node(base_ty, self.llbc)?, self.llbc)?
+        // Type aliases are transparent: `IdentityDictStorage` is
+        // `RDict<IdentityKey, PyObjectRef, RandomState>`, and the field
+        // descr is keyed by that instantiated STRUCT
+        // (`descr.py` `get_field_descr`). Peel after stripping `&` so a
+        // borrowed alias still projects the aliased ADT's generics.
+        let node = strip_ty_wrappers(tyref_node(base_ty, self.llbc)?, self.llbc)?;
+        type_node_peel_aliases(node, self.llbc)?
             .as_object()?
             .get("Adt")?
             .as_object()
@@ -22634,9 +22976,14 @@ impl<'a> Lowering<'a> {
             } else {
                 owner_leaf
             };
-            match adt_head_instantiation_suffix(head, self.llbc) {
+            match adt_head_instantiation_suffix(head, self.llbc, self.tombstoned_leaves) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
-                None => match struct_instantiation_suffix(&name_path, head, self.llbc) {
+                None => match struct_instantiation_suffix(
+                    &name_path,
+                    head,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                ) {
                     Some(suffix) => {
                         majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix)
                     }
@@ -22647,9 +22994,9 @@ impl<'a> Lowering<'a> {
         if variant_idx.is_none()
             && let Some(fields) = type_decl_struct_fields(td, self.llbc)
         {
-            // `type Alias = Struct<…>` is an Alias whose fields live on
-            // the generic struct. Keep the alias as owner so
-            // `exact_layouts` uses the monomorph's rustc offsets.
+            // `type Alias = Struct<…>` is transparent: `field_base_adt`
+            // already peeled to the aliased ADT, so `owner_id` is the
+            // instance STRUCT (`descr.py` `get_field_descr`).
             let f = fields.get(field_idx)?;
             let name = f
                 .name
@@ -22660,7 +23007,12 @@ impl<'a> Lowering<'a> {
                 &name_path,
                 self.tombstoned_leaves,
             ));
-            let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
+            let owner_id = Some(concrete_adt_struct_id(
+                template,
+                head_adt,
+                self.llbc,
+                self.tombstoned_leaves,
+            ));
             return Some((owner_root, name, ty, owner_id, host_index));
         }
         match (&td.kind, variant_idx) {
@@ -22682,7 +23034,12 @@ impl<'a> Lowering<'a> {
                     decl_path_for_tombstone(&name_path, self.tombstoned_leaves),
                     variant.name
                 ));
-                let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
+                let owner_id = Some(concrete_adt_struct_id(
+                    template,
+                    head_adt,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                ));
                 Some((variant_owner, name, ty, owner_id, host_index))
             }
             _ => None,
@@ -24535,8 +24892,14 @@ impl<'a> Lowering<'a> {
         };
         let dest_class_ty: &TyRef = match &fd_output {
             Some(out)
-                if tyref_enum_instantiation_suffix(&call.dest.ty, self.llbc).is_empty()
-                    && !tyref_enum_instantiation_suffix(out, self.llbc).is_empty() =>
+                if tyref_enum_instantiation_suffix(
+                    &call.dest.ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                )
+                .is_empty()
+                    && !tyref_enum_instantiation_suffix(out, self.llbc, self.tombstoned_leaves)
+                        .is_empty() =>
             {
                 out
             }
@@ -31450,6 +31813,7 @@ impl<'a> Lowering<'a> {
             let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
                 &call.dest.ty,
                 self.llbc,
+                self.tombstoned_leaves,
             );
             // `Result<(), PyError>`: the transformed callee returns void
             // (`tyref_result_ok_is_unit`), so the payload is `Void`, not the
@@ -39582,7 +39946,9 @@ impl<'a> Lowering<'a> {
                     .as_object()
                     .and_then(|o| o.get("Adt"))
                     .and_then(serde_json::Value::as_object)
-                    .and_then(|adt| adt_head_instantiation_suffix(adt, self.llbc))
+                    .and_then(|adt| {
+                        adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves)
+                    })
                     .is_some();
         if !payload_ok {
             return None;
@@ -39591,7 +39957,7 @@ impl<'a> Lowering<'a> {
         // spelling a static `Some(..)` construction of this instantiation mints.
         // An empty suffix is the template ClassDef; its `Some.__pos_0` is the
         // typevar and getattr cannot succeed (`bookkeeper.py` `getuniqueclassdef`).
-        let suffix = tyref_enum_instantiation_suffix(dest_ty, self.llbc);
+        let suffix = tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves);
         if suffix.is_empty() {
             return None;
         }
@@ -39717,7 +40083,7 @@ impl<'a> Lowering<'a> {
         let option_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(dest_ty)?;
@@ -40159,7 +40525,7 @@ impl<'a> Lowering<'a> {
             let enum_owner = format!(
                 "{}{}",
                 td.item_meta.name_path(),
-                tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+                tyref_enum_instantiation_suffix(recv_ty, self.llbc, self.tombstoned_leaves)
             );
             let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, 0)?;
             (enum_owner, payload_owner, false, false)
@@ -40242,9 +40608,12 @@ impl<'a> Lowering<'a> {
         }
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let call_once_owner = closure_env_call_once_owner(self.llbc.type_by_id(env_def_id)?);
-        let result_suffix =
-            crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc)
-                .unwrap_or_default();
+        let result_suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+        )
+        .unwrap_or_default();
         let ok_ty = self.tyref_adt_type_arg(dest_ty, 0)?;
         let err_ty = self.tyref_adt_type_arg(dest_ty, 1)?;
         Some(crate::front::checked_arith::CheckedArithOkOrElseSite {
@@ -40495,7 +40864,10 @@ impl<'a> Lowering<'a> {
         some_owner: &mut String,
         niche: &mut bool,
     ) {
-        if *niche || !tyref_enum_instantiation_suffix(recv_ty, self.llbc).is_empty() {
+        if *niche
+            || !tyref_enum_instantiation_suffix(recv_ty, self.llbc, self.tombstoned_leaves)
+                .is_empty()
+        {
             return;
         }
         let Some(opt_var) = opt_var else {
@@ -40517,7 +40889,7 @@ impl<'a> Lowering<'a> {
             {
                 return;
             }
-            if tyref_enum_instantiation_suffix(&dest, self.llbc).is_empty()
+            if tyref_enum_instantiation_suffix(&dest, self.llbc, self.tombstoned_leaves).is_empty()
                 && !self.tyref_is_niche_option_ptr(&dest)
             {
                 return;
@@ -40614,7 +40986,7 @@ impl<'a> Lowering<'a> {
         option_owner: &mut String,
         some_owner: &mut String,
     ) {
-        if !tyref_enum_instantiation_suffix(dest_ty, self.llbc).is_empty() {
+        if !tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves).is_empty() {
             return;
         }
         let Some(hint) = payload_hint else {
@@ -40626,7 +40998,7 @@ impl<'a> Lowering<'a> {
         let Some(inst) = self.option_dest_with_payload(dest_ty, hint) else {
             return;
         };
-        if tyref_enum_instantiation_suffix(&inst, self.llbc).is_empty() {
+        if tyref_enum_instantiation_suffix(&inst, self.llbc, self.tombstoned_leaves).is_empty() {
             return;
         }
         if let Some((owner, some, _)) = self.resolve_bool_then_option_dest(&inst) {
@@ -40897,7 +41269,7 @@ impl<'a> Lowering<'a> {
         let result_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(ty, self.llbc)
+            tyref_enum_instantiation_suffix(ty, self.llbc, self.tombstoned_leaves)
         );
         let ok_owner = Self::tagged_pair_payload_owner(td, &result_owner, 0)?;
         let err_owner = Self::tagged_pair_payload_owner(td, &result_owner, 1)?;
@@ -41259,7 +41631,7 @@ impl<'a> Lowering<'a> {
         let option_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+            tyref_enum_instantiation_suffix(recv_ty, self.llbc, self.tombstoned_leaves)
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
@@ -41391,12 +41763,12 @@ impl<'a> Lowering<'a> {
         let receiver_owner = format!(
             "{}{}",
             recv_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+            tyref_enum_instantiation_suffix(recv_ty, self.llbc, self.tombstoned_leaves)
         );
         let result_owner = format!(
             "{}{}",
             dest_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let receiver_ok_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 0)?;
         let receiver_err_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 1)?;
@@ -41538,12 +41910,12 @@ impl<'a> Lowering<'a> {
         let receiver_owner = format!(
             "{}{}",
             source_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(&recv_ty, self.llbc)
+            tyref_enum_instantiation_suffix(&recv_ty, self.llbc, self.tombstoned_leaves)
         );
         let result_owner = format!(
             "{}{}",
             dest_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         Some(crate::front::result_as_ref::ResultAsRefSite {
             result_var: result_var.clone(),
@@ -41649,7 +42021,7 @@ impl<'a> Lowering<'a> {
         let option_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(&recv_ty, self.llbc)
+            tyref_enum_instantiation_suffix(&recv_ty, self.llbc, self.tombstoned_leaves)
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let mut payload_ty = self.tyref_option_payload_value_type(&recv_ty)?;
@@ -41717,6 +42089,7 @@ impl<'a> Lowering<'a> {
             let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
                 &call_result_tyref,
                 self.llbc,
+                self.tombstoned_leaves,
             );
             let payload_ty =
                 crate::front::result_exc::tyref_result_ok(&call_result_tyref, self.llbc)
@@ -43255,7 +43628,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
         let bb_id = self.emit_bb(mir_bb);
@@ -43477,7 +43850,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
 
@@ -43609,7 +43982,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
@@ -43839,7 +44212,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let tuple_owner = format!("Tuple{suffix}");
         let bb_id = self.emit_bb(mir_bb);
@@ -43984,7 +44357,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
         if src_is_signed_word {
@@ -44178,7 +44551,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(result_ty, self.llbc)
+            tyref_enum_instantiation_suffix(result_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
@@ -44380,7 +44753,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(result_ty, self.llbc)
+            tyref_enum_instantiation_suffix(result_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let disc = self
@@ -44817,11 +45190,16 @@ impl<'a> Lowering<'a> {
         let def_id = inline_adt_def_id(v)?;
         let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
         let adt = v.as_object()?.get("Adt")?.as_object()?;
-        match adt_head_instantiation_suffix(adt, self.llbc) {
+        match adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves) {
             Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                 &name_path, &suffix,
             )),
-            None => match struct_instantiation_suffix(&name_path, adt, self.llbc) {
+            None => match struct_instantiation_suffix(
+                &name_path,
+                adt,
+                self.llbc,
+                self.tombstoned_leaves,
+            ) {
                 Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                     &name_path, &suffix,
                 )),
@@ -44833,17 +45211,23 @@ impl<'a> Lowering<'a> {
     /// Concrete physical-layout identity of an ADT type. Unlike
     /// [`Self::tyref_adt_class_root`], this always preserves generic arguments:
     /// annotator class splitting is selective, while Rust monomorphization is
-    /// not.
+    /// not. A `type T = Struct<…>` alias peels to that instance STRUCT.
     fn tyref_adt_layout_id(&self, ty: &TyRef) -> Option<majit_ir::descr::StructId> {
         let value = self.tyref_adt_body(ty)?;
-        let def_id = inline_adt_def_id(value)?;
+        let peeled = type_node_peel_aliases(value, self.llbc)?;
+        let def_id = inline_adt_def_id(peeled)?;
         let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
         let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
             &name_path,
             self.tombstoned_leaves,
         ));
-        let adt = value.as_object()?.get("Adt")?.as_object();
-        Some(concrete_adt_struct_id(template, adt, self.llbc))
+        let adt = peeled.as_object()?.get("Adt")?.as_object();
+        Some(concrete_adt_struct_id(
+            template,
+            adt,
+            self.llbc,
+            self.tombstoned_leaves,
+        ))
     }
 
     /// `true` when `ty` resolves to a FIELDLESS enum whose discriminant
@@ -63081,8 +63465,15 @@ fn declared_adt_struct_id(
     }
     match &td.kind {
         TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) => Some(struct_id_for_type_decl(td)),
-        TypeDeclKind::Alias(_) if type_decl_struct_fields(td, llbc).is_some() => {
-            Some(struct_id_for_type_decl(td))
+        TypeDeclKind::Alias(body) if type_decl_struct_fields(td, llbc).is_some() => {
+            let adt = alias_target_adt(body, llbc)?;
+            let target_td = llbc.type_by_id(type_decl_ref_adt_id(adt)?)?;
+            Some(concrete_adt_struct_id(
+                struct_id_for_type_decl(target_td),
+                Some(adt),
+                llbc,
+                no_tombstoned_leaves(),
+            ))
         }
         _ => None,
     }
@@ -63367,7 +63758,7 @@ fn raw_address_owner_root(
         .as_object()
         .and_then(|obj| obj.get("Adt"))
         .and_then(serde_json::Value::as_object)
-        .map(|adt| render_adt_type_args(adt, llbc, 0))
+        .map(|adt| render_adt_type_args(adt, llbc, 0, tombstoned))
         .unwrap_or_default();
     if args.is_empty() {
         return Some(root);
@@ -64707,7 +65098,7 @@ fn dont_look_inside_return_class_root(
     if !by_value_args {
         return None;
     }
-    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    let suffix = adt_head_instantiation_suffix(adt, llbc, no_tombstoned_leaves())?;
     Some(format!("{}{suffix}", td.item_meta.name_path()))
 }
 
@@ -66504,7 +66895,11 @@ fn adt_node_class_root_leaf(
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
         .is_some_and(|t| !t.is_empty());
-    let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+    let td = llbc.type_by_id(def_id)?;
+    let name = td.item_meta.name_path();
+    let crate_root = name.split("::").next().unwrap_or(&name);
+    let is_core = matches!(crate_root, "core" | "std" | "alloc");
+    let is_enum = matches!(td.kind, TypeDeclKind::Enum(_));
     if has_type_args {
         // A parameterised workspace ADT (e.g. `CodeObject<C>` used at
         // its one `ConstantData` instantiation) registers in
@@ -66531,14 +66926,13 @@ fn adt_node_class_root_leaf(
         // so the raising call stays last (checkgraph, `simplify.py`). The
         // `?` rewrite peels the Option recast that this paint inserts on a
         // call-returned Option.
-        let crate_root = name.split("::").next().unwrap_or(&name);
-        if matches!(crate_root, "core" | "std" | "alloc") {
+        if is_core {
             let types = type_decl_ref_generics(adt, llbc)
                 .and_then(|g| g.get("types"))
                 .and_then(|t| t.as_array());
             let unary = types.is_some_and(|t| t.len() == 1);
             let tagged_result = name.ends_with("::result::Result");
-            let split = adt_head_instantiation_suffix(adt, llbc).is_some();
+            let split = adt_head_instantiation_suffix(adt, llbc, tombstoned).is_some();
             let pointer_niche = types
                 .is_some_and(|types| types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)));
             // A generic struct in a harvested foreign-body crate is one
@@ -66547,19 +66941,14 @@ fn adt_node_class_root_leaf(
             // container family above stays excluded; Opaque TypeDecls
             // are not `Struct` and do not match.
             let foreign_struct =
-                foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc).is_some();
+                foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc, tombstoned)
+                    .is_some();
             let paint_core_enum = (unary && split && !pointer_niche) || (tagged_result && split);
             if !foreign_struct && !paint_core_enum {
                 return None;
             }
         }
-    } else if matches!(
-        name.split("::").next().unwrap_or(&name),
-        "core" | "std" | "alloc"
-    ) && matches!(
-        llbc.type_by_id(def_id).map(|td| &td.kind),
-        Some(TypeDeclKind::Enum(_))
-    ) {
+    } else if is_core && is_enum {
         // A core enum with no type arguments is the template, not an
         // instantiation. Painting it recasts a call result onto the
         // shared variant ClassDef whose `__pos_0` is the typevar
@@ -66577,6 +66966,8 @@ fn adt_node_class_root_leaf(
     // A crate-root declaration (`crate::Code`) strips to the leaf itself.
     // The stripped spelling is the withdrawn token, so paint the full
     // declaration path — the same spelling the constructor joins.
+    // Opaque declarations now enter that census, so a leaf an Opaque
+    // shares with a workspace Struct is withdrawn the same way.
     if tombstoned.contains(&leaf) {
         leaf = tombstoned_owner_spelling(&name, &leaf, tombstoned);
     }
@@ -66588,10 +66979,10 @@ fn adt_node_class_root_leaf(
     // constructor / field-read sites must agree — they share
     // `adt_head_instantiation_suffix`.  Non-enum and primitive-payload
     // heads return `None` and keep collapsing to the bare leaf.
-    if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
+    if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc, tombstoned) {
         return Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix));
     }
-    if let Some(suffix) = struct_instantiation_suffix(&name, adt, llbc) {
+    if let Some(suffix) = struct_instantiation_suffix(&name, adt, llbc, tombstoned) {
         return Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix));
     }
     Some(leaf)
@@ -66603,11 +66994,12 @@ fn entry_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     if !name_path.ends_with("::rordereddict_entries::Entry") {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc)
+    split_struct_instantiation_suffix(adt, llbc, tombstoned)
 }
 
 /// `<T>` suffix for a generic struct whose path is in a harvested
@@ -66623,6 +67015,7 @@ fn foreign_body_generic_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let crate_root = name_path.split("::").next().unwrap_or(name_path);
     if !crate::local_crates::is_foreign_body_crate_root(crate_root) {
@@ -66633,7 +67026,7 @@ fn foreign_body_generic_struct_instantiation_suffix(
     if !matches!(td.kind, TypeDeclKind::Struct(_)) {
         return None;
     }
-    let type_args = render_adt_type_args(adt, llbc, 0);
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
     if type_args.is_empty()
         || !type_args
             .iter()
@@ -66641,23 +67034,27 @@ fn foreign_body_generic_struct_instantiation_suffix(
     {
         return None;
     }
-    split_struct_instantiation_suffix(adt, llbc)
+    split_struct_instantiation_suffix(adt, llbc, tombstoned)
 }
 
 fn struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    entry_struct_instantiation_suffix(name_path, adt, llbc)
-        .or_else(|| foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc))
+    entry_struct_instantiation_suffix(name_path, adt, llbc, tombstoned).or_else(|| {
+        foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc, tombstoned)
+    })
 }
 
 fn split_struct_instantiation_suffix(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let type_args = render_adt_type_args(adt, llbc, 0);
+    let type_args = render_adt_type_args(adt, llbc, 0, tombstoned);
+
     if type_args.is_empty()
         || !type_args
             .iter()
@@ -67506,7 +67903,12 @@ fn type_node_peel_aliases<'l>(
         };
         match &td.kind {
             TypeDeclKind::Alias(aliased) => {
-                node = aliased;
+                // Charon stores `type T = U` as `Alias { aliased_ty: U }`
+                // (`TypeDeclKind::Alias` comment). The use-site Adt names
+                // `T` with empty generics; `U` carries the monomorphization
+                // (`RDict<IdentityKey, PyObjectRef, RandomState>`). Follow
+                // that body the same way `alias_target_adt` does.
+                node = aliased.get("aliased_ty").unwrap_or(aliased);
             }
             _ => return Some(stripped),
         }
@@ -69135,6 +69537,15 @@ pub(crate) fn charon_type_value_to_ast_string(
     llbc: &Llbc,
     depth: usize,
 ) -> String {
+    charon_type_value_to_ast_string_with(v, llbc, depth, no_tombstoned_leaves())
+}
+
+fn charon_type_value_to_ast_string_with(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
     if depth > 24 {
         return "??deep".to_string();
     }
@@ -69144,14 +69555,14 @@ pub(crate) fn charon_type_value_to_ast_string(
     // Indirections — follow the dedup table / inline hash-cons one hop.
     if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
         return match llbc.dedup_body(id) {
-            Some(body) => charon_type_value_to_ast_string(body, llbc, depth + 1),
+            Some(body) => charon_type_value_to_ast_string_with(body, llbc, depth + 1, tombstoned),
             None => format!("??unresolved_dedup#{id}"),
         };
     }
     if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
-        return charon_type_value_to_ast_string(&arr[1], llbc, depth + 1);
+        return charon_type_value_to_ast_string_with(&arr[1], llbc, depth + 1, tombstoned);
     }
     // Primitive literals.
     if let Some(lit) = obj.get("Scalar") {
@@ -69162,7 +69573,7 @@ pub(crate) fn charon_type_value_to_ast_string(
         if let Some(arr) = r.as_array() {
             // `{"Ref": [region, ty, kind]}`.
             if let Some(inner) = arr.get(1) {
-                return charon_type_value_to_ast_string(inner, llbc, depth + 1);
+                return charon_type_value_to_ast_string_with(inner, llbc, depth + 1, tombstoned);
             }
         }
         return "??ref_shape".to_string();
@@ -69172,7 +69583,7 @@ pub(crate) fn charon_type_value_to_ast_string(
         if let Some(arr) = rp.as_array()
             && arr.len() == 2
         {
-            let inner = charon_type_value_to_ast_string(&arr[0], llbc, depth + 1);
+            let inner = charon_type_value_to_ast_string_with(&arr[0], llbc, depth + 1, tombstoned);
             let mutbl = arr[1].as_str().unwrap_or("");
             let prefix = if mutbl.eq_ignore_ascii_case("Mut") {
                 "*mut "
@@ -69193,13 +69604,13 @@ pub(crate) fn charon_type_value_to_ast_string(
     }
     // ADTs: tuples, builtins (Box/Slice/Str/Array), and named types.
     if let Some(adt) = obj.get("Adt").and_then(|a| a.as_object()) {
-        return charon_adt_to_ast_string(adt, llbc, depth);
+        return charon_adt_to_ast_string(adt, llbc, depth, tombstoned);
     }
     // Top-level array `{"Array": [elem, len, trait_ref]}` -> `[elem;len]`.
     if let Some(arr) = obj.get("Array").and_then(serde_json::Value::as_array)
         && arr.len() == 3
     {
-        let elem = charon_type_value_to_ast_string(&arr[0], llbc, depth + 1);
+        let elem = charon_type_value_to_ast_string_with(&arr[0], llbc, depth + 1, tombstoned);
         let len = charon_array_len_to_string(&arr[1], llbc);
         return format!("[{elem};{len}]");
     }
@@ -69211,7 +69622,7 @@ pub(crate) fn charon_type_value_to_ast_string(
     {
         return format!(
             "[{}]",
-            charon_type_value_to_ast_string(elem, llbc, depth + 1)
+            charon_type_value_to_ast_string_with(elem, llbc, depth + 1, tombstoned)
         );
     }
     // Trait associated-type projections (`C::Name`).  The decl-level
@@ -69601,6 +70012,7 @@ fn render_adt_type_args(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
     depth: usize,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
@@ -69608,7 +70020,7 @@ fn render_adt_type_args(
         .and_then(|t| t.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|t| charon_type_value_to_ast_string(t, llbc, depth + 1))
+                .map(|t| charon_type_value_to_ast_string_with(t, llbc, depth + 1, tombstoned))
                 .filter(|s| s != "Global" && s != "RandomState")
                 .collect()
         })
@@ -69626,6 +70038,7 @@ fn render_adt_payload_type_args(
     llbc: &Llbc,
     depth: usize,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
@@ -69634,7 +70047,8 @@ fn render_adt_payload_type_args(
         .map(|arr| {
             arr.iter()
                 .filter_map(|t| {
-                    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
+                    let rendered =
+                        charon_type_value_to_ast_string_with(t, llbc, depth + 1, tombstoned);
                     if rendered == "Global" || rendered == "RandomState" {
                         return None;
                     }
@@ -69758,11 +70172,15 @@ pub(crate) fn fnptr_indirect_enabled() -> bool {
 /// [`render_adt_type_args`] both the construction and the projection derive
 /// from the tuple's `place.ty` node (NOT the element-type-less `AggregateKind`
 /// head), so the `__pos_N` read and write owners agree.
-fn tuple_shape_suffix(adt: &serde_json::Map<String, serde_json::Value>, llbc: &Llbc) -> String {
+fn tuple_shape_suffix(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
     if adt.get("builtin").and_then(serde_json::Value::as_str) != Some("Tuple") {
         return String::new();
     }
-    let args = render_adt_type_args(adt, llbc, 0);
+    let args = render_adt_type_args(adt, llbc, 0, tombstoned);
     if args.is_empty() || args.iter().any(|a| a.contains("??")) {
         return String::new();
     }
@@ -69789,7 +70207,7 @@ fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
         .as_object()
         .and_then(|m| m.get("Adt"))
         .and_then(serde_json::Value::as_object)
-        .map(|adt| tuple_shape_suffix(adt, llbc))
+        .map(|adt| tuple_shape_suffix(adt, llbc, no_tombstoned_leaves()))
         .unwrap_or_default()
 }
 
@@ -69951,9 +70369,13 @@ fn tyref_adt_map<'l>(
 /// (an `f32`/`()`/`""` argument yields `None`).  Fail-closed: a
 /// missing `Adt` node, a non-enum type, or a deferred argument yields `""` —
 /// the bare owner, unchanged.
-fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> String {
+fn tyref_enum_instantiation_suffix(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
     tyref_adt_map(ty, llbc)
-        .and_then(|adt| adt_head_instantiation_suffix(adt, llbc))
+        .and_then(|adt| adt_head_instantiation_suffix(adt, llbc, tombstoned))
         .unwrap_or_default()
 }
 
@@ -70099,7 +70521,7 @@ fn adt_type_args_are_concrete(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
 ) -> bool {
-    render_adt_type_args(adt, llbc, 0)
+    render_adt_type_args(adt, llbc, 0, no_tombstoned_leaves())
         .iter()
         .all(|arg| type_arg_is_concrete(arg))
 }
@@ -70158,13 +70580,14 @@ fn enum_instantiation_suffix_from_args(type_args: &[String]) -> Option<String> {
 pub(crate) fn adt_head_instantiation_suffix(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let def_id = type_decl_ref_adt_id(adt)?;
     let td = llbc.type_by_id(def_id)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
         return None;
     }
-    enum_instantiation_suffix_from_args(&render_adt_type_args(adt, llbc, 0))
+    enum_instantiation_suffix_from_args(&render_adt_type_args(adt, llbc, 0, tombstoned))
 }
 
 /// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).
@@ -70172,9 +70595,10 @@ fn charon_adt_to_ast_string(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
     depth: usize,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> String {
     let id = adt.get("id");
-    let type_args: Vec<String> = render_adt_type_args(adt, llbc, depth);
+    let type_args: Vec<String> = render_adt_type_args(adt, llbc, depth, tombstoned);
     // `id` is a `TypeDecl` id. `builtin` names a compiler ADT (`Tuple`,
     // `Box`, `Str`) when the declaration is not a user type.
     if adt.get("builtin").and_then(serde_json::Value::as_str) == Some("Tuple") {
@@ -70188,15 +70612,20 @@ fn charon_adt_to_ast_string(
         return charon_builtin_adt_to_ast_string(builtin, &type_args);
     }
     if let Some(def_id) = id.and_then(serde_json::Value::as_u64) {
-        let name = llbc
-            .type_by_id(def_id)
+        let td = llbc.type_by_id(def_id);
+        let name = td
             .map(|td| td.item_meta.name_path())
             .unwrap_or_else(|| format!("??adt#{def_id}"));
-        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
-        if type_args.is_empty() {
-            return leaf;
+        // A leaf [`harden_duplicate_leaf_metadata`] withdrew is painted
+        // as the crate-stripped path, matching [`adt_node_class_root_leaf`].
+        let mut head = name.rsplit("::").next().unwrap_or(&name).to_string();
+        if tombstoned.contains(&head) {
+            head = tombstoned_owner_spelling(&name, &head, tombstoned);
         }
-        return format!("{leaf}<{}>", type_args.join(","));
+        if type_args.is_empty() {
+            return head;
+        }
+        return format!("{head}<{}>", type_args.join(","));
     }
     // A field type copied from another crate names the ADT by path. The
     // leaf is the same spelling the defining crate's numeric id rendered.
@@ -78444,7 +78873,9 @@ fn rust_vec_std_leaf(segments: &[String]) -> Option<&str> {
 
 /// `alloc::vec::from_elem`, the call `vec![item; count]` lowers to.
 fn is_alloc_vec_from_elem(segments: &[String]) -> bool {
-    matches!(segments, [a, b, c] if a == "alloc" && b == "vec" && c == "from_elem")
+    segments.len() >= 2
+        && segments[segments.len() - 2] == "vec"
+        && segments[segments.len() - 1] == "from_elem"
 }
 
 /// The `Vec` operation and item kind of a `Vec::new()` /
@@ -90571,6 +91002,391 @@ mod tests {
         assert_eq!(offsets.get("loop_header_pc"), Some(&8));
     }
 
+    /// Two type aliases of one generic struct are two lltype STRUCTs
+    /// (`descr.py` `get_field_descr(STRUCT, fieldname)`). Their Charon
+    /// layouts must stay on the instantiated identities, not the template.
+    #[test]
+    fn alias_instantiations_keep_their_own_field_offsets() {
+        let span = serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }});
+        let item_meta = |name: &str| {
+            serde_json::json!({
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": [name, 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let named_field = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                "attr_info": null
+            })
+        };
+        let adt = |id: u64, types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "Adt": {
+                    "id": id,
+                    "generics": {
+                        "regions": [],
+                        "types": types,
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            })
+        };
+        let layout = |size: u64, field_offsets: Vec<u64>| {
+            serde_json::json!([{
+                "key": "fixture-target",
+                "value": {
+                    "size": size,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": field_offsets}],
+                    "repr": {"transparent": false}
+                }
+            }])
+        };
+        let key = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta("IdentityKey"),
+            "kind": {"Struct": []},
+            "layout": layout(8, vec![])
+        });
+        let value = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta("PyObjectRef"),
+            "kind": {"Struct": []},
+            "layout": layout(8, vec![])
+        });
+        let rdict = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta("RDict"),
+            "kind": {"Struct": [
+                named_field("indexes"),
+                named_field("entries"),
+                named_field("num_live_items")
+            ]},
+            "layout": layout(24, vec![0, 8, 16])
+        });
+        let int_alias = serde_json::json!({
+            "def_id": 3,
+            "item_meta": item_meta("IntDictStorage"),
+            "kind": {"Alias": {"aliased_ty": adt(0, vec![
+                serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+                adt(2, vec![])
+            ])}},
+            "layout": layout(24, vec![0, 8, 16])
+        });
+        let ident_alias = serde_json::json!({
+            "def_id": 4,
+            "item_meta": item_meta("IdentityDictStorage"),
+            "kind": {"Alias": {"aliased_ty": adt(0, vec![
+                adt(1, vec![]),
+                adt(2, vec![])
+            ])}},
+            "layout": layout(48, vec![16, 24, 32])
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [rdict, key, value, int_alias, ident_alias],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let (_, _, _, _, _, _, exact_layouts, _) = super::derive_program_metadata(
+            &llbc,
+            &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        );
+        let template = majit_ir::descr::StructId::from_canonical("RDict");
+        let int_sid = template.instantiate("<i64,PyObjectRef>");
+        let ident_sid = template.instantiate("<IdentityKey,PyObjectRef>");
+        assert_eq!(
+            exact_layouts
+                .get(&int_sid)
+                .and_then(|exact| exact.field_offsets.get("num_live_items").copied()),
+            Some(16)
+        );
+        assert_eq!(
+            exact_layouts
+                .get(&ident_sid)
+                .and_then(|exact| exact.field_offsets.get("num_live_items").copied()),
+            Some(32)
+        );
+        assert_eq!(
+            exact_layouts
+                .get(&template)
+                .and_then(|exact| exact.field_offsets.get("num_live_items").copied()),
+            Some(16)
+        );
+    }
+
+    /// Production `pyre-object.ullbc`: Identity vs Int `RDict` aliases must
+    /// keep distinct instantiated STRUCTs and the identity length helper's
+    /// `num_live_items` FieldRead must name the identity STRUCT.
+    #[test]
+    fn production_rdict_alias_instances_keep_distinct_num_live_items() {
+        use crate::model::OpKind;
+        use majit_charon_reader::ullbc::TypeDeclKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        let tombstoned = super::no_tombstoned_leaves();
+        let ident_td = llbc
+            .iter_type_decls()
+            .find(|td| td.item_meta.name_path().ends_with("::IdentityDictStorage"))
+            .expect("IdentityDictStorage alias");
+        let int_td = llbc
+            .iter_type_decls()
+            .find(|td| td.item_meta.name_path().ends_with("::IntDictStorage"))
+            .expect("IntDictStorage alias");
+        let TypeDeclKind::Alias(ident_body) = &ident_td.kind else {
+            panic!("IdentityDictStorage is an alias");
+        };
+        let TypeDeclKind::Alias(int_body) = &int_td.kind else {
+            panic!("IntDictStorage is an alias");
+        };
+        let ident_adt = super::alias_target_adt(ident_body, &llbc).expect("identity Adt");
+        let int_adt = super::alias_target_adt(int_body, &llbc).expect("int Adt");
+        let rdict = llbc
+            .iter_type_decls()
+            .find(|td| td.item_meta.name_path().ends_with("::rordereddict::RDict"))
+            .expect("RDict");
+        let TypeDeclKind::Struct(rdict_fields) = &rdict.kind else {
+            panic!("RDict is a struct");
+        };
+        let live_idx = rdict_fields
+            .iter()
+            .position(|f| f.name.as_deref() == Some("num_live_items"))
+            .expect("RDict::num_live_items field");
+        // Same Charon source `register_alias_instantiation_layouts` reads
+        // (`TypeDecl::layout_for_target` + `TypeLayout::struct_field_offset`
+        // on the alias TypeDecl), used here without going through
+        // `exact_layouts`.
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let ident_llbc_off = ident_td
+            .layout_for_target(&llbc, &target)
+            .and_then(|layout| layout.struct_field_offset(live_idx))
+            .expect("IdentityDictStorage Charon offset for num_live_items");
+        let int_llbc_off = int_td
+            .layout_for_target(&llbc, &target)
+            .and_then(|layout| layout.struct_field_offset(live_idx))
+            .expect("IntDictStorage Charon offset for num_live_items");
+        let canonical = super::strip_crate_prefix(&rdict.item_meta.name_path());
+        let template = majit_ir::descr::StructId::from_canonical(&canonical);
+        let ident_sid = super::concrete_adt_struct_id(template, Some(ident_adt), &llbc, tombstoned);
+        let int_sid = super::concrete_adt_struct_id(template, Some(int_adt), &llbc, tombstoned);
+        let (_, _, fields, _, _, _, exact_layouts, struct_ids) = super::derive_program_metadata(
+            &llbc,
+            &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        );
+        let ident_off = exact_layouts
+            .get(&ident_sid)
+            .and_then(|exact| exact.field_offsets.get("num_live_items").copied());
+        let int_off = exact_layouts
+            .get(&int_sid)
+            .and_then(|exact| exact.field_offsets.get("num_live_items").copied());
+        assert_ne!(ident_sid, int_sid, "instances must not share a STRUCT");
+        assert_eq!(ident_off, Some(ident_llbc_off), "identity num_live_items");
+        assert_eq!(int_off, Some(int_llbc_off), "int num_live_items");
+
+        let graph = super::lower_function(&llbc, "w_dict_length_identity_strategy")
+            .expect("lower identity length helper");
+        let reads: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => Some((
+                    field.name.clone(),
+                    field.owner_root.clone(),
+                    field.owner_id.map(|id| id.as_u64()),
+                )),
+                _ => None,
+            })
+            .collect();
+        let live = reads
+            .iter()
+            .find(|(name, _, _)| name == "num_live_items")
+            .expect("num_live_items FieldRead");
+        assert_eq!(
+            live.2,
+            Some(ident_sid.as_u64()),
+            "FieldRead owner_id must be the identity STRUCT, got {live:?}"
+        );
+
+        // Populate CallControl the way `lib.rs` does, then the assembler
+        // `fielddescrof` must read the identity STRUCT's offset. Register
+        // only this generic's spellings: the full pyre-object table would
+        // publish `W_FloatObject` into the process-global name map and
+        // race `fuse_boxing_alloc_lowers_float_box_cluster`.
+        let rdict_ids: std::collections::HashMap<_, _> = struct_ids
+            .iter()
+            .filter(|(name, _)| name.contains("RDict"))
+            .map(|(name, id)| (name.clone(), *id))
+            .collect();
+        let _registry = crate::test_support::register_struct_ids_serialized(rdict_ids.clone());
+        let pair_fields: std::collections::HashMap<String, Vec<(String, String)>> =
+            fields.fields.clone().into();
+        let provider = crate::layout::HeuristicLayoutProvider::from_struct_fields(
+            &pair_fields,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        let mut cc = crate::codewriter::call::CallControl::new();
+        cc.set_struct_fields(fields.clone());
+        for entry in crate::layout::program_struct_layouts(&fields, &exact_layouts, &provider) {
+            cc.set_struct_layout(entry.sid, entry.layout);
+        }
+        let ident_layout_off = cc.struct_layout_for_id(ident_sid).and_then(|layout| {
+            layout
+                .fields
+                .iter()
+                .find(|f| f.name == "num_live_items")
+                .map(|f| f.offset)
+        });
+        let int_layout_off = cc.struct_layout_for_id(int_sid).and_then(|layout| {
+            layout
+                .fields
+                .iter()
+                .find(|f| f.name == "num_live_items")
+                .map(|f| f.offset)
+        });
+        assert_eq!(ident_layout_off, Some(ident_llbc_off as usize));
+        assert_eq!(int_layout_off, Some(int_llbc_off as usize));
+
+        let ident_field =
+            crate::model::FieldDescriptor::new("num_live_items", Some("RDict".to_string()))
+                .with_owner_id(Some(ident_sid));
+        let int_field =
+            crate::model::FieldDescriptor::new("num_live_items", Some("RDict".to_string()))
+                .with_owner_id(Some(int_sid));
+        let descr_off = |field: &crate::model::FieldDescriptor| {
+            match crate::codewriter::assembler::fielddescrof(
+                field,
+                &crate::model::ValueType::Int,
+                Some(&cc),
+                true,
+            ) {
+                crate::jitcode::BhDescr::Field {
+                    offset,
+                    parent: Some(parent),
+                    ..
+                } => (offset, parent.type_id),
+                other => panic!("num_live_items Field descr, got {other:?}"),
+            }
+        };
+        let (ident_descr_off, ident_ty) = descr_off(&ident_field);
+        let (int_descr_off, int_ty) = descr_off(&int_field);
+        assert_eq!(
+            ident_descr_off, ident_llbc_off as usize,
+            "identity getfield offset"
+        );
+        assert_eq!(int_descr_off, int_llbc_off as usize, "int getfield offset");
+        assert_eq!(ident_ty, ident_sid.as_u64());
+        assert_eq!(int_ty, int_sid.as_u64());
+
+        // A 4-crate merge withdraws the bare leaf. The FieldRead still
+        // names the instance STRUCT; the descr must keep that offset.
+        let mut withdrawn = rdict_ids.clone();
+        withdrawn.insert("RDict".to_string(), None);
+        majit_ir::descr::register_struct_ids(withdrawn);
+        let (ident_descr_off, ident_ty) = descr_off(&ident_field);
+        let (int_descr_off, int_ty) = descr_off(&int_field);
+        assert_eq!(
+            ident_descr_off, ident_llbc_off as usize,
+            "identity getfield offset, withdrawn leaf"
+        );
+        assert_eq!(
+            int_descr_off, int_llbc_off as usize,
+            "int getfield offset, withdrawn leaf"
+        );
+        assert_eq!(ident_ty, ident_sid.as_u64());
+        assert_eq!(int_ty, int_sid.as_u64());
+
+        // A 4-crate merge can withdraw the instantiated spelling itself.
+        // Exact layouts stay keyed by STRUCT identity and must still
+        // install that STRUCT's Charon offsets.
+        let mut withdrawn_instances = rdict_ids.clone();
+        withdrawn_instances.insert("RDict".to_string(), None);
+        for name in rdict_ids.keys() {
+            if name.contains('<') {
+                withdrawn_instances.insert(name.clone(), None);
+            }
+        }
+        majit_ir::descr::register_struct_ids(withdrawn_instances);
+        let mut cc_withdrawn = crate::codewriter::call::CallControl::new();
+        cc_withdrawn.set_struct_fields(fields.clone());
+        for entry in crate::layout::program_struct_layouts(&fields, &exact_layouts, &provider) {
+            cc_withdrawn.set_struct_layout(entry.sid, entry.layout);
+        }
+        let ident_layout_off = cc_withdrawn
+            .struct_layout_for_id(ident_sid)
+            .and_then(|layout| {
+                layout
+                    .fields
+                    .iter()
+                    .find(|f| f.name == "num_live_items")
+                    .map(|f| f.offset)
+            });
+        assert_eq!(
+            ident_layout_off,
+            Some(ident_llbc_off as usize),
+            "withdrawn instantiated spelling still installs the identity STRUCT"
+        );
+
+        // FieldRead paints type-args with the crate's tombstones. Re-register
+        // the alias under that STRUCT so a withdrawn hasher leaf does not
+        // miss the Charon row.
+        let mut tombstoned = std::collections::HashSet::new();
+        tombstoned.insert("RandomState".to_string());
+        let ident_sid_tomb =
+            super::concrete_adt_struct_id(template, Some(ident_adt), &llbc, &tombstoned);
+        let mut fields_tomb = fields.clone();
+        let mut ids_tomb = struct_ids.clone();
+        let mut exact_tomb = exact_layouts.clone();
+        super::register_alias_instantiation_layouts(
+            &llbc,
+            &std::env::var("TARGET").unwrap_or_default(),
+            &mut fields_tomb,
+            &mut ids_tomb,
+            &mut exact_tomb,
+            &tombstoned,
+            &std::collections::HashSet::new(),
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            exact_tomb
+                .get(&ident_sid_tomb)
+                .and_then(|exact| exact.field_offsets.get("num_live_items").copied()),
+            Some(ident_llbc_off),
+            "tombstoned FieldRead STRUCT must keep the identity Charon offset"
+        );
+    }
+
     /// An `ArrayRead` element is addressable two ways: a scalar names its
     /// spelling so the descr computes the real width, or a thin pointer takes
     /// the identity-less mint's one-target-word assumption, which is already
@@ -102323,6 +103139,56 @@ mod tests {
         })
     }
 
+    fn opaque_type(def_id: u64, path: &[&str]) -> serde_json::Value {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": "Opaque",
+            "layout": null
+        })
+    }
+
+    fn result_enum(def_id: u64) -> serde_json::Value {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["result", 0]},
+                    {"Ident": ["Result", 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": {"Enum": [
+                {
+                    "name": "Ok",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                },
+                {
+                    "name": "Err",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                }
+            ]}
+        })
+    }
+
     fn llbc_with_types(
         crate_name: &str,
         types: Vec<serde_json::Value>,
@@ -102447,13 +103313,14 @@ mod tests {
             })
             .into(),
         );
+        let tomb = super::no_tombstoned_leaves();
         assert_eq!(
-            super::tyref_enum_instantiation_suffix(&wrapped, &llbc),
+            super::tyref_enum_instantiation_suffix(&wrapped, &llbc, tomb),
             "<i64>"
         );
         let bare_id = TyRef::Other(serde_json::json!({"Adt": {"id": 0}}).into());
         assert_eq!(
-            super::tyref_enum_instantiation_suffix(&bare_id, &llbc),
+            super::tyref_enum_instantiation_suffix(&bare_id, &llbc, tomb),
             "",
             "a TypeDeclRef with no generics and no instantiation() has no suffix"
         );
@@ -102999,6 +103866,100 @@ mod tests {
             super::adt_node_class_root_with(&adt_node(0), &llbc, &tombstoned).as_deref(),
             Some("ClassObject"),
             "the class-static narrow and the field registry both key the bare leaf"
+        );
+    }
+
+    #[test]
+    fn core_alloc_layout_does_not_share_typeobject_layout_leaf() {
+        // `std_gc_array_size` takes `core::alloc::layout::Layout` (Opaque,
+        // lang_item AllocLayout). `typeobject::Layout` is a workspace Struct
+        // of the same leaf. Including Opaque in the census withdraws the
+        // shared leaf so intern is injective (`bookkeeper.py`
+        // `getuniqueclassdef`). RPython has no Layout object
+        // (`llmemory.sizeof` / `raw_malloc`).
+        let llbc = llbc_with_types(
+            "pyre_object",
+            vec![
+                code_struct(0, &["pyre_object", "typeobject", "Layout"]),
+                opaque_type(1, &["core", "alloc", "layout", "Layout"]),
+                opaque_type(2, &["core", "alloc", "layout", "LayoutError"]),
+                result_enum(3),
+            ],
+            vec![],
+        );
+        let tomb = super::tombstoned_leaves_of(&llbc);
+        assert!(
+            tomb.contains("Layout"),
+            "two Layout declarations withdraw the bare leaf, got {tomb:?}"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &llbc, &tomb).as_deref(),
+            Some("typeobject::Layout"),
+            "workspace typeobject::Layout intern is the crate-stripped path"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(1), &llbc, &tomb).as_deref(),
+            Some("alloc::layout::Layout"),
+            "core Layout intern is the crate-stripped path"
+        );
+        let result_adt = serde_json::json!({
+            "id": 3,
+            "generics": {
+                "regions": [],
+                "types": [
+                    {"Adt": {
+                        "id": 1,
+                        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+                    }},
+                    {"Adt": {
+                        "id": 2,
+                        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+                    }}
+                ],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        });
+        let suffix = super::adt_head_instantiation_suffix(
+            result_adt.as_object().expect("Adt object"),
+            &llbc,
+            &tomb,
+        );
+        let suffix = suffix.expect("Result<Layout, LayoutError> splits");
+        assert!(
+            suffix.contains("alloc::layout::Layout") && !suffix.contains("<Layout,"),
+            "Result suffix must qualify the Opaque Layout arg, got {suffix}"
+        );
+        let option_llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+        let option_tomb = super::tombstoned_leaves_of(&option_llbc);
+        assert!(
+            !option_tomb.contains("Option"),
+            "a unique core enum is not an ambiguous leaf"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(
+                &option_adt_node(0, option_int_arg(true)),
+                &option_llbc,
+                &option_tomb
+            )
+            .as_deref(),
+            Some("Option<i64>"),
+            "core enums keep the leaf so Option intern is unchanged"
+        );
+        let vec_llbc = llbc_with_types(
+            "fixture",
+            vec![opaque_type(0, &["alloc", "vec", "Vec"])],
+            vec![],
+        );
+        let vec_tomb = super::tombstoned_leaves_of(&vec_llbc);
+        assert!(
+            !vec_tomb.contains("Vec"),
+            "a unique Opaque keeps the leaf so from_elem still matches"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &vec_llbc, &vec_tomb).as_deref(),
+            Some("Vec"),
+            "unique Opaque intern stays the leaf"
         );
     }
 
@@ -114583,6 +115544,55 @@ mod tests {
                 "Some of Option<usize> must intern under the instantiation, got {owner:?} from {some_owners:?}"
             );
         }
+        // The payload is `core::alloc::layout::Layout`, not
+        // `typeobject::Layout`. RPython has no Layout object
+        // (`llmemory.sizeof` / `raw_malloc`); intern must not share the
+        // leaf with the workspace classdef.
+        let layout_inputs: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { class_root, .. } => class_root.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            layout_inputs
+                .iter()
+                .any(|r| r == "alloc::layout::Layout" || r == "core::alloc::layout::Layout"),
+            "std_gc_array_size payload class_root must be the alloc Layout, got {layout_inputs:?}"
+        );
+        assert!(
+            layout_inputs
+                .iter()
+                .all(|r| r != "Layout" && !r.ends_with("typeobject::Layout")),
+            "payload must not intern as typeobject::Layout, got {layout_inputs:?}"
+        );
+        let layout_pos: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. }
+                    if (field.name == "__pos_0" || field.name == "__pos_1")
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|o| o.contains("Layout") && !o.contains("Option")) =>
+                {
+                    Some(field.owner_root.clone().unwrap_or_default())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !layout_pos.is_empty()
+                && layout_pos.iter().all(|o| {
+                    o == "alloc::layout::Layout" || o == "core::alloc::layout::Layout"
+                }),
+            "Layout size/align reads must key the alloc Layout owner, got {layout_pos:?}"
+        );
     }
 
     #[test]

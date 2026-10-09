@@ -284,14 +284,18 @@ pub(crate) fn tyref_is_result(ty: &TyRef, llbc: &Llbc) -> bool {
 /// both writers agree on one ClassDef and the `__pos_0` payload no longer
 /// unions across instantiations.  Both the `Ok` and `Err` shells of one
 /// callee share this suffix so the two variants share one base ClassDef.
-pub(crate) fn tyref_result_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+pub(crate) fn tyref_result_instantiation_suffix(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
     let adt = body.get("Adt")?.as_object()?;
-    crate::front::mir::adt_head_instantiation_suffix(adt, llbc)
+    crate::front::mir::adt_head_instantiation_suffix(adt, llbc, tombstoned)
 }
 
 /// True when `ty` is `Result<(), PyError>` — the Ok payload is the unit

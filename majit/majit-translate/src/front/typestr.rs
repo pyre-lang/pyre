@@ -171,8 +171,10 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     }
     // `{cap, ptr, len}` — the indexed pointer is the buffer, which has
     // no length word. Length lives in the third word of the Vec value.
-    let vec_tail = inner.rsplit("::").next().unwrap_or(inner);
-    if vec_tail.starts_with("Vec<") {
+    // Compare the ADT constructor path (`alloc::vec::Vec`), not a
+    // crate-stripped leaf: a qualified type argument (`Vec<module::T>`)
+    // still names this declaration.
+    if crate::vec_layout::spelling_is_alloc_vec(inner) {
         return true;
     }
     // Length-prefixed wrappers carry `<` (generic) or `(` (paren-style
@@ -237,7 +239,13 @@ mod tests {
 
     #[test]
     fn rust_vec_buffer_has_no_length_header() {
-        for id in ["Vec<u8>", "alloc::vec::Vec<u8>", "&mut Vec<i64>"] {
+        for id in [
+            "Vec<u8>",
+            "alloc::vec::Vec<u8>",
+            "&mut Vec<i64>",
+            "Vec<module::marshal::Rooted>",
+            "vec::Vec<module::marshal::Rooted>",
+        ] {
             assert!(
                 nolength_from_array_type_id(Some(id)),
                 "{id} indexes a headerless buffer"

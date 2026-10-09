@@ -461,6 +461,21 @@ impl TypeDecl {
         Some(layout)
     }
 
+    /// Whether Charon recorded a layout row whose key equals `target`.
+    ///
+    /// An empty `target` is the sole-extraction case (`TARGET` unset) and
+    /// matches. A non-empty `target` matches only an explicit key: the
+    /// sole-entry fallback in [`Self::layout_for_target`] still feeds the
+    /// codewriter for types with no field rows (`alloc::layout::Layout`),
+    /// but `llmemory.offsetof` of an instantiated STRUCT must not be a
+    /// foreign triple's offsets (`lltype.Signed` is WORD).
+    pub fn has_layout_entry_for(&self, target: &str) -> bool {
+        let Some(raw) = self.layout.as_ref() else {
+            return target.is_empty();
+        };
+        layout_json_has_target(raw.get(), target)
+    }
+
     /// Byte size and alignment, even when a field offset is still a
     /// deduplicated expression. `size_of` / `align_of` only need these two
     /// words; [`Self::layout_for_target`] refuses the whole layout when an
@@ -512,6 +527,18 @@ fn select_target_layout(mut entries: Vec<TargetLayout>, target: &str) -> Option<
         return Some(entries.swap_remove(0).value);
     }
     None
+}
+
+/// Whether `raw` layout JSON names `target`. Empty `target` is the
+/// sole-extraction case and matches.
+fn layout_json_has_target(raw: &str, target: &str) -> bool {
+    if target.is_empty() {
+        return true;
+    }
+    let Ok(entries) = serde_json::from_str::<Vec<TargetLayout>>(raw) else {
+        return false;
+    };
+    entries.iter().any(|entry| entry.key == target)
 }
 
 /// A layout integer written inline: a bare `u64`, `{"chosen": <u64>}`, or a
@@ -2962,6 +2989,17 @@ mod tests {
 
         // empty list → None
         assert!(select_target_layout(Vec::new(), "aarch64-apple-darwin").is_none());
+    }
+
+    /// A host-only layout row is not a wasm32 offsetof. Instantiated
+    /// STRUCTs (`RDict<…>` via an alias) must not publish that row as
+    /// `num_live_items` (`rordereddict.rtype_len` / `llmemory.offsetof`).
+    #[test]
+    fn has_layout_entry_for_requires_the_named_triple() {
+        let host = r#"[{"key":"aarch64-apple-darwin","value":{"variant_layouts":[{"field_offsets":[16]}]}}]"#;
+        assert!(layout_json_has_target(host, ""));
+        assert!(layout_json_has_target(host, "aarch64-apple-darwin"));
+        assert!(!layout_json_has_target(host, "wasm32-unknown-unknown"));
     }
 
     /// A union body keeps its field list. `#[serde(other)]` turns any tag this
