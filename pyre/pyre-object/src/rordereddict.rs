@@ -425,7 +425,9 @@ impl<K, V, S> RDict<K, V, S> {
 
     /// `d.num_live_items` — the number of pairs, not the number of slots.
     ///
-    /// `rordereddict.rtype_len` / `ll_dict_len` is `getfield(d, "num_live_items")`.
+    /// `rordereddict.py ll_dict_len` / `OrderedDictRepr.rtype_len` is
+    /// `return d.num_live_items`, so a traced `AbstractTypedStrategy.length`
+    /// records `getfield num_live_items` on this header.
     #[inline]
     pub fn num_live_items(&self) -> usize {
         self.num_live_items

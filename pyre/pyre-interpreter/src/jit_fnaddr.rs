@@ -2255,6 +2255,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_dict_length_bytes_strategy",
         pyre_object::dictmultiobject::w_dict_length_bytes_strategy,
     );
+    upa1(
+        &mut entries,
+        "pyre_object::identitydict::w_dict_length_identity_strategy",
+        "pyre_object::w_dict_length_identity_strategy",
+        pyre_object::identitydict::w_dict_length_identity_strategy,
+    );
     // The wtf8-keyed dict adapters residualise their fallible `Wtf8::as_str`
     // dispatch: `wtf8_key_is_utf8` is the `bool` validity probe, and
     // `wtf8_surrogate_key_str_object` wraps the cold lone-surrogate
