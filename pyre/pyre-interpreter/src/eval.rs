@@ -7100,6 +7100,20 @@ result = (
         walk_global_prebuilt_roots(visitor);
     }
 
+    fn unpublished_rawdict_minor_walk(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !DECL_SHIPPED_WALK.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        pyre_object::gc_roots::walk_shadow_stack(|slot| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+            let value = *slot;
+            unsafe {
+                walk_raw_immortal_roots(value, visitor);
+            }
+        });
+        walk_global_prebuilt_roots(visitor);
+    }
+
     fn declaration_test_owns(addr: usize) -> bool {
         DECL_OWNED.with(|slots| slots.borrow().contains(&addr))
     }
@@ -7128,6 +7142,20 @@ result = (
             prev_dirty: pyre_object::gc_roots::prebuilt_roots_dirty(),
             roots_len: pyre_object::typedef::test_declaration_roots_len(),
         }
+    }
+
+    unsafe fn root_declaration(value: PyObjectRef) -> *mut PyObjectRef {
+        let definition =
+            pyre_object::typedef::leak_typedef(&pyre_object::INSTANCE_TYPE, false, false);
+        unsafe {
+            (*(definition as *mut pyre_object::typedef::TypeDef))
+                .rawdict
+                .insert(
+                    "slot".into(),
+                    pyre_object::typedef::TypeDefValue::root(value),
+                );
+        }
+        pyre_object::typedef::test_last_declaration_slot()
     }
 
     /// A clean minor still walks TypeDef.rawdict slots (`incminimark.py`
@@ -7162,8 +7190,7 @@ result = (
         let young_tid = gc.register_type(TypeInfo::simple(16));
         let young = gc.alloc_nursery_typed(young_tid, 16);
         DECL_OWNED.with(|slots| slots.borrow_mut().push(young.0));
-        let _rooted = unsafe { pyre_object::typedef::TypeDefValue::root(young.0 as PyObjectRef) };
-        let slot = pyre_object::typedef::test_last_declaration_slot();
+        let slot = unsafe { root_declaration(young.0 as PyObjectRef) };
         let young_before = young.0;
         pyre_object::gc_roots::clear_prebuilt_roots_dirty();
 
@@ -7177,8 +7204,7 @@ result = (
         pyre_object::typedef::test_truncate_declaration_roots(roots_len);
         let young2 = gc.alloc_nursery_typed(young_tid, 16);
         DECL_OWNED.with(|slots| slots.borrow_mut().push(young2.0));
-        let _rooted2 = unsafe { pyre_object::typedef::TypeDefValue::root(young2.0 as PyObjectRef) };
-        let slot2 = pyre_object::typedef::test_last_declaration_slot();
+        let slot2 = unsafe { root_declaration(young2.0 as PyObjectRef) };
         let young2_before = young2.0;
         pyre_object::gc_roots::clear_prebuilt_roots_dirty();
         DECL_SHIPPED_WALK.store(true, Ordering::Release);
@@ -7232,11 +7258,11 @@ result = (
         assert!(!pyre_object::gc_hook::try_gc_owns_object(
             gateway as pyre_object::gc_hook::GCREF
         ));
-        let _rooted = unsafe { pyre_object::typedef::TypeDefValue::root(gateway) };
+        let slot = unsafe { root_declaration(gateway) };
 
         let mut seen = Vec::new();
         unsafe {
-            let value = *pyre_object::typedef::test_last_declaration_slot();
+            let value = *slot;
             assert_eq!(value, gateway);
             assert!(!pyre_object::gc_hook::try_gc_owns_object(
                 value as pyre_object::gc_hook::GCREF
@@ -7262,5 +7288,109 @@ result = (
             unsafe { (*(gateway as *mut pyre_object::gateway::interp2app))._code as usize };
         assert_ne!(forwarded, young_before);
         assert!(gc.is_managed_heap_object(forwarded));
+    }
+
+    /// iterobject.rs builds a local IndexMap of `TypeDefValue::root` values
+    /// and only later calls `TypeDef.from_rawdict`. A minor between two
+    /// gateway allocations must forward the first gateway through the house
+    /// pin so the published rawdict stores live pointers.
+    #[test]
+    fn unpublished_rawdict_forwards_across_minor_between_gateways() {
+        use indexmap::IndexMap;
+        use majit_gc::GcAllocator;
+        use majit_gc::collector::{GcConfig, MiniMarkGC};
+        use majit_gc::trace::TypeInfo;
+        use pyre_object::gc_roots::RootedItems;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        crate::module::thread::ensure_runtime_thread();
+        let _restore = restore_declaration_test_state();
+
+        let descr = <pyre_object::gateway::interp2app as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descr.pytype_ptr as usize,
+            descr.ptr_offsets,
+        );
+
+        majit_gc::shadow_stack::register_extra_root_walker(
+            unpublished_rawdict_minor_walk,
+            "unpublished_rawdict_minor",
+        );
+        pyre_object::gc_hook::register_gc_owns_object_hook(declaration_test_owns);
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+
+        let mut items = RootedItems::new();
+        let young1 = gc.alloc_nursery_typed(young_tid, 16);
+        let young1_before = young1.0;
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young1_before));
+        let gateway1 =
+            unsafe { pyre_object::gateway::interp2app::new(young1_before as PyObjectRef, "first") };
+        items.push(young1_before as PyObjectRef);
+        items.push(gateway1);
+
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+        DECL_SHIPPED_WALK.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+
+        let young2 = gc.alloc_nursery_typed(young_tid, 16);
+        let young2_before = young2.0;
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young2_before));
+        let gateway2 = unsafe {
+            pyre_object::gateway::interp2app::new(young2_before as PyObjectRef, "second")
+        };
+        items.push(young2_before as PyObjectRef);
+        items.push(gateway2);
+
+        let mut entries = IndexMap::new();
+        unsafe {
+            entries.insert(
+                "first".into(),
+                pyre_object::typedef::TypeDefValue::root(items.get(1)),
+            );
+            entries.insert(
+                "first_code".into(),
+                pyre_object::typedef::TypeDefValue::root(items.get(0)),
+            );
+            entries.insert(
+                "second".into(),
+                pyre_object::typedef::TypeDefValue::root(items.get(3)),
+            );
+            entries.insert(
+                "second_code".into(),
+                pyre_object::typedef::TypeDefValue::root(items.get(2)),
+            );
+            let definition = pyre_object::typedef::TypeDef::from_rawdict(
+                "unpublished_probe",
+                vec![],
+                entries,
+                &pyre_object::INSTANCE_TYPE,
+            );
+            let slot_ptr = |name: &str| match (*definition).rawdict.get(name) {
+                Some(pyre_object::typedef::TypeDefValue::Root(slot)) => *slot.get(),
+                _ => panic!("expected Root slot {name}"),
+            };
+            let first = slot_ptr("first");
+            let first_code = slot_ptr("first_code");
+            let second = slot_ptr("second");
+            let second_code = slot_ptr("second_code");
+            assert_eq!(first, items.get(1));
+            assert_eq!(first_code, items.get(0));
+            assert_eq!(second, items.get(3));
+            assert_eq!(second_code, items.get(2));
+            let forwarded = (*(first as *mut pyre_object::gateway::interp2app))._code as usize;
+            assert_eq!(forwarded, first_code as usize);
+            assert_ne!(forwarded, young1_before);
+            assert!(gc.is_managed_heap_object(forwarded));
+            let code2 = (*(second as *mut pyre_object::gateway::interp2app))._code as usize;
+            assert_eq!(code2, young2_before);
+            assert_eq!(code2, second_code as usize);
+        }
     }
 }
