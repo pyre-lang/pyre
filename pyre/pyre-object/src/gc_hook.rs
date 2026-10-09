@@ -875,13 +875,25 @@ pub fn gc_identity_hash(obj_addr: usize) -> usize {
 /// remembering.
 pub type GcWriteBarrierHookFn = fn(obj: GCREF);
 
+/// `incminimark.py` `write_barrier_from_array(addr_array, index)`.
+/// `framework.py` `transform_generic_set` emits this for a
+/// `setarrayitem` / `setinteriorfield` into a GC array part
+/// (`_set_into_gc_array_part`).
+pub type GcWriteBarrierFromArrayHookFn = fn(obj: GCREF, index: usize);
+
 majit_gc::global_hook!(static GC_WRITE_BARRIER_HOOK: GcWriteBarrierHookFn);
+majit_gc::global_hook!(static GC_WRITE_BARRIER_FROM_ARRAY_HOOK: GcWriteBarrierFromArrayHookFn);
 majit_gc::global_hook!(static GC_WRITE_BARRIER_MANAGED_HOOK: GcWriteBarrierHookFn);
 majit_gc::global_hook!(static GC_WRITE_BARRIER_BEFORE_MOVE_HOOK: GcWriteBarrierHookFn);
 
 /// Install the write-barrier callback.
 pub fn register_gc_write_barrier_hook(hook: GcWriteBarrierHookFn) {
     GC_WRITE_BARRIER_HOOK.set(Some(hook));
+}
+
+/// Install the array write-barrier callback.
+pub fn register_gc_write_barrier_from_array_hook(hook: GcWriteBarrierFromArrayHookFn) {
+    GC_WRITE_BARRIER_FROM_ARRAY_HOOK.set(Some(hook));
 }
 
 /// Install the callback run before an object's items are permuted in place.
@@ -897,6 +909,11 @@ pub fn register_gc_write_barrier_managed_hook(hook: GcWriteBarrierHookFn) {
 /// Remove the write-barrier callback.
 pub fn clear_gc_write_barrier_hook() {
     GC_WRITE_BARRIER_HOOK.set(None);
+}
+
+/// Remove the array write-barrier callback.
+pub fn clear_gc_write_barrier_from_array_hook() {
+    GC_WRITE_BARRIER_FROM_ARRAY_HOOK.set(None);
 }
 
 /// Remove the before-move barrier callback.
@@ -921,6 +938,24 @@ pub extern "C" fn try_gc_write_barrier(obj: GCREF) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Run `write_barrier_from_array(addr_array, index)` when the array is
+/// collector-owned. A pre-hook immortal array has no GC header, so this
+/// keeps [`try_gc_write_barrier`].
+// `dont_look_inside`: host hook dispatch, as for `try_gc_write_barrier`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn try_gc_write_barrier_from_array(obj: GCREF, index: usize) -> bool {
+    if !try_gc_owns_object(obj) {
+        return try_gc_write_barrier(obj);
+    }
+    match GC_WRITE_BARRIER_FROM_ARRAY_HOOK.get() {
+        Some(f) => {
+            f(obj, index);
+            true
+        }
+        None => try_gc_write_barrier(obj),
     }
 }
 
@@ -1173,6 +1208,12 @@ mod tests {
 
     fn mock_write_barrier(_obj: GCREF) {}
 
+    fn mock_write_barrier_from_array(_obj: GCREF, _index: usize) {}
+
+    fn mock_owns_sentinel(addr: usize) -> bool {
+        addr == 0x1000
+    }
+
     #[test]
     fn root_hooks_register_and_remove_round_trip() {
         let _hook_lock = hook_test_guard();
@@ -1271,10 +1312,13 @@ mod tests {
     fn write_barrier_hook_registers_invokes_and_clears() {
         let _hook_lock = hook_test_guard();
         clear_gc_write_barrier_hook();
+        clear_gc_write_barrier_from_array_hook();
         let obj = 0x1000usize as GCREF;
         assert!(!try_gc_write_barrier(obj));
+        assert!(!try_gc_write_barrier_from_array(obj, 0));
 
         register_gc_write_barrier_hook(mock_write_barrier);
+        register_gc_write_barrier_from_array_hook(mock_write_barrier_from_array);
         // `try_gc_write_barrier` returns true iff it dispatched to the installed
         // hook, so the return value alone proves invocation. We deliberately do
         // NOT assert on a shared call counter: the write-barrier hook cell is
@@ -1282,8 +1326,39 @@ mod tests {
         // dict / descriptor / …) fire the same hook from concurrent tests, which
         // would perturb any global counter and reintroduce a parallel-test flake.
         assert!(try_gc_write_barrier(obj));
+        // No owns hook: the array is not collector-owned, so the array form
+        // keeps the plain hook.
+        assert!(try_gc_write_barrier_from_array(obj, 3));
 
         clear_gc_write_barrier_hook();
+        clear_gc_write_barrier_from_array_hook();
         assert!(!try_gc_write_barrier(obj));
+        assert!(!try_gc_write_barrier_from_array(obj, 3));
+    }
+
+    #[test]
+    fn write_barrier_from_array_hook_registers_invokes_and_clears() {
+        let _hook_lock = hook_test_guard();
+        clear_gc_write_barrier_hook();
+        clear_gc_write_barrier_from_array_hook();
+        clear_gc_owns_object_hook();
+        let obj = 0x1000usize as GCREF;
+        let immortal = 0x2000usize as GCREF;
+        assert!(!try_gc_write_barrier_from_array(obj, 0));
+
+        register_gc_write_barrier_from_array_hook(mock_write_barrier_from_array);
+        register_gc_owns_object_hook(mock_owns_sentinel);
+        assert!(try_gc_write_barrier_from_array(obj, 3));
+        // Pre-hook immortal: not collector-owned, so the array form is not
+        // taken. The plain hook is also unregistered.
+        assert!(!try_gc_write_barrier_from_array(immortal, 3));
+
+        register_gc_write_barrier_hook(mock_write_barrier);
+        assert!(try_gc_write_barrier_from_array(immortal, 3));
+
+        clear_gc_write_barrier_from_array_hook();
+        clear_gc_write_barrier_hook();
+        clear_gc_owns_object_hook();
+        assert!(!try_gc_write_barrier_from_array(obj, 3));
     }
 }
