@@ -834,7 +834,9 @@ unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<(*mut ItemsBlock, bool)
                 // (`rlist.py` `_ll_list_resize_hint_really` mallocs
                 // through `gc_malloc_array`, which leaves GCREF slots
                 // NULL).
-                std::ptr::write_bytes(raw, 0, payload);
+                // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes`
+                // on the GCREF itself writes no bytes. Zero through `*mut u8`.
+                std::ptr::write_bytes(raw as *mut u8, 0, payload);
                 (*block).capacity = cap;
             }
             return Some((block, true));
@@ -2217,7 +2219,9 @@ pub fn allocate_array_struct_at_typed(
     // `f_valid` and the value word 0 like
     // `materialize_cleared_struct_gcarray`.
     unsafe {
-        std::ptr::write_bytes(raw, 0, total);
+        // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes` on
+        // the GCREF itself writes no bytes. Zero through `*mut u8`.
+        std::ptr::write_bytes(raw as *mut u8, 0, total);
         let array = raw.cast::<GcTypedArray>();
         (*array).len = num_elems;
         crate::gc_hook::try_gc_write_barrier_managed(raw);

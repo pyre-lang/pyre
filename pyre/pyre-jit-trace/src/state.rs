@@ -10051,10 +10051,13 @@ fn materialize_resumed_pyframe_block(
         return None;
     }
     unsafe {
-        std::ptr::write_bytes(raw, 0, size);
+        // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes` /
+        // `add` on the GCREF itself move no bytes. Address through `*mut u8`.
+        let bytes = raw as *mut u8;
+        std::ptr::write_bytes(bytes, 0, size);
         // `llmodel.py bh_new_with_vtable`: the vtable word at
         // `vtable_offset`, which pyre's backends set to `OB_TYPE_OFFSET`.
-        *(raw.add(pyre_object::pyobject::OB_TYPE_OFFSET) as *mut usize) = vtable;
+        *(bytes.add(pyre_object::pyobject::OB_TYPE_OFFSET) as *mut usize) = vtable;
     }
     Some(raw as i64)
 }

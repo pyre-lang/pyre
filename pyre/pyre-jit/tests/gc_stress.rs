@@ -277,7 +277,7 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     // The probe block is never rooted; zero it so any later sweep reads a
     // well-formed (null map/storage) payload before reclaiming it.
     unsafe {
-        std::ptr::write_bytes(probe, 0, pyre_object::W_OBJECT_OBJECT_SIZE);
+        std::ptr::write_bytes(probe as *mut u8, 0, pyre_object::W_OBJECT_OBJECT_SIZE);
     }
     Ok(())
 }
