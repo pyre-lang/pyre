@@ -1939,33 +1939,79 @@ pub unsafe fn dealloc_mro_block(block: *mut FixedObjectArray) {
 /// Allocated on the **stable** (non-moving old-gen) path via
 /// [`crate::gc_hook::try_gc_alloc_stable_raw`] — code-object const/name
 /// tables share this helper and outlive a minor collection as old-gen
-/// arrays. Heap-type `mro_w` uses [`alloc_mro_block_gc_young`] so the
-/// type↔MRO cycle can die at the next minor.
+/// arrays. Heap-type `mro_w` uses [`alloc_mro_block_young_gc`] so the
+/// type↔MRO cycle can die at the next minor. The caller's `values` are
+/// pinned because a nursery-full request collects.
 /// Falls back to a header-prefixed `std::alloc` block when no GC hook
 /// is installed (bootstrap / pure interpreter).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArray {
+    unsafe { alloc_mro_block_gc_kind(values, false) }
+}
+
+/// Heap-type MRO: nursery `malloc_varsize` twin of [`alloc_mro_block_gc`].
+/// # Safety
+/// Same contract as [`alloc_mro_block_gc`]. The caller roots `values` across
+/// this call if it still names them afterwards; this function pins them
+/// itself for the collecting allocation.
+pub unsafe fn alloc_mro_block_young_gc(values: &[PyObjectRef]) -> *mut FixedObjectArray {
+    unsafe { alloc_mro_block_gc_kind(values, true) }
+}
+
+unsafe fn alloc_mro_block_gc_kind(values: &[PyObjectRef], young: bool) -> *mut FixedObjectArray {
+    let len = values.len();
     let payload = FIXED_ARRAY_ITEMS_OFFSET + std::mem::size_of_val(values);
+    if young {
+        let _roots = crate::gc_roots::push_roots();
+        let save = crate::gc_roots::pin_roots(values);
+        let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
+        let mut needs_write_barrier = true;
+        let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
+            crate::gc_hook::try_gc_alloc_collecting_rooted(
+                PY_OBJECT_ARRAY_GC_TYPE_ID,
+                payload,
+                &mut allocation_root,
+                &mut needs_write_barrier,
+            )
+        })
+        .allocated_or_abort(payload)
+        .unwrap_or(std::ptr::null_mut());
+        let block = if !raw.is_null() {
+            raw as *mut FixedObjectArray
+        } else {
+            let layout = mro_block_layout(len);
+            (unsafe { std_alloc_gc_array(layout, false) })
+                .unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
+                as *mut FixedObjectArray
+        };
+        unsafe {
+            (*block).len = len;
+            // Barrier before the items, matching `alloc_list_items_block_gc`:
+            // an old-gen spill must be on the remembered set before young
+            // MRO entries land.
+            if !raw.is_null() && needs_write_barrier {
+                crate::gc_hook::try_gc_write_barrier(block as crate::gc_hook::GCREF);
+            }
+            let items = (*block).items_mut_ptr();
+            let dst = std::slice::from_raw_parts_mut(items, len);
+            crate::gc_roots::shadow_stack_copy_range(save, dst);
+        }
+        return block;
+    }
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(PY_OBJECT_ARRAY_GC_TYPE_ID, payload);
     unsafe { fill_mro_block(values, raw) }
 }
 
-/// [`alloc_mro_block_gc`] for a heap type's `mro_w`: the same non-moving
-/// block, born young (`external_malloc(..., alloc_young=True)`) so that it
-/// dies with the type at the first minor collection that reaches neither.
-/// The block holds the type itself (`mro_w[0]`), so an old-born block on
-/// the remembered set would promote a class that nothing else refers to.
+/// [`alloc_mro_block_gc`] for a heap type's `mro_w`.
+///
+/// Collecting nursery twin of [`alloc_mro_block_young_gc`]: a discarded
+/// heap type's MRO dies with it at the first minor that reaches neither.
 /// # Safety
 /// Same as [`alloc_mro_block_gc`].
 pub unsafe fn alloc_mro_block_gc_young(values: &[PyObjectRef]) -> *mut FixedObjectArray {
-    let payload = FIXED_ARRAY_ITEMS_OFFSET + std::mem::size_of_val(values);
-    let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
-        PY_OBJECT_ARRAY_GC_TYPE_ID,
-        payload,
-    );
-    unsafe { fill_mro_block(values, raw) }
+    unsafe { alloc_mro_block_young_gc(values) }
 }
 
 unsafe fn fill_mro_block(

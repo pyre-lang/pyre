@@ -230,10 +230,11 @@ pub struct W_TypeObject {
     /// Class dict backing storage (`dict_w` analogue). `llmemory.GCREF`.
     pub dict: crate::gc_hook::GCREF,
     /// Cached C3 MRO — W_TypeObject.mro_w (typeobject.py `mro_w?[*]`,
-    /// an immutable `[W_Root]`). Stored as a stable `Ptr(GcArray(OBJECTPTR))`
-    /// block (`alloc_mro_block_gc`) so the length-prefixed inline layout
-    /// matches upstream and a JIT-prepass read types as
-    /// `SomeList(SomeInstance(PyObjectRef))`.
+    /// an immutable `[W_Root]`). A `Ptr(GcArray(OBJECTPTR))` block
+    /// (`alloc_mro_block_gc` / `alloc_mro_block_young_gc`) so the
+    /// length-prefixed inline layout matches upstream and a JIT-prepass
+    /// read types as `SomeList(SomeInstance(PyObjectRef))`. Heap types
+    /// store a nursery block; immortal builtins keep the stable twin.
     pub mro_w: *mut crate::object_array::FixedObjectArray,
     /// typeobject.py:184 `flag_heaptype` — immutable after creation.
     pub flag_heaptype: bool,
@@ -557,30 +558,36 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
     let save_point = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(bases);
     let _ = crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
-    // `typeobject.py W_TypeObject` is `malloc_fixedsize`: born young, so
-    // the first minor collection that does not reach it frees it, and the
-    // weakref `add_subclass` recorded in each base is nulled by
-    // `invalidate_young_weakrefs` on that same minor. A type born old
-    // instead (`alloc_in_oldgen`) survives every minor, so a program that
-    // builds and drops classes grows every base's `weak_subclasses` until
-    // the next major, and `add_subclass`'s linear scan for a dead slot
-    // grows with it. The block is `external_malloc(..., alloc_young=True)`
-    // rather than a nursery bump because `w_class` / `instantiate` / type
-    // caches hold raw type pointers the translator would rewrite as GCREFs,
-    // so the address has to stay put, matching `w_type_alloc_builtin`'s
-    // non-moving contract for the same raw couriers. An old instance whose
-    // `w_class` is this young type reaches it through the remembered set:
-    // `alloc_instance_object` and `descr_set___class__` take the barrier on
-    // the store. Young `bases` / name boxes still take the barrier below.
-    let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
-        W_TYPE_GC_TYPE_ID,
-        W_TYPE_OBJECT_SIZE,
-    );
+    // `typeobject.py W_TypeObject` is `malloc_fixedsize` (nursery). A discarded
+    // `type(name, (), {})` must die at the next minor so `add_subclass`'s
+    // `weak_subclasses` scan reuses a dead slot (`W_TypeObject.add_subclass`)
+    // instead of appending forever. `try_gc_alloc_collecting_rooted` is the
+    // host `do_malloc_fixedsize_clear`: nursery-full runs a minor, matching
+    // lists / exceptions / weakrefs. Young-nonmoving rawmalloc does not fill
+    // the nursery, so a loop of abandoned types never collected and the scan
+    // grew with every `type()`. Builtin types stay on `w_type_alloc_builtin`.
+    // `store_subclass_tag` barriers a `w_class` store, so an old instance that
+    // names a live nursery type is in the remembered set. Spill-old takes the
+    // barrier below (`needs_write_barrier`).
+    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
+    let mut needs_write_barrier = true;
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
+        crate::gc_hook::try_gc_alloc_collecting_rooted(
+            W_TYPE_GC_TYPE_ID,
+            W_TYPE_OBJECT_SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    })
+    .allocated_or_abort(W_TYPE_OBJECT_SIZE)
+    .unwrap_or(std::ptr::null_mut());
     // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
     // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
     // `name` slot in `type_object_custom_trace`. The immortal fallback (pre-GC /
     // snapshot tools) keeps a `malloc_raw` name that an immortal holder can never
-    // grey.
+    // grey. The type alloc above may collect; bases / dict are pinned. The
+    // name-box alloc is old-gen and does not collect, so the box cannot be
+    // swept before it is stored into the type below.
     let name_value = name.to_string();
     let (name, qualname) = if raw.is_null() {
         (
@@ -665,10 +672,12 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         (crate::lltype::malloc_typed(value) as PyObjectRef, false)
     };
     if gc_managed {
-        // Young-nonmoving header ignores the barrier (no TRACK_YOUNG_PTRS);
-        // the old-gen fallback (no young hook) still needs it so `bases` /
-        // name boxes that are young get forwarded.
-        crate::gc_hook::try_gc_write_barrier(w_type as crate::gc_hook::GCREF);
+        // A nursery header needs no creation barrier. The collecting
+        // allocator can still spill old (pinned nursery gap); only that
+        // placement remembers young `bases` / name boxes.
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier(w_type as crate::gc_hook::GCREF);
+        }
     } else {
         // Immortal fallback type (pre-GC): its trace never fires, so root its
         // namespace the same way builtin types are rooted.
@@ -1761,11 +1770,19 @@ pub unsafe fn w_type_get_best_base(w_type: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     let purely_of_types = is_mro_purely_of_types(&mro);
+    // The MRO malloc may collect. Pin the type and reload it after; a
+    // nursery-born heap type would otherwise keep the pre-collection
+    // address in this raw local.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let mro_w = if (*(obj as *const W_TypeObject)).flag_heaptype {
         crate::object_array::alloc_mro_block_gc_young(&mro)
     } else {
         crate::object_array::alloc_mro_block_gc(&mro)
     };
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     type_write_barrier(obj);
     (*(obj as *mut W_TypeObject)).mro_w = mro_w;
     if !purely_of_types {

@@ -5487,8 +5487,8 @@ fn call_metaclass_with_kwargs(
     // `__new__` and `__init__` calls, both arbitrary Python.  The caller roots
     // the namespace and reads it back immediately before this call, and that
     // is undone the moment it is passed by value.  Tuples and dicts are
-    // nursery-born, and a heap type is born old (`try_gc_alloc_stable_raw`)
-    // but reclaimable by a major; `pin_root`'s return is the pre-collect
+    // nursery-born, and a heap type is born nursery
+    // (`try_gc_alloc_collecting_rooted` / `malloc_fixedsize`); `pin_root`'s return is the pre-collect
     // word, so every consumer after a collecting call reloads from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5621,8 +5621,9 @@ fn call_metaclass_with_kwargs(
     if instance.is_null() {
         return PY_NULL;
     }
-    // Heap types are born old-gen (`w_type_new` / `try_gc_alloc_stable_raw`).
-    // `__init__` is arbitrary Python and can collect, so the slot is the
+    // Heap types are born nursery (`w_type_new` /
+    // `try_gc_alloc_collecting_rooted`). `__init__` is arbitrary Python and
+    // can collect, so the slot is the
     // live word after those calls.
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(instance);
@@ -7720,8 +7721,20 @@ pub unsafe fn create_all_slots(
     unsafe {
         use pyre_object::typeobject::{Layout, leak_layout};
 
+        // Heap types are nursery. Slot construction (`copy_for_type`,
+        // `w_member_new`) collects, so the type and bases live in the
+        // shadow stack and every use after a collecting call reloads.
+        let _slot_roots = pyre_object::gc_roots::push_roots();
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_type);
+        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_bases);
+        w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+        let w_bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
+
         // typeobject.py: w_bestbase = check_and_find_best_base(space, bases_w)
         let mut w_bestbase = check_and_find_best_base(w_bases)?;
+        w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
 
         // typeobject.py:1507-1508: inherit flag_map_or_seq from bases
         pyre_object::typeobject::inherit_flag_map_or_seq(w_type, w_bases);
@@ -7753,6 +7766,7 @@ pub unsafe fn create_all_slots(
             wantweakref = false;
             let all_names =
                 pyre_object::with_roots!(w_bestbase, w_type => collect_slot_names(w_slots))?;
+            w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
             if base_has_variable_items && !all_names.is_empty() {
                 return Err(crate::PyError::type_error(format!(
                     "nonempty __slots__ not supported for subtype of '{}'",
@@ -7830,7 +7844,9 @@ pub unsafe fn create_all_slots(
                     newslotnames[i] = mangled.clone();
                     if crate::type_dict_has_storage(w_type) {
                         let member = pyre_object::w_member_new(slot_index, mangled.clone(), w_type);
+                        w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
                         crate::type_dict_store(w_type, &mangled, member);
+                        w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
                     }
                     slot_index += 1;
                     i += 1;
@@ -7864,6 +7880,12 @@ pub unsafe fn create_all_slots(
         // the constructor's stores are dropped and every such reference reads
         // back dead — `weakref.KeyedRef` is exactly that shape.
         let weakref_ref_type = crate::module::_weakref::interp__weakref::weakref_type();
+        // `weakref_type` lazily runs `make_builtin_type_with_layout` (`OnceLock`),
+        // which collects. `w_type` is a nursery heap type (`w_type_new`);
+        // typeobject.py `create_all_slots` `w_self` is an RPython GC local, so
+        // the shadow-stack slot is the forwarded address after that first
+        // init. Reload before `issubtype_w` walks `w_type_get_mro`.
+        w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
         let is_weakref_subclass = !weakref_ref_type.is_null()
             && !std::ptr::eq(w_type, weakref_ref_type)
             && crate::baseobjspace::issubtype_w(w_type, weakref_ref_type);
@@ -7890,11 +7912,14 @@ pub unsafe fn create_all_slots(
         }
 
         // typeobject.py: create_dict_slot / create_weakref_slot
+        w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
         if wantdict {
             create_dict_slot(w_type);
+            w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
         }
         if wantweakref {
             create_weakref_slot(w_type);
+            w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
         }
         if crate::type_dict_contains(w_type, "__del__") {
             pyre_object::w_type_set_hasuserdel(w_type, true);

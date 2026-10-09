@@ -11674,8 +11674,8 @@ pub fn new_exception_class(
     new_fn: crate::gateway::BuiltinCodeFn,
     mut base: PyObjectRef,
 ) -> PyObjectRef {
-    let cls = pyre_object::with_roots!(base => make_exc_type(name, new_fn, base));
-    add_weakref_slot(cls, base);
+    let mut cls = pyre_object::with_roots!(base => make_exc_type(name, new_fn, base));
+    pyre_object::with_roots!(cls, base => add_weakref_slot(cls, base));
     cls
 }
 
@@ -11684,7 +11684,7 @@ pub fn new_exception_class(
 /// slot to inherit, which is why `_pickle.PickleError.__dict__` carries one and
 /// `_pickle.PicklingError.__dict__` does not.  The flag is set either way --
 /// it is what `getweakref` / `setweakref` read.
-fn add_weakref_slot(cls: PyObjectRef, base: PyObjectRef) {
+fn add_weakref_slot(mut cls: PyObjectRef, base: PyObjectRef) {
     if !unsafe { pyre_object::w_type_get_weakrefable(base) } {
         let _roots = pyre_object::gc_roots::push_roots();
         let save = pyre_object::gc_roots::shadow_stack_len();
@@ -12344,7 +12344,7 @@ pub fn make_exc_type_multi(
         return cls;
     }
     let mut w_base0 = bases[0];
-    let cls = pyre_object::with_roots!(w_base0 =>
+    let mut cls = pyre_object::with_roots!(w_base0 =>
         crate::typedef::make_builtin_type_with_bases_and_overridetypedef(
             name,
             move |ns| {
@@ -12362,7 +12362,7 @@ pub fn make_exc_type_multi(
             bases,
         )
     );
-    add_weakref_slot(cls, w_base0);
+    pyre_object::with_roots!(cls, w_base0 => add_weakref_slot(cls, w_base0));
     register_exc_class(name, cls)
 }
 
@@ -13393,7 +13393,7 @@ fn make_exception_group_type(
     }
     let layout_pytype = exception_layout_pytype(name, bases[0]);
     let overridetypedef = exception_overridetypedef(layout_pytype, bases[0]);
-    let cls = crate::typedef::make_builtin_type_with_bases_and_layout_owner(
+    let mut cls = crate::typedef::make_builtin_type_with_bases_and_layout_owner(
         name,
         move |ns| {
             let _roots = pyre_object::gc_roots::push_roots();

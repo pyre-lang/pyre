@@ -1148,8 +1148,9 @@ where
         (),
         crate::dictmultiobject::ObjectKeyBuildHasher,
     >::from_preserved_slots(&slot_keys, &snap.live, index_len);
-    // `try_gc_alloc_stable_raw` does not collect. The wrapped keys stay on
-    // the shadow stack until the new box, which traces them, is installed.
+    // `from_preserved_slots` pins the wrapped keys across `_ll_malloc_entries`.
+    // The box malloc below is stable and does not collect; the keys stay on
+    // the shadow stack until that box, which traces them, is installed.
     let storage = crate::gc_storage::gc_alloc_storage_box(mapped, set_items_gc_type_id());
     let obj = crate::gc_roots::shadow_stack_get(set_slot);
     {

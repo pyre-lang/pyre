@@ -630,6 +630,51 @@ unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
     term as MapRef
 }
 
+/// Forward `Terminator.w_cls` stored in the immortal map node.
+///
+/// PyPy's `Terminator` is a GC object (`mapdict.py`); `w_cls` is an
+/// `_immutable_field_` MiniMark traces with the terminator
+/// (`Terminator.__init__`). pyre internodes map nodes as `malloc_raw`
+/// immortal `MapNode`s (`intern_node` / `new_terminator`), so the
+/// collector never visits those slots on its own. Heap types are
+/// nursery-born (`w_type_new` / `malloc_fixedsize`); after the first
+/// minor that copies the type, an unforwarded `w_cls` dangles into the
+/// emptied nursery and `LOAD_ATTR_slowpath` (`map.terminator.w_cls`)
+/// reads a swept type.
+///
+/// Visiting the slot from `type_object_custom_trace` is the MiniMark
+/// equivalent of tracing PyPy's GC `Terminator.w_cls`: the type is
+/// already reached (via `instance.w_class`); this updates the immortal
+/// sidecar. The paired `DevolvedDictTerminator.w_cls` is the same store
+/// (`DictTerminator.__init__`).
+///
+/// # Safety
+/// `w_type` must be a live `W_TypeObject`.
+pub unsafe fn walk_type_terminator_w_cls(w_type: PyObjectRef, f: &mut dyn FnMut(*mut PyObjectRef)) {
+    if w_type.is_null() {
+        return;
+    }
+    let term = unsafe { pyre_object::w_type_get_terminator(w_type) } as MapRef;
+    if term.is_null() {
+        return;
+    }
+    unsafe { walk_one_terminator_w_cls(term, f) };
+}
+
+unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjectRef)) {
+    let node = unsafe { &mut *(term as *mut MapNode) };
+    match node {
+        MapNode::Terminator(t) => {
+            f(std::ptr::addr_of_mut!(t.w_cls));
+            let devolved = t.devolved_dict_terminator.get();
+            if !devolved.is_null() && !std::ptr::eq(devolved, term) {
+                unsafe { walk_one_terminator_w_cls(devolved, f) };
+            }
+        }
+        MapNode::Plain(_) => {}
+    }
+}
+
 /// mapdict.py `MapdictDictSupport.setclass` — re-root `obj`'s map chain
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
 /// `descr_set___class__` for a `W_ObjectObject`. pyre additionally keeps the
