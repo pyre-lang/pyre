@@ -207,6 +207,10 @@ pub fn try_gc_alloc_with_placement(
     payload_size: usize,
     needs_write_barrier: &mut bool,
 ) -> Option<GCREF> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return None;
+    }
     if let Some(f) = GC_ALLOC_WITH_PLACEMENT_HOOK.get() {
         return Some(unsafe { f(type_id, payload_size, needs_write_barrier as *mut bool) });
     }
@@ -260,6 +264,10 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<GCREF> {
 /// discriminant to erase, unlike the `Option<GCREF>` accessor.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> GCREF {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return core::ptr::null_mut();
+    }
     GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
         .allocated_or_abort(payload_size)
         .unwrap_or(core::ptr::null_mut())
@@ -295,6 +303,10 @@ pub fn clear_gc_alloc_young_nonmoving_hook() {
 /// With no young hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> GCREF {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return core::ptr::null_mut();
+    }
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
@@ -328,6 +340,10 @@ pub fn clear_gc_alloc_young_nonmoving_no_collect_hook() {
 /// With no such hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: usize) -> GCREF {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return core::ptr::null_mut();
+    }
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
@@ -365,6 +381,10 @@ pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: u
 /// recording.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_nursery_raw(type_id: u32, payload_size: usize) -> GCREF {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return core::ptr::null_mut();
+    }
     GcAllocOutcome::from_hook(try_gc_alloc(type_id, payload_size))
         .allocated_or_abort(payload_size)
         .unwrap_or(core::ptr::null_mut())
@@ -429,6 +449,10 @@ pub unsafe fn try_gc_alloc_collecting_rooted(
     root: *mut GCREF,
     needs_write_barrier: *mut bool,
 ) -> Option<GCREF> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return None;
+    }
     if let Some(f) = GC_ALLOC_COLLECTING_ROOTED_HOOK.get() {
         return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
     }
