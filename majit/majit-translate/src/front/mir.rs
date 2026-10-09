@@ -68186,6 +68186,12 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
                 return None;
             }
             let (kind, len) = tyref_raw_array_item_kind(&decl.ty, llbc)?;
+            // GCREFs live in GC arrays or as individual boxes
+            // (`shadowstack.py push_roots`). A raw malloc of pointer
+            // items is not traced, so a collection leaves stale words.
+            if kind == majit_ir::rvec::VecItemKind::Ref {
+                return None;
+            }
             Some(RawArrayRole::Storage { kind, len })
         })
         .collect();
