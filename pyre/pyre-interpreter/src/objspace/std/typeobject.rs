@@ -239,14 +239,20 @@ mod tests {
     #[test]
     fn declarations_keep_typedef_identity_and_bind_functions_per_space() {
         crate::typedef::init_typeobjects();
+        let _roots = gc_roots::push_roots();
         let gateway =
             crate::gateway::interp2app(crate::gateway::builtin_code_new("original", answer));
+        let gateway_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(gateway);
         unsafe {
             let definition = TypeDef::from_rawdict(
                 "Declared",
                 vec![],
                 IndexMap::from([
-                    ("method".into(), TypeDefValue::root(gateway)),
+                    (
+                        "method".into(),
+                        TypeDefValue::root(gc_roots::shadow_stack_get(gateway_slot)),
+                    ),
                     (
                         "__doc__".into(),
                         TypeDefValue::Text("declaration doc".into()),
@@ -254,7 +260,8 @@ mod tests {
                 ]),
                 &INSTANCE_TYPE,
             );
-            let gateway = &*(gateway as *const pyre_object::gateway::interp2app);
+            let gateway = &*(gc_roots::shadow_stack_get(gateway_slot)
+                as *const pyre_object::gateway::interp2app);
             assert_eq!(gateway.name, "method");
             assert!(gateway._is_type_method);
             let a = ObjSpace::new();
@@ -550,6 +557,56 @@ mod tests {
     }
 
     #[test]
+    fn sequence_iterator_types_own_distinct_next_descriptors() {
+        crate::typedef::init_typeobjects();
+        unsafe {
+            let types = [
+                &STR_ASCII_ITER_TYPE,
+                &STR_ITER_TYPE,
+                &BYTES_ITER_TYPE,
+                &BYTEARRAY_ITER_TYPE,
+            ];
+            let nexts: Vec<PyObjectRef> = types
+                .iter()
+                .map(|tp| {
+                    let w_type = crate::typedef::gettypefor(*tp).unwrap().as_ptr();
+                    w_dict_getitem_str(w_type_get_dict_ptr(w_type).cast(), "__next__").unwrap()
+                })
+                .collect();
+            for i in 0..nexts.len() {
+                for j in (i + 1)..nexts.len() {
+                    assert_ne!(
+                        nexts[i], nexts[j],
+                        "__next__ of {} and {} must be distinct objects",
+                        types[i].name, types[j].name
+                    );
+                }
+            }
+            let ascii_type = crate::typedef::gettypefor(&STR_ASCII_ITER_TYPE)
+                .unwrap()
+                .as_ptr();
+            assert_eq!(
+                crate::function::fget_func_objclass(nexts[0]).unwrap(),
+                ascii_type
+            );
+            let _roots = gc_roots::push_roots();
+            let seq = gc_roots::pin_root(w_str_new("ab"));
+            let iter_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(w_seq_iter_new(seq, 2));
+            assert!(std::ptr::eq(
+                (*gc_roots::shadow_stack_get(iter_slot)).ob_type,
+                &STR_ASCII_ITER_TYPE
+            ));
+            let first = crate::call::call_function_impl_result(
+                nexts[0],
+                &[gc_roots::shadow_stack_get(iter_slot)],
+            )
+            .unwrap();
+            assert_eq!(w_str_get_wtf8(first), "a");
+        }
+    }
+
+    #[test]
     fn fixed_pycode_function_gets_typecache_metadata() {
         crate::typedef::init_typeobjects();
         let code = crate::compile::compile_source("42", crate::compile::Mode::Eval).unwrap();
@@ -562,15 +619,22 @@ mod tests {
             "original".into(),
             globals,
         );
+        let function_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(function);
         unsafe {
-            assert!(crate::function::is_function_with_fixed_code(function));
+            assert!(crate::function::is_function_with_fixed_code(
+                gc_roots::shadow_stack_get(function_slot)
+            ));
             assert!(!crate::gateway::is_builtin_code(crate::function::getcode(
-                function
+                gc_roots::shadow_stack_get(function_slot)
             )));
             let definition = TypeDef::from_rawdict(
                 "FixedCodeOwner",
                 vec![],
-                IndexMap::from([("method".into(), TypeDefValue::root(function))]),
+                IndexMap::from([(
+                    "method".into(),
+                    TypeDefValue::root(gc_roots::shadow_stack_get(function_slot)),
+                )]),
                 &INSTANCE_TYPE,
             );
             let w_type = ObjSpace::new().gettypeobject(definition).unwrap();
@@ -602,6 +666,8 @@ mod tests {
             "original".into(),
             globals,
         );
+        let function_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(function);
         unsafe {
             let base_def =
                 TypeDef::from_rawdict("FlagBase", vec![], IndexMap::new(), &INSTANCE_TYPE)
@@ -614,7 +680,10 @@ mod tests {
             let derived_def = TypeDef::from_rawdict(
                 "FlagDerived",
                 vec![base_def],
-                IndexMap::from([("method".into(), TypeDefValue::root(function))]),
+                IndexMap::from([(
+                    "method".into(),
+                    TypeDefValue::root(gc_roots::shadow_stack_get(function_slot)),
+                )]),
                 &INSTANCE_TYPE,
             ) as *mut TypeDef;
             (*derived_def).applevel_subclasses_base = base_def;
@@ -639,6 +708,7 @@ mod tests {
     #[test]
     fn getset_template_is_copied_for_each_cached_type_identity() {
         crate::typedef::init_typeobjects();
+        let _roots = gc_roots::push_roots();
         let property = pyre_object::typedef::w_getset_property_new(
             PY_NULL,
             PY_NULL,
@@ -648,11 +718,16 @@ mod tests {
             false,
             w_str_new("template"),
         );
+        let property_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(property);
         unsafe {
             let definition = TypeDef::from_rawdict(
                 "PropertyOwner",
                 vec![],
-                IndexMap::from([("field".into(), TypeDefValue::root(property))]),
+                IndexMap::from([(
+                    "field".into(),
+                    TypeDefValue::root(gc_roots::shadow_stack_get(property_slot)),
+                )]),
                 &INSTANCE_TYPE,
             );
             let a = ObjSpace::new();
@@ -661,10 +736,10 @@ mod tests {
                 let w_type = space.gettypeobject(definition).unwrap();
                 let ns = w_type_get_dict_ptr(w_type) as PyObjectRef;
                 let bound = w_dict_getitem_str(ns, "field").unwrap();
-                assert_ne!(bound, property);
+                assert_ne!(bound, gc_roots::shadow_stack_get(property_slot));
                 assert_eq!(w_getset_get_objclass(bound), w_type);
             }
-            assert!(w_getset_get_objclass(property).is_null());
+            assert!(w_getset_get_objclass(gc_roots::shadow_stack_get(property_slot)).is_null());
         }
     }
 }

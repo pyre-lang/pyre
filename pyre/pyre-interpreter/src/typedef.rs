@@ -34390,22 +34390,25 @@ fn init_sequence_iterator_type(ns: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ns);
-    for (name, value) in crate::objspace::std::iterobject::rawdict() {
-        let value = match value {
-            pyre_object::typedef::TypeDefValue::None => w_none(),
-            pyre_object::typedef::TypeDefValue::Text(text) => w_str_new(&text),
-            pyre_object::typedef::TypeDefValue::Root(slot) => crate::gateway::interp2app_spacebind(
-                unsafe { *slot.get() },
-                crate::baseobjspace::object_space(),
-            ),
-        };
-        unsafe {
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    unsafe {
+        for (name, value) in crate::objspace::std::iterobject::rawdict(&mut items) {
+            let value = match value {
+                pyre_object::typedef::TypeDefValue::None => w_none(),
+                pyre_object::typedef::TypeDefValue::Text(text) => w_str_new(&text),
+                pyre_object::typedef::TypeDefValue::Root(slot) => {
+                    crate::gateway::interp2app_spacebind(
+                        *slot.get(),
+                        crate::baseobjspace::object_space(),
+                    )
+                }
+            };
             pyre_object::w_dict_setitem_str_no_proxy(
                 pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 &name,
                 value,
-            )
-        };
+            );
+        }
     }
 }
 
