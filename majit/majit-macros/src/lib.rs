@@ -3552,6 +3552,112 @@ fn expand_specialize_argtype(indices: &[syn::LitInt], func: &ItemFn) -> proc_mac
     }
 }
 
+fn path_ends_with(path: &syn::Path, name: &str) -> bool {
+    path.segments.last().is_some_and(|seg| seg.ident == name)
+}
+
+fn attr_ends_with(attr: &syn::Attribute, name: &str) -> bool {
+    path_ends_with(attr.path(), name)
+}
+
+/// rlib/jit.py `func.oopspec = spec`. Body-local `oopspec_<NAME>` is what
+/// `harvest_hints_from_llbcs` keys (`oopspec_` prefix); Charon promotes it
+/// under the function path, and `marker_path_to_fn_path` binds that parent.
+fn oopspec_body_markers(fn_ident: &Ident, spec: &str) -> proc_macro2::TokenStream {
+    let body_name = format_ident!("oopspec_{}", fn_ident);
+    let identity = icf_identity_tokens(fn_ident);
+    quote! {
+        #[doc(hidden)]
+        #[allow(dead_code)]
+        const _MAJIT_OOPSPEC: &str = #spec;
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals, dead_code)]
+        const #body_name: &'static str = #spec;
+        #identity
+    }
+}
+
+/// Module-level sibling for a free function. Methods skip it: a trait impl
+/// rejects a foreign associated item (`rpython_attribute_const_for`).
+fn oopspec_sibling_const(
+    vis: &syn::Visibility,
+    fn_ident: &Ident,
+    spec: &str,
+) -> proc_macro2::TokenStream {
+    let const_name = format_ident!("oopspec_{}", fn_ident);
+    quote! {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis const #const_name: &'static str = #spec;
+    }
+}
+
+fn const_lit_str(item: &syn::ItemConst) -> Option<String> {
+    match item.expr.as_ref() {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(lit),
+            ..
+        }) => Some(lit.value()),
+        _ => None,
+    }
+}
+
+fn stmt_is_icf_identity(stmt: &syn::Stmt) -> bool {
+    match stmt {
+        syn::Stmt::Macro(mac) => path_ends_with(&mac.mac.path, "icf_identity"),
+        syn::Stmt::Expr(syn::Expr::Macro(expr_mac), _) => {
+            path_ends_with(&expr_mac.mac.path, "icf_identity")
+        }
+        _ => false,
+    }
+}
+
+/// Pull `#[oopspec("spec")]` off remaining attrs so `look_inside_iff` can
+/// move it (`rlib/jit.py` `trampoline.oopspec = func.oopspec`).
+fn take_oopspec_spec_from_attrs(attrs: &mut Vec<syn::Attribute>) -> Option<String> {
+    let mut spec = None;
+    attrs.retain(|attr| {
+        if !attr_ends_with(attr, "oopspec") {
+            return true;
+        }
+        match attr.parse_args::<syn::LitStr>() {
+            Ok(lit) => {
+                if spec.is_none() {
+                    spec = Some(lit.value());
+                }
+                false
+            }
+            Err(_) => true,
+        }
+    });
+    spec
+}
+
+/// `del func.oopspec` once `look_inside_iff` has seen the already-expanded
+/// `#[oopspec]` markers in the original body.
+fn take_oopspec_markers_from_block(block: &mut syn::Block, fn_name: &Ident) -> Option<String> {
+    let oopspec_ident = format_ident!("oopspec_{}", fn_name);
+    let mut spec = None;
+    let mut found_marker = false;
+    block.stmts.retain(|stmt| {
+        let syn::Stmt::Item(syn::Item::Const(item)) = stmt else {
+            return true;
+        };
+        if item.ident == "_MAJIT_OOPSPEC" || item.ident == oopspec_ident {
+            found_marker = true;
+            if spec.is_none() {
+                spec = const_lit_str(item);
+            }
+            return false;
+        }
+        true
+    });
+    if found_marker {
+        block.stmts.retain(|stmt| !stmt_is_icf_identity(stmt));
+    }
+    spec
+}
+
 /// The JIT compiler won't look inside this decorated function,
 /// but instead during translation, rewrites it according to the handler in
 /// the codewriter/jtransform.
@@ -3579,7 +3685,7 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     // binds that parent when it is the function path. Emit the body-local
     // const for every item, and keep the module-level const for free
     // functions so the existing external name stays visible.
-    let body_name = format_ident!("oopspec_{}", sig.ident);
+    let body_markers = oopspec_body_markers(&sig.ident, &spec_value);
     // The function stays an ordinary callable one: a call jtransform does not
     // rewrite from its oopspec is a residual call to its address
     // (`getfunctionptr`).
@@ -3602,6 +3708,15 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
                 )
             })
     });
+    // `look_inside_iff` moves `func.oopspec` onto the trampoline
+    // (`rlib/jit.py` `trampoline.oopspec = func.oopspec; del func.oopspec`).
+    // A sibling `oopspec_<orig>` would harvest onto the dispatch wrapper
+    // that keeps the original name; skip it so the move can emit
+    // `oopspec_<name>_trampoline` instead.
+    let look_inside_iff_follows = func
+        .attrs
+        .iter()
+        .any(|attr| attr_ends_with(attr, "look_inside_iff"));
     // ... or one already expanded above it left its marker const in the body.
     let policy_attr_expanded = func.block.stmts.iter().any(|stmt| {
         matches!(stmt, syn::Stmt::Item(syn::Item::Const(item))
@@ -3616,30 +3731,18 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(err) => return err.to_compile_error().into(),
         }
     };
-    let oopspec_const = if sig.receiver().is_none() {
-        let const_name = body_name.clone();
-        Some(quote! {
-            #[doc(hidden)]
-            #[allow(non_upper_case_globals)]
-            #vis const #const_name: &'static str = #spec_value;
-        })
+    let oopspec_const = if sig.receiver().is_none() && !look_inside_iff_follows {
+        Some(oopspec_sibling_const(vis, &sig.ident, &spec_value))
     } else {
         None
     };
-    let identity = icf_identity_tokens(&sig.ident);
 
     let expanded = quote! {
         #(#attrs)*
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         #vis #sig {
-            #[doc(hidden)]
-            #[allow(dead_code)]
-            const _MAJIT_OOPSPEC: &str = #spec_value;
-            #[doc(hidden)]
-            #[allow(non_upper_case_globals, dead_code)]
-            const #body_name: &'static str = #spec_value;
-            #identity
+            #body_markers
             #block
         }
 
@@ -3661,18 +3764,33 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// 3. `<name>` — dispatch wrapper (the public name):
 ///    `if !we_are_jitted() || predicate(args) { _orig(args) } else { trampoline(args) }`
 ///
+/// If `func` has `oopspec`, it is moved onto the trampoline
+/// (`trampoline.oopspec = func.oopspec; del func.oopspec`). A trace that
+/// looks inside records the plain `_orig_*` body; a residual call when the
+/// predicate fails is the trampoline that still carries the spec.
+///
 /// Usage: `#[look_inside_iff(my_predicate)]`
 /// where `my_predicate` has the same signature as the decorated function returning bool.
 #[proc_macro_attribute]
 pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     let predicate_path: Path = parse_macro_input!(attr as Path);
     let func = parse_macro_input!(item as ItemFn);
+    expand_look_inside_iff_item(predicate_path, func).into()
+}
+
+fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_macro2::TokenStream {
+    let fn_name = func.sig.ident.clone();
+    // rlib/jit.py — `if hasattr(func, "oopspec"): trampoline.oopspec =
+    // func.oopspec; del func.oopspec`. Consume a still-pending `#[oopspec]`
+    // attr, or the markers an already-expanded `#[oopspec]` left in the body.
+    let oopspec_from_attrs = take_oopspec_spec_from_attrs(&mut func.attrs);
+    let oopspec_from_body = take_oopspec_markers_from_block(&mut func.block, &fn_name);
+    let moved_oopspec = oopspec_from_attrs.or(oopspec_from_body);
 
     let attrs = &func.attrs;
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
-    let fn_name = &sig.ident;
     let unsafety = &sig.unsafety;
     // rlib/jit.py — func = unroll_safe(func)
     let orig_name = format_ident!("_orig_{}", fn_name);
@@ -3721,6 +3839,16 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     // same way `#[unroll_safe]` / `#[dont_look_inside]` do.
     let orig_unroll_marker = format_ident!("_jit_unroll_safe_{}", orig_name);
     let trampoline_opaque_marker = format_ident!("_jit_look_inside_{}", trampoline_name);
+    let trampoline_oopspec_markers = moved_oopspec
+        .as_deref()
+        .map(|spec| oopspec_body_markers(&trampoline_name, spec));
+    let trampoline_oopspec_sibling = moved_oopspec.as_deref().and_then(|spec| {
+        if has_receiver {
+            None
+        } else {
+            Some(oopspec_sibling_const(vis, &trampoline_name, spec))
+        }
+    });
 
     // Residual CondCall (rlist.py `_ll_list_resize_ge` →
     // `jit.conditional_call(_ll_list_resize_hint_really, ...)`) needs the
@@ -3732,10 +3860,10 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
         match emit_helper_call_target_fn(&func, true, None, "look_inside_iff", &[], false) {
             Ok(Some((_, _, tokens))) => Some(tokens),
             Ok(None) => None,
-            Err(err) => return err.to_compile_error().into(),
+            Err(err) => return err.to_compile_error(),
         };
 
-    let expanded = quote! {
+    quote! {
         // rlib/jit.py — func = unroll_safe(func)
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
@@ -3757,12 +3885,15 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[allow(non_upper_case_globals, dead_code)]
             const #trampoline_opaque_marker: bool = false;
+            #trampoline_oopspec_markers
             #orig_call
         }
 
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         const #trampoline_opaque_marker: bool = false;
+
+        #trampoline_oopspec_sibling
 
         // rlib/jit.py f — the decorated name becomes the dispatch wrapper
         // def f(*args):
@@ -3780,9 +3911,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #call_target_fn
-    };
-
-    expanded.into()
+    }
 }
 
 /// Serialize a helper into a hidden `JitCode` builder.
@@ -5055,7 +5184,6 @@ mod tests {
         );
         assert!(text.contains("stringify ! (leaf)"), "{text}");
     }
-
     fn specialize_argtype_tokens(attr: &str, src: &str) -> proc_macro2::TokenStream {
         let args: SpecializeArgtypeArgs = syn::parse_str(attr).expect("indices parse");
         expand_specialize_argtype(&args.indices, &parse_fn(src))
@@ -5095,5 +5223,151 @@ mod tests {
             });
             assert!(has_body_const, "missing body-local marker: {src}");
         }
+    }
+
+    fn parse_expansion_items(tokens: proc_macro2::TokenStream) -> Vec<syn::Item> {
+        syn::parse2::<syn::File>(tokens.clone())
+            .map(|file| file.items)
+            .or_else(|_| {
+                syn::parse2::<syn::ItemMod>(quote! { mod __expansion { #tokens } })
+                    .map(|module| module.content.expect("mod body").1)
+            })
+            .expect("look_inside_iff expansion should parse")
+    }
+
+    fn expansion_fn<'a>(items: &'a [syn::Item], name: &str) -> &'a syn::ItemFn {
+        items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(func) if func.sig.ident == name => Some(func),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fn {name}"))
+    }
+
+    fn fn_const_names(func: &syn::ItemFn) -> Vec<String> {
+        func.block
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                syn::Stmt::Item(syn::Item::Const(item)) => Some(item.ident.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sibling_const_names(items: &[syn::Item]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Const(item) => Some(item.ident.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn const_has_str(func: &syn::ItemFn, name: &str, spec: &str) -> bool {
+        func.block.stmts.iter().any(|stmt| {
+            let syn::Stmt::Item(syn::Item::Const(item)) = stmt else {
+                return false;
+            };
+            item.ident == name && const_lit_str(item).as_deref() == Some(spec)
+        })
+    }
+
+    /// `rlib/jit.py look_inside_iff`: `trampoline.oopspec = func.oopspec;
+    /// del func.oopspec`. A still-pending `#[oopspec]` attr is consumed and
+    /// lands on the dont_look_inside trampoline, not the looked-inside body.
+    #[test]
+    fn look_inside_iff_moves_pending_oopspec_attr_onto_trampoline() {
+        let func = parse_fn(
+            r#"
+            #[oopspec("dict.lookup")]
+            fn lookup(d: i64, key: i64, hash: i64) -> i64 {
+                d + key + hash
+            }
+            "#,
+        );
+        let predicate: Path = syn::parse_str("lookup_iff").unwrap();
+        let items = parse_expansion_items(expand_look_inside_iff_item(predicate, func));
+        let orig = expansion_fn(&items, "_orig_lookup");
+        let trampoline = expansion_fn(&items, "lookup_trampoline");
+        let dispatch = expansion_fn(&items, "lookup");
+        let orig_consts = fn_const_names(orig);
+        let dispatch_consts = fn_const_names(dispatch);
+        let siblings = sibling_const_names(&items);
+        assert!(
+            !orig_consts
+                .iter()
+                .any(|name| name == "_MAJIT_OOPSPEC" || name.starts_with("oopspec_")),
+            "orig body must not keep oopspec, got {orig_consts:?}"
+        );
+        assert!(
+            !dispatch_consts
+                .iter()
+                .any(|name| name == "_MAJIT_OOPSPEC" || name.starts_with("oopspec_")),
+            "dispatch wrapper must not keep oopspec, got {dispatch_consts:?}"
+        );
+        assert!(
+            const_has_str(trampoline, "_MAJIT_OOPSPEC", "dict.lookup"),
+            "trampoline body-local _MAJIT_OOPSPEC"
+        );
+        assert!(
+            const_has_str(trampoline, "oopspec_lookup_trampoline", "dict.lookup"),
+            "trampoline body-local oopspec_lookup_trampoline"
+        );
+        assert!(
+            siblings
+                .iter()
+                .any(|name| name == "oopspec_lookup_trampoline"),
+            "sibling oopspec on trampoline, got {siblings:?}"
+        );
+        assert!(
+            !siblings.iter().any(|name| name == "oopspec_lookup"),
+            "sibling oopspec must not stay on the original name, got {siblings:?}"
+        );
+        assert!(
+            dispatch
+                .attrs
+                .iter()
+                .all(|attr| !attr_ends_with(attr, "oopspec")),
+            "dispatch must not keep a pending #[oopspec] attr"
+        );
+    }
+
+    /// Same move when `#[oopspec]` already expanded and left markers in the
+    /// original body (`func.oopspec` before `look_inside_iff.inner`).
+    #[test]
+    fn look_inside_iff_moves_expanded_oopspec_markers_onto_trampoline() {
+        let func = parse_fn(
+            r#"
+            fn lookup(d: i64, key: i64, hash: i64) -> i64 {
+                const _MAJIT_OOPSPEC: &str = "dict.lookup";
+                const oopspec_lookup: &'static str = "dict.lookup";
+                d + key + hash
+            }
+            "#,
+        );
+        let predicate: Path = syn::parse_str("lookup_iff").unwrap();
+        let items = parse_expansion_items(expand_look_inside_iff_item(predicate, func));
+        let orig = expansion_fn(&items, "_orig_lookup");
+        let trampoline = expansion_fn(&items, "lookup_trampoline");
+        let orig_consts = fn_const_names(orig);
+        assert!(
+            !orig_consts
+                .iter()
+                .any(|name| name == "_MAJIT_OOPSPEC" || name.starts_with("oopspec_")),
+            "orig body must drop func.oopspec, got {orig_consts:?}"
+        );
+        assert!(const_has_str(
+            trampoline,
+            "oopspec_lookup_trampoline",
+            "dict.lookup"
+        ));
+        assert!(
+            sibling_const_names(&items)
+                .iter()
+                .any(|name| name == "oopspec_lookup_trampoline")
+        );
     }
 }
