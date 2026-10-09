@@ -4911,6 +4911,43 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     crate::state::note_inline_subwalk_end();
                 }
                 let walked = walked?;
+                // `opimpl_jit_merge_point` else-branch inside the inlined
+                // portal: `finishframe` + `do_recursive_call(assembler_call=True)`
+                // + `ChangeFrame` back to this call. Emit CALL_ASSEMBLER here
+                // rather than bubbling `SubLoopCalleeCallAssembler` to the
+                // root walk, which the FBW driver maps to a plain Abort.
+                if let DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } = walked {
+                    let Some(token) = token else {
+                        return Ok(None);
+                    };
+                    let (Some(&callee_frame), Some(&callee_ec)) = (reds_r.first(), reds_r.get(1))
+                    else {
+                        return Ok(None);
+                    };
+                    let is_being_profiled =
+                        frame_box_is_being_profiled(ctx.trace_ctx, ctx.session, callee_frame);
+                    let w_code = green_values
+                        .get(2)
+                        .copied()
+                        .map(|v| v as *const ())
+                        .unwrap_or(std::ptr::null());
+                    return inline_call::emit_walker_loop_callee_call_assembler(
+                        ctx,
+                        op,
+                        dst_bank,
+                        dst,
+                        callee_frame,
+                        callee_ec,
+                        0,
+                        Some(token),
+                        target_pc,
+                        w_code,
+                        is_being_profiled,
+                        None,
+                        None,
+                        None,
+                    );
+                }
                 return Ok(Some(finish_recursive_inline(
                     ctx, op, dst, dst_bank, walked,
                 )?));
@@ -8940,6 +8977,17 @@ pub(crate) struct GuardCaptureScope {
     /// own raise) needs its own catch to receive the raise. Uncovered
     /// residuals fall back to the fallthrough resume even when this is set.
     pub residual_call_catch_resume: bool,
+
+    /// Shared `dispatch_bytecode` residual: keep the `setfield_vable`
+    /// `last_instr` already on the boxes (this opcode's offset) instead of
+    /// publishing `py_pc - 1`.  The out-of-line residual's floor is the last
+    /// opcode, so a capture keyed there writes RETURN and a compiled
+    /// GuardNotForced deopt leaves the loop
+    /// (`settrace_local_tracer_armed_before_entry` acc 576201).  Capture at
+    /// the `goto L_shared` with `after_residual_call=false` so the resume
+    /// marker is a can_decode startpoint; skipping the rewrite leaves the
+    /// switch key the blackhole needs.  Still publish `valuestackdepth`.
+    pub preserve_vable_last_instr: bool,
 
     /// Bridge-entry flavor guard (`_prepare_exception_resumption`,
     /// pyjitpl.py): the walk-entry `position` IS the resume
@@ -14696,7 +14744,7 @@ fn latch_taken_python_branch_abort_stack<Sym: WalkSym>(
     );
 }
 
-fn goto_if_not_branch_on<Sym: WalkSym>(
+pub(crate) fn goto_if_not_branch_on<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -18553,14 +18601,10 @@ fn handle<Sym: WalkSym>(
                 if !no_loop_header {
                     // pyjitpl.py `if self.metainterp.portal_call_depth:
                     // return` — nested portal call waits for an explicit
-                    // loop_header.
-                    let depth_zero = ctx
-                        .trace_ctx
-                        .portal_call_depth_fn
-                        .as_ref()
-                        .map(|f| f() == 0)
-                        .unwrap_or(false);
-                    if !depth_zero || !ctx.is_top_level {
+                    // loop_header. The function-entry merge of a recursive
+                    // callee (every instruction is a merge point) takes this
+                    // return; CALL_ASSEMBLER is `_opimpl_recursive_call`'s.
+                    if portal_call_depth != 0 {
                         return Ok((DispatchOutcome::Continue, op.next_pc));
                     }
                     // pyjitpl.py: fall-through arrival counts as
@@ -18598,6 +18642,49 @@ fn handle<Sym: WalkSym>(
                 "found a loop_header for a JitDriver that does not match \
                  the following jit_merge_point's"
             );
+
+            // pyjitpl.py `opimpl_jit_merge_point` else-branch: when
+            // `portal_call_depth` is non-zero this header is not the
+            // traced loop's own close. Finish the callee and
+            // `do_recursive_call(..., assembler_call=True)`. Body
+            // merges never reach here: they returned above at
+            // `if portal_call_depth: return`. A nested inlined *loop*
+            // stamped `seen_loop_header` via `loop_header` and reaches
+            // this arm; a recursive function-entry does not.
+            //
+            // FBW's top-level walk *is* that compiling portal frame
+            // (`portal_call_depth == 0` upstream). `note_inline_subwalk_start`
+            // `newframe`s each inlined callee onto `MetaInterp.portal_call_depth`,
+            // and a failed multi-frame carrier rebuild can leave those frames
+            // sitting while this walk continues in the root body. The root
+            // header must still `reached_loop_header` (CloseLoop / compile the
+            // bridge). Nested sub-walks (`is_top_level == false`) keep this
+            // arm so the call site can emit CALL_ASSEMBLER.
+            //
+            // `surface_inline_subloop_after_back_edge` resets the stamp the
+            // way `opimpl_jit_merge_point` clears `seen_loop_header_for_jdindex`
+            // before `finishframe` + `do_recursive_call`. Call it while the
+            // stamp is still set so a `no_loop_header` driver and a
+            // first-back-edge cut both surface; fall-through visits already
+            // returned above.
+            if portal_call_depth != 0
+                && !ctx.is_top_level
+                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none()
+            {
+                if let Some(outcome) = try_surface_inline_subloop_for_pycode(
+                    ctx,
+                    code_ptr as usize,
+                    next_instr,
+                    is_being_profiled,
+                    ctx.fbw_mode.carrier_resume,
+                    op.pc,
+                    op.next_pc,
+                    no_loop_header,
+                    jdindex,
+                ) {
+                    return Ok(outcome);
+                }
+            }
             ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
             let back_edge_jit_pc = ctx.trace_ctx.seen_loop_header_jit_pc.take();
 

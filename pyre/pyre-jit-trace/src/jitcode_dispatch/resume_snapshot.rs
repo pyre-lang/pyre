@@ -526,15 +526,24 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
     op_pc: usize,
     scope: GuardCaptureScope,
 ) -> Result<(), DispatchError> {
-    let after_residual_call = matches!(
-        ctx.trace_ctx.last_guard_opcode(),
-        Some(
-            OpCode::GuardException
-                | OpCode::GuardNoException
-                | OpCode::GuardNotForced
-                | OpCode::GuardAlwaysFails
+    // `pyjitpl.py generate_guard` keys `after_residual_call` on the
+    // opcode (`GUARD_EXCEPTION` included). Shared `dispatch_bytecode`
+    // residuals capture at the `goto L_shared` instead, and that
+    // startpoint must not take the after-residual advance
+    // (`GuardCaptureScope::preserve_vable_last_instr`).
+    let after_residual_call = if scope.preserve_vable_last_instr {
+        false
+    } else {
+        matches!(
+            ctx.trace_ctx.last_guard_opcode(),
+            Some(
+                OpCode::GuardException
+                    | OpCode::GuardNoException
+                    | OpCode::GuardNotForced
+                    | OpCode::GuardAlwaysFails
+            )
         )
-    );
+    };
     let scope = GuardCaptureScope {
         residual_call_catch_resume: scope.residual_call_catch_resume || after_residual_call,
         ..scope
