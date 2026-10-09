@@ -3699,11 +3699,9 @@ mod tests {
         let _jitcode = assemble(&mut ssarepr, JitCodeBuilder::default(), None);
     }
 
-    // TODO: once a descr-consuming op (e.g. `switch`, `getfield_gc_d`) is
-    // ported into `dispatch_op`, add a positive test that confirms its
-    // descr lands on `BlackholeInterpBuilder.descrs` and that
-    // `SwitchDictDescr._labels` → `BhDescr::Switch.dict` round-trips via
-    // the shared pool at `fix_labels()` time (blackhole.py).
+    // `switch` is now a descr-consuming op (`dispatch_op` `"switch"`);
+    // `portal_we_are_jitted_is_shared_residual_block` checks the
+    // `switch/id` round-trip.  `getfield_gc_d` is still unported.
 
     /// `assembler.py:208-209` parity:
     /// ```python

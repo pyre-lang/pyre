@@ -284,15 +284,24 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
     op_pc: usize,
     scope: GuardCaptureScope,
 ) -> Result<(), DispatchError> {
-    let after_residual_call = matches!(
-        ctx.trace_ctx.last_guard_opcode(),
-        Some(
-            OpCode::GuardException
-                | OpCode::GuardNoException
-                | OpCode::GuardNotForced
-                | OpCode::GuardAlwaysFails
+    // `pyjitpl.py generate_guard` keys `after_residual_call` on the
+    // opcode (`GUARD_EXCEPTION` included). Shared `dispatch_bytecode`
+    // residuals capture at the `goto L_shared` instead, and that
+    // startpoint must not take the after-residual advance
+    // (`GuardCaptureScope::preserve_vable_last_instr`).
+    let after_residual_call = if scope.preserve_vable_last_instr {
+        false
+    } else {
+        matches!(
+            ctx.trace_ctx.last_guard_opcode(),
+            Some(
+                OpCode::GuardException
+                    | OpCode::GuardNoException
+                    | OpCode::GuardNotForced
+                    | OpCode::GuardAlwaysFails
+            )
         )
-    );
+    };
     let scope = GuardCaptureScope {
         residual_call_catch_resume: scope.residual_call_catch_resume || after_residual_call,
         ..scope
@@ -675,14 +684,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 saved_vable_scalars = Some(crate::trace_opcode::save_vable_resume_scalars(
                     ctx.trace_ctx,
                 ));
-                let last_instr_value = py_pc as i64 - 1;
-                let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-                    ctx.trace_ctx,
-                    "last_instr",
-                    last_instr_op,
-                    Value::Int(last_instr_value),
-                );
+                if !scope.preserve_vable_last_instr {
+                    let last_instr_value = py_pc as i64 - 1;
+                    let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
+                    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+                        ctx.trace_ctx,
+                        "last_instr",
+                        last_instr_op,
+                        Value::Int(last_instr_value),
+                    );
+                }
                 // `ResumeGuardForcedDescr.handle_async_forcing` consumes the
                 // virtualizable section WHILE the residual is running. Its
                 // result belongs to the MIFrame's post-call registers, but

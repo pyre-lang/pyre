@@ -2569,7 +2569,8 @@ pub fn report_stack_underflow(frame: &PyFrame) {
 /// carries (`eval::eval_with_jit_inner`), a callee's by the walker declining
 /// to enter one while a hook is installed
 /// (`jitcode_dispatch::ec_hook_installed`), and a frame that arms local
-/// tracing by `record_portal_debugdata_guard` keeping it from compiling.
+/// tracing by the portal jitcode's `we_are_jitted` arm
+/// (`emit_we_are_jitted_bytecode_only_trace`).
 /// `setprofile` owes the same frame-level pair, from the same bracket plus
 /// `leave`'s `_trace('leaveframe')`, and owes `c_call` / `c_return` on top —
 /// which the residual call helpers fire themselves

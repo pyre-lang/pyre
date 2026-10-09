@@ -11158,9 +11158,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // counterpart here because this body is never traced: pyre records
         // from a per-CodeObject JitCode built by `jit/codewriter.rs` and walked
         // by `pyre-jit-trace`'s `run_perfn_walk`, not from this Rust loop.  The
-        // port of that arm is `record_portal_debugdata_guard`
-        // (`pyre-jit-trace/src/jitcode_dispatch/mod.rs`), which runs at the
-        // portal merge point — the walker's counterpart of this loop's top.
+        // port of that arm is `emit_we_are_jitted_bytecode_only_trace`
+        // (`jit/codewriter.rs`), which the walker records as it steps the
+        // portal jitcode — the counterpart of this loop's top.
         // `we_are_jitted()` here would be a runtime thread-local set only while
         // cranelift-compiled code is on the stack, not the folded compile-time
         // constant upstream's translator sees, so splitting on it would strip
@@ -13085,8 +13085,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // instruction that can start one, and those are fired by
     // `ec.bytecode_trace` from the dispatch loop.  Compiled code has no route
     // to that call, and this door runs the WHOLE frame compiled rather than a
-    // loop inside it, so it has no merge point for
-    // `record_portal_debugdata_guard` to place its guard at.  Measured on a
+    // loop inside it, so it never steps the portal jitcode's `we_are_jitted`
+    // arm (`emit_we_are_jitted_bytecode_only_trace`).  Measured on a
     // callee whose `f_trace` is armed by the `ec.call_trace` at the portal:
     // the `line` events stop at the 1239th call — the entry threshold — and
     // never resume, at any length of tail, while `call` and `return` keep

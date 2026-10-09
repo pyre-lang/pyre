@@ -8280,6 +8280,30 @@ pub extern "C" fn bh_get_iter_fn(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// Residual callee for `dispatch_bytecode`'s `we_are_jitted()` arm:
+/// `ec.bytecode_only_trace(frame)`.
+///
+/// Void result matching `bh_bytecode_trace_jitted_slow`: always returns 0;
+/// an exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException`.  The portal jitcode emits this on the true arm of
+/// `if self.debugdata` so a blackhole from that guard fires the event
+/// instead of CRNing at the merge with no call.
+pub extern "C" fn bh_bytecode_only_trace(
+    ec: *mut pyre_interpreter::PyExecutionContext,
+    frame_ptr: *mut PyFrame,
+) -> i64 {
+    if ec.is_null() {
+        return 0;
+    }
+    match unsafe { (*ec).bytecode_only_trace(frame_ptr) } {
+        Ok(_) => 0,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object());
+            0
+        }
+    }
+}
+
 /// Residual callee for the jitted `jump_absolute` armed path:
 /// `ec.bytecode_trace(frame, decr_by)`.
 ///
