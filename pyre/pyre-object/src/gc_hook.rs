@@ -846,6 +846,22 @@ pub extern "C" fn try_gc_owns_object(addr: GCREF) -> bool {
     }
 }
 
+/// Stamp `init_gc_object_immortal`'s `GCFLAG_NO_HEAP_PTRS` on a collector-owned
+/// old-gen object that already has `GCFLAG_TRACK_YOUNG_PTRS`
+/// (`finish_alloc_in_oldgen`). The next [`try_gc_write_barrier_managed`]
+/// enrolls it in `prebuilt_root_objects` (`remember_young_pointer`).
+///
+/// # Safety
+/// `obj` must be a payload pointer returned by a collector allocation
+/// ([`try_gc_alloc_stable_raw`]) that wrote a `GcHeader` immediately before it.
+pub unsafe fn stamp_gc_no_heap_ptrs(obj: GCREF) {
+    debug_assert!(!obj.is_null());
+    unsafe {
+        let hdr = majit_gc::header::header_of(obj as usize);
+        (*hdr).set_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS);
+    }
+}
+
 /// Return the current address for `addr` without registering it as a root.
 /// When the active GC does not know the object, the address is unchanged.
 ///

@@ -4643,6 +4643,10 @@ fn init_module_type(mut ns: PyObjectRef) {
             "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type.",
         )
     );
+    // `__pyre_store!` rebinds `ns` from an inner slot that then pops.
+    // Reload from the outer pin before `make_builtin_function_with_arity`
+    // (`function.py` `Function.__init__` / `rstr.mallocstr` can collect).
+    ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     let ann_get = make_builtin_function_with_arity("__annotations__", module_annotations_get, 2);
     let ann_get_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ann_get);
@@ -4661,6 +4665,7 @@ fn init_module_type(mut ns: PyObjectRef) {
             pyre_object::gc_roots::shadow_stack_get(ann_del_slot)
         )
     );
+    ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     let annotate_get = make_builtin_function_with_arity("__annotate__", module_annotate_get, 2);
     let annotate_get_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(annotate_get);
@@ -9661,8 +9666,10 @@ fn init_dict_type(ns: PyObjectRef) {
                     } {
                         return Ok(pyre_object::w_not_implemented());
                     }
-                    let a = resolve(pyre_object::gc_roots::shadow_stack_get(base));
-                    let b = resolve(pyre_object::gc_roots::shadow_stack_get(base + 1));
+                    let mut a = resolve(pyre_object::gc_roots::shadow_stack_get(base));
+                    let b = pyre_object::with_roots!(
+                        a => resolve(pyre_object::gc_roots::shadow_stack_get(base + 1))
+                    );
                     // `dictmultiobject.py descr_eq`: a non-dict operand yields
                     // NotImplemented. Handing it to `compare` would re-dispatch
                     // to this `__eq__` (the operand is not a dict for compare's
@@ -9695,12 +9702,14 @@ fn init_dict_type(ns: PyObjectRef) {
                     } {
                         return Ok(pyre_object::w_not_implemented());
                     }
-                    let a = crate::type_methods::resolve_dict_backing(
+                    let mut a = crate::type_methods::resolve_dict_backing(
                         pyre_object::gc_roots::shadow_stack_get(base),
                     );
-                    let b = crate::type_methods::resolve_dict_backing(
-                        pyre_object::gc_roots::shadow_stack_get(base + 1),
-                    );
+                    let b = pyre_object::with_roots!(a => {
+                        crate::type_methods::resolve_dict_backing(
+                            pyre_object::gc_roots::shadow_stack_get(base + 1),
+                        )
+                    });
                     if a.is_null() || b.is_null() {
                         return Ok(pyre_object::w_not_implemented());
                     }
@@ -9744,12 +9753,14 @@ fn init_dict_type(ns: PyObjectRef) {
                     crate::type_methods::arity_slot(args, 1)?;
                     let _scope = pyre_object::gc_roots::push_roots();
                     let base = pyre_object::gc_roots::pin_roots(args);
-                    let src = crate::type_methods::resolve_dict_backing(
+                    let mut src = crate::type_methods::resolve_dict_backing(
                         pyre_object::gc_roots::shadow_stack_get(base),
                     );
-                    let other = crate::type_methods::resolve_dict_backing(
-                        pyre_object::gc_roots::shadow_stack_get(base + 1),
-                    );
+                    let other = pyre_object::with_roots!(src => {
+                        crate::type_methods::resolve_dict_backing(
+                            pyre_object::gc_roots::shadow_stack_get(base + 1),
+                        )
+                    });
                     if other.is_null() {
                         return Ok(pyre_object::w_not_implemented());
                     }
@@ -9774,12 +9785,14 @@ fn init_dict_type(ns: PyObjectRef) {
                     crate::type_methods::arity_slot(args, 1)?;
                     let _scope = pyre_object::gc_roots::push_roots();
                     let base = pyre_object::gc_roots::pin_roots(args);
-                    let self_ = crate::type_methods::resolve_dict_backing(
+                    let mut self_ = crate::type_methods::resolve_dict_backing(
                         pyre_object::gc_roots::shadow_stack_get(base),
                     );
-                    let other = crate::type_methods::resolve_dict_backing(
-                        pyre_object::gc_roots::shadow_stack_get(base + 1),
-                    );
+                    let other = pyre_object::with_roots!(self_ => {
+                        crate::type_methods::resolve_dict_backing(
+                            pyre_object::gc_roots::shadow_stack_get(base + 1),
+                        )
+                    });
                     if other.is_null() {
                         return Ok(pyre_object::w_not_implemented());
                     }
