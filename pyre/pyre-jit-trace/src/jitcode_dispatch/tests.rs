@@ -5298,6 +5298,36 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
 }
 
 #[test]
+fn newdict_is_the_pypy_empty_dict_leaf() {
+    // `dictmultiobject.py allocate_and_init_instance` empty-dict arm /
+    // `pyopcode.py BUILD_MAP` itemcount 0 is `space.newdict()`.  Own graph
+    // so `fuse_boxing_alloc` rewrites `malloc_typed_managed` to
+    // `new_with_vtable` + `dstorage` / `dstrategy` setfields, the shape
+    // PyPy traces.
+    let newdict =
+        crate::jitcode_runtime::pathed_jitcode("pyre_object::dictmultiobject::newdict_empty")
+            .expect("newdict_empty must be a discovered jitcode");
+    let newdict_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&newdict.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        newdict_ops.iter().any(|op| *op == "new_with_vtable"),
+        "newdict_empty must lower to new_with_vtable; ops={newdict_ops:?}"
+    );
+    assert!(
+        !newdict_ops
+            .iter()
+            .any(|op| op.contains("residual") || *op == "residual_call"),
+        "fused newdict_empty must not residualise malloc; ops={newdict_ops:?}"
+    );
+    assert!(
+        newdict_ops.len() < 32,
+        "fused newdict_empty is New+setfields, not malloc_typed; ops={newdict_ops:?}"
+    );
+    eprintln!("newdict_empty {} ops: {newdict_ops:?}", newdict_ops.len());
+}
+
+#[test]
 fn newcomplex_and_lane_getters_are_the_pypy_leaf() {
     // complexobject.py `descr__new__` allocates `W_ComplexObject(real, imag)`.
     // `complexwprop` then boxes one lane with `space.newfloat`. Both leaves
