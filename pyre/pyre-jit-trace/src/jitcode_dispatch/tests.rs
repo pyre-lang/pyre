@@ -858,6 +858,28 @@ fn the_substituted_bare_super_descr_is_a_may_force_live_heap_write() {
     );
 }
 
+/// BUILD_MAP 0 and DELETE_FAST's unbound arm are replay-safe allocations.
+/// The residual executor uses this set so CALL_ASSEMBLER is not blocked.
+#[test]
+fn empty_dict_and_unbound_local_error_are_replay_safe_fresh_allocations() {
+    assert!(
+        super::residual_call::runtime_helper_is_replay_safe_fresh_allocation(
+            majit_ir::RuntimeHelperKind::NewEmptyDict
+        )
+    );
+    assert!(
+        super::residual_call::runtime_helper_is_replay_safe_fresh_allocation(
+            majit_ir::RuntimeHelperKind::UnboundLocalError
+        )
+    );
+    assert!(!super::residual_call::helper_kind_writes_live_heap(
+        majit_ir::RuntimeHelperKind::NewEmptyDict
+    ));
+    assert!(!super::residual_call::helper_kind_writes_live_heap(
+        majit_ir::RuntimeHelperKind::UnboundLocalError
+    ));
+}
+
 #[test]
 fn specialised_pair_unpack_recognises_the_float_layout() {
     use super::specialize::{SpecialisedPairKind, specialised_pair_kind};

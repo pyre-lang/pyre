@@ -4106,6 +4106,22 @@ pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::RuntimeHelperKind) 
     )
 }
 
+/// Allocation-only helpers whose residual creates a fresh object and cannot
+/// mutate anything visible before the call.  Omitting one marks a non-pure
+/// residual and `try_walker_call_assembler` denies a later `CALL_ASSEMBLER`.
+pub(crate) fn runtime_helper_is_replay_safe_fresh_allocation(
+    helper: majit_ir::RuntimeHelperKind,
+) -> bool {
+    matches!(
+        helper,
+        majit_ir::RuntimeHelperKind::NewtupleFromArray
+            | majit_ir::RuntimeHelperKind::NewlistFromArray
+            | majit_ir::RuntimeHelperKind::BuildStringFromArray
+            | majit_ir::RuntimeHelperKind::NewEmptyDict
+            | majit_ir::RuntimeHelperKind::UnboundLocalError
+    )
+}
+
 /// The standard virtualizable word `try_execute_residual_call_via_executor`
 /// saves across a non-forcing residual, rooted for the duration of the call.
 struct SavedVableRoot {
@@ -4928,22 +4944,19 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `RuntimeHelperKind::None`.  The fnaddr only names the helper;
     // user `__add__` / `__eq__` still mutate, so keep the exact-int gate.
     let opcode_binop_or_compare = opcode_binop_or_compare_fnaddr && exact_int_binop_operands;
-    // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
-    // backing array (`pyopcode.py`).  Re-executing either allocation
-    // cannot mutate an object visible before the call.  Upstream records list
-    // construction directly as `opimpl_newlist` (`pyjitpl.py`) and
-    // allows residual calls at every `MIFrame` depth (`pyjitpl.py`);
-    // it has no nested-callee abort for these allocation helpers.
+    // `BUILD_TUPLE` / `BUILD_LIST` / `BUILD_MAP 0` create a fresh container
+    // (`pyopcode.py`).  Re-executing the allocation cannot mutate an object
+    // visible before the call.  Upstream records list construction as
+    // `opimpl_newlist` (`pyjitpl.py`) and allows residual calls at every
+    // `MIFrame` depth (`pyjitpl.py`); it has no nested-callee abort for
+    // these allocation helpers.  DELETE_FAST's unbound arm builds the
+    // `UnboundLocalError` value from immutable `co_varnames` and returns it
+    // for the following `raise` (`pyopcode.py DELETE_FAST`).
     //
     // Disjoint from the three observed-value classes above: those name `CallFn`
-    // and `GetIter` over exact builtin scalars, this one names the two
-    // allocation helpers, and no helper kind is in both.
-    let replay_safe_fresh_allocation = matches!(
-        helper,
-        majit_ir::RuntimeHelperKind::NewtupleFromArray
-            | majit_ir::RuntimeHelperKind::NewlistFromArray
-            | majit_ir::RuntimeHelperKind::BuildStringFromArray
-    );
+    // and `GetIter` over exact builtin scalars, this one names the allocation
+    // helpers, and no helper kind is in both.
+    let replay_safe_fresh_allocation = runtime_helper_is_replay_safe_fresh_allocation(helper);
     // A journaled cursor is replay-safe: `fbw_bridge_iter_journal_rollback`
     // puts it back.  A generator, `map`, dict/set iterator, itertools
     // iterator, or user `__next__` records nothing, so the consume is not
