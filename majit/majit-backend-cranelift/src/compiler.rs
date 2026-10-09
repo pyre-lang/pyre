@@ -2817,7 +2817,7 @@ fn register_call_assembler_target(
     // — the assembler body. The host-ABI wrapper stays on `entry_code_ptr`
     // for `execute_token`; in-code CALL_ASSEMBLER loads this slot.
     token.set_ll_function_addr(entry_body as usize);
-    let depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
+    let depth = compiled.frame_depth as i64;
     let base_ofs = JF_FRAME_ITEM0_OFS as i64;
     // Preserve an existing registered CLT Arc when this token number is
     // re-registered, so metadata pointers already baked into callers remain
@@ -9914,6 +9914,11 @@ struct CompiledLoop {
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
+    /// `assembler.py assemble_loop` / `jitframeinfo_update_depth`:
+    /// `max(own, baked JUMP target)` (`guaranteed_frame_depth`).
+    /// `make_execute_token` sizes the entry from `clt.frame_info`, which
+    /// this value is published as.
+    frame_depth: usize,
     /// `compile.py setattr(cpu, name, descr)` — heap-stable clone of
     /// the owning `CraneliftBackend`'s per-cpu descr attachments.  The
     /// JIT-emitted CALL_ASSEMBLER slow path bakes this Arc's address as
@@ -20139,6 +20144,7 @@ impl CraneliftBackend {
             num_inputs: inputargs.len(),
             num_ref_roots: reserved_tail,
             max_output_slots,
+            frame_depth: guaranteed_frame_depth as usize,
             cpu_attachments: self.cpu_handle(),
             gc_table,
             gcmap_allocs,
@@ -21490,7 +21496,7 @@ impl CraneliftBackend {
         if let Some(table) = merged.gc_table.clone() {
             self.register_gc_table(token, table);
         }
-        let depth = merged.max_output_slots + merged.num_ref_roots;
+        let depth = merged.frame_depth;
         let code_ptr = merged.code_ptr as usize;
         let body_ptr = merged.body_ptr as usize;
         let family_entry = LoopTargetEntry {
@@ -21546,8 +21552,17 @@ impl CraneliftBackend {
         compiled: &CompiledLoop,
         args: &[i64],
     ) -> (*mut JitFrame, *mut JitFrame, usize, usize) {
-        let depth = compiled.max_output_slots.max(args.len()).max(1);
-        let num_slots = depth + compiled.num_ref_roots;
+        // `llmodel.py` `AbstractLLCPU.make_execute_token`:
+        // `frame = self.gc_ll_descr.malloc_jitframe(clt.frame_info)`.
+        // Dynasm `run_done_raw_entry` reads `frame_info.depth()` the same
+        // way. Own `max_output_slots + num_ref_roots` is below the
+        // prologue `_check_frame_depth` when a baked JUMP target is
+        // wider (`guaranteed_frame_depth`); that miss is
+        // `cranelift_realloc_frame` on every call.
+        let clt = unsafe { &*token.compiled_loop_token_ptr() };
+        let fi_depth = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
+        let own = compiled.max_output_slots.max(args.len()).max(1) + compiled.num_ref_roots;
+        let num_slots = fi_depth.max(own);
         let facts = self.jitframe_facts;
         let jf_ptr = unsafe { prepare_done_raw_entry_frame(token, args, 0, num_slots, facts) };
         let code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
@@ -21976,7 +21991,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // CALL_ASSEMBLER callee frames.  The GC rewriter reads the
         // CompiledLoopToken.frame_info pointer at runtime, so update the
         // original token in place just like RPython's update_frame_depth.
-        let bridge_frame_depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
+        let bridge_frame_depth = compiled.frame_depth as i64;
         let baseofs = JF_FRAME_ITEM0_OFS as i64 + GcHeader::SIZE as i64;
         if let Some(clt) = original_token.compiled_loop_token() {
             clt.frame_info
@@ -26067,7 +26082,7 @@ mod tests {
             (
                 compiled_b.code_ptr as usize,
                 compiled_b.body_ptr as usize,
-                compiled_b.max_output_slots + compiled_b.num_ref_roots,
+                compiled_b.frame_depth,
                 family_entry,
             )
         };
