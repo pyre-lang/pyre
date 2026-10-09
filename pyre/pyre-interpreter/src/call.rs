@@ -5103,7 +5103,28 @@ pub fn type_call_instantiate_with_kwargs(
 fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     // One-argument `type(x)` is `type_call_special_case` before any
     // allocation. The instantiation tail is a separate graph.
-    if let Some(result) = type_call_special_case(w_type, args, false) {
+    // `type_of_object` can intern the unnamed-layout name
+    // (`box_str_constant`), so the type and every argument stay in
+    // shadow-stack slots across that call (`framework.py` `push_roots`).
+    let args_len = args.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    for &arg in args {
+        let _ = pyre_object::gc_roots::pin_root(arg);
+    }
+    let current_args = || {
+        let mut pinned_args = Vec::with_capacity(args_len);
+        for i in 0..args_len {
+            pinned_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+        }
+        pinned_args
+    };
+    if let Some(result) = type_call_special_case(
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+        &current_args(),
+        false,
+    ) {
         return match result {
             Ok(value) => value,
             Err(error) => {
@@ -5112,7 +5133,10 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
             }
         };
     }
-    type_descr_call_instantiate(w_type, args)
+    type_descr_call_instantiate(
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+        &current_args(),
+    )
 }
 
 /// Gateway the tracer enters for one-argument `type(x)`.
@@ -5148,6 +5172,7 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
     // instance live across both Python calls.  In translated RPython the GC
     // transform reloads these from shadow-stack slots after `__new__`; Rust
     // slices are only copies and otherwise retain pre-move addresses.
+    let args_len = args.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_type);
@@ -5159,12 +5184,16 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
     // fill their argument vector straight from the pinned slots — reloading
     // into a throwaway `Vec` first would allocate a second one per call.
     let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
-        for i in 0..args.len() {
+        for i in 0..args_len {
             dst.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
         }
     };
 
-    if let Some(result) = type_call_special_case(current_type(), args, false) {
+    if let Some(result) = {
+        let mut pinned_args = Vec::with_capacity(args_len);
+        extend_current_args(&mut pinned_args);
+        type_call_special_case(current_type(), &pinned_args, false)
+    } {
         return match result {
             Ok(value) => value,
             Err(error) => {
@@ -5173,7 +5202,11 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
             }
         };
     }
-    if let Some(result) = type_call_vectorcall(current_type(), args, &[], &[]) {
+    if let Some(result) = {
+        let mut pinned_args = Vec::with_capacity(args_len);
+        extend_current_args(&mut pinned_args);
+        type_call_vectorcall(current_type(), &pinned_args, &[], &[])
+    } {
         return match result {
             Ok(value) => value,
             Err(error) => {
@@ -5191,7 +5224,7 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
     let instance = if let Some(new_fn) =
         unsafe { crate::baseobjspace::lookup_in_type(current_type(), "__new__") }
     {
-        let mut new_args = Vec::with_capacity(1 + args.len());
+        let mut new_args = Vec::with_capacity(1 + args_len);
         new_args.push(current_type());
         extend_current_args(&mut new_args);
         call_function_impl(new_fn, &new_args)
@@ -5210,7 +5243,7 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
     ) && let Some(init_fn) =
         unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
     {
-        let mut init_args = Vec::with_capacity(1 + args.len());
+        let mut init_args = Vec::with_capacity(1 + args_len);
         init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
         extend_current_args(&mut init_args);
         let res = call_function_impl(init_fn, &init_args);
@@ -7474,14 +7507,14 @@ fn type_descr_call_with_mode(
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
-    if let Some(result) = type_call_special_case(w_type, args, false) {
-        return result;
-    }
     // `typeobject.py:731,738-739` threads one `__args__` through `__new__` and
     // then `__init__`; it needs no reload because `Arguments.arguments_w` is a
     // traced list the moving GC updates in place. This slice is a raw copy the
     // collector cannot see, so pin the type and every argument here and read
     // them back from the shadow stack after `__new__` has run Python code.
+    // `type_call_special_case` can intern via `type_of_object`, so the same
+    // slots cover that call (`framework.py` `push_roots`).
+    let args_len = args.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_type);
@@ -7489,15 +7522,30 @@ fn type_descr_call_with_mode(
         let _ = pyre_object::gc_roots::pin_root(arg);
     }
     let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    if let Some(result) = {
+        let mut pinned_args = Vec::with_capacity(args_len);
+        for index in 0..args_len {
+            pinned_args.push(pyre_object::gc_roots::shadow_stack_get(
+                root_base + 1 + index,
+            ));
+        }
+        type_call_special_case(current_type(), &pinned_args, false)
+    } {
+        return result;
+    }
     let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
-        for index in 0..args.len() {
+        for index in 0..args_len {
             dst.push(pyre_object::gc_roots::shadow_stack_get(
                 root_base + 1 + index,
             ));
         }
     };
 
-    if let Some(result) = type_call_vectorcall(current_type(), args, &[], &[]) {
+    if let Some(result) = {
+        let mut pinned_args = Vec::with_capacity(args_len);
+        extend_current_args(&mut pinned_args);
+        type_call_vectorcall(current_type(), &pinned_args, &[], &[])
+    } {
         return result;
     }
     check_type_instantiable(current_type())?;
@@ -7526,7 +7574,7 @@ fn type_descr_call_with_mode(
         unsafe { crate::baseobjspace::get(new_descr, pyre_object::PY_NULL, current_type())? }
             .unwrap_or(pyre_object::gc_roots::shadow_stack_get(new_descr_slot));
     // typeobject.py — `space.call_obj_args(w_newfunc, self, __args__)`.
-    let mut new_args = Vec::with_capacity(1 + args.len());
+    let mut new_args = Vec::with_capacity(1 + args_len);
     new_args.push(current_type());
     extend_current_args(&mut new_args);
     // `typeobject.py descr_call` runs `__new__` and `__init__` through
@@ -7556,7 +7604,7 @@ fn type_descr_call_with_mode(
         let init_result = if unsafe {
             crate::is_function(init_descr) || crate::is_slot_wrapper(init_descr)
         } {
-            let mut init_args = Vec::with_capacity(1 + args.len());
+            let mut init_args = Vec::with_capacity(1 + args_len);
             init_args.push(current_instance());
             extend_current_args(&mut init_args);
             call_callable_with_mode(
@@ -7574,7 +7622,7 @@ fn type_descr_call_with_mode(
                     .unwrap_or(pyre_object::gc_roots::shadow_stack_get(init_descr_slot));
             // Binding the descriptor allocates, so the arguments are reloaded
             // after it rather than before.
-            let mut init_args = Vec::with_capacity(args.len());
+            let mut init_args = Vec::with_capacity(args_len);
             extend_current_args(&mut init_args);
             call_callable_with_mode(
                 execution_context,

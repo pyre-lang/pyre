@@ -16,13 +16,19 @@
 //! dict (`resize_counter = -1`), so the rehash-then-resize path never
 //! runs.
 //!
-//! Entries are `_ll_malloc_entries`: nursery `try_gc_alloc_nursery_raw`,
-//! matching `lltype.malloc(ENTRIES, n, zero=True)` of a `GcArray`. Access
-//! is index-based (`entry(entries, i)`); no `&K` / `&V` iterator is handed
-//! out. The `WEAKDICT` object itself stands for the prebuilt
-//! `interned_strings` dict (`baseobjspace.py` builds it at translation
-//! time, so it stays old/prebuilt). `_ll_free_entries` is a no-op, so a
-//! replaced array is left for the collector.
+//! Entries are `_ll_malloc_entries`: collecting nursery malloc
+//! (`try_gc_alloc_collecting_rooted`), matching `lltype.malloc(ENTRIES, n,
+//! zero=True)` of a `GcArray` (`rdict.py` `_ll_malloc_entries`,
+//! `framework.py` `push_roots`). Access is index-based (`entry(entries, i)`);
+//! no `&K` / `&V` iterator is handed out, so the rordereddict no-collect
+//! non-moving path does not apply. The `WEAKDICT` object itself stands for
+//! the prebuilt `interned_strings` dict (`ObjSpace.__init__` /
+//! `WeakValueDictRepr.convert_const`): `alloc_raw` takes
+//! `try_gc_alloc_stable_raw`, stamps `GCFLAG_NO_HEAP_PTRS`, and write-barriers
+//! so `remember_young_pointer` enrolls it in `prebuilt_root_objects`.
+//! `_ll_free_entries` is a no-op, so a replaced array is left for the
+//! collector — collecting malloc lets a minor reclaim it instead of spilling
+//! the block OLD (`alloc_with_type_no_collect`).
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
@@ -101,13 +107,22 @@ impl WeakDictKey for StrKey {
     }
 }
 
+/// Prebuilt `WEAKDICT` (`WeakValueDictRepr.convert_const` /
+/// `ObjSpace.__init__` interned_strings): old-gen, non-moving
+/// (`try_gc_alloc_stable_raw`), stamped `GCFLAG_NO_HEAP_PTRS`, then
+/// write-barried so `remember_young_pointer` enrolls it in
+/// `prebuilt_root_objects`. Falls back to host memory when the tid is
+/// unpublished or no stable hook is installed.
 fn alloc_raw(tid: u32, bytes: usize) -> crate::gc_hook::GCREF {
-    if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, bytes);
-        if !raw.is_null() {
-            crate::gc_hook::try_gc_write_barrier_managed(raw);
-            return raw;
-        }
+    let gc_ptr = if tid != 0 {
+        crate::gc_hook::try_gc_alloc_stable_raw(tid, bytes)
+    } else {
+        std::ptr::null_mut()
+    };
+    if !gc_ptr.is_null() {
+        unsafe { crate::gc_hook::stamp_gc_no_heap_ptrs(gc_ptr) };
+        crate::gc_hook::try_gc_write_barrier_managed(gc_ptr);
+        return gc_ptr;
     }
     let layout = std::alloc::Layout::from_size_align(bytes, std::mem::align_of::<usize>())
         .expect("weakdict layout");
@@ -128,21 +143,37 @@ fn entries_bytes<K>(n: usize) -> usize {
 }
 
 /// `_ll_malloc_entries`: `malloc(ENTRIES, n, zero=True)` of a `GcArray`.
-/// Nursery (`try_gc_alloc_nursery_raw`), matching that malloc. Access is
+/// Collecting (`try_gc_alloc_collecting_rooted`), matching that malloc
+/// (`framework.py` `push_roots` around `_ll_malloc_entries`). Access is
 /// index-based (`entry`); the array may move. The `WEAKDICT` object stays
-/// on the old/prebuilt path (`alloc_raw`).
+/// on the old/prebuilt path (`alloc_raw`). Callers pin `d` and the old
+/// array before this returns.
 fn alloc_entries<K>(n: usize) -> *mut WeakDictEntries<K> {
     let bytes = entries_bytes::<K>(n);
     let tid = weakdict_entries_gc_type_id();
     if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_nursery_raw(tid, bytes);
+        let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
+        let mut needs_write_barrier = true;
+        let raw = unsafe {
+            crate::gc_hook::try_gc_alloc_collecting_rooted(
+                tid,
+                bytes,
+                &mut allocation_root,
+                &mut needs_write_barrier,
+            )
+        };
+        let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+            .allocated_or_abort(bytes)
+            .unwrap_or(std::ptr::null_mut());
         if !raw.is_null() {
-            // Nursery allocation stamps the header only (`init_nursery_object`).
-            // `_ll_malloc_entries` is `zero=True`. `GCREF` is `*mut GCREFOpaque`
-            // (`size_of` 0), so `write_bytes` on the GCREF itself writes no
-            // bytes; zero through `*mut u8`.
+            // Collecting malloc stamps the header only. `_ll_malloc_entries`
+            // is `zero=True`. `GCREF` is `*mut GCREFOpaque` (`size_of` 0), so
+            // `write_bytes` on the GCREF itself writes no bytes; zero through
+            // `*mut u8`.
             unsafe { std::ptr::write_bytes(raw as *mut u8, 0, bytes) };
-            crate::gc_hook::try_gc_write_barrier_managed(raw);
+            if needs_write_barrier {
+                crate::gc_hook::try_gc_write_barrier_managed(raw);
+            }
             let entries = raw as *mut WeakDictEntries<K>;
             unsafe { (*entries).length = n };
             return entries;
@@ -178,6 +209,13 @@ fn valid<K>(entries: *mut WeakDictEntries<K>, i: usize) -> bool {
     }
     // `ll_valid`: `bool(value) and bool(weakref_deref(...))`.
     !unsafe { crate::weakref::w_weakref_deref(value) }.is_null()
+}
+
+/// Convert_const intern entry: `WeakValueDictRepr.convert_const` stores a
+/// prebuilt weakref (`prebuilt_weakref`, not collector-owned);
+/// `new_interned_w_str` stores a GC weakref (`w_weakref_new`).
+fn valueref_is_prebuilt(valueref: *mut Weakref) -> bool {
+    !valueref.is_null() && !crate::gc_hook::try_gc_owns_object(valueref as crate::gc_hook::GCREF)
 }
 
 /// `WEAKDICTENTRYARRAY` adt `hash`: `ll_hash(entries, i)` =
@@ -292,12 +330,24 @@ fn barrier_entries<K>(entries: *mut WeakDictEntries<K>, i: usize) {
 }
 
 /// `setfield_gc` write barrier on `WEAKDICT.entries`. Resize replaces the
-/// array pointer; a minor extra-root walk of an old dict forwards the dict
-/// and does not scan the new `entries` unless this remembers it.
+/// array pointer; a prebuilt/old dict is not scanned on a minor unless this
+/// remembers it (`old_objects_pointing_to_young`).
 fn barrier_dict<K>(d: *mut WeakDict<K>) {
     if !d.is_null() {
         crate::gc_hook::try_gc_write_barrier(d as crate::gc_hook::GCREF);
     }
+}
+
+/// `setfield_gc` write barrier on `WEAKDICT`. Not a collection: the flag
+/// test in `incminimark.py` `write_barrier` enrolls
+/// `old_objects_pointing_to_young` when `GCFLAG_TRACK_YOUNG_PTRS` is set.
+/// `_rweakvaldict.py` `ll_set_nonnull` keeps `d` a livevar across
+/// `weakref_create`; for an old/prebuilt table the barrier is what lets a
+/// minor trace `d.entries`. Callers publish any young livevars after this
+/// and before the first safepoint (`framework.py` `push_roots`). Does not
+/// extra-pin `entries`.
+pub fn barrier_weakdict<K>(d: *mut WeakDict<K>) {
+    barrier_dict(d);
 }
 
 /// `rordereddict.rs` `pin_table_and_entries`. Barrier-before-pin of an
@@ -439,6 +489,15 @@ impl WeakDict<StrKey> {
         }
     }
 
+    /// Convert_const intern entry: the stored valueref is a prebuilt weakref
+    /// (`unicodeobject.rs` `prebuilt_weakref`, not collector-owned).
+    /// `new_interned_w_str` stores a GC weakref (`w_weakref_new`).
+    pub fn ll_valueref_is_prebuilt(&self, llkey: StrKey) -> bool {
+        let hash = llkey.ll_keyhash();
+        let i = ll_dict_lookup(self, llkey, hash) & (HIGHEST_BIT - 1);
+        valueref_is_prebuilt(unsafe { (*entry(self.entries, i)).value })
+    }
+
     /// `WeakValueDictRepr.ll_set`. A null `llvalue` is `None` and
     /// dispatches to `ll_set_null`.
     #[majit_macros::dont_look_inside]
@@ -463,10 +522,31 @@ impl WeakDict<StrKey> {
     }
 
     /// `WeakValueDictRepr.ll_set_nonnull`. `weakref_create(llvalue)` runs
-    /// first (GC effects), then the valueref store.
+    /// first (GC effects), then the valueref store. `d`, `llkey`, and
+    /// `llvalue` are livevars across that malloc (`framework.py`
+    /// `push_roots`).
     #[majit_macros::dont_look_inside]
     pub fn ll_set_nonnull(&mut self, key: StrKey, llvalue: crate::pyobject::PyObjectRef) {
-        let valueref = unsafe { crate::weakref::w_weakref_new(llvalue) };
+        let _roots = crate::gc_roots::push_roots();
+        // `write_barrier` first (not a collect), then `d` / `llvalue` /
+        // `llkey` as one livevar set (`framework.py` `push_roots`) across
+        // `weakref_create`.
+        barrier_weakdict(self as *mut WeakDict<StrKey>);
+        let has_key = !key.0.is_null();
+        let val_slot = if has_key {
+            crate::gc_roots::pin_roots(&[llvalue, key.0 as crate::pyobject::PyObjectRef])
+        } else {
+            let slot = crate::gc_roots::shadow_stack_len();
+            let _ = crate::gc_roots::pin_root(llvalue);
+            slot
+        };
+        let valueref =
+            unsafe { crate::weakref::w_weakref_new(crate::gc_roots::shadow_stack_get(val_slot)) };
+        let key = if has_key {
+            StrKey(crate::gc_roots::shadow_stack_get(val_slot + 1) as *mut Utf8Str)
+        } else {
+            key
+        };
         self.ll_set_nonnull_valueref(key, valueref);
     }
 
@@ -505,9 +585,10 @@ impl<K: WeakDictKey> WeakDict<K> {
         (0..n).filter(|&i| valid(self.entries, i)).count()
     }
 
-    /// Live entries whose referent the GC does not own. `sys.getunicodeinternedsize(
-    /// _only_immortal=True)` counts these: a prebuilt interned string, not a
-    /// value first presented to `sys.intern()`.
+    /// Live entries whose stored valueref is a convert_const prebuilt weakref
+    /// (`prebuilt_weakref`, not collector-owned). `sys.getunicodeinternedsize(
+    /// _only_immortal=True)` counts these: a convert_const interned string,
+    /// not a value first presented to `sys.intern()` (`w_weakref_new`).
     pub fn count_valid_immortal(&self) -> usize {
         if self.entries.is_null() {
             return 0;
@@ -515,39 +596,10 @@ impl<K: WeakDictKey> WeakDict<K> {
         let n = unsafe { (*self.entries).length };
         (0..n)
             .filter(|&i| {
-                if !valid(self.entries, i) {
-                    return false;
-                }
-                let referent =
-                    unsafe { crate::weakref::w_weakref_deref((*entry(self.entries, i)).value) };
-                !crate::gc_hook::try_gc_owns_object(referent as crate::gc_hook::GCREF)
+                valid(self.entries, i)
+                    && valueref_is_prebuilt(unsafe { (*entry(self.entries, i)).value })
             })
             .count()
-    }
-
-    /// Visit live referents until `f` returns `Some`. Does not hash or
-    /// dereference an external pointer; the visitor sees only stored values.
-    pub fn find_live<T>(
-        &self,
-        mut f: impl FnMut(crate::pyobject::PyObjectRef) -> Option<T>,
-    ) -> Option<T> {
-        if self.entries.is_null() {
-            return None;
-        }
-        let n = unsafe { (*self.entries).length };
-        for i in 0..n {
-            if !valid(self.entries, i) {
-                continue;
-            }
-            let obj = unsafe { crate::weakref::w_weakref_deref((*entry(self.entries, i)).value) };
-            if obj.is_null() {
-                continue;
-            }
-            if let Some(found) = f(obj) {
-                return Some(found);
-            }
-        }
-        None
     }
 
     fn ll_dict_lookup_clean(&self, hash: isize) -> usize {
@@ -638,11 +690,65 @@ mod tests {
         assert_eq!(d.ll_get(key), Some(obj));
         assert!(d.ll_get(str_key(b"abd")).is_none());
         assert_eq!(d.count_valid(), 1);
+        // `ll_set_nonnull` uses `w_weakref_new`; without a collecting hook
+        // that falls back to `malloc_typed` (a prebuilt weakref).
         assert_eq!(d.count_valid_immortal(), 1);
         assert_eq!(
             ll_dict_lookup(d, key, key.ll_keyhash()) & (HIGHEST_BIT - 1),
             ll_dict_lookup(d, str_key(b"abc"), str_key(b"abc").ll_keyhash()) & (HIGHEST_BIT - 1)
         );
+    }
+
+    /// `count_valid_immortal` inspects the stored valueref, not the referent:
+    /// a GC weakref (`w_weakref_new`) is not counted; a prebuilt weakref is.
+    #[test]
+    fn count_valid_immortal_inspects_valueref_not_referent() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        thread_local! {
+            static MANAGED_ALLOCS: std::cell::RefCell<Vec<usize>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn record_managed_alloc(_type_id: u32, payload_size: usize) -> crate::gc_hook::GCREF {
+            let layout = std::alloc::Layout::from_size_align(payload_size.max(1), 8)
+                .expect("managed valueref probe layout");
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                MANAGED_ALLOCS.with(|slots| slots.borrow_mut().push(ptr as usize));
+            }
+            ptr as crate::gc_hook::GCREF
+        }
+        fn managed_alloc_is_owned(addr: usize) -> bool {
+            MANAGED_ALLOCS.with(|slots| slots.borrow().contains(&addr))
+        }
+        struct ClearProbe;
+        impl Drop for ClearProbe {
+            fn drop(&mut self) {
+                crate::gc_hook::clear_gc_alloc_collecting_hook();
+                crate::gc_hook::clear_gc_owns_object_hook();
+                MANAGED_ALLOCS.with(|slots| slots.borrow_mut().clear());
+            }
+        }
+        let _clear = ClearProbe;
+        crate::gc_hook::register_gc_alloc_collecting_hook(record_managed_alloc);
+        crate::gc_hook::register_gc_owns_object_hook(managed_alloc_is_owned);
+
+        let d = unsafe { &mut *crate::rweakvaldict::ll_new_weakdict::<StrKey>() };
+        let gc_key = str_key(b"gc-weakref");
+        let gc_obj = 0x4444 as crate::pyobject::PyObjectRef;
+        d.ll_set_nonnull(gc_key, gc_obj);
+        assert_eq!(d.ll_get(gc_key), Some(gc_obj));
+        assert_eq!(d.count_valid(), 1);
+        assert_eq!(d.count_valid_immortal(), 0);
+
+        let prebuilt_key = str_key(b"prebuilt-weakref");
+        let prebuilt_obj = 0x5555 as crate::pyobject::PyObjectRef;
+        let valueref = crate::lltype::malloc_typed(crate::weakref::Weakref {
+            weakptr: prebuilt_obj,
+        });
+        d.ll_set_nonnull_valueref(prebuilt_key, valueref);
+        assert_eq!(d.ll_get(prebuilt_key), Some(prebuilt_obj));
+        assert_eq!(d.count_valid(), 2);
+        assert_eq!(d.count_valid_immortal(), 1);
     }
 
     /// Six new slots drive `resize_counter` from `DICT_INITSIZE * 2` through

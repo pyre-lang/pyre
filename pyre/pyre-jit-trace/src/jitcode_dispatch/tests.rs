@@ -11908,8 +11908,11 @@ fn make_call_descr(
 
 #[derive(Clone, Copy)]
 enum SymbolicBoxStrArg {
+    /// Interned object's STR (`OpKind::ConstStr` /
+    /// `StrConstDescriptor.as_unicode_object = false`). Intern by chars
+    /// (`WeakValueDictRepr.ll_get`); identity is the interned wrapper.
     InternedStr,
-    /// Prebuilt STR constants materialize as `_utf8` storage, not the wrapper.
+    /// Prebuilt STR constants materialize as `_utf8` storage (`OpKind::ConstStr`).
     StoragePayload,
     NonStr,
     NonConstant,
@@ -11941,7 +11944,8 @@ fn run_symbolic_box_str_dispatch(
             let obj = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
                 "__instancecheck__",
             ));
-            (tc.const_ref(obj as i64), Some(obj as usize))
+            let storage = unsafe { pyre_object::unicodeobject::w_str_storage(obj) };
+            (tc.const_ref(storage as i64), Some(obj as usize))
         }
         SymbolicBoxStrArg::StoragePayload => {
             let obj = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
