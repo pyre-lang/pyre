@@ -11996,6 +11996,13 @@ impl CraneliftBackend {
         // and the gc_table walker forwards its slots across collections.
         // Empty list ⇒ no table, base stays 0.
         let gc_table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        // `gcreftracer.py` `llop.gc_writebarrier(tr)`: remember at tracer
+        // creation, before compile can collect. `register_gc_table` repeats
+        // this after codegen; a second Weak in `pending_gc_tables` is
+        // drained as a no-op once the slots already hold old-gen refs.
+        if let Some(ref table) = gc_table {
+            let _ = with_cranelift_gc(|gc| gc.remember_gc_table(table));
+        }
         let gc_table_base = gc_table.as_ref().map_or(0usize, |t| t.base_addr());
         let _gc_table_guard = GcTableCompileGuard::enter(gc_table_base);
         // RPython parity: regalloc asserts that every Box used as an
