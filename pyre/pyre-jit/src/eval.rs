@@ -439,7 +439,20 @@ fn release_green_ref(handle: usize) {
 }
 
 fn pyre_object_gc_write_barrier_trampoline(obj: majit_gc::GCREF) {
-    majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
+    // A cell (or other prebuilt-family object) outside the heap is reached
+    // by the prebuilt root walk; `remember_young_pointer` enrolls such
+    // objects, and this dirty-bit is that walk's analog. The safe
+    // `gc_write_barrier` still no-ops a truly foreign address and handles
+    // `registered_external_header` bootstrap objects even though
+    // `gc_owns_object` is false. One ownership query: the managed barrier
+    // is the owned path and skips the membership lookup the safe barrier
+    // would repeat.
+    if !majit_gc::gc_owns_object(obj as usize) {
+        gc_roots::mark_prebuilt_roots_dirty();
+        majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
+        return;
+    }
+    majit_gc::gc_write_barrier_managed(majit_ir::GcRef(obj as usize));
 }
 
 fn pyre_object_gc_write_barrier_from_array_trampoline(obj: majit_gc::GCREF, index: usize) {
@@ -16598,6 +16611,26 @@ mod tests {
 
         assert_eq!(hash, make_green_key(w_code.cast(), 17, false));
         assert_eq!(typed.get_uhash(), hash);
+    }
+
+    /// A store into a collector-unowned cell (the prebuilt/bootstrap family)
+    /// must dirty the prebuilt-root walk. The pyre-jit write-barrier trampoline
+    /// is the installed hook; without it `try_gc_write_barrier` is a no-op.
+    #[test]
+    fn try_gc_write_barrier_on_non_owned_address_dirties_prebuilt_roots() {
+        init_gc_subsystem();
+        let obj = Box::leak(Box::new(0u8)) as *mut u8 as pyre_object::gc_hook::GCREF;
+        assert!(
+            !majit_gc::gc_owns_object(obj as usize),
+            "leaked address must take the trampoline's non-owned arm"
+        );
+        gc_roots::clear_prebuilt_roots_dirty();
+        assert!(!gc_roots::prebuilt_roots_dirty());
+        assert!(
+            pyre_object::gc_hook::try_gc_write_barrier(obj),
+            "pyre-jit write-barrier hook must be installed"
+        );
+        assert!(gc_roots::prebuilt_roots_dirty());
     }
 
     /// Read a global by name from the frame's canonical `w_globals` object.
