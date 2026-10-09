@@ -477,7 +477,7 @@ pub fn decode_fieldnum(
                 .storage
                 .as_ref()
                 .expect("resume_data.storage missing");
-            let c = storage.rd_consts()[ci];
+            let c = storage.rd_consts().unwrap_or(&[])[ci];
             match c.get_type() {
                 majit_ir::Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
                 majit_ir::Type::Float => ctx.const_float(c.getfloatstorage()),
@@ -1494,13 +1494,13 @@ pub fn replay_pending_fields(
     if __diag {
         eprintln!(
             "[replay] storage=Some pendingfields={} rd_virtuals={} num_failargs={}",
-            storage.rd_pendingfields().len(),
-            storage.rd_virtuals().len(),
+            storage.rd_pendingfields().map_or(0, <[_]>::len),
+            storage.rd_virtuals().map_or(0, <[_]>::len),
             resume_data.num_failargs,
         );
     }
-    let num_virtuals = storage.rd_virtuals().len();
-    for pending in storage.rd_pendingfields() {
+    let num_virtuals = storage.rd_virtuals().map_or(0, <[_]>::len);
+    for pending in storage.rd_pendingfields().unwrap_or(&[]) {
         let Some(descr) = pending.descr.as_ref() else {
             if __diag {
                 eprintln!(
@@ -1515,7 +1515,7 @@ pub fn replay_pending_fields(
         };
         // `resume.py` `_prepare_pendingfields` decodes both operands the same way as frame
         // boxes.
-        let rd_consts = storage.rd_consts();
+        let rd_consts = storage.rd_consts().unwrap_or(&[]);
         let target = majit_ir::resumedata::decode_tagged_value(
             pending.target_tagged,
             resume_data.num_failargs,
@@ -1901,7 +1901,7 @@ mod tests {
 
         let tagged = ((majit_ir::resumedata::TAG_CONST_OFFSET << 2)
             | majit_ir::resumedata::TAGCONST as i32) as i16;
-        let storage = crate::resume::ResumeStorage::new(
+        let storage = crate::resume::new_resume_storage(
             Vec::new(),
             vec![Const::Ref(GcRef(0x1111))],
             Vec::new(),

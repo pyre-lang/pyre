@@ -12066,7 +12066,10 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             "[dynasm-debug] resume_in_blackhole: raw_values.len={} exit_types.len={} rd_numb={:?}",
             raw_values.len(),
             exit_layout.exit_types.len(),
-            exit_layout.storage.as_deref().map(|s| s.rd_numb.len())
+            exit_layout
+                .storage
+                .as_deref()
+                .map(|s| s.rd_numb().expect("rd_numb").len())
         );
     }
 
@@ -12097,11 +12100,11 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
         let all_virtuals = take_forced_virtuals_for_frame(savedata);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
-            &storage.rd_numb,
-            storage.rd_consts(),
+            storage.rd_numb().expect("rd_numb"),
+            storage.rd_consts().unwrap_or(&[]),
             majit_backend::FailArgSource::from(&*raw_values),
-            Some(&storage.rd_pendingfields),
-            Some(&storage.rd_virtuals),
+            storage.rd_pendingfields(),
+            storage.rd_virtuals(),
             Some(exit_layout.exit_types.as_slice()),
             guard_exc,
             novable,
@@ -14543,7 +14546,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             exit_layout
                 .storage
                 .as_deref()
-                .map(|s| s.rd_numb.len())
+                .map(|s| s.rd_numb().expect("rd_numb").len())
                 .unwrap_or(0),
         );
     }
@@ -14566,9 +14569,10 @@ pub(crate) fn decode_and_restore_guard_failure(
     // from the guard-owned shared Arc instead of a per-guard Vec copy.
     let (typed, mut pending_virtuals_cache) = {
         let storage = exit_layout.storage.as_deref();
-        let rd_numb = storage.map(|s| s.rd_numb.as_ref()).unwrap_or(&[]);
-        let empty_consts: Vec<majit_ir::Const> = Vec::new();
-        let rd_consts: &[majit_ir::Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
+        let rd_numb = storage
+            .map(|s| s.rd_numb().expect("rd_numb"))
+            .unwrap_or(&[]);
+        let rd_consts: &[majit_ir::Const] = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
         if rd_numb.is_empty() {
             (dead_frame_typed.clone(), HashMap::new())
         } else {
@@ -14614,7 +14618,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             .as_deref()
             .expect("rebuild_guard_fail_state: exit_layout.storage missing");
         assert!(
-            !storage.rd_numb.is_empty(),
+            !storage.rd_numb().expect("rd_numb").is_empty(),
             "rebuild_guard_fail_state: storage.rd_numb is empty (fail_index={})",
             exit_layout.fail_index
         );
@@ -14626,8 +14630,8 @@ pub(crate) fn decode_and_restore_guard_failure(
         // in the vable `last_instr` field.
         build_resumed_frames(
             raw_values,
-            storage.rd_numb.as_ref(),
-            storage.rd_consts(),
+            storage.rd_numb().expect("rd_numb"),
+            storage.rd_consts().unwrap_or(&[]),
             exit_layout,
             ResumeVableMode::GuardFailureSync,
             &mut pending_virtuals_cache,
@@ -14763,7 +14767,7 @@ fn rebuild_typed_from_rd_numb(
     let num_virtuals = exit_layout
         .storage
         .as_deref()
-        .map_or(0, |s| s.rd_virtuals.len());
+        .map_or(0, |s| s.rd_virtuals().map_or(0, <[_]>::len));
     let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
         rd_numb,
         rd_consts,
@@ -14805,8 +14809,8 @@ fn rebuild_typed_from_rd_numb(
             RebuiltValue::Const(c) => c.to_value(),
             RebuiltValue::Virtual(vidx) => {
                 let storage = exit_layout.storage.as_deref();
-                let rd_consts = storage.map(|s| s.rd_consts()).unwrap_or(&[]);
-                let rd_virtuals = storage.map(|s| s.rd_virtuals.as_slice());
+                let rd_consts = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
+                let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
                 materialize_virtual_from_rd(
                     *vidx,
                     dead_frame_typed,
@@ -15053,7 +15057,7 @@ fn build_resumed_frames(
     let num_virtuals = exit_layout
         .storage
         .as_deref()
-        .map_or(0, |s| s.rd_virtuals.len());
+        .map_or(0, |s| s.rd_virtuals().map_or(0, <[_]>::len));
     let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
         rd_numb,
         rd_consts,
@@ -15089,8 +15093,8 @@ fn build_resumed_frames(
             RebuiltValue::Const(c) => c.to_value(),
             RebuiltValue::Virtual(vidx) => {
                 let storage = exit_layout.storage.as_deref();
-                let rd_consts = storage.map(|s| s.rd_consts()).unwrap_or(&[]);
-                let rd_virtuals = storage.map(|s| s.rd_virtuals.as_slice());
+                let rd_consts = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
+                let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
                 materialize_virtual_from_rd(
                     *vidx,
                     dead_frame_typed,
@@ -15382,8 +15386,8 @@ fn _prepare_next_section(
 ) {
     use majit_ir::resumedata::RebuiltValue;
     let storage = exit_layout.storage.as_deref();
-    let rd_consts = storage.map(|s| s.rd_consts()).unwrap_or(&[]);
-    let rd_virtuals = storage.map(|s| s.rd_virtuals.as_slice());
+    let rd_consts = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
+    let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
     let num_failargs = exit_layout.exit_types.len() as i32;
     for val in &frame.values {
         typed.push(match val {
@@ -15433,23 +15437,21 @@ fn replay_pending_fields(
     // `resume.py _prepare_pendingfields` reads the list off the guard's
     // `rd_pendingfields` (`ResumeGuardDescr.get_resumestorage`).
     let pending = match exit_layout.storage.as_deref() {
-        Some(storage) => storage.exit_pending_field_layouts(num_failargs),
+        Some(storage) => {
+            majit_metainterp::resume::exit_pending_field_layouts(storage, num_failargs)
+        }
         None => return,
     };
     if pending.is_empty() {
         return;
     }
 
-    let empty_consts: Vec<majit_ir::Const> = Vec::new();
     let rd_consts: &[majit_ir::Const] = exit_layout
         .storage
         .as_deref()
-        .map(|s| s.rd_consts())
-        .unwrap_or(&empty_consts);
-    let rd_virtuals = exit_layout
-        .storage
-        .as_deref()
-        .map(|s| s.rd_virtuals.as_slice());
+        .and_then(|s| s.rd_consts())
+        .unwrap_or(&[]);
+    let rd_virtuals = exit_layout.storage.as_deref().and_then(|s| s.rd_virtuals());
     let value_to_raw_bits = |value: Value| match value {
         Value::Int(i) => i,
         Value::Float(f) => f.to_bits() as i64,
@@ -16069,7 +16071,7 @@ mod tests {
                 .collect(),
             is_finish: false,
             is_exception_exit: false,
-            storage: Some(majit_metainterp::resume::ResumeStorage::new(
+            storage: Some(majit_metainterp::resume::new_resume_storage(
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),

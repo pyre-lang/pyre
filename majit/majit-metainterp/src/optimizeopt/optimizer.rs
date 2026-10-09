@@ -3149,8 +3149,8 @@ impl Optimizer {
         // but after the optimizer is constructed (setup already done at __init__).
         if let Some(prd) = self.pending_bridge_rd.take() {
             crate::optimizeopt::bridgeopt::deserialize_optimizer_knowledge(
-                &prd.storage.rd_numb,
-                prd.storage.rd_consts(),
+                prd.storage.rd_numb().expect("rd_numb"),
+                prd.storage.rd_consts().unwrap_or(&[]),
                 &prd.frontend_boxes,
                 &prd.liveboxes,
                 &prd.livebox_types,

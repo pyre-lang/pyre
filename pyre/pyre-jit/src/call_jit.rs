@@ -2182,14 +2182,14 @@ fn jit_blackhole_resume_from_guard(
     // int (needs boxing) or a GcRef (use as-is). Without it, unboxed ints
     // are treated as pointers → SIGSEGV. Both come off the one descr so
     // the storage and the types cannot describe different deadframes.
-    let exit_layout = majit_metainterp::exit_layout_for_descr(descr_fd);
+    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
     if let Some(storage) = exit_layout.storage.clone() {
         let deadframe_types = exit_layout.exit_types.to_vec();
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
-                storage.rd_numb.len(),
-                storage.rd_consts().len(),
+                storage.rd_numb().expect("rd_numb").len(),
+                storage.rd_consts().unwrap_or(&[]).len(),
                 fail_args.len(),
             );
         }
@@ -2219,11 +2219,11 @@ fn jit_blackhole_resume_from_guard(
             None
         };
         let result = blackhole_resume_via_rd_numb(
-            &storage.rd_numb,
-            storage.rd_consts(),
+            storage.rd_numb().expect("rd_numb"),
+            storage.rd_consts().unwrap_or(&[]),
             fail_args,
-            Some(&storage.rd_pendingfields),
-            Some(&storage.rd_virtuals),
+            storage.rd_pendingfields(),
+            storage.rd_virtuals(),
             Some(deadframe_types.as_slice()),
             guard_exc,
             false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
@@ -4561,9 +4561,7 @@ fn jit_ca_handle_guard_failure(
 
     // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
     // descr's own; a bridge guard has no frontend record.
-    let exit_layout = descr_arc
-        .as_fail_descr()
-        .map(majit_metainterp::exit_layout_for_descr)?;
+    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
 
     // compile.py try/finally: `start_compiling()` before
     // bridge, `done_compiling()` on every unwind path.  RAII guard
@@ -4690,9 +4688,7 @@ fn try_compile_ca_bridge(
     }
     // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
     // descr's own; a bridge guard has no frontend record.
-    let exit_layout = descr_arc
-        .as_fail_descr()
-        .map(majit_metainterp::exit_layout_for_descr)?;
+    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
     let frame_ptr = raw_values[0] as *mut PyFrame;
     if frame_ptr.is_null() {
         return None;

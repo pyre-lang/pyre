@@ -208,7 +208,10 @@ pub struct CompiledExitLayout {
 ///
 /// `storage` is `None` for a descr with no resume payload (the
 /// `_DoneWithThisFrameDescr` family and `ExitFrameWithExceptionDescrRef`).
-pub fn exit_layout_for_descr(descr: &dyn majit_ir::FailDescr) -> CompiledExitLayout {
+pub fn exit_layout_for_descr(descr_arc: &majit_ir::DescrRef) -> CompiledExitLayout {
+    let descr = descr_arc
+        .as_fail_descr()
+        .expect("a compiled exit's descr always implements FailDescr");
     CompiledExitLayout {
         rd_loop_token: majit_backend::descr_owning_green_key(descr).unwrap_or(0),
         trace_id: descr.trace_id(),
@@ -217,7 +220,7 @@ pub fn exit_layout_for_descr(descr: &dyn majit_ir::FailDescr) -> CompiledExitLay
         exit_types: ExitTypes::from_slice(descr.fail_arg_types()),
         is_finish: descr.is_finish(),
         is_exception_exit: descr.is_exit_frame_with_exception(),
-        storage: crate::resume::ResumeStorage::from_fail_descr(descr).map(Arc::new),
+        storage: crate::resume::get_resumestorage(descr_arc),
     }
 }
 
@@ -3616,6 +3619,9 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
     fn is_resume_at_position(&self) -> bool {
         true
     }
@@ -4000,6 +4006,9 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
     fn is_guard_forced(&self) -> bool {
         true
     }
@@ -4279,6 +4288,9 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
         Some(&self.inner)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
     fn is_guard_exc(&self) -> bool {
@@ -4675,6 +4687,9 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
     fn is_resume_guard_copied(&self) -> bool {
         true
     }
@@ -5030,6 +5045,9 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
         self.inner.fail_index
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
     fn is_resume_guard_copied(&self) -> bool {
@@ -5471,6 +5489,9 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
         Some(&self.inner)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
     fn is_loop_version(&self) -> bool {

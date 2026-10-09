@@ -164,6 +164,9 @@ impl Descr for DoneWithThisFrameDescrVoid {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
 }
 
 impl FailDescr for DoneWithThisFrameDescrVoid {
@@ -215,6 +218,9 @@ impl Descr for DoneWithThisFrameDescrInt {
         self.0.descr_index.store(index, Ordering::Relaxed);
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
 }
@@ -269,6 +275,9 @@ impl Descr for DoneWithThisFrameDescrRef {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
 }
 
 impl FailDescr for DoneWithThisFrameDescrRef {
@@ -319,6 +328,9 @@ impl Descr for DoneWithThisFrameDescrFloat {
         self.0.descr_index.store(index, Ordering::Relaxed);
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
 }
@@ -405,6 +417,9 @@ impl Descr for DoneWithThisFrameDescrMulti {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
 }
 
 impl FailDescr for DoneWithThisFrameDescrMulti {
@@ -455,6 +470,9 @@ impl Descr for ExitFrameWithExceptionDescrRef {
         self.0.descr_index.store(index, Ordering::Relaxed);
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
 }
@@ -540,6 +558,9 @@ impl Descr for PropagateExceptionDescr {
         self.descr_index.store(index, Ordering::Relaxed);
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {

@@ -6020,12 +6020,10 @@ impl<S: JitState> JitDriver<S> {
         &self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     ) -> bool {
-        let Some(descr_fd) = descr_arc.as_fail_descr() else {
-            return false;
-        };
         // `ResumeGuardDescr.get_resumestorage()`: the payload is the descr's.
-        crate::resume::ResumeStorage::from_fail_descr(descr_fd).is_some_and(|storage| {
-            !storage.rd_pendingfields().is_empty() && storage.rd_virtuals().len() > 1
+        crate::resume::get_resumestorage(descr_arc).is_some_and(|storage| {
+            !storage.rd_pendingfields().is_none_or(<[_]>::is_empty)
+                && storage.rd_virtuals().map_or(0, <[_]>::len) > 1
         })
     }
 
@@ -6338,7 +6336,7 @@ impl<S: JitState> JitDriver<S> {
             let virtual_count = resume
                 .storage
                 .as_ref()
-                .map_or(0, |storage| storage.rd_virtuals().len());
+                .map_or(0, |storage| storage.rd_virtuals().map_or(0, <[_]>::len));
             let mut virt_cache = match allocator {
                 Some(allocator) => crate::BridgeVirtualCache::executing(
                     virtual_count,
@@ -6468,7 +6466,7 @@ impl<S: JitState> JitDriver<S> {
                                     let rd_virtuals = resume
                                         .storage
                                         .as_ref()
-                                        .map(|storage| storage.rd_virtuals());
+                                        .map(|storage| storage.rd_virtuals().unwrap_or(&[]));
                                     let opref = crate::materialize_bridge_virtual(
                                         ctx,
                                         *vidx,
@@ -11296,7 +11294,7 @@ impl<S: JitState> JitDriver<S> {
             let virtual_count = retrace
                 .storage
                 .as_deref()
-                .map_or(0, |storage| storage.rd_virtuals().len());
+                .map_or(0, |storage| storage.rd_virtuals().map_or(0, <[_]>::len));
             let boxes: crate::VrefVableBoxes;
             let mut reader = match replay_allocator {
                 Some(allocator) => crate::BridgeVirtualCache::executing(
@@ -11327,7 +11325,8 @@ impl<S: JitState> JitDriver<S> {
                 if execute_replay
                     && replay_allocator.is_none()
                     && retrace.storage.as_deref().is_some_and(|storage| {
-                        !storage.rd_pendingfields().is_empty() || !storage.rd_virtuals().is_empty()
+                        !storage.rd_pendingfields().is_none_or(<[_]>::is_empty)
+                            || !storage.rd_virtuals().is_none_or(<[_]>::is_empty)
                     })
                 {
                     ctx.mark_bridge_replay_incomplete();
@@ -11340,7 +11339,7 @@ impl<S: JitState> JitDriver<S> {
                     sym,
                     ctx,
                     bfm,
-                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    retrace.storage.as_deref().and_then(|s| s.rd_virtuals()),
                     frontend_fail_values,
                     &retrace.fail_types,
                     &mut reader,
@@ -11351,7 +11350,7 @@ impl<S: JitState> JitDriver<S> {
                     sym,
                     ctx,
                     bfm,
-                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    retrace.storage.as_deref().and_then(|s| s.rd_virtuals()),
                     frontend_fail_values,
                     &retrace.fail_types,
                     &mut reader,
@@ -11411,7 +11410,7 @@ impl<S: JitState> JitDriver<S> {
                     sym,
                     ctx,
                     bfm,
-                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    retrace.storage.as_deref().and_then(|s| s.rd_virtuals()),
                     frontend_fail_values,
                     &retrace.fail_types,
                     &mut reader,

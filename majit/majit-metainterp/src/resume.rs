@@ -594,113 +594,58 @@ const ENCODED_UNAVAILABLE: i64 = -3;
 const INLINE_TAGGED_MIN: i64 = -(1_i64 << 61);
 const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
 
-/// RPython's nullable `rd_virtuals` / `rd_pendingfields` arrays with a slice
-/// surface.  The overwhelmingly common null case occupies only the enum and
-/// performs no allocation; a populated array shares the guard descr's exact
-/// backing storage.  `Deref<[T]>` deliberately preserves the field operations
-/// used by generated JIT code (`len`, `iter`, indexing).
-pub enum SharedResumeSlice<T> {
-    Empty,
-    Shared(Arc<[T]>),
+/// `compile.py AbstractResumeGuardDescr.get_resumestorage(): return self`.
+/// The resume storage is the guard descr itself: `rd_numb` / `rd_consts` /
+/// `rd_virtuals` / `rd_pendingfields` are its own attributes, so every
+/// reader — bridge retrace, blackhole resume, the GC root walker — holds
+/// the one descr and nothing is copied per failure.
+pub type ResumeStorage = dyn majit_ir::FailDescr;
+
+/// `get_resumestorage()` on a descr handle. `None` for a descr that carries
+/// no resume payload (the `_DoneWithThisFrameDescr` family /
+/// `ExitFrameWithExceptionDescrRef`), matching the `_attrs_`-only-on-
+/// `AbstractResumeGuardDescr` contract.
+pub fn get_resumestorage(descr: &majit_ir::DescrRef) -> Option<Arc<ResumeStorage>> {
+    descr
+        .clone()
+        .as_fail_descr_arc()
+        .filter(|fd| fd.rd_numb().is_some())
 }
 
-impl<T> SharedResumeSlice<T> {
-    pub fn as_slice(&self) -> &[T] {
-        match self {
-            Self::Empty => &[],
-            Self::Shared(values) => values,
-        }
-    }
+/// A resume guard descr carrying the given payload, the way
+/// `ResumeDataVirtualAdder.finish` leaves one (`storage.rd_numb = ...`).
+/// Fixtures that need a storage without a compiled trace build it here.
+pub fn new_resume_storage(
+    rd_numb: Vec<u8>,
+    rd_consts: Vec<Const>,
+    rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
+    rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
+) -> Arc<ResumeStorage> {
+    let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+    let fd = descr.as_fail_descr().expect("resume guard descr");
+    fd.set_rd_numb(Some(rd_numb));
+    fd.set_rd_consts(Some(rd_consts));
+    fd.set_rd_virtuals(Some(rd_virtuals));
+    fd.set_rd_pendingfields(Some(rd_pendingfields));
+    descr.as_fail_descr_arc().expect("resume guard descr")
 }
 
-impl<T> From<Vec<T>> for SharedResumeSlice<T> {
-    fn from(values: Vec<T>) -> Self {
-        if values.is_empty() {
-            Self::Empty
-        } else {
-            Self::Shared(Arc::from(values))
-        }
-    }
-}
-
-impl<T> From<Option<Arc<[T]>>> for SharedResumeSlice<T> {
-    fn from(values: Option<Arc<[T]>>) -> Self {
-        match values {
-            Some(values) if !values.is_empty() => Self::Shared(values),
-            _ => Self::Empty,
-        }
-    }
-}
-
-impl<T> std::ops::Deref for SharedResumeSlice<T> {
-    type Target = [T];
-
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
-    }
-}
-
-/// compile.py `ResumeGuardDescr` storage.
-///
-/// Canonical, guard-owned resume payload (`storage.rd_numb/rd_consts/
-/// rd_virtuals/rd_pendingfields`). Shared via `Arc<ResumeStorage>` so
-/// every reader — `StoredExitLayout` (the sole carrier on the trace
-/// surrogate after T4.4 retired the parallel `StoredResumeData` side
-/// table), bridge retrace, blackhole resume, GC root walker —
-/// observes the **same** pool, matching RPython's guard-owned
-/// `ResumeGuardDescr` singleton.
-///
-/// `rd_consts` uses `UnsafeCell` because the GC root walker
-/// (framework.py `root_walker.walk_roots` parity) rewrites `Const::Ref`
-/// slots in place during minor collection, and the pyre runtime is
-/// single-threaded so `Mutex` overhead is unnecessary.
-pub struct ResumeStorage {
-    /// resume.py:466 `storage.rd_numb` — packed byte stream (NUMBERING
-    /// lltype equivalent). Immutable once installed.
-    pub rd_numb: majit_ir::NumberingRef,
-    /// resume.py:467 `storage.rd_consts` — shared constant pool.
-    ///
-    /// Interior mutability: the minor-collection root walker visits
-    /// `Const::Ref` slots to update forwarded GCREFs, so the slice
-    /// must remain mutable after the `Arc` is shared. `UnsafeCell`
-    /// is sound here because pyre is single-threaded and the walker
-    /// holds exclusive access for the duration of each GC cycle.
-    pub rd_consts: Arc<majit_ir::SharedConstPool>,
-    /// compile.py:858 `storage.rd_virtuals` — live `RdVirtualInfo`
-    /// entries describing virtual objects to materialize on resume.
-    pub rd_virtuals: SharedResumeSlice<std::rc::Rc<majit_ir::RdVirtualInfo>>,
-    /// resume.py:468 `storage.rd_pendingfields` — pending field writes
-    /// replayed during blackhole resume.
-    pub rd_pendingfields: SharedResumeSlice<majit_ir::GuardPendingFieldEntry>,
-    /// `rd_virtuals` in the shape `ResumeDataDirectReader` consumes, built
-    /// once — see [`ResumeStorage::virtual_infos`].
-    virtual_infos: std::sync::OnceLock<Vec<VirtualInfo>>,
-}
-
-impl ResumeStorage {
-    /// `compile.py AbstractResumeGuardDescr.get_resumestorage(): return
-    /// self` — the failing guard descr *is* its own resume storage upstream,
-    /// because `rd_numb` / `rd_consts` / `rd_virtuals` / `rd_pendingfields`
-    /// are its `_attrs_` (`compile.py:855`).  Pyre additionally indexes the
-    /// same payload under `compiled_loops[green_key].traces[trace_id]`, and
-    /// that index can be dropped while a guard exit from the loop is still
-    /// being processed — compiled code re-enters the driver through residual
-    /// calls, and the re-entrant run may retire the green key.  Reading the
-    /// descr reproduces upstream's lookup-free path for exactly that case.
-    ///
-    /// `None` for descrs that carry no resume payload at all (the
-    /// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescrRef`),
-    /// matching the `_attrs_`-only-on-`AbstractResumeGuardDescr` contract.
-    pub fn from_fail_descr(descr: &dyn majit_ir::FailDescr) -> Option<Self> {
-        let rd_numb = descr.rd_numb_arc()?;
-        Some(Self {
-            rd_numb,
-            rd_consts: descr.rd_consts_arc()?,
-            rd_virtuals: descr.rd_virtuals_arc().into(),
-            rd_pendingfields: descr.rd_pendingfields_arc().into(),
-            virtual_infos: std::sync::OnceLock::new(),
-        })
-    }
+/// `resume.py _prepare_pendingfields` read off `rd_pendingfields`: this
+/// guard's deferred writes as exit-slot sources, ready to replay against
+/// the deadframe.  Derived on demand from the guard-owned payload, so
+/// nothing is kept per guard for it.
+pub fn exit_pending_field_layouts(
+    storage: &ResumeStorage,
+    num_failargs: i32,
+) -> Vec<ExitPendingFieldLayout> {
+    let rd_consts = storage.rd_consts().unwrap_or(&[]);
+    let num_virtuals = storage.rd_virtuals().map_or(0, <[_]>::len) as i32;
+    storage
+        .rd_pendingfields()
+        .unwrap_or(&[])
+        .iter()
+        .map(|pf| exit_pending_field_layout(pf, num_failargs, rd_consts, num_virtuals))
+        .collect()
 }
 
 /// One `resume.py` PENDINGFIELDSTRUCT entry (lldescr / num / fieldnum /
@@ -814,122 +759,6 @@ pub fn outermost_frame_pc(rd_numb: &[u8]) -> Option<i32> {
 // Pyre is single-threaded; UnsafeCell prevents auto-Send/Sync so
 // provide them explicitly (matches RPython's non-thread-safe
 // ResumeGuardDescr).
-unsafe impl Send for ResumeStorage {}
-unsafe impl Sync for ResumeStorage {}
-
-impl std::fmt::Debug for ResumeStorage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let consts_len = self.rd_consts.len();
-        f.debug_struct("ResumeStorage")
-            .field("rd_numb_len", &self.rd_numb.len())
-            .field("rd_consts_len", &consts_len)
-            .field("rd_virtuals_len", &self.rd_virtuals().len())
-            .field("rd_pendingfields_len", &self.rd_pendingfields().len())
-            .finish()
-    }
-}
-
-impl ResumeStorage {
-    pub fn new(
-        rd_numb: Vec<u8>,
-        rd_consts: Vec<Const>,
-        rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
-        rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
-    ) -> Arc<Self> {
-        Arc::new(ResumeStorage {
-            rd_numb: majit_ir::NumberingRef::from_bytes(&rd_numb),
-            rd_consts: majit_ir::SharedConstPool::new(rd_consts),
-            rd_virtuals: rd_virtuals.into(),
-            rd_pendingfields: rd_pendingfields.into(),
-            virtual_infos: std::sync::OnceLock::new(),
-        })
-    }
-
-    /// Empty storage (pre-finalization placeholder).
-    pub fn empty() -> Arc<Self> {
-        Self::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
-    }
-
-    /// Snapshot the constant pool (for readers that need an owned
-    /// copy — e.g. legacy `Vec<Const>`-typed APIs before their
-    /// migration to the shared storage handle).
-    pub fn rd_consts_snapshot(&self) -> Vec<Const> {
-        self.rd_consts.snapshot()
-    }
-
-    /// Borrow `rd_consts` for reading. Safety: the root walker holds
-    /// the only writer and runs during GC, outside of reader scope.
-    pub fn rd_consts(&self) -> &[Const] {
-        self.rd_consts.as_slice()
-    }
-
-    /// `resume.py ResumeDataReader._prepare_virtuals`: `None` is the
-    /// allocation-free common case; readers see the same empty slice they
-    /// previously obtained from an empty `Vec`.
-    pub fn rd_virtuals(&self) -> &[std::rc::Rc<majit_ir::RdVirtualInfo>] {
-        self.rd_virtuals.as_slice()
-    }
-
-    /// `resume.py ResumeDataReader._prepare_pendingfields`: upstream uses a
-    /// null pointer when there are no deferred writes.
-    pub fn rd_pendingfields(&self) -> &[majit_ir::GuardPendingFieldEntry] {
-        self.rd_pendingfields.as_slice()
-    }
-
-    /// `resume.py ResumeDataReader._prepare_virtuals`: `self.virtuals =
-    /// storage.rd_virtuals` — a bare assignment, because upstream builds the
-    /// `AbstractVirtualInfo` objects once, at compile time, in
-    /// `ResumeDataVirtualAdder.finish`.
-    ///
-    /// This `OnceLock` reshapes `rd_virtuals` for one `ResumeStorage` value.
-    /// `from_fail_descr` builds a fresh storage, so the list that outlives
-    /// that value is [`guard_virtual_infos`], stored beside `rd_virtuals` on
-    /// the guard. The reshape is a pure function of `rd_virtuals`: the tagged
-    /// `fieldnums` stay tagged and every descriptor is cloned as-is.
-    ///
-    /// Nothing in the result is a GC reference: the field sources are
-    /// numbering tags, and the descriptors, type ids, known-class vtable words
-    /// and raw-buffer function pointers are all immortal. The minor-collection
-    /// root walker therefore has nothing to rewrite here, and visits
-    /// `rd_consts` alone as before.
-    pub fn virtual_infos(&self) -> &[VirtualInfo] {
-        self.virtual_infos.get_or_init(|| {
-            self.rd_virtuals()
-                .iter()
-                .map(|rd| virtual_info_from_rd(rd))
-                .collect()
-        })
-    }
-
-    /// `resume.py _prepare_pendingfields` read off `rd_pendingfields`: this
-    /// guard's deferred writes as exit-slot sources, ready to replay against
-    /// the deadframe.  Derived on demand from the guard-owned payload, so
-    /// nothing is kept per guard for it.
-    pub fn exit_pending_field_layouts(&self, num_failargs: i32) -> Vec<ExitPendingFieldLayout> {
-        let rd_consts = self.rd_consts();
-        let num_virtuals = self.rd_virtuals.as_slice().len() as i32;
-        self.rd_pendingfields()
-            .iter()
-            .map(|pf| exit_pending_field_layout(pf, num_failargs, rd_consts, num_virtuals))
-            .collect()
-    }
-
-    pub fn with_shared_consts(
-        rd_numb: majit_ir::NumberingRef,
-        rd_consts: Arc<majit_ir::SharedConstPool>,
-        rd_virtuals: Option<Arc<[std::rc::Rc<majit_ir::RdVirtualInfo>]>>,
-        rd_pendingfields: Option<Arc<[majit_ir::GuardPendingFieldEntry]>>,
-    ) -> Arc<Self> {
-        Arc::new(ResumeStorage {
-            rd_numb,
-            rd_consts,
-            rd_virtuals: rd_virtuals.into(),
-            rd_pendingfields: rd_pendingfields.into(),
-            virtual_infos: std::sync::OnceLock::new(),
-        })
-    }
-}
-
 /// resume.py: ResumeGuardDescr storage fields.
 ///
 /// `rd_numb` is a flat encoded numbering section (resume.py:466):
@@ -1795,7 +1624,7 @@ pub(crate) fn guard_virtual_infos<'a>(
 /// pool, the deadframe width and the virtual count that a reader would need to
 /// resolve them play no part here. Callers holding those may go through
 /// `rd_virtual_to_virtual_info`, which names them for the reader-shaped call
-/// sites; the purity is what lets `ResumeStorage::virtual_infos` build the
+/// sites; the purity is what lets `guard_virtual_infos` build the
 /// result once.
 pub fn virtual_info_from_rd(rd: &majit_ir::RdVirtualInfo) -> VirtualInfo {
     match rd {
@@ -2056,305 +1885,6 @@ impl EncodedResumeData {
             &rd.virtuals,
             &rd.pending_fields,
         )
-    }
-
-    /// Build the guard-owned storage shape consumed by
-    /// `ResumeDataDirectReader`.
-    ///
-    /// This is used only by the MetaInterp test helper that injects
-    /// `ResumeData` after compilation. The production path obtains the
-    /// same fields directly from `ResumeDataVirtualAdder::finish`.
-    ///
-    /// Pending-field replay still comes from `store_final_boxes_in_guard`
-    /// in production. The encoded pending-field records do carry their
-    /// live descr Arc (`resume.py PENDINGFIELDSTRUCT.lldescr`), but
-    /// this helper does not currently rebuild `GuardPendingFieldEntry`
-    /// from them — the production path attaches that elsewhere.
-    pub fn to_resume_storage(&self) -> Result<Arc<ResumeStorage>, TagOverflow> {
-        fn const_pool_tag(c: &Const, rd_consts: &mut Vec<Const>) -> Result<i16, TagOverflow> {
-            let idx = rd_consts
-                .iter()
-                .position(|existing| existing == c)
-                .unwrap_or_else(|| {
-                    rd_consts.push(*c);
-                    rd_consts.len() - 1
-                });
-            tag((idx as i32) + TAG_CONST_OFFSET, TAGCONST)
-        }
-
-        fn source_tag(
-            source: &ResumeValueSource,
-            liveboxes: &[usize],
-            rd_consts: &mut Vec<Const>,
-        ) -> Result<i16, TagOverflow> {
-            match source {
-                ResumeValueSource::FailArg(index) => {
-                    // A fail arg that was never numbered is `UNASSIGNED`
-                    // (`resume.py` liveboxes miss). A numbered index that
-                    // does not fit the tag is `TagOverflow`, which
-                    // `compile.py giveup` turns into an abandoned compile.
-                    let Some(compact) = liveboxes.iter().position(|live| live == index) else {
-                        return Ok(UNASSIGNED);
-                    };
-                    tag(compact as i32, TAGBOX)
-                }
-                ResumeValueSource::Constant(Const::Int(value)) => {
-                    // `resume.py getconst`: `tag(val, TAGINT)` and, on
-                    // `TagOverflow`, the constant pool (`_newconst`).
-                    if let Ok(v) = i32::try_from(*value)
-                        && let Ok(tagged) = tag(v, TAGINT)
-                    {
-                        return Ok(tagged);
-                    }
-                    const_pool_tag(&Const::Int(*value), rd_consts)
-                }
-                ResumeValueSource::Constant(Const::Ref(gcref)) if gcref.is_null() => Ok(NULLREF),
-                ResumeValueSource::Constant(c) => const_pool_tag(c, rd_consts),
-                ResumeValueSource::Virtual(index) => tag(*index as i32, TAGVIRTUAL),
-                ResumeValueSource::Tagged(tagged) => Ok(*tagged),
-                ResumeValueSource::Uninitialized => Ok(UNINITIALIZED_TAG),
-                ResumeValueSource::Unavailable => Ok(UNASSIGNED),
-            }
-        }
-
-        fn fieldnums(
-            sources: impl IntoIterator<Item = VirtualFieldSource>,
-            liveboxes: &[usize],
-            rd_consts: &mut Vec<Const>,
-        ) -> Result<Vec<i16>, TagOverflow> {
-            sources
-                .into_iter()
-                .map(|source| source_tag(&source, liveboxes, rd_consts))
-                .collect()
-        }
-
-        fn rd_virtual(
-            info: &VirtualInfo,
-            liveboxes: &[usize],
-            rd_consts: &mut Vec<Const>,
-        ) -> Result<std::rc::Rc<majit_ir::RdVirtualInfo>, TagOverflow> {
-            let rd = match info {
-                VirtualInfo::VirtualObj {
-                    descr,
-                    type_id,
-                    known_class,
-                    fields,
-                    fielddescrs,
-                    descr_size,
-                } => majit_ir::RdVirtualInfo::VirtualInfo {
-                    descr: descr.clone(),
-                    type_id: *type_id,
-                    known_class: *known_class,
-                    fielddescrs: fielddescrs.clone(),
-                    fieldnums: fieldnums(
-                        fields.iter().map(|(_, source)| source.clone()),
-                        liveboxes,
-                        rd_consts,
-                    )?,
-                    descr_size: *descr_size,
-                },
-                VirtualInfo::VStruct {
-                    typedescr,
-                    type_id,
-                    fields,
-                    fielddescrs,
-                    descr_size,
-                } => majit_ir::RdVirtualInfo::VStructInfo {
-                    typedescr: typedescr.clone(),
-                    type_id: *type_id,
-                    fielddescrs: fielddescrs.clone(),
-                    fieldnums: fieldnums(
-                        fields.iter().map(|(_, source)| source.clone()),
-                        liveboxes,
-                        rd_consts,
-                    )?,
-                    descr_size: *descr_size,
-                },
-                VirtualInfo::VArray {
-                    arraydescr,
-                    clear,
-                    items,
-                } => {
-                    let fieldnums = fieldnums(items.iter().cloned(), liveboxes, rd_consts)?;
-                    if *clear {
-                        majit_ir::RdVirtualInfo::VArrayInfoClear {
-                            arraydescr: arraydescr.clone(),
-                            kind: array_kind_from_descr(arraydescr.as_ref()),
-                            fieldnums,
-                        }
-                    } else {
-                        majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-                            arraydescr: arraydescr.clone(),
-                            kind: array_kind_from_descr(arraydescr.as_ref()),
-                            fieldnums,
-                        }
-                    }
-                }
-                VirtualInfo::VArrayStruct {
-                    arraydescr,
-                    fielddescrs,
-                    element_fields,
-                } => {
-                    let mut flat = Vec::new();
-                    for element in element_fields {
-                        flat.extend(fieldnums(
-                            element.iter().map(|(_, source)| source.clone()),
-                            liveboxes,
-                            rd_consts,
-                        )?);
-                    }
-                    // resume.py:740 self.fielddescrs — live InteriorFieldDescr
-                    // objects expose offset/field_size/field_type via the
-                    // FieldDescr trait (descr.py / llmodel.py bh_setinteriorfield_gc_i).
-                    // Recover the per-field metadata from the live Arc rather
-                    // than emitting placeholders; PyPy `make_virtual_info`
-                    // (resume.py) forwards `fielddescrs[j]` to the
-                    // VArrayStructInfo materialiser which reads
-                    // `is_pointer_field`/`is_float_field`/offset/field_size
-                    // through the same accessors at replay time
-                    // (resume.py).
-                    let field_types: Vec<u8> = fielddescrs
-                        .iter()
-                        .map(|fd| match fd.as_field_descr().map(|f| f.field_type()) {
-                            Some(majit_ir::Type::Ref) => 0,
-                            Some(majit_ir::Type::Float) => 2,
-                            _ => 1,
-                        })
-                        .collect();
-                    let field_offsets: Vec<usize> = fielddescrs
-                        .iter()
-                        .map(|fd| fd.as_field_descr().map(|f| f.offset()).unwrap_or(0))
-                        .collect();
-                    let field_sizes: Vec<usize> = fielddescrs
-                        .iter()
-                        .map(|fd| {
-                            fd.as_field_descr()
-                                .map(|f| f.field_size())
-                                .unwrap_or(std::mem::size_of::<usize>())
-                        })
-                        .collect();
-                    majit_ir::RdVirtualInfo::VArrayStructInfo {
-                        arraydescr: arraydescr.clone(),
-                        size: element_fields.len(),
-                        fielddescrs: fielddescrs.clone(),
-                        fielddescr_indices: (0..fielddescrs.len()).map(|i| i as u32).collect(),
-                        field_types,
-                        base_size: arraydescr
-                            .as_ref()
-                            .and_then(|d| d.as_array_descr())
-                            .map(|ad| ad.base_size())
-                            .unwrap_or(0),
-                        item_size: arraydescr
-                            .as_ref()
-                            .and_then(|d| d.as_array_descr())
-                            .map(|ad| ad.item_size())
-                            .unwrap_or(0),
-                        field_offsets,
-                        field_sizes,
-                        fieldnums: flat,
-                    }
-                }
-                VirtualInfo::VRawBuffer {
-                    func,
-                    size,
-                    offsets,
-                    descrs,
-                    values,
-                } => majit_ir::RdVirtualInfo::VRawBufferInfo {
-                    func: *func,
-                    size: *size,
-                    offsets: offsets.clone(),
-                    descrs: descrs.clone(),
-                    fieldnums: fieldnums(values.iter().cloned(), liveboxes, rd_consts)?,
-                },
-                VirtualInfo::VRawSlice { offset, parent } => {
-                    majit_ir::RdVirtualInfo::VRawSliceInfo {
-                        offset: *offset,
-                        fieldnums: fieldnums(
-                            std::iter::once(parent.clone()),
-                            liveboxes,
-                            rd_consts,
-                        )?,
-                    }
-                }
-                VirtualInfo::VStrPlain { chars } => majit_ir::RdVirtualInfo::VStrPlainInfo {
-                    fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts)?,
-                },
-                VirtualInfo::VStrConcat { left, right, .. } => {
-                    majit_ir::RdVirtualInfo::VStrConcatInfo {
-                        fieldnums: fieldnums(
-                            [left.as_ref().clone(), right.as_ref().clone()],
-                            liveboxes,
-                            rd_consts,
-                        )?,
-                    }
-                }
-                VirtualInfo::VStrSlice {
-                    source,
-                    start,
-                    length,
-                    ..
-                } => majit_ir::RdVirtualInfo::VStrSliceInfo {
-                    fieldnums: fieldnums(
-                        [
-                            source.as_ref().clone(),
-                            start.as_ref().clone(),
-                            length.as_ref().clone(),
-                        ],
-                        liveboxes,
-                        rd_consts,
-                    )?,
-                },
-                VirtualInfo::VUniPlain { chars } => majit_ir::RdVirtualInfo::VUniPlainInfo {
-                    fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts)?,
-                },
-                VirtualInfo::VUniConcat { left, right, .. } => {
-                    majit_ir::RdVirtualInfo::VUniConcatInfo {
-                        fieldnums: fieldnums(
-                            [left.as_ref().clone(), right.as_ref().clone()],
-                            liveboxes,
-                            rd_consts,
-                        )?,
-                    }
-                }
-                VirtualInfo::VUniSlice {
-                    source,
-                    start,
-                    length,
-                    ..
-                } => majit_ir::RdVirtualInfo::VUniSliceInfo {
-                    fieldnums: fieldnums(
-                        [
-                            source.as_ref().clone(),
-                            start.as_ref().clone(),
-                            length.as_ref().clone(),
-                        ],
-                        liveboxes,
-                        rd_consts,
-                    )?,
-                },
-                VirtualInfo::Empty => majit_ir::RdVirtualInfo::Empty,
-            };
-            Ok(std::rc::Rc::new(rd))
-        }
-
-        let mut writer = crate::resumecode::Writer::new(self.rd_numb.len());
-        for &item in &self.rd_numb {
-            writer.append_int(item);
-        }
-        let mut rd_consts = self.rd_consts.clone();
-        let rd_virtuals = self
-            .rd_virtuals
-            .iter()
-            .map(|info| rd_virtual(info, &self.liveboxes, &mut rd_consts))
-            .collect::<Result<Vec<_>, TagOverflow>>()?;
-
-        Ok(ResumeStorage::new(
-            writer.create_numbering(),
-            rd_consts,
-            rd_virtuals,
-            Vec::new(),
-        ))
     }
 
     /// resume.py number + resume.py finish

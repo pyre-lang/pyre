@@ -684,9 +684,7 @@ impl StoredExitLayout {
             storage: self
                 .descr
                 .as_ref()
-                .and_then(|descr| descr.as_fail_descr())
-                .and_then(ResumeStorage::from_fail_descr)
-                .map(Arc::new),
+                .and_then(crate::resume::get_resumestorage),
         }
     }
 
@@ -4137,9 +4135,7 @@ impl<M: Clone> MetaInterp<M> {
                 let storage = layout
                     .descr
                     .as_ref()
-                    .and_then(|descr| descr.as_fail_descr())
-                    .and_then(crate::resume::ResumeStorage::from_fail_descr)
-                    .map(std::sync::Arc::new);
+                    .and_then(crate::resume::get_resumestorage);
                 // `from_vec`, so whichever arm wins hands over the buffer it
                 // already owns instead of being copied into a fresh one.
                 let exit_types = ExitTypes::from_vec(if layout.fail_arg_types.is_empty() {
@@ -10433,7 +10429,7 @@ impl<M: Clone> MetaInterp<M> {
                     origin_key,
                     green_key,
                     fail_index,
-                    fail_descr,
+                    &descr_arc,
                     bridge_ops,
                     &bridge_inputargs,
                     finish_args,
@@ -13628,11 +13624,7 @@ impl<M: Clone> MetaInterp<M> {
                     is_exception_exit: layout.is_exception_exit,
                     // `ResumeGuardDescr.get_resumestorage()`: the pool is the
                     // failing descr's own.
-                    storage: result
-                        .descr_arc
-                        .as_fail_descr()
-                        .and_then(crate::resume::ResumeStorage::from_fail_descr)
-                        .map(Arc::new),
+                    storage: crate::resume::get_resumestorage(&result.descr_arc),
                 }
             })
             .or(trace_layout)
@@ -13648,9 +13640,7 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types,
                     is_finish: result.is_finish,
                     is_exception_exit: result.is_exit_frame_with_exception,
-                    storage: fd
-                        .and_then(crate::resume::ResumeStorage::from_fail_descr)
-                        .map(Arc::new),
+                    storage: crate::resume::get_resumestorage(&result.descr_arc),
                 }
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
@@ -13823,8 +13813,7 @@ impl<M: Clone> MetaInterp<M> {
                         // failing descr still carries the resume payload it was
                         // compiled with (`compile.py get_resumestorage`), so a
                         // blackhole resume off this layout stays possible.
-                        storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                            .map(std::sync::Arc::new),
+                        storage: crate::resume::get_resumestorage(&descr_arc),
                     }),
             )
         };
@@ -13923,13 +13912,10 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(descr_arc) = &result.descr_arc
             && !Self::is_jump_exit(result.is_finish, result.fail_index)
         {
-            let descr = descr_arc
-                .as_fail_descr()
-                .expect("a guard exit carries a FailDescr");
             result.exit_layout = Some(Box::new(self.guard_exit_layout(
                 jd_no,
                 green_key,
-                descr,
+                &descr_arc,
                 result.rd_loop_token,
             )));
         }
@@ -13961,9 +13947,12 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         jd_no: usize,
         green_key: u64,
-        descr: &dyn majit_ir::FailDescr,
+        descr_arc: &majit_ir::DescrRef,
         rd_loop_token: Option<u64>,
     ) -> CompiledExitLayout {
+        let descr: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("a guard exit carries a FailDescr");
         let fail_index = descr.fail_index();
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
@@ -13995,8 +13984,7 @@ impl<M: Clone> MetaInterp<M> {
                 // failing descr still carries the resume payload it was
                 // compiled with (`compile.py get_resumestorage`), so a
                 // blackhole resume off this layout stays possible.
-                storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                    .map(std::sync::Arc::new),
+                storage: crate::resume::get_resumestorage(descr_arc),
             });
         // RPython: deadframe has ALL jitframe slots accessible.
         // If the backend's descr covers more slots than the trace layout,
@@ -16442,7 +16430,7 @@ impl<M: Clone> MetaInterp<M> {
         // and without this parameter.  It is a parity correction, not a lever.
         jump_target_key: u64,
         fail_index: u32,
-        fail_descr: &dyn majit_ir::FailDescr,
+        fail_descr_arc: &majit_ir::DescrRef,
         bridge_ops: Vec<majit_ir::OpRc>,
         bridge_inputargs: &[majit_ir::InputArgRc],
         jump_args: &[OpRef],
@@ -16463,6 +16451,9 @@ impl<M: Clone> MetaInterp<M> {
         self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
+        let fail_descr: &dyn majit_ir::FailDescr = fail_descr_arc
+            .as_fail_descr()
+            .expect("compile_bridge: the bridge origin descr is a FailDescr");
         if !self.has_compiled_loop_entry(green_key) {
             self.jitlog_trace_aborted();
             return false;
@@ -16562,8 +16553,7 @@ impl<M: Clone> MetaInterp<M> {
             // guard sits in the root loop or in a bridge the frontend never
             // indexed (`send_bridge_to_backend`).  The pool Arcs are the ones
             // the descr holds, so the deserializer shares them.
-            let pending = crate::resume::ResumeStorage::from_fail_descr(fail_descr).and_then(|storage| {
-                let storage = Arc::new(storage);
+            let pending = crate::resume::get_resumestorage(fail_descr_arc).and_then(|storage| {
                 // Each bridge inputarg carries its `box.type`
                 // (resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float});
                 // mint the typed `OpRef::input_arg_*` variant via
@@ -17421,7 +17411,7 @@ impl<M: Clone> MetaInterp<M> {
         // can rebuild parent virtuals via NEW_WITH_VTABLE + SETFIELD_GC
         // at trace start, mirroring ResumeDataBoxReader.consume_boxes
         // → rd_virtuals[i].allocate (resume.py getvirtual_ptr).
-        let storage = crate::resume::ResumeStorage::from_fail_descr(fail_descr).map(Arc::new);
+        let storage = crate::resume::get_resumestorage(&descr_arc);
 
         let fail_types = bridge_input_types.to_vec();
 
@@ -17483,7 +17473,7 @@ impl<M: Clone> MetaInterp<M> {
     /// loop's frontend record.
     fn handle_async_forcing_with_allocator(
         &mut self,
-        descr: Option<&dyn majit_ir::FailDescr>,
+        descr: Option<&majit_ir::DescrRef>,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
@@ -17507,7 +17497,7 @@ impl<M: Clone> MetaInterp<M> {
         // loop's `compiled_loops` row and drops AllVirtuals. When
         // `descr` is None the test entry keeps the compiling/active
         // driver.
-        let jd_no = match descr {
+        let jd_no = match descr.and_then(|descr| descr.as_fail_descr()) {
             Some(descr) => self.jitdriver_index_for_failed_token(
                 majit_backend::descr_owning_jct(descr).as_deref(),
             ),
@@ -17544,9 +17534,8 @@ impl<M: Clone> MetaInterp<M> {
         // forced virtuals fell back to NullAllocator entries and pending
         // heap writes were dropped on async forcing.
         let storage = exit_layout.storage.as_deref();
-        let rd_numb = storage.map(|s| s.rd_numb.as_ref()).unwrap_or(&[]);
-        let empty_consts: [Const; 0] = [];
-        let rd_consts: &[Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
+        let rd_numb = storage.and_then(|s| s.rd_numb()).unwrap_or(&[]);
+        let rd_consts: &[Const] = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
         // resume.py _prepare(storage) parity: materialize rd_virtuals
         // entries before handling_async_forcing. The decoder needs the
         // resumecode item count up-front to size virtual layouts.
@@ -17557,10 +17546,9 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             fail_values.len() as i32
         };
-        let rd_virtuals = storage.map(|s| {
-            let num_virtuals = s.rd_virtuals().len();
-            s.rd_virtuals()
-                .iter()
+        let rd_virtuals = storage.and_then(|s| s.rd_virtuals()).map(|rds| {
+            let num_virtuals = rds.len();
+            rds.iter()
                 .map(|rd| {
                     crate::resume::rd_virtual_to_virtual_info(
                         rd.as_ref(),
@@ -17588,7 +17576,7 @@ impl<M: Clone> MetaInterp<M> {
                 fail_values,
                 Some(deadframe_types),
                 rd_virtuals.as_deref(),
-                storage.map(|s| s.rd_pendingfields()),
+                storage.and_then(|s| s.rd_pendingfields()),
                 Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
                 vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo — pyre has no greenfield mechanism
@@ -17673,7 +17661,7 @@ impl<M: Clone> MetaInterp<M> {
                 };
             // compile.py: faildescr.handle_async_forcing(deadframe)
             let cache = self.handle_async_forcing_with_allocator(
-                Some(descr),
+                Some(&descr_arc),
                 green_key,
                 trace_id,
                 fail_index,
@@ -19589,7 +19577,7 @@ impl<M: Clone> MetaInterp<M> {
                 let rd_virtuals = resume_data
                     .storage
                     .as_ref()
-                    .map(|storage| storage.rd_virtuals());
+                    .map(|storage| storage.rd_virtuals().unwrap_or(&[]));
                 for (bank, index, vidx) in virtuals {
                     let mut opref = crate::materialize_bridge_virtual(
                         ctx,
@@ -24027,7 +24015,7 @@ mod portal_resume_rebuild_tests {
         install(&mut meta, jitcode.clone());
 
         let mut tracing = crate::TraceCtx::for_test(0);
-        let storage = crate::resume::ResumeStorage::new(
+        let storage = crate::resume::new_resume_storage(
             vec![],
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
@@ -24116,7 +24104,7 @@ mod portal_resume_rebuild_tests {
         }
 
         let mut tracing = crate::TraceCtx::for_test(0);
-        let storage = crate::resume::ResumeStorage::new(
+        let storage = crate::resume::new_resume_storage(
             vec![],
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
@@ -24194,7 +24182,7 @@ mod portal_resume_rebuild_tests {
             majit_ir::descr::SimpleSizeDescr::new(0, 16, 0).with_all_fielddescrs(vec![field]),
         );
         let mut tracing = crate::TraceCtx::for_test(0);
-        let storage = crate::resume::ResumeStorage::new(
+        let storage = crate::resume::new_resume_storage(
             vec![],
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
@@ -24226,7 +24214,7 @@ mod portal_resume_rebuild_tests {
         let rd_virtuals = resume_data
             .storage
             .as_ref()
-            .map(|storage| storage.rd_virtuals());
+            .map(|storage| storage.rd_virtuals().unwrap_or(&[]));
         let virtual_count = rd_virtuals.map_or(0, |entries| entries.len());
         let mut cache =
             crate::BridgeVirtualCache::new(virtual_count, crate::default_bridge_array_descr);
@@ -30431,7 +30419,7 @@ mod tests {
             vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()].into(),
         );
         let pending_bridge_rd = PendingBridgeRd {
-            storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),
+            storage: crate::resume::new_resume_storage(vec![1, 2, 3], vec![], vec![], vec![]),
             frontend_boxes: vec![11, 22],
             liveboxes: vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
             livebox_types: vec![Type::Int, Type::Ref],
@@ -31407,7 +31395,7 @@ mod tests {
                 .exit_layout
                 .storage
                 .as_ref()
-                .map(|storage| storage.rd_numb.to_vec()),
+                .map(|storage| storage.rd_numb().expect("rd_numb").to_vec()),
             expected_rd_numb
         );
         assert_eq!(
@@ -34716,7 +34704,7 @@ mod loop_side_table_tests {
         meta.active_jitdriver_sd = Some(jd0);
         let (ptrs, ints) = meta
             .handle_async_forcing_with_allocator(
-                descr.as_fail_descr(),
+                Some(&descr),
                 green_key,
                 trace_id,
                 fail_index,

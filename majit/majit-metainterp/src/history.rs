@@ -2786,6 +2786,11 @@ mod tests {
             fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
                 Some(self)
             }
+            fn as_fail_descr_arc(
+                self: std::sync::Arc<Self>,
+            ) -> Option<std::sync::Arc<dyn FailDescr>> {
+                Some(self)
+            }
         }
         impl FailDescr for TestFailDescr {
             fn fail_index(&self) -> u32 {
