@@ -10632,7 +10632,7 @@ mod tests {
     fn descr_from_set_member_bridges_gil_ready() {
         let canonical = gil_ready_descr();
         let lookup = descr_from_set_member(&majit_ir::effectinfo::DescrSetMember::Field {
-            struct_id: 0,
+            struct_id: majit_ir::descr::path_hash("pyre_object::gil_ready::GilReadyState"),
             field_name: "gil_ready".into(),
         });
         let SetMemberLookup::Resolved(descr) = lookup else {
