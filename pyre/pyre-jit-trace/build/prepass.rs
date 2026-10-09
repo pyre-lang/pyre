@@ -1204,6 +1204,17 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // BUILD_MAP 0 residualises `build_map_from_empty_array` /
+                // NewEmptyDict. The portal never calls `newdict_empty` in
+                // source (`pyopcode.py BUILD_MAP` is `space.newdict()`;
+                // pyre's codewriter lowers the opcode to the residual), so
+                // the walker looks the body up by this graph key
+                // (`specialize.rs NEWDICT_DESCENT`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "dictmultiobject",
+                    "newdict_empty",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.

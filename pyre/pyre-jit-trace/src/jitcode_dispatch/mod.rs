@@ -1058,9 +1058,18 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     // skipped at the `SubRaise` catch site instead, matching
     // `pyopcode.py handle_bytecode` routing that exception around
     // `record_context`.
+    //
     // The hook chains through `chain_context`, so calling it here both applies
     // the effect to this authoritative walk's concrete exception and reaches
-    // the value the compiled iterations will store.
+    // the value the compiled iterations will store. A recording-time skip
+    // when `sys_exc_info` is None would bake that into the trace; compiled
+    // iterations that later run under a live handler would leave
+    // `__context__` unset. PyPy traces `executioncontext.py sys_exc_info`
+    // as jitcode (`guard_isnull` on `sys_exc_operror` and
+    // `current_gen_or_coroutine`) and compiles a bridge when a guard fails.
+    // Those guards synthesized here resume at the inlined CALL whose
+    // valuestack was already consumed. Residual-call the hook instead
+    // (`resolve_exception_context` reads `get_sys_exception` at run time).
     majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
     let hook = majit_metainterp::resolve_exception_context_hook_address();
     if !hook.is_null() && !exc.is_none() {

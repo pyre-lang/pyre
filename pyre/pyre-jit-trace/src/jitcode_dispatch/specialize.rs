@@ -14215,6 +14215,29 @@ fn walker_emit_canonical_message_raise<Sym: WalkSym>(
     }
 }
 
+const NEWDICT_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::dictmultiobject::newdict_empty",
+    commit_label: "newdict_commit",
+    call_site_label: "newdict_call_site",
+    decline_tag: "NEWDICT-SUBWALK",
+};
+
+/// BUILD_MAP 0 (`{}`) is `space.newdict()` (`pyopcode.py BUILD_MAP`) with
+/// an empty unroll.  Walk `newdict_empty` (`allocate_and_init_instance`
+/// empty-dict arm) so the trace records `new_with_vtable` + `dstorage` /
+/// `dstrategy` setfields, the shape PyPy traces.  Not a spec-fold row.
+pub(crate) fn try_walker_orthodox_newdict<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    try_walker_orthodox_descent(ctx, op.pc, &[], &[], &[], dst, dst_bank, &NEWDICT_DESCENT)
+}
+
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::floatobject::newfloat",
     commit_label: "newfloat_commit",
