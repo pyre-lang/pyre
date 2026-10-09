@@ -1457,6 +1457,11 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRe
 /// The test is `loop_header`, not `jit_merge_point`: the merge point marks the
 /// portal's dispatch entry (`interp_jit.py PyFrame.dispatch`), while the
 /// back-edge is `can_enter_jit` (`interp_jit.py PyFrame.jump_absolute`).
+/// After the per-instruction portal merge, every Python function body has a
+/// `jit_merge_point` at each opcode, which would make this predicate true for
+/// every inlinable callee and residualize `synth/name_bound_super_attr`'s
+/// `Child.val`. The nested merge protocol stamps `seen_loop_header` only at
+/// the back-edge.
 pub(crate) fn callee_body_owns_loop_header(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
     decoded_ops_on_fresh_frame(body_code, descr_refs)
         .is_some_and(|ops| ops.iter().any(|op| op.opname == "loop_header"))
@@ -3737,185 +3742,6 @@ pub(crate) fn collect_callee_active_boxes_excluding(
     Ok((active, skipped))
 }
 
-/// Whether a loop-carried operand parked below the call keeps the fold
-/// worthwhile.
-///
-/// A numeric accumulator (`a` in `a += r(d)`) does: the fold's resume rebuilds
-/// it from the caller's own register writeback, and folding the call is what
-/// turns a residual recursion back into an assembler-to-assembler jump.
-///
-/// A live iterator does not, for a recursive callee.  Folding a self-call that
-/// sits under a `FOR_ITER` iterator costs the caller a compiled loop and a
-/// bridge — measured on
-/// `recursive_call_frame_relocation` (`for k in range(n): r += cat(n - 1)`) as
-/// `loops_compiled 3 -> 2`.  The residual path keeps that loop, so leave the
-/// iterator-bearing shape to it.  `do_recursive_call(..., assembler_call=True)`
-/// (`pyjitpl.py`) is the inlined callee's own header, keyed at `next_instr`,
-/// not this CALL-site fold's `pc = 0` token.
-fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    slot: OpRef,
-) -> bool {
-    match ctx.trace_ctx.box_value(slot) {
-        Some(majit_ir::Value::Int(_)) | Some(majit_ir::Value::Float(_)) => true,
-        Some(majit_ir::Value::Ref(r)) => {
-            let obj = r.as_usize();
-            obj != 0 && unsafe { pyre_object::is_int(obj as pyre_object::PyObjectRef) }
-        }
-        _ => false,
-    }
-}
-
-/// Operand-stack depth at `jit_pc` from the containing-opcode table, then
-/// `LiveVars.stack_depth_at`.
-fn table_operand_depth_at_jit_pc<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    jit_pc: usize,
-) -> Option<usize> {
-    let index = ctx.walk_jitcode_index()?;
-    let pjc = crate::state::pyjitcode_for_jitcode_index(index as i32)?;
-    if pjc.depth_containing_populated() {
-        return pjc
-            .depth_containing_for_jitcode_pc(jit_pc)
-            .map(|depth| depth as usize);
-    }
-    let py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, jit_pc) as usize;
-    crate::liveness::liveness_for(pjc.code_ptr).stack_depth_at(py_pc)
-}
-
-fn walk_stack_base<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
-    let index = ctx.walk_jitcode_index()?;
-    let pjc = crate::state::pyjitcode_for_jitcode_index(index as i32)?;
-    if pjc.code_ptr.is_null() {
-        return None;
-    }
-    let code = unsafe { &*pjc.code_ptr };
-    Some(code.varnames.len() + pyre_interpreter::ncells(code))
-}
-
-/// `virtualizable_boxes[num_static_extra_boxes + stack_base + slot]`, the
-/// index math `capture_vable_shadow_stack_image` uses for
-/// `locals_cells_stack_w`.
-fn vable_stack_box_at<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    stack_base: usize,
-    slot: usize,
-) -> Option<OpRef> {
-    let info = ctx.trace_ctx.virtualizable_info()?;
-    ctx.trace_ctx
-        .virtualizable_box_at(info.num_static_extra_boxes + stack_base + slot)
-}
-
-/// Loop-carried operand-stack slots below a CALL. On the virtualizable
-/// owner they are `virtualizable_boxes` (`capture_vable_shadow_stack_image`
-/// index math: `num_static_extra_boxes + stack_base + slot`); an inlined
-/// frame is not the owner, so its slots are the `registers_r` colors the
-/// pcdep map names at this jitcode pc (`get_list_of_active_boxes`). Depth is
-/// the containing opcode's static table at this jitcode pc
-/// (`depth_containing_for_jitcode_pc` / `LiveVars.stack_depth_at`).
-fn vable_loop_carried_below_call_declines<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    jit_pc: usize,
-    nargs: usize,
-) -> bool {
-    let Some(operand_depth) = table_operand_depth_at_jit_pc(ctx, jit_pc) else {
-        return false;
-    };
-    let kept_below = operand_depth.saturating_sub(nargs);
-    if kept_below == 0 {
-        return false;
-    }
-    let Some(stack_base) = walk_stack_base(ctx) else {
-        return false;
-    };
-    let pjc = if ctx.fbw_mode.inline_subwalk {
-        let Some(index) = ctx.walk_jitcode_index() else {
-            return false;
-        };
-        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(index as i32) else {
-            return false;
-        };
-        Some(pjc)
-    } else {
-        None
-    };
-    for slot in 0..kept_below {
-        let box_ref = match &pjc {
-            Some(pjc) => pjc
-                .pcdep_for_jitcode_pc(jit_pc)
-                .and_then(|pcdep| {
-                    crate::state::semantic_slot_color_for_ref_slot(pcdep, stack_base + slot)
-                })
-                .and_then(|color| ctx.registers_r.get(color)),
-            None => vable_stack_box_at(ctx, stack_base, slot),
-        };
-        let Some(box_ref) = box_ref else {
-            continue;
-        };
-        if box_ref.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, box_ref) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Whether a callee that is not the walk's own code may take `CALL_ASSEMBLER`.
-///
-/// `_opimpl_recursive_call` (`pyjitpl.py`) falls through to
-/// `do_recursive_call(assembler_call=True)` with no extra callee screens.
-/// `direct_assembler_call` records `CALL_ASSEMBLER` to
-/// `warmstate.get_assembler_token(greenargs)`; the callee's compiled loop
-/// already contains its handlers. A raise that crosses the boundary is
-/// `handle_possible_exception` (`GUARD_NO_EXCEPTION`).
-///
-/// The `has_abort_permanent` decline (and the missing-facts decline) is a
-/// pyre-only screen with no upstream counterpart. `guess_call_kind`
-/// (`call.py`) returns `'recursive'` for a portal-runner call before any
-/// look-inside policy.
-fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
-    let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return false;
-    };
-    foreign_callee_facts_admit_call_assembler(facts)
-}
-
-fn foreign_callee_facts_admit_call_assembler(facts: crate::pyjitcode::InlineBodyFacts) -> bool {
-    !facts.has_abort_permanent
-}
-
-#[cfg(test)]
-mod foreign_call_assembler_admission_tests {
-    use super::*;
-    use crate::pyjitcode::InlineBodyFacts;
-
-    fn facts(has_exception_table: bool, has_abort_permanent: bool) -> InlineBodyFacts {
-        InlineBodyFacts {
-            contains_raise: false,
-            has_abort_permanent,
-            exc_override_straight_line: true,
-            exc_override_sample_safe: false,
-            index_sample_safe: false,
-            exc_override_has_nested_call: false,
-            owns_loop_header: false,
-            has_exception_table,
-        }
-    }
-
-    #[test]
-    fn callee_exception_table_does_not_block_call_assembler() {
-        // `_opimpl_recursive_call` fall-through has no callee-table screen.
-        // The `has_abort_permanent` decline is a pyre-only screen with no
-        // upstream counterpart (`guess_call_kind` returns `'recursive'` for
-        // a portal-runner call before any look-inside policy).
-        assert!(foreign_callee_facts_admit_call_assembler(facts(
-            true, false
-        )));
-        assert!(!foreign_callee_facts_admit_call_assembler(facts(
-            false, true
-        )));
-    }
-}
-
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
 /// at the inline recursion-bound boundary.
 ///
@@ -4102,65 +3928,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    // `is_self_recursive = callee code == portal code`. During
-    // recording `we_are_jitted()` is false, so `function_get_code` (the
-    // `w_code` already in hand) equals `getcode` — the pointer the
-    // jit_merge_point green key and the portal jitcode were registered
-    // under.
-    let caller_code = unsafe {
-        pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ()) as *const ()
-    };
-    // Self-fold requires callee code == portal code.  The full-portal cutover
-    // additionally admits a *mutual*-recursive callee — one whose code is
-    // already on the inline framestack, i.e. a
-    // genuine recursion cycle (`is_even` → `is_odd` → `is_even` at the unroll
-    // cap).  The emit below keys on `w_code` (callee-agnostic); the token
-    // is resolved / synthesised per `callee_key` via `get_assembler_token`.
-    //
-    // Any other callee is admitted only through
-    // [`foreign_callee_admits_call_assembler`]. `_opimpl_recursive_call`
-    // (`pyjitpl.py`) puts no condition on `assembler_call` once control
-    // reaches the fall-through. The remaining `has_abort_permanent` (and
-    // missing-facts) decline is a pyre-only screen with no upstream
-    // counterpart; a callee exception table lives in the target token.
-    if w_code as usize != caller_code as usize {
-        let admit_mutual = ctx
-            .session
-            .borrow()
-            .framestack
-            .iter()
-            .any(|f| f.w_code == w_code as usize);
-        if !admit_mutual && !foreign_callee_admits_call_assembler(w_code) {
-            return Ok(None);
-        }
-    }
-    // The operand stack below the call's own operands (`r_args = [callable,
-    // null_or_self, arg0..]`) may hold loop-carried input args: the enclosing
-    // loop's `FOR_ITER` iterator, or an accumulator reloaded for `+=`.  Only
-    // the iterator disqualifies the fold — see
-    // `loop_carried_slot_keeps_fold_profitable`.  Declining every loop-carried
-    // operand instead kept a recursion called from a `while` body on the
-    // residual path permanently.
-    //
-    // Those slots live in `virtualizable_boxes` (`_opimpl_setarrayitem_vable`
-    // → `synchronize_virtualizable_at`), indexed the way
-    // `capture_vable_shadow_stack_image` reads `locals_cells_stack_w`.
-    //
-    // The screen is about a recursion re-entering through the loop it sits
-    // in.  A foreign, non-recursive callee called from a `for` body is the
-    // shape `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) folds for
-    // any callee with its own loop token; declining it left the whole callee
-    // as a residual call per iteration.
-    let recursive_callee = w_code as usize == caller_code as usize
-        || ctx
-            .session
-            .borrow()
-            .framestack
-            .iter()
-            .any(|f| f.w_code == w_code as usize);
-    if recursive_callee && vable_loop_carried_below_call_declines(ctx, op.pc, r_args.len()) {
-        return Ok(None);
-    }
+    // `_opimpl_recursive_call` (`pyjitpl.py`) puts no condition on
+    // `assembler_call` once control reaches the fall-through above; builder
+    // checks below still apply.
+
     // Branch A frame shape only: `ncells == 0`, non-global-storing callee.
     let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
@@ -8631,6 +8402,66 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
+/// Allocate the live wrapper `&[PyObjectRef]` block, record
+/// `NEW_ARRAY_CLEAR` with that pointer, and `SETARRAYITEM_GC` each CALL
+/// operand into it (`pyjitpl.py` `MetaInterp.execute_new_array_clear` /
+/// `execute_setarrayitem_gc`). `History._make_op` then carries
+/// `Box.value`; `MIFrame.do_residual_call` → `execute_and_record_varargs`
+/// (`executor.py` `execute_varargs`) reads that word. A record-only
+/// `NewArrayClear` leaves the box empty, so a nested residual in the
+/// generated body declines `ValueUnavailable` before execute.
+///
+/// The pin lives across the helper sub-walk: `record` can collect, and
+/// the generated body reads this array (`arraylen_gc`, residual
+/// `int_descr_new`).
+fn stamp_wrapper_args_array(
+    ctx: &mut TraceCtx,
+    wrapper_items: &[OpRef],
+) -> (
+    OpRef,
+    ConcreteValue,
+    Option<majit_gc::shadow_stack::OwnerRootGuard>,
+) {
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.const_int(wrapper_items.len() as i64);
+    let allocated =
+        unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(wrapper_items.len()) };
+    let pin = allocated.and_then(|p| residual_call::owner_root_if_gc(p as usize));
+    let value = pin
+        .as_ref()
+        .map(|g| majit_ir::Value::Ref(g.get()))
+        .or_else(|| allocated.map(|p| majit_ir::Value::Ref(majit_ir::GcRef(p as usize))));
+    let args_array = match value {
+        Some(value) => ctx.record_new_array_clear(len, array_descr.clone(), value),
+        None => ctx.record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone()),
+    };
+    // `MetaInterp.execute_new_array_clear` stamps `heapcache.new_array`
+    // (`pyjitpl.py`); a record-only `NEW_ARRAY_CLEAR` leaves the cache empty.
+    ctx.heap_cache_mut().new_array(args_array, len, true);
+    for (index, &item) in wrapper_items.iter().enumerate() {
+        let index = ctx.const_int(index as i64);
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        // The wrapper reads its `&[PyObjectRef]` argument through this same
+        // ArrayDescr, so its getarrayitem returns the live CALL operand.
+        // `execute_setarrayitem_gc` (`pyjitpl.py`) publishes that store.
+        ctx.heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+    }
+    let concrete = if let Some(g) = &pin {
+        let live = g.get();
+        let _ = ctx.try_set_opref_concrete(args_array, majit_ir::Value::Ref(live));
+        ConcreteValue::Ref(live.0 as pyre_object::PyObjectRef)
+    } else if let Some(p) = allocated {
+        ConcreteValue::Ref(p as pyre_object::PyObjectRef)
+    } else {
+        ConcreteValue::Null
+    };
+    (args_array, concrete, pin)
+}
+
 /// Stamp wrapper arguments, walk the generated body, restore the caller
 /// frame, and handle SubReturn / SubRaise.  Shared by CALL
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
@@ -8682,26 +8513,8 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, mut args_array_concrete, args_array_pin) =
+        stamp_wrapper_args_array(ctx.trace_ctx, wrapper_items);
     // Nested in an active `SubWalkDriver` (generator-next inlining a body
     // that type-calls `list(...)`), the yield would cut this gateway args
     // array and restore a heap cache that still names it. The wrapper body
@@ -8774,6 +8587,12 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
     let exc_before_subwalk = ctx.last_exc_value();
+    if let Some(pin) = &args_array_pin {
+        let live = pin.get();
+        ctx.trace_ctx
+            .try_set_opref_concrete(args_array, majit_ir::Value::Ref(live));
+        args_array_concrete = ConcreteValue::Ref(live.0 as pyre_object::PyObjectRef);
+    }
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -8781,7 +8600,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     // The helper's level ends with its walk.  A type-call `__init__` walked
@@ -8796,6 +8615,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
+    drop(args_array_pin);
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
@@ -9220,24 +9040,8 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, mut args_array_concrete, args_array_pin) =
+        stamp_wrapper_args_array(ctx.trace_ctx, &wrapper_items);
     // Same residual-step cut as `walk_translated_builtin_wrapper`.
     keep_residual_recordings_across_suspend::<Sym>();
 
@@ -9268,6 +9072,12 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.fbw_mode.helper_return = HelperReturn::CallResult;
     let helper_frame = enter_helper_level(ctx, nested_helper_entry);
     let exc_before_subwalk = ctx.last_exc_value();
+    if let Some(pin) = &args_array_pin {
+        let live = pin.get();
+        ctx.trace_ctx
+            .try_set_opref_concrete(args_array, majit_ir::Value::Ref(live));
+        args_array_concrete = ConcreteValue::Ref(live.0 as pyre_object::PyObjectRef);
+    }
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -9275,7 +9085,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     drop(helper_frame);
@@ -9287,6 +9097,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
+    drop(args_array_pin);
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
