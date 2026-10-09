@@ -1366,13 +1366,22 @@ where
 }
 
 /// `get_storage_copy` — `erase(d.copy())`.
+///
+/// `RDict::clone` reaches `_ll_malloc_entries` / `alloc_entries`, a
+/// collection point. `src` and `dst` are nursery set objects; pin both
+/// before the clone and write through the reloaded `dst`.
 unsafe fn unwrapped_copy_storage<S>(strategy: &S, src: PyObjectRef, dst: PyObjectRef)
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
 {
+    let _roots = crate::gc_roots::push_roots();
+    let dst_slot = crate::gc_roots::pin_roots(&[dst, src]);
+    let src_slot = dst_slot + 1;
+    let src = crate::gc_roots::shadow_stack_get(src_slot);
     let copied = unsafe { (*strategy.storage_ptr(&*(src as *const W_SetObject))).clone() };
     let len = copied.len();
+    let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     {
         let d = unsafe { &mut *(dst as *mut W_SetObject) };
         d.sstorage =
@@ -3149,9 +3158,10 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// what makes the operand's elements reach the new set without handing them
 /// to a user `__hash__` (or `__eq__`) a second time.
 ///
-/// Cloning does not call back into user code, and the storage box uses the
-/// non-collecting stable old-generation allocator, so there is no collection
-/// point between reading `src`'s table and installing the new field value.
+/// `RDict::clone` allocates a young `DICTENTRYARRAY` (`_ll_malloc_entries` /
+/// `alloc_entries`), which is a collection point. `src` and `dst` are
+/// nursery-born set objects, so they live on the shadow stack across that
+/// malloc and `get_storage_copy` writes through the reloaded `dst`.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// `w_set_new` twin: cloning `src`'s `SetItemsStorage` (`RDict<ObjectKey,
@@ -3168,6 +3178,11 @@ pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
     let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
     // `w_other.get_storage_copy()` installed by `copy_real` /
     // `EmptySetStrategy.update`.
+    let _roots = crate::gc_roots::push_roots();
+    let dst_slot = crate::gc_roots::pin_roots(&[dst, src]);
+    let src_slot = dst_slot + 1;
+    let src = crate::gc_roots::shadow_stack_get(src_slot);
+    let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     let src_set = &*(src as *const W_SetObject);
     src_set.strategy.get_storage_copy(src, dst);
 }
@@ -3858,8 +3873,14 @@ pub unsafe fn w_set_setitem_with_hash(obj: *mut PyObject, key: *mut PyObject, ha
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
     let _set_guard = w_set_lock(obj);
     // `W_BaseSetObject.getkeys` → `self.strategy.getkeys(self)`.
+    // A contended stripe parks in `before_external_block`, so the set is
+    // reloaded after the acquire rather than kept in the pre-lock local.
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     (*(obj as *const W_SetObject)).strategy.getkeys(obj)
 }
 
@@ -4161,8 +4182,14 @@ impl SetStrategy for ObjectSetStrategy {
     }
 
     unsafe fn get_storage_copy(&self, src: PyObjectRef, dst: PyObjectRef) {
+        let _roots = crate::gc_roots::push_roots();
+        let dst_slot = crate::gc_roots::pin_roots(&[dst, src]);
+        let src_slot = dst_slot + 1;
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
         let copied = (*object_set_storage_ptr(&*(src as *const W_SetObject))).clone();
         // `gc_alloc_storage_box` is a stable allocation and never collects.
+        // `RDict::clone` above already did: write into the forwarded `dst`.
+        let dst = crate::gc_roots::shadow_stack_get(dst_slot);
         {
             let d = &mut *(dst as *mut W_SetObject);
             // Box first, then the kind, so the word is never Object over null.
@@ -4749,19 +4776,33 @@ pub unsafe fn w_list_try_extend_empty_from_set(list: PyObjectRef, set: PyObjectR
     ) {
         return false;
     }
-    if let Some(ints) = w_set_listview_int(set)
+    // Each listview helper takes the set stripe. A contended acquire parks
+    // in `before_external_block`, so both operands are reloaded after the
+    // view and before the matching install.
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::pin_roots(&[list, set]);
+    if let Some(ints) = w_set_listview_int(crate::gc_roots::shadow_stack_get(base + 1))
         && !ints.is_empty()
-        && crate::listobject::w_list_install_int_items(list, &ints)
+        && crate::listobject::w_list_install_int_items(
+            crate::gc_roots::shadow_stack_get(base),
+            &ints,
+        )
     {
         return true;
     }
-    if let Some(blocks) = w_set_listview_bytes(set)
-        && crate::listobject::w_list_install_bytes_items(list, &blocks)
+    if let Some(blocks) = w_set_listview_bytes(crate::gc_roots::shadow_stack_get(base + 1))
+        && crate::listobject::w_list_install_bytes_items(
+            crate::gc_roots::shadow_stack_get(base),
+            &blocks,
+        )
     {
         return true;
     }
-    if let Some(chars) = w_set_listview_ascii(set)
-        && crate::listobject::w_list_install_ascii_items(list, &chars)
+    if let Some(chars) = w_set_listview_ascii(crate::gc_roots::shadow_stack_get(base + 1))
+        && crate::listobject::w_list_install_ascii_items(
+            crate::gc_roots::shadow_stack_get(base),
+            &chars,
+        )
     {
         return true;
     }

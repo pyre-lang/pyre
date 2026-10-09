@@ -14665,7 +14665,6 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
             || pyre_object::is_str(arg_obj)
             || pyre_object::is_bytes(arg_obj)
             || pyre_object::is_bytearray(arg_obj)
-            || complex_arg_has_complex_dunder(arg_obj)
         {
             // An int subclass stays on the residual. The numeric arm admits
             // only an exact int, and its class guard is the builtin `int`.
@@ -14674,13 +14673,23 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
             }
             None
         } else {
-            match prepare_walker_inline_index(ctx, arg_op, arg_obj) {
-                Some(candidate) => Some(Plan::Index(candidate)),
-                None => {
-                    if fbw_inline_diag_enabled() {
-                        eprintln!("[complex-call-decline] why=index-prepare-none");
+            // `lookup_in_type` boxes the name while tracing. Reload `arg_obj`
+            // before the `__index__` prepare, which still reads that word.
+            let mut arg_obj = arg_obj;
+            if pyre_object::with_roots!(arg_obj => complex_arg_has_complex_dunder(arg_obj)) {
+                if fbw_inline_diag_enabled() {
+                    eprintln!("[complex-call-decline] why=conversion-dunder-or-other-type");
+                }
+                None
+            } else {
+                match prepare_walker_inline_index(ctx, arg_op, arg_obj) {
+                    Some(candidate) => Some(Plan::Index(candidate)),
+                    None => {
+                        if fbw_inline_diag_enabled() {
+                            eprintln!("[complex-call-decline] why=index-prepare-none");
+                        }
+                        None
                     }
-                    None
                 }
             }
         }

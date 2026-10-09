@@ -11689,12 +11689,13 @@ fn add_weakref_slot(mut cls: PyObjectRef, base: PyObjectRef) {
         let _roots = pyre_object::gc_roots::push_roots();
         let save = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(cls);
-        let cls = pyre_object::gc_roots::shadow_stack_get(save);
+        cls = pyre_object::gc_roots::shadow_stack_get(save);
         let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
         let _ = pyre_object::gc_roots::pin_root(descr);
-        let cls = pyre_object::gc_roots::shadow_stack_get(save);
+        cls = pyre_object::gc_roots::shadow_stack_get(save);
         let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
         crate::type_dict_store(cls, "__weakref__", descr);
+        cls = pyre_object::gc_roots::shadow_stack_get(save);
     }
     unsafe { pyre_object::w_type_set_weakrefable(cls, true) };
 }
@@ -13516,13 +13517,15 @@ fn make_exception_group_type(
         let _roots = pyre_object::gc_roots::push_roots();
         let save = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(cls);
-        let cls = pyre_object::gc_roots::shadow_stack_get(save);
+        cls = pyre_object::gc_roots::shadow_stack_get(save);
         let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
         let _ = pyre_object::gc_roots::pin_root(descr);
-        let cls = pyre_object::gc_roots::shadow_stack_get(save);
+        cls = pyre_object::gc_roots::shadow_stack_get(save);
         let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
         crate::type_dict_store(cls, "__weakref__", descr);
+        cls = pyre_object::gc_roots::shadow_stack_get(save);
         unsafe { pyre_object::w_type_set_weakrefable(cls, true) };
+        cls = pyre_object::gc_roots::shadow_stack_get(save);
     }
     register_exc_class(name, cls)
 }
@@ -27003,18 +27006,18 @@ fn complex_index_to_real(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
 fn complex_space_float(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
     use pyre_object::*;
     if unsafe { is_float(obj) && !is_exact_builtin_instance(obj) } {
-        let Some(method) = (unsafe {
+        let Some(mut method) = (unsafe {
             pyre_object::with_roots!(obj => crate::baseobjspace::lookup(obj, "__float__"))
         }) else {
             return Err(unsafe {
                 crate::PyError::from_exc_object(crate::baseobjspace::float_w_must_be_real(obj))
             });
         };
-        let w_type = crate::typedef::r#type(obj)
+        let mut w_type = crate::typedef::r#type(obj)
             .map(|w_type| w_type.as_ptr())
             .unwrap_or(obj);
         let w_result = unsafe {
-            pyre_object::with_roots!(obj => {
+            pyre_object::with_roots!(obj, method, w_type => {
                 crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])
             })?
         };

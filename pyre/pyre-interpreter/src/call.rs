@@ -7180,7 +7180,7 @@ fn build_class_inner(
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
-        let dict_obj = pyre_object::gc_roots::pin_root(dict_obj);
+        let _ = pyre_object::gc_roots::pin_root(dict_obj);
         // `_PyDict_HasOnlyStringKeys(type->tp_dict)` decides the
         // `RuntimeWarning` reported below; reading the keys answers it
         // without hashing any of them.
@@ -7188,7 +7188,6 @@ fn build_class_inner(
         let has_non_string_key = unsafe { pyre_object::w_dict_items(class_ns) }
             .iter()
             .any(|&(key, _)| !unsafe { pyre_object::is_str(key) });
-        let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
         // Slot creation, C3 validation and `__set_name__` below all allocate
         // and can execute Python; the nascent type has no other referrer
         // until its mro is installed, so keep it rooted and reread it after
@@ -7197,20 +7196,20 @@ fn build_class_inner(
         let w = pyre_object::w_type_new(
             name,
             pyre_object::gc_roots::shadow_stack_get(bases_root),
-            dict_obj as pyre_object::gc_hook::GCREF,
+            pyre_object::gc_roots::shadow_stack_get(dict_root) as pyre_object::gc_hook::GCREF,
         );
         let _ = pyre_object::gc_roots::pin_root(w);
-        // `w_type_new` allocates the name-storage box
-        // (`gc_alloc_young_storage_box`) and may spill the header to old-gen
-        // when the nursery is full. Either collect. The namespace is a
-        // nursery dict; the pre-alloc local is then recycled poison.
-        // `_create_new_type` reloads both words from their slots
-        // (`type_new_take_qualname(w_type(), shadow_stack_get(dict_root))`).
+        // `w_type_new` is `malloc_fixedsize` (`incminimark.py`); a nursery-full
+        // minor moves the namespace dict. `typeobject.py W_TypeObject.__init__`
+        // consumes `__qualname__` off that dict. RPython's gctransform reloads
+        // the livevar (`framework.py` `push_roots` around malloc); reload both
+        // the type and the dict from their slots rather than the pre-alloc words.
         crate::builtins::type_new_take_qualname(
             pyre_object::gc_roots::shadow_stack_get(w_root),
             pyre_object::gc_roots::shadow_stack_get(dict_root),
         )?;
-        // typeobject.py create_all_slots parity.
+        // typeobject.py create_all_slots parity. Interning `__qualname__`
+        // above is another malloc; reload the nursery type.
         unsafe {
             create_all_slots(
                 pyre_object::gc_roots::shadow_stack_get(w_root),
@@ -7722,19 +7721,21 @@ pub unsafe fn create_all_slots(
         use pyre_object::typeobject::{Layout, leak_layout};
 
         // Heap types are nursery. Slot construction (`copy_for_type`,
-        // `w_member_new`) collects, so the type and bases live in the
-        // shadow stack and every use after a collecting call reloads.
+        // `w_member_new`, `type_dict_store`) collects, so the type, bases,
+        // and best base live in the shadow stack and every use after a
+        // collecting call reloads.
         let _slot_roots = pyre_object::gc_roots::push_roots();
-        let type_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_type);
-        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_bases);
+        let type_slot = pyre_object::gc_roots::pin_roots(&[w_type, w_bases]);
+        let bases_slot = type_slot + 1;
         w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
-        let w_bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
+        let mut w_bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
 
         // typeobject.py: w_bestbase = check_and_find_best_base(space, bases_w)
         let mut w_bestbase = check_and_find_best_base(w_bases)?;
+        let bestbase_slot = pyre_object::gc_roots::pin_roots(&[w_bestbase]);
+        w_bestbase = pyre_object::gc_roots::shadow_stack_get(bestbase_slot);
         w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+        w_bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
 
         // typeobject.py:1507-1508: inherit flag_map_or_seq from bases
         pyre_object::typeobject::inherit_flag_map_or_seq(w_type, w_bases);
@@ -7760,13 +7761,15 @@ pub unsafe fn create_all_slots(
         // typeobject.py create_all_slots
         let mut newslotnames = Vec::new();
         let (mut wantdict, mut wantweakref);
-        if let Some(w_slots) = crate::type_dict_lookup(w_type, "__slots__") {
+        if let Some(mut w_slots) = crate::type_dict_lookup(w_type, "__slots__") {
             // typeobject.py:1154-1176: has __slots__
             wantdict = false;
             wantweakref = false;
-            let all_names =
-                pyre_object::with_roots!(w_bestbase, w_type => collect_slot_names(w_slots))?;
+            // `unpackiterable` collects. `w_bestbase` / `w_type` already sit
+            // in the function-wide slots; pin the slots tuple itself.
+            let all_names = pyre_object::with_roots!(w_slots => collect_slot_names(w_slots))?;
             w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+            w_bestbase = pyre_object::gc_roots::shadow_stack_get(bestbase_slot);
             if base_has_variable_items && !all_names.is_empty() {
                 return Err(crate::PyError::type_error(format!(
                     "nonempty __slots__ not supported for subtype of '{}'",
@@ -7867,7 +7870,9 @@ pub unsafe fn create_all_slots(
         // backing.
         //
         // No Member is stored for the slot: it is interpreter storage, not an
-        // attribute the subclass exposes.
+        // attribute the subclass exposes. `type_dict_store` above may have
+        // moved the best base; read it back before walking its layout.
+        w_bestbase = pyre_object::gc_roots::shadow_stack_get(bestbase_slot);
         if crate::type_methods::base_owes_dict_backing(w_bestbase) {
             newslotnames.push(crate::type_methods::DICT_DATA_SLOT.to_string());
         }
@@ -7957,8 +7962,7 @@ unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
     unsafe {
         if !pyre_object::w_type_get_hasdict(w_type) {
             let _roots = pyre_object::gc_roots::push_roots();
-            let save = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_type);
+            let save = pyre_object::gc_roots::pin_roots(&[w_type]);
             let w_type = pyre_object::gc_roots::shadow_stack_get(save);
             let descr =
                 crate::typedef::copy_descriptor_for_type(crate::typedef::dict_descr(), w_type);
@@ -7968,6 +7972,7 @@ unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
             if !crate::type_dict_contains(w_type, "__dict__") {
                 crate::type_dict_store(w_type, "__dict__", descr);
             }
+            let w_type = pyre_object::gc_roots::shadow_stack_get(save);
             pyre_object::w_type_set_hasdict(w_type, true);
         }
     }
@@ -7986,8 +7991,7 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
     unsafe {
         if !pyre_object::w_type_get_weakrefable(w_type) {
             let _roots = pyre_object::gc_roots::push_roots();
-            let save = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_type);
+            let save = pyre_object::gc_roots::pin_roots(&[w_type]);
             let w_type = pyre_object::gc_roots::shadow_stack_get(save);
             let descr =
                 crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), w_type);
@@ -7997,6 +8001,7 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
             if !crate::type_dict_contains(w_type, "__weakref__") {
                 crate::type_dict_store(w_type, "__weakref__", descr);
             }
+            let w_type = pyre_object::gc_roots::shadow_stack_get(save);
             pyre_object::w_type_set_weakrefable(w_type, true);
         }
     }

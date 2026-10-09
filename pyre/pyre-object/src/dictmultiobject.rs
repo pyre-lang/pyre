@@ -1785,9 +1785,14 @@ pub unsafe fn w_dict_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(&mut
     // Grey the dicttable box (`W_DictMultiObject.dstorage`). Walking only
     // the entries interiors leaves a young-nonmoving box without
     // `VISITED_RMY`, and the next trace of `dstorage` reads a swept header.
+    // EmptyDictStrategy / EmptyKwargsDictStrategy store `erased(None)`
+    // (`get_empty_storage`); skip that null the way `dict_object_custom_trace`
+    // does. Visiting it would walk a slot the strategy has no storage for.
     let dstorage_slot =
         std::ptr::addr_of_mut!((*(obj as *mut W_DictObject)).dstorage) as *mut PyObjectRef;
-    visitor(unsafe { &mut *dstorage_slot });
+    if !(*dstorage_slot).is_null() {
+        visitor(unsafe { &mut *dstorage_slot });
+    }
     let strategy = unsafe { w_dict_get_strategy(obj) };
     let mut adapter = |slot: *mut PyObjectRef| {
         visitor(unsafe { &mut *slot });
@@ -2625,7 +2630,9 @@ pub unsafe fn w_module_dict_walk_gc_cells(
         return;
     }
     let md = &mut *(obj as *mut W_ModuleDictObject);
-    visitor(unsafe { &mut *(std::ptr::addr_of_mut!(md.dstorage) as *mut PyObjectRef) });
+    if !md.dstorage.is_null() {
+        visitor(unsafe { &mut *(std::ptr::addr_of_mut!(md.dstorage) as *mut PyObjectRef) });
+    }
     if w_module_dict_is_object_strategy(obj) {
         let object_storage = &mut *(md.dstorage as *mut ObjectDictStorage);
         for (key, value) in object_storage.iter_mut_for_trace() {

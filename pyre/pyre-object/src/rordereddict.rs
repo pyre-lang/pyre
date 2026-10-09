@@ -1165,8 +1165,8 @@ where
 #[majit_macros::oopspec("odict.resize(d)")]
 pub fn ll_dict_resize<K, V, S>(d: &mut RDict<K, V, S>)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1178,8 +1178,8 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_remove_deleted_items<K, V, S>(d: &mut RDict<K, V, S>)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1263,6 +1263,15 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
+    // `_ll_dict_setitem_lookup_done` livevars: `key` and `value` survive
+    // `ll_dict_grow` / `ll_dict_resize`. The transformer inserts
+    // `push_roots` around `_ll_malloc_entries`; without that bracket the
+    // pair's GC words stay in this frame and the write below stores the
+    // pre-move address (`ll_arraycopy` of an unrooted nursery key copies
+    // interiors). Same pin/reload as `map_keys_preserving_layout`.
+    let _roots = crate::gc_roots::push_roots();
+    let key_base = pin_key_gc_refs(&key);
+    let value_base = pin_key_gc_refs(&value);
     let mut reindexed = false;
     let mut rc = d.resize_counter - 3;
     // `_ll_malloc_entries` may collect (`ll_dict_grow` /
@@ -1295,6 +1304,8 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
         d.set_index_at(i as usize, d.next_slot() + VALID_OFFSET);
     }
     d.resize_counter = rc;
+    let key = reload_key_gc_refs(key, key_base);
+    let value = reload_key_gc_refs(value, value_base);
     let slot = d.num_ever_used_items;
     d.barrier_entries();
     unsafe {
@@ -1332,8 +1343,8 @@ pub fn ll_dict_setitem_lookup_done_trampoline<K, V, S>(
 /// `_ll_dict_del`. look_inside_iff(isvirtual(d) and isconstant(i)).
 pub fn ll_dict_del<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1346,8 +1357,8 @@ where
 
 fn ll_dict_del_orig<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1371,8 +1382,8 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_del_trampoline<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1405,8 +1416,8 @@ fn reload_gcrefs<T: GcRefOffsets>(roots: &crate::gc_roots::RootScope, val: &mut 
 
 impl<K, V, S> RDict<K, V, S>
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
