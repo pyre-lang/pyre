@@ -917,21 +917,16 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
 /// follows. `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
 ///
-/// Source-level helpers (`typeobject::type_write_barrier`,
-/// `celldict::object_mutable_cell_write_barrier`) are erased in
-/// `front/mir.rs` `is_source_write_barrier_call`, the same point the
-/// LLBC call becomes a unit constant before the following `setfield`.
+/// `typeobject::type_write_barrier` is erased in `front/mir.rs` `is_source_write_barrier_call`.
 fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     let [.., module, leaf] = segments else {
         return false;
     };
-    matches!(
-        (module.as_str(), leaf.as_str()),
-        (
-            "gc_hook",
+    module == "gc_hook"
+        && matches!(
+            leaf.as_str(),
             "try_gc_write_barrier" | "try_gc_write_barrier_managed"
         )
-    )
 }
 
 /// Unary ops `optimize_block` drops as `same_as`.
@@ -1052,14 +1047,13 @@ fn canonical_gc_base(
 /// call the JIT rewriter does not keep: `rewrite.py
 /// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
 /// `SETFIELD_GC` / `SETARRAYITEM_GC` of a pointer. The interpreter spells
-/// that barrier as an explicit `try_gc_write_barrier(obj)` right
-/// before the store it guards, so the call is dropped only when a GC
-/// `FieldWrite` / `ArrayWrite` of the same base follows it in the same
-/// block: that store lowers to the op the backend barriers. Any other
-/// barrier stays residual.
+/// that barrier as an explicit `try_gc_write_barrier(obj)` right before the
+/// store it guards, so the call is dropped only when a GC `FieldWrite` /
+/// `ArrayWrite` of the same base follows it in the same block: that store
+/// lowers to the op the backend barriers. Any other barrier stays residual.
 ///
-/// The bool-returning `gc_hook` result becomes `true`: the hook is
-/// installed before any compiled code runs.
+/// The result becomes `true`: the hook is installed before any compiled
+/// code runs.
 fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     let aliases = std::collections::HashMap::new();
     let mut drops: Vec<(usize, usize)> = Vec::new();
@@ -24776,9 +24770,7 @@ mod tests {
     }
 
     /// Only the `gc_hook` barrier is this op: a same-named leaf in another
-    /// module is an ordinary call. Source-level helpers such as
-    /// `celldict::object_mutable_cell_write_barrier` are erased in
-    /// `front/mir.rs` `is_source_write_barrier_call`.
+    /// module is an ordinary call. `write_cell` spells `try_gc_write_barrier`.
     #[test]
     fn gc_write_barrier_path_requires_gc_hook_module() {
         let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
