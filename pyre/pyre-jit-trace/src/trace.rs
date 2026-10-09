@@ -544,6 +544,66 @@ fn abort_too_long_action() -> TraceAction {
     })
 }
 
+/// True when this recorded history already contains `CALL_ASSEMBLER`.
+/// `_opimpl_recursive_call` (`pyjitpl.py`) records that op once
+/// `dont_trace_here` has flipped `assembler_call=True`.
+fn trace_recorded_call_assembler(ctx: &TraceCtx) -> bool {
+    (0..ctx.opcode_at_len()).any(|i| {
+        matches!(
+            ctx.opcode_at(i),
+            Some(
+                majit_ir::OpCode::CallAssemblerI
+                    | majit_ir::OpCode::CallAssemblerR
+                    | majit_ir::OpCode::CallAssemblerF
+                    | majit_ir::OpCode::CallAssemblerN
+            )
+        )
+    })
+}
+
+/// `pyjitpl.py blackhole_if_trace_too_long` + `find_biggest_function`:
+/// the inlined frame that owns the most recorded ops is this portal itself.
+///
+/// A recursive Python unroll in FBW finishes (`Terminate`) well under
+/// `trace_limit` — `fib(20)` records ~955 ops here vs PyPy's ~8449 on the
+/// generic eval loop, which does trip `ABORT_TOO_LONG`. Without that abort
+/// the next attempt inlines the same portal again, reconstruction of the
+/// unrolled tree's multi-frame guards fails (`P2Drain::NoRecipes`), and
+/// `abort_ceiling` bans the cell. Naming the same portal here runs the
+/// upstream disable (`disable_noninlinable_function` + `trace_next_iteration`)
+/// so `_opimpl_recursive_call` records `CALL_ASSEMBLER` on the retrace.
+/// A history that already has that op is that retrace; a bridge Terminate is
+/// a specialization of the compiled token and must compile.
+fn recursive_portal_was_inlined(w_code: *const ()) -> bool {
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return false;
+    };
+    let Some((_, huge_key)) = driver.meta_interp().find_biggest_function() else {
+        return false;
+    };
+    match huge_key.1.as_ref() {
+        Some(typed) => typed.values.get(2).copied() == Some(w_code as i64),
+        None => false,
+    }
+}
+
+fn recursive_portal_terminate_without_call_assembler(
+    w_code: *const (),
+    ctx: &TraceCtx,
+) -> Option<TraceAction> {
+    if ctx.is_bridge_trace || trace_recorded_call_assembler(ctx) {
+        return None;
+    }
+    if !recursive_portal_was_inlined(w_code) {
+        return None;
+    }
+    crate::state::note_root_trace_too_long(
+        ctx.current_merge_points_first_green_key_pair(),
+        ctx.resumekey_original_loop_token().cloned(),
+    );
+    Some(abort_too_long_action())
+}
+
 #[allow(dead_code)]
 fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> bool {
     (start_pc..code.instructions.len()).all(|pc| {
@@ -5890,11 +5950,26 @@ fn run_perfn_walk<Sym: WalkSym>(
             if commit_walk_end(flush_committed, WalkEndCommitLeg::VableEscape, resume) {
                 crate::jitcode_dispatch::discard_escape_flush_undo();
                 // The force-time escape flush wrote the resume state into the
-                // LIVE frame (the frame the callee inspected).  The portal
-                // epilogue propagates `executed_frame` → live on a committed
-                // flush, so mirror the live frame's resume state into the walk
-                // snapshot to make that copy the identity.
+                // LIVE frame (the frame the callee inspected).  A residual
+                // that is still running then puts the executing opcode back
+                // so `f_lasti` readers see it; an Exact interpreter resume
+                // needs `last_instr = resume_py_pc - 1` again.
                 let live = sym.live_vable_frame_addr();
+                if matches!(
+                    escape_kind,
+                    crate::jitcode_dispatch::EscapeResumeKind::Exact
+                ) {
+                    let frame = if live != 0 { live } else { cf_addr };
+                    if frame != 0 {
+                        unsafe {
+                            (*(frame as *mut pyre_interpreter::PyFrame)).last_instr =
+                                resume_py_pc as isize - 1;
+                        }
+                    }
+                }
+                // The portal epilogue propagates `executed_frame` → live on a
+                // committed flush, so mirror the live frame's resume state
+                // into the walk snapshot to make that copy the identity.
                 if live != 0 && cf_addr != 0 && live != cf_addr {
                     unsafe {
                         (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
@@ -7490,6 +7565,10 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 finish_arg,
                 finish_arg_type,
             } => {
+                if let Some(action) = recursive_portal_terminate_without_call_assembler(w_code, ctx)
+                {
+                    return action;
+                }
                 // A loop-free portal exit: the top-level `*_return` reached
                 // `done_with_this_frame` with no back-edge.  The return arm
                 // routed through `fbw_terminate_with_finish`, which re-boxed the

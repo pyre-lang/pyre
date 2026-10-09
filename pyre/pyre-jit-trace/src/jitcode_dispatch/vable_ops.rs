@@ -856,8 +856,16 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     // with, or the trace and the optimizer could disagree about the constant;
     // `trace.rs` installs this same `shared()` handle via `set_cpu`.
     let cpu = crate::pyre_cpu::shared();
+    // `_opimpl_getfield_vable` returns `virtualizable_boxes[index]` when
+    // `standard_box is box`.  The jitcode `VableField` descr may lack a
+    // vinfo backref, so `walker_nonstandard_virtualizable` would take
+    // `finish_known_nonstandard` and mark the portal frame nonstandard.
     let (result, shadow_value) = with_replace_frames(ctx, |ctx| {
-        let nonstandard = walker_nonstandard_virtualizable(ctx, pc, obj, &descr)?;
+        let nonstandard = if vable_is_standard_virtualizable(ctx, obj) {
+            false
+        } else {
+            walker_nonstandard_virtualizable(ctx, pc, obj, &descr)?
+        };
         // Seeded virtual callee frame: fold a scalar field through the heapcache
         // `emit_new_pyframe_inline_with_params` and `setfield_vable_*` install
         // under the parent-struct descr (`vable_static_record_descr`). Twin of
@@ -1044,23 +1052,42 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
             _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
         };
         let descr = read_descr(code, op, 2, ctx)?;
-        if let (Some(Value::Int(value)), Some(field_index), Some(shadow)) = (
-            vable_value_concrete(code, op, 1, ctx, value_bank, value),
-            ctx.trace_ctx
-                .virtualizable_info()
-                .and_then(|info| info.static_field_by_descr(&descr)),
-            ctx.frame_state.borrow().callee_shadow.as_ref(),
-        ) {
-            if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
+        let field_index = ctx
+            .trace_ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_by_descr(&descr));
+        let concrete = vable_value_concrete(code, op, 1, ctx, value_bank, value);
+        let shadow_frame = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .map(|shadow| shadow.concrete_frame);
+        if let (Some(Value::Int(int_val)), Some(field_index), Some(frame)) =
+            (concrete, field_index, shadow_frame)
+        {
+            if let Some(frame) = durable_resume_frame(ctx, frame) {
                 fbw_arm_durable_frame_undo(frame);
             }
-            crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, value);
+            crate::state::store_live_frame_static_int(frame, field_index, int_val);
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setarrayitem_vable`: only the standard virtualizable
         // folds the write away. `_opimpl_setfield_vable` records `SETFIELD_GC`
         // for any other box.
         if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+            // `_opimpl_setfield_vable` always writes
+            // `virtualizable_boxes[index] = valuebox` (`pyjitpl.py`).  The
+            // live-frame store is the heap half; without this box write a
+            // later `getfield_vable` (the shared `dispatch_bytecode`
+            // `last_instr` / `debugdata` block) reads a stale slot.
+            if let (Some(field_index), Some(concrete)) = (field_index, concrete)
+                && ctx.trace_ctx.virtualizable_box_at(field_index).is_some()
+            {
+                ctx.trace_ctx
+                    .set_virtualizable_entry_at(field_index, value, concrete);
+                ctx.trace_ctx.synchronize_virtualizable_at(field_index);
+            }
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
@@ -1110,6 +1137,29 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Whether `vable` is the standard virtualizable identity, by Box or by
+/// the concrete frame pointer `virtualizable_boxes[-1]` carries.
+///
+/// `_nonstandard_virtualizable` compares Box identity first
+/// (`pyjitpl.py`); a portal frame register that is a copy of that
+/// identity still names the same object, and the `dispatch_bytecode`
+/// `last_instr` store has to see it.
+fn vable_is_standard_virtualizable<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    vable: OpRef,
+) -> bool {
+    if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+        return true;
+    }
+    let Some(std_ptr) = ctx.trace_ctx.standard_virtualizable_ptr() else {
+        return false;
+    };
+    matches!(
+        ctx.trace_ctx.lookup_opref_concrete(vable),
+        Some(Value::Ref(ptr)) if ptr.as_usize() == std_ptr
+    )
+}
+
 /// `setfield_vable_i_imm/rdd`: `_opimpl_setfield_vable` with a u16 immediate
 /// instead of an int register. Same standard-vable box update, no recorded
 /// op (`pyjitpl.py` `_opimpl_setfield_vable`).
@@ -1122,24 +1172,45 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let descr = read_descr(code, op, 3, ctx)?;
-        if let (Some(field_index), Some(shadow)) = (
-            ctx.trace_ctx
-                .virtualizable_info()
-                .and_then(|info| info.static_field_by_descr(&descr)),
-            ctx.frame_state.borrow().callee_shadow.as_ref(),
-        ) {
-            if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
-                fbw_arm_durable_frame_undo(frame);
+        let field_index = ctx
+            .trace_ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_by_descr(&descr));
+        let shadow_frame = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .map(|shadow| shadow.concrete_frame);
+        if let (Some(field_index), Some(frame)) = (field_index, shadow_frame) {
+            if frame != 0 {
+                if let Some(frame) = durable_resume_frame(ctx, frame) {
+                    fbw_arm_durable_frame_undo(frame);
+                }
+                crate::state::store_live_frame_static_int(frame, field_index, imm);
             }
-            crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, imm);
         }
-        let vable = read_ref_reg_raw(code, op, 0, ctx)?;
-        // Same split as `setfield_vable_via_metainterp`: only the standard
-        // virtualizable folds the write away. `_opimpl_setfield_vable` records
-        // `SETFIELD_GC` for any other box.
-        if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+        let obj = read_ref_reg_raw(code, op, 0, ctx)?;
+        let is_std = vable_is_standard_virtualizable(ctx, obj);
+        let has_box =
+            field_index.is_some_and(|index| ctx.trace_ctx.virtualizable_box_at(index).is_some());
+        // Same split as `setfield_vable_via_metainterp`: only the
+        // standard virtualizable folds the write away.
+        // `_opimpl_setfield_vable` always writes
+        // `virtualizable_boxes[index] = valuebox`.
+        if is_std {
+            if let Some(field_index) = field_index
+                && has_box
+            {
+                let imm_box = ctx.trace_ctx.const_int(imm);
+                ctx.trace_ctx
+                    .set_virtualizable_entry_at(field_index, imm_box, Value::Int(imm));
+                ctx.trace_ctx.synchronize_virtualizable_at(field_index);
+            }
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        // Identity mismatch: fall through to `vable_setfield_checked`
+        // (records SETFIELD_GC for a nonstandard box).
     }
     let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     if obj.is_none() {
@@ -1151,6 +1222,34 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
         .trace_ctx
         .virtualizable_info()
         .and_then(|info| info.static_field_by_descr(&descr));
+    let is_std = vable_is_standard_virtualizable(ctx, obj);
+    let has_box =
+        inline_field_index.is_some_and(|index| ctx.trace_ctx.virtualizable_box_at(index).is_some());
+    // Root portal walks have `fold_frame_reg == MAX` (no callee_shadow).
+    // `_opimpl_setfield_vable` still writes `virtualizable_boxes[index]
+    // = valuebox` for the standard virtualizable, including when the
+    // frame register is a copy of `virtualizable_boxes[-1]`.
+    if is_std {
+        if let Some(field_index) = inline_field_index
+            && has_box
+        {
+            let imm_box = ctx.trace_ctx.const_int(imm);
+            ctx.trace_ctx
+                .set_virtualizable_entry_at(field_index, imm_box, Value::Int(imm));
+            ctx.trace_ctx.synchronize_virtualizable_at(field_index);
+        }
+        if let (Some(frame), Some(field_index)) = (
+            current_inline_vable_target(ctx, obj)
+                .or_else(|| ctx.trace_ctx.standard_virtualizable_ptr()),
+            inline_field_index,
+        ) {
+            if let Some(frame) = durable_resume_frame(ctx, frame) {
+                fbw_arm_durable_frame_undo(frame);
+            }
+            crate::state::store_live_frame_static_int(frame, field_index, imm);
+        }
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let write = with_replace_frames(ctx, |ctx| {
         let nonstandard = walker_nonstandard_virtualizable(ctx, op.pc, obj, &descr)?;
         Ok(ctx.trace_ctx.vable_setfield_checked(

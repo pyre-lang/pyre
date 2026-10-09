@@ -250,6 +250,99 @@ fn portal_jit_merge_point_graph_args(
     args
 }
 
+/// Advance a block-head `-live-` that precedes a portal `jit_merge_point`
+/// onto the `-live-` after it.
+///
+/// `jtransform.py Transformer.handle_jit_marker__jit_merge_point` emits
+/// `[op3=-live-, op1=jit_merge_point, op2=-live-]`. op2 is "for
+/// do_recursive_call / guard resume"; `pyjitpl.py
+/// MIFrame.get_list_of_active_boxes` reads `self.pc - SIZE_LIVE_OP`, which
+/// for a guard inside `handle_bytecode` is past the dispatch-top merge
+/// (`interp_jit.py PyFrame.dispatch`). A pyre guard that resumes at op3
+/// lets `blackhole.py BlackholeInterpreter.bhimpl_jit_merge_point` CRN
+/// before the opcode's `last_instr` store.
+///
+/// Pyre materializes the merge's greens in front of the marker: the
+/// debugdata diamond (`get_is_being_profiled`), `int_copy` of `next_instr`,
+/// `promote_greens` (`-live-` + `{kind}_guard_value`), then op3 `-live-`
+/// and the stack writes. Skip that prefix so the sandwich still matches.
+fn portal_merge_prefix_op(opname: &str) -> bool {
+    opname == "live"
+        || opname == "int_copy"
+        || opname == "int_guard_value"
+        || opname == "ref_guard_value"
+        || opname == "getfield_gc_i"
+        || opname == "goto_if_not_ptr_iszero"
+        || opname.starts_with("getfield_vable")
+        || opname.starts_with("setarrayitem_vable")
+        || opname.starts_with("setfield_vable")
+}
+
+fn guard_resume_live_after_portal_merge(code: &[u8], marker: usize) -> usize {
+    let Some(live) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, marker) else {
+        return marker;
+    };
+    if live.opname != "live" {
+        return marker;
+    }
+    let mut pc = live.next_pc;
+    loop {
+        let Some(op) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc) else {
+            return marker;
+        };
+        if op.opname == "jit_merge_point" {
+            let Some(op2) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, op.next_pc) else {
+                return marker;
+            };
+            return if op2.opname == "live" { op2.pc } else { marker };
+        }
+        if !portal_merge_prefix_op(op.opname) {
+            return marker;
+        }
+        if op.next_pc <= pc {
+            return marker;
+        }
+        pc = op.next_pc;
+    }
+}
+
+/// Advance a block-head `-live-` onto op3, the last `-live-` before the
+/// portal `jit_merge_point`.
+///
+/// After-residual resume leaves the blackhole on that word so it replays
+/// the dispatch-top stack materialize writes, then
+/// `bhimpl_jit_merge_point` CRNs. The diamond / `promote_greens` prefix
+/// inserts extra `-live-`s in front of op3; skip them the same way
+/// [`guard_resume_live_after_portal_merge`] skips them to reach op2.
+fn after_residual_live_before_portal_merge(code: &[u8], marker: usize) -> usize {
+    let Some(live) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, marker) else {
+        return marker;
+    };
+    if live.opname != "live" {
+        return marker;
+    }
+    let mut last_live = marker;
+    let mut pc = live.next_pc;
+    loop {
+        let Some(op) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc) else {
+            return marker;
+        };
+        if op.opname == "jit_merge_point" {
+            return last_live;
+        }
+        if !portal_merge_prefix_op(op.opname) {
+            return marker;
+        }
+        if op.opname == "live" {
+            last_live = op.pc;
+        }
+        if op.next_pc <= pc {
+            return marker;
+        }
+        pc = op.next_pc;
+    }
+}
+
 fn frame_blocks_for_offset(code: &CodeObject, next_offset: usize) -> Vec<FrameBlock> {
     if next_offset >= code.instructions.len() {
         return Vec::new();
@@ -9097,9 +9190,10 @@ impl CodeWriter {
         // is the pycode green: `rewrite_op_hint` promote, then either
         // `jit_merge_point` or the dropped `can_enter_jit` argument.
         //
-        // The remaining vable scalar variants (`getfield_vable_i/f`,
-        // `setfield_vable_r/f`) have assembler dispatch arms but no
-        // production emit site today; those arms already require the same
+        // `int_copy` of the instruction-start PC is emitted at the portal
+        // merge for the `next_instr` green. `setfield_vable_r/f` and
+        // `getfield_vable_f` still have assembler dispatch arms but no
+        // production emit site; those arms already require the same
         // canonical `[v_inst, ... descr]` operand shape.
 
         // `pushvalue` (pyframe.py) lowers to
@@ -9770,43 +9864,71 @@ impl CodeWriter {
                         }
                     }
 
-                    // jtransform.py:1708-1712 emits [op3, op1, op2]:
+                    // jtransform.py Transformer.handle_jit_marker__jit_merge_point
+                    // emits [op3, op1, op2]:
                     //   op3 = -live- (for inlined short preambles)
                     //   op1 = jit_merge_point
                     //   op2 = -live- (for do_recursive_call / guard resume)
                     // The per-PC emit_live_placeholder!() after this block
                     // serves as op2; op3 is emitted inside the block below.
                     //
-                    // The loop-header `jit_merge_point` belongs to the block that
-                    // legitimately STARTS at this PC — the one entered via its own
-                    // back-edge / pending-block pop (`flatten.py make_bytecode_block`
-                    // enters a block only via its own links).  Pyre's PC-sequential
-                    // walker can also reach a loop-header PC by sequentially
-                    // advancing off the PC-adjacent predecessor block AFTER that
-                    // predecessor was closed by an unconditional terminator
-                    // (`emit_goto!` / `emit_ref_return!` / `emit_raise!` cleared
-                    // `needs_fallthrough` so `emit_mark_label_pc!` could not switch
-                    // away, and no joinpoint is registered at the loop-header PC yet
-                    // because its back-edge lies at a higher, not-yet-walked PC).
-                    // In that case `current_block` is the terminator-closed
-                    // predecessor, NOT the loop-header block:
-                    //   - a JumpBackward block carrying `loop_header` + `goto`
-                    //     target whose PC-adjacent next PC is a DIFFERENT loop's
-                    //     header (the word-drop bug: the merge lands after the
-                    //     `goto`, so `insert_exits` serialises it BEFORE the goto
-                    //     target and a blackhole guard-resume reaches the
-                    //     `jit_merge_point` first, `ContinueRunningNormally`s at the
-                    //     loop-header PC without the predecessor's state reset →
-                    //     truncated / duplicated output);
-                    //   - an explicit `raise X` block whose fall-through PC is a
-                    //     loop header (merge serialised before the `raise`, dropping
-                    //     the handler).
-                    // In every terminator-closed case the merge belongs to the real
-                    // loop-header block, emitted when that PC is walked through its
-                    // own entry.  Suppress it here on any terminator-closed block —
-                    // the same guard the op-dispatch `block_closed_by_terminator`
-                    // gate applies below.  Computed once here and reused at that
-                    // gate.
+                    // interp_jit.py PyFrame.dispatch calls jit_merge_point at
+                    // every bytecode boundary, then handle_bytecode.
+                    // can_enter_jit / loop_header stay on the back edge
+                    // (jump_absolute). A true-portal merge at every
+                    // instruction-start PC is that dispatch-top merge:
+                    // after a guard fail, blackhole.py
+                    // BlackholeInterpreter.bhimpl_jit_merge_point CRNs at
+                    // the next merge the outermost blackhole frame
+                    // reaches. Trivia units are not dispatch iterations
+                    // (skip_python_trivia_forward); blackhole steps them
+                    // as no-ops onto the next real opcode.
+                    // merge_entry_by_green stays function entry plus loop
+                    // headers, so traces still start there. A body merge
+                    // only records debug_merge_point unless
+                    // seen_loop_header_for_jdindex is set
+                    // (pyjitpl.py MIFrame.opimpl_jit_merge_point).
+                    //
+                    // Guard resume must land on op2. pyjitpl.py
+                    // MIFrame.get_list_of_active_boxes reads
+                    // `self.pc - SIZE_LIVE_OP`, which for a guard inside
+                    // handle_bytecode is past the dispatch-top merge.
+                    // Resuming at op3 lets the blackhole CRN before this
+                    // opcode's last_instr store.
+                    //
+                    // The merge belongs to the block that legitimately
+                    // STARTS at this PC — the one entered via its own
+                    // back-edge / pending-block pop (`flatten.py
+                    // make_bytecode_block` enters a block only via its
+                    // own links).  Pyre's PC-sequential walker can also
+                    // reach a PC by sequentially advancing off the
+                    // PC-adjacent predecessor block AFTER that predecessor
+                    // was closed by an unconditional terminator
+                    // (`emit_goto!` / `emit_ref_return!` / `emit_raise!`
+                    // cleared `needs_fallthrough` so `emit_mark_label_pc!`
+                    // could not switch away, and no joinpoint is registered
+                    // at the PC yet because its back-edge lies at a higher,
+                    // not-yet-walked PC).  In that case `current_block` is
+                    // the terminator-closed predecessor, NOT the target
+                    // block:
+                    //   - a JumpBackward block carrying `loop_header` +
+                    //     `goto` whose PC-adjacent next PC is a DIFFERENT
+                    //     loop's header (the word-drop bug: the merge lands
+                    //     after the `goto`, so `insert_exits` serialises it
+                    //     BEFORE the goto target and a blackhole
+                    //     guard-resume reaches the `jit_merge_point` first,
+                    //     `ContinueRunningNormally`s at the loop-header PC
+                    //     without the predecessor's state reset → truncated
+                    //     / duplicated output);
+                    //   - an explicit `raise X` block whose fall-through
+                    //     PC is a loop header (merge serialised before the
+                    //     `raise`, dropping the handler).
+                    // In every terminator-closed case the merge belongs to
+                    // the real block, emitted when that PC is walked
+                    // through its own entry.  Suppress it here on any
+                    // terminator-closed block — the same guard the
+                    // op-dispatch `block_closed_by_terminator` gate applies
+                    // below.  Computed once here and reused at that gate.
                     let block_closed_by_terminator = {
                         let block_rc = current_block.block();
                         let block = block_rc.borrow();
@@ -9995,11 +10117,10 @@ impl CodeWriter {
                     // loop headers behind an unsupported opcode.
                     //
                     // Reuses `block_closed_by_terminator` computed above the
-                    // loop-header `jit_merge_point` gate. The debugdata
-                    // diamond closes the header and switches
-                    // `current_block` to the join, which has no exits, so
-                    // the cached `false` still matches the block opcode
-                    // dispatch writes into.
+                    // per-opcode `jit_merge_point` gate. The debugdata diamond
+                    // closes the block and switches `current_block` to the
+                    // join, which has no exits, so the cached `false` still
+                    // matches the block opcode dispatch writes into.
                     if block_closed_by_terminator {
                         current_state.next_offset = py_pc + 1;
                         current_state.blocklist =
@@ -10091,6 +10212,7 @@ impl CodeWriter {
                             }
                             needs_fallthrough = true;
                         }
+                        needs_fallthrough = true;
                     }
 
                     // Snapshot the entry stack for `emit_abort_permanent!`.  The
@@ -16988,12 +17110,23 @@ impl CodeWriter {
                 result_color_trivia_pred_by_jit_pc.push((pos, result_color_trivia));
             }
             // Marker tier: exact-match, block-head precedence.
+            //
+            // `jtransform.py Transformer.handle_jit_marker__jit_merge_point`
+            // op2 is "for do_recursive_call / guard resume". A portal
+            // `[op3=-live-, op1=jit_merge_point, op2=-live-]` would otherwise
+            // resolve to op3 (nearest live at-or-before the merge, which
+            // `pc_first_insn_pos` records as the first non-live). Resuming
+            // there lets `blackhole.py BlackholeInterpreter.bhimpl_jit_merge_point`
+            // CRN before the opcode's `last_instr` store. Advance onto op2.
+            // `merge_entry_by_green` keeps the unwrapped marker so traces
+            // still start at op3 and record the header merge.
             for &(off, py) in &block_head_py_by_jit_pc {
                 let skipped_py =
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
                 let marker = first_jit_pc_by_py_pc
                     .get(skipped_py)
-                    .and_then(|_| resolve_marker(skipped_py));
+                    .and_then(|_| resolve_marker(skipped_py))
+                    .map(|m| guard_resume_live_after_portal_merge(jitcode.code.as_slice(), m));
                 resume_marker_marker_by_jit_pc.push((off, marker));
             }
             resume_marker_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
@@ -17005,19 +17138,31 @@ impl CodeWriter {
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
                 let marker = first_jit_pc_by_py_pc
                     .get(skipped_py)
-                    .and_then(|_| resolve_marker(skipped_py));
+                    .and_then(|_| resolve_marker(skipped_py))
+                    .map(|m| guard_resume_live_after_portal_merge(jitcode.code.as_slice(), m));
                 resume_marker_pred_by_jit_pc.push((pos, marker));
             }
             // Marker tier: exact-match, block-head precedence. Compose the
             // runtime after-residual path's trivia skip and semantic
             // fallthrough before resolving the resume marker.
+            //
+            // Fallthrough's first insn is the portal merge sandwich.
+            // `resolve_marker(ft)` is the first `-live-` of that PC, which
+            // is now the diamond's terminator `-live-`. Advance onto op3,
+            // the last `-live-` before `jit_merge_point`: blackhole
+            // replays the dispatch-top stack materialize writes, then
+            // `bhimpl_jit_merge_point` CRNs with a complete frame.
+            // `ContinueRunningNormally` already carries `next_instr` as a
+            // green, so the portal runner publishes `last_instr` without
+            // needing op2.
             for &(off, py) in &block_head_py_by_jit_pc {
                 let sk =
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
                 let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
                 let value = first_jit_pc_by_py_pc
                     .get(ft)
-                    .and_then(|_| resolve_marker(ft));
+                    .and_then(|_| resolve_marker(ft))
+                    .map(|m| after_residual_live_before_portal_merge(jitcode.code.as_slice(), m));
                 after_residual_marker_marker_by_jit_pc.push((off, value));
                 // The retired runtime read took the fallthrough of the RAW
                 // block-head py (no trivia skip); match it exactly so the twin
@@ -17043,7 +17188,10 @@ impl CodeWriter {
                     let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
                     let value = first_jit_pc_by_py_pc
                         .get(ft)
-                        .and_then(|_| resolve_marker(ft));
+                        .and_then(|_| resolve_marker(ft))
+                        .map(|m| {
+                            after_residual_live_before_portal_merge(jitcode.code.as_slice(), m)
+                        });
                     after_residual_marker_pred_by_jit_pc.push((pos, value));
                     let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py);
                     result_color_after_residual_pred_by_jit_pc
@@ -17749,6 +17897,44 @@ mod tests {
             .expect("expected nested function code object")
     }
 
+    fn function_code_named(source: &str, name: &str) -> CodeObject {
+        fn walk(code: &CodeObject, name: &str) -> Option<CodeObject> {
+            if code.obj_name.as_str() == name {
+                return Some(code.clone());
+            }
+            code.constants.iter().find_map(|constant| match constant {
+                ConstantData::Code { code } => walk(code, name),
+                _ => None,
+            })
+        }
+        let module = compile_exec(source).expect("compile failed");
+        walk(&module, name).unwrap_or_else(|| panic!("expected code object {name}"))
+    }
+
+    fn assemble_portal(code: &CodeObject) -> std::sync::Arc<PyJitCode> {
+        let w_code = pyre_interpreter::box_code_constant(code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let code = unsafe { &*code_ptr };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} with {} units must assemble",
+                    code.obj_name,
+                    code.instructions.len()
+                )
+            })
+    }
+
     #[test]
     fn drained_callee_jump_backward_emits_loop_header() {
         // `interp_jit.py` `jump_absolute` / `can_enter_jit` is on every
@@ -17954,9 +18140,14 @@ mod tests {
             "catch_exception must be adjacent to the FOR_ITER residual call"
         );
 
+        // Instruction-start `we_are_jitted` emits `ptr_nonzero` on `debugdata`
+        // before the opcode body.  FOR_ITER's exhaustion split is the one
+        // after its StopIteration catch.
         let ptr_nonzero_index = ops
             .iter()
-            .position(|op| op.key == "ptr_nonzero/r>i")
+            .enumerate()
+            .skip(catch_index + 1)
+            .find_map(|(index, op)| (op.key == "ptr_nonzero/r>i").then_some(index))
             .expect("FOR_ITER must retain its existing exhaustion split");
         let last_exc_value_index = ops
             .iter()

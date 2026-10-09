@@ -1272,6 +1272,11 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRe
 /// The test is `loop_header`, not `jit_merge_point`: the merge point marks the
 /// portal's dispatch entry (`interp_jit.py PyFrame.dispatch`), while the
 /// back-edge is `can_enter_jit` (`interp_jit.py PyFrame.jump_absolute`).
+/// After the per-instruction portal merge, every Python function body has a
+/// `jit_merge_point` at each opcode, which would make this predicate true for
+/// every inlinable callee and residualize `synth/name_bound_super_attr`'s
+/// `Child.val`. The nested merge protocol stamps `seen_loop_header` only at
+/// the back-edge.
 pub(crate) fn callee_body_owns_loop_header(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
     decoded_ops_on_fresh_frame(body_code, descr_refs)
         .is_some_and(|ops| ops.iter().any(|op| op.opname == "loop_header"))
@@ -3669,6 +3674,20 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     }
     let sym = unsafe { &*sym_ptr };
     let caller_frame = sym.frame();
+    // `_opimpl_recursive_call` (`pyjitpl.py`): once `can_inline_callable` is
+    // false — `dont_trace_here` at `max_unroll_recursion`, or a prior
+    // disable — the fall-through is `assembler_call = True` with no further
+    // screens. The inline path stamps that flag before returning `Ok(None)`,
+    // so this fold is that fall-through. Builder checks below still apply.
+    let assembler_call_fallthrough = crate::driver::try_driver_pair().is_some_and(|pair| {
+        let callee_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
+        !pair
+            .0
+            .meta_interp()
+            .warm_state_ref_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
+            .expect("pypyjit warmstate")
+            .can_inline_callable_for_key(&callee_key)
+    });
     // A CALL_ASSEMBLER raising inside a `try` body must route its
     // GUARD_NO_EXCEPTION deopt into the handler, and this fold cannot encode
     // that resume in its snapshot.  Ask whether THIS call site is protected
@@ -3677,7 +3696,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // every generator outright — 3.14 wraps each generator body in a
     // whole-body entry, so a `while` loop in a generator that calls nothing
     // protected was declining on a handler it can never reach.
-    if call_site_inside_protected_region(sym, op.pc) {
+    if !assembler_call_fallthrough && call_site_inside_protected_region(sym, op.pc) {
         if p2_diag_enabled() {
             eprintln!("[p2-ca] decline pc={} reason=call-inside-try", op.pc);
         }
@@ -3705,7 +3724,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // control reaches the fall-through it emits unconditionally.  Without the
     // screen an arbitrary foreign call (e.g. a CALL_KW-bearing leaf) would fold
     // to CALL_ASSEMBLER, building and entering a frame the callee's own loop
-    // was never traced against.
+    // was never traced against.  The fall-through above skips it.
     if w_code as usize != caller_code as usize {
         let admit_mutual = ctx
             .session
@@ -3713,7 +3732,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             .framestack
             .iter()
             .any(|f| f.w_code == w_code as usize);
-        if !admit_mutual && !foreign_callee_admits_call_assembler(w_code) {
+        if !admit_mutual
+            && !assembler_call_fallthrough
+            && !foreign_callee_admits_call_assembler(w_code)
+        {
             if p2_diag_enabled() {
                 eprintln!("[p2-ca] decline pc={} reason=not-self-nor-mutual", op.pc);
             }
@@ -3744,7 +3766,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             .framestack
             .iter()
             .any(|f| f.w_code == w_code as usize);
-    if recursive_callee && ctx.vstack_valid {
+    if !assembler_call_fallthrough && recursive_callee && ctx.vstack_valid {
         let kept_below = ctx
             .frame_state
             .borrow()
@@ -9455,33 +9477,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return resolved_inline_decline(op.pc, line!());
     }
-    // Inlining a self-recursive callee into a foreign caller (the
-    // module `for` around `walk(...)`) starts a sub-walk whose
-    // nested recursive CALL residualizes and then hits
-    // `fbw_abort_nested_unjournaled_residual`'s self-recursive
-    // hazard, aborting the enclosing loop
-    // (`selfrec_bridge_nontail_promote`).  Same-function unroll
-    // (`fib`) and the root-bridge admission keep the inline.
-    if !bridge_rec_root_selfrec && !recursive_portal_present {
-        let raw = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
-        if !raw.is_null() && unsafe { pyre_interpreter::code_is_self_recursive(&*raw) } {
-            let root_code = {
-                let session = ctx.session.borrow();
-                let frame = session.recording_frame_ptr as *const pyre_interpreter::PyFrame;
-                if frame.is_null() {
-                    0
-                } else {
-                    unsafe { (*frame).pycode as usize }
-                }
-            };
-            if root_code != 0 && root_code != callee_code_key {
-                return resolved_inline_decline(op.pc, line!());
-            }
-        }
-    }
+    // `_opimpl_recursive_call` `perform_call`s from any caller. A
+    // self-recursive callee inlined into a foreign root (the module `for`
+    // around `fib(i)`, `step(8)` from a `while`) is that call. The nested
+    // CALL hits the unroll bound and falls through to CALL_ASSEMBLER
+    // (`assembler_call = True`); it does not residualize as `call_fn`.
     // An unseeded inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary and replays the whole callee, so a live-heap write
     // would execute twice.  A seeded callee frame answers that hazard exactly:
