@@ -8,7 +8,8 @@
 //! [`crate::deadframe::JitFrameDeadFrame`] is
 //! ownership: these frames come from [`crate::jitframe::alloc_off_gc_jitframe`]
 //! instead of the nursery, so they never move, take no root slot, and this
-//! value's `Drop` frees the whole `jf_forward` chain it was handed.
+//! value's `Drop` releases each off-GC host link of the `jf_forward`
+//! chain it was handed.
 use parking_lot::RwLock;
 use std::sync::OnceLock;
 
@@ -37,7 +38,7 @@ pub struct LibcJitFrameDeadFrame {
     /// The frame compiled code returned — the tip of `head`'s `jf_forward`
     /// chain whenever `_check_frame_depth` reallocated on the way.
     tip: *mut JitFrame,
-    /// Head of the chain this deadframe OWNS and frees on drop, or `None`
+    /// Head of the chain this deadframe OWNS and releases on drop, or `None`
     /// when the frames belong to somebody else. `Backend::force` mints a
     /// deadframe over the frame of a compiled run that is still executing
     /// (`llmodel.py force` likewise returns that frame rather than a
@@ -74,10 +75,11 @@ impl LibcJitFrameDeadFrame {
     /// deadframe.
     ///
     /// # Safety
-    /// `head` must be a live chain of `register_libc_jitframe`-tracked frames
-    /// that no one else frees, `tip` must be a node of that chain, and the
-    /// compiled epilogue must already have popped every node off the JF shadow
-    /// stack.
+    /// `head` is a live `jf_forward` chain this value owns. Off-GC host
+    /// links are `register_libc_jitframe`-tracked and no one else frees
+    /// them; GC links stay for the collector. `tip` is a node of that
+    /// chain, and the compiled epilogue has already popped every host
+    /// node off the JF shadow stack.
     pub unsafe fn owning(
         head: *mut JitFrame,
         tip: *mut JitFrame,
@@ -199,30 +201,30 @@ impl LibcJitFrameDeadFrame {
     }
 }
 
-/// Free a libc-allocated jitframe and every frame it forwards to.
+/// Walk `jf_forward` (`jitframe.py` `jitframe_resolve`) and release each
+/// off-GC host block. `llmodel.py` `jitframe_allocate` is
+/// `lltype.malloc(JITFRAME)` — a GC object never freed explicitly — so a
+/// GC link is left for the collector. `malloc_jitframe_no_collect` may mint
+/// that replacement onto a host head (`llmodel.py` `realloc_frame` stores
+/// `frame.jf_forward = new_frame`).
 ///
-/// Freeing a jitframe has no upstream counterpart at all: upstream's JITFRAME
-/// is a GcStruct, so a dead frame is simply collected. Frames allocated off the
-/// GC heap have to be released by hand instead, and there can be more than one
-/// of them: when `_check_frame_depth`'s realloc slowpath fires, the outgrown
-/// frame's `jf_forward` links to its replacement, and every node in that chain
-/// was `register_libc_jitframe`'d. Walk the chain the way
-/// `jitframe.py jitframe_resolve` walks it — read `jf_forward` before
-/// freeing each node — so every frame is unregistered and freed exactly once.
-/// In the common no-realloc case the chain is one node.
+/// Host vs GC is [`crate::jitframe::jitframe_is_off_gc_host`]: the mimic
+/// header word equals [`majit_gc::header::OFF_GC_HOST_MARKER`], not a
+/// zero word (`GcHeader::new(0)` is also zero). Host bookkeeping is
+/// [`crate::jitframe::release_malloc_host_jitframe`] inside
+/// [`crate::jitframe::free_host_jitframe`].
 ///
 /// # Safety
-/// `head` must be a live chain of `register_libc_jitframe`-tracked frames that
-/// no one else frees, and the compiled epilogue must already have popped every
-/// chain frame off the JF shadow stack (`gen_footer_shadowstack`) before this
-/// runs, so no freed frame is still a GC root.
+/// `head` is a live `jf_forward` chain. Off-GC host links must not still
+/// be a GC root (`gen_footer_shadowstack` has popped them). GC links stay
+/// reachable for the collector.
 pub unsafe fn free_jitframe_chain(head: *mut JitFrame) {
     let mut cur = head;
     while !cur.is_null() {
         let next = unsafe { (*cur).jf_forward };
-        crate::jitframe::release_malloc_host_jitframe(cur);
-        // Frees the block base, which sits one header word behind `cur`.
-        unsafe { crate::jitframe::free_off_gc_jitframe(cur) };
+        if unsafe { crate::jitframe::jitframe_is_off_gc_host(cur) } {
+            unsafe { crate::jitframe::free_host_jitframe(cur) };
+        }
         cur = next;
     }
 }
@@ -324,5 +326,67 @@ mod tests {
         assert_eq!(frame.slot_of(43), None);
         assert_eq!(frame.slot_of(44), Some(28));
         assert_eq!(frame.slot_of(45), None);
+    }
+
+    /// A host head forwarded (`jf_forward`) to a type-id-0 non-host
+    /// JITFRAME must free only the host link. The non-host payload lives
+    /// in this test's buffer: `GcHeader::new(0)` is word 0, which used to
+    /// look like an off-GC mimic header, and the size-slot poison makes
+    /// `free_off_gc_jitframe` panic (`Layout`) or park this buffer as a
+    /// host block.
+    #[test]
+    fn free_jitframe_chain_releases_host_and_leaves_non_host_forward() {
+        use crate::jitframe::{JitFrameInfo, jitframe_is_off_gc_host, malloc_host_jitframe};
+
+        let depth = 4;
+        let bytes = JitFrame::alloc_size(depth);
+        let prefix = 2 * majit_gc::header::GcHeader::SIZE;
+        let word_count = prefix.saturating_add(bytes).div_ceil(8);
+        let mut buf = vec![0u64; word_count];
+        buf[0] = u64::MAX;
+        buf[1] = majit_gc::header::GcHeader::new(0).tid_and_flags;
+
+        let gc_frame = unsafe { (buf.as_mut_ptr() as *mut u8).add(prefix) as *mut JitFrame };
+        let host = malloc_host_jitframe(bytes);
+        let info = JitFrameInfo::default();
+        unsafe {
+            JitFrame::init(host, &info, depth);
+            JitFrame::init(gc_frame, &info, depth);
+            *JitFrame::slot_ptr(gc_frame, 0) = 0x11C0_FFEE;
+            (*host).jf_forward = gc_frame;
+            assert!(jitframe_is_off_gc_host(host));
+            assert!(
+                !jitframe_is_off_gc_host(gc_frame),
+                "a type-id-0 header must not be classified as a host block"
+            );
+            majit_gc::shadow_stack::register_libc_jitframe(host as usize);
+            super::free_jitframe_chain(host);
+            // A buggy walk parks this buffer (size-slot `u64::MAX`) as a
+            // host block; the next host malloc then returns `gc_frame`.
+            let recycled = malloc_host_jitframe(JitFrame::alloc_size(1));
+            assert!(
+                recycled != gc_frame,
+                "non-host forward link was released as a host block"
+            );
+            crate::jitframe::free_host_jitframe(recycled);
+            #[cfg(not(debug_assertions))]
+            assert!(
+                !majit_gc::shadow_stack::is_libc_jitframe(host as usize),
+                "host frame must have been released by free_host_jitframe"
+            );
+            majit_gc::shadow_stack::unregister_libc_jitframe(host as usize);
+            assert_eq!(
+                buf[0],
+                u64::MAX,
+                "non-host size-slot poison must be untouched"
+            );
+            assert_eq!(
+                (*majit_gc::header::header_of(gc_frame as usize)).tid_and_flags,
+                0
+            );
+            assert_eq!(*JitFrame::slot_ptr(gc_frame, 0), 0x11C0_FFEE);
+            assert!((*gc_frame).jf_forward.is_null());
+            assert!(!jitframe_is_off_gc_host(gc_frame));
+        }
     }
 }

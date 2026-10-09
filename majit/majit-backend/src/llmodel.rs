@@ -22,8 +22,8 @@ use majit_gc::shadow_stack::OwnerRootGuard;
 use majit_ir::{FailDescr, GcRef};
 
 use crate::jitframe::{
-    FIRST_ITEM_OFFSET, JitFrame, JitframeDescrFacts, free_host_jitframe, jitframe_is_off_gc_host,
-    malloc_gc_jitframe, malloc_host_jitframe, reuse_off_gc_jitframe,
+    FIRST_ITEM_OFFSET, JitFrame, JitframeDescrFacts, malloc_gc_jitframe, malloc_host_jitframe,
+    reuse_off_gc_jitframe,
 };
 
 /// llmodel.py — get_latest_descr.
@@ -544,22 +544,10 @@ pub fn park_or_free_done_entry_frame(
     unsafe { free_off_gc_host_done_entry_chain(head) };
 }
 
-/// Walk `jf_forward` (`jitframe.py jitframe_resolve`) and release each
-/// off-GC host block. `malloc_jitframe_no_collect` may mint a GC
-/// replacement onto a host head; that link is left for the collector.
-///
-/// Host vs GC is [`crate::jitframe::jitframe_is_off_gc_host`]: the mimic
-/// header word equals [`majit_gc::header::OFF_GC_HOST_MARKER`], not a
-/// zero word (`GcHeader::new(0)` is also zero).
+/// Same walk as [`crate::libc_deadframe::free_jitframe_chain`]: host
+/// links only. `park_or_free_done_entry_frame` is the done-entry caller.
 unsafe fn free_off_gc_host_done_entry_chain(head: *mut JitFrame) {
-    let mut cur = head;
-    while !cur.is_null() {
-        let next = unsafe { (*cur).jf_forward };
-        if unsafe { jitframe_is_off_gc_host(cur) } {
-            unsafe { free_host_jitframe(cur) };
-        }
-        cur = next;
-    }
+    unsafe { crate::libc_deadframe::free_jitframe_chain(head) };
 }
 
 /// Slot 0 of a `DoneWithThisFrameDescrInt` frame. `get_int_value(deadframe, 0)`.
