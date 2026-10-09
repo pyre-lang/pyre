@@ -636,11 +636,6 @@ pub(crate) struct StoredExitLayout {
     pub(crate) source_op_index: Option<usize>,
     pub(crate) recovery_layout: Option<std::sync::Arc<ExitRecoveryLayout>>,
     pub(crate) resume_layout: Option<std::sync::Arc<ResumeLayoutSummary>>,
-    /// compile.py `ResumeGuardDescr` storage — single guard-owned
-    /// shared pool containing rd_numb / rd_consts / rd_virtuals /
-    /// rd_pendingfields. All readers (blackhole resume, bridge
-    /// retrace, GC root walker) share this Arc.
-    pub(crate) storage: Option<Arc<ResumeStorage>>,
     /// Source-op `descr` Arc, captured at trace-build time. Production
     /// guards / FINISH carry their `ResumeGuardDescr` /
     /// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescrRef`
@@ -686,7 +681,14 @@ impl StoredExitLayout {
             is_exception_exit: self.resolve_is_exception_exit(),
             recovery_layout: self.recovery_layout.clone(),
             resume_layout: self.resume_layout.clone(),
-            storage: self.storage.clone(),
+            // `ResumeGuardDescr.get_resumestorage()`: the `rd_*` payload is
+            // the descr's own; this record only names the descr.
+            storage: self
+                .descr
+                .as_ref()
+                .and_then(|descr| descr.as_fail_descr())
+                .and_then(ResumeStorage::from_fail_descr)
+                .map(Arc::new),
         }
     }
 
@@ -3562,12 +3564,6 @@ impl<M: Clone> MetaInterp<M> {
             for entry in self.compiled_loops.values_mut() {
                 for trace in entry.traces.values_mut() {
                     for layout in trace.exit_layouts.values_mut() {
-                        visit_pool(
-                            layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                            generation,
-                            is_minor,
-                            &mut visitor,
-                        );
                         let descr_pool = layout
                             .descr
                             .as_ref()
@@ -3576,12 +3572,6 @@ impl<M: Clone> MetaInterp<M> {
                         visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
                     }
                     for layout in trace.terminal_exit_layouts.values_mut() {
-                        visit_pool(
-                            layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                            generation,
-                            is_minor,
-                            &mut visitor,
-                        );
                         let descr_pool = layout
                             .descr
                             .as_ref()
@@ -13651,18 +13641,13 @@ impl<M: Clone> MetaInterp<M> {
                         || trace_layout_ref.and_then(|layout| layout.recovery_layout.clone()),
                     ),
                     resume_layout: resume_layout.map(std::sync::Arc::new),
-                    // A bridge guard has no frontend record
-                    // (`send_bridge_to_backend`); its pool is the descr's
-                    // own (`ResumeGuardDescr.get_resumestorage`).
-                    storage: trace_layout_ref
-                        .and_then(|layout| layout.storage.clone())
-                        .or_else(|| {
-                            result
-                                .descr_arc
-                                .as_fail_descr()
-                                .and_then(crate::resume::ResumeStorage::from_fail_descr)
-                                .map(Arc::new)
-                        }),
+                    // `ResumeGuardDescr.get_resumestorage()`: the pool is the
+                    // failing descr's own.
+                    storage: result
+                        .descr_arc
+                        .as_fail_descr()
+                        .and_then(crate::resume::ResumeStorage::from_fail_descr)
+                        .map(Arc::new),
                 }
             })
             .or(trace_layout)
@@ -30308,12 +30293,11 @@ mod tests {
     fn compiled_graph_root_walk_consumes_its_aggregate_minor_barrier() {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
-        let storage = crate::resume::ResumeStorage::new(
-            Vec::new(),
-            vec![majit_ir::Const::Ref(GcRef(0x1000))],
-            Vec::new(),
-            Vec::new(),
-        );
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+        descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .set_rd_consts(Some(vec![majit_ir::Const::Ref(GcRef(0x1000))]));
         let mut exit_layouts = crate::FxIndexMap::default();
         exit_layouts.insert(
             0,
@@ -30321,8 +30305,7 @@ mod tests {
                 source_op_index: None,
                 recovery_layout: None,
                 resume_layout: None,
-                storage: Some(storage.clone()),
-                descr: None,
+                descr: Some(descr.clone()),
                 op_arg_types_for_jump: None,
             },
         );
@@ -30367,7 +30350,11 @@ mod tests {
         });
         assert_eq!(seen, 1);
         assert!(matches!(
-            storage.rd_consts()[0],
+            descr
+                .as_fail_descr()
+                .expect("resume guard")
+                .rd_consts_arc()
+                .expect("pool")[0],
             majit_ir::Const::Ref(GcRef(0x2000))
         ));
         meta.walk_rd_consts_refs(|_| seen += 1);
@@ -30992,19 +30979,22 @@ mod tests {
                 source_op_index: Some(0),
                 recovery_layout: None,
                 resume_layout: None,
-                storage: Some(crate::resume::ResumeStorage::new(
-                    rd_numb,
-                    vec![],
-                    vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawBufferInfo {
-                        func: 77,
-                        size: 0,
-                        offsets: vec![],
-                        descrs: vec![],
-                        fieldnums: vec![],
-                    })],
-                    vec![],
-                )),
-                descr: Some(crate::compile::make_fail_descr_typed(vec![])),
+                descr: Some({
+                    let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+                    let fd = descr.as_fail_descr().expect("resume guard");
+                    fd.set_rd_numb(Some(rd_numb));
+                    fd.set_rd_consts(Some(vec![]));
+                    fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
+                        majit_ir::RdVirtualInfo::VRawBufferInfo {
+                            func: 77,
+                            size: 0,
+                            offsets: vec![],
+                            descrs: vec![],
+                            fieldnums: vec![],
+                        },
+                    )]));
+                    descr
+                }),
                 op_arg_types_for_jump: None,
             },
         );
@@ -31431,9 +31421,11 @@ mod tests {
                 fail_index,
                 layout.source_op_index,
                 layout
-                    .storage
+                    .descr
                     .as_ref()
-                    .map(|storage| storage.rd_numb.clone()),
+                    .and_then(|descr| descr.as_fail_descr())
+                    .and_then(|fd| fd.rd_numb_arc())
+                    .map(|numb| numb.as_ref().to_vec()),
                 layout.resolve_exit_types().to_vec(),
             )
         };
@@ -31476,7 +31468,7 @@ mod tests {
                 .exit_layout
                 .storage
                 .as_ref()
-                .map(|storage| storage.rd_numb.clone()),
+                .map(|storage| storage.rd_numb.to_vec()),
             expected_rd_numb
         );
         assert_eq!(
@@ -34699,19 +34691,22 @@ mod loop_side_table_tests {
                 source_op_index: Some(0),
                 recovery_layout: None,
                 resume_layout: None,
-                storage: Some(crate::resume::ResumeStorage::new(
-                    rd_numb,
-                    vec![],
-                    vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawBufferInfo {
-                        func: 77,
-                        size: 0,
-                        offsets: vec![],
-                        descrs: vec![],
-                        fieldnums: vec![],
-                    })],
-                    vec![],
-                )),
-                descr: Some(crate::compile::make_fail_descr_typed(vec![])),
+                descr: Some({
+                    let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+                    let fd = descr.as_fail_descr().expect("resume guard");
+                    fd.set_rd_numb(Some(rd_numb));
+                    fd.set_rd_consts(Some(vec![]));
+                    fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
+                        majit_ir::RdVirtualInfo::VRawBufferInfo {
+                            func: 77,
+                            size: 0,
+                            offsets: vec![],
+                            descrs: vec![],
+                            fieldnums: vec![],
+                        },
+                    )]));
+                    descr
+                }),
                 op_arg_types_for_jump: None,
             },
         );

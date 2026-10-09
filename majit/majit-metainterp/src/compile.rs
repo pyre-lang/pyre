@@ -930,8 +930,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
         } else {
             None
         };
-        let resume_layout;
-        let storage = if is_guard {
+        let resume_layout = if is_guard {
             // store_final_boxes / ResumeGuardDescr: when rd_numb is present,
             // fail_args are liveboxes only. Project the frontend
             // ResumeLayoutSummary from that stream so TAGCONST/TAGINT slots
@@ -964,32 +963,13 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
             // One Arc; `enrich_guard_resume_layouts_for_trace` make_muts
             // it. Cloning the summary here minted a second frame_pcs /
             // slot_sources / slot_layouts heap per guard.
-            resume_layout = Some(std::sync::Arc::new(layout));
-            // compile.py `ResumeGuardDescr` storage — build the shared
-            // Arc once from the guard op's `rd_*` fields so every reader
-            // (StoredExitLayout, bridge retrace, blackhole resume, GC
-            // root walker) observes the same pool.  Resolve through
-            // descr.prev (`resolved_rd_*` chases the copied-descr chain)
-            // so a sharing-path guard's ResumeStorage points at the same
-            // byte stream the donor was built from (RPython compile.py:832
-            // ResumeGuardCopiedDescr).
-            let storage_for_guard = op.resolved_rd_numb().map(|numb| {
-                crate::resume::ResumeStorage::with_shared_consts(
-                    numb,
-                    op.resolved_rd_consts()
-                        .unwrap_or_else(|| majit_ir::SharedConstPool::new(Vec::new())),
-                    op.resolved_rd_virtuals(),
-                    op.resolved_rd_pendingfields(),
-                )
-            });
-            storage_for_guard
+            Some(std::sync::Arc::new(layout))
         } else {
-            resume_layout = None;
             None
         };
 
-        // rd_* values are now carried inside `storage` (an
-        // `Arc<ResumeStorage>` installed above). They still feed into
+        // The `rd_*` payload stays on the guard's descr
+        // (`ResumeGuardDescr.get_resumestorage`); it feeds into
         // `recovery_layout` below via the guard op's rd_numb / rd_consts.
         // Sharing-path guards (mod.rs::sharing-guard) own a
         // ResumeGuardCopiedDescr whose `prev` points at the donor;
@@ -1351,7 +1331,6 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
                 source_op_index: Some(op_idx),
                 recovery_layout: recovery_layout.map(std::sync::Arc::new),
                 resume_layout,
-                storage,
                 descr: op.getdescr(),
                 op_arg_types_for_jump: None,
             },
@@ -1368,16 +1347,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
     ops: &[T],
 ) {
     for layout in backend_layouts {
-        // `ResumeGuardDescr.get_resumestorage`: an exit the frontend never
-        // saw still carries its payload on its own descr, so downstream
-        // consumers (rebuild_guard_fail_state, blackhole_resume_via_rd_numb)
-        // see the same pool they get on the frontend-primed path.
-        let storage_from_backend = layout
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_fail_descr())
-            .and_then(crate::resume::ResumeStorage::from_fail_descr)
-            .map(std::sync::Arc::new);
         // Pre-resolve the source-op `descr` for backend-only entries so
         // `entry.descr` matches what `build_guard_metadata` would have
         // primed had the frontend seen this exit.  When the source op
@@ -1416,7 +1385,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
                     source_op_index: layout.source_op_index,
                     recovery_layout: layout.recovery_layout.clone().map(std::sync::Arc::new),
                     resume_layout: None,
-                    storage: storage_from_backend.clone(),
                     descr: descr_from_op.clone(),
                     op_arg_types_for_jump: None,
                 });
@@ -1455,10 +1423,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
                 entry.recovery_layout = layout.recovery_layout.clone().map(std::sync::Arc::new);
             }
         }
-        if entry.storage.is_none() {
-            entry.storage = storage_from_backend.clone();
-        }
-
         // Merge backend frame_stack metadata into the stored resume layout.
         if let Some(frame_stack) = &layout.frame_stack {
             merge_frame_stack_into_resume_layout(entry, frame_stack);
@@ -1707,7 +1671,6 @@ pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
                 source_op_index: Some(layout.op_index),
                 recovery_layout: layout.recovery_layout.clone().map(std::sync::Arc::new),
                 resume_layout: None,
-                storage: None,
                 descr: descr_from_op.clone(),
                 op_arg_types_for_jump: op_arg_types_for_jump.clone(),
             });
@@ -1877,7 +1840,6 @@ pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>, A: AsRef<Input
                     source_op_index: Some(op_index),
                     recovery_layout: None,
                     resume_layout: None,
-                    storage: None,
                     descr: op.getdescr(),
                     op_arg_types_for_jump,
                 },
