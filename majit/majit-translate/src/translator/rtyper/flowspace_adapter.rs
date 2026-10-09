@@ -1747,7 +1747,7 @@ fn enum_payload_getattr_ops(
         .is_some_and(|reg| {
             reg.fields
                 .get(owner)
-                .is_some_and(|rows| rows.iter().any(|(name, _)| name == &field.name))
+                .is_some_and(|rows| rows.iter().any(|row| row.name == field.name))
         });
     if !registered {
         return Ok(None);
@@ -5328,9 +5328,9 @@ fn unique_string_field(
         rows.to_vec()
     };
     let mut found: Option<String> = None;
-    for (name, ty) in &rows {
+    for row in &rows {
         if !matches!(
-            bk.project_struct_field_type(ty),
+            bk.project_struct_field_type(&row.ty),
             crate::annotator::model::SomeValue::String(_)
         ) {
             continue;
@@ -5338,7 +5338,7 @@ fn unique_string_field(
         if found.is_some() {
             return Err("more than one string field");
         }
-        found = Some(name.clone());
+        found = Some(row.name.clone());
     }
     found.ok_or("no string field")
 }
@@ -5346,7 +5346,7 @@ fn unique_string_field(
 fn layout_rows<'a>(
     reg: &'a crate::front::StructFieldRegistry,
     class_name: &str,
-) -> Option<&'a [(String, String)]> {
+) -> Option<&'a [crate::front::semantic::FieldRow]> {
     if class_name.is_empty() {
         return None;
     }
@@ -5358,7 +5358,7 @@ fn layout_rows<'a>(
     if let Some(rows) = reg.fields.get(&canonical) {
         return Some(rows.as_slice());
     }
-    let mut found: Option<&[(String, String)]> = None;
+    let mut found: Option<&[crate::front::semantic::FieldRow]> = None;
     for (key, rows) in &reg.fields {
         let suffix = key.ends_with(&format!("::{class_name}"))
             || class_name.ends_with(&format!("::{key}"))
@@ -11364,7 +11364,7 @@ mod tests {
         registry
             .bookkeeper()
             .set_struct_fields(Rc::new(crate::front::StructFieldRegistry {
-                fields: HashMap::from([
+                fields: HashMap::<String, Vec<crate::front::semantic::FieldRow>>::from([
                     ("PlainObject".to_string(), vec![]),
                     ("TypedObject".to_string(), vec![]),
                 ])

@@ -6593,7 +6593,7 @@ mod tests {
         );
         reg.fields.insert(
             "pyopcode::StepResult<*mut PyObject>::Continue".to_string(),
-            vec![],
+            Vec::<crate::front::semantic::FieldRow>::new(),
         );
         bk.set_struct_fields(Rc::new(reg));
         for root in bk.struct_root_names() {

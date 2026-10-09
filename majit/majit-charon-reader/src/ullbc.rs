@@ -891,15 +891,10 @@ pub enum TypeDeclKind {
 pub const POSITIONAL_FIELD_PREFIX: &str = "__pos_";
 
 /// `{POSITIONAL_FIELD_PREFIX}{index}` — the front's name for positional
-/// field `index`.
+/// field `index`. Origin is [`FieldDecl::name`] being `None`, not this
+/// spelling: a declared field called `__pos_0` is still named.
 pub fn positional_field_name(index: usize) -> String {
     format!("{POSITIONAL_FIELD_PREFIX}{index}")
-}
-
-/// Whether `name` is a positional-field fallback ([`positional_field_name`]).
-pub fn is_positional_field_name(name: &str) -> bool {
-    name.strip_prefix(POSITIONAL_FIELD_PREFIX)
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `name` is `None` for a positional field (tuple struct / tuple variant
@@ -2620,10 +2615,6 @@ mod tests {
         .unwrap();
         assert_eq!(named.name.as_deref(), Some("_0"));
         assert_eq!(positional_field_name(0), "__pos_0");
-        assert!(is_positional_field_name("__pos_0"));
-        assert!(is_positional_field_name("__pos_12"));
-        assert!(!is_positional_field_name("__pos_"));
-        assert!(!is_positional_field_name("_0"));
     }
 
     /// A struct's field offsets are the single `variant_layouts[0]` entry.

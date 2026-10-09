@@ -4791,7 +4791,7 @@ fn inherited_enum_tag_spec(
 ) -> Option<crate::jitcode::BhFieldSpec> {
     let (base_owner, variant) = variant_owner.rsplit_once("::")?;
     let entries = cc.struct_field_entries(base_owner)?;
-    if entries.len() != 1 || entries[0].0 != "__discriminant" {
+    if entries.len() != 1 || entries[0].name != "__discriminant" {
         return None;
     }
     let tag = bh_all_field_specs_for_struct(cc, base_owner)
@@ -4841,7 +4841,9 @@ fn bh_result_variant_field_specs(
     };
     let mut specs = Vec::new();
     let mut offset = 8usize;
-    for (field_name, field_type_str) in fields {
+    for row in fields {
+        let field_name = &row.name;
+        let field_type_str = &row.ty;
         // This builder lays out the variant's own payload rows, which start
         // past the inherited tag at byte 8.  The registry can also carry the
         // enum base's synthetic `__discriminant` row (`layout.rs`,
@@ -4900,7 +4902,7 @@ fn bh_all_field_specs_for_struct_into(
         // for nested fields; match by field name to recover the owner
         // string when recursing.  Cloned out of `cc` so the immutable
         // borrow does not collide with the recursive call below.
-        let entries: Vec<(String, String)> = cc
+        let entries: Vec<crate::front::semantic::FieldRow> = cc
             .struct_field_entries(owner)
             .map(|fs| fs.to_vec())
             .unwrap_or_default();
@@ -4923,8 +4925,8 @@ fn bh_all_field_specs_for_struct_into(
                 //  all_fielddescrs(gccache, FIELD, only_gc, res, get_field_descr)`.
                 if let Some(inner_owner) = entries
                     .iter()
-                    .find(|(name, _)| name == &fl.name)
-                    .map(|(_, ty)| ty.as_str())
+                    .find(|row| row.name == fl.name)
+                    .map(|row| row.ty.as_str())
                 {
                     let nested_prefix = format!("{field_prefix}{}.", fl.name);
                     bh_all_field_specs_for_struct_into(
@@ -4967,7 +4969,9 @@ fn bh_all_field_specs_for_struct_into(
         return;
     };
     let mut offset = 0usize;
-    for (field_name, field_type_str) in &fields {
+    for row in &fields {
+        let field_name = &row.name;
+        let field_type_str = &row.ty;
         let (field_flag, field_type, field_size) = if cc.is_known_struct(field_type_str) {
             (
                 majit_ir::descr::ArrayFlag::Struct,
@@ -5033,7 +5037,8 @@ fn heuristic_struct_size_for_bh(cc: &CallControl, owner: &str) -> Option<usize> 
     let fields = cc.struct_field_entries(owner)?;
     let mut offset = 0usize;
     let mut max_align = 0usize;
-    for (_, field_type_str) in fields {
+    for row in fields {
+        let field_type_str = &row.ty;
         let field_size = if cc.is_known_struct(field_type_str) {
             cc.struct_layout_for(field_type_str)
                 .map(|layout| layout.size)
@@ -5521,7 +5526,9 @@ fn heuristic_field_layout(
 )> {
     let fields = cc.struct_field_entries(owner)?;
     let mut offset = 0usize;
-    for (name, type_str) in fields {
+    for row in fields {
+        let name = &row.name;
+        let type_str = &row.ty;
         let (flag, field_type, mut field_size) = if cc.is_known_struct(type_str) {
             (
                 majit_ir::descr::ArrayFlag::Struct,

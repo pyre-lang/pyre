@@ -3593,8 +3593,12 @@ impl CallControl {
         } else {
             crate::front::mir::positional_shape_rows(name)?
         };
+        let pairs: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row.name.clone(), row.ty.clone()))
+            .collect();
         let layout = std::rc::Rc::new(StructLayout::from_type_strings(
-            rows,
+            &pairs,
             &self.known_struct_names,
             &HashMap::new(),
             &HashMap::new(),
@@ -3675,7 +3679,7 @@ impl CallControl {
     /// RPython: ordered `STRUCT._names` + field types for descriptor layout
     /// reconstruction. The order is required to reproduce
     /// `symbolic.get_field_token()`.
-    pub fn struct_field_entries(&self, owner: &str) -> Option<&[(String, String)]> {
+    pub fn struct_field_entries(&self, owner: &str) -> Option<&[crate::front::semantic::FieldRow]> {
         if let Some(rows) = crate::front::mir::mut_ref_shape_rows(owner) {
             return Some(rows.as_slice());
         }
@@ -4152,7 +4156,9 @@ impl CallControl {
         })?;
         let mut offset: usize = 0;
         let mut leaf = None;
-        for (fname, fty) in fields {
+        for row in fields {
+            let fname = &row.name;
+            let fty = &row.ty;
             let (flag, ir_type, field_size) = get_type_flag(fty);
             // `heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`
             // open with `if FIELD is lltype.Void: continue`, so a zero-sized
@@ -4462,8 +4468,8 @@ impl CallControl {
                 .flat_map(|(outer, fields)| {
                     fields
                         .iter()
-                        .filter(|(_, fty)| self.is_known_struct(fty))
-                        .map(move |(fname, fty)| (fty.clone(), outer.clone(), fname.clone()))
+                        .filter(|row| self.is_known_struct(&row.ty))
+                        .map(move |row| (row.ty.clone(), outer.clone(), row.name.clone()))
                 })
                 .collect();
             rows.sort();
@@ -4498,7 +4504,9 @@ impl CallControl {
         let fields = self.struct_field_entries(owner)?;
         let sid = majit_ir::descr::struct_id_for_name(owner);
         let mut offset: usize = 0;
-        for (fname, fty) in fields {
+        for row in fields {
+            let fname = &row.name;
+            let fty = &row.ty;
             let (flag, ir_type, field_size) = get_type_flag(fty);
             if ir_type == majit_ir::value::Type::Void || fname == "typeptr" {
                 continue;
@@ -4591,7 +4599,9 @@ impl CallControl {
         let fields = self.struct_fields.fields.get(&elem_name)?;
         let mut offset: usize = 0;
         let mut found: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
-        for (fname, fty) in fields {
+        for row in fields {
+            let fname = &row.name;
+            let fty = &row.ty;
             let (flag, ir_type, field_size) = get_type_flag(fty);
             // Same skip, same reason as `fielddescrof_concrete`: this walk
             // hands its match to `field_pos_in`, and `heaptracker.py
@@ -10266,10 +10276,10 @@ impl CallControl {
         {
             leaves.extend(
                 rows.iter()
-                    .filter(|(leaf, _)| {
-                        crate::front::mir::is_flattened_storage_leaf(owner, &field.name, leaf)
+                    .filter(|row| {
+                        crate::front::mir::is_flattened_storage_leaf(owner, &field.name, &row.name)
                     })
-                    .map(|(leaf, _)| (owner.to_string(), format!("{}.{leaf}", field.name))),
+                    .map(|row| (owner.to_string(), format!("{}.{}", field.name, row.name))),
             );
         }
         // A field of a by-value nested struct is also the dotted leaf of
@@ -11282,8 +11292,8 @@ fn all_interiorfielddescrs(
         Some(f) => f,
         None => return (Vec::new(), 0),
     };
-    for (_, field_type_str) in fields.iter() {
-        if cc.is_known_struct(field_type_str) {
+    for row in fields.iter() {
+        if cc.is_known_struct(&row.ty) {
             return (Vec::new(), 0);
         }
     }
@@ -11304,7 +11314,9 @@ fn all_interiorfielddescrs(
         bool,
         majit_ir::descr::ArrayFlag,
     )> = Vec::new();
-    for (field_name, field_type_str) in fields.iter() {
+    for row in fields.iter() {
+        let field_name = &row.name;
+        let field_type_str = &row.ty;
         let (flag, field_type, field_size) = get_type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void {
             continue;
@@ -11333,7 +11345,7 @@ fn all_interiorfielddescrs(
     }
     let max_align = fields
         .iter()
-        .map(|(_, ty)| type_align(ty))
+        .map(|row| type_align(&row.ty))
         .filter(|s| *s > 0)
         .max();
     let item_size = match max_align {
@@ -11488,7 +11500,8 @@ fn compute_struct_size_uncached(
         }
     };
     let mut offset: usize = 0;
-    for (_, field_type_str) in fields.iter() {
+    for row in fields.iter() {
+        let field_type_str = &row.ty;
         let field_size = if cc.is_known_struct(field_type_str) {
             // RPython: symbolic.get_field_token() uses actual nested struct size.
             cc.struct_layout_for(field_type_str)
@@ -11507,7 +11520,8 @@ fn compute_struct_size_uncached(
     }
     let max_align = fields
         .iter()
-        .map(|(_, ty)| {
+        .map(|row| {
+            let ty = &row.ty;
             if cc.is_known_struct(ty) {
                 cc.struct_layout_for(ty)
                     .map(|l| l.align)

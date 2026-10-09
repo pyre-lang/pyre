@@ -716,13 +716,13 @@ fn owner_ll_container(
     };
     building.insert(name.to_string(), fwd.clone());
     let mut fields = Vec::with_capacity(rows.len());
-    for (index, (field_name, spelling)) in rows.iter().enumerate() {
-        if field_name.is_empty() {
+    for (index, row) in rows.iter().enumerate() {
+        if row.name.is_empty() {
             continue;
         }
-        let concrete = instantiate_field_spelling(registry, name, spelling);
+        let concrete = instantiate_field_spelling(registry, name, &row.ty);
         fields.push((
-            field_name.clone(),
+            row.name.clone(),
             field_spelling_lltype(registry, layouts, &concrete, gckind, index, building),
         ));
     }
@@ -1418,10 +1418,10 @@ impl Bookkeeper {
                 field.size > 0
                     && rows
                         .iter()
-                        .any(|(name, ty)| name == &field.name && registry_ty_is_raw_ptr(ty))
+                        .any(|row| row.name == field.name && registry_ty_is_raw_ptr(&row.ty))
             });
         }
-        rows.iter().any(|(_, ty)| registry_ty_is_raw_ptr(ty))
+        rows.iter().any(|row| registry_ty_is_raw_ptr(&row.ty))
     }
 
     fn layout_of_named(
@@ -1437,26 +1437,25 @@ impl Bookkeeper {
     /// classed scalar ADT written by `robjmodel_instantiate` (Fmt /
     /// Utf16Or32Form / RootScope as an enum payload). A closure capture
     /// and a nullable pointer word keep the SomePtr the writer stores.
+    /// Positional origin is the harvested `FieldDecl::name == None` flag
+    /// on the registry row, not the `__pos_N` spelling.
     fn variant_payload_promotes_to_instance(
         &self,
         owner: &str,
-        field_name: &str,
-        field_ty: &str,
+        row: &crate::front::semantic::FieldRow,
         s_value: &SomeValue,
     ) -> bool {
-        if !majit_charon_reader::ullbc::is_positional_field_name(field_name)
-            || !matches!(s_value, SomeValue::Ptr(_))
-        {
+        if !row.is_positional || !matches!(s_value, SomeValue::Ptr(_)) {
             return false;
         }
         let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
         if majit_charon_reader::ullbc::is_closure_leaf(owner_leaf) {
             return false;
         }
-        if self.field_ty_is_nullable_ptr(field_ty) {
+        if self.field_ty_is_nullable_ptr(&row.ty) {
             return false;
         }
-        !self.struct_ty_has_raw_pointer_field(field_ty)
+        !self.struct_ty_has_raw_pointer_field(&row.ty)
     }
 
     /// A niche-optimized pointer-sized enum is the nullable `lltype.Ptr`
@@ -2885,11 +2884,11 @@ impl Bookkeeper {
                 if let Some(reg) = guard.as_ref() {
                     if let Some(fields) = reg.fields.get(&n) {
                         let mut out: Vec<String> = Vec::new();
-                        for (field_name, field_ty) in fields {
-                            if field_name == "__class__" {
+                        for row in fields {
+                            if row.name == "__class__" {
                                 continue;
                             }
-                            collect_referenced_struct_names(field_ty, reg, &mut out);
+                            collect_referenced_struct_names(&row.ty, reg, &mut out);
                         }
                         out
                     } else {
@@ -3284,12 +3283,12 @@ impl Bookkeeper {
                     .and_then(|r| r.fields.get(n))
                     .into_iter()
                     .flat_map(|fields| fields.iter())
-                    .filter(|(_, ty)| is_nullable_sum_spelling(ty))
-                    .map(|(name, _)| name.clone())
+                    .filter(|row| is_nullable_sum_spelling(&row.ty))
+                    .map(|row| row.name.clone())
                     .collect()
             }
         };
-        let mut fields: Vec<(String, String)> = {
+        let mut fields: Vec<crate::front::semantic::FieldRow> = {
             if let Some(rows) = crate::front::mir::mut_ref_shape_rows(n) {
                 rows.clone()
             } else {
@@ -3323,7 +3322,7 @@ impl Bookkeeper {
             // and then fails `generalize_attr` against
             // `Instance(Option<Vec<*mut PyObject>>::None)`.  Leave those rows
             // to the constructor.
-            fields.retain(|(_, ty)| !is_nullable_sum_spelling(ty));
+            fields.retain(|row| !is_nullable_sum_spelling(&row.ty));
         }
         // A per-instantiation variant carries concrete payload rows keyed
         // under its full `<…>`-suffixed spelling
@@ -3345,20 +3344,20 @@ impl Bookkeeper {
             let guard = self.struct_fields.borrow();
             if let Some(reg) = guard.as_ref() {
                 let exact = reg.fields.get(n);
-                for (fname, fty) in &mut fields {
-                    if let Some((_, exact_ty)) =
-                        exact.and_then(|rows| rows.iter().find(|(en, _)| en == fname))
-                        && fty.contains("??")
-                        && !exact_ty.contains("??")
+                for row in &mut fields {
+                    if let Some(exact_row) =
+                        exact.and_then(|rows| rows.iter().find(|er| er.name == row.name))
+                        && row.ty.contains("??")
+                        && !exact_row.ty.contains("??")
                     {
-                        *fty = exact_ty.clone();
+                        row.ty = exact_row.ty.clone();
                         continue;
                     }
                     // Template `??TypeVar#N` on a suffixed owner
                     // (`Option<(K, V)>::Some`) substitutes from the
                     // owner's type args (`instantiate_field_spelling`).
-                    if fty.contains("??TypeVar") {
-                        *fty = instantiate_field_spelling(reg, n, fty);
+                    if row.ty.contains("??TypeVar") {
+                        row.ty = instantiate_field_spelling(reg, n, &row.ty);
                     }
                 }
             }
@@ -3397,12 +3396,12 @@ impl Bookkeeper {
                 }
             }
         }
-        for (field_name, field_ty) in &fields {
-            if field_name == "__class__" {
+        for row in &fields {
+            if row.name == "__class__" {
                 continue;
             }
-            let s_value = self.project_struct_field_type(field_ty);
-            // A variant payload (`__pos_N`) is written by
+            let s_value = self.project_struct_field_type(&row.ty);
+            // A variant payload (`FieldDecl::name == None`) is written by
             // `robjmodel_instantiate` + setattr, which is always
             // SomeInstance (`builtin.py` `robjmodel_instantiate`).
             // Flattening a classed scalar ADT (Fmt / Utf16Or32Form)
@@ -3413,7 +3412,7 @@ impl Bookkeeper {
             // `getfield_raw` matches the named-field projection
             // (`raw_struct_ptr_annotation`). Named raw fields
             // (`mapped`, `sin_addr`) and FUNC.ARGS `&Raw` are not
-            // `__pos_N` and stay SomePtr either way.
+            // positional and stay SomePtr either way.
             //
             // A closure capture is the captured value, not a variant
             // constructor: `__cast_instance_intrinsic` / FUNC.ARGS of a
@@ -3424,12 +3423,11 @@ impl Bookkeeper {
             // None is the null word); promoting that to Instance(enum)
             // is the mmap_get_attr_i64 `Ptr(MappedObj) ∪ Instance(enum)`
             // refusal.
-            let s_value =
-                if self.variant_payload_promotes_to_instance(n, field_name, field_ty, &s_value) {
-                    self.struct_instance_annotation(field_ty).unwrap_or(s_value)
-                } else {
-                    s_value
-                };
+            let s_value = if self.variant_payload_promotes_to_instance(n, row, &s_value) {
+                self.struct_instance_annotation(&row.ty).unwrap_or(s_value)
+            } else {
+                s_value
+            };
             // `rlist.py` `ll_length` is `return l.length`. A Vec field's
             // length word is the parent `{name}.len` Signed getfield
             // (`assembler` suffixes `.len`); getattr of that name must
@@ -3439,8 +3437,8 @@ impl Bookkeeper {
             {
                 let attr = classdef_mut
                     .attrs
-                    .entry(field_name.clone())
-                    .or_insert_with(|| super::classdesc::Attribute::new(field_name.clone()));
+                    .entry(row.name.clone())
+                    .or_insert_with(|| super::classdesc::Attribute::new(row.name.clone()));
                 // The slot may also hold the untyped FORCE_ATTRIBUTES
                 // shell: `register_struct_fields` seeds Ref-typed rows
                 // through `valuetype_to_someshell`, which renders every
@@ -3475,7 +3473,7 @@ impl Bookkeeper {
                 // `fn_null_constant`. Any other value was produced by real
                 // annotation flow and stays.
                 let is_fn_integer_force_shell =
-                    fn_ptr_somevalue_for_spelling_in(field_ty, Some(self)).is_some()
+                    fn_ptr_somevalue_for_spelling_in(&row.ty, Some(self)).is_some()
                         && crate::codewriter::annotation_state::valuetype_to_someshell(
                             &crate::model::ValueType::Int,
                         )
@@ -3494,7 +3492,7 @@ impl Bookkeeper {
                 // item annotation `SomeIterator.next` reads.
                 if (majit_ir::descr::is_shaped_tuple_name(n)
                     || majit_ir::descr::is_shaped_array_name(n))
-                    && field_name.starts_with("__pos_")
+                    && row.is_positional
                     && matches!(
                         &attr.s_value,
                         SomeValue::Instance(inst)
@@ -3508,7 +3506,7 @@ impl Bookkeeper {
                 }
             }
             if field_is_vec {
-                let len_name = format!("{field_name}.len");
+                let len_name = format!("{}.len", row.name);
                 let len_attr = classdef_mut
                     .attrs
                     .entry(len_name.clone())
@@ -3738,16 +3736,16 @@ impl Bookkeeper {
                     let leaf = lookup.rsplit("::").next()?;
                     reg.fields.get(leaf)
                 })?;
-                let (first_name, first_ty) = rows.first()?;
+                let first = rows.first()?;
                 // Only header-conventional first fields mark subclassing
                 // (`ob_header: PyObject` / `base: FrameBlock`).  A
                 // by-value first field of another registered type is
                 // otherwise plain composition (`PyError { kind:
                 // PyErrorKind, … }`), not a class hierarchy.
-                if first_name != "ob_header" && first_name != "base" {
+                if first.name != "ob_header" && first.name != "base" {
                     return None;
                 }
-                let leaf = first_ty.rsplit("::").next().unwrap_or(first_ty);
+                let leaf = first.ty.rsplit("::").next().unwrap_or(&first.ty);
                 (reg.fields.contains_key(leaf) && !seen.contains(leaf)).then(|| leaf.to_string())
             });
             match next {
@@ -6735,7 +6733,10 @@ mod tests {
         });
         assert_eq!(
             rows,
-            &vec![("__pos_0".to_string(), "*mut PyObject".to_string())]
+            &vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "*mut PyObject"
+            )]
         );
         let _registry =
             crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
@@ -6953,7 +6954,7 @@ mod tests {
         }
         reg.fields.insert(
             "pyre_interpreter::pyopcode::StepResult::Continue".to_string(),
-            vec![],
+            Vec::<crate::front::semantic::FieldRow>::new(),
         );
         bk.set_struct_fields(Rc::new(reg));
         for root in bk.struct_root_names() {
@@ -7135,7 +7136,7 @@ mod tests {
         );
         reg.fields.insert(
             "pyopcode::StepResult<*mut PyObject>::Continue".to_string(),
-            vec![],
+            Vec::<crate::front::semantic::FieldRow>::new(),
         );
         bk.set_struct_fields(Rc::new(reg));
         for root in bk.struct_root_names() {
@@ -7364,7 +7365,10 @@ mod tests {
             base.to_string(),
             vec![("__discriminant".to_string(), "i64".to_string())],
         );
-        reg.fields.insert(format!("{base}::Pad"), vec![]);
+        reg.fields.insert(
+            format!("{base}::Pad"),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
         reg.fields.insert(
             format!("{base}::Int"),
             vec![("signed".to_string(), "bool".to_string())],
@@ -8032,7 +8036,9 @@ mod tests {
         );
         reg.fields.insert(
             some.to_string(),
-            vec![("__pos_0".into(), inner.to_string())],
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
         );
         reg.raw_word_owners.insert(inner.to_string());
         bk.set_struct_fields(Rc::new(reg));
@@ -8114,7 +8120,9 @@ mod tests {
         );
         reg.fields.insert(
             some.to_string(),
-            vec![("__pos_0".into(), inner.to_string())],
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
         );
         reg.raw_word_owners.insert(inner.to_string());
         bk.set_struct_fields(Rc::new(reg));
@@ -8173,6 +8181,85 @@ mod tests {
     }
 
     #[test]
+    fn declared_pos_spelling_does_not_promote_to_instance() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawproj::Fmt";
+        let owner = "rawproj::NamedPos";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("size".into(), "usize".into()),
+                ("needcount".into(), "bool".into()),
+            ],
+        );
+        reg.fields.insert(
+            owner.to_string(),
+            vec![crate::front::semantic::FieldRow::named("__pos_0", inner)],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "size".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "needcount".into(),
+                        offset: 8,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let cd = bk
+            .getuniqueclassdef_for_struct_root(owner)
+            .expect("named owner registers");
+        let payload = cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("declared attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Ptr(_)),
+            "a declared field named __pos_0 is not a FieldDecl positional payload, got {payload:?}"
+        );
+    }
+
+    #[test]
     fn option_some_payload_of_payload_enum_stays_instance() {
         // `BuiltinEncoder`: the base is `__discriminant` only, the
         // `Utf16Or32` variant carries `Utf16Or32Form`. A named-field
@@ -8199,8 +8286,12 @@ mod tests {
             inner.to_string(),
             vec![("__discriminant".into(), "u8".into())],
         );
-        reg.fields
-            .insert(variant.to_string(), vec![("__pos_0".into(), form.into())]);
+        reg.fields.insert(
+            variant.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", form,
+            )],
+        );
         reg.fields.insert(
             form.to_string(),
             vec![
@@ -8209,8 +8300,12 @@ mod tests {
                 ("bom".into(), "bool".into()),
             ],
         );
-        reg.fields
-            .insert(some.to_string(), vec![("__pos_0".into(), inner.into())]);
+        reg.fields.insert(
+            some.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
         reg.raw_word_owners.insert(inner.to_string());
         bk.set_struct_fields(Rc::new(reg));
 
@@ -8281,7 +8376,9 @@ mod tests {
         );
         reg.fields.insert(
             some.to_string(),
-            vec![("__pos_0".into(), inner.to_string())],
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
         );
         reg.raw_word_owners.insert(inner.to_string());
         bk.set_struct_fields(Rc::new(reg));
@@ -8350,7 +8447,9 @@ mod tests {
         );
         reg.fields.insert(
             owner.to_string(),
-            vec![("__pos_0".into(), inner.to_string())],
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
         );
         reg.raw_word_owners.insert(inner.to_string());
         bk.set_struct_fields(Rc::new(reg));
@@ -8428,7 +8527,10 @@ mod tests {
         );
         reg.fields.insert(
             some.to_string(),
-            vec![("__pos_0".into(), "Option<rawproj::PosixMap>".into())],
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "Option<rawproj::PosixMap>",
+            )],
         );
         reg.raw_word_owners.insert(inner.to_string());
         bk.set_struct_fields(Rc::new(reg));
@@ -8522,8 +8624,12 @@ mod tests {
 
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
-        reg.fields
-            .insert(owner.to_string(), vec![("__pos_0".into(), "&usize".into())]);
+        reg.fields.insert(
+            owner.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", "&usize",
+            )],
+        );
         reg.raw_word_owners.insert(owner.to_string());
         bk.set_struct_fields(Rc::new(reg));
 
@@ -9659,7 +9765,7 @@ mod tests {
         );
         reg.fields.insert(
             "pyopcode::StepResult<*mut PyObject>::Continue".to_string(),
-            vec![],
+            Vec::<crate::front::semantic::FieldRow>::new(),
         );
         bk.set_struct_fields(Rc::new(reg));
         for root in bk.struct_root_names() {

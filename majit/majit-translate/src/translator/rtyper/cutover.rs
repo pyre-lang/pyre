@@ -9617,7 +9617,10 @@ mod tests {
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = CallRegistry::new(ann.bookkeeper.clone());
         let mut reg = StructFieldRegistry::default();
-        reg.fields.insert("Utf8LocElem".to_string(), Vec::new());
+        reg.fields.insert(
+            "Utf8LocElem".to_string(),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
         registry
             .bookkeeper()
             .set_struct_fields(std::rc::Rc::new(reg));
