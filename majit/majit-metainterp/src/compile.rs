@@ -194,30 +194,6 @@ pub struct CompiledExitLayout {
     /// `make_finish_fail_descr_typed` routes a `[Type::Ref]` exit to the
     /// correct `_DoneWithThisFrameDescr` subclass.
     pub is_exception_exit: bool,
-    /// Held behind a pointer, not inline. Both this and [`Self::resume_layout`]
-    /// describe how to REBUILD interpreter state after a guard failed, so both
-    /// are `None` on the two exits the steady path actually takes — a FINISH
-    /// and a loop-carried JUMP. Held inline they added 120 and 176 bytes to a
-    /// struct that is 120 bytes without them, and this layout is in turn a
-    /// field of the [`CompileResult`] every compiled entry returns by value,
-    /// so those 296 bytes were copied on every warm entry to carry two absent
-    /// values.
-    ///
-    /// The indirection costs an allocation only where the layout EXISTS, which
-    /// is the guard-failure arm — already several allocations deep building
-    /// the vectors these hold, and off the steady path by construction. A
-    /// FINISH or JUMP exit stores two null words and allocates nothing, so the
-    /// per-entry allocation count is unchanged.
-    ///
-    /// `Arc`, not `Box`, because both halves are decided once when the trace
-    /// is compiled and then only read: every guard failure asks
-    /// `StoredExitLayout::public` for them again, and through a `Box` that
-    /// question deep-copied both frame vectors per deopt. The few places that
-    /// still edit one — the backend merge in this file — take
-    /// `Arc::make_mut`, which is free while the trace-side handle is the only
-    /// one.
-    pub recovery_layout: Option<std::sync::Arc<ExitRecoveryLayout>>,
-    pub resume_layout: Option<std::sync::Arc<ResumeLayoutSummary>>,
     /// compile.py `ResumeGuardDescr` storage handle — shared
     /// pool with rd_numb / rd_consts / rd_virtuals / rd_pendingfields.
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
@@ -241,8 +217,6 @@ pub fn exit_layout_for_descr(descr: &dyn majit_ir::FailDescr) -> CompiledExitLay
         exit_types: ExitTypes::from_slice(descr.fail_arg_types()),
         is_finish: descr.is_finish(),
         is_exception_exit: descr.is_exit_frame_with_exception(),
-        recovery_layout: None,
-        resume_layout: None,
         storage: crate::resume::ResumeStorage::from_fail_descr(descr).map(Arc::new),
     }
 }
@@ -1557,79 +1531,6 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
     }
 }
 
-/// Enrich an `Option<ResumeLayoutSummary>` with backend-origin `frame_stack`
-/// metadata at runtime, merging slot types and outer frames.
-pub(crate) fn enrich_resume_layout_with_frame_stack(
-    resume_layout: &mut Option<ResumeLayoutSummary>,
-    frame_stack: Option<&[ExitFrameLayout]>,
-) {
-    let Some(frame_stack) = frame_stack else {
-        return;
-    };
-    if frame_stack.is_empty() {
-        return;
-    }
-
-    let frame_layouts: Vec<ResumeFrameLayoutSummary> = frame_stack
-        .iter()
-        .map(crate::resume::resume_frame_layout_from_exit_frame_layout)
-        .collect();
-
-    if let Some(layout) = resume_layout {
-        let shared = layout.frame_layouts.len().min(frame_layouts.len());
-        for offset in 0..shared {
-            let resume_index = layout.frame_layouts.len() - 1 - offset;
-            let fs_index = frame_layouts.len() - 1 - offset;
-            let target = &mut layout.frame_layouts[resume_index];
-            let source = &frame_layouts[fs_index];
-
-            if target.trace_id.is_none() {
-                target.trace_id = source.trace_id;
-            }
-            if target.header_pc.is_none() {
-                target.header_pc = source.header_pc;
-            }
-            if target.source_guard.is_none() {
-                target.source_guard = source.source_guard;
-            }
-
-            let needs_slot_types = target
-                .slot_types
-                .as_ref()
-                .is_none_or(|types| types.len() != target.slot_layouts.len());
-            if needs_slot_types
-                && source
-                    .slot_types
-                    .as_ref()
-                    .is_some_and(|types| types.len() == target.slot_layouts.len())
-            {
-                target.slot_types = source.slot_types.clone();
-            }
-        }
-
-        if frame_layouts.len() > layout.frame_layouts.len() {
-            let extra_count = frame_layouts.len() - layout.frame_layouts.len();
-            let mut new_frames = frame_layouts[..extra_count].to_vec();
-            new_frames.append(&mut layout.frame_layouts);
-            layout.frame_layouts = new_frames;
-            layout.num_frames = layout.frame_layouts.len();
-        }
-    } else {
-        *resume_layout = Some(ResumeLayoutSummary {
-            num_frames: frame_layouts.len(),
-            frame_pcs: Vec::new(),
-            frame_slot_counts: Vec::new(),
-            frame_layouts,
-            num_virtuals: 0,
-            virtual_kinds: Vec::new(),
-            virtual_layouts: Vec::new(),
-            pending_field_count: 0,
-            pending_field_layouts: Vec::new(),
-            const_pool_size: 0,
-        });
-    }
-}
-
 pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     terminal_exit_layouts: &mut crate::FxIndexMap<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
@@ -1808,8 +1709,6 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>, A: AsRef<InputA
         exit_types,
         is_finish,
         is_exception_exit,
-        recovery_layout: None,
-        resume_layout: None,
         storage: None,
     })
 }
@@ -2760,8 +2659,6 @@ mod tests {
             exit_types: ExitTypes::from_slice(&[Type::Ref, Type::Int, Type::Ref]),
             is_finish: false,
             is_exception_exit: false,
-            recovery_layout: None,
-            resume_layout: None,
             storage: None,
         };
 

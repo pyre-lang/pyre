@@ -679,8 +679,6 @@ impl StoredExitLayout {
             exit_types: ExitTypes::from_slice(self.resolve_exit_types()),
             is_finish: self.resolve_is_finish(),
             is_exception_exit: self.resolve_is_exception_exit(),
-            recovery_layout: self.recovery_layout.clone(),
-            resume_layout: self.resume_layout.clone(),
             // `ResumeGuardDescr.get_resumestorage()`: the `rd_*` payload is
             // the descr's own; this record only names the descr.
             storage: self
@@ -4157,8 +4155,6 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types,
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
-                    resume_layout: None,
                     storage,
                 }
             })
@@ -13614,13 +13610,6 @@ impl<M: Clone> MetaInterp<M> {
             .clone()
             .map(|layout| {
                 let trace_layout_ref = trace_layout.as_ref();
-                let mut resume_layout = trace_layout
-                    .as_ref()
-                    .and_then(|tl| tl.resume_layout.as_deref().cloned());
-                compile::enrich_resume_layout_with_frame_stack(
-                    &mut resume_layout,
-                    layout.frame_stack.as_deref(),
-                );
                 CompiledExitLayout {
                     rd_loop_token: green_key, // compile.py:186
                     trace_id,
@@ -13637,10 +13626,6 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    recovery_layout: layout.recovery_layout.map(std::sync::Arc::new).or_else(
-                        || trace_layout_ref.and_then(|layout| layout.recovery_layout.clone()),
-                    ),
-                    resume_layout: resume_layout.map(std::sync::Arc::new),
                     // `ResumeGuardDescr.get_resumestorage()`: the pool is the
                     // failing descr's own.
                     storage: result
@@ -13663,8 +13648,6 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types,
                     is_finish: result.is_finish,
                     is_exception_exit: result.is_exit_frame_with_exception,
-                    recovery_layout: None,
-                    resume_layout: None,
                     storage: fd
                         .and_then(crate::resume::ResumeStorage::from_fail_descr)
                         .map(Arc::new),
@@ -13836,8 +13819,6 @@ impl<M: Clone> MetaInterp<M> {
                         exit_types: ExitTypes::from_slice(exit_types),
                         is_finish,
                         is_exception_exit: is_exit_frame_with_exception,
-                        recovery_layout: None,
-                        resume_layout: None,
                         // The green-key index no longer holds this trace, but the
                         // failing descr still carries the resume payload it was
                         // compiled with (`compile.py get_resumestorage`), so a
@@ -14010,8 +13991,6 @@ impl<M: Clone> MetaInterp<M> {
                 exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
-                recovery_layout: None,
-                resume_layout: None,
                 // The green-key index no longer holds this trace, but the
                 // failing descr still carries the resume payload it was
                 // compiled with (`compile.py get_resumestorage`), so a
@@ -17997,34 +17976,9 @@ impl<M: Clone> MetaInterp<M> {
                     is_finish: false,
                     is_exception_exit: false,
                     exit_types,
-                    recovery_layout: None,
-                    resume_layout: None,
                     storage: None,
                 }
             });
-        // pyjitpl.py initialize_state_from_guard_failure:
-        // guard failure rebuild is stack-critical code — must not be
-        // interrupted by StackOverflow, otherwise jit_virtual_refs are
-        // left in a dangling state. RPython try/finally; Rust Drop
-        // guard — see CriticalCodeGuard.
-        let _cc_guard = crate::CriticalCodeGuard::enter();
-        let reconstructed_state = exit_layout
-            .resume_layout
-            .as_ref()
-            .map(|layout| layout.reconstruct_state(fail_values));
-        let resume_layout = exit_layout.resume_layout.as_deref().cloned();
-        let reconstructed = reconstructed_state
-            .as_ref()
-            .map(|state| state.frames.clone());
-        let materialized_virtuals = reconstructed_state
-            .as_ref()
-            .map(|state| state.virtuals.clone())
-            .unwrap_or_default();
-        let pending_field_writes = reconstructed_state
-            .as_ref()
-            .map(|state| state.pending_fields.clone())
-            .unwrap_or_default();
-        drop(_cc_guard);
 
         Some(GuardRecovery {
             trace_id,
@@ -18032,11 +17986,6 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout,
             fail_values: fail_values.to_vec(),
             typed_fail_values: typed_fail_values.map(|values| values.to_vec()),
-            resume_layout,
-            reconstructed_frames: reconstructed,
-            reconstructed_state,
-            materialized_virtuals,
-            pending_field_writes,
             savedata,
             exception,
         })
@@ -21879,16 +21828,6 @@ pub struct GuardRecovery {
     pub fail_values: Vec<i64>,
     /// Typed fail values decoded from the backend deadframe, when available.
     pub typed_fail_values: Option<Vec<Value>>,
-    /// Compact resume/jitframe layout for this exit, when available.
-    pub resume_layout: Option<ResumeLayoutSummary>,
-    /// Reconstructed interpreter frames (if resume data was available).
-    pub reconstructed_frames: Option<Vec<crate::resume::ReconstructedFrame>>,
-    /// Full reconstructed state, including materialized virtuals.
-    pub reconstructed_state: Option<ReconstructedState>,
-    /// Materialized virtuals referenced by the reconstructed state.
-    pub materialized_virtuals: Vec<MaterializedVirtual>,
-    /// Deferred heap writes reconstructed from resume data.
-    pub pending_field_writes: Vec<ResolvedPendingFieldWrite>,
     /// Optional saved-data GC ref captured from the failing exit.
     pub savedata: Option<GcRef>,
     /// Pending exception state captured from the failing deadframe.

@@ -14536,7 +14536,7 @@ pub(crate) fn decode_and_restore_guard_failure(
 ) -> Option<DecodedGuardFailure> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
+            "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={}",
             exit_layout.trace_id,
             exit_layout.fail_index,
             exit_layout.source_op_index,
@@ -14545,8 +14545,6 @@ pub(crate) fn decode_and_restore_guard_failure(
                 .as_deref()
                 .map(|s| s.rd_numb.len())
                 .unwrap_or(0),
-            exit_layout.recovery_layout.is_some(),
-            exit_layout.resume_layout.is_some(),
         );
     }
     if majit_metainterp::majit_log_enabled() {
@@ -15433,20 +15431,11 @@ fn replay_pending_fields(
 ) {
     let num_failargs = exit_layout.exit_types.len() as i32;
     // `resume.py _prepare_pendingfields` reads the list off the guard's
-    // `rd_pendingfields`.  The root loop's frontend record carries it
-    // pre-resolved in `recovery_layout`; a bridge guard has no such record
-    // (`compile.py send_bridge_to_backend`), so it is resolved off the
-    // descr-owned storage here.
-    let pending: std::borrow::Cow<'_, [majit_backend::ExitPendingFieldLayout]> =
-        match exit_layout.recovery_layout.as_deref() {
-            Some(recovery) => std::borrow::Cow::Borrowed(&recovery.pending_field_layouts),
-            None => match exit_layout.storage.as_deref() {
-                Some(storage) => {
-                    std::borrow::Cow::Owned(storage.exit_pending_field_layouts(num_failargs))
-                }
-                None => return,
-            },
-        };
+    // `rd_pendingfields` (`ResumeGuardDescr.get_resumestorage`).
+    let pending = match exit_layout.storage.as_deref() {
+        Some(storage) => storage.exit_pending_field_layouts(num_failargs),
+        None => return,
+    };
     if pending.is_empty() {
         return;
     }
@@ -16080,8 +16069,6 @@ mod tests {
                 .collect(),
             is_finish: false,
             is_exception_exit: false,
-            recovery_layout: None,
-            resume_layout: None,
             storage: Some(majit_metainterp::resume::ResumeStorage::new(
                 Vec::new(),
                 Vec::new(),
