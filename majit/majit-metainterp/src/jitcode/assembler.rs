@@ -503,6 +503,17 @@ impl JitCodeBuilder {
             self.push_reg_u8(dst, "int_copy/c>i dst");
             return;
         }
+        // Bytecode offsets past 127 (`emit_const` short range) still fit
+        // the u16 jump-target space (`assembler.py` `fix_labels`). Encoding
+        // them inline keeps `verify_green_args`' ConstInt without a
+        // `constants_i` slot per unique PC.
+        if let Ok(imm) = u16::try_from(value) {
+            self.touch_reg(dst);
+            self.write_insn("int_copy/d>i");
+            self.push_u16(imm);
+            self.push_reg_u8(dst, "int_copy/d>i dst");
+            return;
+        }
         let const_idx = self.add_const_i(value);
         self.load_const_i(dst, const_idx);
     }
@@ -1553,18 +1564,27 @@ impl JitCodeBuilder {
         // constant value would take a `constants_i` slot. One slot per
         // Python instruction (`dispatch_bytecode` `last_instr`) overflows
         // `check_result`'s 256-wide int index space. The immediate form
-        // writes the u32 inline and shares the `VableField` descr with
+        // writes a u16 inline and shares the `VableField` descr with
         // `setfield_vable_i/rid`. Blackhole `handler_setfield_vable_i_imm`
-        // and the walker's `setfield_vable_i_imm/rddd` arm execute it as
-        // `_opimpl_setfield_vable`.
-        let imm = u32::try_from(value)
-            .unwrap_or_else(|_| panic!("setfield_vable_i immediate {value} does not fit in u32"));
+        // and the walker's `setfield_vable_i_imm/rdd` arm execute it as
+        // `_opimpl_setfield_vable`. Values that do not fit u16 (a negative
+        // abort coordinate) fall back to a pooled `setfield_vable_i/rid`.
         self.touch_ref_reg(vable_reg);
         let field_descr = self.add_vable_field_descr(field_idx);
-        self.write_insn("setfield_vable_i_imm/rddd");
+        if let Ok(imm) = u16::try_from(value) {
+            self.write_insn("setfield_vable_i_imm/rdd");
+            self.push_reg_u8(vable_reg, "setfield_vable_i base");
+            self.push_u16(imm);
+            self.push_u16(field_descr);
+            return;
+        }
+        let const_idx = self.add_const_i(value);
+        self.write_insn("setfield_vable_i/rid");
         self.push_reg_u8(vable_reg, "setfield_vable_i base");
-        self.push_u16(imm as u16);
-        self.push_u16((imm >> 16) as u16);
+        let src_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((src_offset, ConstKind::Int, const_idx));
         self.push_u16(field_descr);
     }
 
@@ -7965,6 +7985,7 @@ mod tests {
         // `load_const_i_value` emits the `USE_C_FORM` short encoding for
         // byte-sized constants, so wire both `int_copy` variants.
         entries.insert("int_copy/c>i".to_string(), jitcode::insns::BC_MOVE_I_C);
+        entries.insert("int_copy/d>i".to_string(), jitcode::insns::BC_MOVE_I_D);
         entries.insert("int_return/i".to_string(), jitcode::insns::BC_INT_RETURN);
         let mut builder = BlackholeInterpBuilder::new();
         builder.setup_insns(&entries);
@@ -8799,18 +8820,39 @@ mod tests {
         );
     }
 
-    /// A value that does not fit a signed byte still goes through the pool
-    /// as `int_copy/i>i`.
+    /// A bytecode offset past the signed-byte short form is a u16 immediate
+    /// (`int_copy/d>i`), not a `constants_i` slot.
     #[test]
-    fn load_const_i_value_pools_values_wider_than_a_byte() {
+    fn load_const_i_value_uses_u16_immediate_for_wide_pcs() {
         let mut builder = JitCodeBuilder::new();
         builder.ensure_i_regs(1);
         builder.load_const_i_value(0, 1000);
+        let jitcode = builder.try_finish().expect("u16 immediate must assemble");
+        assert!(jitcode.constants_i.is_empty());
+        assert_eq!(
+            jitcode.code,
+            vec![
+                majit_jitcode::codewriter::insns::insn_byte("int_copy/d>i"),
+                (1000u16 & 0xff) as u8,
+                (1000u16 >> 8) as u8,
+                0
+            ]
+        );
+    }
+
+    /// A value that does not fit u16 still goes through the pool
+    /// as `int_copy/i>i`.
+    #[test]
+    fn load_const_i_value_pools_values_wider_than_u16() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(1);
+        builder.load_const_i_value(0, 70_000);
         let jitcode = builder.try_finish().expect("pooled form must assemble");
         assert_eq!(
             jitcode.code[0],
             majit_jitcode::codewriter::insns::insn_byte("int_copy/i>i")
         );
+        assert_eq!(jitcode.constants_i, vec![70_000]);
     }
 
     /// A `Constant` operand is the register-space index of its constants

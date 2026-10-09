@@ -560,15 +560,14 @@ impl MIFrame {
         (base, field_idx, src)
     }
 
-    /// `setfield_vable_i_imm/rddd`: `(vable_reg, field_idx, immediate)`.
-    /// Layout: 1B vable_reg + u32 value + 2B descr.
+    /// `setfield_vable_i_imm/rdd`: `(vable_reg, field_idx, immediate)`.
+    /// Layout: 1B vable_reg + u16 value + 2B descr.
     pub fn read_vable_setfield_imm(&mut self) -> (usize, usize, i64) {
-        let field_idx = self.vable_field_index_at(self.code_cursor + 5);
+        let field_idx = self.vable_field_index_at(self.code_cursor + 3);
         let base = self.next_u8() as usize;
-        let lo = self.next_u16() as u32;
-        let hi = self.next_u16() as u32;
+        let imm = self.next_u16() as i64;
         self.code_cursor += 2;
-        (base, field_idx, (lo | (hi << 16)) as i64)
+        (base, field_idx, imm)
     }
 
     /// Decode a `getarrayitem_vable_<kind>/ridd>X` operand quintuple,

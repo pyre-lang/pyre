@@ -328,7 +328,7 @@ pub(crate) struct InlineBodyFacts {
     pub(crate) index_sample_safe: bool,
     /// Body performs a nested Python call.
     pub(crate) exc_override_has_nested_call: bool,
-    /// Body carries a loop header of its own (a `jit_merge_point`).
+    /// Body carries a loop header of its own (a `loop_header` / `can_enter_jit`).
     pub(crate) owns_loop_header: bool,
     /// Wrapped code object carries protected-region metadata.
     pub(crate) has_exception_table: bool,

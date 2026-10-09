@@ -2029,6 +2029,20 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Re-publish the executing opcode after an escape flush overwrote it with
+/// the interpreter resume coordinate (`resume_py_pc - 1`).  `fget_f_lasti`
+/// forces then reads, so without this the tracer reports the previous
+/// instruction.
+fn republish_executing_last_instr(frame: usize, py_pc: usize) {
+    PUBLISHED_LAST_INSTR.with(|slot| {
+        if matches!(slot.get(), Some((published, _)) if published == frame) {
+            unsafe {
+                (*(frame as *mut pyre_interpreter::PyFrame)).last_instr = py_pc as isize;
+            }
+        }
+    });
+}
+
 /// Preserve the instruction that raised when a residual-call traceback hook
 /// has finalized the currently published frame.  On PyPy the dispatch loop's
 /// `last_instr` store precedes `handle_operation_error`, so there is no older
@@ -2535,6 +2549,11 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 };
                 if let Some(py_pc) = portal_py_pc {
                     COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
+                    // `fget_f_lasti` forces then reads.  The flush wrote
+                    // `resume_py_pc - 1` (interpreter resume), which is the
+                    // previous opcode; keep the executing pc visible for the
+                    // rest of the residual (`LiveLastInstrGuard`).
+                    republish_executing_last_instr(expected, py_pc);
                 }
             } else if crate::state::flush_locals_region_to_frame(ctx, expected) {
                 record_escape_flush_image(expected);
@@ -5749,14 +5768,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // reaches that continuation whenever every live color has a
             // concrete value, so build the resume-past image here, before
             // WalkContext's concrete banks disappear, and consume it in
-            // run_perfn_walk's VableEscaped epilogue.  Both the latch
-            // (non-bridge, empty framestack, not an inline sub-walk, resolvable
-            // snapshot sym) and the adopt (`try_adopt_single_frame_blackhole` →
+            // run_perfn_walk's VableEscaped epilogue.  The latch (portal,
+            // not an inline sub-walk, resolvable snapshot sym) and the adopt
+            // (`try_adopt_single_frame_blackhole` →
             // `apply_single_frame_blackhole_crn`, which validates every mapped
             // color and every live operand-stack slot before writing anything)
             // decline to the pre-existing escape/replay path on any unmet
             // condition, so this only ever replaces a replay that would have
-            // produced the same state.
+            // produced the same state.  A bridge walk reaches the same
+            // epilogue; excluding it left ABORT_ESCAPE on the legacy replay
+            // path, which re-enters the loop at GET_ITER.
             //
             // Neither `writes_live_heap` nor the odometer gates it.  Both
             // describe hazards of RE-RUNNING the escaping opcode, which is what
@@ -5793,13 +5814,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     ),
                     Err(exc) => (None, exc, true),
                 };
-                // Same non-bridge latch as the escape-flush commit above:
-                // a bridge walk never adopts this image (`run_perfn_walk`
-                // epilogue is skipped).
-                if ctx.session.borrow().at_portal()
-                    && !ctx.fbw_mode.inline_subwalk
-                    && !ctx.trace_ctx.is_bridge_trace
-                {
+                // Same portal latch as the escape-flush commit above.
+                // `run_perfn_walk`'s VableEscape epilogue adopts this image
+                // for root and bridge walks alike (`pyjitpl.py`
+                // `SwitchToBlackhole(ABORT_ESCAPE)` then
+                // `run_blackhole_interp_to_cancel_tracing`).
+                if ctx.session.borrow().at_portal() && !ctx.fbw_mode.inline_subwalk {
                     let jitcode = unsafe {
                         let sym = &*ctx.fbw_mode.snapshot_sym;
                         (!sym.jitcode().is_null())
@@ -7997,11 +8017,74 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     }
 }
 
+/// Snapshot a residual-call guard.  The shared `dispatch_bytecode`
+/// residual sits out of line: `snapshot_pc` is the `goto L_shared` and
+/// `residual_pc` is the shared call.  `containing_py_pc` of the call is
+/// the last opcode, so a capture at `residual_pc` publishes RETURN's
+/// `last_instr`.  Capture at the goto with `after_residual_call=false`
+/// so `resume_marker(goto)` is a can_decode startpoint, and keep the
+/// `setfield_vable` last_instr (this opcode) instead of `py_pc - 1`.
+fn capture_residual_guard_at<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    residual_pc: usize,
+    snapshot_pc: usize,
+    residual_call_catch_resume: bool,
+) -> Result<(), DispatchError> {
+    if snapshot_pc != residual_pc {
+        walker_capture_snapshot_for_last_guard_impl(
+            ctx,
+            snapshot_pc,
+            false,
+            GuardCaptureScope {
+                residual_call_catch_resume,
+                preserve_vable_last_instr: true,
+                ..GuardCaptureScope::default()
+            },
+        )
+    } else if residual_call_catch_resume {
+        walker_capture_snapshot_for_last_guard_scoped(
+            ctx,
+            snapshot_pc,
+            GuardCaptureScope {
+                residual_call_catch_resume: true,
+                ..GuardCaptureScope::default()
+            },
+        )
+    } else {
+        walker_capture_snapshot_for_last_guard(ctx, snapshot_pc)
+    }
+}
+
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    dispatch_residual_call_iRd_kind_at(code, op, ctx, dst_bank, op.pc, op.next_pc)
+}
+
+/// Same as [`dispatch_residual_call_iRd_kind`], with the instruction's
+/// jitcode pc named separately from the residual's own bytes.
+///
+/// Flatten facts `dispatch_bytecode`'s one `if self.debugdata` copy
+/// out of line (`goto L_shared` + residual + `switch last_instr`).
+/// `containing_py_pc` of the residual would name whichever opcode's
+/// floor owns that shared block, so `LiveLastInstrGuard`, the
+/// ABORT_ESCAPE blackhole, and GuardNotForced / GuardNoException
+/// snapshots must take the `goto`'s pc — the in-loop copy's
+/// coordinate (`pyopcode.py dispatch_bytecode`).  A per-instruction
+/// trailing `-live-` after that goto overflows
+/// `exception_metadata_jitstress.run` (`u16` `code_len`), so the
+/// shared-waj capture uses `after_residual_call=false` and keeps the
+/// `setfield_vable` last_instr instead of `py_pc - 1`.
+pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    dst_bank: char,
+    snapshot_pc: usize,
+    resume_after: usize,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py) opens every residual call
     // with metainterp.clear_exception(), so a caught exception's
@@ -9242,7 +9325,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
         // split rationale.
         if emit_guard_not_forced {
-            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, snapshot_pc);
             write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
@@ -9343,8 +9426,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             &allboxes,
             call_descr,
             recorded,
-            op.pc,
-            Some((op.next_pc, dst_bank, dst)),
+            snapshot_pc,
+            Some((resume_after, dst_bank, dst)),
             namespace_write_journaled,
         )?;
         // `execute_varargs`: `if pure and not last_exc_value and op:
@@ -9433,13 +9516,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if emit_guard_not_forced {
             // #73: maintain the `-live-` AFTER anchor.  A
             // residual-call guard reads its resume point at `self.pc` (the
-            // `-live-` trailing the call, `pyjitpl.py`).  `op.next_pc` is
-            // the first byte after the residual_call opcode, which the
-            // `[funcptr, Call, -live-]` layout (jitcode.rs) makes the
-            // trailing `-live-` byte.  Side-data only.
-            ctx.live_after_jit_pc = op.next_pc;
+            // `-live-` trailing the call, `pyjitpl.py`).  The shared
+            // `dispatch_bytecode` residual is out of line: `snapshot_pc`
+            // is the `goto L_shared`.  A capture at `op.pc` would
+            // publish `last_instr` from the last opcode's floor.
+            ctx.live_after_jit_pc = resume_after;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            capture_residual_guard_at(ctx, op.pc, snapshot_pc, false)?;
         }
         // `metainterp.handle_possible_exception()` —
         // emits `GUARD_EXCEPTION(exc_type)` when the recording-time
@@ -9452,7 +9535,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `COND_CALL_GC_WB` cannot raise (`resoperation.py`).
         if can_raise && !is_list_wb {
             if resid_raised {
-                walker_record_guard_exception(ctx, op.pc)?;
+                walker_record_guard_exception_scoped(
+                    ctx,
+                    snapshot_pc,
+                    GuardCaptureScope {
+                        residual_call_catch_resume: true,
+                        // Shared `dispatch_bytecode` residual: `snapshot_pc`
+                        // is the `goto L_shared`, not `op.pc`. Keep
+                        // `setfield_vable` last_instr and skip the
+                        // after-residual advance (`capture_residual_guard_at`
+                        // when `snapshot_pc != residual_pc`).
+                        preserve_vable_last_instr: snapshot_pc != op.pc,
+                        ..GuardCaptureScope::default()
+                    },
+                )?;
                 // `handle_possible_exception` routes
                 // the raising branch through `finishframe_exception()`
                 // immediately after emitting `GUARD_EXCEPTION`, so the
@@ -9478,15 +9574,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 // the CALL pc is actually covered by the code's exception table
                 // (checked in `walker_capture_snapshot_for_last_guard_impl`);
                 // an uncovered residual keeps the generic fallthrough resume.
-                // See the scope field's doc.
-                walker_capture_snapshot_for_last_guard_scoped(
-                    ctx,
-                    op.pc,
-                    GuardCaptureScope {
-                        residual_call_catch_resume: true,
-                        ..GuardCaptureScope::default()
-                    },
-                )?;
+                // See the scope field's doc.  Shared waj captures at the
+                // `goto`, whose py_pc is this opcode, not the residual.
+                capture_residual_guard_at(ctx, op.pc, snapshot_pc, true)?;
             }
         }
 
