@@ -252,10 +252,40 @@ pub fn atanh(args: &[PyObjectRef]) -> PyResult {
 }
 
 // Exponential / logarithmic
+/// interp_math.py `math1` catches the low-level `ValueError` from
+/// `ll_math.py ll_math_sqrt` and raises the app-level error.
+/// `math1` uses `"math domain error"`; the observable is
+/// `test_math.py test_exception_messages`:
+/// `expected a nonnegative input, got {float_repr(x)}`.
+fn sqrt_from_double(x: f64) -> PyResult {
+    match pyre_interpreter::objspace::descroperation::ll_math_sqrt(x) {
+        Ok(y) => pyre_interpreter::objspace::descroperation::_float_pos(y),
+        Err(err) => sqrt_translate_ll_error(x, err),
+    }
+}
+
+/// `math1`'s `except ValueError: raise oefmt(...)`. The message builder
+/// is the except body, not the recorded success path.
+#[majit_macros::dont_look_inside]
+fn sqrt_translate_ll_error(x: f64, err: pyre_interpreter::PyError) -> PyResult {
+    if err.kind == pyre_interpreter::PyErrorKind::ValueError {
+        Err(pyre_interpreter::PyError::value_error(format!(
+            "expected a nonnegative input, got {}",
+            float_repr(x)
+        )))
+    } else {
+        Err(err)
+    }
+}
+
+/// interp_math.py `sqrt` = `math1(space, math.sqrt, w_x)`.
 pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
-    math1_pymath("sqrt", args, pymath::math::sqrt, |v| {
-        format!("expected a nonnegative input, got {}", float_repr(v))
-    })
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "sqrt() takes exactly one argument",
+        ));
+    }
+    sqrt_from_double(try_get_double(args[0])?)
 }
 
 /// Arity / keyword / domain residual of `sqrt`. The positional-count check is
@@ -285,7 +315,9 @@ pub fn __majit_wrap_math_sqrt(args: &[PyObjectRef]) -> PyResult {
                 None
             };
         if let Some(x) = x {
-            // ll_math.py `ll_math_sqrt`: `x < 0.0` raises; NaN fails `x >= 0.0`.
+            // The two `ll_math_sqrt` branches, then `_float_sqrt`
+            // (`sqrt_nonneg`). Domain miss falls to `sqrt_slow` → `sqrt`
+            // → `sqrt_from_double`, which is `math1`'s catch.
             if x >= 0.0 {
                 if x.is_finite() {
                     return pyre_interpreter::objspace::descroperation::_float_sqrt(x);

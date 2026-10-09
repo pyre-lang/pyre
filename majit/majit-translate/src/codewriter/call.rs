@@ -6444,24 +6444,17 @@ impl CallControl {
             //         todo.append(c_func.value._obj.graph)
             // ```
             //
-            // `int_floordiv` / `int_mod` are the host graph bound to
-            // `_ll_2_int_floordiv` / `_ll_2_int_mod` (`support.py`
-            // bodies).  `PipelineConfig::builtin_graphs` registers that
-            // graph under the bare canonical path, so the seed arm
-            // below pushes it and route (a) classifies the call
-            // `regular`.  Inside, `x // y` / `x % y` are `ll_int_py_div`
-            // / `ll_int_py_mod`; this BFS skips those oopspec callees
-            // (`callee-oopspec-builtin`).
-            //
-            // Two entries stay unseeded, because no graph is registered
-            // under their canonical name:
-            //   (a) `int_abs` — no `_ll_1_int_abs` fnaddr and no helper
-            //       body.  A fnaddr-only binding would make the call an
-            //       opaque extern, the opposite of seeding the graph.
-            //   (b) `ll_math.ll_math_sqrt` — no `ll_math_sqrt` that raises
-            //       `ValueError("math domain error")` on a negative input
-            //       (`ll_math.py`).  `f64::sqrt` returns NaN, so the
-            //       fnaddr stays unbound.
+            // All four `inline_calls_to` helpers have interpreter-source
+            // bodies: `_ll_1_int_abs` / `_ll_2_int_floordiv` /
+            // `_ll_2_int_mod` (`support.py`) and
+            // `_ll_1_ll_math_ll_math_sqrt` (`ll_math.py ll_math_sqrt`).
+            // `PipelineConfig::builtin_graphs` registers the floordiv/mod
+            // graphs under the bare canonical path; abs and sqrt register
+            // under that path via `free_function_alias_paths`.  The seed
+            // arm below pushes each and route (a) classifies the call
+            // `regular`.  Inside floordiv/mod, `x // y` / `x % y` are
+            // `ll_int_py_div` / `ll_int_py_mod`; this BFS skips those
+            // oopspec callees (`callee-oopspec-builtin`).
             for (oopspec_name, ll_args, ll_res) in crate::support::INLINE_CALLS_TO {
                 // `call.py:60-64`:
                 //   c_func, _ = support.builtin_func_for_spec(self.rtyper,
@@ -6479,17 +6472,14 @@ impl CallControl {
                 //
                 // Pre-check via `lookup_function_fnaddr` keeps the strict
                 // panic inside `setup_extra_builtin` (mirroring
-                // `support.py:687-690` raise-on-miss) from firing for
-                // entries pyre's host has not bound — pyre's helpers
-                // (`ll_math.ll_math_sqrt`) are not all registered as
-                // concrete C ABI intrinsics, so the seed loop honestly
-                // skips entries with no host binding rather than
-                // crashing.  Entries that ARE bound flow through
+                // `support.py setup_extra_builtin` raise-on-miss) from
+                // firing for a host/test that has not bound the helper.
+                // Production registers all four `inline_calls_to`
+                // fnaddrs.  Bound entries flow through
                 // `builtin_func_for_spec`, populating the rtyper-
                 // equivalent cache, and contribute their canonical-impl
-                // graph to the BFS seed when (and only when) a
-                // Rust-source graph has been registered under that
-                // canonical name.
+                // graph to the BFS seed when a Rust-source graph has
+                // been registered under that canonical name.
                 let canonical_path = CallPath::from_segments([format!(
                     "_ll_{}_{}",
                     ll_args.len(),
@@ -13962,6 +13952,45 @@ mod tests {
             cc.guess_call_kind(&direct_call_op(unknown)),
             CallKind::Residual
         );
+    }
+
+    /// `call.py find_all_graphs` seeds every `support.inline_calls_to`
+    /// helper graph once the host has registered the body.
+    #[test]
+    fn find_all_graphs_seeds_all_four_inline_calls_to_helpers() {
+        let mut cc = CallControl::new();
+        let portal = CallPath::from_segments(["portal"]);
+        let mut portal_graph = FunctionGraph::new("portal");
+        portal_graph.set_return(portal_graph.startblock, None);
+        cc.register_function_graph(portal.clone(), portal_graph);
+        cc.mark_portal(portal);
+
+        for (name, addr) in [
+            ("_ll_1_int_abs", 1i64),
+            ("_ll_2_int_floordiv", 2),
+            ("_ll_2_int_mod", 3),
+            ("_ll_1_ll_math_ll_math_sqrt", 4),
+        ] {
+            let path = CallPath::from_segments([name]);
+            cc.register_function_fnaddr(path.clone(), addr);
+            let mut graph = FunctionGraph::new(name);
+            graph.set_return(graph.startblock, None);
+            cc.register_function_graph(path, graph);
+        }
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_all_graphs(&mut policy);
+        for name in [
+            "_ll_1_int_abs",
+            "_ll_2_int_floordiv",
+            "_ll_2_int_mod",
+            "_ll_1_ll_math_ll_math_sqrt",
+        ] {
+            assert!(
+                cc.is_candidate(&CallPath::from_segments([name])),
+                "{name} must be an inline_calls_to seed"
+            );
+        }
     }
 
     #[test]

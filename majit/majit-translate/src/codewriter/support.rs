@@ -12,12 +12,10 @@
 //! [`INLINE_CALLS_TO`] mirrors `support.py inline_calls_to`
 //! verbatim — the four entries upstream's `find_all_graphs` BFS seeds
 //! so the inliner can always reach `int_abs` / `int_floordiv` /
-//! `int_mod` / `ll_math.ll_math_sqrt`.  `int_floordiv` / `int_mod`
-//! are the host graph bound to `_ll_2_int_floordiv` / `_ll_2_int_mod`;
+//! `int_mod` / `ll_math.ll_math_sqrt`.  The host graphs are
+//! `_ll_1_int_abs` / `_ll_2_int_floordiv` / `_ll_2_int_mod` /
+//! `_ll_1_ll_math_ll_math_sqrt` (`ll_math.py ll_math_sqrt`);
 //! the BFS seed pushes those canonical paths.
-//! `int_abs` and `ll_math.ll_math_sqrt` stay unseeded: pyre has no
-//! body graph for either, and binding a fnaddr alone would make the
-//! call opaque.
 //!
 //! [`builtin_func_for_spec`] is a line-by-line port of
 //! `support.py:767-808`. The RPython algorithm — cache lookup, list-or-dict
@@ -1184,10 +1182,9 @@ mod tests {
 
     #[test]
     fn inline_calls_to_matches_upstream_four_entries() {
-        // `support.py:444-449` parity — exactly the four upstream
-        // entries, in upstream order.  A new entry here means a new
-        // upstream line landed; sync it instead of letting the
-        // tables drift.
+        // `support.py inline_calls_to` parity — exactly the four
+        // upstream entries, in upstream order.  `find_all_graphs_bfs`
+        // seeds all four when their bodies are registered.
         assert_eq!(INLINE_CALLS_TO.len(), 4);
         assert_eq!(INLINE_CALLS_TO[0].0, "int_abs");
         assert_eq!(INLINE_CALLS_TO[0].1, &[Type::Int]);

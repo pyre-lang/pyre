@@ -4629,25 +4629,16 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if unop_name == "abs" && self.get_value_kind_var(operand) == 'i' => {
-                // `rint.py rtype_abs` → `int_abs`.  There is no `int_abs`
-                // opcode; mint `ll_int_abs` (`if x < 0: -x else x`) the
-                // same way `ll_min` is minted for `core::cmp::min`.
-                let Some(cc) = self.callcontrol.as_deref_mut() else {
-                    return RewriteResult::Keep;
-                };
-                let path = crate::codewriter::minmax::int_abs_path(cc);
-                let helper_call = SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: path.segments.clone(),
-                            fun_decl_id: None,
-                        },
-                        args: crate::model::call_args(std::iter::once(operand.clone())),
-                        result_ty: ValueType::Int,
-                    },
-                };
-                return self.rewrite_operation(&helper_call, graph_name, graph);
+                // `rint.py rtype_abs` → `int_abs`.  `jtransform.py
+                // rewrite_op_int_abs = _do_builtin_call` emits
+                // `direct_call(_ll_1_int_abs, x)`.  A candidate helper
+                // graph is `inline_call`; otherwise residual.
+                RewriteResult::Replace(self.emit_int_abs(
+                    graph,
+                    operand,
+                    op.result.clone(),
+                    graph_name,
+                ))
             }
             OpKind::UnaryOp {
                 op: unop_name,
@@ -5465,6 +5456,65 @@ impl<'a> Transformer<'a> {
             return false;
         };
         self.get_value_type(var) == Some(ValueType::Int)
+    }
+
+    /// Emit `direct_call(_ll_1_int_abs, x)` —
+    /// `jtransform.py rewrite_op_int_abs = _do_builtin_call`.
+    /// `try_lower_checked_neg`'s wrapping `checked_abs` payload is this
+    /// same UnaryOp `abs`; overflow is the `i64::MIN` discriminant
+    /// (`rint.py rtype_abs_ovf` / `ll_int_abs_ovf`).
+    fn emit_int_abs(
+        &mut self,
+        graph: &mut FunctionGraph,
+        operand: &crate::flowspace::model::Variable,
+        result: Option<crate::flowspace::model::Variable>,
+        graph_name: &str,
+    ) -> Vec<SpaceOperation> {
+        let target = CallTarget::function_path(["_ll_1_int_abs"]);
+        let direct_call = SpaceOperation {
+            result: result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(std::iter::once(operand.clone())),
+                result_ty: ValueType::Int,
+            },
+        };
+        let regular = self
+            .callcontrol
+            .as_ref()
+            .is_some_and(|cc| cc.guess_call_kind(&direct_call) == crate::call::CallKind::Regular);
+        if regular
+            && let RewriteResult::Replace(ops) = self.handle_regular_call(
+                &direct_call,
+                &target,
+                std::slice::from_ref(operand),
+                &ValueType::Int,
+                graph_name,
+                graph,
+            )
+        {
+            return ops;
+        }
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        vec![
+            funcptr_op,
+            SpaceOperation {
+                result,
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::from_signature(
+                        &[majit_ir::value::Type::Int],
+                        majit_ir::value::Type::Int,
+                        EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
+                    ),
+                    args_i: vec![operand.clone()],
+                    args_r: vec![],
+                    args_f: vec![],
+                    result_kind: 'i',
+                    indirect_targets: None,
+                },
+            },
+        ]
     }
 
     /// Emit the `_ll_2_int_mod` / `_ll_2_int_floordiv` call shared by
@@ -19075,6 +19125,82 @@ mod tests {
             .expect("registered floordiv must rewrite to inline_call");
         assert_eq!(inline.1, 'i');
         assert_eq!(inline.0, &vec![lhs_var, rhs_var]);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            "inline_call is followed by -live-: {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "a candidate helper is not a residual call: {ops:?}"
+        );
+    }
+
+    /// Route (a): `rewrite_op_int_abs = _do_builtin_call`.  Once the
+    /// `_ll_1_int_abs` graph is a candidate, the i64 `abs` UnaryOp
+    /// is an `inline_call`.
+    #[test]
+    fn int_abs_registered_graph_lowers_to_inline_call() {
+        let mut helper = FunctionGraph::new("_ll_1_int_abs");
+        helper.set_return(helper.startblock, None);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.register_function_graph(
+            crate::parse::CallPath::from_segments(["_ll_1_int_abs"]),
+            helper,
+        );
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("abs_body");
+        let operand = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "abs".to_string(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&operand, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "abs") }),
+            "bare abs must not survive: {ops:?}"
+        );
+        let inline = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::InlineCall {
+                    args_i,
+                    result_kind,
+                    ..
+                } => Some((args_i, *result_kind)),
+                _ => None,
+            })
+            .expect("registered abs must rewrite to inline_call");
+        assert_eq!(inline.1, 'i');
+        assert_eq!(inline.0, &vec![operand]);
         assert!(
             ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
             "inline_call is followed by -live-: {ops:?}"
