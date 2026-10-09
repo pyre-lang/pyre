@@ -9488,8 +9488,8 @@ fn pygraph_initial_block(
         // StringRepr and InstanceRepr callers never meet in one
         // source-level FunctionDesc cell.
         //
-        // Key it on the LAST parameter, never on index 1: both spellings
-        // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
+        // Key it on the LAST parameter, never on index 1: `pin_root` takes
+        // one `PyObjectRef` and `pin_roots` takes the slice; the
         // `RootScope` method form puts `&self` first, so stamping index 1
         // there annotates the receiver and leaves the GC pointer untouched.
         let class_root = if let Some(root) = &cell_root {
@@ -9723,8 +9723,8 @@ impl<'a> Lowering<'a> {
             // StringRepr and InstanceRepr callers never meet in one
             // source-level FunctionDesc cell.
             //
-            // Key it on the LAST parameter, never on index 1: both spellings
-            // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
+            // Key it on the LAST parameter, never on index 1: `pin_root` takes
+            // one `PyObjectRef` and `pin_roots` takes the slice; the
             // `RootScope` method form puts `&self` first, so stamping index 1
             // there annotates the receiver and leaves the GC pointer untouched.
             // Same membership as [`gc_mut_ref_param_locals`]: a cell
@@ -18513,10 +18513,16 @@ impl<'a> Lowering<'a> {
     ///   straight through agree on one annotation.
     /// * **narrow** — `obj as *const RegisteredStruct`; see
     ///   `__cast_instance_intrinsic` below.
+    /// * **recast GCREF** — a value-model word occupying a GC pointer
+    ///   slot (`as PyObjectRef` / `pin_root`). RPython recasts a typed
+    ///   GC pointer into that slot with `cast_opaque_ptr` (`rgcref.py`
+    ///   `pairtype(Repr, GCRefRepr).convert_from_to`).
     ///
     /// Both are pointer-to-pointer only: a `Ref` source is required, since
     /// an `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
-    /// territory and must alias instead.
+    /// territory and must alias instead.  A `Str` source is the same
+    /// physical pointer: aliasing would keep `SomeString` on a slot that
+    /// later phis with `null` PyObjectRef.
     fn ptr_cast_marker(
         &mut self,
         src_kind: Option<&ValueType>,
@@ -18524,17 +18530,28 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         arg: &Variable,
     ) -> Option<(OpKind, Variable)> {
-        if !matches!(src_kind, Some(ValueType::Ref(_)))
-            || !matches!(
-                tyref_to_value_type_with(
-                    dest_ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids
-                ),
-                ValueType::Ref(_)
-            )
-        {
+        let dest_kind = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        );
+        if !matches!(dest_kind, ValueType::Ref(_)) {
+            return None;
+        }
+        // `pairtype(Repr, GCRefRepr).convert_from_to` (`rgcref.py`): the
+        // dest is an instance pointer consumed as a GCREF slot (`pin_root`
+        // / `gc_root_pin_path`). The annotator already accepts the source
+        // value on a GCREF root (`cast_instance_intrinsic` `root == "GCREF"`).
+        if matches!(src_kind, Some(ValueType::Str)) {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let kind =
+                crate::model::cast_instance_call_result("GCREF", arg.clone(), ValueType::Ref(None));
+            return Some((kind, res));
+        }
+        if !matches!(src_kind, Some(ValueType::Ref(_))) {
             return None;
         }
         let (segments, result_ty) =
@@ -24254,7 +24271,10 @@ impl<'a> Lowering<'a> {
         // whether a given callee is scoped.
         let mut callee_name_path: Option<String> = None;
         // `v.extend_from_slice(s)` on a `Vec` of one-word items is
-        // `ll_extend` from the pair.
+        // `ll_extend` from the pair (`rlist.py` `ll_extend` /
+        // `AbstractListRepr.rtype_method_extend`). The helper is
+        // `rust_vec_helper_segments` / `rust_vec_helper_ops` arity 3
+        // `(l, items, length)` (`rrustvec.rs` `"extend_from_slice"`).
         let vec_extend_kind = match &call.func {
             CallFunc::Regular(reg)
                 if matches!(pair_lens.as_slice(), [(1, _)])
@@ -24300,13 +24320,13 @@ impl<'a> Lowering<'a> {
                 let args = splice_pair_lens(args, pair_lens);
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: majit_ir::rvec::vec_helper_path(
+                        // `ll_extend` from the `(items, length)` pair
+                        // (`rlist.py` `ll_extend` /
+                        // `AbstractListRepr.rtype_method_extend`).
+                        segments: rust_vec_helper_segments(
                             majit_ir::rvec::VecOp::ExtendFromSlice,
                             kind,
-                        )
-                        .split("::")
-                        .map(str::to_string)
-                        .collect(),
+                        ),
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(args),
@@ -24469,13 +24489,13 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Rust exposes RPython's generated shadow-stack publication as
-                // a normal `pin_root(PyObjectRef)` call.  Its pointer argument
-                // is actually `llmemory.GCREF`, irrespective of the source
-                // pointer's external repr, so cast it the way
-                // `gct_gc_identityhash` casts a GC helper's pointer argument
-                // (`framework.py:1174-1182`) — before FunctionDesc propagation,
-                // so strings, W_Root instances, and other GC pointers do not
-                // union at the helper's single input cell.
+                // a normal `pin_root(PyObjectRef)` / `pin_roots(&[…])` call.
+                // The last pointer argument is actually `llmemory.GCREF`,
+                // irrespective of the source pointer's external repr, so cast
+                // it the way `gct_gc_identityhash` casts a GC helper's pointer
+                // argument (`framework.py`) — before FunctionDesc
+                // propagation, so strings, W_Root instances, and other GC
+                // pointers do not union at the helper's single input cell.
                 //
                 // The pointer is the LAST argument: the `RootScope` method form
                 // `gc_root_pin_path` also admits passes `&self` first, and
@@ -44355,12 +44375,18 @@ fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::Call
     }
 }
 
-/// True for the root-stack publication helper.  Both the free function and
-/// `RootScope` method spell the last two semantic components `gc_roots` and
-/// `pin_root`, with an optional `<Impl>` segment between them.
+/// True for the root-stack publication helper.  The free function and
+/// `RootScope` method spell `gc_roots` plus `pin_root` / `pin_roots`, with
+/// an optional `<Impl>` segment between them.
+///
+/// `pin_roots` takes the slice as its last argument; that word is the same
+/// GCREF slot `gct_gc_identityhash` (`framework.py`) recasts before the
+/// call, so StringRepr and InstanceRepr callers do not meet in one
+/// FunctionDesc cell (`mergeinputargs` `Instance(PyObject) ∪ Ptr(GCREF)`).
 fn gc_root_pin_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.last() == Some(&"pin_root") && segments.contains(&"gc_roots")
+    let last = segments.last().copied();
+    (last == Some("pin_root") || last == Some("pin_roots")) && segments.contains(&"gc_roots")
 }
 
 /// The root-bracket guard type and the call that closes one.
@@ -67244,8 +67270,9 @@ fn decode_const_lit(llbc: &Llbc, value: &serde_json::Value) -> Option<ConstLit> 
 /// constants as live host values, so an expression such as pyre's
 /// `MASK: Signed = i64::MAX` must likewise become one literal Constant in the
 /// translated graph. Restrict this recovery to the exact `core::num::<Impl>`
-/// owner, the `MIN` / `MAX` leaves, and a primitive fixed-width integer type;
-/// user constants and target-width `isize` / `usize` remain residual.
+/// owner, the `MIN` / `MAX` leaves, and a primitive integer type.
+/// Target-width `isize` / `usize` fold to `sys.maxint` of the extraction
+/// target.
 fn const_eval_core_num_associated_const(llbc: &Llbc, def_id: u64) -> Option<ConstLit> {
     let global = llbc.global_by_id(def_id)?;
     if global
@@ -67285,6 +67312,11 @@ fn const_eval_core_num_associated_const(llbc: &Llbc, def_id: u64) -> Option<Cons
             "I16" => (i16::MIN as i64, i16::MAX as i64),
             "I32" => (i32::MIN as i64, i32::MAX as i64),
             "I64" => (i64::MIN, i64::MAX),
+            "Isize" => match llbc.target_pointer_size()? {
+                8 => (i64::MIN, i64::MAX),
+                4 => (i32::MIN as i64, i32::MAX as i64),
+                _ => return None,
+            },
             _ => return None,
         };
         return Some(ConstLit::Int(if leaf == "MIN" { min } else { max }));
@@ -67295,6 +67327,11 @@ fn const_eval_core_num_associated_const(llbc: &Llbc, def_id: u64) -> Option<Cons
             "U16" => u16::MAX as u64,
             "U32" => u32::MAX as u64,
             "U64" => u64::MAX,
+            "Usize" => match llbc.target_pointer_size()? {
+                8 => u64::MAX,
+                4 => u32::MAX as u64,
+                _ => return None,
+            },
             _ => return None,
         };
         return Some(ConstLit::UInt(if leaf == "MIN" { 0 } else { max }));
@@ -81790,6 +81827,9 @@ mod tests {
                         &op.kind,
                         OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                             if segments == &["vec", "Vec", leaf]
+                                || segments.last().is_some_and(|s| {
+                                    s == leaf || s.starts_with(&format!("ll_vec_{leaf}_"))
+                                })
                     )
                 })
                 .count()

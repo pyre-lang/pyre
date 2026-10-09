@@ -5946,12 +5946,18 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
 /// An operand is threaded only when it is available on every predecessor path
 /// into the use block.  This is the same condition `SSA_to_SSI` enforces while
 /// adding one inputarg to every block and one argument to every incoming link
-/// (`rpython/translator/backendopt/ssa.py`).  Diamond joins are valid
-/// when the definition dominates the split; a value defined in only one arm,
-/// or one with no upstream definition, is left untouched so the adapter can
-/// Skip the malformed graph.  Back edges provisionally satisfy the recursive
-/// check, but a separate ancestor-definition check prevents a source-less SCC
-/// from manufacturing a definition.  Graphs with no cross-block-undefined
+/// (`rpython/translator/backendopt/ssa.py`).  `SSA_to_SSI.record_used_var`
+/// walks `op.args`, `block.exitswitch`, and `link.args`; this pass matches
+/// that census so a loop-carried iterator named only on the back-edge
+/// (`range_iter` plants `iter()` in the preheader, the latch forwards it)
+/// is an inputarg of the latch, the way `ll_listnext` (`rlist.py`) keeps
+/// the iterator live across a body that does not mention it.
+/// Diamond joins are valid when the definition dominates the split; a
+/// value defined in only one arm, or one with no upstream definition, is
+/// left untouched so the adapter can Skip the malformed graph.  Back
+/// edges provisionally satisfy the recursive check, but a separate
+/// ancestor-definition check prevents a source-less SCC from
+/// manufacturing a definition.  Graphs with no cross-block-undefined
 /// operand collect no work and stay byte-identical.
 pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
     use crate::flowspace::model::Variable;
@@ -9170,8 +9176,25 @@ impl FunctionGraph {
                 if matches {
                     saw_match = true;
                 } else if self.block_can_reach_var(pred, var, preds, reach_memo) {
-                    mixed = true;
-                    break;
+                    // `SSA_to_SSI` unions a minted `w` with `v`
+                    // (`variable_families.union(v, w)`) before walking
+                    // predecessors. That copy is the same family, not a
+                    // genuine phi of unrelated values
+                    // (`DataFlowFamilyBuilder.complete` unifies only
+                    // count == 2). An unresolved copy (incoming still
+                    // unpadded, or a back-edge whose producer is the
+                    // in-progress `w`) has no other origin and must
+                    // not force a second mint at the header.
+                    let other_family = match incoming {
+                        Some(LinkArg::Value(incoming_var)) => self
+                            .ssi_origin_definition(incoming_var)
+                            .is_some_and(|origin| origin != *var),
+                        _ => true,
+                    };
+                    if other_family {
+                        mixed = true;
+                        break;
+                    }
                 }
             }
             if mixed || !saw_match {
@@ -9244,18 +9267,25 @@ impl FunctionGraph {
                 local.clone(),
             );
         }
-        // `ssa.py` `SSA_to_SSI`: append a value for `w` on every incoming
-        // link, then give the predecessor its own copy. Recursing first
-        // yields that predecessor local; a later `set_goto` /
-        // `recloseblock` can replace an exit and drop the extra slot, so
-        // re-walk incoming edges and pad any link still short of
+        // `ssa.py` `SSA_to_SSI`:
+        //   for link in links:
+        //       link.args.append(v)
+        //       pending.append((link.prevblock, v))
+        // Append original `v` first so a family lookup at a predecessor
+        // sees this back-edge as `v` (`DataFlowFamilyBuilder` unified
+        // the header phi with `v` when both incomings were `v`).
+        // `renamevariables` at the predecessor then rewrites the slot
+        // to that block's local. A later `set_goto` / `recloseblock`
+        // can drop the extra slot, so pad any link still short of
         // `inputargs` (`flowspace/model.py` `Link.__init__`
         // `len(args) == len(target.inputargs)`).
-        for (pred_block, exit_idx) in pred_edges {
-            let carried = self.carried_from_pred(pred_block, var, memo, block);
+        for &(pred_block, exit_idx) in &pred_edges {
             self.block_mut(pred_block).exits[exit_idx]
                 .args
-                .push(LinkArg::Value(carried));
+                .push(LinkArg::Value(var.clone()));
+        }
+        for (pred_block, _) in pred_edges {
+            self.carried_from_pred(pred_block, var, memo, block);
         }
         self.pad_incoming_slot_for_var(block, var, &local, memo);
         Some(local)
@@ -9332,6 +9362,24 @@ impl FunctionGraph {
             }
         }
         var.clone()
+    }
+
+    /// Operation result or startblock inputarg `var` was minted from.
+    /// `None` when the copy's incoming is still unpadded — the
+    /// in-progress `variable_families.union(v, w)` case, not a second
+    /// family (`DataFlowFamilyBuilder.complete`).
+    fn ssi_origin_definition(
+        &self,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<crate::flowspace::model::Variable> {
+        let producer = self.chase_ssi_producer(var, &mut HashSet::new());
+        let is_origin = self.blocks.iter().any(|b| {
+            b.operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&producer))
+                || (b.id == self.startblock && b.inputargs.contains(&producer))
+        });
+        is_origin.then_some(producer)
     }
 
     /// Incoming links that lost extra SSI slots (one predecessor
@@ -17074,6 +17122,97 @@ mod tests {
             other => panic!("expected UnaryOp, got {other:?}"),
         }
         assert_eq!(graph.block(dead).exits[0].args.len(), 0);
+        assert_unique_variable_definitions(&graph);
+    }
+
+    /// A for-loop latch that names the preheader `iter()` result on the
+    /// back-edge without defining it (`range_iter` plants `iter()` in the
+    /// preheader; `rlist.py` `ll_listnext` keeps that iterator live through
+    /// a body that does not mention it). `SSA_to_SSI` `record_used_var` on
+    /// `link.args` threads a `Variable.copy()` inputarg so the adapter's
+    /// `link_arg_to_hlvalue` sees a defined operand (`flowspace/model.py`
+    /// `checkgraph` `definevar`).
+    #[test]
+    fn thread_undefined_link_arg_on_loop_back_edge() {
+        let mut graph = FunctionGraph::new("thread_link_arg_latch");
+        let entry = graph.startblock;
+        let (header, header_args) = graph.create_block_with_arg_vars(1);
+        let latch = graph.create_block();
+        let iter = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let iter_phi = header_args[0].clone();
+        let next_item = graph.alloc_value_var();
+        graph.block_mut(header).operations.push(SpaceOperation {
+            result: Some(next_item),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__iter_next".to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![iter_phi.clone()]),
+                result_ty: ValueType::Int,
+            },
+        });
+        graph.set_goto(entry, header, vec![iter.clone()]);
+        graph.set_goto(header, latch, vec![]);
+        graph.set_goto(latch, header, vec![iter.clone()]);
+
+        assert!(
+            !graph.variable_defined_in_block(latch, &iter),
+            "pre-thread latch must not define the preheader iterator",
+        );
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert_eq!(
+            graph.block(header).inputargs.as_slice(),
+            std::slice::from_ref(&iter_phi),
+            "header phi is reused as the family member (DataFlowFamilyBuilder.complete)"
+        );
+        let latch_iter = graph
+            .ssi_variable_at_block(latch, &iter)
+            .expect("latch back-edge iterator is threaded");
+        assert_ne!(
+            latch_iter.id(),
+            iter.id(),
+            "latch inputarg is Variable.copy()"
+        );
+        assert!(
+            graph.variable_defined_in_block(latch, &latch_iter),
+            "latch copy is a definition of this block"
+        );
+        assert!(
+            graph.block(latch).inputargs.contains(&latch_iter),
+            "latch copy is a latch inputarg"
+        );
+        assert_eq!(graph.block(latch).exits[0].target, header);
+        assert!(
+            matches!(
+                &graph.block(latch).exits[0].args[0],
+                LinkArg::Value(v) if v.id() == latch_iter.id()
+            ),
+            "latch exit and header incoming slot from the latch carry the local copy"
+        );
+        assert!(
+            graph.variable_defined_in_block(entry, &iter),
+            "producer identity stays defined in the preheader"
+        );
+        assert!(
+            !graph.variable_defined_in_block(latch, &iter),
+            "producer identity is not defined in latch"
+        );
         assert_unique_variable_definitions(&graph);
     }
 
