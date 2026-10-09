@@ -370,6 +370,113 @@ mod tests {
         assert_eq!(graph.blocks.len(), nblocks);
     }
 
+    /// `raise PyError::value_error("literal")` in one block fuses through
+    /// `to_exc_object` into the published helper. `ll_math.py ll_math_sqrt`
+    /// is this shape after `lower_carrier_raises`.
+    #[test]
+    fn a_same_block_literal_value_error_fuses_its_constructor() {
+        let mut graph = FunctionGraph::new("same_block_value_error");
+        let entry = graph.startblock;
+        let v_msg = graph
+            .push_op_var(entry, OpKind::ConstStr(b"math domain error".to_vec()), true)
+            .unwrap();
+        let v_err = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_interpreter",
+                        "error",
+                        "PyError",
+                        "value_error",
+                    ]),
+                    args: crate::model::call_args(vec![v_msg]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        crate::front::exc_from_raise::set_raise_from_instance(&mut graph, entry, v_err);
+        lower_error_carrier_edges(&mut graph, &carrier());
+
+        let names: Vec<_> = graph.blocks[entry.0]
+            .operations
+            .iter()
+            .filter_map(|op| call_segments(op).and_then(|s| s.last()).map(String::as_str))
+            .collect();
+        assert!(
+            names.contains(&"pyerror_value_error_to_exc_object"),
+            "same-block ctor+to_exc_object must fuse: {names:?}"
+        );
+        assert!(
+            !names.contains(&"value_error"),
+            "PyError::value_error must not survive: {names:?}"
+        );
+        assert!(
+            !names.contains(&"pyerror_to_exc_object"),
+            "unfused materialisation must not survive: {names:?}"
+        );
+    }
+
+    /// A `repr(transparent)` cast between the constructor and the raise
+    /// is the same word; fusion still fires (`ll_math_sqrt`'s production
+    /// graph inserts `__cast_instance_intrinsic`).
+    #[test]
+    fn a_same_block_cast_value_error_fuses_its_constructor() {
+        let mut graph = FunctionGraph::new("same_block_cast_value_error");
+        let entry = graph.startblock;
+        let v_msg = graph
+            .push_op_var(entry, OpKind::ConstStr(b"math domain error".to_vec()), true)
+            .unwrap();
+        let v_err = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_interpreter",
+                        "error",
+                        "PyError",
+                        "value_error",
+                    ]),
+                    args: crate::model::call_args(vec![v_msg]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let v_cast = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__cast_instance_intrinsic"]),
+                    args: crate::model::call_args(vec![v_err]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        crate::front::exc_from_raise::set_raise_from_instance(&mut graph, entry, v_cast);
+        lower_error_carrier_edges(&mut graph, &carrier());
+
+        let names: Vec<_> = graph.blocks[entry.0]
+            .operations
+            .iter()
+            .filter_map(|op| call_segments(op).and_then(|s| s.last()).map(String::as_str))
+            .collect();
+        assert!(
+            names.contains(&"pyerror_value_error_to_exc_object"),
+            "same-block cast ctor must fuse: {names:?}"
+        );
+        assert!(
+            !names.contains(&"value_error"),
+            "PyError::value_error must not survive: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| *n == "__cast_instance_intrinsic"),
+            "the transparent cast must drop with the constructor: {names:?}"
+        );
+    }
+
     /// No carrier named: the graph is left alone.
     #[test]
     fn a_pipeline_without_a_carrier_is_untouched() {

@@ -1201,7 +1201,10 @@ fn real_main() {
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.
             // The graphs are registered under the same crate-qualified
-            // spelling as `helper_graphs` above.
+            // spelling as `helper_graphs` above. Sqrt's Rust name is
+            // `ll_math_sqrt`; `_ll_1_ll_math_ll_math_sqrt` is the
+            // `support.py` alias of that function object, so the seed
+            // path shares its GraphKey (`pin_builtin_graphs`).
             builtin_graphs: vec![
                 (
                     "_ll_2_int_floordiv".to_string(),
@@ -1219,6 +1222,15 @@ fn real_main() {
                         "objspace",
                         "descroperation",
                         "_ll_2_int_mod",
+                    ]),
+                ),
+                (
+                    "_ll_1_ll_math_ll_math_sqrt".to_string(),
+                    majit_translate::CallPath::from_segments([
+                        "pyre_interpreter",
+                        "objspace",
+                        "descroperation",
+                        "ll_math_sqrt",
                     ]),
                 ),
             ],

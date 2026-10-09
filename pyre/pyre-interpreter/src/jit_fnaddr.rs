@@ -5056,13 +5056,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // shape jtransform produces.
     //
     // The Rust-source graphs are `objspace::descroperation`'s
-    // `_ll_1_int_abs` / `_ll_2_int_floordiv` / `_ll_2_int_mod` /
-    // `_ll_1_ll_math_ll_math_sqrt` (`support.py` bodies;
-    // `ll_math.py ll_math_sqrt` for the last).
-    // `find_all_graphs_bfs` seeds those canonical names, and a
-    // route-(a) call whose graph is a candidate is an `inline_call`.
-    // The fnaddrs below are the residual/blackhole address for a call
-    // that stays residual.
+    // `_ll_1_int_abs` / `_ll_2_int_floordiv` / `_ll_2_int_mod`
+    // (`support.py` bodies) and `ll_math_sqrt` (`ll_math.py
+    // ll_math_sqrt`). The last is seeded as `_ll_1_ll_math_ll_math_sqrt`
+    // (`support.py` alias of that function object; `builtin_graphs`
+    // shares the graph). `find_all_graphs_bfs` seeds those canonical
+    // names, and a route-(a) call whose graph is a candidate is an
+    // `inline_call`. The fnaddrs below are the residual/blackhole
+    // address for a call that stays residual.
     cpa1(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::_ll_1_int_abs",
@@ -5082,11 +5083,19 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         crate::objspace::descroperation::_ll_2_int_mod,
     );
     // `ll_math.py ll_math_sqrt` raises; the residual ABI is the Ok `f64`
-    // with `PyError` published out of band (`ResidualError`).
+    // with `PyError` published out of band (`ResidualError`). The
+    // canonical seed name and the source path share this trampoline —
+    // `support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`.
     cpa1(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::_ll_1_ll_math_ll_math_sqrt",
         "_ll_1_ll_math_ll_math_sqrt",
+        _ll_1_ll_math_ll_math_sqrt_word,
+    );
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::ll_math_sqrt",
+        "ll_math_sqrt",
         _ll_1_ll_math_ll_math_sqrt_word,
     );
     p2(

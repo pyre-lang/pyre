@@ -7734,6 +7734,12 @@ pub(crate) fn sqrt_nonneg(x: f64) -> f64 {
 ///
 /// `x < 0.0` raises ValueError("math domain error"); a finite non-negative
 /// goes through [`sqrt_nonneg`]; +inf or nan is returned as-is.
+///
+/// `support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt` is
+/// this same function object under the canonical `inline_calls_to`
+/// seed name. The translator registers that path as a GraphStore alias
+/// of this graph (`PipelineConfig::builtin_graphs`); there is no second
+/// body.
 pub fn ll_math_sqrt(x: f64) -> Result<f64, PyError> {
     if x < 0.0 {
         return Err(PyError::value_error("math domain error"));
@@ -7742,13 +7748,6 @@ pub fn ll_math_sqrt(x: f64) -> Result<f64, PyError> {
         return Ok(sqrt_nonneg(x));
     }
     Ok(x)
-}
-
-/// `support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`.
-///
-/// Canonical impl name `setup_extra_builtin` / `inline_calls_to` seed.
-pub fn _ll_1_ll_math_ll_math_sqrt(x: f64) -> Result<f64, PyError> {
-    ll_math_sqrt(x)
 }
 
 /// ll_math.py `ll_math_sqrt` after the domain pin: `W_FloatObject(sqrt_nonneg(x))`.

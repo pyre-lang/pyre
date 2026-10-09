@@ -14,7 +14,8 @@
 //! so the inliner can always reach `int_abs` / `int_floordiv` /
 //! `int_mod` / `ll_math.ll_math_sqrt`.  The host graphs are
 //! `_ll_1_int_abs` / `_ll_2_int_floordiv` / `_ll_2_int_mod` /
-//! `_ll_1_ll_math_ll_math_sqrt` (`ll_math.py ll_math_sqrt`);
+//! `_ll_1_ll_math_ll_math_sqrt` (`ll_math.py ll_math_sqrt`, the
+//! `support.py` alias of that function object);
 //! the BFS seed pushes those canonical paths.
 //!
 //! [`builtin_func_for_spec`] is a line-by-line port of

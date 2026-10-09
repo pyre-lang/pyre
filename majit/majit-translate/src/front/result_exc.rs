@@ -9820,10 +9820,11 @@ pub(crate) fn collapse_pos0_read(
 /// `int_floordiv` / `int_mod` bodies contribute the literal-message
 /// `zero_division` sites; `long_lshift` / `long_rshift` / `int_lshift` /
 /// `int_rshift` contribute the literal-message `value_error` sites;
-/// `getitem_str` contributes a literal-message `index_error` site.  Each
-/// entry removes the Rust carrier aggregate from the generated JitCode while
-/// preserving the interpreter's exception-object materialisation as one
-/// opaque call.
+/// `ll_math_sqrt` contributes the same-block `"math domain error"`
+/// `value_error` site; `getitem_str` contributes a literal-message
+/// `index_error` site.  Each entry removes the Rust carrier aggregate from
+/// the generated JitCode while preserving the interpreter's exception-object
+/// materialisation as one opaque call.
 const FUSED_KIND_CTORS: &[(&str, &str)] = &[
     ("type_error", "pyerror_type_error_to_exc_object"),
     ("zero_division", "pyerror_zero_division_to_exc_object"),
@@ -9877,15 +9878,17 @@ fn instance_cast_source(op: &OpKind) -> Option<Variable> {
 /// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes
 /// it into a single published call.
 ///
-/// The carrier raise conversion (`codewriter::error_carrier_edges`) leaves
-/// each raise site as a constructor in one block feeding a materialisation in
-/// its successor. The constructor is
+/// The carrier raise conversion (`codewriter::error_carrier_edges`) inserts
+/// `to_exc_object` into the raising block (`lower_carrier_raises`), so a
+/// `return Err(PyError::<kind>("literal"))` site is constructor and
+/// materialisation in the *same* block. A constructor forwarded into a
+/// successor that only materialises is the two-block twin. The constructor is
 /// `PyError::new` once inlined — a transparent constructor with no host
 /// symbol, so it can never be given an address, and the descent that reaches
 /// it is refused. Rewriting the pair to one opaque call removes it from the
 /// caller's JitCode altogether.
 ///
-/// The shape required, all of it verified before anything is mutated:
+/// Two-block shape, all of it verified before anything is mutated:
 ///
 /// ```text
 ///   pred:  v_msg = <string literal>          (may be several blocks back)
@@ -9894,6 +9897,17 @@ fn instance_cast_source(op: &OpKind) -> Option<Variable> {
 ///   succ:  inputargs[pos] = v_payload        (pred is succ's only predecessor)
 ///          v_exc = pyerror_to_exc_object(v_payload)   (succ's only operation)
 ///          -> exceptblock, args = [v_exc, v_exc]
+/// ```
+///
+/// Same-block shape (`ll_math.py ll_math_sqrt` / `flowcontext.py
+/// exc_from_raise` after `lower_carrier_raises`):
+///
+/// ```text
+///   block: v_msg = <string literal>
+///          v_err = PyError::<kind>(v_msg)
+///          v_exc = pyerror_to_exc_object(v_err)   (optional instance cast)
+///          etype = type(v_exc)
+///          -> exceptblock, args = [etype, v_exc]
 /// ```
 ///
 /// `v_msg` must resolve to a string literal: the helper reads it as a
@@ -10056,6 +10070,127 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
             .operations
             .retain(|op| is_frame_exit_cleanup(&op.kind));
         crate::front::exc_from_raise::set_raise_from_instance(graph, graph.blocks[si].id, payload);
+    }
+    fuse_same_block_kind_ctor_raise(graph);
+}
+
+/// Same-block twin of the two-block loop above: constructor, optional
+/// instance cast, `pyerror_to_exc_object`, and `op.type` live in the
+/// raising block (`error_carrier_edges.lower_carrier_raises`).
+fn fuse_same_block_kind_ctor_raise(graph: &mut FunctionGraph) {
+    // (block, ctor op index, helper leaf, indices to drop: high to low)
+    let mut fusions: Vec<(usize, usize, &'static str, Vec<usize>)> = Vec::new();
+    for bi in 0..graph.blocks.len() {
+        let block = &graph.blocks[bi];
+        if block.id == graph.exceptblock || block.exitswitch.is_some() {
+            continue;
+        }
+        let [exit] = block.exits.as_slice() else {
+            continue;
+        };
+        if exit.target != graph.exceptblock {
+            continue;
+        }
+        let [LinkArg::Value(etype), LinkArg::Value(evalue)] = exit.args.as_slice() else {
+            continue;
+        };
+        let Some(type_idx) = block.operations.iter().position(|op| {
+            op.result.as_ref() == Some(etype)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if segments.as_slice() == ["type"]
+                        && args.len() == 1
+                        && args[0].as_variable() == Some(evalue)
+                )
+        }) else {
+            continue;
+        };
+        let Some(mat_idx) = block.operations.iter().position(|op| {
+            op.result.as_ref() == Some(evalue)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("pyerror_to_exc_object")
+                )
+        }) else {
+            continue;
+        };
+        let OpKind::Call { args: mat_args, .. } = &block.operations[mat_idx].kind else {
+            continue;
+        };
+        let [LinkArg::Value(v_payload)] = mat_args.as_slice() else {
+            continue;
+        };
+        let payload_uses = count_var_uses(graph, v_payload);
+        if payload_uses.op_uses != 1 || payload_uses.link_uses != 0 {
+            continue;
+        }
+        let Some(payload_idx) = block
+            .operations
+            .iter()
+            .position(|o| o.result.as_ref() == Some(v_payload))
+        else {
+            continue;
+        };
+        let produced = &block.operations[payload_idx].kind;
+        let (ctor_idx, helper, v_msg, mut drop_idxs) = if let Some((helper, v_msg)) =
+            fused_kind_ctor(produced)
+        {
+            (payload_idx, helper, v_msg, vec![type_idx, mat_idx])
+        } else if let Some(cast_src) = instance_cast_source(produced) {
+            let src_uses = count_var_uses(graph, &cast_src);
+            if src_uses.op_uses != 1 || src_uses.link_uses != 0 {
+                continue;
+            }
+            let Some(real_idx) = block
+                .operations
+                .iter()
+                .position(|o| o.result.as_ref() == Some(&cast_src))
+            else {
+                continue;
+            };
+            let Some((helper, v_msg)) = fused_kind_ctor(&block.operations[real_idx].kind) else {
+                continue;
+            };
+            (
+                real_idx,
+                helper,
+                v_msg,
+                vec![type_idx, mat_idx, payload_idx],
+            )
+        } else {
+            continue;
+        };
+        if !message_is_str_literal(graph, bi, ctor_idx, &v_msg) {
+            continue;
+        }
+        drop_idxs.sort_unstable_by(|a, b| b.cmp(a));
+        drop_idxs.dedup();
+        fusions.push((bi, ctor_idx, helper, drop_idxs));
+    }
+    for (bi, ctor_idx, helper, drop_idxs) in fusions {
+        if let OpKind::Call { target, .. } = &mut graph.blocks[bi].operations[ctor_idx].kind {
+            *target = CallTarget::FunctionPath {
+                segments: [crate::runtime_names::crates::INTERPRETER, "error", helper]
+                    .map(str::to_string)
+                    .to_vec(),
+                fun_decl_id: None,
+            };
+        }
+        let payload = graph.blocks[bi].operations[ctor_idx]
+            .result
+            .clone()
+            .expect("fused constructor produces the exception object");
+        for idx in drop_idxs {
+            graph.blocks[bi].operations.remove(idx);
+        }
+        crate::front::exc_from_raise::set_raise_from_instance(graph, graph.blocks[bi].id, payload);
     }
 }
 

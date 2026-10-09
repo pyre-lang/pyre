@@ -26,6 +26,7 @@ use crate::parse::CallPath;
 use crate::policy::JitPolicy;
 use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{AnalyzerResult, Dependency, DependencyTracker};
+use crate::translator::rtyper::call_registry::{FunctionPathKey, is_exception_object_materializer};
 
 // Decline-census gate names.  Declared in `crate::decline::gate` so a
 // gate name cannot exist without the recorder that consumes it; aliased
@@ -6446,15 +6447,18 @@ impl CallControl {
             //
             // All four `inline_calls_to` helpers have interpreter-source
             // bodies: `_ll_1_int_abs` / `_ll_2_int_floordiv` /
-            // `_ll_2_int_mod` (`support.py`) and
-            // `_ll_1_ll_math_ll_math_sqrt` (`ll_math.py ll_math_sqrt`).
-            // `PipelineConfig::builtin_graphs` registers the floordiv/mod
-            // graphs under the bare canonical path; abs and sqrt register
-            // under that path via `free_function_alias_paths`.  The seed
-            // arm below pushes each and route (a) classifies the call
-            // `regular`.  Inside floordiv/mod, `x // y` / `x % y` are
-            // `ll_int_py_div` / `ll_int_py_mod`; this BFS skips those
-            // oopspec callees (`callee-oopspec-builtin`).
+            // `_ll_2_int_mod` (`support.py`) and `ll_math_sqrt`
+            // (`ll_math.py ll_math_sqrt`). `PipelineConfig::builtin_graphs`
+            // registers the floordiv/mod graphs under the bare canonical
+            // path, and sqrt under `_ll_1_ll_math_ll_math_sqrt` pointing at
+            // `ll_math_sqrt` (`support.py` `_ll_1_ll_math_ll_math_sqrt =
+            // ll_math.ll_math_sqrt`, one function object). abs registers
+            // under that path via `free_function_alias_paths` because the
+            // Rust function is named `_ll_1_int_abs`.  The seed arm below
+            // pushes each and route (a) classifies the call `regular`.
+            // Inside floordiv/mod, `x // y` / `x % y` are `ll_int_py_div`
+            // / `ll_int_py_mod`; this BFS skips those oopspec callees
+            // (`callee-oopspec-builtin`).
             for (oopspec_name, ll_args, ll_res) in crate::support::INLINE_CALLS_TO {
                 // `call.py:60-64`:
                 //   c_func, _ = support.builtin_func_for_spec(self.rtyper,
@@ -7516,6 +7520,16 @@ impl CallControl {
         let path = self.target_to_path(target)?;
         let graph = self.function_graphs.get(&path)?;
         Some((path, graph))
+    }
+
+    /// `call_registry::is_exception_object_materializer` on the spelled path.
+    fn target_is_exception_object_materializer(&self, target: &CallTarget) -> bool {
+        let Some(path) = self.target_to_path(target) else {
+            return false;
+        };
+        is_exception_object_materializer(&FunctionPathKey::from_segments(
+            path.segments.iter().cloned(),
+        ))
     }
 
     /// Convert a CallTarget to a CallPath for lookup.
@@ -9584,13 +9598,34 @@ impl CallControl {
         }
 
         // RPython call.py:282-286: random_effects + can_invalidate.
-        let random_effects = match shape {
-            CallShape::Direct(target) => self.cached_random_effects(target, cache),
-            CallShape::Indirect(graphs) => self.cached_random_effects_family(graphs, cache),
+        //
+        // Exception-object materialisers (`pyerror_*_to_exc_object`) are the
+        // fused residual of `PyError::<kind>(msg)` + `to_exc_object`. They
+        // allocate the exception instance the raise consumes, which is the
+        // same contract `residual_call_is_effect_free` gives an elidable
+        // residual: a rewind discards the allocation, and the raise uses the
+        // result so the call is not dropped. `RandomEffectsAnalyzer` of the
+        // `dont_look_inside` stub, or a top write set, would otherwise force
+        // `EF_RANDOM_EFFECTS` and the descent scan would treat the fused
+        // residual as an effect (`inline_call.rs residual_call_is_effect_free`).
+        let materializer = match shape {
+            CallShape::Direct(target) => self.target_is_exception_object_materializer(target),
+            CallShape::Indirect(_) => false,
+        };
+        let random_effects = if materializer {
+            false
+        } else {
+            match shape {
+                CallShape::Direct(target) => self.cached_random_effects(target, cache),
+                CallShape::Indirect(graphs) => self.cached_random_effects_family(graphs, cache),
+            }
         };
         let mut extraeffect = extraeffect;
         if random_effects {
             extraeffect = Some(ExtraEffect::RandomEffects);
+        }
+        if materializer && extraeffect.is_none() {
+            extraeffect = Some(ExtraEffect::ElidableCanRaise);
         }
         let can_invalidate = random_effects
             || match shape {
@@ -9735,13 +9770,23 @@ impl CallControl {
                     .join(",")
             ),
         };
-        let effects = match shape {
-            CallShape::Direct(target) => self.cached_readwrite(target, cache),
-            CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
+        let effects = if materializer {
+            // Empty write set: a top image would force `EF_RANDOM_EFFECTS`
+            // in `effectinfo_from_writeanalyze` and undo the elidable mark.
+            ReadWriteEffects::bottom_result()
+        } else {
+            match shape {
+                CallShape::Direct(target) => self.cached_readwrite(target, cache),
+                CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
+            }
         };
-        let can_collect = match shape {
-            CallShape::Direct(target) => self.cached_can_collect(target, cache),
-            CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
+        let can_collect = if materializer {
+            true
+        } else {
+            match shape {
+                CallShape::Direct(target) => self.cached_can_collect(target, cache),
+                CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
+            }
         };
         // `call.py` `getcalldescr`: `tgt_func, tgt_saveerr =
         // func._call_aroundstate_target_` then
@@ -13993,6 +14038,30 @@ mod tests {
         }
     }
 
+    /// `support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`:
+    /// `pin_builtin_graphs` registers the source graph under the canonical
+    /// seed name, so `path_to_key` shares one GraphKey.
+    #[test]
+    fn sqrt_canonical_seed_name_aliases_ll_math_sqrt_graph() {
+        let mut cc = CallControl::new();
+        let source = CallPath::from_segments([
+            "pyre_interpreter",
+            "objspace",
+            "descroperation",
+            "ll_math_sqrt",
+        ]);
+        let alias = CallPath::from_segments(["_ll_1_ll_math_ll_math_sqrt"]);
+        let mut graph = FunctionGraph::new("ll_math_sqrt");
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(source.clone(), graph.clone());
+        cc.register_function_graph(alias.clone(), graph);
+        assert_eq!(
+            cc.function_graphs().key_for(&source),
+            cc.function_graphs().key_for(&alias),
+            "canonical seed name must name the same funcobj as ll_math_sqrt"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "the JIT must never come close to _get_errno() or _set_errno()")]
     fn guess_call_kind_rejects_rposix_get_errno() {
@@ -15071,6 +15140,43 @@ mod tests {
             descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCanRaise
         );
+    }
+
+    /// Fused `pyerror_*_to_exc_object` residuals are rewindable allocations
+    /// (`residual_call_is_effect_free`): `getcalldescr` must not collapse
+    /// them to `EF_RANDOM_EFFECTS`.
+    #[test]
+    fn exception_object_materializer_is_elidable_can_raise() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments([
+            "pyre_interpreter",
+            "error",
+            "pyerror_value_error_to_exc_object",
+        ]);
+        cc.register_function_graph(path, simple_graph("pyerror_value_error_to_exc_object"));
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path([
+            "pyre_interpreter",
+            "error",
+            "pyerror_value_error_to_exc_object",
+        ]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ElidableCanRaise
+        );
+        assert!(descriptor.extra_info.can_collect);
+        assert!(descriptor.extra_info._write_descrs_fields.is_some());
     }
 
     #[test]
