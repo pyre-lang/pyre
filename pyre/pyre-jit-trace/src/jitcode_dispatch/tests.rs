@@ -5125,9 +5125,145 @@ fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
     );
 }
 
+fn assert_identity_iter_w_leaf(path: &str) {
+    let jc = crate::jitcode_runtime::pathed_jitcode(path)
+        .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+    let body = jc
+        .try_body()
+        .unwrap_or_else(|| panic!("{path} body must be assembled"));
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(body.calldescr.arg_classes, "r", "{path} ops={ops:?}");
+    assert_eq!(body.calldescr.result_type, 'r', "{path} ops={ops:?}");
+    assert!(
+        ops.iter().any(|op| *op == "ref_return"),
+        "{path} must return the receiver; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op.contains("residual")),
+        "{path} must not residualise; ops={ops:?}"
+    );
+}
+
+#[test]
+fn zip_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Zip.iter_w` is `return self`. Own graph so GET_ITER
+    // records that body (`specialize.rs ZIP_ITER_DESCENT`) instead of a
+    // hand identity.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_zip_iter");
+}
+
+#[test]
+fn map_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Map.iter_w` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_map_iter");
+}
+
+#[test]
+fn filter_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Filter.iter_w` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_filter_iter");
+}
+
+#[test]
+fn seqiter_iter_jitcode_is_the_descr_iter_leaf() {
+    // `iterobject.py W_AbstractSeqIterObject.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::iterobject::w_seqiter_iter");
+}
+
+#[test]
+fn reverseseqiter_iter_jitcode_is_the_descr_iter_leaf() {
+    // `iterobject.py W_ReverseSeqIterObject.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::iterobject::w_reverseseqiter_iter");
+}
+
+#[test]
+fn range_new_stop_jitcode_is_the_descr_new_leaf() {
+    // `functional.py W_Range.descr_new` nargs==1 after arity unpacking.
+    // `specialize.rs RANGE_NEW_STOP_DESCENT` records this body, including
+    // `space.index` (`range_index_bound`).
+    let stop =
+        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::builtins::w_range_new_stop")
+            .expect("w_range_new_stop must be a discovered jitcode");
+    let body = stop
+        .try_body()
+        .expect("w_range_new_stop body must be assembled");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&stop.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(body.calldescr.arg_classes, "r", "ops={ops:?}");
+    assert_eq!(body.calldescr.result_type, 'r', "ops={ops:?}");
+    assert!(
+        ops.iter().any(|op| op.starts_with("inline_call_")),
+        "w_range_new_stop records w_int_new / w_range_new via inline_call; ops={ops:?}"
+    );
+    assert!(
+        !(ops.len() == 1 && ops[0].contains("residual")),
+        "w_range_new_stop must not be a single residual; ops={ops:?}"
+    );
+    assert!(
+        ops.first()
+            .is_none_or(|op| !op.starts_with("residual_call")),
+        "w_range_new_stop must not open on a residual pin; ops={ops:?}"
+    );
+    // rustc does not inline `w_range_new` / `w_range_allocate` into the
+    // arity leaves; the walker follows `inline_call_ir_r`. Allocation is
+    // `allocate_stable` fused to `new_with_vtable` on `w_range_allocate`
+    // (`fuse_boxing_alloc`).
+    let alloc = crate::jitcode_runtime::pathed_jitcode("pyre_object::functional::w_range_allocate")
+        .expect("w_range_allocate must be a discovered jitcode");
+    let alloc_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&alloc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        alloc_ops.iter().any(|op| *op == "new_with_vtable"),
+        "W_Range must box via new_with_vtable; w_range_allocate ops={alloc_ops:?} stop ops={ops:?}"
+    );
+    assert!(
+        !alloc_ops.iter().any(|op| op.contains("residual")),
+        "w_range_allocate must not residualise allocate_stable; ops={alloc_ops:?}"
+    );
+    // `compute_range_length` is `space.lt` / `space.sub` / …; a leading
+    // `pin_root` residual (`with_shadow_stack` closure) aborts the descent.
+    let length =
+        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::builtins::compute_range_length")
+            .expect("compute_range_length must be a discovered jitcode");
+    let length_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&length.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        length_ops.iter().any(|op| op.starts_with("inline_call_")),
+        "compute_range_length records space int ops via inline_call; ops={length_ops:?}"
+    );
+    assert!(
+        length_ops
+            .first()
+            .is_none_or(|op| !op.starts_with("residual_call")),
+        "compute_range_length must not open on a residual pin; ops={length_ops:?}"
+    );
+    let two = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::builtins::w_range_new_start_stop",
+    )
+    .expect("w_range_new_start_stop must be a discovered jitcode");
+    let two_body = two
+        .try_body()
+        .expect("w_range_new_start_stop body must be assembled");
+    assert_eq!(two_body.calldescr.arg_classes, "rr");
+    let three = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::builtins::w_range_new_start_stop_step",
+    )
+    .expect("w_range_new_start_stop_step must be a discovered jitcode");
+    let three_body = three
+        .try_body()
+        .expect("w_range_new_start_stop_step body must be assembled");
+    assert_eq!(three_body.calldescr.arg_classes, "rrr");
+}
+
 #[test]
 fn zip_two_tuple_next_jitcode_is_the_tuple_iter_leaf() {
-    // `functional.py` `W_Zip.next_w` arity two, specialised to
+    // `functional.py` `W_Zip.next_w` length==2 arm, recorded by
+    // `specialize.rs ZIP_NEXT_DESCENT`. Inner `space.next` is
     // `W_FastTupleIterObject.descr_next` over `W_TupleObject`. The product
     // is `w_specialised_tuple_oo_new` (`fuse_boxing_alloc` → `new_with_vtable`).
     let zip = crate::jitcode_runtime::pathed_jitcode(
@@ -5176,6 +5312,59 @@ fn zip_two_tuple_next_jitcode_is_the_tuple_iter_leaf() {
     assert!(
         !(ops.len() == 1 && ops[0].contains("residual")),
         "zip_two_tuple_next collapsed to one residual; ops={ops:?}"
+    );
+}
+
+#[test]
+fn helper_resume_recipe_selects_bridge_frame_subwalk_entry() {
+    // B3: a helper recipe's jitcode pc is the `drive_bridge_frame_subwalk`
+    // entry (`rebuild_from_resumedata` `setup_resume_at_op`). Driving the
+    // body to `SubReturn` needs a portal `WalkSym`, terminal descrs, and
+    // `compute_bridge_root_parent_frame` — the reconstruction test covers
+    // `setup_bridge_sym`; this checks the walk-entry dispatch.
+    let zip = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::baseobjspace::zip_two_tuple_next",
+    )
+    .expect("zip_two_tuple_next must be a discovered jitcode");
+    let helper_index = zip
+        .try_index()
+        .expect("zip_two_tuple_next must have a jitcode index") as i32;
+    let pjc = crate::state::ensure_build_time_jitcode_at(helper_index as usize)
+        .expect("zip helper must install as a PyJitCode");
+    assert!(
+        pjc.code_ptr.is_null(),
+        "zip_two_tuple_next is a helper jitcode"
+    );
+    assert!(
+        pjc.jitcode.uses_global_descr_pool(),
+        "from_canonical translator helpers index ALL_DESCRS"
+    );
+    let live_pc = crate::jitcode_runtime::decoded_ops(&zip.code)
+        .find(|op| op.opname == "live")
+        .map(|op| op.pc as i32)
+        .expect("zip_two_tuple_next must have a -live-");
+    let recipe = majit_metainterp::ReconstructRecipe {
+        code_ptr: std::ptr::null(),
+        jitcode_index: helper_index,
+        jitcode_pc: live_pc,
+        nlocals: 0,
+        valuestackdepth: 0,
+        registers_i: Vec::new(),
+        registers_r: Vec::new(),
+        registers_f: Vec::new(),
+        concrete_r: Vec::new(),
+        frame: OpRef::NONE,
+        nargs: 0,
+        return_substitute: None,
+        len_tail: false,
+        rebuilt_frame: None,
+        rebuilt_ec: None,
+    };
+    assert!(crate::state::recipe_is_helper_resume(&recipe));
+    assert_eq!(pjc.jitcode.index() as i32, helper_index);
+    assert!(
+        crate::state::resolve_bridge_walk_entry_at(helper_index, live_pc).is_some(),
+        "helper recipe must select a drive_bridge_frame_subwalk entry"
     );
 }
 
@@ -5779,6 +5968,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -5934,6 +6124,7 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
             constants_i: &[],
             constants_r: &[],
             constants_f: &[],
+            jitcode_index: None,
         });
     }
     let lookup = move |index: usize| bodies.get(index).cloned();
@@ -6081,6 +6272,7 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -6197,6 +6389,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -6309,6 +6502,7 @@ fn compare_tag_inline_call_records_no_binary_exception_guard() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -6434,6 +6628,7 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -6553,6 +6748,7 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -6660,6 +6856,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -8405,6 +8602,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = move |idx: usize| {
         if idx == 11 {
@@ -8548,6 +8746,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = move |idx: usize| {
         if idx == 13 {
@@ -14358,6 +14557,7 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
             constants_i: &[],
             constants_r: &[],
             constants_f: &[],
+            jitcode_index: None,
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -14467,6 +14667,7 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = move |idx: usize| {
         if idx == 5 {
@@ -14560,6 +14761,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -14660,6 +14862,7 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -14746,6 +14949,7 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -14837,6 +15041,7 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -14926,6 +15131,7 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();
@@ -15020,6 +15226,7 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
         constants_i: &[],
         constants_r: &[],
         constants_f: &[],
+        jitcode_index: None,
     };
     let lookup = {
         let sub_body = sub_body.clone();

@@ -323,6 +323,14 @@ pub unsafe fn w_map_set_strict(obj: PyObjectRef, value: bool) {
     }
 }
 
+/// `functional.py W_Map.iter_w` — `return self`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Map`.
+pub unsafe fn w_map_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
 // ── functional.rs ─────────────────────────────────────────────
 
 // `pypy/module/__builtin__/functional.py W_Filter` line-by-line
@@ -396,6 +404,14 @@ pub unsafe fn w_filter_get_iterable(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Filter)).w_iterable }
 }
 
+/// `functional.py W_Filter.iter_w` — `return self`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Filter`.
+pub unsafe fn w_filter_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
 // ── functional.rs ─────────────────────────────────────────────
 
 // `pypy/module/__builtin__/functional.py W_Zip` line-by-line port.
@@ -426,6 +442,15 @@ pub struct W_Zip {
     pub iteration_progress: usize,
 }
 
+/// `functional.py W_Zip._immutable_fields_ = ["w_fun", "iterators_w", "strict"]`.
+/// `w_fun` is the W_Map leftover; W_Zip stores `iterators_w` and `strict`.
+/// `#[jit_immutable_fields]` cannot wrap `#[pyre_class]` (both consume the
+/// item), so this is the harvest marker `harvest_immutable_fields_from_llbcs`
+/// reads (`_immutable_fields_<Struct>`).
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _immutable_fields_W_Zip: &str = "w_iterators,strict";
+
 /// Allocate a `W_Zip`.  `w_iterators` is a `list` of already-built
 /// iterators (`build_iterators_from_args`).
 pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool, w_subtype: PyObjectRef) -> PyObjectRef {
@@ -450,6 +475,14 @@ pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool, w_subtype: PyObjectRef)
 #[inline]
 pub unsafe fn is_zip(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &ZIP_TYPE) || py_type_check(obj, &ZIP_USER_TYPE) }
+}
+
+/// `functional.py W_Zip.iter_w` — `return self`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Zip`.
+pub unsafe fn w_zip_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
 }
 
 /// # Safety
@@ -917,21 +950,11 @@ mod range_iter_tests {
     fn test_promote_step_picks_the_iterator_shape() {
         unsafe {
             // `range(4)` — no step argument, starting at zero.
-            let one_arg = w_range_iter(w_range_new(
-                crate::intobject::w_int_new(0),
-                crate::intobject::w_int_new(4),
-                crate::intobject::w_int_new(1),
-                true,
-            ));
+            let one_arg = w_range_iter(w_range_from_i64(0, 4, 1, true));
             assert!(is_range_iter_one_arg(one_arg));
 
             // `range(2, 6)` — no step argument, but not from zero.
-            let step_one = w_range_iter(w_range_new(
-                crate::intobject::w_int_new(2),
-                crate::intobject::w_int_new(6),
-                crate::intobject::w_int_new(1),
-                true,
-            ));
+            let step_one = w_range_iter(w_range_from_i64(2, 6, 1, true));
             assert!(is_range_iter_step_one(step_one));
 
             // `range(0, 4, 1)` — the step is one, but it was spelled out, so
@@ -945,24 +968,14 @@ mod range_iter_tests {
     fn test_empty_promoted_range_iter_remaining_is_non_negative() {
         unsafe {
             // `range(-1)` — one-arg promotion, raw stop is negative.
-            let one_arg = w_range_iter(w_range_new(
-                crate::intobject::w_int_new(0),
-                crate::intobject::w_int_new(-1),
-                crate::intobject::w_int_new(1),
-                true,
-            ));
+            let one_arg = w_range_iter(w_range_from_i64(0, -1, 1, true));
             assert!(is_range_iter_one_arg(one_arg));
             assert_eq!(w_range_iter_remaining(one_arg), 0);
             assert_eq!(w_range_iter_fields(one_arg), (0, 0, 1));
             assert!(!w_range_iter_has_next(one_arg));
 
             // `range(3, 1)` — step-one promotion, raw stop sits below start.
-            let step_one = w_range_iter(w_range_new(
-                crate::intobject::w_int_new(3),
-                crate::intobject::w_int_new(1),
-                crate::intobject::w_int_new(1),
-                true,
-            ));
+            let step_one = w_range_iter(w_range_from_i64(3, 1, 1, true));
             assert!(is_range_iter_step_one(step_one));
             assert_eq!(w_range_iter_remaining(step_one), 0);
             assert_eq!(w_range_iter_fields(step_one), (3, 0, 1));
@@ -1011,80 +1024,86 @@ pub const RANGE_STEP_OFFSET: usize = std::mem::offset_of!(W_Range, step);
 pub const RANGE_LENGTH_OFFSET: usize = std::mem::offset_of!(W_Range, length);
 pub const RANGE_PROMOTE_STEP_OFFSET: usize = std::mem::offset_of!(W_Range, promote_step);
 
-/// Allocate a `W_Range` from three wrapped int/long bounds.  `step` must
-/// already be non-zero (the caller raises `ValueError` for a zero step
-/// before reaching here).  The element count is computed once here and
-/// stored, mirroring `descr_new`'s `compute_range_length`.
+/// `functional.py get_len_of_range`. Callers keep `step != 0`.
+///
+/// After the `step < 0` swap, `diff` uses wrapping `r_uint` subtraction and
+/// unsigned `//`; `as i64` is `intmask`. Truncating unsigned `/` matches
+/// floor on the non-negative numerator the comment there records.
+#[inline]
+pub fn get_len_of_range(lo: i64, hi: i64, step: i64) -> i64 {
+    debug_assert_ne!(step, 0);
+    let (lo, hi, step) = if step < 0 {
+        (hi, lo, step.wrapping_neg())
+    } else {
+        (lo, hi, step)
+    };
+    if lo < hi {
+        let uhi = hi as u64;
+        let ulo = lo as u64;
+        let diff = uhi.wrapping_sub(ulo).wrapping_sub(1);
+        (diff / (step as u64)).wrapping_add(1) as i64
+    } else {
+        0
+    }
+}
+
+/// `functional.py W_Range.descr_new` `allocate_instance` / `__init__`.
+/// Length is computed by the interpreter's `compute_range_length`.
+///
+/// `malloc_typed_managed` is the boxing `_int_add` / specialised-tuple
+/// constructors use; `fuse_boxing_alloc` rewrites it to `new_with_vtable`.
+/// `allocate_stable`'s `push_roots` is a symbolic residual and aborts
+/// `RANGE_NEW_*_DESCENT`.
+#[inline(never)]
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
-pub fn w_range_new(
+pub fn w_range_allocate(
     start: PyObjectRef,
     stop: PyObjectRef,
     step: PyObjectRef,
+    length: PyObjectRef,
     promote_step: bool,
 ) -> PyObjectRef {
-    let _roots = crate::gc_roots::push_roots();
-    let _ = crate::gc_roots::pin_root(start);
-    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
-    let _ = crate::gc_roots::pin_root(stop);
-    let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
-    let _ = crate::gc_roots::pin_root(step);
-    let step_slot = crate::gc_roots::shadow_stack_len() - 1;
-    // `RBigInt::fromint` / `RBigInt::new` allocate a nursery `Digits`
-    // payload (`rbigint.py fromint`), so each conversion can collect.
-    // Reload every bound from its shadow-stack slot before the next
-    // `range_obj_to_bigint` — the Rust locals above are not rewritten.
-    let length = unsafe {
-        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
-            start_slot,
-        )));
-        let stop_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
-            stop_slot,
-        )));
-        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
-            step_slot,
-        )));
-        let len_big = range_length_big(&start_b, &stop_b, &step_b);
-        range_bigint_to_obj(len_big)
-    };
-    // `range_bigint_to_obj` is `w_int_new` / `w_long_new` and may collect.
-    // The three bounds live on the shadow stack (`expand_pop_roots` /
-    // `gc_restore_root`); the Rust locals do not, so an old-gen store of
-    // those copies would remember a nursery interior.
-    let length = crate::gc_roots::pin_root(length);
-    let start = crate::gc_roots::shadow_stack_get(start_slot);
-    let stop = crate::gc_roots::shadow_stack_get(stop_slot);
-    let step = crate::gc_roots::shadow_stack_get(step_slot);
-    W_Range::allocate_stable(W_Range {
+    crate::lltype::malloc_typed_managed(W_Range {
         ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+            ob_type: &RANGE_TYPE as *const PyType,
+            w_class: get_instantiate(&RANGE_TYPE),
         },
         start,
         stop,
         step,
         length,
         promote_step,
-    })
+    }) as PyObjectRef
 }
 
-/// Convenience constructor wrapping three machine-int bounds.  The explicit
-/// step spells `promote_step = false`, matching `range(start, stop, step)`.
-pub fn w_range_new_i64(start: i64, stop: i64, step: i64) -> PyObjectRef {
+/// Box three machine-int bounds and the `get_len_of_range` length.
+fn w_range_from_i64(start: i64, stop: i64, step: i64, promote_step: bool) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let _ = crate::gc_roots::pin_root(crate::intobject::w_int_new(start));
     let start_slot = crate::gc_roots::shadow_stack_len() - 1;
     let _ = crate::gc_roots::pin_root(crate::intobject::w_int_new(stop));
     let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
-    let step = crate::gc_roots::pin_root(crate::intobject::w_int_new(step));
-    w_range_new(
+    let _ = crate::gc_roots::pin_root(crate::intobject::w_int_new(step));
+    let step_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let length = crate::gc_roots::pin_root(crate::intobject::w_int_new(get_len_of_range(
+        start, stop, step,
+    )));
+    w_range_allocate(
         crate::gc_roots::shadow_stack_get(start_slot),
         crate::gc_roots::shadow_stack_get(stop_slot),
-        step,
-        false,
+        crate::gc_roots::shadow_stack_get(step_slot),
+        length,
+        promote_step,
     )
+}
+
+/// Convenience constructor wrapping three machine-int bounds.  The explicit
+/// step spells `promote_step = false`, matching `range(start, stop, step)`.
+pub fn w_range_new_i64(start: i64, stop: i64, step: i64) -> PyObjectRef {
+    w_range_from_i64(start, stop, step, false)
 }
 
 /// # Safety
@@ -1515,45 +1534,9 @@ pub unsafe fn w_range_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
 }
 
 /// Number of elements in a `(start, stop, step)` range —
-/// `functional.py compute_range_length`.
+/// `functional.py get_len_of_range`.
 pub fn range_length(start: i64, stop: i64, step: i64) -> i64 {
-    if step > 0 {
-        if start < stop {
-            (stop - start - 1) / step + 1
-        } else {
-            0
-        }
-    } else if start > stop {
-        (start - stop - 1) / (-step) + 1
-    } else {
-        0
-    }
-}
-
-/// Bignum `compute_range_length` — always non-negative.
-pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt {
-    let start = RBigIntGcRoot::new(start.translated_alias());
-    let stop = RBigIntGcRoot::new(stop.translated_alias());
-    let step = RBigIntGcRoot::new(step.translated_alias());
-    let zero = BigInt::zero();
-    if *step > zero {
-        if *start < *stop {
-            let diff = RBigIntGcRoot::new(stop.sub(&start));
-            let adj = RBigIntGcRoot::new(diff.sub(&BigInt::one()));
-            let q = RBigIntGcRoot::new(&*adj / &*step);
-            q.add(&BigInt::one())
-        } else {
-            BigInt::zero()
-        }
-    } else if *start > *stop {
-        let diff = RBigIntGcRoot::new(start.sub(&stop));
-        let adj = RBigIntGcRoot::new(diff.sub(&BigInt::one()));
-        let neg_step = RBigIntGcRoot::new(step.neg());
-        let q = RBigIntGcRoot::new(&*adj / &*neg_step);
-        q.add(&BigInt::one())
-    } else {
-        BigInt::zero()
-    }
+    get_len_of_range(start, stop, step)
 }
 
 // ── Long range iterator ──
@@ -1722,6 +1705,10 @@ mod range_obj_tests {
         assert_eq!(range_length(0, 10, 3), 4);
         assert_eq!(range_length(10, 0, -1), 10);
         assert_eq!(range_length(10, 0, -3), 4);
+        assert_eq!(get_len_of_range(0, 5, 1), 5);
+        assert_eq!(get_len_of_range(10, 0, -3), 4);
+        // wrapping `r_uint` form: `intmask((u64::MAX - 1) / 1 + 1) == -1`.
+        assert_eq!(get_len_of_range(i64::MIN, i64::MAX, 1), -1);
     }
 
     #[test]

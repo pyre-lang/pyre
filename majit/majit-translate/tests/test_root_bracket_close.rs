@@ -863,7 +863,8 @@ fn shadow_stack_erase_census() {
 /// Nested exclusive RootScopes in `zip_two_tuple_next` close before they
 /// merge with a sibling that never opened them. Closing must drop that
 /// set's pin-count key; leftover keys refuse the rewrite and leave a
-/// residual unpublished `push_roots` that declines `zip_two_tuple_iters`.
+/// residual unpublished `push_roots`. FOR_ITER over zip already calls
+/// `zip_two_tuple_next` as a residual; the body is not descended.
 #[test]
 fn zip_two_tuple_next_erases_the_nested_root_brackets() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()

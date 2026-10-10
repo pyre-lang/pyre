@@ -1228,6 +1228,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
             cf_addr,
             WalkJournals::Reset,
             None,
+            false,
         );
         finish_trace_namespace_dependency(meta);
         return (action, concrete_frame, flush_committed.get());
@@ -1437,6 +1438,7 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
                 constants_i: jc.constants_i.as_slice(),
                 constants_r: jc.constants_r.as_slice(),
                 constants_f: jc.constants_f.as_slice(),
+                jitcode_index: jc.try_index(),
             })
     };
 
@@ -1488,16 +1490,29 @@ fn select_recipe_entry(
         .flatten()
 }
 
-fn residual_ref_call_before(code: &[u8], entry: usize) -> Option<(usize, usize)> {
+/// Dest color of the `residual_call*` / `inline_call*` ending at `entry`.
+/// `make_result_of_lastop` / `_setup_return_value_r` write `code[position-1]`
+/// after either form; helper SubReturn into the portal is `inline_call_*`.
+fn ref_call_ending_at(code: &[u8], entry: usize) -> Option<(usize, usize, bool)> {
     crate::jitcode_runtime::decoded_ops(code)
-        .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
-        .and_then(|op| {
-            op.argcodes
-                .ends_with(">r")
-                .then(|| code.get(entry - 1).copied())
-                .flatten()
-                .map(|dst| (op.pc, usize::from(dst)))
+        .find(|op| {
+            op.next_pc == entry
+                && (op.opname.starts_with("residual_call") || op.opname.starts_with("inline_call"))
+                && op.argcodes.ends_with(">r")
         })
+        .and_then(|op| {
+            code.get(entry.checked_sub(1)?).copied().map(|dst| {
+                (
+                    op.pc,
+                    usize::from(dst),
+                    op.opname.starts_with("residual_call"),
+                )
+            })
+        })
+}
+
+fn residual_ref_call_before(code: &[u8], entry: usize) -> Option<(usize, usize)> {
+    ref_call_ending_at(code, entry).and_then(|(pc, dst, residual)| residual.then_some((pc, dst)))
 }
 
 /// `MIFrame.make_result_of_lastop` pushes a completed call's result at the
@@ -1555,8 +1570,9 @@ fn inject_root_call_result<Sym: WalkSym>(
         return false;
     }
     let payload = unsafe { &(*sym.jitcode()).payload };
-    let residual_call = residual_ref_call_before(payload.jitcode.code.as_slice(), root_pc);
-    let result_reg = residual_call.map(|(_, dst)| dst).or_else(|| {
+    let call = ref_call_ending_at(payload.jitcode.code.as_slice(), root_pc);
+    let residual_call = call.and_then(|(pc, dst, residual)| residual.then_some((pc, dst)));
+    let result_reg = call.map(|(_, dst, _)| dst).or_else(|| {
         payload
             .result_color_trivia_for_jitcode_pc(root_pc)
             .map(|c| c as usize)
@@ -1572,36 +1588,39 @@ fn inject_root_call_result<Sym: WalkSym>(
         }
         bridge_regs.set(result_reg, result);
     }
-    let post_call_depth = residual_call
-        .and_then(|(call_pc, _)| payload.depth_after_residual_for_jitcode_pc(call_pc))
-        .map(usize::from);
-    let Some(post_call_depth) = post_call_depth else {
-        return false;
-    };
-    let semantic_result_slot = pending_call_result_semantic_slot(nlocals, post_call_depth);
-    let Some(semantic_result_slot) = semantic_result_slot else {
-        return false;
-    };
-    if semantic_result_slot < nlocals {
-        if let Some(locals) = sym.bridge_local_oprefs_mut().as_mut() {
-            if locals.len() <= semantic_result_slot {
-                locals.resize(semantic_result_slot + 1, majit_ir::OpRef::NONE);
+    // `MIFrame.make_result_of_lastop` writes `registers_*[ord(bytecode[pc-1])]`.
+    // A residual CALL's dest is the Python operand-stack top, so the after-
+    // residual depth twin also sizes the semantic slot. Helper `inline_call_*`
+    // dest is a jitcode color inside FOR_ITER / COMPARE; bumping
+    // `valuestackdepth` to that twin (or to fallthrough trivia) makes
+    // `run_perfn_walk` see live_stack=2 against pred depth 1 and decline.
+    if let Some((call_pc, _)) = residual_call {
+        let post_call_depth = payload
+            .depth_after_residual_for_jitcode_pc(call_pc)
+            .map(usize::from);
+        if let Some(post_call_depth) = post_call_depth {
+            if let Some(semantic_result_slot) =
+                pending_call_result_semantic_slot(nlocals, post_call_depth)
+            {
+                if semantic_result_slot < nlocals {
+                    if let Some(locals) = sym.bridge_local_oprefs_mut().as_mut() {
+                        if locals.len() <= semantic_result_slot {
+                            locals.resize(semantic_result_slot + 1, majit_ir::OpRef::NONE);
+                        }
+                        locals.set(semantic_result_slot, result);
+                    }
+                } else {
+                    let slot = semantic_result_slot - nlocals;
+                    let bridge = sym.bridge_stack_oprefs_mut().get_or_insert_with(Vec::new);
+                    if bridge.len() <= slot {
+                        bridge.resize(slot + 1, majit_ir::OpRef::NONE);
+                    }
+                    bridge.set(slot, result);
+                }
             }
-            locals.set(semantic_result_slot, result);
+            sym.set_valuestackdepth(nlocals + post_call_depth);
         }
-    } else {
-        let slot = semantic_result_slot - nlocals;
-        let bridge = sym.bridge_stack_oprefs_mut().get_or_insert_with(Vec::new);
-        if bridge.len() <= slot {
-            bridge.resize(slot + 1, majit_ir::OpRef::NONE);
-        }
-        bridge.set(slot, result);
     }
-    // `MIFrame.make_result_of_lastop` both stores the value and advances the
-    // caller's stack pointer.  Without the matching depth update,
-    // `init_symbolic` sizes its resumed stack from the pre-call depth and
-    // truncates the just-injected top slot.
-    sym.set_valuestackdepth(nlocals + post_call_depth);
     true
 }
 
@@ -1737,12 +1756,19 @@ fn discard_bridge_carrier_walk<Sym: WalkSym>(
 ///
 /// The multi-frame depth cap bounds reconstructed `PyFrame`s, so a level that
 /// reconstructs none — `descr_call`'s tail, which only substitutes its
-/// callee's result — must not consume one of its slots.
-fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> usize {
+/// callee's result, `len`'s operator tail, or a helper jitcode resume —
+/// must not consume one of its slots. `rebuild_from_resumedata` rebuilds
+/// every encoded frame; the recursion bound is `max_unroll_recursion` on
+/// portals only.
+pub(crate) fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> usize {
     carrier
         .recipes
         .iter()
-        .filter(|recipe| recipe.return_substitute.is_none() && !recipe.len_tail)
+        .filter(|recipe| {
+            recipe.return_substitute.is_none()
+                && !recipe.len_tail
+                && !crate::state::recipe_is_helper_resume(recipe)
+        })
         .count()
 }
 
@@ -1815,6 +1841,14 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // guard while the reconstructed frames it drove executed nothing
     // irreversible.
     let effects_at_entry = crate::jitcode_dispatch::fbw_executed_effect_count();
+    let abort_walk = |ctx: &mut TraceCtx,
+                      sym: &mut Sym,
+                      pre_virtualref_boxes: &[(majit_ir::OpRef, usize)],
+                      label: &'static str| {
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, pre_virtualref_boxes, true);
+        crate::jitcode_dispatch::census_record(label);
+        p2_drain_abort()
+    };
 
     let root_ec = sym.concrete_execution_context();
     let root_ec_box = sym.execution_context();
@@ -1859,9 +1893,12 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     if !recursive_carrier
         && carrier_py_frame_depth(carrier) > crate::jitcode_dispatch::fbw_max_multiframe_depth()
     {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
-        crate::jitcode_dispatch::census_record("P2Drain::OverMultiframeDepth");
-        return p2_drain_abort();
+        return abort_walk(
+            ctx,
+            sym,
+            &pre_virtualref_boxes,
+            "P2Drain::OverMultiframeDepth",
+        );
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
@@ -1869,57 +1906,74 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         return p2_drain_abort();
     };
 
-    // `setup_reconstructed_callee_frame` binds the callee frame recorded while
-    // the framestack was rebuilt and returns `argboxes_r` seeding the portal
-    // reds + in-flight operand-stack temps. The sub-walk drives the callee
-    // body off `argboxes_r` and that frame, not a callee MIFrame.
-    let Some((pending, argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
-        ctx,
-        is_being_profiled,
-        recipe,
-        root_ec,
-        root_ec_box,
-        Vec::new(),
-    ) else {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
-        crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
-        return p2_drain_abort();
+    let helper_innermost = crate::state::recipe_is_helper_resume(recipe);
+    let paused_parents: &[majit_metainterp::ReconstructRecipe] = if carrier.recipes.len() >= 2
+        && (recursive_carrier
+            || carrier_py_frame_depth(carrier)
+                <= crate::jitcode_dispatch::fbw_max_multiframe_depth())
+    {
+        &carrier.recipes[..carrier.recipes.len() - 1]
+    } else {
+        &[]
     };
-    let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
-        crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
-        return p2_drain_abort();
-    };
-    let entry = select_recipe_entry(
-        recipe.jitcode_index,
-        callee_pjc.jitcode.index() as i32,
-        recipe.jitcode_pc,
-    );
-    let Some(entry) = entry else {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
-        crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
-        return p2_drain_abort();
-    };
-    let raw_callee_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
-    if raw_callee_code.is_null() {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
-        crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
-        return p2_drain_abort();
-    }
+    let mut python_pending: Option<(
+        crate::state::PendingInlineFrame,
+        Vec<majit_ir::OpRef>,
+        usize,
+    )> = None;
+    let (callee_pjc, entry) = if helper_innermost {
+        // Helper jitcode: no `CodeObject`. `_interpret` steps
+        // `framestack[-1]` (`run_one_step`) from `setup_resume_at_op(pc)`;
+        // `opimpl_ref_return` `finishframe`s. Do not call
+        // `setup_reconstructed_callee_frame` (that requires a Python frame).
+        let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)
+        else {
+            return abort_walk(ctx, sym, &pre_virtualref_boxes, "P2Drain::NoCalleePjc");
+        };
+        let Some(entry) = select_recipe_entry(
+            recipe.jitcode_index,
+            callee_pjc.jitcode.index() as i32,
+            recipe.jitcode_pc,
+        ) else {
+            return abort_walk(ctx, sym, &pre_virtualref_boxes, "P2Drain::NoCalleeEntry");
+        };
+        (callee_pjc, entry)
+    } else {
+        // `setup_reconstructed_callee_frame` binds the callee frame recorded while
+        // the framestack was rebuilt and returns `argboxes_r` seeding the portal
+        // reds + in-flight operand-stack temps. The sub-walk drives the callee
+        // body off `argboxes_r` and that frame, not a callee MIFrame.
+        let Some((pending, argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
+            ctx,
+            is_being_profiled,
+            recipe,
+            root_ec,
+            root_ec_box,
+            Vec::new(),
+        ) else {
+            return abort_walk(ctx, sym, &pre_virtualref_boxes, "P2Drain::SetupFailed");
+        };
+        let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
+            return abort_walk(ctx, sym, &pre_virtualref_boxes, "P2Drain::NoCalleePjc");
+        };
+        let entry = select_recipe_entry(
+            recipe.jitcode_index,
+            callee_pjc.jitcode.index() as i32,
+            recipe.jitcode_pc,
+        );
+        let Some(entry) = entry else {
+            return abort_walk(ctx, sym, &pre_virtualref_boxes, "P2Drain::NoCalleeEntry");
+        };
+        let raw_callee_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
+        if raw_callee_code.is_null() {
+            return abort_walk(ctx, sym, &pre_virtualref_boxes, "P2Drain::NoCalleeCode");
+        }
 
-    let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
-    // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
-    // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
-    // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
-    // is known.
-    let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
-    let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
-    let local_concretes = &recipe.concrete_r[..nlocals];
-    let stack_end = recipe.valuestackdepth.min(recipe.registers_r.len());
-    let resumed_stack_oprefs = &recipe.registers_r[nlocals.min(stack_end)..stack_end];
-    let concrete_stack_end = recipe.valuestackdepth.min(recipe.concrete_r.len());
-    let resumed_stack_concretes =
-        &recipe.concrete_r[nlocals.min(concrete_stack_end)..concrete_stack_end];
+        let callee_w_globals =
+            crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
+        python_pending = Some((pending, argboxes_r, callee_w_globals));
+        (callee_pjc, entry)
+    };
     // `_prepare_exception_resumption` / `finishframe_exception`: on an
     // exception-guard bridge the deepest callee is the frame whose residual
     // call raised. `Restored` replays the already-recorded exception
@@ -1948,44 +2002,62 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             entry,
         ),
     });
-    // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
-    // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
-    // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
-    // rejects.  Diagnostic: log the outcome, then abort (trace discarded).
-    let walk = crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
-        ctx,
-        &session,
-        sym,
-        root_pc,
-        &callee_pjc,
-        recipe.code_ptr as usize,
-        callee_w_globals,
-        entry,
-        &argboxes_r,
-        &recipe.registers_i,
-        &recipe.registers_f,
-        local_oprefs,
-        local_concretes,
-        resumed_stack_oprefs,
-        resumed_stack_concretes,
-        pending.sym.concrete_vable_ptr as usize,
-        pending.sym.frame(),
-        pending.sym.execution_context(),
-        // Depth-N: tell the deepest sub-walk that all shallower frames are
-        // paused so its in-callee guard snapshots encode the full
-        // [root, ..middles.., deepest] chain (else the blackhole rebuilds a
-        // framestack missing the middles on such a guard's deopt).
-        if carrier.recipes.len() >= 2
-            && (recursive_carrier
-                || carrier_py_frame_depth(carrier)
-                    <= crate::jitcode_dispatch::fbw_max_multiframe_depth())
-        {
-            &carrier.recipes[..carrier.recipes.len() - 1]
-        } else {
-            &[]
-        },
-        handler_entry,
-    );
+    let walk = if helper_innermost {
+        walk_helper_resume_recipe(
+            ctx,
+            &session,
+            sym,
+            root_pc,
+            &callee_pjc,
+            entry,
+            recipe,
+            paused_parents,
+            None,
+            handler_entry,
+        )
+    } else {
+        let (pending, argboxes_r, callee_w_globals) = python_pending
+            .take()
+            .expect("python innermost fills python_pending");
+        // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
+        // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
+        // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
+        // is known.
+        let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
+        let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
+        let local_concretes = &recipe.concrete_r[..nlocals];
+        let stack_end = recipe.valuestackdepth.min(recipe.registers_r.len());
+        let resumed_stack_oprefs = &recipe.registers_r[nlocals.min(stack_end)..stack_end];
+        let concrete_stack_end = recipe.valuestackdepth.min(recipe.concrete_r.len());
+        let resumed_stack_concretes =
+            &recipe.concrete_r[nlocals.min(concrete_stack_end)..concrete_stack_end];
+        // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
+        // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
+        // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
+        // rejects.  Diagnostic: log the outcome, then abort (trace discarded).
+        crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
+            ctx,
+            &session,
+            sym,
+            root_pc,
+            &callee_pjc,
+            recipe.code_ptr as usize,
+            callee_w_globals,
+            entry,
+            &argboxes_r,
+            &recipe.registers_i,
+            &recipe.registers_f,
+            local_oprefs,
+            local_concretes,
+            resumed_stack_oprefs,
+            resumed_stack_concretes,
+            pending.sym.concrete_vable_ptr as usize,
+            pending.sym.frame(),
+            pending.sym.execution_context(),
+            paused_parents,
+            handler_entry,
+        )
+    };
     let deepest_got_exception = matches!(
         &walk,
         Some(Ok((
@@ -2012,7 +2084,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 _
             )))
         );
-    if deepest_finished && !deepest_too_long {
+    if deepest_finished && !deepest_too_long && !helper_innermost {
         crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, deepest_got_exception);
     }
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
@@ -2394,7 +2466,10 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     // `drive_middle_frame_from_handler` would otherwise reject after
     // deeper uncatching frames have already been popped.
     for middle in middles {
-        if middle.return_substitute.is_some() || middle.len_tail {
+        if middle.return_substitute.is_some()
+            || middle.len_tail
+            || crate::state::recipe_is_helper_resume(middle)
+        {
             continue;
         }
         let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
@@ -2427,7 +2502,10 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     }
     for i in (0..middles.len()).rev() {
         let middle = &middles[i];
-        if middle.return_substitute.is_some() || middle.len_tail {
+        if middle.return_substitute.is_some()
+            || middle.len_tail
+            || crate::state::recipe_is_helper_resume(middle)
+        {
             continue;
         }
         let middle_pjc =
@@ -2506,9 +2584,22 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             exc_concrete,
             catch_target,
         }),
+        false,
     );
     crate::jitcode_dispatch::fbw_store_journal_rollback();
     Some(action)
+}
+
+/// Helper-only (or helper + `len`/`descr_call` tails) recipes continue the
+/// portal jitcode at `root_pc` after `SubReturn`. A Python-callee recipe in
+/// the carrier keeps the existing Python-pc walk.
+fn carrier_continues_in_portal_jitcode(carrier: &majit_metainterp::BridgeInlineCarrier) -> bool {
+    !carrier.recipes.is_empty()
+        && carrier.recipes.iter().all(|recipe| {
+            crate::state::recipe_is_helper_resume(recipe)
+                || recipe.len_tail
+                || recipe.return_substitute.is_some()
+        })
 }
 
 fn compile_root_from_carrier_result<Sym: WalkSym>(
@@ -2526,18 +2617,41 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
         return None;
     }
     crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
-    let root_py_pc =
+    // After-call portal continue (`finishframe` → `make_result_of_lastop`
+    // into `inline_call_*`) enters at a post-call jitcode pc. The loop-entry
+    // abort scans treat that containing py as a header; skip them here.
+    // Marker-depth is a separate fact: every `compile_bridge` walk
+    // (`rebuild_state_after_failure`) already has a reconstructed live
+    // stack, so `full_body_walk_trace` skips that check via
+    // `ctx.is_bridge_trace`.
+    let portal_continue = carrier_continues_in_portal_jitcode(carrier);
+    let start_pc = if portal_continue {
+        // `MetaInterp.finishframe` → `make_result_of_lastop` → caller
+        // jitcode after `inline_call_*`. `resume_py_pc_for_jitcode_word`
+        // maps the after-call pc onto FOR_ITER fallthrough (UNPACK).
+        // containing_py is FOR_ITER itself; the walk enters at `root_pc`.
+        let orgpc = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
+            carrier.root_jitcode_index,
+            root_pc as i32,
+        )
+        .map(|pc| pc as usize)
+        .unwrap_or(root_pc);
+        sym.set_bridge_walk_entry(root_pc, carrier.root_jitcode_index);
+        orgpc
+    } else {
         crate::py_coord::resume_py_pc_for_jitcode_word(carrier.root_jitcode_index, root_pc as i32)
-            as usize;
+            as usize
+    };
     let action = full_body_walk_trace(
         ctx,
         flush_committed,
         sym,
         w_code,
-        root_py_pc,
+        start_pc,
         cf_addr,
         WalkJournals::Keep,
         None,
+        portal_continue,
     );
     crate::jitcode_dispatch::fbw_store_journal_rollback();
     Some(action)
@@ -2653,6 +2767,57 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
     }
 }
 
+/// Walk a helper jitcode resume section from `recipe.jitcode_pc`.
+///
+/// `resume.py rebuild_from_resumedata` `newframe(jitcode)` + `setup_resume_at_op`
+/// for a helper `MIFrame`: no Python `CodeObject`, so the drain seeds the
+/// three color-indexed banks from the encoded live list and runs the body
+/// (`_interpret` `framestack[-1].run_one_step()`). `child_result` is `None`
+/// for the innermost (the failed guard) and `Some` when a nested return
+/// `finishframe`s into this helper. `opimpl_ref_return` surfaces `SubReturn`.
+#[allow(clippy::too_many_arguments)]
+fn walk_helper_resume_recipe<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
+    sym: &mut Sym,
+    root_pc: usize,
+    pjc: &std::sync::Arc<crate::PyJitCode>,
+    entry: usize,
+    recipe: &majit_metainterp::ReconstructRecipe,
+    paused_parents: &[majit_metainterp::ReconstructRecipe],
+    child_result: Option<majit_ir::OpRef>,
+    handler_entry: Option<crate::jitcode_dispatch::FrameHandlerEntry>,
+) -> Option<
+    Result<
+        (crate::jitcode_dispatch::DispatchOutcome, usize),
+        crate::jitcode_dispatch::DispatchError,
+    >,
+> {
+    crate::jitcode_dispatch::drive_bridge_frame_subwalk(
+        ctx,
+        session,
+        sym,
+        root_pc,
+        pjc,
+        0,
+        0,
+        entry,
+        &recipe.registers_r,
+        &recipe.registers_i,
+        &recipe.registers_f,
+        &[],
+        &[],
+        &[],
+        &[],
+        0,
+        majit_ir::OpRef::NONE,
+        majit_ir::OpRef::NONE,
+        child_result,
+        paused_parents,
+        handler_entry,
+    )
+}
+
 /// `operation.py len` after the inlined `__len__` returns.
 ///
 /// The tail level's jitcode is `-live-`, `residual_call_r_r bh_len_tail`,
@@ -2763,6 +2928,53 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
             paused_parents,
             child_result,
         );
+    }
+    if crate::state::recipe_is_helper_resume(middle) {
+        // Helper jitcode paused at a residual/inline call: walk the rest of
+        // the body with the child's box in the pending result register. No
+        // Python frame, so no `carrier_ec_leave`.
+        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index) else {
+            crate::jitcode_dispatch::census_record("P2Drain::HelperWalkFailed");
+            return None;
+        };
+        let Some(entry) = select_recipe_entry(
+            middle.jitcode_index,
+            pjc.jitcode.index() as i32,
+            middle.jitcode_pc,
+        ) else {
+            crate::jitcode_dispatch::census_record("P2Drain::HelperWalkFailed");
+            return None;
+        };
+        return match walk_helper_resume_recipe(
+            ctx,
+            session,
+            sym,
+            root_pc,
+            &pjc,
+            entry,
+            middle,
+            paused_parents,
+            Some(child_result),
+            None,
+        ) {
+            Some(Ok((
+                crate::jitcode_dispatch::DispatchOutcome::SubReturn {
+                    result: Some(mid_result),
+                },
+                _,
+            ))) => Some(Ok(mid_result)),
+            Some(Ok((
+                crate::jitcode_dispatch::DispatchOutcome::SubRaise {
+                    exc: raised,
+                    exc_concrete: raised_concrete,
+                },
+                _,
+            ))) => Some(Err((raised, raised_concrete))),
+            _ => {
+                crate::jitcode_dispatch::census_record("P2Drain::HelperWalkFailed");
+                None
+            }
+        };
     }
     if let Some(instance) = middle.return_substitute {
         // `check_init_returned_none` still has to hold, and the resumed
@@ -4357,6 +4569,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     is_being_profiled: bool,
     authoritative: bool,
     carrier_raise_seed: Option<crate::jitcode_dispatch::CarrierRaiseSeed>,
+    skip_marker_depth_check: bool,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
         is_being_profiled,
@@ -4466,13 +4679,23 @@ fn run_perfn_walk<Sym: WalkSym>(
         // its own jitcode offset, so it may legitimately have a different
         // live depth and must continue walking.
         let entry_is_resume_marker = pjc.resume_marker_for_jitcode_pc(entry) == Some(entry);
-        if live_stack != entry_depth as usize && entry_is_resume_marker {
+        // `compile_bridge` (`pyjitpl.py` `_handle_guard_failure` →
+        // `rebuild_state_after_failure` → `interpret()` continue) seeds
+        // live stack from resumedata. `depth_for_jitcode_pc_pred` is the
+        // opcode-start twin, so a guard at a `-live-` marker (FOR_ITER
+        // item, CALL return, unpack) mismatches without being the
+        // marker-inside-super-instruction unsoundness this check is for.
+        // `full_body_walk_trace` passes `ctx.is_bridge_trace` as this flag;
+        // that is the one owner. A main-trace walk keeps the check.
+        if live_stack != entry_depth as usize && entry_is_resume_marker && !skip_marker_depth_check
+        {
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 let marker_py =
                     crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, entry);
                 eprintln!(
-                    "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \\
-                     entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
+                    "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \
+                     entry_depth={entry_depth} marker_py={marker_py} skip={skip_marker_depth_check}; \
+                     declining marker-entry walk"
                 );
             }
             fbw_decline(crate::driver::make_green_key(
@@ -6078,6 +6301,7 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
         is_being_profiled,
         authoritative,
         None,
+        false,
     ) else {
         return;
     };
@@ -6731,6 +6955,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     cf_addr: usize,
     journals: WalkJournals,
     carrier_raise_seed: Option<crate::jitcode_dispatch::CarrierRaiseSeed>,
+    skip_entry_abort_scans: bool,
 ) -> TraceAction {
     let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
     // #125: decline up front when a loop body carries an `abort_permanent`
@@ -6738,7 +6963,18 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // guard, exit early, and concretely double-execute the post-loop tail;
     // declining before the walk reaches the unported op avoids frame
     // corruption and returns to interpretation.
-    if let Some(abort_pc) = loop_body_abort_permanent_pc(w_code, start_pc) {
+    //
+    // `loop_body_abort_permanent_pc` treats `start_pc` as a loop-header
+    // green (`merge_entry_for`). A helper-section parent continue
+    // (`finishframe` → `make_result_of_lastop`) enters at the containing
+    // Python opcode of an after-call jitcode pc — often FOR_ITER, which
+    // is that header — so the scan would decline a continue that has
+    // already compiled past it. `loop_inlines_abort_permanent_callee` and
+    // `loop_iterates_send_generator` use the same `start_pc` as a fresh
+    // loop entry. PyPy's `interpret()` has no such re-scan.
+    if !skip_entry_abort_scans
+        && let Some(abort_pc) = loop_body_abort_permanent_pc(w_code, start_pc)
+    {
         // Tag the decline so `PYRE_FBW_DEBUG_ABORT` census attributes it to the
         // up-front `abort_permanent` scan, not the trait retry fall-through
         // (`Trait::DeclinedAbort`).  Without this the real declining class is
@@ -6755,7 +6991,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
         ));
         return TraceAction::Decline;
     }
-    if loop_iterates_send_generator(cf_addr, start_pc) {
+    if !skip_entry_abort_scans && loop_iterates_send_generator(cf_addr, start_pc) {
         crate::jitcode_dispatch::census_record("FullBodyWalk::SendGeneratorIterator");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
@@ -6775,7 +7011,9 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // abort the walk, roll back the store journal, and replay from loop entry
     // — re-executing the non-journaled store.  Decline up front, before the
     // walk runs anything.  (See `loop_inlines_abort_permanent_callee`.)
-    if let Some(hit) = loop_inlines_abort_permanent_callee(w_code, start_pc, cf_addr) {
+    if !skip_entry_abort_scans
+        && let Some(hit) = loop_inlines_abort_permanent_callee(w_code, start_pc, cf_addr)
+    {
         crate::jitcode_dispatch::census_record("FullBodyWalk::CalleeAbortPermanent");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
@@ -6867,6 +7105,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
         is_being_profiled,
         true,
         carrier_raise_seed,
+        ctx.is_bridge_trace,
     );
     // A guard snapshot emitted during the walk may have hit a resume
     // coordinate the jitcode resume markers cannot encode (#124/#130) and requested

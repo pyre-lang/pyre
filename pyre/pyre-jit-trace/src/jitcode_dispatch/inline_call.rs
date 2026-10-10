@@ -9782,6 +9782,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // inherit a helper's deferred limit check.
                 transparent_helper_subwalk: false,
                 transparent_helper_jitcode_index: None,
+                transparent_helper_owns_resume_section: false,
                 ..ctx.fbw_mode
             },
             session: ctx.session,

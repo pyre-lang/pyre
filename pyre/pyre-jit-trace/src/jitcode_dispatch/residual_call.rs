@@ -8480,14 +8480,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // Range GET_ITER: virtualize exact machine-word `range` into the same
-    // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
+    // GET_ITER records `W_Range.descr_iter` (`RANGE_ITER_DESCENT`) for
+    // exact `range`, `iter_w` for exact `zip` / `map` / `filter`, and
+    // `descr_iter` for exact sequence iterators. Not a spec-fold row —
+    // HelperDescent, the `newdict` twin.
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::GetIter
     {
-        if let Some(iter_op) = spec_gate(SpecFold::GetIter, || {
-            try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)
-        })? {
+        if let Some(iter_op) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
@@ -8529,6 +8529,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if let Some(item_op) =
             try_walker_orthodox_list_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
         {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // Exact `zip` records `W_Zip.next_w` (`zip_two_tuple_next` /
+        // `zip_next_method`). Not a spec-fold row.
+        if let Some(item_op) = try_walker_orthodox_zip_next(ctx, op.pc, &r_args, dst, dst_bank)? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
@@ -8770,18 +8776,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // An exact `range(...)` constructor call becomes a virtual W_Range whose
-    // four wrapped-int fields can fold directly into GET_ITER virtualization.
-    // Non-canonical callables and arguments fall through to the residual.
+    // An exact `range(...)` records `W_Range.descr_new` (`RANGE_NEW_*_DESCENT`)
+    // with the raw bound boxes. The leaf applies `space.index` and the
+    // zero-step `ValueError`. Not a spec-fold row — HelperDescent, the
+    // `newfloat` twin.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && try_walker_orthodox_range_new(ctx, code, op, &r_args, dst)?.is_some()
     {
-        if let Some(outcome) = spec_gate(SpecFold::BuiltinRange, || {
-            try_walker_specialize_builtin_range(ctx, code, op, funcptr, &r_args, call_descr, dst)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal

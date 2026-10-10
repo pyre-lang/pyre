@@ -1491,6 +1491,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     // pool (mirror `dispatch_perfn_frame`).  `callee_pjc` is an `Arc` that
     // outlives the walk, so extend the descr-slice borrow to `'static` for the
     // `'static`-bodied `SubJitCodeBody` lookup.
+    //
+    // Translator helpers (`JitCode::from_canonical` in
+    // `ensure_build_time_jitcode_at`) index `d`/`j` through ALL_DESCRS.
+    // Codeless continuations (`operator_continuation`, `ctor_continuation`)
+    // are `JitCodeBuilder` bodies whose descr indices name their own
+    // `exec.descrs`. The flag is the single owner of that fact.
+    let uses_global_descr_pool = callee_pjc.jitcode.uses_global_descr_pool();
     let perfn_descrs: &'static [RuntimeBhDescr] =
         unsafe { &*(callee_pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
     let perfn_descr_refs: Vec<majit_ir::DescrRef> = perfn_descrs
@@ -1520,8 +1527,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 constants_i: jc.constants_i.as_slice(),
                 constants_r: jc.constants_r.as_slice(),
                 constants_f: jc.constants_f.as_slice(),
+                jitcode_index: jc.try_index(),
             })
     };
+    let global_descrs = crate::jitcode_runtime::descr_ref_table();
 
     // Allocate the callee register banks sized to `num_regs_* + constants_*`,
     // seed the constant pool into the upper slots and `argboxes_r` into the
@@ -1612,7 +1621,11 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let outer_active_boxes = root_frame.boxes.clone();
 
     let callee_code = jc.code.as_slice();
-    let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
+    let lookup_ref: &SubJitCodeLookup = if uses_global_descr_pool {
+        &GLOBAL_SUB_JITCODE_LOOKUP_FN
+    } else {
+        &sub_jitcode_lookup
+    };
     // `callee_w_code` is the callee frame's `pycode` red — a
     // `W_Code` object.  `callee_code_key` is the raw compiled-code pointer the
     // recipe carries, which is the JIT-side key, not that object; the live
@@ -1720,6 +1733,38 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             pending_tail = Some(tail);
             continue;
         }
+        if crate::state::recipe_is_helper_resume(parent_recipe) {
+            // Helper jitcode on the paused chain: no Python code object, so
+            // the `parent_w_code == 0` decline below would abort the drain.
+            // A helper is not a Python inline frame; do not push
+            // `InlineFrameGuard`. Carry it as a continuation parent the way
+            // `len`'s operator tail is carried (`newframe(jitcode)` has no
+            // `w_code`).
+            if parent_recipe.jitcode_pc < 0 {
+                return None;
+            }
+            let resume_pc = parent_recipe.jitcode_pc as usize;
+            pending_tail = Some(InlineParentFrame {
+                jitcode_index: parent_recipe.jitcode_index as u32,
+                call_jitcode_pc: None,
+                call_stack_overrides: Vec::new(),
+                blackhole: None,
+                resume_coord: ParentResumeCoord::Backxlat(resume_pc),
+                resume_marker_jit_pc: Some(resume_pc),
+                boxes: Vec::new(),
+                registers_r: None,
+                registers_i: None,
+                registers_f: None,
+                frame_state: None,
+                caller_py_pc: None,
+                result_slot: super::call_result_slot(
+                    parent_recipe.jitcode_index as u32,
+                    resume_pc,
+                    parent_recipe.registers_r.len(),
+                ),
+            });
+            continue;
+        }
         // Preserve the wrapper identity for frame-local metadata, but not a
         // recursion greenkey: `resume.rebuild_from_resumedata` reconstructs
         // every frame through `MetaInterp.newframe(jitcode)`, so
@@ -1796,8 +1841,16 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             registers_f: &RegisterBank::with_constants(regs_f, num_regs_f),
 
             concrete_registers_i: &mut concrete_i,
-            descr_refs: &perfn_descr_refs,
-            raw_descrs: RawDescrPool::PerFn(perfn_descrs),
+            descr_refs: if uses_global_descr_pool {
+                global_descrs
+            } else {
+                &perfn_descr_refs
+            },
+            raw_descrs: if uses_global_descr_pool {
+                RawDescrPool::Global
+            } else {
+                RawDescrPool::PerFn(perfn_descrs)
+            },
             // The carrier sub-walk IS the bridge-resume metainterp: after a
             // guard failure `handle_guard_failure` rebuilds the frame state and
             // drives it forward through the SAME `self.interpret()` the initial
