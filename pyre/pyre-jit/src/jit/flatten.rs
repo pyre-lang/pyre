@@ -2689,6 +2689,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "build_map_from_empty_array"
             | "dict_display_new"
             | "dict_display_setitem"
+            | "set_display_new"
             | "build_set_from_array"
             | "build_string_from_array"
     )
@@ -3740,9 +3741,10 @@ pub struct LoweringContext {
     /// SET_ADD/SET_UPDATE/DICT_UPDATE record 2-Ref void HLOps
     /// (`set_add(set, value)` etc.), MAP_ADD/DICT_MERGE record 3-Ref void
     /// HLOps (`map_add(dict, key, value)`, `dict_merge(dict, source,
-    /// callable)`), all lowered to `residual_call_r_v` via
-    /// [`lower_accumulator_hlop_to_insn`]; the `bh_*` residuals mutate the
-    /// peeked container in place (user `__hash__`/iterator → `MayForce`).
+    /// callable)`), lowered via [`lower_accumulator_hlop_to_insn`] to
+    /// `inline_call_r_v` of the matching `opcode_ops::*` body when bound,
+    /// else `residual_call_r_v`; the `bh_*` residuals mutate the peeked
+    /// container in place (user `__hash__`/iterator → `MayForce`).
     pub set_add_fn_idx: u16,
     pub set_update_fn_idx: u16,
     pub dict_update_fn_idx: u16,
@@ -5075,6 +5077,21 @@ where
                 .collect();
             // One `BUILD_MAP` pair. `inline_call_r_v`, same shape as `delitem`.
             build_orthodox_inline_call_r_v(inline_call_targets::DICT_DISPLAY_SETITEM, refs)
+        }
+        "set_display_new" => {
+            if !op.args.is_empty() {
+                return None;
+            }
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            // pyopcode.py BUILD_SET `space.newset()`.
+            build_orthodox_inline_call_r_r_n(
+                inline_call_targets::SET_DISPLAY_NEW,
+                Vec::new(),
+                dst_reg,
+            )
         }
         _ => None,
     }
@@ -6534,6 +6551,18 @@ pub(crate) mod inline_call_targets {
     pub const IS_OP: &str = "pyre_interpreter::runtime_ops::is_op";
     /// LIST_EXTEND — `lower_list_extend_hlop_to_insn`.
     pub const LIST_EXTEND: &str = "pyre_interpreter::opcode_ops::list_extend_value";
+    /// SET_ADD — `lower_accumulator_hlop_to_insn`.
+    pub const SET_ADD: &str = "pyre_interpreter::opcode_ops::set_add_value";
+    /// SET_UPDATE — `lower_accumulator_hlop_to_insn`.
+    pub const SET_UPDATE: &str = "pyre_interpreter::opcode_ops::set_update_value";
+    /// DICT_UPDATE — `lower_accumulator_hlop_to_insn`.
+    pub const DICT_UPDATE: &str = "pyre_interpreter::opcode_ops::dict_update_value";
+    /// MAP_ADD — `lower_accumulator_hlop_to_insn`.
+    pub const MAP_ADD: &str = "pyre_interpreter::opcode_ops::map_add_value";
+    /// DICT_MERGE — `lower_accumulator_hlop_to_insn`.
+    pub const DICT_MERGE: &str = "pyre_interpreter::opcode_ops::dict_merge_value";
+    /// BUILD_SET allocation — `lower_tuple_build_hlop_to_insn`.
+    pub const SET_DISPLAY_NEW: &str = "pyre_object::setobject::w_set_new";
     /// FORMAT_SIMPLE — `lower_format_simple_hlop_to_insn`.
     pub const FORMAT_SIMPLE_W: &str = "pyre_interpreter::type_methods::format_simple_w";
     /// CONVERT_VALUE — `lower_convert_value_hlop_to_insn`.
@@ -7521,13 +7550,18 @@ where
     ))
 }
 
-/// Lower the comprehension/display accumulator HLOps to `residual_call_r_v`
-/// (void, N Ref operands, `MayForce`).  Each mutates a peeked container in
-/// place through its `bh_*` residual:
+/// Lower the comprehension/display accumulator HLOps to `inline_call_r_v`
+/// of the matching `opcode_ops::*` body when this build binds that body
+/// fully, else `residual_call_r_v` (void, N Ref operands, `MayForce`).
+/// Each mutates a peeked container in place:
 /// - `set_add(set, value)` / `set_update(set, iterable)` /
 ///   `dict_update(dict, source)` — 2 Ref operands.
 /// - `map_add(dict, key, value)` / `dict_merge(dict, source, callable)` —
 ///   3 Ref operands.
+///
+/// pyopcode.py SET_ADD / SET_UPDATE / MAP_ADD / DICT_UPDATE / DICT_MERGE
+/// are `space.call_method` / `space.setitem` — the LIST_EXTEND
+/// `inline_call_r_v` then residual shape.
 ///
 /// Returns `None` for any other opname so the caller can fall through to
 /// other lowering arms.
@@ -7541,12 +7575,12 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    let (fn_idx, argc) = match op.opname.as_str() {
-        "set_add" => (ctx.set_add_fn_idx, 2),
-        "set_update" => (ctx.set_update_fn_idx, 2),
-        "dict_update" => (ctx.dict_update_fn_idx, 2),
-        "map_add" => (ctx.map_add_fn_idx, 3),
-        "dict_merge" => (ctx.dict_merge_fn_idx, 3),
+    let (fn_idx, argc, target) = match op.opname.as_str() {
+        "set_add" => (ctx.set_add_fn_idx, 2, inline_call_targets::SET_ADD),
+        "set_update" => (ctx.set_update_fn_idx, 2, inline_call_targets::SET_UPDATE),
+        "dict_update" => (ctx.dict_update_fn_idx, 2, inline_call_targets::DICT_UPDATE),
+        "map_add" => (ctx.map_add_fn_idx, 3, inline_call_targets::MAP_ADD),
+        "dict_merge" => (ctx.dict_merge_fn_idx, 3, inline_call_targets::DICT_MERGE),
         _ => return None,
     };
     if op.args.len() != argc || op.result.is_some() {
@@ -7557,6 +7591,9 @@ where
         .iter()
         .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
         .collect();
+    if let Some(insn) = build_orthodox_inline_call_r_v(target, operands.clone()) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_v_insn_from_operands(
         fn_idx,
         operands,

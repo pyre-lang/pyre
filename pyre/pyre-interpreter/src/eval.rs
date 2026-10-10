@@ -5624,18 +5624,28 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── BuildSet ──
-    /// `pyopcode.py BUILD_SET` is `@jit.unroll_safe`.
+    /// `pyopcode.py BUILD_SET` is `@jit.unroll_safe`: `space.newset()`, then
+    /// `call_method(w_set, 'add', peekvalue(i))` from `itemcount-1` down to
+    /// 0, then `dropvalues` / `pushvalue`.
     #[majit_macros::unroll_safe]
     fn build_set(&mut self, count: usize) -> Result<(), PyError> {
-        // Build as a set-like object backed by __data__ dict.
-        let mut items = Vec::with_capacity(count);
-        for _ in 0..count {
-            items.push(self.pop());
+        let count = majit_metainterp::jit::promote(count);
+        let set_obj = pyre_object::w_set_new();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let set_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(set_obj);
+        let mut i = count;
+        while i > 0 {
+            i -= 1;
+            let w_item = PyFrame::peek_at(self, i);
+            crate::opcode_ops::set_add_value(
+                pyre_object::gc_roots::shadow_stack_get(set_slot),
+                w_item,
+            )?;
         }
-        items.reverse();
-        let anchor = FrameAnchor::new(self);
-        let set_obj = crate::builtins::builtin_set_from_items(&items)?;
-        Self::push_anchored(&anchor, set_obj)
+        self.dropvalues(count);
+        self.push(pyre_object::gc_roots::shadow_stack_get(set_slot));
+        Ok(())
     }
 
     // ── DictUpdate ──
