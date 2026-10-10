@@ -316,7 +316,7 @@ pub struct UnrollOptimizer {
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// history.py: JitCellToken.target_tokens — compiled versions of this loop.
     /// Each TargetToken has its own virtual state and short preamble.
-    pub target_tokens: Vec<TargetToken>,
+    pub target_tokens: Vec<std::sync::Arc<TargetToken>>,
     /// `compile.py:355` — the `JitCellToken` this compilation's artifact will be
     /// installed under, when there is one. `compile_retrace` resolves it from
     /// `get_procedure_token(greenkey)` and the result is attached as a bridge to
@@ -567,7 +567,7 @@ impl UnrollOptimizer {
     /// `inline_short_preamble` retains the `sb.target_token is target_token`
     /// discrimination at `unroll.py:376-385`; its descriptor-identity gate
     /// prevents an in-place setup against every matching candidate.
-    pub fn seed_prior_target_tokens(&mut self, tokens: Vec<TargetToken>) {
+    pub fn seed_prior_target_tokens(&mut self, tokens: Vec<std::sync::Arc<TargetToken>>) {
         self.target_tokens = tokens;
     }
 
@@ -798,11 +798,11 @@ impl UnrollOptimizer {
     /// `_compute_hint_locations_from_descr` asserts for a compiled target.
     pub fn jump_to_preamble(
         body_ops: &[majit_ir::OpRc],
-        preamble_target: &TargetToken,
+        preamble_target: &std::sync::Arc<TargetToken>,
         preamble_args: &[OpRef],
     ) -> Vec<majit_ir::OpRc> {
         assert!(
-            preamble_target.virtual_state.is_none(),
+            preamble_target.attrs().virtual_state.is_none(),
             "jump_to_preamble expects the start/preamble target token"
         );
         let mut result = body_ops.to_vec();
@@ -821,7 +821,7 @@ impl UnrollOptimizer {
         if self
             .target_tokens
             .first()
-            .is_some_and(|token| token.virtual_state.is_none())
+            .is_some_and(|token| token.attrs().virtual_state.is_none())
         {
             return;
         }
@@ -1673,7 +1673,7 @@ impl UnrollOptimizer {
                     let mut target_states: Vec<crate::optimizeopt::virtualstate::VirtualState> =
                         self.target_tokens
                             .iter()
-                            .filter_map(|token| token.virtual_state.clone())
+                            .filter_map(|token| token.attrs().virtual_state.clone())
                             .collect();
                     let target_virtual_state = if let Some(idx) =
                         pick_virtual_state(&current_vs, &target_states, &mut final_ctx)
@@ -2042,7 +2042,7 @@ impl UnrollOptimizer {
         let sp = self
             .target_tokens
             .last()
-            .and_then(|target| target.short_preamble.clone())
+            .and_then(|target| target.attrs().short_preamble.clone())
             .unwrap_or(initial_sp);
         if !sp.is_empty() {
             self.short_preamble = Some(sp.clone());
@@ -2273,7 +2273,7 @@ impl UnrollOptimizer {
         // assembly, empty included, because this token can be recompiled with
         // a different body and a stale list would append args the LABEL no
         // longer has.
-        if let Some(target) = self.target_tokens.last_mut() {
+        if let Some(target) = self.target_tokens.last() {
             let recipes = vable_config
                 .as_ref()
                 .filter(|_| !appended_label_args.is_empty())
@@ -2295,9 +2295,14 @@ impl UnrollOptimizer {
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
-            target.label_tail_unrebuildable = recipes.len() != appended_label_args.len();
-            if !target.vable_label_arg_recipes.is_empty() || !recipes.is_empty() {
-                target.vable_label_arg_recipes = recipes;
+            let mut attrs = target.attrs();
+            attrs.label_tail_unrebuildable = recipes.len() != appended_label_args.len();
+            let replaced = !attrs.vable_label_arg_recipes.is_empty() || !recipes.is_empty();
+            if replaced {
+                attrs.vable_label_arg_recipes = recipes;
+            }
+            drop(attrs);
+            if replaced {
                 target.mark_minor_scan_pending();
             }
         }
@@ -3660,12 +3665,15 @@ impl OptUnroll {
         short_preamble: crate::optimizeopt::shortpreamble::ShortPreamble,
         short_preamble_builder: Option<&crate::optimizeopt::shortpreamble::ShortPreambleBuilder>,
     ) -> (
-        TargetToken,
+        std::sync::Arc<TargetToken>,
         Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
     ) {
-        let mut target_token = TargetToken::new_loop(token_id);
-        target_token.virtual_state = Some(virtual_state);
-        target_token.short_preamble = Some(short_preamble);
+        let target_token = TargetToken::new_loop(token_id);
+        {
+            let mut attrs = target_token.attrs();
+            attrs.virtual_state = Some(virtual_state);
+            attrs.short_preamble = Some(short_preamble);
+        }
         let short_preamble_producer = short_preamble_builder.map(|builder| {
             crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder::new(
                 target_token.as_jump_target_descr(),
@@ -3695,7 +3703,7 @@ impl OptUnroll {
         &self,
         jump_args: &[OpRef],
         current_label_args: Option<&[OpRef]>,
-        target_tokens: &mut [TargetToken],
+        target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
@@ -3724,7 +3732,7 @@ impl OptUnroll {
         &self,
         jump_args: &[OpRef],
         current_label_args: Option<&[OpRef]>,
-        target_tokens: &mut [TargetToken],
+        target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
@@ -3760,7 +3768,7 @@ impl OptUnroll {
         &self,
         jump_args: &[OpRef],
         current_label_args: Option<&[OpRef]>,
-        target_tokens: &mut [TargetToken],
+        target_tokens: &[std::sync::Arc<TargetToken>],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         force_boxes: bool,
@@ -3774,20 +3782,22 @@ impl OptUnroll {
             .map(|&a| ctx.get_replacement_opref(a))
             .collect();
 
-        for (tt_idx, target_token) in target_tokens.iter_mut().enumerate() {
+        for (tt_idx, target_token) in target_tokens.iter().enumerate() {
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
                     "jit-tracing",
                     &format!("jump_to_existing trying target_token #{tt_idx}"),
                 );
             }
-            let target_vs = match &target_token.virtual_state {
+            // Cloned out of the token's lock: the body below re-enters the
+            // token (`short_preamble`, recipes) while this state is in use.
+            let target_vs = match target_token.attrs().virtual_state.clone() {
                 Some(vs) => vs,
                 None => continue,
             };
             // A LABEL arg appended without a recipe is one no close can
             // supply: the JUMP would land short of the LABEL.
-            if target_token.label_tail_unrebuildable {
+            if target_token.attrs().label_tail_unrebuildable {
                 if crate::log_jtet_enabled() {
                     eprintln!(
                         "[jit][jte] target_token #{tt_idx} skipped: LABEL tail has no recipe",
@@ -3999,7 +4009,10 @@ impl OptUnroll {
 
             // unroll.py:353-356: inline short preamble
             let mut extra = Vec::new();
-            if let Some(sp) = target_token.short_preamble.clone() {
+            // Bound outside the `if let`: the scrutinee's lock guard would
+            // otherwise live through the body, which locks the token again.
+            let short_preamble = target_token.attrs().short_preamble.clone();
+            if let Some(sp) = short_preamble {
                 let is_mine = optimizer
                     .short_preamble_producer
                     .as_ref()
@@ -4067,7 +4080,8 @@ impl OptUnroll {
                     if !ctx.has_pending_invalid_loop()
                         && let Some(builder) = optimizer.short_preamble_producer.as_ref()
                     {
-                        target_token.short_preamble = Some(builder.build_short_preamble_struct());
+                        target_token.attrs().short_preamble =
+                            Some(builder.build_short_preamble_struct());
                         // `history.TargetToken.short_preamble` is a traced GC
                         // field upstream, so this replacement invokes the
                         // normal MiniMark write barrier.
@@ -4119,10 +4133,10 @@ impl OptUnroll {
             // virtualizable) so the JUMP matches the LABEL the backend
             // regalloc asserts against. Without this the close lands short and
             // `compile_bridge` gives the bridge up.
-            if !target_token.vable_label_arg_recipes.is_empty()
+            let recipes = target_token.attrs().vable_label_arg_recipes.clone();
+            if !recipes.is_empty()
                 && let Some(frame_operand) = jump_args.first().cloned()
             {
-                let recipes = target_token.vable_label_arg_recipes.clone();
                 for (opcode, descr) in recipes {
                     let tp = opcode.result_type();
                     let mut load = Op::new(opcode, std::slice::from_ref(&frame_operand));
@@ -6715,7 +6729,7 @@ mod tests {
         );
         assert_eq!(
             result[1].getdescr().map(|descr| descr.repr()),
-            Some("LoopTargetDescr(start:7)".to_string())
+            Some("TargetToken(start:7)".to_string())
         );
     }
 
@@ -6744,7 +6758,7 @@ mod tests {
         );
         assert_eq!(
             result[0].getdescr().map(|descr| descr.repr()),
-            Some("LoopTargetDescr(start:7)".to_string())
+            Some("TargetToken(start:7)".to_string())
         );
     }
 
@@ -6806,7 +6820,7 @@ mod tests {
         );
         assert_eq!(
             result[1].getdescr().map(|descr| descr.repr()),
-            Some("LoopTargetDescr(start:7)".to_string())
+            Some("TargetToken(start:7)".to_string())
         );
     }
 
@@ -6814,16 +6828,17 @@ mod tests {
     fn test_ensure_preamble_target_token_inserts_start_descr_first() {
         let mut unroll = UnrollOptimizer::new();
         let mut regular = TargetToken::new_loop(3);
-        regular.virtual_state = Some(crate::optimizeopt::virtualstate::VirtualState::new(vec![
-            crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(majit_ir::Type::Int),
-        ]));
+        regular.attrs().virtual_state =
+            Some(crate::optimizeopt::virtualstate::VirtualState::new(vec![
+                crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(majit_ir::Type::Int),
+            ]));
         unroll.target_tokens.push(regular);
 
         unroll.ensure_preamble_target_token();
 
         assert_eq!(unroll.target_tokens.len(), 2);
         assert!(unroll.target_tokens[0].is_preamble_target);
-        assert!(unroll.target_tokens[0].virtual_state.is_none());
+        assert!(unroll.target_tokens[0].attrs().virtual_state.is_none());
         assert_eq!(unroll.target_tokens[1].token_id, 3);
     }
 
@@ -9612,8 +9627,7 @@ mod tests {
             .iter()
             .find(|op| {
                 op.opcode == OpCode::Label
-                    && op.getdescr().map(|descr| descr.repr())
-                        == Some("LoopTargetDescr(1)".to_string())
+                    && op.getdescr().map(|descr| descr.repr()) == Some("TargetToken(1)".to_string())
             })
             .expect("body label");
         assert_eq!(
@@ -10174,7 +10188,7 @@ mod tests {
         let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
         let runtime_box = OpRef::const_int(5);
         let mut target_tokens = vec![TargetToken::new_loop(1)];
-        target_tokens[0].virtual_state =
+        target_tokens[0].attrs().virtual_state =
             Some(VirtualState::new(vec![VirtualStateInfo::IntBounded(
                 IntBound::bounded(0, 10),
             )]));
@@ -10218,10 +10232,11 @@ mod tests {
         // the LABEL slot no close can deliver.
         let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
         let mut target_tokens = vec![TargetToken::new_loop(1)];
-        target_tokens[0].virtual_state = Some(VirtualState::new(vec![VirtualStateInfo::Unknown(
-            Type::Int,
-        )]));
-        target_tokens[0].label_tail_unrebuildable = true;
+        target_tokens[0].attrs().virtual_state =
+            Some(VirtualState::new(vec![VirtualStateInfo::Unknown(
+                Type::Int,
+            )]));
+        target_tokens[0].attrs().label_tail_unrebuildable = true;
 
         let vs = OptUnroll::default().jump_to_existing_trace_with_vs(
             &[arg],
@@ -10423,7 +10438,7 @@ mod tests {
 
         let mut target_tokens = vec![TargetToken::new_loop(1)];
         let peeled = target_tokens[0].as_jump_target_descr();
-        target_tokens[0].virtual_state = Some(target_vs);
+        target_tokens[0].attrs().virtual_state = Some(target_vs);
 
         let unroll = OptUnroll::default();
         let vs = unroll.jump_to_existing_trace_with_vs(

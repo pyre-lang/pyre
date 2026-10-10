@@ -2172,10 +2172,7 @@ pub(crate) struct CompiledEntry<M> {
     /// Behind an `Arc` the pyre entry path matches that: a warm entry clones a
     /// refcount where it used to clone the whole struct, on every call.
     pub(crate) meta: std::sync::Arc<M>,
-    /// Front-end loop-version state, mirroring RPython's
-    /// jitcell_token.target_tokens ownership across recompilations.
-    pub(crate) front_target_tokens: Vec<crate::history::TargetToken>,
-    /// Index into `front_target_tokens` of the LABEL the Cranelift host
+    /// Index into the token's `target_tokens` of the LABEL the Cranelift host
     /// enters this loop through, decided once when the entry is installed.
     ///
     /// Upstream has no counterpart: `JitCellToken.target_tokens`
@@ -2322,9 +2319,9 @@ impl<M> CompiledEntry<M> {
 /// will tell you.
 ///
 /// These two are carried at **all five** replace paths. They are deliberately
-/// the *only* members: `front_target_tokens` is carried at exactly one site
-/// (`compile_entry_bridge`) because the other four **mint** fresh labels, so
-/// inheriting it elsewhere would be a behaviour change, not a fix. Likewise
+/// the *only* members: the label list is `JitCellToken.target_tokens`
+/// (`history.py`), and a token minted by `make_jitcell_token` starts with
+/// none, so no replace path inherits the displaced loop's labels. Likewise
 /// `migrate_bridges` is called at three of the five and must stay at the call
 /// sites. Adding a field here that is not universal re-introduces exactly the
 /// bug this type exists to prevent.
@@ -2570,7 +2567,7 @@ pub struct MetaInterp<M: Clone> {
     /// structurally shaped like one. `cut_trace_from_with_consts` does run
     /// (`[jit] cut_trace_from: start.op_index=40 original_boxes=33
     /// trace_ops=77`) and the artifact does carry a peeled preamble —
-    /// `front_target_tokens` is `[preamble(no virtual state), specialized]`,
+    /// `token.target_tokens` is `[preamble(no virtual state), specialized]`,
     /// the same pair a loop compiled at its own header gets, which is what
     /// makes `jump_to_preamble` (unroll.py) sound there.
     ///
@@ -2845,7 +2842,8 @@ pub struct MetaInterp<M: Clone> {
     /// `(jitdriver_sd.index, cell green_key)` like `compiled_loops`; entries
     /// are added on InvalidLoop and removed when the next retrace succeeds,
     /// so the active set is bounded by the count of in-flight retraces.
-    pending_preamble_tokens: crate::FxIndexMap<(usize, u64), Vec<crate::history::TargetToken>>,
+    pending_preamble_tokens:
+        crate::FxIndexMap<(usize, u64), Vec<std::sync::Arc<crate::history::TargetToken>>>,
     // pyjitpl.py `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs()`.
@@ -3613,17 +3611,23 @@ impl<M: Clone> MetaInterp<M> {
                         }
                     }
                 }
-                for tt in entry.front_target_tokens.iter_mut() {
+                let target_tokens = entry
+                    .token
+                    .upgrade()
+                    .map(|token| crate::history::target_tokens_of(&token))
+                    .unwrap_or_default();
+                for tt in &target_tokens {
                     // `history.TargetToken` is a GC object upstream. MiniMark
                     // visits it in a minor only while its write barrier is
                     // dirty; after forwarding its graph, clean tokens stay out
                     // of later minor walks until another traced-field store. A
                     // major must still see every token graph.
                     if !is_minor || tt.take_minor_scan_pending() {
-                        if let Some(virtual_state) = tt.virtual_state.as_mut() {
+                        let mut attrs = tt.attrs();
+                        if let Some(virtual_state) = attrs.virtual_state.as_mut() {
                             virtual_state.walk_const_ptr_refs_mut(&mut visitor);
                         }
-                        if let Some(sp) = tt.short_preamble.as_mut() {
+                        if let Some(sp) = attrs.short_preamble.as_mut() {
                             sp.walk_const_ptr_refs_mut(&mut visitor);
                         }
                     }
@@ -8787,7 +8791,8 @@ impl<M: Clone> MetaInterp<M> {
         // key are spent either way.
         let preamble_key = self.compiled_loop_key(green_key);
         self.pending_preamble_tokens.swap_remove(&preamble_key);
-        let prior_front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
+        let prior_front_target_tokens: Vec<std::sync::Arc<crate::history::TargetToken>> =
+            Vec::new();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.enable_opts = enable_opts.clone();
         unroll_opt.supports_efficient_uint_mul_high =
@@ -9624,11 +9629,19 @@ impl<M: Clone> MetaInterp<M> {
                 // target_tokens = [start_descr] before Phase 2 runs).
                 if is_invalid_loop && !unroll_opt.target_tokens.is_empty() {
                     if let Some(compiled) = self.compiled_entry_mut(green_key) {
-                        if compiled.front_target_tokens.is_empty() {
-                            compiled.front_target_tokens = unroll_opt.target_tokens.clone();
+                        if let Some(live) = compiled.live_token()
+                            && !live.has_target_tokens()
+                        {
+                            live.set_target_tokens(
+                                unroll_opt
+                                    .target_tokens
+                                    .iter()
+                                    .map(|target| target.as_jump_target_descr())
+                                    .collect(),
+                            );
                             if compiled.front_entry_index.is_none() {
                                 compiled.front_entry_index =
-                                    Self::front_entry_index_for(&compiled.front_target_tokens);
+                                    Self::front_entry_index_for(&unroll_opt.target_tokens);
                             }
                         }
                     } else {
@@ -9766,7 +9779,7 @@ impl<M: Clone> MetaInterp<M> {
                             format!(
                                 "{}{}",
                                 if target.is_preamble_target { "P" } else { "S" },
-                                target.virtual_state.is_some() as u8,
+                                target.attrs().virtual_state.is_some() as u8,
                             )
                         })
                         .collect();
@@ -9790,7 +9803,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_target_tokens,
                         front_entry_index,
                         front_target_source_positions,
                         root_trace_id: trace_id,
@@ -10847,7 +10859,12 @@ impl<M: Clone> MetaInterp<M> {
         // installs (`record_jump_to`).
         let prior_front_target_tokens = self
             .compiled_entry(green_key)
-            .map(|compiled| compiled.front_target_tokens.clone())
+            .map(|compiled| {
+                compiled
+                    .live_token()
+                    .map(|live| crate::history::target_tokens_of(&live))
+                    .unwrap_or_default()
+            })
             .or_else(|| {
                 let preamble_key = self.compiled_loop_key(green_key);
                 self.pending_preamble_tokens.swap_remove(&preamble_key)
@@ -11338,19 +11355,14 @@ impl<M: Clone> MetaInterp<M> {
                 // not by republishing its labels as this token's entry.
                 // `compile_retrace` installs a trace that ends in a JUMP to
                 // the previous `TargetToken`; it does not re-emit that
-                // LABEL. No new label: keep the previous list only as the
-                // optimizer scan state a later retrace seeds, and leave
-                // `front_entry_index` unset so the host does not dispatch
-                // on a LABEL this function never emitted.
+                // LABEL. No new label: the fresh token's `target_tokens`
+                // holds nothing, and `front_entry_index` stays unset so the
+                // host does not dispatch on a LABEL this function never
+                // emitted.
                 let front_entry_index = if minted_label_tokens.is_empty() {
                     None
                 } else {
                     Self::front_entry_index_for(&minted_label_tokens)
-                };
-                let front_target_tokens = if minted_label_tokens.is_empty() {
-                    prior_front_target_tokens
-                } else {
-                    minted_label_tokens
                 };
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.note_compiled_loops_changed();
@@ -11360,7 +11372,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
@@ -11619,15 +11630,23 @@ impl<M: Clone> MetaInterp<M> {
                     // newly minted TargetToken to `jitcelltoken.target_tokens`
                     // — the SAME list `unroll.py:198/239/277` scans when a
                     // later trace looks for a label to jump onto. majit keeps
-                    // that scan list on the compiled entry, so the token has to
+                    // that scan list on the loop's token, so the token has to
                     // land there whichever way the artifact is installed;
                     // otherwise no later bridge can ever reach this retrace's
                     // label and each one grows another guard-attached retrace.
                     if !unroll_opt.target_tokens.is_empty() {
-                        compiled.front_target_tokens = unroll_opt.target_tokens.clone();
+                        if let Some(live) = compiled.live_token() {
+                            live.set_target_tokens(
+                                unroll_opt
+                                    .target_tokens
+                                    .iter()
+                                    .map(|target| target.as_jump_target_descr())
+                                    .collect(),
+                            );
+                        }
                         if compiled.front_entry_index.is_none() {
                             compiled.front_entry_index =
-                                Self::front_entry_index_for(&compiled.front_target_tokens);
+                                Self::front_entry_index_for(&unroll_opt.target_tokens);
                         }
                     }
                     // `compile.py send_bridge_to_backend`: the bridge is
@@ -12406,7 +12425,8 @@ impl<M: Clone> MetaInterp<M> {
                     let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                     let ft = self
                         .compiled_entry(green_key)
-                        .map(|c| c.front_target_tokens.clone())
+                        .and_then(|c| c.live_token())
+                        .map(|live| crate::history::target_tokens_of(&live))
                         .unwrap_or_default();
                     let _had_old = self.has_compiled_loop_entry(green_key);
                     // Carried forward for the same reason as the compile_loop site.
@@ -12437,7 +12457,7 @@ impl<M: Clone> MetaInterp<M> {
                     // and attaches through `resumekey.compile_and_attach`.  It
                     // never builds a `TargetToken`/LABEL and never adds to
                     // `jitcell_token.target_tokens`.  So a FINISH-only trace
-                    // leaves `front_target_tokens` empty: `has_compiled_targets`
+                    // leaves `target_tokens` empty: `has_compiled_targets`
                     // (`pyjitpl.py` = `bool(token.target_tokens)`) is
                     // false, while the trace stays enterable through
                     // `has_compiled_loop`
@@ -12458,7 +12478,6 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledEntry {
                             token: Arc::downgrade(&token),
                             meta: Arc::new(meta),
-                            front_target_tokens: ft,
                             front_entry_index,
                             front_target_source_positions: None,
                             root_trace_id: trace_id,
@@ -12526,7 +12545,7 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py compile_simple_loop parity.
     ///
     /// Compiles the trace with simple optimizer (no preamble peeling),
-    /// prepends a LABEL (via front_target_tokens) for bridge attachment.
+    /// prepends a LABEL (via the token's `target_tokens`) for bridge attachment.
     /// Returns the green_key on success (caller must call
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
@@ -12907,7 +12926,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
@@ -13478,7 +13496,9 @@ impl<M: Clone> MetaInterp<M> {
             .any(|(jump_arg, label_arg)| jump_arg.is_constant() && !label_arg.is_constant())
     }
 
-    fn front_entry_index_for(tokens: &[crate::history::TargetToken]) -> Option<usize> {
+    fn front_entry_index_for(
+        tokens: &[std::sync::Arc<crate::history::TargetToken>],
+    ) -> Option<usize> {
         tokens
             .iter()
             .position(|target| !target.is_preamble_target)
@@ -13487,15 +13507,16 @@ impl<M: Clone> MetaInterp<M> {
 
     fn selected_front_target_token(
         compiled: &CompiledEntry<M>,
-    ) -> Option<&crate::history::TargetToken> {
-        compiled
-            .front_target_tokens
-            .get(compiled.front_entry_index?)
+    ) -> Option<std::sync::Arc<crate::history::TargetToken>> {
+        let live = compiled.live_token()?;
+        crate::history::target_tokens_of(&live)
+            .into_iter()
+            .nth(compiled.front_entry_index?)
     }
 
     fn compact_label_values_for_selected_target(
         green_key: u64,
-        front_target_tokens: &[crate::history::TargetToken],
+        front_target_tokens: &[std::sync::Arc<crate::history::TargetToken>],
         compiled_ops: &[majit_ir::OpRc],
         trace: &TreeLoop,
         full_live_values: Option<&[Value]>,
@@ -14764,7 +14785,7 @@ impl<M: Clone> MetaInterp<M> {
     /// trace's saved ops, so rebuild their types from that trace.
     ///
     /// Two parity paths cover every JUMP target:
-    /// 1. Peeled (unrolled) loops — `front_target_tokens.first()` names the
+    /// 1. Peeled (unrolled) loops — `target_tokens.first()` names the
     ///    peeled-entry `TargetToken`; locate its LABEL in the root trace and
     ///    read each arg's type via `build_trace_value_maps`. RPython:
     ///    `optimizeopt/unroll.py` peeled-entry LABEL is the JUMP target.
@@ -15970,12 +15991,18 @@ impl<M: Clone> MetaInterp<M> {
         let optimize_start = Instant::now();
         let mut retraced_count = retraced_count;
         let bridge_optimize_result = {
-            let compiled = self.compiled_entry_mut(green_key).unwrap();
+            // `unroll.py for target_token in jitcelltoken.target_tokens`
+            let scan_target_tokens = self
+                .compiled_entry(green_key)
+                .unwrap()
+                .live_token()
+                .map(|live| crate::history::target_tokens_of(&live))
+                .unwrap_or_default();
             optimizer.optimize_bridge(
                 bridge_ops,
                 &mut constants,
                 bridge_inputargs.len(),
-                &mut compiled.front_target_tokens,
+                &scan_target_tokens,
                 bridge_runtime_boxes,
                 true,
                 &mut retraced_count,
@@ -16245,26 +16272,17 @@ impl<M: Clone> MetaInterp<M> {
                 //
                 // `attach_procedure_to_interp` (warmstate.py) re-points
                 // the jitcell and keeps the old token alive; it never takes the
-                // loop's own TargetTokens away.  `compiled_loops` is the single
-                // map pyre reads for both, so the replacement entry carries the
-                // retired loop's labels forward — publishing an empty list here
-                // leaves a key whose loop nothing can close into again, and every
-                // later trace reaching it declines for want of a front target.
-                let mut front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
+                // loop's own TargetTokens away, and the fresh token's
+                // `target_tokens` stays empty.
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                // Carried forward for the same reason as `front_target_tokens`
-                // just below: the replacement entry inherits the retired loop's
-                // close target, and a key with labels but no header pc is just
-                // as unreachable to a closing bridge as one with neither.
+                // Carried forward: the replacement entry inherits the retired
+                // loop's close target, and a key with no header pc is
+                // unreachable to a closing bridge.
                 let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(original_green_key)
                 {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
-                    // Read off `old_entry`, not `carried`: this is the only one
-                    // of the five sites that inherits the retired loop's
-                    // labels, so it is not a `CarriedFields` member.
-                    front_target_tokens = old_entry.front_target_tokens.clone();
                     carried_loop_header_pc = carried.loop_header_pc;
                     if let Some(old_tok) = old_entry.live_token() {
                         self.backend.migrate_bridges(&old_tok, token.as_ref());
@@ -16272,8 +16290,8 @@ impl<M: Clone> MetaInterp<M> {
                     previous_tokens =
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
-                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
-                // The labels carry over, the retrace budget does not. `token`
+                let front_entry_index = None;
+                // The retrace budget does not carry over. `token`
                 // came out of `make_jitcell_token`, so its count is the
                 // `history.py JitCellToken` default — see the fresh-token note in
                 // `compile_loop`. The count read at the top of this function is
@@ -16287,7 +16305,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
@@ -16799,22 +16816,18 @@ impl<M: Clone> MetaInterp<M> {
         }
         let _compiled = self.compiled_entry_mut(green_key).unwrap();
         // `unroll.py for target_token in jitcelltoken.target_tokens` scans
-        // the tokens of the loop the JUMP enters.  `compiled_loops` cannot
-        // hand out a second `&mut` alongside the origin entry, so a cross-loop
-        // close runs against a clone of the target's vector and stores it back
-        // below; a same-loop close keeps borrowing the entry in place.
-        let mut crossed_target_tokens = if cell_token_key != green_key {
-            self.compiled_entry(cell_token_key)
-                .map(|compiled| compiled.front_target_tokens.clone())
-        } else {
-            None
-        };
+        // the tokens of the loop the JUMP enters.
+        let scan_target_tokens = self
+            .compiled_entry(cell_token_key)
+            .and_then(|compiled| compiled.live_token())
+            .map(|live| crate::history::target_tokens_of(&live))
+            .unwrap_or_default();
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] compile_bridge origin={green_key} dest={jump_target_key} \
                  cell={cell_token_key} crossed={} dest_n={}",
-                crossed_target_tokens.is_some(),
-                crossed_target_tokens.as_ref().map(|t| t.len()).unwrap_or(0),
+                cell_token_key != green_key,
+                scan_target_tokens.len(),
             );
         }
         // compile.py compile_trace: ends_with_jump selects BridgeCompileData
@@ -16827,16 +16840,6 @@ impl<M: Clone> MetaInterp<M> {
         // bridge. Mirror that here so the trace abort doesn't unwind
         // past compile_bridge.
         let bridge_optimize_result = if ends_with_jump {
-            let front_target_tokens = match crossed_target_tokens.as_mut() {
-                Some(tokens) => tokens,
-                None => {
-                    &mut self
-                        .compiled_loops
-                        .get_mut(&(self.active_jitdriver_sd.unwrap_or(0), green_key))
-                        .unwrap()
-                        .front_target_tokens
-                }
-            };
             // compile.py BridgeCompileData.optimize → UnrollOptimizer.optimize_bridge
             let bridge_data = compile::BridgeCompileData::new(
                 &bridge_trace_data,
@@ -16852,7 +16855,7 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_ops,
                     constants,
                     bridge_inputargs.len(),
-                    front_target_tokens,
+                    &scan_target_tokens,
                     bridge_runtime_boxes,
                     bridge_inline_short_preamble,
                     &mut retraced_count,
@@ -16882,12 +16885,6 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .map(|ops| (ops, false))
         };
-        if let Some(tokens) = crossed_target_tokens
-            && let Some(compiled) = self.compiled_entry_mut(cell_token_key)
-        {
-            compiled.front_entry_index = Self::front_entry_index_for(&tokens);
-            compiled.front_target_tokens = tokens;
-        }
         // Hand the descrs back as soon as the optimizer is done with them,
         // before any of the paths below can leave the function. `optimize_bridge`
         // is the last reader; everything after it touches `optimizer` only for
@@ -24705,7 +24702,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -26880,7 +26876,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -26940,7 +26935,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -26996,7 +26990,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -27061,7 +27054,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -27164,7 +27156,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -29366,7 +29357,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -29448,7 +29438,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -30253,7 +30242,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -30676,12 +30664,12 @@ mod tests {
             .keep_loop_alive(&token);
         meta.warm_state_for_driver(0)
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        token.set_target_tokens(vec![start_token.as_jump_target_descr()]);
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: vec![start_token],
                 front_entry_index: Some(0),
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
@@ -30749,12 +30737,12 @@ mod tests {
             .keep_loop_alive(&token);
         meta.warm_state_for_driver(0)
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        token.set_target_tokens(vec![start_token.as_jump_target_descr()]);
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: vec![start_token],
                 front_entry_index: Some(0),
                 front_target_source_positions: source_positions,
                 root_trace_id: trace_id,
@@ -30953,7 +30941,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
@@ -31274,7 +31261,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token_arc),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
@@ -32145,7 +32131,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 0,
@@ -32662,7 +32647,7 @@ mod tests {
     /// previous occupant of the green key had run its own down.
     ///
     /// The state under test is the one `compile_loop` actually reaches: past
-    /// the `has_compiled_targets` give-up, which needs `front_target_tokens`
+    /// the `has_compiled_targets` give-up, which needs `target_tokens`
     /// empty, while the entry's own `Weak` still upgrades. The seeded token
     /// carries the `unroll.py disable_retracing_if_max_retrace_guards`
     /// sentinel, which is the value whose transfer costs the replacement loop
@@ -32695,7 +32680,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&stale),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 101,
@@ -32805,12 +32789,14 @@ mod tests {
 
         let old_token = std::sync::Arc::new(JitCellToken::new(1));
         old_token.set_compiled(Box::new(()));
+        old_token.set_target_tokens(vec![
+            crate::history::TargetToken::new_loop(1).as_jump_target_descr(),
+        ]);
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&old_token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: vec![crate::history::TargetToken::new_loop(1)],
                 front_entry_index: Some(0),
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -32879,7 +32865,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&stale),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 102,
@@ -32934,7 +32919,8 @@ mod tests {
 
         let jump_descr = meta
             .compiled_entry(green_key)
-            .and_then(|entry| entry.front_target_tokens.first())
+            .and_then(|entry| entry.live_token())
+            .and_then(|live| crate::history::target_tokens_of(&live).into_iter().next())
             .expect("the target loop installed a front target")
             .as_jump_target_descr();
         let original_green_key = green_key;
@@ -34330,7 +34316,6 @@ mod bridge_cell_token_tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: green_key,
@@ -34384,7 +34369,6 @@ mod loop_side_table_tests {
         CompiledEntry {
             token: std::sync::Weak::new(),
             meta: std::sync::Arc::new(()),
-            front_target_tokens: Vec::new(),
             front_entry_index: None,
             front_target_source_positions: None,
             root_trace_id,
@@ -34651,7 +34635,6 @@ mod loop_side_table_tests {
         CompiledEntry {
             token,
             meta: std::sync::Arc::new(()),
-            front_target_tokens: Vec::new(),
             front_entry_index: None,
             front_target_source_positions: None,
             root_trace_id,

@@ -4217,6 +4217,12 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_fail_descr_arc(self: Arc<Self>) -> Option<Arc<dyn FailDescr>> {
         None
     }
+    /// The shared handle to this descr as `Any`, for a frontend reader that
+    /// stores its own descr type on a backend-visible list
+    /// (`JitCellToken.target_tokens` holding `history.TargetToken`).
+    fn as_any_arc(self: Arc<Self>) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
     fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
         None
     }

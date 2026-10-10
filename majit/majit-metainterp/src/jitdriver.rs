@@ -4395,7 +4395,7 @@ impl<S: JitState> JitDriver<S> {
                                     &live_arg_boxes,
                                 ),
                                 // compile.py:269-270: a cross-loop CUT keeps its cut prefix
-                                // in `front_target_tokens[0]`, where a loop closed at its own
+                                // in `target_tokens[0]`, where a loop closed at its own
                                 // header keeps its PREAMBLE — the peeled iteration that
                                 // re-derives the specialized label's invariants from the
                                 // loop's entry state, which is what makes `jump_to_preamble`
@@ -12762,7 +12762,6 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -12844,7 +12843,6 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -12892,7 +12890,6 @@ mod tests {
         let entry = |meta: Arc<()>, root_trace_id: u64| crate::pyjitpl::CompiledEntry {
             token: std::sync::Weak::new(),
             meta,
-            front_target_tokens: Vec::new(),
             front_entry_index: None,
             front_target_source_positions: None,
             root_trace_id,
@@ -15518,7 +15515,7 @@ mod cross_loop_cut_close_tests {
         });
     }
 
-    /// A cross-loop cut leaves no PREAMBLE in `front_target_tokens[0]` — that
+    /// A cross-loop cut leaves no PREAMBLE in `target_tokens[0]` — that
     /// slot holds the cut prefix, whose entry invariants only the cutting trace
     /// has proven. `jump_to_preamble` (unroll.py) is the fallback
     /// whenever no specialized label matches, and an interp-origin entry bridge

@@ -59,114 +59,17 @@ pub fn get_const_ptr_for_unicode(
 /// Each peeled loop body creates a TargetToken that records the virtual state
 /// and short preamble needed for bridge entry. Multiple TargetTokens can exist
 /// per loop (from retracing with different virtual states).
-#[derive(Clone, Debug)]
-pub struct TargetToken {
-    /// RPython history.py: identity of this target token within the current
-    /// JitCellToken.target_tokens list. Debug-display only — backend identity
-    /// is the `jump_target_descr` Arc address.
-    pub token_id: u64,
-    /// compile.py: start_descr — the preamble target token has no virtual
-    /// state and lives at `target_tokens[0]`.
-    pub is_preamble_target: bool,
-    /// Virtual state at this loop entry point.
-    /// Used by _jump_to_existing_trace to check compatibility.
+/// `history.py TargetToken` attributes the optimizer writes after the token
+/// is minted (`virtual_state`, `short_preamble`) and pyre's LABEL/JUMP
+/// vable contract. Behind one lock because the token is shared through
+/// `JitCellToken.target_tokens` and mutated by `unroll.py` passes.
+#[derive(Debug, Default)]
+pub struct TargetTokenAttrs {
     pub virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
-    /// Short preamble: ops to replay when entering from a bridge.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
-    /// Loop-header values the assembled LABEL carries beyond the short
-    /// preamble's contract, each with the recipe that rebuilds it from the
-    /// virtualizable frame the LABEL's first arg holds.
-    ///
-    /// `assemble_peeled_trace_with_jump_args` appends a body-live,
-    /// preamble-defined box to the LABEL without a matching `used_boxes`
-    /// entry, so `inline_short_preamble` cannot produce it and a bridge
-    /// closing onto this LABEL lands one arg short. A virtualizable static
-    /// field is reconstructible from the frame at any point, so record the
-    /// `(opcode, field descr)` pair and let the close emit the load.
-    /// Non-reconstructible appends record nothing; the LABEL/JUMP
-    /// contract is `vable_label_arg_recipes` in
-    /// `OptUnroll::jump_to_existing_trace`.
     pub vable_label_arg_recipes: Vec<(majit_ir::OpCode, majit_ir::DescrRef)>,
-    /// The assembled LABEL carries an appended arg with no recipe, so no
-    /// close can deliver every LABEL slot.  `jump_to_existing_trace` skips
-    /// such a target, and the bridge falls back to `jump_to_preamble`.
     pub label_tail_unrebuildable: bool,
-    jump_target_descr: Arc<LoopTargetDescr>,
-    /// `IncrementalMiniMarkGC.old_objects_pointing_to_young` state for the
-    /// off-GC `TargetToken.virtual_state` / `short_preamble` graph.  Upstream
-    /// stores both fields on the GC-managed `history.TargetToken`: publishing
-    /// or mutating that object puts it in the remembered set for one minor,
-    /// and `collect_oldrefs_to_nursery` makes it clean after tracing it.
     minor_scan_pending: bool,
-}
-
-impl Default for TargetToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TargetToken {
-    pub fn new() -> Self {
-        TargetToken {
-            token_id: 0,
-            is_preamble_target: false,
-            virtual_state: None,
-            short_preamble: None,
-            vable_label_arg_recipes: Vec::new(),
-            label_tail_unrebuildable: false,
-            jump_target_descr: Arc::new(LoopTargetDescr::new(0, false)),
-            minor_scan_pending: true,
-        }
-    }
-
-    pub fn new_loop(token_id: u64) -> Self {
-        let mut token = Self::new();
-        token.token_id = token_id;
-        token.jump_target_descr = Arc::new(LoopTargetDescr::new(token_id, false));
-        token
-    }
-
-    pub fn new_preamble(token_id: u64) -> Self {
-        let mut token = Self::new();
-        token.token_id = token_id;
-        token.is_preamble_target = true;
-        token.jump_target_descr = Arc::new(LoopTargetDescr::new(token_id, true));
-        token
-    }
-
-    pub fn as_jump_target_descr(&self) -> majit_ir::DescrRef {
-        self.jump_target_descr.clone()
-    }
-
-    /// Consume this token's remembered-set membership for a minor walk.
-    pub(crate) fn take_minor_scan_pending(&mut self) -> bool {
-        std::mem::take(&mut self.minor_scan_pending)
-    }
-
-    /// Mirror MiniMark's write barrier after replacing a traced field.
-    pub(crate) fn mark_minor_scan_pending(&mut self) {
-        self.minor_scan_pending = true;
-    }
-
-    /// `compile.py compile_simple_loop` / `compile_loop` —
-    /// `target_token.original_jitcell_token = jitcell_token`.
-    /// Stores the token object (Weak on the descr; see
-    /// `LoopTargetDescr::original_jitcell_token_handle`) and caches
-    /// `token.number` for the dense `unroll.rs` compare.
-    pub fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
-        self.jump_target_descr.set_original_jitcell_token(token);
-    }
-
-    /// Number-only backfill for descrs that do not carry a token object
-    /// (`BasicLoopTargetDescr`). Production compile sites use
-    /// [`Self::set_original_jitcell_token`].
-    pub fn set_original_jitcell_token_number(&self, num: u64) {
-        majit_ir::LoopTargetDescr::set_original_jitcell_token_number(
-            self.jump_target_descr.as_ref(),
-            num,
-        );
-    }
 }
 
 #[derive(Debug, Default)]
@@ -182,10 +85,15 @@ struct LoopTargetDescrState {
     original_jitcell_token_number: Option<u64>,
 }
 
+/// `history.py TargetToken(AbstractDescr)`: one object that is both the
+/// LABEL/JUMP descr the backend dispatches through and the optimizer's
+/// per-version state (`virtual_state`, `short_preamble`). The list of a
+/// loop's versions lives on `JitCellToken.target_tokens`
+/// ([`target_tokens_of`] reads it back as this type).
 #[derive(Debug)]
-struct LoopTargetDescr {
-    token_id: u64,
-    is_preamble_target: bool,
+pub struct TargetToken {
+    pub token_id: u64,
+    pub is_preamble_target: bool,
     /// `history.py` `TargetToken._ll_loop_code` parity (PyPy stores
     /// a plain integer GIL-atomic; pyre uses `AtomicUsize` so the
     /// cranelift backend's in-code `closing_jump` dispatch can read
@@ -202,49 +110,120 @@ struct LoopTargetDescr {
     /// gate on the source's already-allocated frame being big enough.
     target_frame_depth: std::sync::atomic::AtomicUsize,
     state: Mutex<LoopTargetDescrState>,
+    attrs: Mutex<TargetTokenAttrs>,
 }
 
-impl LoopTargetDescr {
-    fn new(token_id: u64, is_preamble_target: bool) -> Self {
-        Self {
+// `VirtualState` / `ShortPreamble` hold `Rc` operands. The token is only
+// touched by the single JIT compile/execute thread, like the `Rc`-carrying
+// resume payload on `ResumeGuardDescr`.
+unsafe impl Send for TargetToken {}
+unsafe impl Sync for TargetToken {}
+
+impl TargetToken {
+    fn new(token_id: u64, is_preamble_target: bool) -> Arc<Self> {
+        Arc::new(TargetToken {
             token_id,
             is_preamble_target,
             ll_loop_code: std::sync::atomic::AtomicUsize::new(0),
             label_block_id: std::sync::atomic::AtomicU32::new(0),
             target_frame_depth: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(LoopTargetDescrState::default()),
-        }
+            attrs: Mutex::new(TargetTokenAttrs {
+                minor_scan_pending: true,
+                ..TargetTokenAttrs::default()
+            }),
+        })
+    }
+
+    pub fn new_loop(token_id: u64) -> Arc<Self> {
+        Self::new(token_id, false)
+    }
+
+    pub fn new_preamble(token_id: u64) -> Arc<Self> {
+        Self::new(token_id, true)
+    }
+
+    /// The optimizer-side attributes (`virtual_state`, `short_preamble`, …).
+    pub fn attrs(&self) -> parking_lot::MutexGuard<'_, TargetTokenAttrs> {
+        self.attrs.lock()
+    }
+
+    /// This token as the descr a LABEL / JUMP carries: the token itself.
+    pub fn as_jump_target_descr(self: &Arc<Self>) -> majit_ir::DescrRef {
+        self.clone()
+    }
+
+    /// Consume this token's remembered-set membership for a minor walk.
+    pub(crate) fn take_minor_scan_pending(&self) -> bool {
+        std::mem::take(&mut self.attrs.lock().minor_scan_pending)
+    }
+
+    /// Mirror MiniMark's write barrier after replacing a traced field.
+    pub(crate) fn mark_minor_scan_pending(&self) {
+        self.attrs.lock().minor_scan_pending = true;
     }
 
     /// `compile.py compile_simple_loop` / `compile_loop` /
-    /// `propagate_original_jitcell_token`.
-    fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
+    /// `propagate_original_jitcell_token` —
+    /// `target_token.original_jitcell_token = jitcell_token`.
+    /// Stores the token object (Weak) and caches `token.number` for the
+    /// dense `unroll.rs` compare.
+    pub fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
         let number = token.number;
         let mut st = self.state.lock();
         st.original_jitcell_token_number = Some(number);
         st.original_jitcell_token = Some(Arc::downgrade(token));
     }
+
+    /// Number-only backfill for descrs that do not carry a token object
+    /// (`BasicLoopTargetDescr`). Production compile sites use
+    /// [`Self::set_original_jitcell_token`].
+    pub fn set_original_jitcell_token_number(&self, num: u64) {
+        majit_ir::LoopTargetDescr::set_original_jitcell_token_number(self, num);
+    }
 }
 
-impl majit_ir::Descr for LoopTargetDescr {
+/// `JitCellToken.target_tokens` read back as the `TargetToken` objects the
+/// frontend scans (`unroll.py` `for token in target_tokens`). A descr on the
+/// list that is not a `TargetToken` (a backend fixture's
+/// `BasicLoopTargetDescr`) is skipped.
+pub fn target_tokens_of(token: &JitCellToken) -> Vec<Arc<TargetToken>> {
+    token
+        .target_tokens
+        .lock()
+        .iter()
+        .filter_map(|descr| {
+            descr
+                .clone()
+                .as_any_arc()
+                .and_then(|any| any.downcast::<TargetToken>().ok())
+        })
+        .collect()
+}
+
+impl majit_ir::Descr for TargetToken {
     fn index(&self) -> u32 {
         self.token_id as u32
     }
 
     fn repr(&self) -> String {
         if self.is_preamble_target {
-            format!("LoopTargetDescr(start:{})", self.token_id)
+            format!("TargetToken(start:{})", self.token_id)
         } else {
-            format!("LoopTargetDescr({})", self.token_id)
+            format!("TargetToken({})", self.token_id)
         }
     }
 
     fn as_loop_target_descr(&self) -> Option<&dyn majit_ir::LoopTargetDescr> {
         Some(self)
     }
+
+    fn as_any_arc(self: Arc<Self>) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        Some(self)
+    }
 }
 
-impl majit_ir::LoopTargetDescr for LoopTargetDescr {
+impl majit_ir::LoopTargetDescr for TargetToken {
     fn token_id(&self) -> u64 {
         self.token_id
     }
