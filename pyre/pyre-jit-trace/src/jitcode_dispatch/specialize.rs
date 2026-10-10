@@ -818,11 +818,11 @@ fn walker_emit_specialised_pair_item<Sym: WalkSym>(
 /// Each of these is a `GetSetProperty` whose getter body is a slot read on a
 /// receiver [`walker_specialize_traceback_walk_field`] pins by class:
 /// `pytraceback.py descr_get_next` / `descr_get_tb_frame` /
-/// `descr_get_tb_lineno` / `descr_get_tb_lasti` and `pyframe.py fget_code`.
-/// None of them dispatches anywhere or can raise.  Left residual, every hop of
-/// the walk costs a forcing call — measured at 207 ns per `tb_lineno` read
-/// against 0 for the folded `tb_next` — which is what makes each traceback
-/// fixture dominated by the walk rather than by the raise.
+/// `descr_get_tb_lasti` and `pyframe.py fget_code`.
+/// None of them dispatches anywhere or can raise.  `tb_lineno` is not a
+/// slot fold: [`try_walker_orthodox_traceback_lineno`] descends
+/// `descr_get_tb_lineno` so a sentinel node records getfield + residual
+/// `offset2lineno` instead of `bh_load_attr_fn`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TracebackWalkField {
     /// `tb.tb_next` — the chain link; a null slot is the terminator and
@@ -832,16 +832,9 @@ enum TracebackWalkField {
     /// ALSO runs `mark_as_escaped()`; see the escape emit.
     TbFrame,
     /// `frame.f_code` — `fget_f_code` is `self.pycode as PyObjectRef`.
+    /// `tb_lasti` / `tb_lineno` are absent: `tb_lasti` is unused on the walk,
+    /// and `tb_lineno` is recorded by descending `descr_get_tb_lineno`.
     FCode,
-    /// `tb.tb_lineno` — the line the node froze at.  The getter resolves the
-    /// sentinel out of `w_code` and `lasti`; `record_application_traceback`
-    /// stamps the real line instead, so a recorded node reads as the slot and
-    /// only a hand-constructed one has to resolve.  The fold covers the stamped
-    /// case and declines the other.
-    ///
-    /// `tb_lasti` is deliberately absent: it is the one traceback slot the
-    /// walker has no reason to reach, since nothing on the walk consumes it.
-    TbLineno,
     /// `code.co_name` — `code_get_field` answers it with `w_code_name_obj`,
     /// which realizes the string once and retains it on the code object, so
     /// every later read is the retained slot.
@@ -863,7 +856,6 @@ fn traceback_walk_field(
         return match name {
             "tb_next" => Some(TracebackWalkField::TbNext),
             "tb_frame" => Some(TracebackWalkField::TbFrame),
-            "tb_lineno" => Some(TracebackWalkField::TbLineno),
             _ => None,
         };
     }
@@ -934,37 +926,6 @@ fn walker_guard_code_ptr_present<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[absent])
 }
 
-/// The line `w_pytraceback_get_lineno` resolves for a node whose `lineno`,
-/// `lasti` and `w_code` slots are all trace constants in the heap cache —
-/// the node `emit_traceback_node` built in this trace, whose stores are the
-/// cached values.  `None` when any slot is not a known constant, when the
-/// stored `lineno` is not the sentinel, or when `tb_lasti` names no line (the
-/// getter answers `None` there, which only the residual reproduces).
-fn walker_traceback_lineno_from_trace_constants<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    obj: OpRef,
-) -> Option<i64> {
-    let mut cached_const = |index: usize| {
-        let descr = crate::descr::pytraceback_field_descr(index);
-        let value = ctx
-            .trace_ctx
-            .heapcache_getfield_cached(obj, descr.index())?;
-        ctx.trace_ctx.const_value(value)
-    };
-    // `emit_traceback_node`'s field order: 1 = `lasti`, 3 = `lineno`,
-    // 4 = `w_code`.
-    if cached_const(3)? != pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED {
-        return None;
-    }
-    let lasti = cached_const(1)?;
-    let w_code = cached_const(4)? as pyre_object::PyObjectRef;
-    if w_code.is_null() || !unsafe { pyre_interpreter::pycode::is_code(w_code) } {
-        return None;
-    }
-    let lineno = unsafe { pyre_interpreter::pycode::w_code_addr2line(w_code, lasti) };
-    (lineno >= 0).then_some(lineno as i64)
-}
-
 /// Emit one traceback-walk hop as a guarded inline field read instead of the
 /// opaque `getattr_fn` residual.
 ///
@@ -994,7 +955,6 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         TracebackWalkField::TbNext => crate::descr::pytraceback_w_next_descr(),
         TracebackWalkField::TbFrame => crate::descr::pytraceback_frame_descr(),
         TracebackWalkField::FCode => crate::descr::pyframe_code_descr(),
-        TracebackWalkField::TbLineno => crate::descr::pytraceback_lineno_descr(),
         TracebackWalkField::CoName => crate::descr::pycode_w_name_descr(),
         TracebackWalkField::CoFirstlineno => crate::descr::pycode_co_firstlineno_descr(),
     };
@@ -1036,55 +996,8 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         let raw_value = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, descr);
         ctx.trace_ctx
             .set_opref_concrete(raw_value, majit_ir::Value::Int(live));
-        // Reboxed for the same reason `TbLineno` is: the getter hands back a
-        // Python int, and the boxed op is a heap `NewWithVtable`.
-        let boxed = walker_box_int(ctx, op_pc, raw_value, live)?;
-        let live_ptr = pyre_object::w_int_new(live) as i64;
-        ctx.trace_ctx
-            .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-        return Ok(Some(()));
-    }
-
-    if field == TracebackWalkField::TbLineno {
-        let live =
-            unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_lineno_raw(concrete_obj) };
-        // A slot holding the sentinel is not the getter's value — the getter
-        // resolves it out of `w_code` and `lasti`.  A node this trace built
-        // (`emit_traceback_node`) carries all three as trace constants, and
-        // resolving an immutable code object's line table at a constant
-        // offset is the value the getter's resolution produces, so that node
-        // folds to the resolved line.  Any other sentinel node — recorded by
-        // the interpreter, or handed `-1` through `TracebackType(...)` — has
-        // slots this fold would have to pin, so it declines before recording
-        // anything and the getter runs as a residual.
-        if live == pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED {
-            let Some(resolved) = walker_traceback_lineno_from_trace_constants(ctx, obj) else {
-                return Ok(None);
-            };
-            walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
-            let raw_value = ctx.trace_ctx.const_int(resolved);
-            let boxed = walker_box_int(ctx, op_pc, raw_value, resolved)?;
-            let live_ptr = pyre_object::w_int_new(resolved) as i64;
-            ctx.trace_ctx
-                .set_opref_concrete(boxed, box_int_concrete(resolved, live_ptr));
-            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-            return Ok(Some(()));
-        }
-        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
-        let raw_value = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, descr);
-        ctx.trace_ctx
-            .set_opref_concrete(raw_value, majit_ir::Value::Int(live));
-        let not_computed = ctx
-            .trace_ctx
-            .const_int(pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED);
-        let is_not_computed = ctx
-            .trace_ctx
-            .record_op(OpCode::IntEq, &[raw_value, not_computed]);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_not_computed])?;
-        // The getter returns a Python int, so the raw slot is reboxed the way
-        // the unboxed mapdict read does; the boxed op is a heap `NewWithVtable`
-        // so its concrete has to be a heap pointer too.
+        // The getter hands back a Python int, and the boxed op is a heap
+        // `NewWithVtable`.
         let boxed = walker_box_int(ctx, op_pc, raw_value, live)?;
         let live_ptr = pyre_object::w_int_new(live) as i64;
         ctx.trace_ctx
@@ -14794,6 +14707,63 @@ pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
         Some(DispatchOutcome::Continue)
     ) {
         return walker_complex_decline(ctx, pre);
+    }
+    Ok(Some(()))
+}
+
+const TRACEBACK_LINENO_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::pytraceback::descr_get_tb_lineno",
+    commit_label: "tb_lineno_commit",
+    call_site_label: "tb_lineno_call_site",
+    decline_tag: "TB-LINENO-SUBWALK",
+};
+
+/// `tb.tb_lineno` on a traceback: walk `pytraceback.py descr_get_tb_lineno`.
+///
+/// The leaf getfields `lineno` / `lasti` / `w_code` and boxes with
+/// `space.newint`, residualising `offset2lineno` (`w_code_addr2line`)
+/// because `location.py _offset2lineno` is a loop `look_inside_graph`
+/// refuses.  A subclass receiver cannot exist (`traceback` is not a
+/// base); a non-traceback stays on the residual getset.
+pub(crate) fn try_walker_orthodox_traceback_lineno<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || name != "tb_lineno" {
+        return Ok(None);
+    }
+    let Some(concrete) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    if unsafe { !pyre_interpreter::pytraceback::is_pytraceback(concrete) } {
+        return Ok(None);
+    }
+    let pre = ctx.trace_ctx.get_trace_position();
+    let tb_type = &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE;
+    let tb_type_obj = pyre_interpreter::typedef::gettypeobject(tb_type);
+    let tb_type_addr = tb_type as *const _ as i64;
+    walker_guard_fold_class(ctx, op_pc, obj, tb_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, obj, tb_type_obj)?;
+    if !matches!(
+        try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[],
+            &[(obj, concrete)],
+            &[],
+            dst,
+            'r',
+            &TRACEBACK_LINENO_DESCENT,
+        )?,
+        Some(DispatchOutcome::Continue)
+    ) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
     }
     Ok(Some(()))
 }

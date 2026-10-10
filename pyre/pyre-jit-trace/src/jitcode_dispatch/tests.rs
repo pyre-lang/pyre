@@ -4874,6 +4874,39 @@ fn newcomplex_and_lane_getters_are_the_pypy_leaf() {
 }
 
 #[test]
+fn descr_get_tb_lineno_is_the_pypy_leaf() {
+    // pytraceback.py `descr_get_tb_lineno` / `get_lineno`: getfield the
+    // slot, then residual `offset2lineno` (`location.py _offset2lineno`
+    // is a loop `look_inside_graph` refuses). LOAD_ATTR of `tb_lineno`
+    // descends this graph instead of residualising `bh_load_attr_fn`.
+    let path = "pyre_interpreter::pytraceback::descr_get_tb_lineno";
+    let getter = crate::jitcode_runtime::pathed_jitcode(path)
+        .expect("descr_get_tb_lineno must be a discovered jitcode");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&getter.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        !getter.code.is_empty(),
+        "{path} must carry assembled bytecode; ops={ops:?}"
+    );
+    // Slot reads lower as `inline_call` of the `#[inline]` accessors
+    // (`w_pytraceback_get_lineno_raw` / `get_w_code` / `get_lasti`).
+    assert!(
+        ops.iter().any(|op| *op == "inline_call_r_i"),
+        "{path} must read the integer slots; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| *op == "residual_call_ir_i"),
+        "{path} must residualise offset2lineno; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| op.contains("call_may_force") || op.contains("getattr")),
+        "{path} must not force through getattr; ops={ops:?}"
+    );
+}
+
+#[test]
 fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
     // `space.newutf8` / `W_UnicodeObject.__init__` (`objspace.py` /
     // `unicodeobject.py`): field stores after `malloc_typed_managed`,
