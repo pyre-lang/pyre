@@ -18,17 +18,15 @@ pub enum LocaleError {
 /// `rlocale.py numeric_formatting` / `numeric_formatting_impl`.
 ///
 /// The decimal point, thousands separator, and grouping bytes `localeconv`
-/// reports. Without `host_env`, and under `sandbox`, the C locale stands in
-/// (`b"."`, empty separator, empty grouping). `rlocale.py` marks `localeconv`
-/// `sandboxsafe` and would read the host there; this build compiles that
-/// call out so `format()` does not grow a raising path next to the sandbox
-/// stubs on `_locale`.
+/// reports. Without `host_env` the C locale stands in (`b"."`, empty
+/// separator, empty grouping). `rlocale.py` marks `localeconv`
+/// `sandboxsafe`, so a `host_env` build reads the host even under sandbox.
 pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(any(unix, windows), feature = "host_env"))]
     {
         return rustpython_host_env::locale::localeconv_numeric();
     }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
     (b".".to_vec(), Vec::new(), Vec::new())
 }
 
@@ -39,12 +37,12 @@ pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// the CRT invalid-parameter handler would abort on a category outside
 /// `LC_ALL..=LC_TIME`.
 pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u8>, LocaleError> {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(any(unix, windows), feature = "host_env"))]
     {
         return rustpython_host_env::locale::setlocale(category, locale)
             .ok_or(LocaleError::Unsupported);
     }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
     {
         let _ = (category, locale);
         Ok(b"C".to_vec())
@@ -56,7 +54,7 @@ pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u
 /// Grouping bytes stop at `0` or `CHAR_MAX` inside the host copy. The
 /// trailing `0` `_w_copy_grouping` appends belongs to the Python list, not
 /// to this walk.
-#[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub fn localeconv_data() -> rustpython_host_env::locale::LocaleConv {
     rustpython_host_env::locale::localeconv_data()
 }
@@ -65,7 +63,6 @@ pub fn localeconv_data() -> rustpython_host_env::locale::LocaleConv {
 #[cfg(all(
     unix,
     feature = "host_env",
-    not(feature = "sandbox"),
     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
 ))]
 pub fn nl_langinfo_codeset() -> Option<Vec<u8>> {
@@ -88,7 +85,7 @@ pub fn nl_langinfo(item: libc::nl_item) -> Option<Vec<u8>> {
 }
 
 /// `GetACP`, as the integer the `cp<n>` encoding name is built from.
-#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(windows, feature = "host_env"))]
 pub fn acp() -> u32 {
     rustpython_host_env::locale::acp()
 }
@@ -97,7 +94,7 @@ pub fn acp() -> u32 {
 ///
 /// `lctype` is `LOCALE_SISO639LANGNAME` or `LOCALE_SISO3166CTRYNAME`. The
 /// `cp<n>` encoding half stays with the builtin that formats [`acp`].
-#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(windows, feature = "host_env"))]
 pub fn user_default_locale_component(lctype: u32) -> Option<String> {
     rustpython_host_env::locale::locale_info(
         rustpython_host_env::locale::user_default_lcid(),
@@ -148,7 +145,7 @@ fn defining_module() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
     #[test]
     fn numeric_formatting_stands_in_for_the_c_locale() {
         let (decimal, sep, grouping) = super::numeric_formatting();
