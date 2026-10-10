@@ -256,14 +256,13 @@ impl W_BytesIO {
     /// the copy lands in the abandoned body.  Upstream has no counterpart:
     /// RPython's GC transform keeps `self` live across the call for it.
     fn from_slot(slot: usize) -> &'static mut Self {
-        unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut Self) }
+        super::from_pinned_slot(slot)
     }
 
     /// Pin the receiver so [`Self::from_slot`] can recover it, and answer the
     /// slot it landed in.
     fn pin_self(&self) -> usize {
-        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
-        pyre_object::gc_roots::shadow_stack_len() - 1
+        super::pin_io_self(self.self_obj())
     }
 
     fn reset_buffer(&mut self) {

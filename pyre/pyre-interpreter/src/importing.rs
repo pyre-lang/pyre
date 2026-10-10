@@ -8688,15 +8688,15 @@ where
             // bytes-keyed proxies, ...) participates.
             match pyre_object::with_roots!(module => crate::baseobjspace::getattr_str(module, "__dict__"))
             {
-                Ok(w_dict) => {
-                    let w_keys_method = pyre_object::with_roots!(module => crate::baseobjspace::getattr_str(w_dict, "keys"))?;
+                Ok(mut w_dict) => {
+                    let mut w_keys_method = pyre_object::with_roots!(module, w_dict => crate::baseobjspace::getattr_str(w_dict, "keys"))?;
                     // pyopcode.py `all = dict.keys()` — pyre's
                     // `call_function` stashes errors as PY_NULL; use
                     // `call_and_check` so a misbehaving `keys()` (or
                     // `__getattr__`-installed override) raises here
                     // rather than handing a bogus iterable to
                     // `space.iter` below.
-                    let w_keys = pyre_object::with_roots!(module => crate::builtins::call_and_check(w_keys_method, &[]))?;
+                    let w_keys = pyre_object::with_roots!(module, w_keys_method => crate::builtins::call_and_check(w_keys_method, &[]))?;
                     (w_keys, true)
                 }
                 Err(e2) if e2.kind == crate::PyErrorKind::AttributeError => {
@@ -8725,7 +8725,8 @@ where
     module_name.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(module_name_w) });
 
     // pyopcode.py — `for name in all:` lazy iteration.
-    let mut w_iter = pyre_object::with_roots!(module => crate::baseobjspace::iter(w_iterable))?;
+    let mut w_iter =
+        pyre_object::with_roots!(module, w_iterable => crate::baseobjspace::iter(w_iterable))?;
     loop {
         let next_name =
             pyre_object::with_roots!(module, w_iter => crate::baseobjspace::next(w_iter));
@@ -8771,7 +8772,7 @@ where
             continue;
         }
         // pyopcode.py — `into_locals[name] = getattr(module, name)`.
-        let value = pyre_object::with_roots!(module, w_iter => crate::baseobjspace::getattr_str(module, &name))?;
+        let value = pyre_object::with_roots!(module, w_iter, w_name => crate::baseobjspace::getattr_str(module, &name))?;
         write(&name, value)?;
     }
     Ok(())
@@ -8785,14 +8786,21 @@ pub fn import_all_from_w(
     module: PyObjectRef,
     into_locals: PyObjectRef,
 ) -> Result<(), crate::PyError> {
+    // pyopcode.py `import_all_from`: `into_locals` is a livevar of the
+    // applevel loop (`into_locals[name] = getattr(module, name)`). Pin it
+    // once for the whole walk and read it back on every store; a per-name
+    // pin of the Copy capture would republish a stale word after the first
+    // collection. `w_str_new_managed` allocates, so the getattr result is
+    // pinned before that intern.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(into_locals);
     import_all_from_each(module, |name, value| {
         let _name_roots = pyre_object::gc_roots::push_roots();
-        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(into_locals);
-        let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(value);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
         crate::baseobjspace::setitem(
             pyre_object::gc_roots::shadow_stack_get(locals_slot),
             pyre_object::gc_roots::shadow_stack_get(name_slot),

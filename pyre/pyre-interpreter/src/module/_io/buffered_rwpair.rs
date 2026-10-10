@@ -27,6 +27,18 @@ impl Default for W_BufferedRWPair {
 }
 
 impl W_BufferedRWPair {
+    fn self_obj(&self) -> PyObjectRef {
+        self as *const Self as PyObjectRef
+    }
+
+    fn from_slot(slot: usize) -> &'static mut Self {
+        super::from_pinned_slot(slot)
+    }
+
+    fn pin_self(&self) -> usize {
+        super::pin_io_self(self.self_obj())
+    }
+
     fn check_reader(&self) -> Result<PyObjectRef, crate::PyError> {
         if self.w_reader.is_null() {
             Err(crate::PyError::value_error(
@@ -95,10 +107,14 @@ impl W_BufferedRWPair {
         w_writer: PyObjectRef,
         #[default(DEFAULT_BUFFER_SIZE)] buffer_size: i64,
     ) -> Result<(), crate::PyError> {
-        self.w_reader = PY_NULL;
-        self.w_writer = PY_NULL;
-
+        // Constructing the inner BufferedReader / BufferedWriter allocates.
+        // Pin `self` first (`interp_bufferedio.py` `W_BufferedRWPair.descr_init`)
+        // so the field stores land on the live nursery object.
         let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        Self::from_slot(slot).w_reader = PY_NULL;
+        Self::from_slot(slot).w_writer = PY_NULL;
+
         let _ = pyre_object::gc_roots::pin_root(w_reader);
         let _ = pyre_object::gc_roots::pin_root(w_writer);
         let input_sp = pyre_object::gc_roots::shadow_stack_len() - 2;
@@ -122,10 +138,13 @@ impl W_BufferedRWPair {
                 pyre_object::gc_roots::shadow_stack_get(writer_size_slot),
             ],
         )?;
-        self.w_reader = pyre_object::gc_roots::shadow_stack_get(reader_slot);
-        self.w_writer = writer;
+        let writer_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(writer);
+        let this = Self::from_slot(slot);
+        this.w_reader = pyre_object::gc_roots::shadow_stack_get(reader_slot);
+        this.w_writer = pyre_object::gc_roots::shadow_stack_get(writer_slot);
         pyre_object::gc_hook::try_gc_write_barrier(
-            self as *mut Self as pyre_object::gc_hook::GCREF,
+            this as *mut Self as pyre_object::gc_hook::GCREF,
         );
         Ok(())
     }
@@ -163,19 +182,29 @@ impl W_BufferedRWPair {
     }
 
     fn close(&self) -> Result<(), crate::PyError> {
-        let writer = self.check_writer()?;
-        let writer_close = super::call_method_result(writer, "close", &[]);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let writer = Self::from_slot(slot).check_writer()?;
+        let writer_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(writer);
+        let writer_close = super::call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(writer_slot),
+            "close",
+            &[],
+        );
         let (reader, mut writer_error) = match writer_close {
             Err(error) => {
-                let _roots = pyre_object::gc_roots::push_roots();
+                let _err_roots = pyre_object::gc_roots::push_roots();
                 let mut error = error;
-                let error_slot = error.pin(&_roots);
-                let reader = self.check_reader()?;
-                error.reload(&_roots, error_slot);
+                let error_slot = error.pin(&_err_roots);
+                let reader = Self::from_slot(slot).check_reader()?;
+                error.reload(&_err_roots, error_slot);
                 (reader, Some(error))
             }
-            Ok(_) => (self.check_reader()?, None),
+            Ok(_) => (Self::from_slot(slot).check_reader()?, None),
         };
+        let reader_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(reader);
         // The reader close can collect. The writer handle is a `PyObjectRef`
         // for that call so `pin_root`'s returned word is the live root.
         let writer_ptr = writer_error
@@ -183,12 +212,23 @@ impl W_BufferedRWPair {
             .map(|err| err.as_raw() as pyre_object::PyObjectRef)
             .unwrap_or(pyre_object::PY_NULL);
         let (reader_close, writer_error) = if writer_ptr.is_null() {
-            (super::call_method_result(reader, "close", &[]), None)
+            (
+                super::call_method_result(
+                    pyre_object::gc_roots::shadow_stack_get(reader_slot),
+                    "close",
+                    &[],
+                ),
+                None,
+            )
         } else {
             let _roots = pyre_object::gc_roots::push_roots();
             let slot = pyre_object::gc_roots::shadow_stack_len();
             let writer_ptr = pyre_object::gc_roots::pin_root(writer_ptr);
-            let result = super::call_method_result(reader, "close", &[]);
+            let result = super::call_method_result(
+                pyre_object::gc_roots::shadow_stack_get(reader_slot),
+                "close",
+                &[],
+            );
             let writer_ptr = pyre_object::gc_roots::shadow_stack_get(slot);
             let _ = writer_ptr;
             (
@@ -236,11 +276,13 @@ impl W_BufferedRWPair {
     }
 
     fn isatty(&self) -> Result<PyObjectRef, crate::PyError> {
-        let writer = self.writer_call("isatty", &[])?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let writer = Self::from_slot(slot).writer_call("isatty", &[])?;
         if crate::baseobjspace::is_true(writer)? {
             Ok(w_bool_from(true))
         } else {
-            self.reader_call("isatty", &[])
+            Self::from_slot(slot).reader_call("isatty", &[])
         }
     }
 

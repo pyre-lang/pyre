@@ -38,6 +38,18 @@ impl Default for W_FileIO {
 }
 
 impl W_FileIO {
+    pub(crate) fn self_obj(&self) -> PyObjectRef {
+        self as *const Self as PyObjectRef
+    }
+
+    pub(crate) fn from_slot(slot: usize) -> &'static mut Self {
+        super::from_pinned_slot(slot)
+    }
+
+    pub(crate) fn pin_self(&self) -> usize {
+        super::pin_io_self(self.self_obj())
+    }
+
     pub(crate) fn fd(&self) -> i32 {
         self.fd
     }

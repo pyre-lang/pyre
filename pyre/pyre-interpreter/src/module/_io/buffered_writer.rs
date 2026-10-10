@@ -106,6 +106,25 @@ impl W_BufferedWriter {
         self as *const Self as PyObjectRef
     }
 
+    /// Re-read the receiver from `slot` after Python code ran.
+    ///
+    /// `writable()`, `try_new_buffer`, and `raw.write` each allocate; a
+    /// collection inside one of those moves a nursery writer — leaving the
+    /// `&mut self` the method was entered with behind the forwarding
+    /// pointer, so later stores land in the abandoned body.
+    /// RPython's GC transform keeps `self` live across the call
+    /// (`interp_bufferedio.py` `W_BufferedWriter`); reload from the
+    /// shadow-stack slot instead.
+    fn from_slot(slot: usize) -> &'static mut Self {
+        super::from_pinned_slot(slot)
+    }
+
+    /// Pin the receiver so [`Self::from_slot`] can recover it, and answer the
+    /// slot it landed in.
+    fn pin_self(&self) -> usize {
+        super::pin_io_self(self.self_obj())
+    }
+
     fn check_init(&self) -> Result<(), crate::PyError> {
         match self.state {
             STATE_ZERO => Err(crate::PyError::value_error(
@@ -160,53 +179,67 @@ impl W_BufferedWriter {
     }
 
     fn raw_tell(&mut self) -> Result<i64, crate::PyError> {
-        let result = super::call_method_result(self.w_raw, "tell", &[])?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(Self::from_slot(slot).w_raw);
+        let result = super::call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(raw_slot),
+            "tell",
+            &[],
+        )?;
         let pos = crate::baseobjspace::int_w(result)?;
         if pos < 0 {
             return Err(crate::PyError::os_error(
                 "raw stream returned invalid position",
             ));
         }
-        self.abs_pos = pos;
+        Self::from_slot(slot).abs_pos = pos;
         Ok(pos)
     }
 
     fn raw_seek(&mut self, pos: i64, whence: i64) -> Result<i64, crate::PyError> {
-        let result = {
-            let _seek_roots = pyre_object::gc_roots::push_roots();
-            let pos_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_int_new(pos));
-            let whence_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_int_new(whence));
-            super::call_method_result(
-                self.w_raw,
-                "seek",
-                &[
-                    pyre_object::gc_roots::shadow_stack_get(pos_slot),
-                    pyre_object::gc_roots::shadow_stack_get(whence_slot),
-                ],
-            )?
-        };
+        let _seek_roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let pos_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(pos));
+        let whence_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(whence));
+        let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(Self::from_slot(slot).w_raw);
+        let result = super::call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(raw_slot),
+            "seek",
+            &[
+                pyre_object::gc_roots::shadow_stack_get(pos_slot),
+                pyre_object::gc_roots::shadow_stack_get(whence_slot),
+            ],
+        )?;
         let pos = crate::baseobjspace::int_w(result)?;
         if pos < 0 {
             return Err(crate::PyError::os_error(
                 "Raw stream returned invalid position",
             ));
         }
-        self.abs_pos = pos;
+        Self::from_slot(slot).abs_pos = pos;
         Ok(pos)
     }
 
     fn raw_write(&mut self, data: &[u8]) -> Result<usize, crate::PyError> {
-        let bytes = pyre_object::bytesobject::w_bytes_from_bytes(data);
+        // `w_bytes_from_bytes` and the raw `write` each allocate. Pin
+        // before the first of those (`interp_bufferedio.py` `_write`) so
+        // `abs_pos` is stored on the live object.
         let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
+        let slot = self.pin_self();
+        let bytes = pyre_object::bytesobject::w_bytes_from_bytes(data);
+        let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(bytes);
-        let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
+        let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(Self::from_slot(slot).w_raw);
         let result = super::call_method_result(
-            self.w_raw,
+            pyre_object::gc_roots::shadow_stack_get(raw_slot),
             "write",
-            &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
+            &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
         )?;
         if unsafe { pyre_object::is_none(result) } {
             return Err(make_write_blocking_error(0));
@@ -217,43 +250,53 @@ impl W_BufferedWriter {
                 "raw write() returned invalid length",
             ));
         }
-        if self.abs_pos != -1 {
-            self.abs_pos += written;
+        let this = Self::from_slot(slot);
+        if this.abs_pos != -1 {
+            this.abs_pos += written;
         }
         Ok(written as usize)
     }
 
     fn writer_flush_unlocked(&mut self) -> Result<(), crate::PyError> {
-        if self.write_end == -1 || self.write_pos == self.write_end {
-            self.writer_reset_buf();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let this = Self::from_slot(slot);
+        if this.write_end == -1 || this.write_pos == this.write_end {
+            this.writer_reset_buf();
             return Ok(());
         }
-        let rewind = self.raw_offset() + (self.pos - self.write_pos);
+        let rewind = this.raw_offset() + (this.pos - this.write_pos);
         if rewind != 0 {
-            self.raw_seek(-rewind, 1)?;
-            self.raw_pos -= rewind;
+            this.raw_seek(-rewind, 1)?;
+            let this = Self::from_slot(slot);
+            this.raw_pos -= rewind;
         }
-        while self.write_pos < self.write_end {
-            let start = self.write_pos as usize;
-            let end = self.write_end as usize;
-            let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(self.buffer) }
+        loop {
+            let this = Self::from_slot(slot);
+            if this.write_pos >= this.write_end {
+                break;
+            }
+            let start = this.write_pos as usize;
+            let end = this.write_end as usize;
+            let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(this.buffer) }
                 [start..end]
                 .to_vec();
-            let written = match self.raw_write(&data) {
+            let written = match this.raw_write(&data) {
                 Ok(written) => written,
                 Err(error) if is_blocking_error(&error) => {
                     return Err(make_write_blocking_error(0));
                 }
                 Err(error) => return Err(error),
             };
-            self.write_pos += written as i64;
-            self.raw_pos = self.write_pos;
+            let this = Self::from_slot(slot);
+            this.write_pos += written as i64;
+            this.raw_pos = this.write_pos;
             // Partial writes can return successfully when interrupted by a
             // signal (see write(2)).  Run signal handlers before blocking
             // another time, possibly indefinitely.
             super::checksignals()?;
         }
-        self.writer_reset_buf();
+        Self::from_slot(slot).writer_reset_buf();
         Ok(())
     }
 
@@ -263,7 +306,10 @@ impl W_BufferedWriter {
 
     fn write_bytes(&mut self, data: &[u8]) -> Result<i64, crate::PyError> {
         self.with_lock(|this| {
-            this.check_closed("write to closed file")?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = this.pin_self();
+            Self::from_slot(slot).check_closed("write to closed file")?;
+            let this = Self::from_slot(slot);
             if !((this.readable && this.read_end != -1) || (this.writable && this.write_end != -1))
             {
                 this.pos = 0;
@@ -284,6 +330,7 @@ impl W_BufferedWriter {
             }
 
             if let Err(error) = this.writer_flush_unlocked() {
+                let this = Self::from_slot(slot);
                 if !is_blocking_error(&error) {
                     return Err(error);
                 }
@@ -316,11 +363,16 @@ impl W_BufferedWriter {
             }
 
             let mut written = 0usize;
-            while data.len() - written > this.buffer_size as usize {
+            loop {
+                let this = Self::from_slot(slot);
+                if data.len() - written <= this.buffer_size as usize {
+                    break;
+                }
                 match this.raw_write(&data[written..]) {
                     Ok(0) => return Err(make_write_blocking_error(written)),
                     Ok(size) => written += size,
                     Err(error) if is_blocking_error(&error) => {
+                        let this = Self::from_slot(slot);
                         let remaining = data.len() - written;
                         let take = remaining.min(this.buffer_size as usize);
                         let buffer = unsafe {
@@ -341,6 +393,7 @@ impl W_BufferedWriter {
                 super::checksignals()?;
             }
 
+            let this = Self::from_slot(slot);
             let remaining = data.len() - written;
             if remaining > 0 {
                 let buffer =
@@ -389,12 +442,19 @@ impl W_BufferedWriter {
         w_raw: PyObjectRef,
         #[default(DEFAULT_BUFFER_SIZE)] buffer_size: i64,
     ) -> Result<(), crate::PyError> {
-        self.state = STATE_ZERO;
+        // `writable()` and `try_new_buffer` each allocate. Pin `self` and
+        // `w_raw` first (`interp_bufferedio.py` `W_BufferedWriter.descr_init`)
+        // so the field stores land on the live nursery object.
         let _raw_roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
         let raw_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_raw);
-        let w_raw = || pyre_object::gc_roots::shadow_stack_get(raw_slot);
-        let writable = super::call_method_result(w_raw(), "writable", &[])?;
+        Self::from_slot(slot).state = STATE_ZERO;
+        let writable = super::call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(raw_slot),
+            "writable",
+            &[],
+        )?;
         if !crate::baseobjspace::is_true(writable)? {
             return Err(super::unsupported("File or stream is not writable."));
         }
@@ -406,23 +466,24 @@ impl W_BufferedWriter {
         // `_buffered_init` reports a buffer it cannot allocate as
         // `MemoryError`, and `buffer_size` came from Python.
         let buffer = super::try_new_buffer(buffer_size as usize)?;
-        self.w_raw = w_raw();
-        self.buffer = buffer;
-        self.buffer_size = buffer_size;
-        self.readable = false;
-        self.writable = true;
-        self.pos = 0;
-        self.raw_pos = 0;
-        self.read_end = -1;
-        self.writer_reset_buf();
-        self.lock = super::allocate_buffered_lock();
+        let this = Self::from_slot(slot);
+        this.w_raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+        this.buffer = buffer;
+        this.buffer_size = buffer_size;
+        this.readable = false;
+        this.writable = true;
+        this.pos = 0;
+        this.raw_pos = 0;
+        this.read_end = -1;
+        this.writer_reset_buf();
+        this.lock = super::allocate_buffered_lock();
         // Unknown rather than asked for, as in `buffered.rs`: `tell` always
         // asks the raw stream and `flush` only adjusts a position it already
         // knows, so construction owes no `lseek`.
-        self.abs_pos = -1;
-        self.state = STATE_OK;
+        this.abs_pos = -1;
+        this.state = STATE_OK;
         pyre_object::gc_hook::try_gc_write_barrier(
-            self as *mut Self as pyre_object::gc_hook::GCREF,
+            this as *mut Self as pyre_object::gc_hook::GCREF,
         );
         Ok(())
     }
@@ -437,14 +498,22 @@ impl W_BufferedWriter {
     fn write(&mut self, w_data: PyObjectRef) -> Result<i64, crate::PyError> {
         // PyPy `BufferedMixin.write_w`: initialization is checked before
         // acquiring `self.lock` (which does not exist until `__init__`).
-        self.check_init()?;
-        let data = input_bytes(w_data)?;
-        self.write_bytes(&data)
+        // `input_bytes` allocates; pin first so `write_bytes` sees the live
+        // receiver.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let data_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_data);
+        Self::from_slot(slot).check_init()?;
+        let data = input_bytes(pyre_object::gc_roots::shadow_stack_get(data_slot))?;
+        Self::from_slot(slot).write_bytes(&data)
     }
 
     fn flush(&mut self) -> Result<(), crate::PyError> {
-        self.check_closed("flush of closed file")?;
-        self.with_lock(Self::flush_unlocked)
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        Self::from_slot(slot).check_closed("flush of closed file")?;
+        Self::from_slot(slot).with_lock(Self::flush_unlocked)
     }
 
     #[getter]
@@ -498,8 +567,11 @@ impl W_BufferedWriter {
     }
 
     fn tell(&mut self) -> Result<i64, crate::PyError> {
-        self.check_init()?;
-        Ok((self.raw_tell()? - self.raw_offset()).max(0))
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        Self::from_slot(slot).check_init()?;
+        let pos = Self::from_slot(slot).raw_tell()?;
+        Ok((pos - Self::from_slot(slot).raw_offset()).max(0))
     }
 
     fn seek(
@@ -507,7 +579,9 @@ impl W_BufferedWriter {
         mut w_pos: PyObjectRef,
         #[default(pyre_object::w_int_new(0))] mut w_whence: PyObjectRef,
     ) -> Result<i64, crate::PyError> {
-        pyre_object::with_roots!(w_pos, w_whence => self.check_closed("seek of closed file"))?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        pyre_object::with_roots!(w_pos, w_whence => Self::from_slot(slot).check_closed("seek of closed file"))?;
         let pos = pyre_object::with_roots!(w_whence => crate::builtins::space_index_w(w_pos))?;
         let whence = crate::builtins::space_index_w(w_whence)?;
         if !(0..=2).contains(&whence) {
@@ -515,12 +589,21 @@ impl W_BufferedWriter {
                 "whence must be between 0 and 2, not {whence}"
             )));
         }
-        let seekable = super::call_method_result(self.w_raw, "seekable", &[])?;
+        let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(Self::from_slot(slot).w_raw);
+        let seekable = super::call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(raw_slot),
+            "seekable",
+            &[],
+        )?;
         if !crate::baseobjspace::is_true(seekable)? {
             return Err(super::unsupported("File or stream is not seekable."));
         }
-        self.with_lock(|this| {
-            this.writer_flush_unlocked()?;
+        Self::from_slot(slot).with_lock(|this| {
+            let _lock_roots = pyre_object::gc_roots::push_roots();
+            let lock_slot = this.pin_self();
+            Self::from_slot(lock_slot).writer_flush_unlocked()?;
+            let this = Self::from_slot(lock_slot);
             this.writer_reset_buf();
             let adjusted = if whence == 1 {
                 pos - this.raw_offset()
@@ -528,31 +611,33 @@ impl W_BufferedWriter {
                 pos
             };
             let result = this.raw_seek(adjusted, whence)?;
-            this.raw_pos = -1;
+            Self::from_slot(lock_slot).raw_pos = -1;
             Ok(result)
         })
     }
 
     fn close(&mut self) -> Result<(), crate::PyError> {
-        self.check_init()?;
-        if self.with_lock(|this| this.raw_closed())? {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        Self::from_slot(slot).check_init()?;
+        if Self::from_slot(slot).with_lock(|this| this.raw_closed())? {
             return Ok(());
         }
-        let self_obj = self.self_obj();
+        let self_obj = Self::from_slot(slot).self_obj();
         let flushed = super::call_method_result(self_obj, "flush", &[]);
         let (close_result, flush_error) = match flushed {
             Err(error) => {
-                let _roots = pyre_object::gc_roots::push_roots();
+                let _err_roots = pyre_object::gc_roots::push_roots();
                 let mut error = error;
-                let error_slot = error.pin(&_roots);
-                let close_result = self.with_lock(|this| {
+                let error_slot = error.pin(&_err_roots);
+                let close_result = Self::from_slot(slot).with_lock(|this| {
                     super::call_method_result(this.w_raw, "close", &[]).map(|_| ())
                 });
-                error.reload(&_roots, error_slot);
+                error.reload(&_err_roots, error_slot);
                 (close_result, Some(error))
             }
             Ok(_) => (
-                self.with_lock(|this| {
+                Self::from_slot(slot).with_lock(|this| {
                     super::call_method_result(this.w_raw, "close", &[]).map(|_| ())
                 }),
                 None,
@@ -560,18 +645,18 @@ impl W_BufferedWriter {
         };
         if let Err(close_error) = close_result {
             let close_error = if let Some(flush_error) = flush_error {
-                let _roots = pyre_object::gc_roots::push_roots();
+                let _err_roots = pyre_object::gc_roots::push_roots();
                 let mut close_error = close_error;
                 let mut flush_error = flush_error;
-                let close_slot = close_error.pin(&_roots);
-                let flush_slot = flush_error.pin(&_roots);
+                let close_slot = close_error.pin(&_err_roots);
+                let flush_slot = flush_error.pin(&_err_roots);
                 let flush_obj = flush_error.to_exc_object();
-                flush_error.reload(&_roots, flush_slot);
+                flush_error.reload(&_err_roots, flush_slot);
                 let _ = pyre_object::gc_roots::pin_root(flush_obj);
                 let flush_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                close_error.reload(&_roots, close_slot);
+                close_error.reload(&_err_roots, close_slot);
                 let close_obj = close_error.to_exc_object();
-                close_error.reload(&_roots, close_slot);
+                close_error.reload(&_err_roots, close_slot);
                 let _ = pyre_object::gc_roots::pin_root(close_obj);
                 let close_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 unsafe {
@@ -580,7 +665,7 @@ impl W_BufferedWriter {
                         pyre_object::gc_roots::shadow_stack_get(flush_obj_slot),
                     )
                 };
-                close_error.reload(&_roots, close_slot);
+                close_error.reload(&_err_roots, close_slot);
                 close_error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(close_obj_slot));
                 close_error
             } else {
@@ -588,21 +673,21 @@ impl W_BufferedWriter {
             };
             return Err(close_error);
         }
-        self.buffer = PY_NULL;
+        Self::from_slot(slot).buffer = PY_NULL;
         match flush_error {
             Some(error) => {
-                let _roots = pyre_object::gc_roots::push_roots();
+                let _err_roots = pyre_object::gc_roots::push_roots();
                 let mut error = error;
-                let error_slot = error.pin(&_roots);
+                let error_slot = error.pin(&_err_roots);
                 pyre_object::gc_hook::try_gc_write_barrier(
-                    self as *mut Self as pyre_object::gc_hook::GCREF,
+                    Self::from_slot(slot) as *mut Self as pyre_object::gc_hook::GCREF
                 );
-                error.reload(&_roots, error_slot);
+                error.reload(&_err_roots, error_slot);
                 Err(error)
             }
             None => {
                 pyre_object::gc_hook::try_gc_write_barrier(
-                    self as *mut Self as pyre_object::gc_hook::GCREF,
+                    Self::from_slot(slot) as *mut Self as pyre_object::gc_hook::GCREF
                 );
                 Ok(())
             }
@@ -610,14 +695,17 @@ impl W_BufferedWriter {
     }
 
     fn detach(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        self.check_init()?;
-        super::call_method_result(self.self_obj(), "flush", &[])?;
-        let raw = self.w_raw;
-        self.w_raw = PY_NULL;
-        self.buffer = PY_NULL;
-        self.state = STATE_DETACHED;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        Self::from_slot(slot).check_init()?;
+        super::call_method_result(Self::from_slot(slot).self_obj(), "flush", &[])?;
+        let this = Self::from_slot(slot);
+        let raw = this.w_raw;
+        this.w_raw = PY_NULL;
+        this.buffer = PY_NULL;
+        this.state = STATE_DETACHED;
         pyre_object::gc_hook::try_gc_write_barrier(
-            self as *mut Self as pyre_object::gc_hook::GCREF,
+            this as *mut Self as pyre_object::gc_hook::GCREF,
         );
         Ok(raw)
     }
@@ -626,9 +714,14 @@ impl W_BufferedWriter {
         &mut self,
         #[default(pyre_object::w_none())] mut w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        pyre_object::with_roots!(w_size => self.check_closed("truncate of closed file"))?;
-        self.with_lock(|this| {
-            this.flush_unlocked()?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        pyre_object::with_roots!(w_size => Self::from_slot(slot).check_closed("truncate of closed file"))?;
+        Self::from_slot(slot).with_lock(|this| {
+            let _lock_roots = pyre_object::gc_roots::push_roots();
+            let lock_slot = this.pin_self();
+            Self::from_slot(lock_slot).flush_unlocked()?;
+            let this = Self::from_slot(lock_slot);
             this.abs_pos = -1;
             super::call_method_result(this.w_raw, "truncate", &[w_size])
         })
@@ -640,17 +733,22 @@ impl W_BufferedWriter {
     }
 
     fn __repr__(&self) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
-        let self_obj = self.self_obj();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let mut self_obj = Self::from_slot(slot).self_obj();
         let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
             return Err(crate::PyError::runtime_error(
                 "reentrant call inside BufferedWriter.__repr__",
             ));
         };
         let typename = crate::type_methods::arg_type_name(self_obj);
-        match crate::baseobjspace::getattr_str(self_obj, "name") {
-            Ok(name) => Ok(crate::display::wtf8_format!(
+        match pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, "name"))
+        {
+            Ok(mut name) => Ok(crate::display::wtf8_format!(
                 format!("<{typename} name="),
-                unsafe { crate::display::py_repr_wtf8(name)? },
+                unsafe {
+                    pyre_object::with_roots!(self_obj, name => crate::display::py_repr_wtf8(name))?
+                },
                 ">"
             )),
             Err(_) => Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
