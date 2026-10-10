@@ -4802,7 +4802,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             let green_key = majit_backend::descr_owning_jct(descr)
                 .map(|jct| jct.green_key())
                 .unwrap_or(0);
-            let exit_layout = majit_metainterp::exit_layout_for_descr(descr);
+            let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
             // compile.py `AbstractResumeGuardDescr.must_compile` reads a
             // GUARD_VALUE's actual operand directly from the deadframe before
             // hashing `(descr, value)`.  It need not be one of the guard's

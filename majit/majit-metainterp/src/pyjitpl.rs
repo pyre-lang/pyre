@@ -3578,13 +3578,17 @@ impl<M: Clone> MetaInterp<M> {
                 // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
                 // the other tracer kinds (GcTables) are rooted through
                 // the gcreftracer registry.
-                let tokens = entry.live_token().into_iter().chain(
-                    entry
-                        .previous_tokens
-                        .iter()
-                        .filter_map(std::sync::Weak::upgrade),
-                );
-                for token in tokens {
+                let tokens: Vec<std::sync::Arc<JitCellToken>> = entry
+                    .live_token()
+                    .into_iter()
+                    .chain(
+                        entry
+                            .previous_tokens
+                            .iter()
+                            .filter_map(std::sync::Weak::upgrade),
+                    )
+                    .collect();
+                for token in &tokens {
                     let Some(clt) = token.compiled_loop_token() else {
                         continue;
                     };
@@ -3604,12 +3608,15 @@ impl<M: Clone> MetaInterp<M> {
                         }
                     }
                 }
-                let target_tokens = entry
-                    .token
-                    .upgrade()
-                    .map(|token| crate::history::target_tokens_of(&token))
-                    .unwrap_or_default();
-                for tt in &target_tokens {
+                // A displaced token stays alive while a JUMP still enters it
+                // (`history.py JitCellToken.record_jump_to`), and its
+                // `TargetToken.virtual_state` / `short_preamble` graphs with
+                // it, so the walk covers the same live-plus-previous set as
+                // the descr pools above.
+                let target_tokens = tokens
+                    .iter()
+                    .flat_map(|token| crate::history::target_tokens_of(token));
+                for tt in target_tokens {
                     // `history.TargetToken` is a GC object upstream. MiniMark
                     // visits it in a minor only while its write barrier is
                     // dirty; after forwarding its graph, clean tokens stay out
@@ -13456,9 +13463,7 @@ impl<M: Clone> MetaInterp<M> {
         compiled: &CompiledEntry<M>,
     ) -> Option<std::sync::Arc<crate::history::TargetToken>> {
         let live = compiled.live_token()?;
-        crate::history::target_tokens_of(&live)
-            .into_iter()
-            .nth(compiled.front_entry_index?)
+        crate::history::target_token_at(&live, compiled.front_entry_index?)
     }
 
     fn compact_label_values_for_selected_target(
@@ -30221,6 +30226,51 @@ mod tests {
         assert_eq!(seen, 2, "major marking always sees the compiled graph");
     }
 
+    /// `history.py TargetToken` is a GC object on
+    /// `JitCellToken.target_tokens`. MiniMark traces it whenever the cell
+    /// token is alive, including a predecessor kept by
+    /// `JitCellToken.record_jump_to` (`_keepalive_jitcell_tokens`). The
+    /// off-GC walker visits the same live-plus-previous set it already uses
+    /// for descr pools.
+    #[test]
+    fn compiled_graph_root_walk_visits_predecessor_target_token_attrs() {
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let pred_tt = crate::history::TargetToken::new_loop(11);
+        let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
+        sp.constants.insert(0, majit_ir::Const::Ref(GcRef(0x3000)));
+        pred_tt.attrs().short_preamble = Some(sp);
+
+        let pred = std::sync::Arc::new(JitCellToken::new(11));
+        pred.set_target_tokens(vec![pred_tt.as_jump_target_descr()]);
+
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.insert_compiled_loop(
+            8,
+            CompiledEntry {
+                token: std::sync::Weak::new(),
+                meta: std::sync::Arc::new(()),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: crate::FxIndexMap::default(),
+                previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut seen = Vec::new();
+        meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
+        assert_eq!(
+            seen,
+            vec![0x3000],
+            "a predecessor JCT's TargetToken.short_preamble is a root \
+             the same way the live token's descr pools are"
+        );
+    }
+
     #[test]
     fn test_normalize_root_loop_entry_contract_rejects_missing_label() {
         // compile.py:359 parity: an optimized trace that arrives without a
@@ -32858,24 +32908,28 @@ mod tests {
         }
         meta.compile_loop(&[OpRef::input_arg_int(0)], ());
 
-        let jump_descr = meta
+        // Charge the live token. `history.py JitCellToken.target_tokens` is
+        // the label list `unroll.py optimize_bridge` scans; a hollow
+        // replacement would drop those labels, and cranelift compile of the
+        // JUMP then leaves an unfilled block. The production loop that an
+        // entry bridge replaces still owns its labels when
+        // `ResumeFromInterpDescr.compile_and_attach` mints the fresh token.
+        let stale = meta
             .compiled_entry(green_key)
             .and_then(|entry| entry.live_token())
-            .and_then(|live| crate::history::target_tokens_of(&live).into_iter().next())
+            .expect("the target loop installed a live token");
+        let jump_descr = crate::history::target_tokens_of(&stale)
+            .into_iter()
+            .next()
             .expect("the target loop installed a front target")
             .as_jump_target_descr();
         let original_green_key = green_key;
-        let stale = std::sync::Arc::new(JitCellToken::new(5));
-        stale.set_inputarg_types(vec![Type::Int]);
         stale.set_retraced_count(u32::MAX);
         assert_ne!(
             stale.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
             0,
             "the sentinel arms bridge segmenting, which is what must not travel"
         );
-        meta.compiled_entry_mut(green_key)
-            .expect("the target loop remains installed")
-            .token = std::sync::Arc::downgrade(&stale);
 
         let bridge_inputargs = vec![InputArg::new_int_rc(0)];
         let bridge_ops = vec![

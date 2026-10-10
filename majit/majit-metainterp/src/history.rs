@@ -201,6 +201,14 @@ pub fn target_tokens_of(token: &JitCellToken) -> Vec<Arc<TargetToken>> {
         .collect()
 }
 
+/// `jitcell_token.target_tokens[index]` as a `TargetToken`.
+pub fn target_token_at(token: &JitCellToken, index: usize) -> Option<Arc<TargetToken>> {
+    let descr = token.target_tokens.lock().get(index).cloned()?;
+    descr
+        .as_any_arc()
+        .and_then(|any| any.downcast::<TargetToken>().ok())
+}
+
 impl majit_ir::Descr for TargetToken {
     fn index(&self) -> u32 {
         self.token_id as u32

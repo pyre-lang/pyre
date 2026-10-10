@@ -594,20 +594,22 @@ const ENCODED_UNAVAILABLE: i64 = -3;
 const INLINE_TAGGED_MIN: i64 = -(1_i64 << 61);
 const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
 
-/// `compile.py AbstractResumeGuardDescr.get_resumestorage(): return self`.
+/// `compile.py ResumeGuardDescr.get_resumestorage(): return self`.
 /// The resume storage is the guard descr itself: `rd_numb` / `rd_consts` /
 /// `rd_virtuals` / `rd_pendingfields` are its own attributes, so every
 /// reader — bridge retrace, blackhole resume, the GC root walker — holds
-/// the one descr and nothing is copied per failure.
+/// the one descr and nothing is copied per failure. A
+/// `ResumeGuardCopiedDescr` hops to `prev`
+/// (`ResumeGuardCopiedDescr.get_resumestorage`).
 pub type ResumeStorage = dyn majit_ir::FailDescr;
 
-/// `get_resumestorage()` on a descr handle. `None` for a descr that carries
-/// no resume payload (the `_DoneWithThisFrameDescr` family /
-/// `ExitFrameWithExceptionDescrRef`), matching the `_attrs_`-only-on-
-/// `AbstractResumeGuardDescr` contract.
+/// `get_resumestorage()` on a descr handle: the descr itself, or the donor
+/// for a `ResumeGuardCopiedDescr` (`get_resumestorage(): return prev`).
+/// `None` for a descr that carries no resume payload (the
+/// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescrRef`),
+/// matching the `_attrs_`-only-on-`AbstractResumeGuardDescr` contract.
 pub fn get_resumestorage(descr: &majit_ir::DescrRef) -> Option<Arc<ResumeStorage>> {
-    descr
-        .clone()
+    crate::compile::get_resumestorage(descr)
         .as_fail_descr_arc()
         .filter(|fd| fd.rd_numb().is_some())
 }
