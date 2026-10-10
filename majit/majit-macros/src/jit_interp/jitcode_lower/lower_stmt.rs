@@ -2125,6 +2125,21 @@ impl<'c> Lowerer<'c> {
                         },
                     );
                 }
+                crate::jit_interp::CallPolicyKind::StrConcat => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let throwaway_reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    let ref_word = assert_ref_result_one_word(func, arg_bindings.len());
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
+                        quote! {
+                            #ref_word
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #throwaway_reg, majit_metainterp::str_concat_effect_info());
+                        },
+                    );
+                }
                 crate::jit_interp::CallPolicyKind::NurseryAllocRef => {
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let throwaway_reg = self.alloc_reg();

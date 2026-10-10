@@ -283,7 +283,11 @@ pub fn do_getfield_raw_f(
 /// split positional `args` by `descr.arg_types()` into I/R/F and call
 /// `bh_call_*_by_classes`. Float results use the real f64 ABI
 /// (`executor.py` `cpu.bh_call_f`) and return packed bits.
-fn do_call_positional(descr: &dyn majit_ir::descr::CallDescr, func_ptr: i64, args: &[i64]) -> i64 {
+pub(crate) fn do_call_positional(
+    descr: &dyn majit_ir::descr::CallDescr,
+    func_ptr: i64,
+    args: &[i64],
+) -> i64 {
     let arg_types = descr.arg_types();
     let mut args_i = Vec::new();
     let mut args_r = Vec::new();

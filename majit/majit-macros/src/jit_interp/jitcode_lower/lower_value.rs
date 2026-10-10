@@ -1836,6 +1836,33 @@ impl<'c> Lowerer<'c> {
                         struct_type: self.declared_return_struct(func),
                     });
                 }
+                crate::jit_interp::CallPolicyKind::StrConcat => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    let ref_word = assert_ref_result_one_word(func, arg_bindings.len());
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
+                        quote! {
+                            #ref_word
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #reg, majit_metainterp::str_concat_effect_info());
+                        },
+                    );
+                    if post_live_after_call {
+                        self.emit_op(
+                            OpMeta::live_marker(),
+                            quote! { let _ = __builder.live_placeholder(); },
+                        );
+                    }
+                    return Some(Binding {
+                        reg,
+                        kind: BindingKind::Ref,
+                        depends_on_stack: false,
+                        struct_type: self.declared_return_struct(func),
+                    });
+                }
                 crate::jit_interp::CallPolicyKind::NurseryAllocRef => {
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let reg = self.alloc_reg();

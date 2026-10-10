@@ -3302,7 +3302,13 @@ impl OptContext {
         };
         let arg1 = self.materialize_operand_at(op_resolved);
         let lengthop = majit_ir::OpRc::new(majit_ir::Op::new(strlen_opcode, &[arg1]));
-        self.emit_extra_rc(self.current_pass_idx, lengthop.clone());
+        // vstring.py StrPtrInfo.getstrlen: `optstring.emit_extra(lengthop)`.
+        // Optimization.emit_extra → send_extra_operation down the rest of
+        // the chain; during force (`in_final_emission`) that lands in
+        // Optimizer.emit immediately, so the STRLEN precedes NEWSTR.
+        // `emit_for_force_rc` is that routing. `emit_extra_rc` queues the
+        // STRLEN after the NEWSTR/COPYSTRCONTENT that consume it.
+        self.emit_for_force_rc(lengthop.clone());
         let result = Operand::from_bound_op(&lengthop);
         // vstring.py: lengthop.set_forwarded(self.getlenbound(mode)). The
         // lenbound is lazily installed on the StrPtrInfo, a PtrInfo-internal
@@ -9914,6 +9920,48 @@ mod opt_context_pos_tests {
                 None | Some(majit_ir::forwarding::Forwarded::None)
             ),
             "consumed SmallConst forwarding must be cleared"
+        );
+    }
+}
+
+#[cfg(test)]
+mod getstrlen_force_tests {
+    use super::*;
+    use crate::optimizeopt::info::{PtrInfo, StrPtrInfo, VStringVariant};
+    use majit_ir::{OpCode, OpRef};
+
+    /// vstring.py `StrPtrInfo.getstrlen`: `optstring.emit_extra(lengthop)`
+    /// during force (`in_final_emission`) lands in `Optimizer.emit`
+    /// immediately, so the STRLEN precedes NEWSTR. `emit_extra_rc` would
+    /// queue it after the NEWSTR/COPYSTRCONTENT that consume it.
+    #[test]
+    fn getstrlen_during_force_emits_strlen_immediately() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
+        ctx.in_final_emission = true;
+        let arg = OpRef::ref_op(1);
+        let arg_box = ctx.materialize_operand_at(arg);
+        ctx.set_ptr_info(
+            &arg_box,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                lgtop: None,
+                mode: 0,
+                length: -1,
+                variant: VStringVariant::Ptr,
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+        let _ = ctx.getstrlen_opref(arg, 0);
+        assert!(
+            ctx.extra_operations_after.is_empty(),
+            "force-time getstrlen must emit STRLEN immediately"
+        );
+        assert!(
+            ctx.new_operations
+                .iter()
+                .any(|op| op.opcode == OpCode::Strlen),
+            "STRLEN must land in new_operations during force"
         );
     }
 }

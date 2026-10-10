@@ -659,6 +659,10 @@ pub(crate) enum CallPolicyKind {
     /// so the call does not flush cached fields, and the compiled code still
     /// enters the function.
     AllocRef,
+    /// `rstr.py ll_strconcat` `@jit.oopspec('stroruni.concat(s1, s2)')`.
+    /// Unwrapped ref result; EffectInfo is `EF_ELIDABLE_OR_MEMORYERROR` +
+    /// `OS_STR_CONCAT` so `OptString` `opt_call_stroruni_STR_CONCAT` sees it.
+    StrConcat,
     ResidualRefWrapped,
     /// `EF_CANNOT_RAISE` for ref-returning residual helpers.
     /// Mirrors `ResidualIntCannotRaiseWrapped`; the unwrapped variant
@@ -734,6 +738,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "residual_ref" => CallPolicyKind::ResidualRef,
         "nursery_alloc_ref" => CallPolicyKind::NurseryAllocRef,
         "alloc_ref" => CallPolicyKind::AllocRef,
+        "str_concat" => CallPolicyKind::StrConcat,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "residual_ref_cannot_raise_wrapped" => CallPolicyKind::ResidualRefCannotRaiseWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,

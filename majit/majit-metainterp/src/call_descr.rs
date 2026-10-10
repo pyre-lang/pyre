@@ -522,6 +522,19 @@ pub const ELIDABLE_CANNOT_RAISE_EFFECT_INFO: EffectInfo =
 pub const ELIDABLE_OR_MEMERROR_EFFECT_INFO: EffectInfo =
     EffectInfo::const_new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None);
 
+/// `rstr.py ll_strconcat` `@jit.oopspec('stroruni.concat(s1, s2)')` →
+/// `effectinfo.py` `EF_ELIDABLE_OR_MEMORYERROR` + `OS_STR_CONCAT`.
+/// Same row `ll_strconcat_effectinfo()` mints for the walker and for
+/// `resume.py concat_strings`.
+pub const STR_CONCAT_EFFECT_INFO: EffectInfo =
+    EffectInfo::const_new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::StrConcat);
+
+/// [`STR_CONCAT_EFFECT_INFO`] as a function, matching
+/// `can_raise_effect_info` / `nursery_alloc_effect_info`.
+pub fn str_concat_effect_info() -> EffectInfo {
+    STR_CONCAT_EFFECT_INFO
+}
+
 /// `EF_ELIDABLE_CAN_RAISE` (effectinfo.py:21). Pure calls do not need
 /// the conservative flush — `effectinfo_from_writeanalyze` (effectinfo.py:
 /// 169-181) clears `_write_descrs_*` for elidable extraeffects. With

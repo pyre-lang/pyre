@@ -718,7 +718,8 @@ pub(super) fn call_policy_effect_slot(
         K::ElidableIntOrMemerror
         | K::ElidableIntOrMemerrorWrapped
         | K::ElidableRefOrMemerrorWrapped
-        | K::ElidableFloatOrMemerrorWrapped => Some(CondCallEffectSlot::ElidableOrMemerror),
+        | K::ElidableFloatOrMemerrorWrapped
+        | K::StrConcat => Some(CondCallEffectSlot::ElidableOrMemerror),
 
         K::MayForceVoid
         | K::MayForceVoidWrapped
@@ -801,6 +802,7 @@ pub(super) fn call_policy_result_kind(
         K::ResidualRef
         | K::NurseryAllocRef
         | K::AllocRef
+        | K::StrConcat
         | K::ResidualRefWrapped
         | K::ResidualRefCannotRaiseWrapped
         | K::MayForceRefWrapped
