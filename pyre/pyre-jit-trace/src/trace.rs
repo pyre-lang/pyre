@@ -100,16 +100,6 @@ thread_local! {
     /// from `ContinueRunningNormally` mirrors `_exit_frame_with_exception`.
     static WALK_END_PROPAGATED_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::PyError>> =
         const { std::cell::RefCell::new(None) };
-    /// Stable address for the in-flight walk-end exception carrier above.
-    ///
-    /// RPython keeps this value in the translated MIFrame / exception object
-    /// graph, which its root walker visits for every mutator. Pyre's
-    /// trace→portal seam is genuinely per-thread, but its raw TLS is outside
-    /// that graph, so the owning mutator publishes its address to the
-    /// collector's STW root-area registry.
-    static WALK_END_ROOT_AREA: WalkEndRootArea = WalkEndRootArea {
-        propagated_exception: WALK_END_PROPAGATED_EXCEPTION.with(|value| value as *const _),
-    };
     /// True at portal trace sites that can consume
     /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
     /// conservatively retains its legacy preflight.
@@ -153,6 +143,7 @@ pub fn restore_walk_end() {
 
 struct WalkEndRootArea {
     propagated_exception: *const std::cell::RefCell<Option<pyre_interpreter::PyError>>,
+    parked_stack: *const std::cell::RefCell<Vec<ParkedWalkEnd>>,
 }
 
 thread_local! {
@@ -162,6 +153,19 @@ thread_local! {
     /// owner until `restore_walk_end`.
     static PARKED_WALK_END_STACK: std::cell::RefCell<Vec<ParkedWalkEnd>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Stable addresses for this mutator's walk-end exception carrier and
+    /// parked outer-walk stack.
+    ///
+    /// RPython keeps these values in the translated MIFrame / exception object
+    /// graph, which its root walker visits for every mutator
+    /// (`rthread.py` `_trace_tlref`). Pyre's trace→portal seam is genuinely
+    /// per-thread, but its raw TLS is outside that graph, so the owning
+    /// mutator publishes both cell addresses to the collector's STW root-area
+    /// registry.
+    static WALK_END_ROOT_AREA: WalkEndRootArea = WalkEndRootArea {
+        propagated_exception: WALK_END_PROPAGATED_EXCEPTION.with(|value| value as *const _),
+        parked_stack: PARKED_WALK_END_STACK.with(|value| value as *const _),
+    };
 }
 
 /// The flush legs that can commit a walk's end state, in the order they are
@@ -376,17 +380,20 @@ pub unsafe fn walk_walk_end_roots_area(
     let exception_cell = unsafe { &*area.propagated_exception };
     // SAFETY: the owner is either synchronously collecting or STW-quiesced;
     // no Rust borrow is live while the collector forwards these raw slots.
+    // Every address comes from the registered extra-area `data`, the same
+    // ownership `ThreadLocalReference._trace_tlref` (`rthread.py`) gives each
+    // mutator's block through `_RPython_ThreadLocals_Enum`.
     let opt = unsafe { &mut *exception_cell.as_ptr() };
     if let Some(err) = opt.as_mut() {
         err.walk_gc_refs(visitor);
     }
-    PARKED_WALK_END_STACK.with(|stack| {
-        for parked in stack.borrow_mut().iter_mut() {
-            if let Some(err) = parked.propagated_exception.as_mut() {
-                err.walk_gc_refs(visitor);
-            }
+    let parked_cell = unsafe { &*area.parked_stack };
+    let parked = unsafe { &mut *parked_cell.as_ptr() };
+    for parked in parked.iter_mut() {
+        if let Some(err) = parked.propagated_exception.as_mut() {
+            err.walk_gc_refs(visitor);
         }
-    });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2679,7 +2686,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             if let Some(catch_target) = catch_target {
                 crate::jitcode_dispatch::census_record("P2Drain::ChangeFrameMiddle");
                 match walk_transparent_helper_middle_from_handler(
-                    ctx,
+                    live_trace_ctx(meta),
                     session,
                     sym,
                     root_pc,
@@ -2691,7 +2698,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                 ) {
                     Some(Ok(result)) => {
                         return drive_middles_finishframe(
-                            ctx,
+                            meta,
                             flush_committed,
                             session,
                             sym,
@@ -7946,6 +7953,15 @@ mod tests {
             // offsets once the collector follows that handle, not as separate
             // roots of this TLS cell. The previous expected pair
             // `(0x3000 + 0x20, 0x4000 + 0x20)` was those two fields.
+            let parked_err = pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::RuntimeError,
+                "parked foreign mutator root",
+            );
+            let parked_handle = parked_err.as_raw() as usize;
+            super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
+                *slot.borrow_mut() = Some(parked_err);
+            });
+            super::park_walk_end();
             let err = pyre_interpreter::PyError::new(
                 pyre_interpreter::PyErrorKind::RuntimeError,
                 "foreign mutator root",
@@ -7955,16 +7971,25 @@ mod tests {
                 *slot.borrow_mut() = Some(err);
             });
             area_tx
-                .send((super::capture_walk_end_root_area() as usize, handle))
+                .send((
+                    super::capture_walk_end_root_area() as usize,
+                    handle,
+                    parked_handle,
+                ))
                 .unwrap();
             resume_rx.recv().unwrap();
             super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
                 let err = slot.borrow_mut().take().unwrap();
                 handle_tx.send(err.as_raw() as usize).unwrap();
             });
+            super::restore_walk_end();
+            super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
+                let err = slot.borrow_mut().take().unwrap();
+                handle_tx.send(err.as_raw() as usize).unwrap();
+            });
         });
 
-        let (area, handle) = area_rx.recv().unwrap();
+        let (area, handle, parked_handle) = area_rx.recv().unwrap();
         let area = area as *const ();
         // The owner is blocked after publishing its stable TLS addresses,
         // matching the mutator quiescence required by the STW registry.
@@ -7977,8 +8002,9 @@ mod tests {
             });
         }
         resume_tx.send(()).unwrap();
-        assert_eq!(seen, vec![handle]);
+        assert_eq!(seen, vec![handle, parked_handle]);
         assert_eq!(handle_rx.recv().unwrap(), handle);
+        assert_eq!(handle_rx.recv().unwrap(), parked_handle);
         owner.join().unwrap();
     }
 

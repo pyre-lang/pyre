@@ -445,7 +445,14 @@ pub mod word_publish {
         type Reg = i64;
         const IS_WORD: bool = false;
         fn from_reg(reg: i64) -> Self {
-            char::from_u32(reg as u32).unwrap_or('\0')
+            // A residual `char` word that is not a Unicode scalar can only
+            // come from a miscompiled call: `lltype.cast_primitive` uses
+            // `unichr` (`_to_primitive[UniChar]`) and `rint.rtype_unichr`
+            // checks the range via `ll_check_unichr` at the boundary.
+            match u32::try_from(reg).ok().and_then(char::from_u32) {
+                Some(c) => c,
+                None => panic!("invalid char residual argument: {reg}"),
+            }
         }
         fn into_reg(self) -> i64 {
             u32::from(self) as i64

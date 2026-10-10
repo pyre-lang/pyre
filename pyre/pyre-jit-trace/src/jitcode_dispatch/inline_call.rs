@@ -4658,33 +4658,46 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             false
         }
     };
+    // `typeobject.py W_TypeObject.descr_call` after `get_and_call_args`:
+    // a non-None `__init__` result raises TypeError there, and the
+    // constructor is not re-entered. Keep the assembler record and play
+    // that tail after GUARD_NO_EXCEPTION (`ctor_continuation`
+    // `bh_check_init_returned_none`) instead of aborting into an entry replay.
+    // `check_init_returned_none` returns the TypeError without publishing
+    // into `BH_LAST_EXC_VALUE` / the compiled `_store_exception` cell.
+    // `execute_residual_call` is what consumes those channels after a
+    // concrete helper run (`BH_LAST_EXC_VALUE` cleared on read, then
+    // `drain_backend_jit_exc`); invoking `bh_check_init_returned_none` here
+    // would skip that consume and leave a pending exception for a later
+    // `GUARD_NO_EXCEPTION`. Record the residual, compute the error here.
+    let record_init_none_check = constructor_result.is_some();
+    let mut init_type_error = None;
     if let Some((dst_bank, dst)) = dst {
-        // `typeobject.py descr_call` discards `__init__`'s result after
-        // checking it is None and returns `w_newobject`. The assembler
-        // result is `__init__`'s None; writing that into the CALL dst made
-        // `C()` evaluate to None, and residualizing the original CALL would
-        // re-run the prefix the sub-walk already executed.
-        // `opimpl_jit_merge_point` continues this frame, so the instance
-        // replaces None here, before GUARD_NOT_FORCED snapshots the dst.
+        // `descr_call` discards `__init__`'s result after checking it is None
+        // and returns `w_newobject`. The assembler result is `__init__`'s
+        // return; writing that into the CALL dst made `C()` evaluate to None,
+        // and residualizing the original CALL would re-run the prefix the
+        // sub-walk already executed. `opimpl_jit_merge_point` continues this
+        // frame, so the instance replaces None here, before GUARD_NOT_FORCED
+        // snapshots the dst. A non-None result skips the dst write: the CALL
+        // raises instead.
         let write_err = if let Some((instance, instance_concrete)) = constructor_result {
-            let init_not_none = match &exec {
-                ResidualExecOutcome::Executed(Ok(result)) => {
-                    let ptr = *result as pyre_object::PyObjectRef;
-                    ptr.is_null() || !unsafe { pyre_object::is_none(ptr) }
-                }
-                ResidualExecOutcome::Executed(Err(_)) | ResidualExecOutcome::Declined(_) => false,
-            };
-            if init_not_none {
-                if leave_callee_ec {
-                    leave_loop_callee_ec(ctx, callee_frame, callee_ec, false);
-                }
-                return Err(DispatchError::callee_inline_unsupported(pc));
+            if let ResidualExecOutcome::Executed(Ok(result)) = &exec
+                && let Err(e) = pyre_interpreter::call::check_init_returned_none(
+                    *result as pyre_object::PyObjectRef,
+                )
+            {
+                init_type_error = Some(e);
             }
-            match &exec {
-                ResidualExecOutcome::Executed(Err(_)) => {
-                    write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
+            if init_type_error.is_some() {
+                Ok(())
+            } else {
+                match &exec {
+                    ResidualExecOutcome::Executed(Err(_)) => {
+                        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
+                    }
+                    _ => write_ref_reg(ctx, pc, dst, instance, instance_concrete),
                 }
-                _ => write_ref_reg(ctx, pc, dst, instance, instance_concrete),
             }
         } else {
             write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
@@ -4739,6 +4752,46 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     }
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
+
+    if record_init_none_check {
+        // `W_TypeObject.descr_call` checks every successful `__init__`
+        // result (`if not space.is_w(w_result, space.w_None)`), after
+        // `get_and_call_args` returns. Record that tail after this
+        // assembler GUARD_NO_EXCEPTION, matching `ctor_continuation`
+        // (`residual_call_r_v bh_check_init_returned_none` then `-live-`
+        // / GUARD_NO_EXCEPTION). The tracing-time outcome only chooses
+        // which continuation the walker takes; the residual itself is
+        // not gated on a non-None result, so a later compiled iteration
+        // that returns a value still raises. Do not invoke the helper at
+        // trace time: `check_init_returned_none` already computed the
+        // error, and a concrete `bh_check_init_returned_none` would
+        // publish into `BH_LAST_EXC_VALUE` without
+        // `execute_residual_call` consuming it.
+        ctx.trace_ctx.call_void_typed_with_effect(
+            pyre_interpreter::residual_word_addr!(
+                1,
+                crate::ctor_continuation::bh_check_init_returned_none
+            ) as *const (),
+            &[ca_result],
+            &[majit_ir::Type::Ref],
+            majit_metainterp::default_effect_info(),
+        );
+        if let Some(mut err) = init_type_error {
+            let exc = err.to_exc_object();
+            ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
+            ctx.fbw_mode.class_of_last_exc_is_const = false;
+            walker_record_guard_exception(ctx, pc)?;
+            let exc_box = ctx
+                .last_exc_value()
+                .expect("guard_exception seeds last_exc_value");
+            return Ok(Some(WalkerLoopCalleePortalRecord {
+                result: ca_result,
+                raised: Some((exc_box, ConcreteValue::Ref(exc))),
+            }));
+        }
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    }
 
     Ok(Some(WalkerLoopCalleePortalRecord {
         result: ca_result,
