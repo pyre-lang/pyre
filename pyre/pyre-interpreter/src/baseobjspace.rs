@@ -20041,8 +20041,8 @@ unsafe fn list_iter_stop(obj: PyObjectRef, index: isize) -> PyObjectRef {
 /// under the GIL (`gil.py` `GILThreadLocals.gil_ready`) and has no per-list
 /// lock. Looking inside `w_list_getitem_inner` while the stripe is held
 /// records a guard that resumes at `FOR_ITER` and never releases, so a
-/// later thread unpacking a list stararg waits forever. `w_list_getitem`
-/// keeps the same opaque pairing.
+/// later thread unpacking a list stararg waits forever. BINARY_SUBSCR
+/// reaches the inner body through look-inside `w_list_getitem` instead.
 #[majit_macros::dont_look_inside]
 unsafe fn list_iter_getitem_locked(seq: PyObjectRef, index: isize) -> Option<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();

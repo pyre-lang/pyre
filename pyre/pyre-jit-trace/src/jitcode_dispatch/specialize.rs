@@ -11739,37 +11739,96 @@ type LocalsDictSetitem = extern "C" fn(
     pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef;
 
+/// Which `fast2locals` setitem helper a localsplus slot uses.  Mapped to the
+/// recording-time function and the residual address that names that same
+/// function in [`locals_dict_setitem`] — `residual_word_addr!` takes a path,
+/// so the pairing lives in one match rather than a function pointer.
+enum LocalsDictSetitemKind {
+    Local,
+    Cell,
+}
+
+fn locals_dict_setitem(kind: LocalsDictSetitemKind) -> (LocalsDictSetitem, *const ()) {
+    match kind {
+        LocalsDictSetitemKind::Local => (
+            pyre_interpreter::pyframe::jit_locals_dict_setitem_local,
+            pyre_interpreter::residual_word_addr!(
+                4,
+                pyre_interpreter::pyframe::jit_locals_dict_setitem_local
+            ),
+        ),
+        LocalsDictSetitemKind::Cell => (
+            pyre_interpreter::pyframe::jit_locals_dict_setitem_cell,
+            pyre_interpreter::residual_word_addr!(
+                4,
+                pyre_interpreter::pyframe::jit_locals_dict_setitem_cell
+            ),
+        ),
+    }
+}
+
 /// The `fast2locals` binder for localsplus slot `index` and the index it names
 /// its key with: `code.varnames[index]` below `numlocals` -- a cellvar sharing
 /// a varname slot included, since that is the name it carries -- and
 /// `cell_slot_names(code)[index - numlocals]` above it.
 ///
+/// Recording-time helper and residual address come from the same
+/// [`LocalsDictSetitemKind`] so the function the walk executes is the one the
+/// compiled loop calls.
+///
 /// The same split [`ModelledLocalSlot::binder`] makes for an inlined callee.
-fn portal_slot_binder(index: usize, numlocals: usize) -> (LocalsDictSetitem, i64) {
-    if index < numlocals {
-        (
-            pyre_interpreter::pyframe::jit_locals_dict_setitem_local,
-            index as i64,
-        )
+fn portal_slot_binder(index: usize, numlocals: usize) -> (LocalsDictSetitem, *const (), i64) {
+    let (kind, name_index) = if index < numlocals {
+        (LocalsDictSetitemKind::Local, index as i64)
     } else {
-        (
-            pyre_interpreter::pyframe::jit_locals_dict_setitem_cell,
-            (index - numlocals) as i64,
-        )
+        (LocalsDictSetitemKind::Cell, (index - numlocals) as i64)
+    };
+    let (setitem, addr) = locals_dict_setitem(kind);
+    (setitem, addr, name_index)
+}
+
+/// Which helper turns the filled mapping into the published result.  Mapped to
+/// the recording-time function and the residual address that names that same
+/// function in [`locals_dict_tail`].
+enum LocalsDictTail {
+    Snapshot,
+    DirNames,
+}
+
+type LocalsDictTailFn = extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef;
+
+fn locals_dict_tail(kind: LocalsDictTail) -> (LocalsDictTailFn, *const ()) {
+    match kind {
+        LocalsDictTail::Snapshot => (
+            pyre_interpreter::pyframe::jit_locals_dict_snapshot,
+            pyre_interpreter::residual_word_addr!(
+                1,
+                pyre_interpreter::pyframe::jit_locals_dict_snapshot
+            ),
+        ),
+        LocalsDictTail::DirNames => (
+            pyre_interpreter::builtins::jit_dir_names_from_locals,
+            pyre_interpreter::residual_word_addr!(
+                1,
+                pyre_interpreter::builtins::jit_dir_names_from_locals
+            ),
+        ),
     }
 }
 
-fn locals_dict_setitem_addr(index: usize, numlocals: usize) -> *const () {
-    if index < numlocals {
-        pyre_interpreter::residual_word_addr!(
-            4,
-            pyre_interpreter::pyframe::jit_locals_dict_setitem_local
-        )
-    } else {
-        pyre_interpreter::residual_word_addr!(
-            4,
-            pyre_interpreter::pyframe::jit_locals_dict_setitem_cell
-        )
+/// `locals()` / `vars()` snapshot a frame-owned mapping; a fresh mapping
+/// already is the independent copy, so it needs none.  `dir()` always takes
+/// the sorted-name tail.
+fn frame_locals_tail(
+    fold: FrameLocalsBuiltin,
+    frame_owned: bool,
+) -> Option<(LocalsDictTailFn, *const ())> {
+    match fold {
+        FrameLocalsBuiltin::Mapping if frame_owned => {
+            Some(locals_dict_tail(LocalsDictTail::Snapshot))
+        }
+        FrameLocalsBuiltin::Mapping => None,
+        FrameLocalsBuiltin::SortedNames => Some(locals_dict_tail(LocalsDictTail::DirNames)),
     }
 }
 
@@ -12135,28 +12194,9 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // `getdictscope` — the mapping itself — through `builtin_dir`'s split-out
     // sorted-key-set tail.  `locals()` / `vars()` hand back
     // `frame_locals_snapshot`'s independent PEP 667 copy, which a mapping the
-    // expansion just built for itself already is.
-    let tail_fn: Option<extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef> =
-        match fold {
-            FrameLocalsBuiltin::Mapping if frame_owned => {
-                Some(pyre_interpreter::pyframe::jit_locals_dict_snapshot)
-            }
-            FrameLocalsBuiltin::Mapping => None,
-            FrameLocalsBuiltin::SortedNames => {
-                Some(pyre_interpreter::builtins::jit_dir_names_from_locals)
-            }
-        };
-    let tail_addr: Option<*const ()> = match fold {
-        FrameLocalsBuiltin::Mapping if frame_owned => Some(pyre_interpreter::residual_word_addr!(
-            1,
-            pyre_interpreter::pyframe::jit_locals_dict_snapshot
-        )),
-        FrameLocalsBuiltin::Mapping => None,
-        FrameLocalsBuiltin::SortedNames => Some(pyre_interpreter::residual_word_addr!(
-            1,
-            pyre_interpreter::builtins::jit_dir_names_from_locals
-        )),
-    };
+    // expansion just built for itself already is.  Recording-time function and
+    // residual address come from the same [`frame_locals_tail`] selection.
+    let tail = frame_locals_tail(fold, frame_owned);
     // Authentic mapping, built on the plain eval loop exactly as the skipped
     // residual would — through the SAME helpers the emitted calls invoke, so
     // the recording-time value and the compiled loop's value cannot diverge.
@@ -12202,7 +12242,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             // pinned slot on every pass.  A fresh mapping never held the key,
             // so its `delitem` arm is skipped rather than emitted.
             let updated = if !value.is_null() {
-                let (setitem, name_index) = portal_slot_binder(i, numlocals);
+                let (setitem, _addr, name_index) = portal_slot_binder(i, numlocals);
                 setitem(
                     locals,
                     code_ptr as *const pyre_interpreter::CodeObject,
@@ -12237,8 +12277,8 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             let locals = pyre_object::gc_roots::shadow_stack_get(locals_root);
             // The tail runs here too, so the recorded result is produced by the
             // very helper the emitted call names.
-            result = match tail_fn {
-                Some(tail) => tail(locals),
+            result = match tail {
+                Some((tail_fn, _)) => tail_fn(locals),
                 None => locals,
             };
         }
@@ -12410,14 +12450,14 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             continue;
         }
         let (helper, args, arg_types): (_, Vec<OpRef>, Vec<majit_ir::Type>) = if bound {
-            let (_setitem, name_index) = portal_slot_binder(i, numlocals);
+            let (_setitem, addr, name_index) = portal_slot_binder(i, numlocals);
             let name_const = if name_index == i as i64 {
                 index_const
             } else {
                 ctx.trace_ctx.const_int(name_index)
             };
             (
-                locals_dict_setitem_addr(i, numlocals),
+                addr,
                 vec![dict_op, code_const, name_const, value_op],
                 vec![
                     majit_ir::Type::Ref,
@@ -12492,10 +12532,10 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // trace and the eval loop run one implementation.  Both report a failure
     // as PY_NULL instead of publishing it, so the guarded side exit re-runs
     // the residual and raises from the eval loop.
-    let result_op = match tail_addr {
-        Some(tail) => {
+    let result_op = match tail {
+        Some((_, tail_addr)) => {
             let op_ref = ctx.trace_ctx.call_ref_typed_with_effect(
-                tail,
+                tail_addr,
                 &[dict_op],
                 &[majit_ir::Type::Ref],
                 majit_ir::EffectInfo::new(
@@ -12654,18 +12694,8 @@ impl ModelledLocalSlot {
     /// with: `code.varnames[index]` for a slot below `numlocals` — a shared
     /// cellvar slot included, since that is the name it carries — and
     /// `cell_slot_names(code)[index - numlocals]` above it.
-    fn binder(&self, numlocals: usize) -> (LocalsDictSetitem, i64) {
-        if (self.index as usize) < numlocals {
-            (
-                pyre_interpreter::pyframe::jit_locals_dict_setitem_local,
-                self.index,
-            )
-        } else {
-            (
-                pyre_interpreter::pyframe::jit_locals_dict_setitem_cell,
-                self.index - numlocals as i64,
-            )
-        }
+    fn binder(&self, numlocals: usize) -> (LocalsDictSetitem, *const (), i64) {
+        portal_slot_binder(self.index as usize, numlocals)
     }
 }
 
@@ -12913,20 +12943,9 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     // `getdictscope` — the mapping itself.  `locals()` / `vars()` need none:
     // nothing else references a mapping the expansion just built, so it is
     // already the independent copy `frame_locals_snapshot` hands back.
-    let tail_fn: Option<extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef> =
-        match fold {
-            FrameLocalsBuiltin::Mapping => None,
-            FrameLocalsBuiltin::SortedNames => {
-                Some(pyre_interpreter::builtins::jit_dir_names_from_locals)
-            }
-        };
-    let tail_addr: Option<*const ()> = match fold {
-        FrameLocalsBuiltin::Mapping => None,
-        FrameLocalsBuiltin::SortedNames => Some(pyre_interpreter::residual_word_addr!(
-            1,
-            pyre_interpreter::builtins::jit_dir_names_from_locals
-        )),
-    };
+    // Recording-time function and residual address come from the same
+    // [`frame_locals_tail`] selection; the mapping is always fresh.
+    let tail = frame_locals_tail(fold, false);
     // The slots that bind a key.  An empty cell binds none — `fast2locals`
     // deletes the name there, and this mapping is fresh, so there is nothing
     // to delete.
@@ -12965,7 +12984,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         for (&i, &value_root) in bound.iter().zip(&value_roots) {
             // The store allocates, so both the mapping and the value are
             // re-read from their pinned slots on every pass.
-            let (setitem, name_index) = slots[i].binder(numlocals);
+            let (setitem, _addr, name_index) = slots[i].binder(numlocals);
             let updated = setitem(
                 pyre_object::gc_roots::shadow_stack_get(locals_root),
                 code_ptr as *const pyre_interpreter::CodeObject,
@@ -12979,8 +12998,8 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         }
         if !slot_failed {
             let locals = pyre_object::gc_roots::shadow_stack_get(locals_root);
-            result = match tail_fn {
-                Some(tail) => tail(locals),
+            result = match tail {
+                Some((tail_fn, _)) => tail_fn(locals),
                 None => locals,
             };
         }
@@ -13064,10 +13083,10 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         // plain fastlocal the value is the SSA operand the level's own
         // `LOAD_FAST` would have folded to; for a cell slot it is the
         // `Cell.contents` read emitted above.
-        let (_setitem, name_index) = slot.binder(numlocals);
+        let (_setitem, addr, name_index) = slot.binder(numlocals);
         let index_const = ctx.trace_ctx.const_int(name_index);
         dict_op = ctx.trace_ctx.call_ref_typed_with_effect(
-            locals_dict_setitem_addr(slot.index as usize, numlocals),
+            addr,
             &[dict_op, code_const, index_const, value_op],
             &[
                 majit_ir::Type::Ref,
@@ -13085,10 +13104,10 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
             .set_opref_concrete(dict_op, concrete_locals_value());
     }
     locals_expansion_cut_if_too_long(ctx, op.pc)?;
-    let result_op = match tail_addr {
-        Some(tail) => {
+    let result_op = match tail {
+        Some((_, tail_addr)) => {
             let op_ref = ctx.trace_ctx.call_ref_typed_with_effect(
-                tail,
+                tail_addr,
                 &[dict_op],
                 &[majit_ir::Type::Ref],
                 majit_ir::EffectInfo::new(

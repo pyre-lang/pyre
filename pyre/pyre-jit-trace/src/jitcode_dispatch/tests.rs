@@ -205,6 +205,79 @@ fn session_root_callback_rejects_a_borrow_across_collection() {
     drop(held);
 }
 
+#[test]
+fn nested_park_restores_outer_escape_flush_undo() {
+    // `warmstate.py bound_reached` builds a fresh MetaInterp per attempt.
+    // pyre reuses one driver and parks the outer walk on `ParkedWalkTls`;
+    // the inner `trace_bytecode` setup still calls `discard_escape_flush_undo`
+    // / `reset_unflushed_escaped_callee` so each attempt starts clean.
+    struct RestoreOnDrop;
+    impl Drop for RestoreOnDrop {
+        fn drop(&mut self) {
+            restore_walk_tls();
+            discard_escape_flush_undo();
+            reset_unflushed_escaped_callee();
+        }
+    }
+    let _restore = RestoreOnDrop;
+
+    let slot = 0x0000_E501_usize as pyre_object::PyObjectRef;
+    let flush = 0x0000_E502_usize as pyre_object::PyObjectRef;
+    let outer_frame = 0x0000_E5F0;
+    let outer_unflushed = 0x0000_E5C1;
+    ESCAPE_FLUSH_UNDO.with(|cell| {
+        *cell.borrow_mut() = Some(EscapeFlushUndo {
+            frame: outer_frame,
+            frame_root: None,
+            last_instr: 7,
+            valuestackdepth: 3,
+            slots: vec![slot],
+            flush_image: vec![flush],
+        });
+    });
+    ESCAPE_FLUSH_UNDO_PENDING.with(|cell| cell.set(true));
+    UNFLUSHED_ESCAPED_CALLEE.with(|cell| cell.set(outer_unflushed));
+
+    park_walk_tls();
+    discard_escape_flush_undo();
+    reset_unflushed_escaped_callee();
+
+    assert!(
+        ESCAPE_FLUSH_UNDO.with(|cell| cell.borrow().is_none()),
+        "inner discard must leave the live slot empty"
+    );
+    assert!(!ESCAPE_FLUSH_UNDO_PENDING.with(|cell| cell.get()));
+    assert_eq!(unflushed_escaped_callee(), 0);
+
+    let mut seen = Vec::new();
+    unsafe {
+        fbw_store_journal_root_walker_area(capture_fbw_store_journal_root_area(), &mut |root| {
+            if root.as_usize() == 0x0000_E501 || root.as_usize() == 0x0000_E502 {
+                seen.push(root.as_usize());
+            }
+        });
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![0x0000_E501, 0x0000_E502],
+        "parked escape-flush undo stays a GC extra-area root"
+    );
+
+    restore_walk_tls();
+
+    let undo = ESCAPE_FLUSH_UNDO
+        .with(|cell| cell.borrow_mut().take())
+        .expect("outer undo image");
+    assert_eq!(undo.frame, outer_frame);
+    assert_eq!(undo.last_instr, 7);
+    assert_eq!(undo.valuestackdepth, 3);
+    assert_eq!(undo.slots, vec![slot]);
+    assert_eq!(undo.flush_image, vec![flush]);
+    assert!(ESCAPE_FLUSH_UNDO_PENDING.with(|cell| cell.get()));
+    assert_eq!(unflushed_escaped_callee(), outer_unflushed);
+}
+
 fn finish_payload_of(outcome: &DispatchOutcome) -> Option<(OpRef, Type)> {
     match outcome {
         DispatchOutcome::Terminate {
@@ -1788,6 +1861,7 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
         &mut wc,
         0,
         Some(('r', 0)),
+        Some(0),
         callee_frame,
         callee_ec,
         None,
@@ -1815,6 +1889,400 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
         "execute_frame finally restores topframeref when the snapshot aborts"
     );
     let _ = (frame, snapshot_sym);
+}
+
+/// `typeobject.py W_TypeObject.descr_call` raises `TypeError` after
+/// `get_and_call_args` when `__init__` returns non-None, and never re-enters
+/// the constructor. A loop-callee portal that residual-executed that body
+/// must keep `CALL_ASSEMBLER` and take the same exception path
+/// (`ctor_continuation::bh_check_init_returned_none`) instead of aborting
+/// into an entry replay.
+#[test]
+fn loop_callee_portal_non_none_init_raises_without_aborting() {
+    use crate::state::ConcreteValue;
+    use pyre_interpreter::compile_exec;
+
+    extern "C" fn portal_returns_int() -> i64 {
+        pyre_object::w_int_new(1) as i64
+    }
+
+    let pair = crate::state::ensure_trace_test_driver();
+    let mut saved_runners: Vec<(usize, i64)> = Vec::new();
+    {
+        let meta = pair.0.meta_interp_mut();
+        let wired = meta.staticdata.jitdrivers_sd.iter().any(|jd| {
+            jd.num_greens() > 0 && jd.portal_runner_adr != 0 && jd.portal_calldescr.is_some()
+        });
+        if !wired {
+            let mut jd = majit_metainterp::JitDriverStaticData::new(
+                vec![("pycode", Type::Ref)],
+                vec![("frame", Type::Ref), ("ec", Type::Ref)],
+            );
+            jd.portal_runner_adr = portal_returns_int as *const () as i64;
+            meta.register_jitdriver_sd(jd);
+            meta.finish_setup_descrs_for_jitdrivers();
+        } else {
+            let n = meta.staticdata.jitdrivers_sd.len();
+            for i in 0..n {
+                if let Some(jd) = meta.jitdriver_sd_mut(i)
+                    && jd.portal_runner_adr != 0
+                {
+                    saved_runners.push((i, jd.portal_runner_adr));
+                    jd.portal_runner_adr = portal_returns_int as *const () as i64;
+                }
+            }
+        }
+    }
+    struct RestorePortal(Vec<(usize, i64)>);
+    impl Drop for RestorePortal {
+        fn drop(&mut self) {
+            if self.0.is_empty() {
+                return;
+            }
+            let pair = crate::state::ensure_trace_test_driver();
+            let meta = pair.0.meta_interp_mut();
+            for (i, adr) in self.0.drain(..) {
+                if let Some(jd) = meta.jitdriver_sd_mut(i) {
+                    jd.portal_runner_adr = adr;
+                }
+            }
+        }
+    }
+    let _restore = RestorePortal(saved_runners);
+    {
+        let meta = pair.0.meta_interp_mut();
+        let expected = portal_returns_int as *const () as i64;
+        let adrs: Vec<i64> = meta
+            .staticdata
+            .jitdrivers_sd
+            .iter()
+            .map(|jd| jd.portal_runner_adr)
+            .collect();
+        assert!(
+            adrs.iter().any(|&adr| adr == expected),
+            "portal stub not wired, adrs={adrs:?} expected={expected}"
+        );
+    }
+
+    let raw_code = compile_exec("None").expect("test code should compile");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let w_code = frame.pycode;
+    assert!(!w_code.is_null(), "compile_exec installs a code object");
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+
+    let jitcode_index = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let callee_frame = OpRef::input_arg_ref(0);
+    let callee_ec = OpRef::input_arg_ref(1);
+    let instance = tc.const_ref(pyre_object::w_int_new(0) as i64);
+    let sentinel = 0xECu64;
+    tc.set_opref_concrete(
+        callee_frame,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
+    );
+    tc.set_opref_concrete(
+        callee_ec,
+        majit_ir::Value::Ref(majit_ir::GcRef(sentinel as usize)),
+    );
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let regs_r = vec![instance];
+    let regs_i = Vec::new();
+    let regs_f = Vec::new();
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    #[cfg(feature = "dynasm")]
+    majit_backend_dynasm::jit_exc_clear();
+
+    let recorded = super::inline_call::record_walker_loop_callee_portal_call(
+        &mut wc,
+        0,
+        Some(('r', 0)),
+        Some(0),
+        callee_frame,
+        callee_ec,
+        None,
+        1,
+        w_code,
+        true,
+        false,
+        Some((instance, ConcreteValue::Ref(pyre_object::w_int_new(0)))),
+    );
+    assert_ne!(
+        recorded.as_ref().err(),
+        Some(&DispatchError::callee_inline_unsupported(0)),
+        "aborting the assembler record replays the original CALL"
+    );
+    let recorded = recorded
+        .expect("keeps the assembler record")
+        .expect("portal runner is wired");
+    let opcodes: Vec<_> = wc.trace_ctx.ops().iter().map(|op| op.opcode).collect();
+    let ca_concrete = wc.trace_ctx.concrete_of_opref(recorded.result);
+    assert!(
+        recorded.raised.is_some(),
+        "descr_call's None check raises TypeError as the CALL outcome; \
+         raised=None opcodes={opcodes:?} ca_concrete={ca_concrete:?} \
+         none={:?}",
+        pyre_object::w_none()
+    );
+    assert!(
+        wc.trace_ctx.ops().iter().any(|op| {
+            op.opcode == majit_ir::OpCode::CallMayForceR
+                || op.opcode == majit_ir::OpCode::CallAssemblerR
+        }),
+        "the constructor portal stays in the trace"
+    );
+    assert!(
+        wc.trace_ctx
+            .ops()
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::CallN),
+        "descr_call's tail records bh_check_init_returned_none"
+    );
+    assert!(
+        wc.trace_ctx
+            .ops()
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardException),
+        "the TypeError is the CALL's exception path"
+    );
+    assert_eq!(
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
+        0,
+        "trace time must not leave BH_LAST_EXC_VALUE set"
+    );
+    #[cfg(feature = "dynasm")]
+    assert_eq!(
+        majit_backend_dynasm::jit_exc_value_peek(),
+        0,
+        "trace time must not leave the compiled JIT_EXC_VALUE cell set"
+    );
+    let _ = frame;
+}
+
+/// `W_TypeObject.descr_call` checks every successful `__init__` result, so a
+/// constructor CALL_ASSEMBLER whose tracing-time result was None still records
+/// `bh_check_init_returned_none` and continues through GUARD_NO_EXCEPTION.
+#[test]
+fn loop_callee_portal_none_init_records_the_none_check() {
+    use crate::state::ConcreteValue;
+    use pyre_interpreter::compile_exec;
+
+    extern "C" fn portal_returns_none() -> i64 {
+        pyre_object::w_none() as i64
+    }
+
+    let pair = crate::state::ensure_trace_test_driver();
+    let mut saved_runners: Vec<(usize, i64)> = Vec::new();
+    {
+        let meta = pair.0.meta_interp_mut();
+        let wired = meta.staticdata.jitdrivers_sd.iter().any(|jd| {
+            jd.num_greens() > 0 && jd.portal_runner_adr != 0 && jd.portal_calldescr.is_some()
+        });
+        if !wired {
+            let mut jd = majit_metainterp::JitDriverStaticData::new(
+                vec![("pycode", Type::Ref)],
+                vec![("frame", Type::Ref), ("ec", Type::Ref)],
+            );
+            jd.portal_runner_adr = portal_returns_none as *const () as i64;
+            meta.register_jitdriver_sd(jd);
+            meta.finish_setup_descrs_for_jitdrivers();
+        } else {
+            let n = meta.staticdata.jitdrivers_sd.len();
+            for i in 0..n {
+                if let Some(jd) = meta.jitdriver_sd_mut(i)
+                    && jd.portal_runner_adr != 0
+                {
+                    saved_runners.push((i, jd.portal_runner_adr));
+                    jd.portal_runner_adr = portal_returns_none as *const () as i64;
+                }
+            }
+        }
+    }
+    struct RestorePortal(Vec<(usize, i64)>);
+    impl Drop for RestorePortal {
+        fn drop(&mut self) {
+            if self.0.is_empty() {
+                return;
+            }
+            let pair = crate::state::ensure_trace_test_driver();
+            let meta = pair.0.meta_interp_mut();
+            for (i, adr) in self.0.drain(..) {
+                if let Some(jd) = meta.jitdriver_sd_mut(i) {
+                    jd.portal_runner_adr = adr;
+                }
+            }
+        }
+    }
+    let _restore = RestorePortal(saved_runners);
+    {
+        let meta = pair.0.meta_interp_mut();
+        let expected = portal_returns_none as *const () as i64;
+        let adrs: Vec<i64> = meta
+            .staticdata
+            .jitdrivers_sd
+            .iter()
+            .map(|jd| jd.portal_runner_adr)
+            .collect();
+        assert!(
+            adrs.iter().any(|&adr| adr == expected),
+            "portal stub not wired, adrs={adrs:?} expected={expected}"
+        );
+    }
+
+    let raw_code = compile_exec("None").expect("test code should compile");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let w_code = frame.pycode;
+    assert!(!w_code.is_null(), "compile_exec installs a code object");
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+
+    let jitcode_index = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let callee_frame = OpRef::input_arg_ref(0);
+    let callee_ec = OpRef::input_arg_ref(1);
+    let instance = tc.const_ref(pyre_object::w_int_new(0) as i64);
+    let sentinel = 0xECu64;
+    tc.set_opref_concrete(
+        callee_frame,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
+    );
+    tc.set_opref_concrete(
+        callee_ec,
+        majit_ir::Value::Ref(majit_ir::GcRef(sentinel as usize)),
+    );
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let regs_r = vec![instance];
+    let regs_i = Vec::new();
+    let regs_f = Vec::new();
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    #[cfg(feature = "dynasm")]
+    majit_backend_dynasm::jit_exc_clear();
+
+    let recorded = super::inline_call::record_walker_loop_callee_portal_call(
+        &mut wc,
+        0,
+        Some(('r', 0)),
+        Some(0),
+        callee_frame,
+        callee_ec,
+        None,
+        1,
+        w_code,
+        true,
+        false,
+        Some((instance, ConcreteValue::Ref(pyre_object::w_int_new(0)))),
+    );
+    assert_ne!(
+        recorded.as_ref().err(),
+        Some(&DispatchError::callee_inline_unsupported(0)),
+        "aborting the assembler record replays the original CALL"
+    );
+    let recorded = recorded
+        .expect("keeps the assembler record")
+        .expect("portal runner is wired");
+    let opcodes: Vec<_> = wc.trace_ctx.ops().iter().map(|op| op.opcode).collect();
+    assert!(
+        recorded.raised.is_none(),
+        "a None __init__ result continues; raised={:?} opcodes={opcodes:?}",
+        recorded.raised
+    );
+    assert!(
+        wc.trace_ctx.ops().iter().any(|op| {
+            op.opcode == majit_ir::OpCode::CallMayForceR
+                || op.opcode == majit_ir::OpCode::CallAssemblerR
+        }),
+        "the constructor portal stays in the trace"
+    );
+    let residual = opcodes
+        .iter()
+        .position(|&op| op == majit_ir::OpCode::CallN)
+        .expect("descr_call's tail records bh_check_init_returned_none on the None path too");
+    let assembler_guard = opcodes
+        .iter()
+        .position(|&op| op == majit_ir::OpCode::GuardNoException)
+        .expect("the assembler call records GUARD_NO_EXCEPTION");
+    assert!(
+        assembler_guard < residual,
+        "the None check sits after the assembler GUARD_NO_EXCEPTION; opcodes={opcodes:?}"
+    );
+    let next_guard = opcodes[residual + 1..].iter().copied().find(|&op| {
+        op == majit_ir::OpCode::GuardNoException || op == majit_ir::OpCode::GuardException
+    });
+    assert_eq!(
+        next_guard,
+        Some(majit_ir::OpCode::GuardNoException),
+        "the None path continues through GUARD_NO_EXCEPTION after the residual; opcodes={opcodes:?}"
+    );
+    assert_eq!(
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
+        0,
+        "trace time must not leave BH_LAST_EXC_VALUE set"
+    );
+    #[cfg(feature = "dynasm")]
+    assert_eq!(
+        majit_backend_dynasm::jit_exc_value_peek(),
+        0,
+        "trace time must not leave the compiled JIT_EXC_VALUE cell set"
+    );
+    let _ = frame;
 }
 
 /// The globals guard reads a frame's namespace override with a plain
@@ -19998,6 +20466,112 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
         Some(Value::Int(37)),
         "the shadow half must carry the published value too",
     );
+}
+
+/// `virtualizable.py VirtualizableInfo.write_boxes` writes every static
+/// then every array item `0..len(lst)`, including slots above
+/// `valuestackdepth`. The residual flush must do the same onto the live
+/// interpreter frame.
+#[test]
+fn flush_known_virtualizable_writes_every_static_and_array_item() {
+    use majit_ir::{GcRef, Value};
+    use pyre_interpreter::bytecode::ConstantData;
+    use pyre_interpreter::locals_w_mut;
+    use pyre_interpreter::{Mode, compile_source};
+
+    let module = compile_source("def f(a, b):\n    c = a\n    return c\n", Mode::Exec)
+        .expect("compile should succeed");
+    let raw_code = module
+        .constants
+        .iter()
+        .find_map(|c| match c {
+            ConstantData::Code { code } => Some((**code).clone()),
+            _ => None,
+        })
+        .expect("source should contain a function body");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    frame.fix_array_ptrs();
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let array_len = crate::state::concrete_frame_array_len(frame_ptr)
+        .expect("frame must have locals_cells_stack_w");
+    let nlocals = crate::state::concrete_nlocals(frame_ptr).unwrap_or(0);
+    assert!(
+        nlocals > 0 && array_len > nlocals,
+        "the fixture needs locals and stack slots above nlocals so write_boxes walks the full array"
+    );
+
+    {
+        let slots = locals_w_mut!(frame).as_mut_slice();
+        for (j, slot) in slots.iter_mut().enumerate() {
+            *slot = (0xBEEF0000 + j) as pyre_object::PyObjectRef;
+        }
+    }
+    unsafe {
+        let last_instr = (frame_ptr as *mut u8).add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
+            as *mut isize;
+        *last_instr = 11;
+    }
+    frame.valuestackdepth = array_len;
+
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let static_count = info.num_static_extra_boxes;
+    let slot_count = static_count + array_len;
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable = tc.const_ref(frame_ptr as i64);
+    let pycode = unsafe {
+        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const usize)
+    };
+    let debugdata = unsafe {
+        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET)
+            as *const usize)
+    };
+    let mut boxes = Vec::with_capacity(slot_count);
+    let mut values = Vec::with_capacity(slot_count);
+    boxes.push(tc.const_int(37));
+    values.push(Value::Int(37));
+    boxes.push(tc.const_ref(pycode as i64));
+    values.push(Value::Ref(GcRef(pycode)));
+    boxes.push(tc.const_int(nlocals as i64));
+    values.push(Value::Int(nlocals as i64));
+    boxes.push(tc.const_ref(debugdata as i64));
+    values.push(Value::Ref(GcRef(debugdata)));
+    assert_eq!(boxes.len(), static_count, "PyFrame static field order");
+    for j in 0..array_len {
+        let ptr = 0x1000 + j * 0x10;
+        boxes.push(tc.const_ref(ptr as i64));
+        values.push(Value::Ref(GcRef(ptr)));
+    }
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(GcRef(frame_ptr)),
+        &boxes,
+        &values,
+        &[array_len],
+    );
+
+    crate::state::flush_known_virtualizable_to_frame(&tc, frame_ptr);
+
+    let last_instr = unsafe {
+        *((frame_ptr as *const u8).add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
+            as *const isize)
+    };
+    assert_eq!(last_instr, 37, "write_boxes writes last_instr");
+    assert_eq!(
+        frame.valuestackdepth, nlocals,
+        "write_boxes writes valuestackdepth"
+    );
+
+    let slots = pyre_interpreter::locals_w!(frame).as_slice();
+    for j in 0..array_len {
+        assert_eq!(
+            slots[j],
+            (0x1000 + j * 0x10) as pyre_object::PyObjectRef,
+            "write_boxes writes array item {j} of {array_len} (nlocals={nlocals}); gc_owns={}",
+            pyre_object::gc_hook::try_gc_owns_object(frame_ptr as pyre_object::gc_hook::GCREF)
+        );
+    }
 }
 
 /// A decline recorded on one thread must be visible to a reader on another.
