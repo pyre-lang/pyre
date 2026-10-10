@@ -20,6 +20,7 @@
 //! `_call_header_shadowstack`.
 use parking_lot::RwLock;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -357,6 +358,7 @@ thread_local! {
 /// be mutably accessed by its owner during a walk.
 struct MutatorEntry {
     thread_id: std::thread::ThreadId,
+    generation: u64,
     shadow_stack: *const ShadowStack,
     owner_roots: *const RefCell<Vec<Option<GcRef>>>,
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
@@ -367,6 +369,8 @@ struct MutatorEntry {
     pruners: Vec<MutatorPruner>,
     young_reconcilers: Vec<MutatorYoungReconciler>,
 }
+
+static NEXT_MUTATOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Walker for one opaque root area owned by a registered mutator.
 ///
@@ -509,6 +513,7 @@ pub fn register_mutator() {
     );
     registry.push(MutatorEntry {
         thread_id,
+        generation: NEXT_MUTATOR_GENERATION.fetch_add(1, AtomicOrdering::Relaxed),
         shadow_stack,
         owner_roots,
         jf_root_stack,
@@ -528,8 +533,7 @@ pub fn register_mutator() {
 /// never register.
 pub fn mutator_is_registered() -> bool {
     let thread_id = std::thread::current().id();
-    MUTATOR_REGISTRY
-        .lock()
+    lock_mutator_registry()
         .iter()
         .any(|entry| entry.thread_id == thread_id)
 }
@@ -547,7 +551,7 @@ pub unsafe fn register_mutator_extra_area(
     data: *const (),
     name: &'static str,
 ) {
-    register_extra_area(walk, data, name, false);
+    let _ = register_extra_area(walk, data, name, false);
 }
 
 fn register_extra_area(
@@ -555,7 +559,7 @@ fn register_extra_area(
     data: *const (),
     name: &'static str,
     scoped: bool,
-) -> usize {
+) -> (usize, u64) {
     let thread_id = std::thread::current().id();
     let mut registry = lock_mutator_registry();
     let entry = registry
@@ -563,13 +567,14 @@ fn register_extra_area(
         .find(|entry| entry.thread_id == thread_id)
         .expect("register_mutator_extra_area called before register_mutator");
     let index = entry.extra_areas.len();
+    let generation = entry.generation;
     entry.extra_areas.push(Some(MutatorExtraArea {
         walk,
         data,
         name,
         scoped,
     }));
-    index
+    (index, generation)
 }
 
 /// Scoped translated-root publication, corresponding to
@@ -578,6 +583,7 @@ fn register_extra_area(
 /// Slots stay fixed so independently owned frames may retire out of order.
 pub struct MutatorExtraAreaGuard {
     index: usize,
+    generation: u64,
     scoped: bool,
     // An area belongs to its acquiring mutator; prevent Send/Sync.
     _owner: std::marker::PhantomData<*const ()>,
@@ -589,8 +595,10 @@ impl MutatorExtraAreaGuard {
     /// must obey MutatorExtraWalkFn's STW/owner-thread contract, including
     /// Rust aliasing rules. Drop the guard before unregistering the mutator.
     pub unsafe fn new(walk: MutatorExtraWalkFn, data: *const (), name: &'static str) -> Self {
+        let (index, generation) = register_extra_area(walk, data, name, true);
         Self {
-            index: register_extra_area(walk, data, name, true),
+            index,
+            generation,
             scoped: true,
             _owner: std::marker::PhantomData,
         }
@@ -610,8 +618,10 @@ impl MutatorExtraAreaGuard {
     /// Same as [`Self::new`], except `data` must remain valid until this
     /// guard is dropped *or* [`unregister_mutator`] runs, whichever is first.
     pub unsafe fn permanent(walk: MutatorExtraWalkFn, data: *const (), name: &'static str) -> Self {
+        let (index, generation) = register_extra_area(walk, data, name, false);
         Self {
-            index: register_extra_area(walk, data, name, false),
+            index,
+            generation,
             scoped: false,
             _owner: std::marker::PhantomData,
         }
@@ -632,6 +642,9 @@ impl Drop for MutatorExtraAreaGuard {
             );
             return;
         };
+        if entry.generation != self.generation {
+            return;
+        }
         let area = entry
             .extra_areas
             .get_mut(self.index)
@@ -2775,6 +2788,42 @@ mod tests {
         assert_eq!(cell.get(), GcRef(0x1001));
         unregister_mutator();
         drop(guard);
+    }
+
+    #[test]
+    fn permanent_extra_area_drop_does_not_steal_a_later_registration() {
+        unsafe fn walk_cell(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+            let slot = unsafe { &*(data as *const Cell<GcRef>) };
+            let mut value = slot.get();
+            visitor(&mut value);
+            slot.set(value);
+        }
+        let _lock = TEST_MUTEX.lock();
+        let old_cell = Cell::new(GcRef(0x1000));
+        let new_cell = Cell::new(GcRef(0x2000));
+        register_mutator();
+        let old_guard = unsafe {
+            MutatorExtraAreaGuard::permanent(
+                walk_cell,
+                &old_cell as *const _ as *const (),
+                "old_permanent_cell",
+            )
+        };
+        unregister_mutator();
+        register_mutator();
+        let new_guard = unsafe {
+            MutatorExtraAreaGuard::permanent(
+                walk_cell,
+                &new_cell as *const _ as *const (),
+                "new_permanent_cell",
+            )
+        };
+        drop(old_guard);
+        let mut seen = Vec::new();
+        walk_my_extra_areas(|root| seen.push(root.0));
+        assert_eq!(seen, [0x2000]);
+        drop(new_guard);
+        unregister_mutator();
     }
 
     /// A thread that unregisters leaves nothing behind for the all-mutator
