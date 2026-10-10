@@ -10848,6 +10848,8 @@ impl<S: JitState> JitDriver<S> {
     /// references a removed entry it will simply miss the lookup and
     /// fall back to the interpreter, matching the RPython "dangling
     /// weakref → re-compile" path.
+    /// An in-progress MetaInterp (`tracing`, `framestack`) is left
+    /// alone: `pypyjit.releaseall` can run during tracing.
     pub fn mark_all_loops_for_release(&mut self) {
         // `memmgr.py release_all_loops` — the upstream entry
         // point for `jit_hooks.releaseall` (`rlib/jit_hooks.py`)

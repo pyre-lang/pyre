@@ -2716,7 +2716,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             if let Some(catch_target) = catch_target {
                 crate::jitcode_dispatch::census_record("P2Drain::ChangeFrameMiddle");
                 match walk_transparent_helper_middle_from_handler(
-                    ctx,
+                    live_trace_ctx(meta),
                     session,
                     sym,
                     root_pc,
@@ -2728,7 +2728,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                 ) {
                     Some(Ok(result)) => {
                         return drive_middles_finishframe(
-                            ctx,
+                            meta,
                             flush_committed,
                             session,
                             sym,

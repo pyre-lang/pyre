@@ -14173,6 +14173,7 @@ impl<M: Clone> MetaInterp<M> {
     /// MetaInterp, which pyre runs as
     /// [`Self::discard_unfinished_compile_and_run_once`].
     pub fn release_all_driver_loops(&mut self) {
+        // memmgr.py `release_all_loops`: `self.alive_loops.clear()` only.
         self.memory_manager.release_all_loops();
     }
 
