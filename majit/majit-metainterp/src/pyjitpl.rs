@@ -3578,7 +3578,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
                 // the other tracer kinds (GcTables) are rooted through
                 // the gcreftracer registry.
-                let tokens: Vec<std::sync::Arc<JitCellToken>> = entry
+                let mut tokens: Vec<std::sync::Arc<JitCellToken>> = entry
                     .live_token()
                     .into_iter()
                     .chain(
@@ -3588,6 +3588,21 @@ impl<M: Clone> MetaInterp<M> {
                             .filter_map(std::sync::Weak::upgrade),
                     )
                     .collect();
+                // `history.py JitCellToken.record_jump_to` keeps the target
+                // of a JUMP alive through `_keepalive_jitcell_tokens` even
+                // after its own cell row is gone; follow that set to a fixed
+                // point so those tokens are walked with the ones above.
+                let mut next = 0;
+                while next < tokens.len() {
+                    let kept: Vec<std::sync::Arc<JitCellToken>> =
+                        tokens[next].keepalive_tokens.lock().clone();
+                    for token in kept {
+                        if !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token)) {
+                            tokens.push(token);
+                        }
+                    }
+                    next += 1;
+                }
                 for token in &tokens {
                     let Some(clt) = token.compiled_loop_token() else {
                         continue;
@@ -30228,10 +30243,9 @@ mod tests {
 
     /// `history.py TargetToken` is a GC object on
     /// `JitCellToken.target_tokens`. MiniMark traces it whenever the cell
-    /// token is alive, including a predecessor kept by
-    /// `JitCellToken.record_jump_to` (`_keepalive_jitcell_tokens`). The
-    /// off-GC walker visits the same live-plus-previous set it already uses
-    /// for descr pools.
+    /// token is alive, including a predecessor listed on
+    /// `CompiledEntry.previous_tokens`. The off-GC walker visits the same
+    /// live-plus-previous set it already uses for descr pools.
     #[test]
     fn compiled_graph_root_walk_visits_predecessor_target_token_attrs() {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
@@ -30268,6 +30282,52 @@ mod tests {
             vec![0x3000],
             "a predecessor JCT's TargetToken.short_preamble is a root \
              the same way the live token's descr pools are"
+        );
+    }
+
+    /// `history.py JitCellToken.record_jump_to` keeps the JUMP target in
+    /// `_keepalive_jitcell_tokens` after that target's own cell row is
+    /// gone. MiniMark traces those tokens through the jumper; the off-GC
+    /// walker follows `keepalive_tokens` to the same TargetToken attrs.
+    #[test]
+    fn compiled_graph_root_walk_visits_keepalive_target_token_attrs() {
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let kept_tt = crate::history::TargetToken::new_loop(12);
+        let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
+        sp.constants.insert(0, majit_ir::Const::Ref(GcRef(0x4000)));
+        kept_tt.attrs().short_preamble = Some(sp);
+
+        let kept = std::sync::Arc::new(JitCellToken::new(12));
+        kept.set_target_tokens(vec![kept_tt.as_jump_target_descr()]);
+
+        let jumper = std::sync::Arc::new(JitCellToken::new(8));
+        jumper.record_jump_to(kept);
+
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.insert_compiled_loop(
+            8,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&jumper),
+                meta: std::sync::Arc::new(()),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: crate::FxIndexMap::default(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut seen = Vec::new();
+        meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
+        assert_eq!(
+            seen,
+            vec![0x4000],
+            "a JUMP target kept only through keepalive_tokens is a root \
+             the same way a previous_tokens predecessor is"
         );
     }
 

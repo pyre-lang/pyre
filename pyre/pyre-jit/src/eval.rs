@@ -12069,7 +12069,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             exit_layout
                 .storage
                 .as_deref()
-                .map(|s| s.rd_numb().expect("rd_numb").len())
+                .map(|s| s.rd_numb().map_or(0, <[_]>::len))
         );
     }
 
@@ -14546,8 +14546,8 @@ pub(crate) fn decode_and_restore_guard_failure(
             exit_layout
                 .storage
                 .as_deref()
-                .map(|s| s.rd_numb().expect("rd_numb").len())
-                .unwrap_or(0),
+                .and_then(|s| s.rd_numb())
+                .map_or(0, <[_]>::len),
         );
     }
     if majit_metainterp::majit_log_enabled() {
