@@ -199,7 +199,11 @@ def rejects(call):
     raise AssertionError("closed stream answered")
 
 sys.stdout.close()
-assert sys.stdout.buffer.closed and sys.stdout.buffer.raw.closed
+# Unbuffered stdout (`-u` / PYTHONUNBUFFERED) has no BufferedWriter layer:
+# create_stdio keeps the FileIO as TextIOWrapper.buffer, so there is no `.raw`.
+buf = sys.stdout.buffer
+raw = getattr(buf, "raw", buf)
+assert buf.closed and raw.closed
 for call in (lambda: print("lost"), lambda: sys.stdout.write("lost"),
              sys.stdout.flush, sys.stdout.fileno, sys.stdout.writable):
     rejects(call)
