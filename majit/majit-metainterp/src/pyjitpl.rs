@@ -2837,13 +2837,6 @@ pub struct MetaInterp<M: Clone> {
     /// so explicitly. Set by [`register_retrace_merge_point`], consumed once
     /// by the driver.
     pub(crate) keep_tracing_after_close: bool,
-    /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
-    /// even when Phase 2 raises InvalidLoop. Keyed by
-    /// `(jitdriver_sd.index, cell green_key)` like `compiled_loops`; entries
-    /// are added on InvalidLoop and removed when the next retrace succeeds,
-    /// so the active set is bounded by the count of in-flight retraces.
-    pending_preamble_tokens:
-        crate::FxIndexMap<(usize, u64), Vec<std::sync::Arc<crate::history::TargetToken>>>,
     // pyjitpl.py `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs()`.
@@ -4216,7 +4209,6 @@ impl<M: Clone> MetaInterp<M> {
             cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
-            pending_preamble_tokens: crate::FxIndexMap::default(),
             pending_frontend_boxes: None,
             pending_frontend_box_types: None,
             cpu: crate::cpu::default_cpu(),
@@ -8785,12 +8777,6 @@ impl<M: Clone> MetaInterp<M> {
         // its own labels. `ensure_preamble_target_token`
         // (`optimizeopt/unroll.rs`) inserts that one element, so an empty list
         // here is `[start_descr]`, not an absent label.
-        //
-        // The drain stays: reaching this point means a recompile is under way,
-        // so the tokens a previous InvalidLoop attempt parked for this green
-        // key are spent either way.
-        let preamble_key = self.compiled_loop_key(green_key);
-        self.pending_preamble_tokens.swap_remove(&preamble_key);
         let prior_front_target_tokens: Vec<std::sync::Arc<crate::history::TargetToken>> =
             Vec::new();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
@@ -9620,40 +9606,9 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compile_loop InvalidLoop, aborting trace at key={green_key}"),
                     );
                 }
-                // compile.py:288 parity: preserve preamble target_tokens
-                // even on InvalidLoop/panic. The unroller's Phase 1 created
-                // target_tokens that the next retrace needs.
-                // Store in compiled_loops if available, otherwise in
-                // pending_preamble_tokens for the first InvalidLoop before
-                // any successful compilation (RPython: jitcell_token.
-                // target_tokens = [start_descr] before Phase 2 runs).
-                if is_invalid_loop && !unroll_opt.target_tokens.is_empty() {
-                    if let Some(compiled) = self.compiled_entry_mut(green_key) {
-                        if let Some(live) = compiled.live_token()
-                            && !live.has_target_tokens()
-                        {
-                            live.set_target_tokens(
-                                unroll_opt
-                                    .target_tokens
-                                    .iter()
-                                    .map(|target| target.as_jump_target_descr())
-                                    .collect(),
-                            );
-                            if compiled.front_entry_index.is_none() {
-                                compiled.front_entry_index =
-                                    Self::front_entry_index_for(&unroll_opt.target_tokens);
-                            }
-                        }
-                    } else {
-                        let preamble_key = self.compiled_loop_key(green_key);
-                        if !self.pending_preamble_tokens.contains_key(&preamble_key) {
-                            self.pending_preamble_tokens
-                                .entry_or_insert_with(preamble_key, || {
-                                    unroll_opt.target_tokens.clone()
-                                });
-                        }
-                    }
-                }
+                // `compile.py compile_loop` `except InvalidLoop: return None`:
+                // the token this compile minted, and the `[start_descr]` it
+                // was given, are dropped with it.
                 // pyjitpl.py disable_noninlinable_function is only the
                 // ABORT_TOO_LONG arm of blackhole_if_trace_too_long.
                 // compile.py compile_loop InvalidLoop / panic returns None
@@ -10859,16 +10814,8 @@ impl<M: Clone> MetaInterp<M> {
         // installs (`record_jump_to`).
         let prior_front_target_tokens = self
             .compiled_entry(green_key)
-            .map(|compiled| {
-                compiled
-                    .live_token()
-                    .map(|live| crate::history::target_tokens_of(&live))
-                    .unwrap_or_default()
-            })
-            .or_else(|| {
-                let preamble_key = self.compiled_loop_key(green_key);
-                self.pending_preamble_tokens.swap_remove(&preamble_key)
-            })
+            .and_then(|compiled| compiled.live_token())
+            .map(|live| crate::history::target_tokens_of(&live))
             .unwrap_or_default();
         let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
         let retrace_limit = self.warm_state_for_driver(compiling_jd).retrace_limit();
@@ -14492,8 +14439,6 @@ impl<M: Clone> MetaInterp<M> {
     pub fn remove_compiled_loop_on_driver(&mut self, jd_no: usize, green_key: u64) {
         self.note_compiled_loops_changed();
         self.compiled_loops.swap_remove(&(jd_no, green_key));
-        self.pending_preamble_tokens
-            .swap_remove(&(jd_no, green_key));
         self.forget_loop_side_tables(jd_no, green_key);
     }
 
@@ -14514,7 +14459,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Drop the per-loop side tables (`loop_header_greens`,
-    /// `cut_compiled_keys`, `pending_preamble_tokens`) when a loop is retired,
+    /// `cut_compiled_keys`) when a loop is retired,
     /// so they cannot outlive `compiled_loops`. `compiled_key_for_greens`
     /// already skips keys without compiled targets, so a leftover entry could
     /// not mis-target a bridge — but keeping them would grow the maps without
@@ -14529,7 +14474,6 @@ impl<M: Clone> MetaInterp<M> {
         let key = (jd_no, green_key);
         self.loop_header_greens.swap_remove(&key);
         self.cut_compiled_keys.swap_remove(&key);
-        self.pending_preamble_tokens.swap_remove(&key);
     }
 
     /// rpython/rlib/rstack.py `stack_almost_full` — delegates to
@@ -15386,10 +15330,7 @@ impl<M: Clone> MetaInterp<M> {
     /// unrecoverable (null Ref in resume data).
     ///
     /// Bulk form of `remove_compiled_loop`, so it drops the per-loop side
-    /// tables too — see `forget_loop_side_tables`. `pending_preamble_tokens`
-    /// is left alone: it is keyed by `(jitdriver_sd.index, cell green_key)`
-    /// but holds tokens for a recompile that has not happened yet, not for
-    /// the loops being dropped.
+    /// tables too — see `forget_loop_side_tables`.
     pub fn clear_compiled_loops(&mut self) {
         self.note_compiled_loops_changed();
         self.compiled_loops.clear();
@@ -34800,15 +34741,11 @@ mod loop_side_table_tests {
         meta.record_loop_header_greens(green_key, (vec![10], vec![], vec![]));
         let jd0_key = meta.compiled_loop_key(green_key);
         meta.cut_compiled_keys.insert(jd0_key);
-        meta.pending_preamble_tokens
-            .insert(jd0_key, vec![crate::history::TargetToken::new_preamble(10)]);
 
         meta.active_jitdriver_sd = Some(jd1);
         meta.record_loop_header_greens(green_key, (vec![11], vec![], vec![]));
         let jd1_key = meta.compiled_loop_key(green_key);
         meta.cut_compiled_keys.insert(jd1_key);
-        meta.pending_preamble_tokens
-            .insert(jd1_key, vec![crate::history::TargetToken::new_preamble(11)]);
 
         meta.warm_state_for_driver(jd1)
             .memory_manager
@@ -34822,8 +34759,6 @@ mod loop_side_table_tests {
         assert!(meta.loop_header_greens.contains_key(&(jd1, green_key)));
         assert!(meta.cut_compiled_keys.contains(&(jd0, green_key)));
         assert!(meta.cut_compiled_keys.contains(&(jd1, green_key)));
-        assert!(meta.pending_preamble_tokens.contains_key(&(jd0, green_key)));
-        assert!(meta.pending_preamble_tokens.contains_key(&(jd1, green_key)));
 
         let mut jd1_gone = false;
         for _ in 0..8 {
@@ -34846,20 +34781,12 @@ mod loop_side_table_tests {
             "jd1 cut marker must go with the evicted row"
         );
         assert!(
-            !meta.pending_preamble_tokens.contains_key(&(jd1, green_key)),
-            "jd1 preamble must go with the evicted row"
-        );
-        assert!(
             meta.loop_header_greens.contains_key(&(jd0, green_key)),
             "same-key jd0 header greens must stay"
         );
         assert!(
             meta.cut_compiled_keys.contains(&(jd0, green_key)),
             "same-key jd0 cut marker must stay"
-        );
-        assert!(
-            meta.pending_preamble_tokens.contains_key(&(jd0, green_key)),
-            "same-key jd0 preamble must stay"
         );
         let _keep = token;
     }
