@@ -2797,7 +2797,10 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) stats: JitStatsCounters,
     /// Host-supplied virtualizable until `TraceCtx` exists.
     /// `sync_before` / tests call `set_vable_ptr` before tracing starts.
-    pending_vable_ptr: *const u8,
+    /// Lifetime is the portal entry that seeded it (`warmstate.py`
+    /// `maybe_compile_and_run` `*args`): cleared when that door returns
+    /// without an attempt taking it over, and at attempt end.
+    pub(crate) pending_vable_ptr: *const u8,
     /// Virtualizable array lengths for trace-entry box layout.
     pub(crate) vable_array_lengths: Vec<usize>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
@@ -3841,6 +3844,40 @@ impl<M: Clone> MetaInterp<M> {
     /// `consume_virtualref_info` so JIT_VIRTUAL_REF handles decode.
     pub fn virtualref_info(&self) -> &crate::virtualref::VirtualRefInfo {
         &self.staticdata.virtualref_info
+    }
+
+    /// Drop the throwaway `MetaInterp` `compile_and_run_once` built.
+    ///
+    /// pyre reuses one MetaInterp. A walk that returns without compiling or
+    /// aborting would leave `tracing` / MIFrame `ref_regs` ConstPtrs as extra
+    /// roots after the portal frame that started the attempt is gone. Take the
+    /// leftover History without `aborted_tracing` (the destructor does not
+    /// count an abort) and re-run the constructor half [`Self::begin_attempt`]
+    /// so the next `bound_reached` sees the same empty attempt fields a fresh
+    /// MetaInterp would.
+    ///
+    /// `JC_TRACING` is cleared by [`JitDriver::abort_entry_tracing`] on the
+    /// entering driver's `WarmEnterState`, not here.
+    pub fn discard_unfinished_compile_and_run_once(&mut self, _starting_tracing_key: u64) {
+        let _ = self.tracing.take();
+        let _ = self.compile_tracing.take();
+        self.clear_trace_session();
+        self.begin_attempt();
+        // `set_vable_ptr` is seeded before tracing starts (`sync_before`),
+        // so `begin_attempt` (`MetaInterp.__init__`) must not drop it.
+        // After the attempt the portal frame is gone; keep the leftover
+        // out of `walk_active_trace_refs`.
+        self.drop_leftover_active_trace_roots();
+    }
+
+    /// Slots `walk_active_trace_refs` still visits after History is gone.
+    /// A throwaway MetaInterp (`warmstate.py bound_reached` /
+    /// `compile.py _trace_and_compile_from_bridge`) drops them with the
+    /// object; the reused one has to empty them at every attempt end.
+    fn drop_leftover_active_trace_roots(&mut self) {
+        self.framestack = crate::pyjitpl::MIFrameStack::empty();
+        self.pending_vable_ptr = std::ptr::null();
+        self.vable_array_lengths.clear();
     }
 
     /// framework.py `root_walker.walk_roots` parity for the JIT-side
@@ -7476,6 +7513,24 @@ impl<M: Clone> MetaInterp<M> {
         // loop-token bit after this reset, matching `__init__(...,
         // force_finish_trace=...)`.
         self.force_finish_trace = false;
+        // Per-attempt extra-root slots `MetaInterp::new` leaves empty.
+        // `walk_active_trace_refs` visits them independently of `tracing`,
+        // so a reused MetaInterp that returns from `compile_and_run_once`
+        // would otherwise keep the last walk's boxes alive after the
+        // portal frame is gone.
+        self.single_pass_outcome = None;
+        self.single_pass_finish = false;
+        self.single_pass_finish_values = None;
+        self.back_edge_finish = None;
+        self.back_edge_finish_word = None;
+        self.raw_int_fallback = None;
+        self.single_pass_scalar_values = None;
+        self.single_pass_ref_scalar_values = None;
+        self.single_pass_virt_array_values = None;
+        self.single_pass_compact_label_values = None;
+        self.single_pass_full_live_values = None;
+        self.single_pass_compiled_key = None;
+        self.pending_token = None;
     }
 
     /// Install `ctx` before `initialize_virtualizable` or the trace
@@ -12721,6 +12776,7 @@ impl<M: Clone> MetaInterp<M> {
             self.clear_trace_session();
         }
         self.clear_trace_session();
+        self.drop_leftover_active_trace_roots();
     }
 
     /// Drop a trace which the frontend declined before it became a traced
@@ -12743,6 +12799,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         self.clear_pending_abort();
         self.clear_trace_session();
+        self.drop_leftover_active_trace_roots();
     }
 
     /// Drop the `pending_abort_*` payload staged by live trace teardown.
@@ -15467,9 +15524,18 @@ impl<M: Clone> MetaInterp<M> {
     /// (RPython's `LoopToken.__del__` analog).
     /// `memmgr.py` `release_all_loops` via `jit_hooks.stats_memmgr_release_all`
     /// on the one `warmrunnerdesc.memory_manager`, which every
-    /// `jitdriver_sd.warmstate` shares.
+    /// `jitdriver_sd.warmstate` shares, plus the crate-split
+    /// `compiled_loops` retirement `try_to_free_some_loops` already does
+    /// after `_kill_old_loops_now`.
+    ///
+    /// `pypyjit.releaseall` can run during tracing. Upstream only
+    /// clears `alive_loops`; leftover History / MIFrame / vable slots
+    /// belong to `warmstate.py bound_reached` dropping the throwaway
+    /// MetaInterp, which pyre runs as
+    /// [`Self::discard_unfinished_compile_and_run_once`].
     pub fn release_all_driver_loops(&mut self) {
-        self.memory_manager.release_all_loops();
+        let evicted = self.memory_manager.release_all_loops();
+        self.retire_evicted_loop_tokens(evicted);
     }
 
     pub fn try_to_free_some_loops(&mut self) {
@@ -15477,6 +15543,13 @@ impl<M: Clone> MetaInterp<M> {
         // `self.staticdata.warmrunnerdesc.memory_manager.next_generation()`,
         // once, on the runner's one manager.
         let evicted = self.memory_manager.next_generation();
+        self.retire_evicted_loop_tokens(evicted);
+    }
+
+    /// Drop `compiled_loops` metadata whose token just left
+    /// `alive_loops`, matching by token-object identity as
+    /// `try_to_free_some_loops` does after `next_generation`.
+    fn retire_evicted_loop_tokens(&mut self, evicted: Vec<std::sync::Arc<JitCellToken>>) {
         for token in evicted {
             // Counters move in `CompiledLoopToken::drop`
             // (`model.py` `CompiledLoopToken.__del__`). This loop only
@@ -26382,6 +26455,7 @@ mod metainterp_static_data_tests {
         meta.call_ids = vec![1, 2];
         meta.last_exc_value = 0xabc;
         meta.forced_virtualizable = 0xdef;
+        meta.single_pass_ref_scalar_values = Some(vec![0x111, 0x222]);
         meta.ovf_flag = true;
         meta.trace_length_at_last_tco = 12;
         let leftover = std::sync::Arc::new(JitCodeBuilder::new().finish());
@@ -26404,6 +26478,7 @@ mod metainterp_static_data_tests {
                 .as_ref()
                 .is_some_and(|p| p.is_empty())
         );
+        assert!(meta.single_pass_ref_scalar_values.is_none());
         // Long-lived owner: the same WarmEnterState instance remains.
         assert_eq!(meta.warm_state_for_driver(0).threshold(), 10);
     }
@@ -36948,6 +37023,117 @@ mod loop_side_table_tests {
             .memory_manager
             .release_all_loops();
         assert_ne!(meta.runnable_generation(), before_release);
+    }
+
+    #[test]
+    fn release_all_loops_retires_compiled_loops_like_eviction() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let token = std::sync::Arc::new(JitCellToken::new(1));
+        token.set_compiled(Box::new(()));
+        token.green_key.set(7);
+        meta.memory_manager.keep_loop_alive(&token);
+        let mut entry = compiled_entry(100);
+        entry.token = std::sync::Arc::downgrade(&token);
+        meta.insert_compiled_loop(7, entry);
+        meta.record_loop_header_pc(7, 7);
+        drop(token);
+
+        assert_eq!(meta.compiled_loops.len(), 1);
+        meta.release_all_driver_loops();
+        assert!(
+            meta.compiled_loops.is_empty(),
+            "current-token eviction drops the compiled_loops entry"
+        );
+        assert!(meta.loop_header_pc_for(7).is_none());
+    }
+
+    #[test]
+    fn release_all_loops_drops_previous_tokens_only_when_current_stays() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let current = std::sync::Arc::new(JitCellToken::new(1));
+        current.set_compiled(Box::new(()));
+        current.green_key.set(7);
+        let previous = std::sync::Arc::new(JitCellToken::new(2));
+        previous.set_compiled(Box::new(()));
+        previous.green_key.set(7);
+        meta.memory_manager.keep_loop_alive(&previous);
+        let mut entry = compiled_entry(100);
+        entry.token = std::sync::Arc::downgrade(&current);
+        entry
+            .previous_tokens
+            .push(std::sync::Arc::downgrade(&previous));
+        meta.insert_compiled_loop(7, entry);
+        drop(previous);
+
+        meta.release_all_driver_loops();
+        let entry = meta
+            .compiled_loops
+            .get(&(0, 7))
+            .expect("current token was not in alive_loops");
+        assert!(entry.previous_tokens.is_empty());
+        assert!(entry.token.upgrade().is_some());
+    }
+
+    /// `walk_active_trace_refs` visits leftover MIFrame ConstPtrs and
+    /// `pending_vable_ptr` independently of `tracing`. A throwaway
+    /// MetaInterp (`warmstate.py` `bound_reached`) drops them with the
+    /// object; pyre's reused MetaInterp empties them at attempt end.
+    #[test]
+    fn discard_unfinished_compile_and_run_once_drops_leftover_active_trace_roots() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.pending_vable_ptr = 0xBEEF as *const u8;
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        b.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
+        frame.ref_regs[0] = Some(majit_ir::OpRef::const_ptr(GcRef(0xAAAA)));
+        frame.ref_values[0] = Some(0xAAAA);
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        let mut before = 0usize;
+        meta.walk_active_trace_refs(|_| before += 1);
+        assert!(
+            before >= 2,
+            "pending_vable_ptr and the MIFrame ConstPtr are extra roots"
+        );
+
+        meta.discard_unfinished_compile_and_run_once(0);
+
+        let mut after = 0usize;
+        meta.walk_active_trace_refs(|_| after += 1);
+        assert_eq!(
+            after, 0,
+            "attempt end drops leftover walk_active_trace_refs slots"
+        );
+        assert!(meta.pending_vable_ptr.is_null());
+        assert_eq!(meta.framestack.len(), 0);
+    }
+
+    /// `memmgr.py release_all_loops` / `interp_jit.py releaseall` only
+    /// clear `alive_loops`. An in-progress `compile_and_run_once` keeps
+    /// its History and MIFrame.
+    #[test]
+    fn release_all_loops_leaves_in_progress_trace_intact() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.tracing = Some(Box::new(crate::trace_ctx::TraceCtx::for_test(1)));
+        meta.pending_vable_ptr = 0xBEEF as *const u8;
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        b.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
+        frame.ref_regs[0] = Some(majit_ir::OpRef::const_ptr(GcRef(0xAAAA)));
+        frame.ref_values[0] = Some(0xAAAA);
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        meta.release_all_driver_loops();
+
+        assert!(meta.tracing.is_some(), "releaseall leaves History");
+        assert_eq!(meta.framestack.len(), 1);
+        assert_eq!(meta.pending_vable_ptr, 0xBEEF as *const u8);
+        let mut after = 0usize;
+        meta.walk_active_trace_refs(|_| after += 1);
+        assert!(
+            after >= 2,
+            "in-progress MIFrame ConstPtr and pending_vable_ptr stay rooted"
+        );
     }
 
     #[test]

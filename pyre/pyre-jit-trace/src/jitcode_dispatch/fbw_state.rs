@@ -634,18 +634,35 @@ pub struct ParkedWalkTls {
     finish_is_exception: bool,
     finish_concrete: Option<FinishConcrete>,
     foriter_inflight_pending: Option<(usize, usize)>,
+    // Nested `compile_and_run_once` (`warmstate.py bound_reached` builds a
+    // fresh MetaInterp). The inner `discard_escape_flush_undo` /
+    // `reset_unflushed_escaped_callee` start that attempt clean; these
+    // three hold the outer capture until `restore_walk_tls`.
+    escape_flush_undo: Option<super::EscapeFlushUndo>,
+    escape_flush_undo_pending: bool,
+    unflushed_escaped_callee: usize,
 }
 
 thread_local! {
     /// Outer-walk journals stacked while a nested `compile_and_run_once` runs.
     /// `park_walk_tls` moves refs out of the registered FBW_* root areas, so
     /// this stack is the collector-visible owner until `restore_walk_tls`.
+    /// The extra area captures this cell's address at registration so a
+    /// collecting thread walks the owner's parked entries, not its own TLS.
     static PARKED_WALK_TLS_STACK: std::cell::RefCell<Vec<ParkedWalkTls>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Take the current walk's journals so a nested trace starts clean.
-/// `fbw_store_journal_reset` would otherwise clear the outer attempt.
+/// Address of this mutator's parked-journal stack, captured into the extra
+/// area at registration so a collecting thread walks the owner.
+pub(crate) fn parked_walk_tls_stack_cell_ptr() -> *const std::cell::RefCell<Vec<ParkedWalkTls>> {
+    PARKED_WALK_TLS_STACK.with(|s| s as *const _)
+}
+
+/// Take the current walk's journals and escape-flush undo so a nested
+/// trace starts clean. `fbw_store_journal_reset` / `discard_escape_flush_undo`
+/// would otherwise clear the outer attempt (`warmstate.py bound_reached`
+/// builds a fresh MetaInterp).
 pub fn park_walk_tls() {
     let parked = ParkedWalkTls {
         store_journal: super::FBW_STORE_JOURNAL.with(|j| std::mem::take(&mut *j.borrow_mut())),
@@ -693,11 +710,14 @@ pub fn park_walk_tls() {
         finish_is_exception: FBW_FINISH_IS_EXCEPTION.with(|c| c.replace(false)),
         finish_concrete: FBW_FINISH_CONCRETE.with(|c| c.take()),
         foriter_inflight_pending: FORITER_INFLIGHT_PENDING.with(|c| c.take()),
+        escape_flush_undo: super::ESCAPE_FLUSH_UNDO.with(|c| c.borrow_mut().take()),
+        escape_flush_undo_pending: super::ESCAPE_FLUSH_UNDO_PENDING.with(|c| c.replace(false)),
+        unflushed_escaped_callee: super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.replace(0)),
     };
     PARKED_WALK_TLS_STACK.with(|s| s.borrow_mut().push(parked));
 }
 
-/// Put the outer attempt's journals back after the nested run.
+/// Put the outer attempt's journals and escape-flush undo back after the nested run.
 pub fn restore_walk_tls() {
     let Some(parked) = PARKED_WALK_TLS_STACK.with(|s| s.borrow_mut().pop()) else {
         return;
@@ -737,6 +757,9 @@ pub fn restore_walk_tls() {
     FBW_FINISH_IS_EXCEPTION.with(|c| c.set(parked.finish_is_exception));
     FBW_FINISH_CONCRETE.with(|c| c.set(parked.finish_concrete));
     FORITER_INFLIGHT_PENDING.with(|c| c.set(parked.foriter_inflight_pending));
+    super::ESCAPE_FLUSH_UNDO.with(|c| *c.borrow_mut() = parked.escape_flush_undo);
+    super::ESCAPE_FLUSH_UNDO_PENDING.with(|c| c.set(parked.escape_flush_undo_pending));
+    super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(parked.unflushed_escaped_callee));
 }
 
 fn visit_pyobject_ref(
@@ -747,14 +770,6 @@ fn visit_pyobject_ref(
         return;
     }
     visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-}
-
-fn visit_opref_const_ptr(op: &mut OpRef, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    if let OpRef::ConstPtr(index) = *op {
-        // `history.py` `ConstPtr.value` lives in `const_ptr_table`, not in the
-        // `OpRef` word (`ConstPtr` is a table index).
-        majit_ir::const_ptr_table::trace_index(index, visitor);
-    }
 }
 
 fn walk_parked_abort_resume(
@@ -779,103 +794,161 @@ fn walk_parked_abort_resume(
 }
 
 /// Forward refs in parked outer-walk journals while a nested trace runs.
-pub(crate) fn walk_parked_walk_tls_stack(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    PARKED_WALK_TLS_STACK.with(|stack| {
-        for parked in stack.borrow_mut().iter_mut() {
-            for triple in &mut parked.store_journal {
-                for slot in triple {
-                    visit_pyobject_ref(slot, visitor);
+///
+/// `parked_stack` is the owner's cell captured into the extra area at
+/// registration. Resolving TLS on the collecting thread would miss a
+/// quiesced mutator's parked journals (`rthread.py` `_trace_tlref`).
+pub(crate) fn walk_parked_walk_tls_stack(
+    parked_stack: *const std::cell::RefCell<Vec<ParkedWalkTls>>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    // SAFETY: the owner is either synchronously collecting or STW-quiesced;
+    // the pointer is the one published in `FbwStoreJournalRootArea`.
+    let parked_cell = unsafe { &*parked_stack };
+    let stack = unsafe { &mut *parked_cell.as_ptr() };
+    for parked in stack.iter_mut() {
+        for triple in &mut parked.store_journal {
+            for slot in triple {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+        for effect in &mut parked.list_effect_journal {
+            match effect {
+                super::FbwListEffect::Append { list, .. } => {
+                    visit_pyobject_ref(list, visitor);
                 }
-            }
-            for effect in &mut parked.list_effect_journal {
-                match effect {
-                    super::FbwListEffect::Append { list, .. } => {
-                        visit_pyobject_ref(list, visitor);
-                    }
-                    super::FbwListEffect::PopEnd { list, w_item, .. } => {
-                        visit_pyobject_ref(list, visitor);
-                        visit_pyobject_ref(w_item, visitor);
-                    }
-                }
-            }
-            for list in &mut parked.append_promote_journal {
-                visit_pyobject_ref(list, visitor);
-            }
-            for entry in &mut parked.cell_store_journal {
-                match entry {
-                    super::FbwCellStore::Int { cell, .. } => visit_pyobject_ref(cell, visitor),
-                    super::FbwCellStore::Obj { cell, before } => {
-                        visit_pyobject_ref(cell, visitor);
-                        visit_pyobject_ref(before, visitor);
-                    }
-                    super::FbwCellStore::Gc {
-                        obj,
-                        before,
-                        managed,
-                        ..
-                    } => {
-                        if *managed {
-                            visit_pyobject_ref(obj, visitor);
-                        }
-                        if let majit_ir::Value::Ref(before) = before
-                            && before.0 != 0
-                        {
-                            visitor(before);
-                        }
-                    }
-                }
-            }
-            for entry in &mut parked.namespace_store_journal {
-                visit_pyobject_ref(&mut entry.namespace, visitor);
-                visit_pyobject_ref(&mut entry.name, visitor);
-                visit_pyobject_ref(&mut entry.displaced, visitor);
-            }
-            for displaced in &mut parked.sys_exc_journal {
-                visit_pyobject_ref(displaced, visitor);
-            }
-            for (exception, node) in &mut parked.traceback_store_journal {
-                visit_pyobject_ref(exception, visitor);
-                visit_pyobject_ref(node, visitor);
-            }
-            for entry in &mut parked.foriter_inflight {
-                visit_pyobject_ref(&mut entry.item, visitor);
-            }
-            for entry in &mut parked.bridge_iter_journal {
-                match entry {
-                    super::BridgeIterJournalEntry::Range { iter, .. } => {
-                        visit_pyobject_ref(iter, visitor);
-                    }
-                    super::BridgeIterJournalEntry::Cursor { iter, pre_seq, .. } => {
-                        visit_pyobject_ref(iter, visitor);
-                        visit_pyobject_ref(pre_seq, visitor);
-                    }
-                }
-            }
-            if let Some(carrier) = parked.abort_call_resume.as_mut() {
-                walk_parked_abort_resume(carrier, visitor);
-            }
-            for (op, prev) in &mut parked.exc_prev {
-                visit_opref_const_ptr(op, visitor);
-                visit_pyobject_ref(prev, visitor);
-            }
-            for entry in &mut parked.locals_mirror_undo {
-                for slot in &mut entry.slots {
-                    visit_pyobject_ref(slot, visitor);
-                }
-            }
-            if let Some(store) = parked.generator_yield_tos.as_mut() {
-                visit_opref_const_ptr(&mut store.value, visitor);
-            }
-            if let Some(finish) = parked.finish_concrete.as_mut() {
-                let value = match finish {
-                    FinishConcrete::Return(value) | FinishConcrete::Raise(value) => value,
-                };
-                if let ConcreteValue::Ref(ptr) = value {
-                    visit_pyobject_ref(ptr, visitor);
+                super::FbwListEffect::PopEnd { list, w_item, .. } => {
+                    visit_pyobject_ref(list, visitor);
+                    visit_pyobject_ref(w_item, visitor);
                 }
             }
         }
-    });
+        for list in &mut parked.append_promote_journal {
+            visit_pyobject_ref(list, visitor);
+        }
+        for entry in &mut parked.cell_store_journal {
+            match entry {
+                super::FbwCellStore::Int { cell, .. } => visit_pyobject_ref(cell, visitor),
+                super::FbwCellStore::Obj { cell, before } => {
+                    visit_pyobject_ref(cell, visitor);
+                    visit_pyobject_ref(before, visitor);
+                }
+                super::FbwCellStore::Gc {
+                    obj,
+                    before,
+                    managed,
+                    ..
+                } => {
+                    if *managed {
+                        visit_pyobject_ref(obj, visitor);
+                    }
+                    if let Value::Ref(before) = before
+                        && before.0 != 0
+                    {
+                        visitor(before);
+                    }
+                }
+            }
+        }
+        for entry in &mut parked.namespace_store_journal {
+            visit_pyobject_ref(&mut entry.namespace, visitor);
+            visit_pyobject_ref(&mut entry.name, visitor);
+            visit_pyobject_ref(&mut entry.displaced, visitor);
+        }
+        for displaced in &mut parked.sys_exc_journal {
+            visit_pyobject_ref(displaced, visitor);
+        }
+        for (exception, node) in &mut parked.traceback_store_journal {
+            visit_pyobject_ref(exception, visitor);
+            visit_pyobject_ref(node, visitor);
+        }
+        for entry in &mut parked.foriter_inflight {
+            visit_pyobject_ref(&mut entry.item, visitor);
+        }
+        for entry in &mut parked.bridge_iter_journal {
+            match entry {
+                super::BridgeIterJournalEntry::Range { iter, .. } => {
+                    visit_pyobject_ref(iter, visitor);
+                }
+                super::BridgeIterJournalEntry::Cursor { iter, pre_seq, .. } => {
+                    visit_pyobject_ref(iter, visitor);
+                    visit_pyobject_ref(pre_seq, visitor);
+                }
+            }
+        }
+        if let Some(carrier) = parked.abort_call_resume.as_mut() {
+            walk_parked_abort_resume(carrier, visitor);
+        }
+        for (op, prev) in &mut parked.exc_prev {
+            op.trace_const_ptr(visitor);
+            visit_pyobject_ref(prev, visitor);
+        }
+        for entry in &mut parked.locals_mirror_undo {
+            for slot in &mut entry.slots {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+        if let Some(store) = parked.generator_yield_tos.as_mut() {
+            store.value.trace_const_ptr(visitor);
+        }
+        if let Some(finish) = parked.finish_concrete.as_mut() {
+            let value = match finish {
+                FinishConcrete::Return(value) | FinishConcrete::Raise(value) => value,
+            };
+            if let ConcreteValue::Ref(ptr) = value {
+                visit_pyobject_ref(ptr, visitor);
+            }
+        }
+        if let Some(undo) = parked.escape_flush_undo.as_mut() {
+            for slot in &mut undo.slots {
+                visit_pyobject_ref(slot, visitor);
+            }
+            for slot in &mut undo.flush_image {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod parked_walk_tls_root_tests {
+    use super::*;
+
+    #[test]
+    fn fbw_store_journal_root_area_forwards_a_quiesced_foreign_mutator() {
+        let (area_tx, area_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let parked = 0xBEEF_usize as pyre_object::PyObjectRef;
+            let live = 0xF00D_usize as pyre_object::PyObjectRef;
+            fbw_store_journal_root(parked, std::ptr::null_mut(), std::ptr::null_mut());
+            park_walk_tls();
+            fbw_store_journal_root(live, std::ptr::null_mut(), std::ptr::null_mut());
+            area_tx
+                .send((
+                    capture_fbw_store_journal_root_area() as usize,
+                    live as usize,
+                    parked as usize,
+                ))
+                .unwrap();
+            resume_rx.recv().unwrap();
+            restore_walk_tls();
+            fbw_store_journal_reset();
+        });
+
+        let (area, live, parked) = area_rx.recv().unwrap();
+        let mut seen = Vec::new();
+        unsafe {
+            super::super::fbw_store_journal_root_walker_area(area as *const (), &mut |root| {
+                if root.as_usize() != 0 {
+                    seen.push(root.as_usize());
+                }
+            });
+        }
+        resume_tx.send(()).unwrap();
+        assert_eq!(seen, vec![live, parked]);
+        owner.join().unwrap();
+    }
 }
 
 /// The address a journalled frame lives at NOW.

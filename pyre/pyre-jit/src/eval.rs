@@ -20,6 +20,7 @@ use pyre_interpreter::{locals_w, locals_w_mut};
 use pyre_object::gc_roots;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use majit_backend::Backend;
@@ -7496,9 +7497,16 @@ fn apply_jit_param_string(
 #[majit_macros::dont_look_inside]
 pub fn releaseall(_space: pyre_object::PyObjectRef) {
     let _ = _space;
-    let (driver, _) = driver_pair();
-    // memmgr.py release_all_loops parity.
-    driver.mark_all_loops_for_release();
+    release_all_loops_via_driver();
+}
+
+/// interp_jit.py `releaseall` → jit_hooks.stats_memmgr_release_all →
+/// memmgr.py `release_all_loops`. A call before the driver exists is a
+/// no-op (`existing_driver_pair`).
+fn release_all_loops_via_driver() {
+    if let Some((driver, _)) = existing_driver_pair() {
+        driver.mark_all_loops_for_release();
+    }
 }
 
 fn init_callbacks() {
@@ -10822,8 +10830,8 @@ pub(crate) fn continue_entered_frame(frame: &mut PyFrame) -> PyResult {
     }
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
-        let err_slot = match &outer_result {
-            Err(err) => Some(err.pin_gc_refs(&roots)),
+        let err_slot = match &mut outer_result {
+            Err(err) => Some(err.pin(&roots)),
             Ok(_) => None,
         };
         let left = unsafe {
@@ -10834,7 +10842,7 @@ pub(crate) fn continue_entered_frame(frame: &mut PyFrame) -> PyResult {
             )
         };
         if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
-            err.reload_gc_refs(&roots, base);
+            err.reload(&roots, base);
         }
         left
     };
@@ -12581,16 +12589,28 @@ enum CompileOnceStart {
 }
 
 /// `warmstate.py` `bound_reached` constructs a fresh `MetaInterp` per
-/// attempt. pyre reuses one driver object; this guard parks the outer
-/// attempt's per-trace fields so the inner run cannot disturb them.
-struct NestedTraceGuard {
+/// attempt; the outer MetaInterp stays another object on the stack.
+/// pyre reuses one driver, so this guard parks the outer attempt on that
+/// object and restores through the same `&mut JitDriver` the nested
+/// `compile_and_run_once` already holds.
+struct NestedTraceGuard<'a> {
+    driver: &'a mut JitDriver<PyreJitState>,
     parked: bool,
+    /// `warmstate.py bound_reached` `finally: cell.flags &= ~JC_TRACING`
+    /// plus dropping the throwaway MetaInterp. Armed once this attempt
+    /// has started tracing so every exit (compile, abort, exception,
+    /// unfinished walk) reaches `close_bound_reached_attempt`.
+    close_key: Option<u64>,
 }
 
-impl NestedTraceGuard {
-    fn enter(driver: &mut JitDriver<PyreJitState>) -> Self {
+impl<'a> NestedTraceGuard<'a> {
+    fn enter(driver: &'a mut JitDriver<PyreJitState>) -> Self {
         if !driver.is_tracing() {
-            return Self { parked: false };
+            return Self {
+                driver,
+                parked: false,
+                close_key: None,
+            };
         }
         // `warmstate.py bound_reached` builds a fresh MetaInterp that reads
         // the interpreter's real virtualizable. The outer walk's locals live
@@ -12605,17 +12625,40 @@ impl NestedTraceGuard {
         pyre_jit_trace::jitcode_dispatch::park_walk_tls();
         pyre_jit_trace::trace::park_walk_end();
         driver.park_nested_trace();
-        Self { parked: true }
+        Self {
+            driver,
+            parked: true,
+            close_key: None,
+        }
+    }
+
+    fn arm_close_on_drop(&mut self, starting_tracing_key: u64) {
+        self.close_key = Some(starting_tracing_key);
     }
 }
 
-impl Drop for NestedTraceGuard {
+impl Deref for NestedTraceGuard<'_> {
+    type Target = JitDriver<PyreJitState>;
+    fn deref(&self) -> &Self::Target {
+        self.driver
+    }
+}
+
+impl DerefMut for NestedTraceGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.driver
+    }
+}
+
+impl Drop for NestedTraceGuard<'_> {
     fn drop(&mut self) {
+        if let Some(key) = self.close_key.take() {
+            self.driver.close_bound_reached_attempt(key);
+        }
         if !self.parked {
             return;
         }
-        let (driver, _) = driver_pair();
-        driver.restore_nested_trace();
+        self.driver.restore_nested_trace();
         pyre_jit_trace::trace::restore_walk_end();
         pyre_jit_trace::jitcode_dispatch::restore_walk_tls();
     }
@@ -12640,7 +12683,7 @@ fn compile_and_run_once(
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
-    let _nested = NestedTraceGuard::enter(driver);
+    let mut driver = NestedTraceGuard::enter(driver);
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     majit_metainterp::mc_diag_bump(match start {
@@ -12708,6 +12751,7 @@ fn compile_and_run_once(
     }
 
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+    driver.arm_close_on_drop(starting_tracing_key);
     let mut propagated_exception = None;
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
@@ -12833,9 +12877,6 @@ fn compile_and_run_once(
         );
     }
     if tracing_finished {
-        // warmstate.py `finally`: the starting cell owns JC_TRACING
-        // even when a cross-loop cut attaches the token to another key.
-        driver.abort_entry_tracing(starting_tracing_key);
         // compile.py record_loop_or_bridge: register every compiled
         // loop/bridge's quasi_immutable_deps against its token. The
         // `!had_compiled` extra gate dropped deps on a replace compile,

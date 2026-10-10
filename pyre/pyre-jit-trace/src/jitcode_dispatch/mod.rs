@@ -8986,6 +8986,7 @@ struct FbwStoreJournalRootArea {
     locals_mirror_undo: *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
     multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
+    parked_stack: *const std::cell::RefCell<Vec<fbw_state::ParkedWalkTls>>,
 }
 
 thread_local! {
@@ -9004,6 +9005,7 @@ thread_local! {
         locals_mirror_undo: locals_mirror_undo_cell_ptr(),
         single_frame_blackhole: single_frame_blackhole_cell_ptr(),
         multi_frame_blackhole: multi_frame_blackhole_cell_ptr(),
+        parked_stack: fbw_state::parked_walk_tls_stack_cell_ptr(),
     };
 }
 
@@ -9534,7 +9536,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             }
         }
     }
-    fbw_state::walk_parked_walk_tls_stack(visitor);
+    fbw_state::walk_parked_walk_tls_stack(area.parked_stack, visitor);
 }
 
 /// #73: classification of a Python opcode's effect on the walk-level

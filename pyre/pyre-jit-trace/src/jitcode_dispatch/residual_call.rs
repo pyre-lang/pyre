@@ -245,7 +245,13 @@ thread_local! {
     /// `locals_cells_stack_w`, and every value the compiled trace was holding
     /// in a register for it stays absent.  A blackhole level resumed on such a
     /// frame reads those slots as Python NULL.
-    static UNFLUSHED_ESCAPED_CALLEE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    ///
+    /// Nested `compile_and_run_once` parks this with the outer walk
+    /// (`park_walk_tls` / `ParkedWalkTls`); `warmstate.py bound_reached`
+    /// starts each attempt as a fresh MetaInterp, so the inner
+    /// `reset_unflushed_escaped_callee` must not drop the outer record.
+    pub(crate) static UNFLUSHED_ESCAPED_CALLEE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
     /// post-call commit withdrawal can put the live frame back.  The legacy
     /// replay's correctness contract is "the live frame still holds pre-walk
@@ -253,12 +259,17 @@ thread_local! {
     /// this before re-entering.  Which leg runs is only known at walk end, so
     /// the withdrawal arms `ESCAPE_FLUSH_UNDO_PENDING` and the epilogue
     /// decides.
-    static ESCAPE_FLUSH_UNDO: std::cell::RefCell<Option<EscapeFlushUndo>> =
+    ///
+    /// Nested `compile_and_run_once` parks the armed capture on
+    /// `ParkedWalkTls`; the inner walk's `discard_escape_flush_undo` then
+    /// starts from an empty slot.
+    pub(crate) static ESCAPE_FLUSH_UNDO: std::cell::RefCell<Option<EscapeFlushUndo>> =
         const { std::cell::RefCell::new(None) };
     /// Set when the force arm withdrew its commit: the pre-flush frame has to
     /// come back, but only on the legacy-replay leg (see
-    /// `mark_escape_flush_undo_pending`).
-    static ESCAPE_FLUSH_UNDO_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `mark_escape_flush_undo_pending`).  Parked with the capture above.
+    pub(crate) static ESCAPE_FLUSH_UNDO_PENDING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// Opcode-scoped purity window: `(py_pc, every_prior_residual_reentrant)`
     /// for the Python opcode currently being walked.  Re-executing a committed
     /// escape re-runs the WHOLE opcode, so the latch gate must know whether any
@@ -316,14 +327,14 @@ pub(crate) fn current_inline_concrete_frame() -> usize {
 }
 
 pub(crate) struct EscapeFlushUndo {
-    frame: usize,
+    pub(crate) frame: usize,
     /// Owner-root for `frame`. A minor collection forwards the nursery
     /// object and then poisons the old address, so a later
     /// `gc_current_object_address` on the captured word cannot find it.
     /// [`Self::current_frame`] re-reads the slot the collector updates.
-    frame_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
-    last_instr: isize,
-    valuestackdepth: usize,
+    pub(crate) frame_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    pub(crate) last_instr: isize,
+    pub(crate) valuestackdepth: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
     /// The region as the flush left it.  The restore compares against this to
     /// tell a slot the flush wrote from one the residual's user Python wrote
@@ -5223,15 +5234,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     };
     // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL: "The values in
     // the virtualizable are always correct during tracing." RPython keeps
-    // that true because `_opimpl_setarrayitem_vable` calls
-    // `synchronize_virtualizable` onto the real object. pyre traces a
+    // that true because `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable`
+    // call `synchronize_virtualizable` onto the real object (`write_boxes`:
+    // every static, then every array item). pyre traces a
     // `snapshot_for_tracing` copy and `synchronize_virtualizable` writes
     // that copy (`virtualizable_heap_ptr`), so a residual that runs Python
     // — and, with nested tracing, `bound_reached` / `compile_and_run_once`
     // for another green key — would `extract_live` from the interpreter
-    // frame and see the pre-walk locals. Write the boxes onto the live
-    // frame at the same moment `vable_and_vrefs_before_residual_call`
-    // arms the token.
+    // frame and see pre-walk statics (`last_instr`, `valuestackdepth`) and
+    // any array slot the walk had not already mirrored. Write the boxes
+    // onto the live frame at the same moment
+    // `vable_and_vrefs_before_residual_call` arms the token.
     flush_live_virtualizable_before_residual_call(ctx, live_frame_root.current(live_frame));
     // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
     // the outer walk's mirror and a sub-walk never advances it.
@@ -6431,32 +6444,58 @@ pub(crate) fn do_not_in_trace_call_result<Sym: WalkSym>(
 /// may run Python, or before a nested `compile_and_run_once`.
 ///
 /// `virtualizable.py force_now` on `TOKEN_TRACING_RESCALL` assumes the
-/// real object already holds the boxes (`synchronize_virtualizable` after
-/// every `_opimpl_setarrayitem_vable`). pyre's walker steps a
+/// real object already holds the boxes (`synchronize_virtualizable` /
+/// `write_boxes` after every `_opimpl_setfield_vable` /
+/// `_opimpl_setarrayitem_vable`). pyre's walker steps a
 /// `snapshot_for_tracing` copy and points `virtualizable_heap_ptr` at that
 /// copy, so the live interpreter frame lags until this write.
+///
+/// Root `setfield_vable` does not store `last_instr` / `valuestackdepth`
+/// onto the live frame (`store_live_frame_static_int` follows
+/// `current_inline_vable_target` only). Array items are mirrored on each
+/// `setarrayitem_vable` (`own_frame_array_store_target`); this write still
+/// covers every array item `0..len(lst)` (`write_boxes`) so a slot that
+/// lived only in the boxes — including above `valuestackdepth` — is not
+/// left behind. [`LiveLastInstrGuard`] then overwrites `last_instr` with
+/// the executing pc for the residual's duration.
 pub fn flush_live_virtualizable_before_nested_trace(ctx: &TraceCtx) {
     let Some(frame) = ctx.standard_virtualizable_ptr() else {
         return;
     };
-    flush_known_locals_to_live_frame(ctx, frame);
+    flush_live_virtualizable_to_frame(ctx, frame);
 }
 
-fn flush_known_locals_to_live_frame(ctx: &TraceCtx, frame: usize) {
+fn flush_live_virtualizable_to_frame(ctx: &TraceCtx, frame: usize) {
     if frame == 0 {
         return;
     }
+    // `fbw_note_last_instr_undo` is first-write-wins and is already armed
+    // at walk start (`trace_bytecode`); noting again is a no-op that keeps
+    // the pre-walk coordinate the non-commit epilogue restores.
+    fbw_note_last_instr_undo(frame);
+    fbw_note_frame_vsd_undo(frame);
+    // Locals undo stays the `nlocals` prefix. `write_boxes` also writes
+    // cells and the whole value stack (`0..len(lst)`), including slots
+    // above `valuestackdepth`. Those stack slots are already written by
+    // `setarrayitem_vable` without a stack-region undo
+    // (`fbw_note_locals_mirror_undo` leaves that region out so rollback
+    // cannot revert a slot another walk-time write owns), and first-write
+    // wins cannot extend an earlier nlocals capture. Completing the array
+    // write here does not add undo entries: a declined walk keeps the
+    // walk's array image, matching those stores. `last_instr` and
+    // `valuestackdepth` already have first-write-wins undos; the other
+    // statics are frame identity (`pycode`, `debugdata`).
     if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
         fbw_note_locals_mirror_undo(frame, nlocals);
     }
-    crate::state::flush_known_locals_region_to_frame(ctx, frame);
+    crate::state::flush_known_virtualizable_to_frame(ctx, frame);
 }
 
 fn flush_live_virtualizable_before_residual_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     live_frame: usize,
 ) {
-    flush_known_locals_to_live_frame(ctx.trace_ctx, live_frame);
+    flush_live_virtualizable_to_frame(ctx.trace_ctx, live_frame);
     let (callee_frame, frame_reg) = {
         let state = ctx.frame_state.borrow();
         match state.callee_shadow.as_ref() {
