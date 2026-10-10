@@ -10067,6 +10067,10 @@ struct CompiledLoop {
     code_size: usize,
     /// Finalized native ranges awaiting transfer to the owning CLT.
     asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
+    /// `(faildescr, trampoline addr)` from `write_pending_failure_recoveries`.
+    /// `x86/assembler.py assemble_loop` stamps these in
+    /// `patch_pending_failure_recoveries` after `materialize_loop`.
+    pending_guard_tokens: Vec<(DescrRef, usize)>,
     fail_descrs: Box<[DescrRef]>,
     /// Position-aligned `FailDescrCell` wrappers (see
     /// `RegisteredLoopTarget::fail_descr_cells`).
@@ -10154,6 +10158,16 @@ unsafe impl Sync for CompiledLoop {}
 impl CompiledLoop {
     fn current(&self) -> &CompiledLoop {
         self
+    }
+
+    /// `x86/assembler.py assemble_loop`: `materialize_loop` then
+    /// `patch_pending_failure_recoveries`. Call after the last fallible
+    /// compile step; the returned blocks must stay owned by the loop
+    /// token or merged generation.
+    fn take_asm_memory_blocks(&mut self) -> Vec<majit_backend::AsmMemoryBlock> {
+        let blocks = std::mem::take(&mut self.asm_memory_blocks);
+        crate::stub::patch_pending_failure_recoveries(&self.pending_guard_tokens);
+        blocks
     }
 
     #[inline]
@@ -11324,6 +11338,11 @@ pub struct CraneliftBackend {
     /// CLIF of the body most recently compiled by this backend.
     #[cfg(test)]
     last_body_clif: String,
+    /// Test hook: fail `do_compile` after trampolines are allocated and
+    /// before `adr_jump_offset` is stamped, matching an emission /
+    /// `materialize_loop` error after `write_pending_failure_recoveries`.
+    #[cfg(test)]
+    fail_after_pending_trampolines: bool,
 }
 
 impl Default for CraneliftBackend {
@@ -11529,6 +11548,8 @@ impl CraneliftBackend {
             jitframe_facts: jitframe_facts_at_cpu_init(),
             #[cfg(test)]
             last_body_clif: String::new(),
+            #[cfg(test)]
+            fail_after_pending_trampolines: false,
         }
     }
 
@@ -12328,8 +12349,12 @@ impl CraneliftBackend {
         // `write_pending_failure_recoveries` / `generate_quick_failure`: one
         // out-of-line trampoline per bridgeable guard. Finish and JUMP
         // deadframe exits tail-call the shared helper directly.
+        // `x86/assembler.py assemble_loop` keeps `(faildescr, addr)` in
+        // `pending_guard_tokens` and stamps `adr_jump_offset` only in
+        // `patch_pending_failure_recoveries` after `materialize_loop`.
         self.ensure_failure_recovery()?;
         let mut stub_blocks = Vec::new();
+        let mut pending_guard_tokens: Vec<(DescrRef, usize)> = Vec::new();
         for (i, info) in guard_infos.iter_mut().enumerate() {
             let recovery = self.failure_recovery[usize::from(info.must_save_exception)]
                 .expect("failure-recovery helper compiled");
@@ -12358,8 +12383,8 @@ impl CraneliftBackend {
                     }
                     None => {
                         crate::stub::emit_recovery_stub(addr, recovery);
-                        if let Some(fd) = fd {
-                            fd.set_adr_jump_offset(addr);
+                        if let Some(descr) = fd.and(fail_descrs.get(i)) {
+                            pending_guard_tokens.push((descr.clone(), addr));
                         }
                     }
                 }
@@ -12367,6 +12392,12 @@ impl CraneliftBackend {
             } else {
                 info.stub_addr = recovery;
             }
+        }
+        #[cfg(test)]
+        if self.fail_after_pending_trampolines {
+            return Err(BackendError::CompilationFailed(
+                "test: fail after pending trampolines".into(),
+            ));
         }
         // RPython jitframe layout parity: ref_root slots start AFTER all
         // output slots. max_output_slots must be >= inputs.len() so that
@@ -20156,6 +20187,15 @@ impl CraneliftBackend {
             asm_memory_blocks.push(block);
         }
         asm_memory_blocks.extend(stub_blocks);
+        // Stubs live on the `CompiledLoop` that `compile_loop` /
+        // `compile_bridge` / `publish_merged_recompile` will publish.
+        // `adr_jump_offset` stays unstamped until that caller has passed
+        // its last fallible step and taken these blocks
+        // (`x86/assembler.py assemble_loop`: `patch_pending_failure_recoveries`
+        // after `materialize_loop`). A later emission / finalize /
+        // `take_executable` error drops `stub_blocks` without leaving a
+        // dangling offset on a descr the old loop still owns
+        // (`publish_merged_recompile` keeps that loop live).
         if majit_log_enabled() {
             let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
                 .iter()
@@ -20299,6 +20339,7 @@ impl CraneliftBackend {
             body_ptr,
             code_size: code_bytes,
             asm_memory_blocks,
+            pending_guard_tokens,
             fail_descrs,
             fail_descr_cells,
             terminal_exit_layouts: UnsafeCell::new(terminal_exit_layouts),
@@ -21671,7 +21712,7 @@ impl CraneliftBackend {
         };
         let label_targets = std::mem::take(&mut merged.merged_label_targets);
         let keepalive = Arc::new(MergedGeneration {
-            asm_memory_blocks: std::mem::take(&mut merged.asm_memory_blocks),
+            asm_memory_blocks: merged.take_asm_memory_blocks(),
             gcmap_allocs: std::mem::take(&mut merged.gcmap_allocs),
             fail_descr_cells: vec![merged.fail_descr_cells.clone()],
             gc_table: merged.gc_table.clone(),
@@ -21982,8 +22023,8 @@ impl majit_backend::Backend for CraneliftBackend {
             }
             clt.asmmemmgr_blocks.lock().extend(
                 compiled
-                    .asm_memory_blocks
-                    .drain(..)
+                    .take_asm_memory_blocks()
+                    .into_iter()
                     .map(|block| Box::new(block) as Box<dyn std::any::Any + Send>),
             );
         }
@@ -22135,17 +22176,6 @@ impl majit_backend::Backend for CraneliftBackend {
         let merge_source = merge_source.and_then(|source| {
             finish_merge_source(source, compiled.trace_id, compiled.gc_table.as_deref())
         });
-        // Same invariant as the loop path above: skipping would free the arena
-        // range the bridge was just written into.
-        {
-            let clt = original_token.compiled_loop_token_expect();
-            clt.asmmemmgr_blocks.lock().extend(
-                compiled
-                    .asm_memory_blocks
-                    .drain(..)
-                    .map(|block| Box::new(block) as Box<dyn std::any::Any + Send>),
-            );
-        }
         // x86/assembler.py assemble_bridge parity:
         // bridge compilation can increase the frame depth required by
         // CALL_ASSEMBLER callee frames.  The GC rewriter reads the
@@ -22166,6 +22196,19 @@ impl majit_backend::Backend for CraneliftBackend {
             CallAssemblerCallerId::BridgeTrace(compiled.trace_id),
             ops,
         )?;
+        // Same invariant as the loop path: skipping would free the arena
+        // range the bridge was just written into. After the last `?`,
+        // `assemble_bridge` `materialize_loop` then
+        // `patch_pending_failure_recoveries`.
+        {
+            let clt = original_token.compiled_loop_token_expect();
+            clt.asmmemmgr_blocks.lock().extend(
+                compiled
+                    .take_asm_memory_blocks()
+                    .into_iter()
+                    .map(|block| Box::new(block) as Box<dyn std::any::Any + Send>),
+            );
+        }
         self.registered_call_assembler_bridge_traces
             .insert(compiled.trace_id);
         // `compile.py record_loop_or_bridge`: bridge descrs
@@ -23685,6 +23728,105 @@ mod tests {
             .expect("ResumeGuardDescr always implements FailDescr")
             .set_trace_id(trace_id);
         descr
+    }
+
+    /// `x86/assembler.py assemble_loop`: `adr_jump_offset` is stamped only
+    /// after `materialize_loop`. A compile that allocates trampolines and
+    /// then fails must leave the shared descr's previous offset in place.
+    #[test]
+    fn compile_failure_after_trampolines_keeps_adr_jump_offset() {
+        fn guard_finish_ops(descr: DescrRef) -> [OpRc; 2] {
+            let guard = mk_op_with_descr(OpCode::GuardFalse, &[OpRef::const_int(1)], 0, descr);
+            guard.setfailargs(vec![].into());
+            guard.set_fail_arg_types(vec![]);
+            let finish = mk_op(OpCode::Finish, &[], 1);
+            finish.set_fail_arg_types(vec![]);
+            finish.setfailargs(vec![].into());
+            [guard, finish]
+        }
+
+        let descr = mk_test_resume_guard_descr(1, vec![]);
+        let mut backend = CraneliftBackend::new();
+        let token = JitCellToken::new(1);
+        backend
+            .compile_loop(&[], &guard_finish_ops(descr.clone()), &token)
+            .expect("first compile stamps trampoline");
+        let fd = descr.as_fail_descr().expect("resume guard is a FailDescr");
+        let stamped = fd.adr_jump_offset();
+        assert_ne!(stamped, 0, "successful compile stamps trampoline address");
+
+        backend.fail_after_pending_trampolines = true;
+        let token2 = JitCellToken::new(2);
+        let err = backend
+            .compile_loop(&[], &guard_finish_ops(descr.clone()), &token2)
+            .expect_err("hooked compile must fail after trampolines");
+        assert!(
+            format!("{err:?}").contains("fail after pending trampolines"),
+            "compile must fail at the trampoline hook, got {err:?}"
+        );
+        assert_eq!(fd.adr_jump_offset(), stamped);
+    }
+
+    /// `x86/assembler.py assemble_loop`: `patch_pending_failure_recoveries`
+    /// runs after `materialize_loop`, when the loop token already owns the
+    /// blocks. A `compile_loop` that returns from `do_compile` and then
+    /// fails in `register_call_assembler_target` must leave `adr_jump_offset`
+    /// unstamped.
+    #[test]
+    fn compile_loop_failure_after_do_compile_does_not_stamp_adr_jump_offset() {
+        fn guard_void_finish_ops(descr: DescrRef) -> [OpRc; 2] {
+            let guard = mk_op_with_descr(OpCode::GuardFalse, &[OpRef::const_int(1)], 0, descr);
+            guard.setfailargs(vec![].into());
+            guard.set_fail_arg_types(vec![]);
+            let finish = mk_op(OpCode::Finish, &[], 1);
+            finish.set_fail_arg_types(vec![]);
+            finish.setfailargs(vec![].into());
+            [guard, finish]
+        }
+
+        let mut backend = make_call_assembler_backend();
+        let callee_inputargs = vec![InputArg::new_int_rc(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let callee_token = JitCellToken::new(1_500_540);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
+            .expect("int-finishing callee registers as call-assembler target");
+
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef::input_arg_int(0)],
+                1,
+                make_call_assembler_descr(&callee_token, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        let caller_token = JitCellToken::new(1_500_541);
+        backend
+            .compile_loop(&callee_inputargs, &caller_ops, &caller_token)
+            .expect("caller installs an int result expectation");
+
+        let descr = mk_test_resume_guard_descr(1, vec![]);
+        let fd = descr.as_fail_descr().expect("resume guard is a FailDescr");
+        assert_eq!(fd.adr_jump_offset(), 0);
+
+        let mismatch_token = JitCellToken::new(1_500_540);
+        let err = backend
+            .compile_loop(&[], &guard_void_finish_ops(descr.clone()), &mismatch_token)
+            .expect_err("void finish must fail call-assembler registration");
+        assert!(
+            format!("{err:?}").contains("incompatible"),
+            "compile must fail at call-assembler registration, got {err:?}"
+        );
+        assert_eq!(fd.adr_jump_offset(), 0);
     }
 
     #[derive(Debug)]

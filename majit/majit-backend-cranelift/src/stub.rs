@@ -16,7 +16,7 @@
 //! the loop frame down, and a linked branch would leak a return address
 //! (`emit_attached_bridge_dispatch` previously did that under closing_jump).
 
-use majit_ir::FailDescr;
+use majit_ir::{DescrRef, FailDescr};
 
 /// Bytes reserved for one trampoline. Fits the aarch64 far veneer
 /// (`MOVZ`/`MOVK`×3 + `BR x16`, 20 bytes) and the x86_64 far form
@@ -108,6 +108,23 @@ pub(crate) fn emit_recovery_stub(at: usize, recovery: usize) {
     write_redirect_branch(at, recovery);
 }
 
+/// `x86/assembler.py patch_pending_failure_recoveries`.
+///
+/// `assemble_loop` / `assemble_bridge` collect `(faildescr, addr)` in
+/// `pending_guard_tokens` while emitting stubs, then stamp
+/// `faildescr.adr_jump_offset` only after `materialize_loop` succeeded.
+/// Call this once the trampoline blocks are owned by the compiled
+/// loop/bridge that will be published and no later compile step can
+/// fail. Dropping `pending` on an error path leaves each descr's
+/// previous offset in place.
+pub(crate) fn patch_pending_failure_recoveries(pending_guard_tokens: &[(DescrRef, usize)]) {
+    for (descr, addr) in pending_guard_tokens {
+        if let Some(fd) = descr.as_fail_descr() {
+            fd.set_adr_jump_offset(*addr);
+        }
+    }
+}
+
 /// `x86/assembler.py patch_jump_for_descr` / `aarch64/assembler.py patch_trace`.
 ///
 /// `adr_jump_offset` is the trampoline address (`generate_quick_failure` /
@@ -143,5 +160,19 @@ mod tests {
             let offset = ((imm26 as i32) << 6) >> 6 << 2;
             assert_eq!(offset as isize, target as isize - at as isize);
         }
+    }
+
+    #[test]
+    fn patch_pending_failure_recoveries_does_not_stamp_until_commit() {
+        let descr = majit_backend::make_resume_guard_descr_typed(Vec::new());
+        let fd = descr.as_fail_descr().expect("resume guard is a FailDescr");
+        fd.set_adr_jump_offset(0x1111);
+        {
+            let pending = vec![(descr.clone(), 0xDEAD_BEEFusize)];
+            let _ = pending;
+        }
+        assert_eq!(fd.adr_jump_offset(), 0x1111);
+        patch_pending_failure_recoveries(&[(descr.clone(), 0x2222)]);
+        assert_eq!(fd.adr_jump_offset(), 0x2222);
     }
 }
