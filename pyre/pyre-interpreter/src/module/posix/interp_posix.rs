@@ -2289,38 +2289,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
         // The `cmd` `lockf` takes, which is the whole of its vocabulary and
         // which os.py neither writes nor names.
-        #[cfg(all(
-            feature = "host_env",
-            any(
-                target_os = "android",
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "netbsd",
-                target_os = "redox"
-            )
-        ))]
-        for (name, val) in [
-            ("F_ULOCK", rustpython_host_env::fcntl::F_ULOCK as i64),
-            ("F_LOCK", rustpython_host_env::fcntl::F_LOCK as i64),
-            ("F_TLOCK", rustpython_host_env::fcntl::F_TLOCK as i64),
-            ("F_TEST", rustpython_host_env::fcntl::F_TEST as i64),
-        ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
-        }
-        #[cfg(not(all(
-            feature = "host_env",
-            any(
-                target_os = "android",
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "netbsd",
-                target_os = "redox"
-            )
-        )))]
         for (name, val) in [
             ("F_ULOCK", libc::F_ULOCK as i64),
             ("F_LOCK", libc::F_LOCK as i64),
@@ -5213,10 +5181,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if crate::importing::utf8_mode_flag() != 0 {
                     return Ok(pyre_object::w_str_new_managed("utf-8"));
                 }
-                #[cfg(feature = "host_env")]
-                let codeset = rustpython_host_env::locale::nl_langinfo_codeset();
+                #[cfg(all(
+                    unix,
+                    not(target_arch = "wasm32"),
+                    feature = "host_env",
+                    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+                ))]
+                let codeset = majit_rlib::rlocale::nl_langinfo_codeset();
                 // host_env owns nl_langinfo; without it there is no locale to ask.
-                #[cfg(not(feature = "host_env"))]
+                #[cfg(not(all(
+                    unix,
+                    not(target_arch = "wasm32"),
+                    feature = "host_env",
+                    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+                )))]
                 let codeset: Option<Vec<u8>> = None;
                 match codeset {
                     Some(codeset) if !codeset.is_empty() => Ok(pyre_object::w_str_new_managed(
@@ -7664,7 +7642,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // surrogateescape rather than U+FFFD.
                         return Ok(crate::typedef::charp2uni(&msg));
                     }
-                    #[cfg(not(feature = "sandbox"))]
+                    #[cfg(all(unix, not(feature = "sandbox")))]
+                    {
+                        let msg = majit_rlib::rposix::strerror(code).map_err(|()| {
+                            crate::PyError::value_error("strerror() argument out of range")
+                        })?;
+                        Ok(crate::typedef::charp2uni(&msg))
+                    }
+                    #[cfg(all(not(unix), not(feature = "sandbox")))]
                     Ok(pyre_object::w_str_new_managed(
                         &rustpython_host_env::time::strerror(code),
                     ))

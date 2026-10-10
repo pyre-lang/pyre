@@ -464,6 +464,17 @@ crate::rffi::llexternal!(
     releasegil = false
 );
 
+/// `rposix.strerror`. A null host result is `Err`.
+#[cfg(unix)]
+pub fn strerror(errnum: crate::rffi::INT) -> Result<Vec<u8>, ()> {
+    let res = unsafe { c_strerror(errnum) };
+    if res.is_null() {
+        Err(())
+    } else {
+        Ok(unsafe { crate::rffi::charp2str(res.cast()) })
+    }
+}
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_getuid = "getuid",

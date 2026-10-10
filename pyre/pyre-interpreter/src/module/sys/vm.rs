@@ -4165,12 +4165,8 @@ fn locale_asks_for_surrogateescape() -> bool {
             // `initstdio` installs the locale the environment names before
             // reading it back, so what is tested is the locale the C library
             // took rather than the variables that asked for it.
-            rustpython_host_env::locale::setlocale(
-                rustpython_host_env::locale::LC_CTYPE,
-                Some(c""),
-            );
-            let effective =
-                rustpython_host_env::locale::setlocale(rustpython_host_env::locale::LC_CTYPE, None);
+            let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
+            let effective = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None).ok();
             // [3.14-spec] CPython `config_get_stdio_errors` also consults
             // `_Py_IsLocaleCoercionTarget`; its target table is C.UTF-8,
             // C.utf8 and UTF-8.  PyPy `app_main.initstdio` owns the control

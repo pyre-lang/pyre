@@ -8939,7 +8939,12 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
         EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
         EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
     };
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    #[cfg(all(unix, feature = "host_env", not(target_arch = "wasm32")))]
+    use libc::{
+        EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
+        EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
+    };
+    #[cfg(all(windows, feature = "host_env", not(target_arch = "wasm32")))]
     use rustpython_host_env::errno::errors::{
         EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
         EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,

@@ -194,9 +194,8 @@ fn locale_implies_utf8_mode() -> bool {
     // reaches the cascade the same way.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     if LAUNCH_ENV.lock().is_none() {
-        rustpython_host_env::locale::setlocale(rustpython_host_env::locale::LC_CTYPE, Some(c""));
-        let effective =
-            rustpython_host_env::locale::setlocale(rustpython_host_env::locale::LC_CTYPE, None);
+        let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
+        let effective = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None).ok();
         return matches!(effective.as_deref(), None | Some(b"C") | Some(b"POSIX"));
     }
     // An empty variable is treated as unset (`setlocale` POSIX semantics) and

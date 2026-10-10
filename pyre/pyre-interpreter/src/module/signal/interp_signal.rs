@@ -824,9 +824,6 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         // installs stay compiled out.
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            #[cfg(feature = "host_env")]
-            use rustpython_host_env::signal as sig;
-            #[cfg(not(feature = "host_env"))]
             use libc as sig;
             let mut ign = pyre_object::w_int_new(1);
             pyre_object::with_roots!(ign => {
@@ -929,46 +926,34 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // `os.fstat` then `get_status_flags`: a bad fd is a ValueError
             // and the fd must already be in non-blocking mode.
             if fd != -1 {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(all(unix, not(feature = "sandbox")))]
                 {
-                    let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-                    let blocking = rustpython_host_env::fileutils::fstat(borrowed)
-                        .and_then(|_| rustpython_host_env::fcntl::get_blocking(borrowed.into()));
-                    let blocking = match blocking {
-                        Ok(blocking) => blocking,
-                        Err(error) => {
-                            if error.raw_os_error() == Some(libc::EBADF) {
-                                return Err(crate::PyError::value_error("invalid fd"));
-                            }
-                            return Err(crate::PyError::os_error_with_errno(
-                                error.raw_os_error().unwrap_or(0),
-                                format!("{error}"),
-                            ));
-                        }
-                    };
-                    if blocking {
-                        return Err(crate::PyError::value_error(format!(
-                            "the fd {fd} must be in non-blocking mode"
-                        )));
-                    }
-                }
-                #[cfg(all(unix, not(feature = "host_env")))]
-                unsafe {
-                    let mut st: libc::stat = std::mem::zeroed();
-                    let bad_fd = libc::fstat(fd, &mut st) != 0;
-                    let flags = if bad_fd {
-                        -1
-                    } else {
-                        libc::fcntl(fd, libc::F_GETFL)
-                    };
-                    if bad_fd || flags < 0 {
-                        let e = std::io::Error::last_os_error();
-                        if e.raw_os_error() == Some(libc::EBADF) {
+                    let mut w_fd = positional[0];
+                    let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+                    let fstat_ret = pyre_object::with_roots!(w_fd => unsafe {
+                        majit_rlib::rposix::c_fstat(fd, &mut st)
+                    });
+                    if fstat_ret != 0 {
+                        let err = majit_rlib::rposix::get_saved_errno();
+                        if err == libc::EBADF {
                             return Err(crate::PyError::value_error("invalid fd"));
                         }
                         return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("{e}"),
+                            err,
+                            format!("{}", std::io::Error::from_raw_os_error(err)),
+                        ));
+                    }
+                    let flags = pyre_object::with_roots!(w_fd => unsafe {
+                        majit_rlib::rposix::c_get_status_flags(fd)
+                    });
+                    if flags < 0 {
+                        let err = majit_rlib::rposix::get_saved_errno();
+                        if err == libc::EBADF {
+                            return Err(crate::PyError::value_error("invalid fd"));
+                        }
+                        return Err(crate::PyError::os_error_with_errno(
+                            err,
+                            format!("{}", std::io::Error::from_raw_os_error(err)),
                         ));
                     }
                     if flags & libc::O_NONBLOCK == 0 {
@@ -1226,10 +1211,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     );
     #[cfg(unix)]
     {
-        #[cfg(not(feature = "host_env"))]
         use libc as sig;
-        #[cfg(feature = "host_env")]
-        use rustpython_host_env::signal as sig;
         // moduledef.py:17 `'ItimerError': 'interp_signal.get_itimer_error(space)'`
         // — `signal.new_exception_class("signal.ItimerError", space.w_IOError)`.
         // An OSError subclass so `setitimer`'s `exception_from_saved_errno`
@@ -1681,21 +1663,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             })
         );
     }
-    #[cfg(all(any(unix, windows), feature = "host_env"))]
+    #[cfg(unix)]
+    crate::__pyre_store!(
+        ns,
+        "SIG_DFL",
+        pyre_object::w_int_new(libc::SIG_DFL as i64)
+    );
+    #[cfg(unix)]
+    crate::__pyre_store!(
+        ns,
+        "SIG_IGN",
+        pyre_object::w_int_new(libc::SIG_IGN as i64)
+    );
+    #[cfg(all(windows, feature = "host_env"))]
     crate::__pyre_store!(
         ns,
         "SIG_DFL",
         pyre_object::w_int_new(rustpython_host_env::signal::SIG_DFL as i64)
     );
-    #[cfg(all(any(unix, windows), feature = "host_env"))]
+    #[cfg(all(windows, feature = "host_env"))]
     crate::__pyre_store!(
         ns,
         "SIG_IGN",
         pyre_object::w_int_new(rustpython_host_env::signal::SIG_IGN as i64)
     );
-    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+    #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
     crate::__pyre_store!(ns, "SIG_DFL", pyre_object::w_int_new(0));
-    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+    #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
     crate::__pyre_store!(ns, "SIG_IGN", pyre_object::w_int_new(1));
     crate::__pyre_store!(
         ns,
@@ -1710,10 +1704,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     }
     #[cfg(unix)]
     {
-        #[cfg(not(feature = "host_env"))]
         use libc as sig;
-        #[cfg(feature = "host_env")]
-        use rustpython_host_env::signal as sig;
         crate::__pyre_store!(ns, "SIGHUP", pyre_object::w_int_new(sig::SIGHUP as i64));
         crate::__pyre_store!(ns, "SIGINT", pyre_object::w_int_new(sig::SIGINT as i64));
         crate::__pyre_store!(ns, "SIGQUIT", pyre_object::w_int_new(sig::SIGQUIT as i64));

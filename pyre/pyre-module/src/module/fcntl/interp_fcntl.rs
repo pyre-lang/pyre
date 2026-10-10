@@ -529,10 +529,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // not exposed here.
     #[cfg(unix)]
     {
-        #[cfg(not(feature = "host_env"))]
         use libc as host_fcntl;
-        #[cfg(feature = "host_env")]
-        use rustpython_host_env::fcntl as host_fcntl;
         macro_rules! cst {
             ($name:literal, $val:expr) => {
                 pyre_interpreter::__pyre_store!(ns, $name, pyre_object::w_int_new($val as i64));
@@ -600,22 +597,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // platform rather than shared.
         #[cfg(target_vendor = "apple")]
         {
-            #[cfg(feature = "host_env")]
-            {
-                cst!("FASYNC", host_fcntl::FASYNC);
-                cst!("F_GETLEASE", host_fcntl::F_GETLEASE);
-                cst!("F_SETLEASE", host_fcntl::F_SETLEASE);
-                cst!("F_GETNOSIGPIPE", host_fcntl::F_GETNOSIGPIPE);
-                cst!("F_SETNOSIGPIPE", host_fcntl::F_SETNOSIGPIPE);
-            }
-            #[cfg(not(feature = "host_env"))]
-            {
-                cst!("FASYNC", 64);
-                cst!("F_GETLEASE", 107);
-                cst!("F_SETLEASE", 106);
-                cst!("F_GETNOSIGPIPE", 74);
-                cst!("F_SETNOSIGPIPE", 73);
-            }
+            // These five names are not libc exports; the numbers match
+            // `<fcntl.h>` (`O_ASYNC`, `F_GETLEASE`, `F_SETLEASE`,
+            // `F_GETNOSIGPIPE`, `F_SETNOSIGPIPE`).
+            cst!("FASYNC", 64);
+            cst!("F_GETLEASE", 107);
+            cst!("F_SETLEASE", 106);
+            cst!("F_GETNOSIGPIPE", 74);
+            cst!("F_SETNOSIGPIPE", 73);
             cst!("F_FULLFSYNC", host_fcntl::F_FULLFSYNC);
             cst!("F_GETPATH", host_fcntl::F_GETPATH);
             cst!("F_NOCACHE", host_fcntl::F_NOCACHE);

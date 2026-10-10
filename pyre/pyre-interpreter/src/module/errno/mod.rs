@@ -2,9 +2,10 @@
 //!
 //! Numerics differ per OS (e.g. `EAGAIN` is 11 on Linux but 35 on
 //! macOS), so when `host_env` is enabled every constant resolves
-//! through `rustpython_host_env::errno::errors` (a `pub use libc::*`
-//! re-export).  The `host_env = off` build keeps a darwin/BSD-flavoured
-//! fallback so pyre-wasm preserves its previous behaviour.
+//! through `libc` on Unix and through `rustpython_host_env::errno::errors`
+//! on Windows (a `pub use libc::*` re-export plus Winsock names).  The
+//! `host_env = off` build keeps a darwin/BSD-flavoured fallback so
+//! pyre-wasm preserves its previous behaviour.
 //!
 //! Which names exist is the other half of the contract: `interp_errno.py`
 //! declares one list for every platform and lets `DefinedConstantInteger`
@@ -56,6 +57,9 @@ pyre_interpreter::py_module! {
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
+            #[cfg(unix)]
+            use libc as host_errno;
+            #[cfg(windows)]
             use rustpython_host_env::errno::errors as host_errno;
             let entries: &[(&str, i32)] = &[
                 ("EPERM", host_errno::EPERM),

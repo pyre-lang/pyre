@@ -49,6 +49,7 @@ fn active_acp() -> u32 {
 
 #[cfg(all(
     unix,
+    not(target_arch = "wasm32"),
     feature = "host_env",
     not(feature = "sandbox"),
     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
@@ -66,6 +67,7 @@ pub(crate) fn locale_encoding() -> String {
     all(windows, not(feature = "sandbox")),
     all(
         unix,
+        not(target_arch = "wasm32"),
         feature = "host_env",
         not(feature = "sandbox"),
         not(any(target_os = "ios", target_os = "android", target_os = "redox"))
@@ -101,6 +103,40 @@ fn collation_arg(obj: pyre_object::PyObjectRef) -> Result<CollationArg, crate::P
 unsafe extern "C" {
     fn wcscoll(s1: *const u16, s2: *const u16) -> i32;
     fn wcsxfrm(dst: *mut u16, src: *const u16, count: usize) -> usize;
+}
+
+/// `interp_locale.py` `_wcscoll` / `_strxfrm` via `rlocale.external`
+/// (`sandboxsafe=True`).
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+mod ll {
+    use majit_rlib::rffi::{CCHARP, CWCHARP, INT, SIZE_T};
+
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["locale.h", "limits.h", "ctype.h", "wchar.h"],
+        };
+    }
+
+    macro_rules! external {
+        ($($t:tt)*) => {
+            majit_rlib::rffi::llexternal!(
+                $($t)*,
+                compilation_info = ECI,
+                sandboxsafe = true
+            );
+        };
+    }
+
+    external!(
+        pub(super) _wcscoll = "wcscoll",
+        [CWCHARP, CWCHARP],
+        INT
+    );
+    external!(
+        pub(super) _strxfrm = "strxfrm",
+        [CCHARP, CCHARP, SIZE_T],
+        SIZE_T
+    );
 }
 
 /// Whether the runtime's locale parser would overrun its fixed code page
@@ -258,10 +294,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // a different category, so it must come from libc there as well.
     #[cfg(any(unix, windows))]
     {
-        #[cfg(not(feature = "host_env"))]
-        use libc as host_locale;
-        #[cfg(feature = "host_env")]
+        #[cfg(all(windows, feature = "host_env"))]
         use rustpython_host_env::locale as host_locale;
+        #[cfg(not(all(windows, feature = "host_env")))]
+        use libc as host_locale;
         crate::__pyre_store!(
             ns,
             "LC_CTYPE",
@@ -297,20 +333,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `locale.py` appends it to `__all__` only if the name survived
     // its `from _locale import *`, so publishing it here on Windows puts a
     // category into `from locale import *` that no call can be made with.
-    #[cfg(all(
-        unix,
-        feature = "host_env",
-        not(any(target_os = "ios", target_os = "redox"))
-    ))]
-    crate::__pyre_store!(
-        ns,
-        "LC_MESSAGES",
-        pyre_object::w_int_new(rustpython_host_env::locale::LC_MESSAGES as i64)
-    );
-    #[cfg(all(
-        unix,
-        not(all(feature = "host_env", not(any(target_os = "ios", target_os = "redox"))))
-    ))]
+    #[cfg(unix)]
     crate::__pyre_store!(
         ns,
         "LC_MESSAGES",
@@ -470,8 +493,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // The host copy retains CHAR_MAX. The Python adapter
                     // still owns PyPy's trailing-zero list convention.
                     let (grouping, mon_grouping) = (
-                        grouping_of(lc.grouping.iter().map(|&size| size as u8).collect()),
-                        grouping_of(lc.mon_grouping.iter().map(|&size| size as u8).collect()),
+                        grouping_of(lc.grouping.clone()),
+                        grouping_of(lc.mon_grouping.clone()),
                     );
                     let data = LocaleConvData {
                         decimal_point: lc.decimal_point.clone(),
@@ -598,6 +621,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |args| {
                 #[cfg(all(
                     unix,
+                    not(target_arch = "wasm32"),
                     feature = "host_env",
                     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
                 ))]
@@ -629,6 +653,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 #[cfg(not(all(
                     unix,
+                    not(target_arch = "wasm32"),
                     feature = "host_env",
                     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
                 )))]
@@ -668,8 +693,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 {
                     #[cfg(windows)]
                     let ord = unsafe { wcscoll(c1.as_ptr(), c2.as_ptr()) } as i64;
-                    #[cfg(not(windows))]
-                    let ord = rustpython_host_env::locale::strcoll(&c1, &c2) as i64;
+                    #[cfg(unix)]
+                    let ord = {
+                        let w1 = majit_rlib::rffi::scoped_utf82wcharp::new(
+                            Some(c1.as_bytes()),
+                            -1,
+                        );
+                        let w2 = majit_rlib::rffi::scoped_utf82wcharp::new(
+                            Some(c2.as_bytes()),
+                            -1,
+                        );
+                        (unsafe { ll::_wcscoll(w1.buf, w2.buf) }) as i64
+                    };
                     Ok(pyre_object::w_int_new(ord))
                 }
                 #[cfg(not(all(
@@ -724,7 +759,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let out = rustpython_host_env::locale::strxfrm(&c, c.as_bytes().len() + 1);
+                    // `interp_locale.py strxfrm`: first `len(s)+1`, then grow
+                    // to `_strxfrm(...) + 1` when the transform does not fit.
+                    let n1 = c.as_bytes().len() + 1;
+                    let mut buf = vec![0u8; n1];
+                    let n2 = unsafe {
+                        ll::_strxfrm(
+                            buf.as_mut_ptr().cast(),
+                            c.as_ptr().cast_mut().cast(),
+                            n1,
+                        )
+                    }
+                    .saturating_add(1);
+                    if n2 > n1 {
+                        buf = vec![0u8; n2];
+                        let _ = unsafe {
+                            ll::_strxfrm(
+                                buf.as_mut_ptr().cast(),
+                                c.as_ptr().cast_mut().cast(),
+                                n2,
+                            )
+                        };
+                    }
+                    let out = unsafe { majit_rlib::rffi::charp2str(buf.as_mut_ptr().cast()) };
                     // `interp_locale.py` returns `space.newtext(val)` —
                     // a plain utf-8 decode (lossy), matching `setlocale`;
                     // unlike `localeconv`/`nl_langinfo` it does not apply

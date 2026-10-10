@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 
 #[cfg(all(windows, not(feature = "host_env")))]
 use libc::SIG_ERR;
-#[cfg(all(any(unix, windows), not(feature = "host_env")))]
+#[cfg(any(unix, all(windows, not(feature = "host_env"))))]
 use libc::{SIG_DFL, SIG_IGN};
 #[cfg(all(windows, feature = "host_env"))]
 use rustpython_host_env::signal::SIG_ERR;
-#[cfg(all(any(unix, windows), feature = "host_env"))]
+#[cfg(all(windows, feature = "host_env"))]
 use rustpython_host_env::signal::{SIG_DFL, SIG_IGN};
 
 /// `signals.c:34` — one past the highest signal number the platform has,
