@@ -859,8 +859,13 @@ pub fn unroll_condition(obj: PyObjectRef) -> bool {
 /// Polymorphic over all four variants — `Cls_ii` / `Cls_ff` re-box
 /// their inline payloads via `w_int_new` / `w_float_new`.
 ///
+/// `W_TupleObject.getitems_copy` is `wrappeditems[:]`; specialised
+/// `getitems_copy` is `tolist` over `unrolling_iterable(range(typelen))`.
+/// `_unroll_condition` decides when that copy looks inside.
+///
 /// # Safety
 /// `obj` must point to a valid tuple of any of the four variants.
+#[majit_macros::look_inside_iff(unroll_condition)]
 pub unsafe fn w_tuple_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
     let n = w_tuple_len(obj);
     if std::ptr::eq((*obj).ob_type, &TUPLE_TYPE)
