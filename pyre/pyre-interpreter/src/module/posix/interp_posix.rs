@@ -9440,21 +9440,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
                             crate::module::imp::interp_imp::after_fork_child();
-                            // CPython's refcounting drops the replaced
-                            // `_MainThread` before os.fork() returns, so its
-                            // weakref has disappeared from `_dangling` when
-                            // child Python code next runs.  A tracing GC needs
-                            // an explicit reachability pass for the same
-                            // observable result.  Defer `interp_gc.collect`
-                            // (`rgc.collect` then `_run_finalizers`) to the
-                            // next opcode: collecting here would run while
-                            // this native builtin still owns unregistered
-                            // Rust-stack temporaries.  A moving full
-                            // collection is admissible at that boundary
-                            // (`run_failed_attr_finalizers`); a non-moving
-                            // oldgen pass is not, because it has no leading
-                            // minor and can death-queue a nursery address.
-                            crate::executioncontext::PyExecutionContext::schedule_collect_and_run_finalizers();
                             drop(fork_serial);
                             Ok(pyre_object::w_int_new(0))
                         }
@@ -9528,7 +9513,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
                             crate::module::imp::interp_imp::after_fork_child();
-                            crate::executioncontext::PyExecutionContext::schedule_collect_and_run_finalizers();
                             drop(fork_serial);
                             let mut fields = pyre_object::gc_roots::RootedItems::new();
                             fields.push(pyre_object::w_int_new(0));

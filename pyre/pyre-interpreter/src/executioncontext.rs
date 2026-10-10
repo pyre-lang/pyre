@@ -1527,20 +1527,6 @@ impl ExecutionContext {
         }
     }
 
-    /// `interp_gc.py collect`: `rgc.collect()` then `_run_finalizers`, deferred
-    /// to the next opcode.  After `fork` the child needs that pass so vanished
-    /// threads' objects become unreachable (`_dangling`) and any `__del__`
-    /// they queued runs while the addresses are still live.  A non-moving
-    /// oldgen collect (`request_oldgen_collection`) has no leading minor, so
-    /// it can death-queue a nursery address that the next `reset_nursery`
-    /// recycles before this drain.
-    pub fn schedule_collect_and_run_finalizers() {
-        let action = space_user_del_action();
-        if !action.is_null() {
-            unsafe { (*action).collect_oldgen_and_fire() };
-        }
-    }
-
     /// pypy/interpreter/executioncontext.py `run_trace_func`.
     ///
     /// ```python
