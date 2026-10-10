@@ -1035,6 +1035,14 @@ impl MIFrame {
 
         // pyjitpl.py:209-214 — pre-allocate the storage array.
         let total = (length_i + length_r + length_f) as usize;
+        if majit_gc::diag_p92_enabled() && total != 4 && (self.pc == 836 || pc == 836) {
+            eprintln!(
+                "P92_ACTIVE_BOXES jc={:?} frame_pc={} live_pc={pc} in_a_call={in_a_call} after_residual={after_residual_call} total={total} li={length_i} lr={length_r} lf={length_f}",
+                self.jitcode.try_index(),
+                self.pc
+            );
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         let storage = trace.new_array(total);
 
         let num_regs_i = self.jitcode.c_num_regs_i as usize;
@@ -1181,6 +1189,14 @@ impl MIFrame {
         offset += 3;
 
         let total = (length_i + length_r + length_f) as usize;
+        if majit_gc::diag_p92_enabled() && total != 4 && (self.pc == 836 || pc == 836) {
+            eprintln!(
+                "P92_ACTIVE_SNAP_BOXES jc={:?} frame_pc={} live_pc={pc} in_a_call={in_a_call} after_residual={after_residual_call} total={total} li={length_i} lr={length_r} lf={length_f}",
+                self.jitcode.try_index(),
+                self.pc
+            );
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         let mut boxes = Vec::with_capacity(total);
 
         let num_regs_i = self.jitcode.c_num_regs_i as usize;

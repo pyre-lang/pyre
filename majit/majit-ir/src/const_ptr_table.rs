@@ -253,7 +253,9 @@ pub fn intern(addr: GcRef) -> u32 {
     // (`arena_reset` mode 0). `history.py` `ConstPtr.value` is the live
     // word.
     let addr = live_gcref(addr);
+    crate::gcref_diag(addr.0, "intern-before-hash");
     let hash = gc_id_or_identityhash(addr.0) as u64;
+    crate::gcref_diag(addr.0, "intern-after-hash");
     let mut guard = table();
     intern_under(&mut guard, addr, hash)
 }
@@ -270,7 +272,9 @@ pub fn intern_and_take_young(addr: GcRef) -> (u32, Vec<u32>) {
         return (0, take_young_under(&mut guard));
     }
     let addr = live_gcref(addr);
+    crate::gcref_diag(addr.0, "intern-before-hash");
     let hash = gc_id_or_identityhash(addr.0) as u64;
+    crate::gcref_diag(addr.0, "intern-after-hash");
     let mut guard = table();
     let idx = intern_under(&mut guard, addr, hash);
     let young = take_young_under(&mut guard);

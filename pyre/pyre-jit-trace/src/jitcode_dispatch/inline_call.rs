@@ -2465,6 +2465,17 @@ pub(crate) fn collect_callee_active_boxes(
             "float",
         )?);
     }
+    if majit_gc::diag_p92_enabled() && carried_jitcode_pc == 836 && active.len() != 4 {
+        eprintln!(
+            "P92_CALLEE_BOXES jc={callee_jitcode_index} op_pc={callee_op_pc} \
+             carried={carried_jitcode_pc} n={} i={} r={} f={}",
+            active.len(),
+            banks.int.len(),
+            banks.ref_.len(),
+            banks.float.len()
+        );
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
     Ok(active)
 }
 
@@ -9651,6 +9662,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // Re-read after `to_pyobj` / cell emission, which can collect and
         // forward the cell. `new_for_call_with_closure_and_globals_obj` and
         // `FrameBox::new` also collect (`maybe_collect_for_external_malloc`).
+        let inline_w_code = callee_state.borrow().inline_w_code;
         let inline_w_globals = callee_state.borrow().inline_w_globals;
         let mut frame = pyre_interpreter::pyframe::FrameBox::new(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(

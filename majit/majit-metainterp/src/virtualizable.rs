@@ -3231,6 +3231,15 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         // in the stream to be re-read as somebody else's values.  A null gets
         // no write — upstream has no such case at all, `cast_gcref_to_vtype`
         // hands `setattr` a null and it crashes — but the read still happens.
+        if majit_gc::diag_p92_trace_io() {
+            eprintln!(
+                "P92_WRITE_VABLE start statics={} arrays={} vable_ptr={:#x} items_read={}",
+                self.static_fields.len(),
+                self.array_fields.len(),
+                virtualizable as usize,
+                reader.resumecodereader.items_read,
+            );
+        }
         for (field_index, field) in self.static_fields.iter().enumerate() {
             let value = reader.next_value_of_type(field.field_type);
             let vable_ptr = reader.virtualizable_ptr as *mut u8;
@@ -3239,6 +3248,12 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
                     self.write_field(vable_ptr, field_index, value);
                 }
             }
+        }
+        if majit_gc::diag_p92_trace_io() {
+            eprintln!(
+                "P92_WRITE_VABLE after_statics items_read={} vable_ptr={:#x}",
+                reader.resumecodereader.items_read, reader.virtualizable_ptr as usize,
+            );
         }
         if reader.virtualizable_ptr == 0 {
             // Matches `get_total_size`, which adds no array length without a
@@ -3249,6 +3264,12 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         for array in &self.array_fields {
             let vable_ptr = reader.virtualizable_ptr as *mut u8;
             let arr_len = unsafe { bhimpl_arraylen_vable(vable_ptr as *const u8, array) };
+            if majit_gc::diag_p92_trace_io() {
+                eprintln!(
+                    "P92_WRITE_VABLE array len={arr_len} item_type={:?} items_read={}",
+                    array.item_type, reader.resumecodereader.items_read,
+                );
+            }
             // `lst = getattr(virtualizable, ARRAYFIELD)` is bound outside the
             // item loop upstream, where the GC transform roots it and forwards
             // it across whatever the reader does.  A bare base pointer is not

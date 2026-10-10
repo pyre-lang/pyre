@@ -373,6 +373,110 @@ fn fresh_slot(addr: usize, host: bool) -> *mut NumSlot {
     }))
 }
 
+/// Temporary P92 NUMBERING diagnostic. `PYRE_DIAG_P92` records payload
+/// address and first bytes at creation; a later read panics if the cell
+/// was not forwarded or the bytes were overwritten.
+static DIAG_NUMB_ON: AtomicUsize = AtomicUsize::new(0);
+static DIAG_NUMB: parking_lot::Mutex<Vec<NumbDiag>> = parking_lot::Mutex::new(Vec::new());
+
+struct NumbDiag {
+    slot: usize,
+    payload: usize,
+    len: usize,
+    first: [u8; 16],
+    nfirst: usize,
+}
+
+fn diag_numb_on() -> bool {
+    let v = DIAG_NUMB_ON.load(Ordering::Relaxed);
+    if v != 0 {
+        return v == 2;
+    }
+    let on = std::env::var_os("PYRE_DIAG_P92").is_some();
+    DIAG_NUMB_ON.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
+fn diag_numb_first_bytes(addr: usize) -> (usize, [u8; 16], usize) {
+    if addr == 0 {
+        return (0, [0; 16], 0);
+    }
+    let len = unsafe { *(addr as *const usize) };
+    let n = len.min(16);
+    let mut first = [0u8; 16];
+    if n > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (addr as *const u8).add(numb_len_word()),
+                first.as_mut_ptr(),
+                n,
+            );
+        }
+    }
+    (len, first, n)
+}
+
+fn diag_numb_record(slot: *mut NumSlot, addr: usize) {
+    if !diag_numb_on() || addr == 0 {
+        return;
+    }
+    if unsafe { (*slot).host } {
+        return;
+    }
+    let (len, first, nfirst) = diag_numb_first_bytes(addr);
+    DIAG_NUMB.lock().push(NumbDiag {
+        slot: slot as usize,
+        payload: addr,
+        len,
+        first,
+        nfirst,
+    });
+}
+
+fn diag_numb_forwarded(slot: *mut NumSlot, old: usize, new: usize) {
+    if !diag_numb_on() || old == new {
+        return;
+    }
+    let mut guard = DIAG_NUMB.lock();
+    for row in guard.iter_mut() {
+        if row.slot == slot as usize {
+            row.payload = new;
+            return;
+        }
+    }
+}
+
+fn diag_numb_check(slot: *mut NumSlot, addr: usize, site: &'static str) {
+    if !diag_numb_on() {
+        return;
+    }
+    if unsafe { (*slot).host } || addr == 0 {
+        return;
+    }
+    let (len, first, nfirst) = diag_numb_first_bytes(addr);
+    let guard = DIAG_NUMB.lock();
+    let Some(row) = guard.iter().rev().find(|r| r.slot == slot as usize) else {
+        return;
+    };
+    let payload_moved = row.payload != addr;
+    let bytes_changed = nfirst != row.nfirst || first[..nfirst] != row.first[..row.nfirst];
+    if !payload_moved && !bytes_changed {
+        return;
+    }
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    panic!(
+        "STALE_NUMBERING site={site} slot={:#x} create_payload={:#x} read_payload={:#x} \
+         payload_moved={payload_moved} bytes_changed={bytes_changed} create_len={} read_len={len} \
+         create_first={:02x?} read_first={:02x?}\n{backtrace}",
+        slot as usize,
+        row.payload,
+        addr,
+        row.len,
+        &row.first[..row.nfirst],
+        &first[..nfirst]
+    );
+}
+
 /// Lock order is [`LIVE_NUMBERINGS`] then [`YOUNG_NUMBERINGS`].
 fn register_gc_slot(slot: *mut NumSlot) {
     let nn = std::ptr::NonNull::new(slot).expect("numb slot");
@@ -394,6 +498,7 @@ impl NumberingRef {
         let slot = fresh_slot(0, false);
         unsafe { (*slot).addr.store(addr, Ordering::Relaxed) };
         register_gc_slot(slot);
+        diag_numb_record(slot, addr);
         Self {
             slot: std::ptr::NonNull::new(slot).expect("numb slot"),
         }
@@ -443,6 +548,9 @@ impl NumberingRef {
         if addr == 0 {
             return &[];
         }
+        if diag_numb_on() {
+            diag_numb_check(self.slot.as_ptr(), addr, "NumberingRef::as_slice");
+        }
         let len = unsafe { *(addr as *const usize) };
         unsafe { std::slice::from_raw_parts((addr as *const u8).add(numb_len_word()), len) }
     }
@@ -469,6 +577,9 @@ fn forward_slot(slot: std::ptr::NonNull<NumSlot>, visitor: &mut dyn FnMut(&mut c
     let mut gc = crate::GcRef(addr);
     visitor(&mut gc);
     unsafe { slot.as_ref().addr.store(gc.0, Ordering::Relaxed) };
+    if addr != gc.0 {
+        diag_numb_forwarded(slot.as_ptr(), addr, gc.0);
+    }
 }
 
 /// Minor remembered-set drain. Forwards each young cell and clears the list.

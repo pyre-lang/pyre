@@ -403,12 +403,17 @@ pub fn current_extra_area() -> &'static str {
 /// is skipped when the area's walk panics, which leaves the finished area's
 /// label installed and makes the next validation failure name the wrong
 /// registrar -- the opposite of what the label exists for.
-struct ExtraAreaLabel(&'static str);
+pub struct ExtraAreaLabel(&'static str);
 
 impl Drop for ExtraAreaLabel {
     fn drop(&mut self) {
         CURRENT_EXTRA_AREA.with(|cell| cell.set(self.0));
     }
+}
+
+/// Stamp [`current_extra_area`] until the guard drops.
+pub fn extra_area_scope(name: &'static str) -> ExtraAreaLabel {
+    ExtraAreaLabel(CURRENT_EXTRA_AREA.with(|cell| cell.replace(name)))
 }
 
 /// Run one area's walk with [`current_extra_area`] naming it.
@@ -1073,6 +1078,9 @@ pub fn get(index: usize) -> GcRef {
 
 /// Acquire a fixed translated-livevar root slot.
 pub fn acquire_owner_root(root: GcRef) -> usize {
+    if crate::diag_p92_enabled() && !root.is_null() {
+        crate::diag_stale_gcref(root.0, "acquire_owner_root");
+    }
     OWNER_ROOTS.with(|roots| {
         let mut roots = roots.borrow_mut();
         let reused = OWNER_ROOTS_FREE.with(|free| free.borrow_mut().pop());
@@ -1393,6 +1401,45 @@ pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
 #[inline]
 pub fn depth() -> usize {
     SHADOW_STACK.with(|ss| ss.len())
+}
+
+/// P92 diagnostic: name whether `slot_addr` sits in the GcRef shadow stack
+/// buffer or in `OWNER_ROOTS`. Both walks share `extra_area=shadow_stack`.
+pub fn describe_root_slot(slot_addr: usize) -> String {
+    let ss = SHADOW_STACK.with(|ss| {
+        let base = ss.base.get() as usize;
+        let top = ss.top.get() as usize;
+        let limit = ss.limit.get() as usize;
+        let len = ss.len();
+        let in_ss = base != 0 && slot_addr >= base && slot_addr < top;
+        let idx = if in_ss {
+            (slot_addr - base) / std::mem::size_of::<GcRef>()
+        } else {
+            usize::MAX
+        };
+        let val = if in_ss {
+            // SAFETY: `idx` is inside the live prefix.
+            Some(unsafe { *ss.base.get().add(idx) }.0)
+        } else {
+            None
+        };
+        format!(
+            "ss_base={base:#x} ss_top={top:#x} ss_limit={limit:#x} ss_len={len} \
+             ss_contains={in_ss} ss_idx={idx} ss_val={val:#x?}"
+        )
+    });
+    // `walk_roots` already holds `OWNER_ROOTS.borrow_mut()` on this path, so
+    // do not `borrow()` here. `as_ptr` is the same raw view `walk_all_roots`
+    // uses under STW.
+    let oroot = OWNER_ROOTS.with(|roots| {
+        let roots = unsafe { &*roots.as_ptr() };
+        let ptr = roots.as_ptr() as usize;
+        let len = roots.len();
+        let bytes = len.saturating_mul(std::mem::size_of::<Option<GcRef>>());
+        let in_or = ptr != 0 && slot_addr >= ptr && slot_addr < ptr.saturating_add(bytes);
+        format!("or_ptr={ptr:#x} or_len={len} or_bytes={bytes} or_contains={in_or}")
+    });
+    format!("{ss} {oroot}")
 }
 
 /// rpython/memory/gctransform/shadowstack.py increase_root_stack_depth
@@ -2245,8 +2292,9 @@ pub fn walk_rescan_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Invoke every registered extra root walker with the given visitor.
 ///
-/// Called by `MiniMarkGC::do_collect_nursery` (Phase 1e). The label stored
-/// beside each walker is not read here.
+/// Called by `MiniMarkGC::do_collect_nursery` (Phase 1e). Each walker's
+/// label is stamped on [`current_extra_area`] so a root that fails
+/// validation names the registrar, not the bare default.
 pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
     // Snapshot the walker list under a read guard so a walker that
     // triggers further allocation (and recursively a collection) does
@@ -2255,7 +2303,8 @@ pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
         let guard = EXTRA_ROOT_WALKERS.read();
         *guard
     };
-    for (walker, _) in walkers.iter().flatten() {
+    for (walker, label) in walkers.iter().flatten() {
+        let _label = extra_area_scope(*label);
         walker(&mut visitor);
     }
 }
