@@ -1019,15 +1019,34 @@ pub extern "C" fn pin_roots_jit_abi(array: *const crate::object_array::GcTypedAr
 /// Flow-graph entry for a `Vec<PyObjectRef>` used as `&[PyObjectRef]`.
 ///
 /// The vec is the address of its header. Slice consumers read one
-/// length-prefixed object array. The residual call is
+/// length-prefixed object array. `listobject.py`
+/// `AbstractUnwrappedStrategy.getitems_copy` is
+/// `@jit.look_inside_iff(_unrolling_heuristic)` with `UNROLL_CUTOFF = 5`;
+/// a residual copy of a small looked-inside list is that path residualized.
+/// The residual call for a list the heuristic declines is
 /// [`gcarray_from_pyobject_vec_jit_abi`].
+fn gcarray_from_pyobject_vec_unroll_iff(items: &Vec<PyObjectRef>) -> bool {
+    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), 5)
+}
+
 #[inline]
-#[majit_macros::dont_look_inside_cannot_raise]
+#[majit_macros::unroll_safe]
+#[majit_macros::look_inside_iff(gcarray_from_pyobject_vec_unroll_iff)]
 pub fn gcarray_from_pyobject_vec(
     items: &Vec<PyObjectRef>,
 ) -> *mut crate::object_array::GcTypedArray {
-    let _ = items;
-    std::ptr::null_mut()
+    let n = items.len();
+    let _roots = push_roots();
+    let save = shadow_stack_len();
+    let mut i = 0usize;
+    while i < n {
+        let _ = pin_root(items[i]);
+        i += 1;
+    }
+    unsafe {
+        crate::object_array::alloc_tuple_items_block_gc(save, n)
+            as *mut crate::object_array::GcTypedArray
+    }
 }
 
 /// `ItemsBlock` and `GcTypedArray` share the length word at offset 0 and the
