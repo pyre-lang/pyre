@@ -76,10 +76,6 @@ pub fn reset_swap_fallback_hits() {
     SWAP_FALLBACK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn rbuiltin_deferred(name: &str) -> TyperError {
-    TyperError::missing_rtype_operation(format!("rbuiltin.{name} helper surface deferred"))
-}
-
 use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, Hlvalue, HostObject};
 use crate::translator::rtyper::error::TyperError;
@@ -141,11 +137,9 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///   * rbuiltin.py — `reversed` (need `Repr::newiter` trait
 ///     method + iterator repr family)
 ///   * rbuiltin.py — `object.__init__` is trivial and landed.
-///     `EnvironmentError.__init__` / `WindowsError.__init__` need
-///     `InstanceRepr::setfield` (rclass.py) to lower the
-///     `r_self.setfield(v_self, 'errno' / 'strerror' / 'filename' /
-///     'winerror', ...)` calls; until that helper lands the qualname
-///     `HostObject`s stay unregistered.
+///     `EnvironmentError.__init__` stores `errno` / `strerror` /
+///     `filename` through `InstanceRepr::setfield`.
+///     `WindowsError.__init__` stores `winerror` the same way.
 ///   * rbuiltin.py — `objectmodel.hlinvoke` (PBC-callable
 ///     dispatch)
 ///   * rbuiltin.py — `range` / `xrange` / `enumerate`
@@ -194,8 +188,9 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///   * rbuiltin.py — `objectmodel.instantiate` (PBC handling +
 ///     `rclass.rtype_new_instance`)
 ///   * rbuiltin.py — `OrderedDict` / `objectmodel.r_dict` /
-///     `objectmodel.r_ordereddict` (need `DictRepr::DICT` /
-///     `ll_newdict` / `custom_eq_hash` interface)
+///     `objectmodel.r_ordereddict` lower through
+///     `OrderedDictRepr::ll_newdict` and, when `custom_eq_hash`,
+///     store `fnkeyeq` / `fnkeyhash`.
 ///   * rbuiltin.py — weakref family low-level path
 ///     (`weakref_create/deref`, `cast_ptr_to_weakrefptr`,
 ///     `cast_weakrefptr_to_ptr` — ported; high-level `BaseWeakRefRepr`
@@ -239,6 +234,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
         ("object.__init__", rtype_object__init__),
+        // rbuiltin.py — `EnvironmentError.__init__` field stores.
+        ("EnvironmentError.__init__", rtype_EnvironmentError__init__),
         // rbuiltin.py:286-297 — registered only when the host exposes
         // WindowsError.__init__; HOST_ENV lookup preserves that conditional.
         ("WindowsError.__init__", rtype_WindowsError__init__),
@@ -1967,40 +1964,171 @@ pub fn rtype_builtin_hasattr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 /// RPython `@typer_for(reversed) def rtype_builtin_reversed(hop)`
 /// (rbuiltin.py).
 ///
-/// Upstream delegates to `hop.r_result.newiter(hop)`. The Rust `Repr`
-/// trait does not expose the `newiter` hook yet, so keep the module-level
-/// parity surface explicit and fail as a structured missing rtype operation.
-pub fn rtype_builtin_reversed(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_builtin_reversed"))
+/// ```python
+/// def rtype_builtin_reversed(hop):
+///     hop.exception_cannot_occur()
+///     return hop.r_result.newiter(hop)
+/// ```
+pub fn rtype_builtin_reversed(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_builtin_reversed: r_result missing"))?;
+    r_result.newiter(hop)
+}
+
+/// The receiver of an exception `__init__` hop, as `InstanceRepr`.
+///
+/// `genop` refuses a raw `args_v` entry, so the self value is the
+/// `inputarg` identity conversion.
+fn hop_instance_self(
+    hop: &HighLevelOp,
+    what: &str,
+) -> Result<
+    (
+        std::sync::Arc<crate::translator::rtyper::rclass::InstanceRepr>,
+        Hlvalue,
+    ),
+    TyperError,
+> {
+    use crate::translator::rtyper::rclass::InstanceRepr;
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+
+    if hop.nb_args() == 0 {
+        return Err(TyperError::message(format!("{what}: missing self")));
+    }
+    let r_any = hop.args_r.borrow()[0]
+        .clone()
+        .ok_or_else(|| TyperError::message(format!("{what}: missing self repr")))?;
+    let raw = std::sync::Arc::into_raw(r_any);
+    if unsafe { (*raw).type_id() } != std::any::TypeId::of::<InstanceRepr>() {
+        let _ = unsafe { std::sync::Arc::from_raw(raw) };
+        return Err(TyperError::message(format!(
+            "{what}: self is not an InstanceRepr"
+        )));
+    }
+    let r_self = unsafe { std::sync::Arc::from_raw(raw as *const () as *const InstanceRepr) };
+    let v_self = hop.inputarg(ConvertedTo::Repr(r_self.as_ref()), 0)?;
+    Ok((r_self, v_self))
 }
 
 /// RPython `@typer_for(EnvironmentError.__init__) def
 /// rtype_EnvironmentError__init__(hop)` (rbuiltin.py).
 ///
-/// The line-by-line port needs `InstanceRepr::setfield` for `errno`,
-/// `strerror`, and `filename` assignment.
+/// ```python
+/// hop.exception_cannot_occur()
+/// v_self = hop.args_v[0]
+/// r_self = hop.args_r[0]
+/// if hop.nb_args <= 2:
+///     v_errno = hop.inputconst(lltype.Signed, 0)
+///     if hop.nb_args == 2:
+///         v_strerror = hop.inputarg(rstr.string_repr, arg=1)
+///         r_self.setfield(v_self, 'strerror', v_strerror, hop.llops)
+/// else:
+///     v_errno = hop.inputarg(lltype.Signed, arg=1)
+///     v_strerror = hop.inputarg(rstr.string_repr, arg=2)
+///     r_self.setfield(v_self, 'strerror', v_strerror, hop.llops)
+///     if hop.nb_args >= 4:
+///         v_filename = hop.inputarg(rstr.string_repr, arg=3)
+///         r_self.setfield(v_self, 'filename', v_filename, hop.llops)
+/// r_self.setfield(v_self, 'errno', v_errno, hop.llops)
+/// ```
 #[allow(non_snake_case)]
 pub fn rtype_EnvironmentError__init__(
-    _hop: &HighLevelOp,
+    hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_EnvironmentError__init__"))
+    use crate::translator::rtyper::rstr::string_repr;
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+
+    hop.exception_cannot_occur()?;
+    let (r_self, v_self) = hop_instance_self(hop, "rtype_EnvironmentError__init__")?;
+    let nb = hop.nb_args();
+    let signed = LowLevelType::Signed;
+    let (v_errno, v_strerror, v_filename) = if nb <= 2 {
+        let v_errno = Hlvalue::Constant(HighLevelOp::inputconst(&signed, &ConstValue::Int(0))?);
+        let v_strerror = if nb == 2 {
+            let r_str = string_repr();
+            Some(hop.inputarg(ConvertedTo::Repr(r_str.as_ref()), 1)?)
+        } else {
+            None
+        };
+        (v_errno, v_strerror, None)
+    } else {
+        let r_str = string_repr();
+        let v_errno = hop.inputarg(ConvertedTo::from(&signed), 1)?;
+        let v_strerror = hop.inputarg(ConvertedTo::Repr(r_str.as_ref()), 2)?;
+        let v_filename = if nb >= 4 {
+            Some(hop.inputarg(ConvertedTo::Repr(r_str.as_ref()), 3)?)
+        } else {
+            None
+        };
+        (v_errno, Some(v_strerror), v_filename)
+    };
+    let flags = crate::translator::rtyper::rclass::Flags::new();
+    let mut llops = hop.llops.borrow_mut();
+    if let Some(v_strerror) = v_strerror {
+        r_self.setfield(
+            v_self.clone(),
+            "strerror",
+            v_strerror,
+            &mut llops,
+            false,
+            &flags,
+        )?;
+    }
+    if let Some(v_filename) = v_filename {
+        r_self.setfield(
+            v_self.clone(),
+            "filename",
+            v_filename,
+            &mut llops,
+            false,
+            &flags,
+        )?;
+    }
+    r_self.setfield(v_self, "errno", v_errno, &mut llops, false, &flags)?;
+    Ok(None)
 }
 
 /// RPython conditional `@typer_for(WindowsError.__init__) def
 /// rtype_WindowsError__init__(hop)` (rbuiltin.py).
 ///
-/// CPython 3 removed `WindowsError` as a distinct builtin, but upstream
-/// still exposes this helper when running on hosts where the class exists.
-/// The concrete field writes need the same `InstanceRepr::setfield` work as
-/// `rtype_EnvironmentError__init__`, so keep the public parity hook explicit
-/// and deferred.
+/// ```python
+/// hop.exception_cannot_occur()
+/// if hop.nb_args == 2:
+///     raise TyperError("WindowsError() should not be called with "
+///                      "a single argument")
+/// if hop.nb_args >= 3:
+///     v_self = hop.args_v[0]
+///     r_self = hop.args_r[0]
+///     v_error = hop.inputarg(lltype.Signed, arg=1)
+///     r_self.setfield(v_self, 'winerror', v_error, hop.llops)
+/// ```
 #[allow(non_snake_case)]
 pub fn rtype_WindowsError__init__(
-    _hop: &HighLevelOp,
+    hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_WindowsError__init__"))
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+
+    hop.exception_cannot_occur()?;
+    if hop.nb_args() == 2 {
+        return Err(TyperError::message(
+            "WindowsError() should not be called with a single argument",
+        ));
+    }
+    if hop.nb_args() >= 3 {
+        let (r_self, v_self) = hop_instance_self(hop, "rtype_WindowsError__init__")?;
+        let signed = LowLevelType::Signed;
+        let v_error = hop.inputarg(ConvertedTo::from(&signed), 1)?;
+        let flags = crate::translator::rtyper::rclass::Flags::new();
+        let mut llops = hop.llops.borrow_mut();
+        r_self.setfield(v_self, "winerror", v_error, &mut llops, false, &flags)?;
+    }
+    Ok(None)
 }
 
 /// Pack a live `Repr` into `ConstValue::Repr`. The box is leaked so the
@@ -2207,9 +2335,42 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
                 "instantiate(x, nonmovable=True) cannot be used if x is not a constant class",
             ));
         }
-        return Err(rbuiltin_deferred(
-            "rtype_instantiate: ClassesPBCRepr._instantiate_runtime_class",
-        ));
+        let r_type = crate::translator::rtyper::rclass::get_type_repr(&hop.rtyper)?;
+        let args = hop.inputargs(vec![ConvertedTo::Repr(r_type.as_ref())])?;
+        let vtypeptr = args
+            .into_iter()
+            .next()
+            .ok_or_else(|| TyperError::message("rtype_instantiate: missing type pointer"))?;
+        let r_any = hop
+            .args_r
+            .borrow()
+            .first()
+            .cloned()
+            .flatten()
+            .ok_or_else(|| TyperError::message("rtype_instantiate: missing class repr"))?;
+        let raw = std::sync::Arc::into_raw(r_any);
+        if unsafe { (*raw).type_id() }
+            != std::any::TypeId::of::<crate::translator::rtyper::rpbc::ClassesPBCRepr>()
+        {
+            let _ = unsafe { std::sync::Arc::from_raw(raw) };
+            return Err(TyperError::message(
+                "rtype_instantiate: class repr is not a ClassesPBCRepr",
+            ));
+        }
+        let r_class = unsafe {
+            std::sync::Arc::from_raw(
+                raw as *const () as *const crate::translator::rtyper::rpbc::ClassesPBCRepr,
+            )
+        };
+        let r_instance = hop
+            .r_result
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| TyperError::message("rtype_instantiate: r_result missing"))?
+            .lowleveltype()
+            .clone();
+        let v = r_class._instantiate_runtime_class(hop, vtypeptr, &r_instance)?;
+        return Ok(Some(v));
     }
     let Some(DescEntry::Class(classdesc)) = s_class.any_description() else {
         return Err(TyperError::message(
@@ -2233,10 +2394,54 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
 /// `objectmodel.r_ordereddict` `def rtype_dict_constructor(...)`
 /// (rbuiltin.py).
 ///
-/// The implementation depends on the concrete `DictRepr::DICT`,
-/// `ll_newdict`, and custom equality/hash helper graph plumbing.
-pub fn rtype_dict_constructor(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_dict_constructor"))
+/// `i_force_non_null` and `i_simple_hash_eq` are ignored: when they
+/// matter they have already been applied to `hop.r_result`.
+pub fn rtype_dict_constructor(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    hop.exception_cannot_occur()?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_dict_constructor: r_result missing"))?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    let r_dict = any_r.downcast_ref::<OrderedDictRepr>().ok_or_else(|| {
+        TyperError::message("rtype_dict_constructor: hop.r_result is not an OrderedDictRepr")
+    })?;
+    let v_result = r_dict.ll_newdict(hop)?;
+    if r_dict.base.custom_eq_hash {
+        let (r_eqfn, r_hashfn) = r_dict.base.custom_eq_hash_repr.as_ref().ok_or_else(|| {
+            TyperError::message("rtype_dict_constructor: custom_eq_hash reprs missing")
+        })?;
+        let v_eqfn = hop.inputarg(ConvertedTo::Repr(r_eqfn.as_ref()), 0)?;
+        let v_hashfn = hop.inputarg(ConvertedTo::Repr(r_hashfn.as_ref()), 1)?;
+        let v_dict = v_result.clone().ok_or_else(|| {
+            TyperError::message("rtype_dict_constructor: ll_newdict returned no value")
+        })?;
+        if !matches!(r_eqfn.lowleveltype(), LowLevelType::Void) {
+            let cname =
+                HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::byte_str("fnkeyeq"))?;
+            hop.genop(
+                "setfield",
+                vec![v_dict.clone(), Hlvalue::Constant(cname), v_eqfn],
+                GenopResult::Void,
+            );
+        }
+        if !matches!(r_hashfn.lowleveltype(), LowLevelType::Void) {
+            let cname =
+                HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::byte_str("fnkeyhash"))?;
+            hop.genop(
+                "setfield",
+                vec![v_dict, Hlvalue::Constant(cname), v_hashfn],
+                GenopResult::Void,
+            );
+        }
+    }
+    Ok(v_result)
 }
 
 /// RPython `@typer_for(lltype.identityhash) def rtype_identity_hash(hop)`
@@ -5744,23 +5949,134 @@ mod tests {
     }
 
     #[test]
-    fn deferred_rbuiltin_parity_surface_reports_missing_rtype_operation() {
-        let hop = dummy_hop();
-        let typers: &[(&str, BuiltinTyperFn)] = &[
-            ("rtype_builtin_reversed", rtype_builtin_reversed),
-            (
-                "rtype_EnvironmentError__init__",
-                rtype_EnvironmentError__init__,
-            ),
-            ("rtype_WindowsError__init__", rtype_WindowsError__init__),
-            ("rtype_dict_constructor", rtype_dict_constructor),
-        ];
+    #[allow(non_snake_case)]
+    fn rtype_EnvironmentError_init_stores_errno_zero_for_a_bare_self() {
+        use crate::annotator::classdesc::{Attribute, ClassDef};
+        use crate::annotator::model::{SomeInstance, SomeInteger};
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
 
-        for (name, typer) in typers {
-            let err = typer(&hop, &HashMap::new()).unwrap_err();
-            assert!(err.is_missing_rtype_operation());
-            assert!(err.to_string().contains(name));
-        }
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("EnvironmentError", None);
+        let mut errno = Attribute::new("errno");
+        errno.s_value = SomeValue::Integer(SomeInteger::new(false, false));
+        errno.readonly = false;
+        classdef
+            .borrow_mut()
+            .attrs
+            .insert("errno".to_string(), errno);
+        let r_self = getinstancerepr(&hop.rtyper, Some(&classdef), Flavor::Gc).expect("repr");
+        Repr::setup(r_self.as_ref()).expect("setup");
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_self.lowleveltype().clone()));
+        let r_dyn: std::sync::Arc<dyn Repr> = r_self;
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_self));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )));
+        hop.args_r.borrow_mut().push(Some(r_dyn));
+
+        rtype_EnvironmentError__init__(&hop, &HashMap::new()).expect("rtype");
+        let ops = hop.llops.borrow();
+        let store = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "setfield")
+            .expect("errno setfield");
+        assert_eq!(store.args.len(), 3);
+        let Hlvalue::Constant(name) = &store.args[1] else {
+            panic!("field name must be a constant");
+        };
+        assert_eq!(name.value, ConstValue::ByteStr(b"inst_errno".to_vec()));
+        let Hlvalue::Constant(errno) = &store.args[2] else {
+            panic!("errno must be a constant");
+        };
+        assert_eq!(errno.value, ConstValue::Int(0));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn rtype_WindowsError_init_stores_winerror_and_rejects_one_argument() {
+        use crate::annotator::classdesc::{Attribute, ClassDef};
+        use crate::annotator::model::{SomeInstance, SomeInteger};
+        use crate::flowspace::model::{Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let bare = dummy_hop();
+        bare.args_v.borrow_mut().extend([
+            Hlvalue::Variable(Variable::new()),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )),
+        ]);
+        let err = rtype_WindowsError__init__(&bare, &HashMap::new()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("WindowsError() should not be called with a single argument")
+        );
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("WindowsError", None);
+        let mut winerror = Attribute::new("winerror");
+        winerror.s_value = SomeValue::Integer(SomeInteger::new(false, false));
+        winerror.readonly = false;
+        classdef
+            .borrow_mut()
+            .attrs
+            .insert("winerror".to_string(), winerror);
+        let r_self = getinstancerepr(&hop.rtyper, Some(&classdef), Flavor::Gc).expect("repr");
+        Repr::setup(r_self.as_ref()).expect("setup");
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(r_self.lowleveltype().clone()));
+        let r_dyn: std::sync::Arc<dyn Repr> = r_self;
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_self),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(7),
+                LowLevelType::Signed,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::ByteStr(b"disk".to_vec()),
+                LowLevelType::Void,
+            )),
+        ]);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )));
+        hop.args_r.borrow_mut().push(Some(r_dyn));
+
+        rtype_WindowsError__init__(&hop, &HashMap::new()).expect("rtype");
+        let ops = hop.llops.borrow();
+        let store = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "setfield")
+            .expect("winerror setfield");
+        let Hlvalue::Constant(name) = &store.args[1] else {
+            panic!("field name must be a constant");
+        };
+        assert_eq!(name.value, ConstValue::ByteStr(b"inst_winerror".to_vec()));
+        let Hlvalue::Constant(code) = &store.args[2] else {
+            panic!("winerror must be a constant");
+        };
+        assert_eq!(code.value, ConstValue::Int(7));
     }
 
     #[test]
@@ -5800,6 +6116,142 @@ mod tests {
             LowLevelType::Ptr(p) => *p,
             other => panic!("OBJECTPTR must be Ptr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rtype_instantiate_variable_class_indirect_calls_instantiate() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::model::{ConstValue, GraphKey, Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{CLASSTYPE, Flavor, OBJECTPTR, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rpbc::ClassesPBCRepr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let left = ClassDef::new_standalone("pkg.Left", None);
+        let right = ClassDef::new_standalone("pkg.Right", None);
+        crate::translator::rtyper::normalizecalls::create_instantiate_function(&ann, &left)
+            .expect("left graph");
+        crate::translator::rtyper::normalizecalls::create_instantiate_function(&ann, &right)
+            .expect("right graph");
+        let s_pbc = SomePBC::new(
+            vec![
+                DescEntry::Class(left.borrow().classdesc.clone()),
+                DescEntry::Class(right.borrow().classdesc.clone()),
+            ],
+            false,
+        );
+        assert_eq!(s_pbc.descriptions.len(), 2);
+        let r_class = ClassesPBCRepr::new(&hop.rtyper, s_pbc).expect("ClassesPBCRepr");
+        let mut expected_graphs = Vec::new();
+        for entry in r_class.s_pbc.descriptions.values() {
+            let DescEntry::Class(desc) = entry else {
+                panic!("class desc");
+            };
+            let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(desc).unwrap();
+            let graph = classdef.borrow().my_instantiate_graph.clone().unwrap();
+            expected_graphs.push(GraphKey::of(&graph).as_usize());
+        }
+        let v_cls = Variable::new();
+        v_cls.set_concretetype(Some(CLASSTYPE.clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_cls));
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::PBC(
+                r_class.s_pbc.clone(),
+            ));
+        hop.args_r.borrow_mut().push(Some(
+            std::sync::Arc::new(r_class) as std::sync::Arc<dyn Repr>
+        ));
+        let r_result = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("object instance");
+        Repr::setup(r_result.as_ref()).expect("setup object");
+        *hop.r_result.borrow_mut() = Some(r_result as std::sync::Arc<dyn Repr>);
+
+        let out = rtype_instantiate(&hop, &HashMap::new())
+            .expect("rtype_instantiate")
+            .expect("cast_pointer result");
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 3);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        let Hlvalue::Constant(field) = &ops.ops[0].args[1] else {
+            panic!("getfield name");
+        };
+        assert_eq!(field.value, ConstValue::byte_str("instantiate"));
+        assert_eq!(ops.ops[1].opname, "indirect_call");
+        let Hlvalue::Constant(graphs) = &ops.ops[1].args[1] else {
+            panic!("c_graphs");
+        };
+        assert_eq!(graphs.value, ConstValue::Graphs(expected_graphs));
+        let Hlvalue::Variable(called) = &ops.ops[1].result else {
+            panic!("indirect_call result");
+        };
+        assert_eq!(called.concretetype(), Some(OBJECTPTR.clone()));
+        assert_eq!(ops.ops[2].opname, "cast_pointer");
+        assert_eq!(ops.ops[2].result, out);
+    }
+
+    #[test]
+    fn rtype_builtin_reversed_calls_r_result_newiter() {
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rrange::{AbstractRangeRepr, RangeIteratorRepr};
+
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::SpaceOperation;
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call",
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        let r_rng = AbstractRangeRepr::new(1).expect("step-1 range");
+        let iter = std::sync::Arc::new(RangeIteratorRepr::new(&r_rng).expect("range iterator"));
+        let v_rng = Variable::new();
+        v_rng.set_concretetype(Some(r_rng.lowleveltype().clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_rng));
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(std::sync::Arc::new(r_rng) as std::sync::Arc<dyn Repr>));
+        *hop.r_result.borrow_mut() = Some(iter as std::sync::Arc<dyn Repr>);
+
+        let out = rtype_builtin_reversed(&hop, &HashMap::new())
+            .expect("reversed")
+            .expect("newiter result");
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert_eq!(ops.ops[0].result, out);
+        let Hlvalue::Constant(func) = &ops.ops[0].args[0] else {
+            panic!("direct_call arg0 is the helper");
+        };
+        let rendered = format!("{:?}", func.value);
+        assert!(
+            rendered.contains("ll_rangeiter"),
+            "reversed on a range iterator must call ll_rangeiter, got {rendered}"
+        );
     }
 
     #[test]
@@ -5977,6 +6429,120 @@ mod tests {
             llops,
         );
         (ann, hop)
+    }
+
+    #[test]
+    fn rtype_dict_constructor_calls_ll_newdict() {
+        use crate::annotator::dictdef::DictDef;
+        use crate::annotator::model::{SomeDict, SomeInteger, SomeString, SomeValue};
+        use crate::translator::rtyper::rdict::somedict_rtyper_makerepr;
+
+        let (ann, hop) = dict_constructor_hop();
+        let _keep_ann = ann;
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let r_dict = somedict_rtyper_makerepr(&SomeDict::new(dictdef), &hop.rtyper).expect("dict");
+        *hop.r_result.borrow_mut() = Some(r_dict);
+
+        let out = rtype_dict_constructor(&hop, &HashMap::new())
+            .expect("dict constructor")
+            .expect("ll_newdict result");
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert_eq!(ops.ops[0].result, out);
+        let crate::flowspace::model::Hlvalue::Constant(func) = &ops.ops[0].args[0] else {
+            panic!("direct_call arg0 is the helper");
+        };
+        let rendered = format!("{:?}", func.value);
+        assert!(
+            rendered.contains("ll_newdict"),
+            "dict constructor must call ll_newdict, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn rtype_dict_constructor_stores_custom_eq_hash_fields() {
+        use crate::annotator::dictdef::DictDef;
+        use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let (ann, hop) = dict_constructor_hop();
+        let _keep_ann = ann;
+        let rtyper = hop.rtyper.clone();
+        let key = rtyper
+            .getrepr(&SomeValue::Integer(SomeInteger::default()))
+            .expect("key");
+        let value = rtyper
+            .getrepr(&SomeValue::String(SomeString::new(false, false)))
+            .expect("value");
+        let eq = std::sync::Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")))
+            as std::sync::Arc<dyn Repr>;
+        let hash = std::sync::Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")))
+            as std::sync::Arc<dyn Repr>;
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            true,
+            false,
+            false,
+        );
+        let r_dict = OrderedDictRepr::new(
+            rtyper.self_rc().expect("rtyper rc"),
+            key,
+            value,
+            dictdef,
+            Some((eq, hash)),
+            false,
+            false,
+        )
+        .expect("ordered dict");
+        *hop.r_result.borrow_mut() = Some(std::sync::Arc::new(r_dict) as std::sync::Arc<dyn Repr>);
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(2),
+                LowLevelType::Signed,
+            )),
+        ]);
+
+        rtype_dict_constructor(&hop, &HashMap::new()).expect("custom dict constructor");
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let fields: Vec<_> = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "setfield")
+            .map(|op| {
+                let Hlvalue::Constant(name) = &op.args[1] else {
+                    panic!("field name");
+                };
+                name.value.clone()
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                ConstValue::byte_str("fnkeyeq"),
+                ConstValue::byte_str("fnkeyhash"),
+            ]
+        );
     }
 
     fn hlinvoke_function(

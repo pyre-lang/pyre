@@ -330,6 +330,15 @@ fn dispatch_convert_from_to(
         (InteriorPtrRepr, InteriorPtrRepr) => {
             same_interior_ptr_dict_convert_from_to(r_from, r_to, v)
         }
+        // rpbc.py — pairtype(ClassesPBCRepr, ClassRepr). RootClassRepr
+        // subclasses ClassRepr upstream; both pyre types report
+        // ReprClassId::Repr, so the concrete type selects the handler.
+        (ClassesPBCRepr, Repr)
+            if r_to.type_id() == std::any::TypeId::of::<super::rclass::ClassRepr>()
+                || r_to.type_id() == std::any::TypeId::of::<super::rclass::RootClassRepr>() =>
+        {
+            super::rpbc::pair_classes_pbc_class_convert_from_to(r_from, r_to, v, llops)
+        }
         // rclass.py — pairtype(InstanceRepr,
         // InstanceRepr).convert_from_to: cast_pointer along the
         // subclass/superclass axis when one classdef is a base of the

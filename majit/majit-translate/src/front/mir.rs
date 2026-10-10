@@ -23326,6 +23326,17 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // A zero-sized std `default` is `lltype.Void`
+                // (`ObjectDictStrategy.get_empty_storage`: the `r_dict`
+                // hasher has no word). Layout size is the gate; a
+                // `Default` with a payload stays a call.
+                if args.is_empty() && self.is_void_zst_std_default(&reg, &call.dest.ty) {
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `(*p.add(i)).field` on a named struct pointee is
                 // `getinteriorfield` (`rewrite_op_getinteriorfield`). The
                 // add records the GcArray header and the index; the field
@@ -24731,6 +24742,18 @@ impl<'a> Lowering<'a> {
                     // blocks at the annotator.  The receiver is already a
                     // raw pointer (`is_ptr_identity_cast`), so this is a
                     // genuine `cast_pointer` (ptr→ptr).
+                    //
+                    // `addr_of_mut!((*header).items).cast::<Entry>()` is
+                    // `lltype.py direct_arrayitems`: the address of a
+                    // `[T; N]` field, `array_items_base` past the header
+                    // (`rordereddict.py get_ll_dict`, `DICTENTRYARRAY`).
+                    // The field read is the array value (`SomeList`), and
+                    // casting that list to the element root is not a
+                    // pointer cast. Recover the header and add the field
+                    // offset, then `cast_int_to_ptr`. `direct_ptradd` is
+                    // the wrong op here: the header is `SomeInstance`,
+                    // `null_mut` joins that as an instance, and
+                    // `ann_direct_arrayitems` is still deferred.
                     if let ValueType::Ref(_) = tyref_to_value_type_with(
                         &call.dest.ty,
                         self.llbc,
@@ -24738,13 +24761,24 @@ impl<'a> Lowering<'a> {
                         self.gc_struct_ids,
                     ) && let Some(kind) = self.instance_narrow_for_type(&call.dest.ty, &args[0])
                     {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind,
-                        });
+                        let res = if let Some((base, offset)) =
+                            self.taken_array_field_address(bb_id, &args[0])
+                            && let Some(root) = tyref_class_root_with(
+                                &call.dest.ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            ) {
+                            self.emit_array_tail_item_ptr(bb_id, base, offset, &root)
+                        } else {
+                            let res = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(res.clone()),
+                                kind,
+                            });
+                            res
+                        };
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
@@ -26896,6 +26930,27 @@ impl<'a> Lowering<'a> {
                                 // argument only.
                                 if let Some(root) = self.opaque_traced_method_self_root(&reg)
                                     && let Some(recv) = args.first().cloned()
+                                {
+                                    let narrowed = self.graph.alloc_value_var_with_type(
+                                        crate::model::ConcreteType::Unknown,
+                                    );
+                                    let bb_id = self.block_id[mir_bb];
+                                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                        result: Some(narrowed.clone()),
+                                        kind: crate::model::cast_instance_call(root, recv),
+                                    });
+                                    args[0] = narrowed;
+                                }
+                                // `ll_dict_setitem` / `ll_dict_lookup`
+                                // (`rordereddict.py`) type the receiver as
+                                // the ordered dict. Paint the instantiated
+                                // `RDict<K,V,S>` so that cast is `SomeDict`;
+                                // a bare `RDict` parameter stays an instance.
+                                if let Some(root) = rdict_insert_get_cast_root(
+                                    &segments,
+                                    first_arg_ty.as_ref(),
+                                    self.llbc,
+                                ) && let Some(recv) = args.first().cloned()
                                 {
                                     let narrowed = self.graph.alloc_value_var_with_type(
                                         crate::model::ConcreteType::Unknown,
@@ -29983,6 +30038,171 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Address-taken `[T; N]` field whose result is `var`.
+    ///
+    /// `direct_arrayitems` (`lltype.py`) is that field's address. The
+    /// header is the field-read base; the byte offset is the field's
+    /// layout offset (`array_items_base` for a length-prefixed array).
+    fn taken_array_field_address(&self, bb_id: BlockId, var: &Variable) -> Option<(Variable, u64)> {
+        let found = {
+            let block = self.graph.block(bb_id);
+            let mut found = None;
+            for op in &block.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    continue;
+                };
+                if op.result.as_ref() != Some(var) || !field.taken_by_address {
+                    continue;
+                }
+                let Some(owner) = field.owner_root.clone() else {
+                    continue;
+                };
+                found = Some((base.clone(), owner, field.name.clone()));
+                break;
+            }
+            found
+        }?;
+        let offset = self.array_field_tail_offset(&found.1, &found.2)?;
+        Some((found.0, offset))
+    }
+
+    /// Byte offset of the `[T; N]` field `field_name` on struct leaf
+    /// `owner`. Every matching declaration must agree. A missing layout
+    /// with the array at field 1 (the `usize` length word of
+    /// `GcEntries`) is one target word.
+    fn array_field_tail_offset(&self, owner: &str, field_name: &str) -> Option<u64> {
+        let leaf = owner
+            .rsplit("::")
+            .next()
+            .unwrap_or(owner)
+            .split('<')
+            .next()
+            .unwrap_or(owner);
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let mut offset: Option<u64> = None;
+        let mut index: Option<usize> = None;
+        let mut saw = false;
+        for td in self.llbc.iter_type_decls() {
+            let name = td.item_meta.name_path();
+            let td_leaf = name.rsplit("::").next().unwrap_or("");
+            if td_leaf.split('<').next().unwrap_or(td_leaf) != leaf {
+                continue;
+            }
+            let TypeDeclKind::Struct(fields) = &td.kind else {
+                continue;
+            };
+            let Some(idx) = fields
+                .iter()
+                .position(|field| field.name.as_deref() == Some(field_name))
+            else {
+                continue;
+            };
+            let Some(node) = tyref_node(&fields[idx].ty, self.llbc) else {
+                continue;
+            };
+            let Some(stripped) = strip_ty_wrappers(node, self.llbc) else {
+                continue;
+            };
+            if !stripped
+                .as_object()
+                .is_some_and(|obj| obj.contains_key("Array"))
+            {
+                continue;
+            }
+            saw = true;
+            match index {
+                None => index = Some(idx),
+                Some(prev) if prev != idx => return None,
+                Some(_) => {}
+            }
+            if let Some(layout) = td.layout_for_target(self.llbc, &target) {
+                let off = layout.struct_field_offset(idx)?;
+                match offset {
+                    None => offset = Some(off),
+                    Some(prev) if prev != off => return None,
+                    Some(_) => {}
+                }
+            }
+        }
+        if let Some(off) = offset {
+            return Some(off);
+        }
+        if saw && index == Some(1) {
+            return Some(crate::layout::target_word_size() as u64);
+        }
+        None
+    }
+
+    /// `direct_arrayitems` (`lltype.py`) as `cast_ptr_to_int` + add +
+    /// `cast_int_to_ptr` + `cast_instance`. The integer is not recorded
+    /// in `cast_ptr_to_int_src`: the round-trip fold would drop `offset`.
+    /// Offset 0 is the header itself (`GcArray` items at byte 0).
+    fn emit_array_tail_item_ptr(
+        &mut self,
+        bb_id: BlockId,
+        base: Variable,
+        offset: u64,
+        root: &str,
+    ) -> Variable {
+        let raw = if offset == 0 {
+            base
+        } else {
+            let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, base);
+            let off = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            let off_n = i64::try_from(offset).expect("array field offset fits in Signed");
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(off.clone()),
+                kind: OpKind::ConstInt(off_n),
+            });
+            let sum = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(sum.clone()),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: addr,
+                    rhs: off,
+                    result_ty: ValueType::Int,
+                },
+            });
+            let raw = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(raw.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: [
+                            "rpython",
+                            "rtyper",
+                            "lltypesystem",
+                            "lltype",
+                            "cast_int_to_ptr",
+                        ]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![sum]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+            raw
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: crate::model::cast_instance_call(root, raw),
+        });
+        res
+    }
+
     /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
     /// / `<ptr>::cast` — address-preserving const↔mut flips and pointee
     /// retypes.  The same i64 machine repr as the receiver, so the JIT
@@ -31921,6 +32141,28 @@ impl<'a> Lowering<'a> {
             segs.as_slice(),
             ["core", "ptr", "const_ptr", "<Impl>", "as_ref"]
         )
+    }
+
+    /// Zero-argument std `default` whose destination is a void ZST.
+    ///
+    /// `name_path` spells the impl as `core::hash::<Impl>::default`. The
+    /// layout size, not the `Self` name, is the gate: a zero-sized
+    /// `core`/`std`/`alloc` `default` is `lltype.Void`
+    /// (`ObjectDictStrategy.get_empty_storage`). A `Default` with a
+    /// payload stays a call, and a pyre `default` stays a call.
+    fn is_void_zst_std_default(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        if !tyref_is_void_zst(dest_ty, self.llbc) {
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let root = path.split("::").next().unwrap_or("");
+        path.rsplit("::").next() == Some("default") && matches!(root, "core" | "std" | "alloc")
     }
 
     /// `<*mut T>::add` / `<*const T>::add` / `::sub` when the pointee has a
@@ -41516,6 +41758,41 @@ fn recast_operand(kind: &OpKind) -> Option<&Variable> {
     match kind {
         OpKind::Call { args, .. } => args.first().and_then(|arg| arg.as_variable()),
         _ => None,
+    }
+}
+
+/// `RDict::insert` / `RDict::get` receiver spelling for
+/// `__cast_instance_intrinsic`.
+///
+/// `ll_dict_setitem` / `ll_dict_lookup` (`rordereddict.py`) see an ordered
+/// dict. The cast root is the instantiated `RDict<K,V,S>` (references and
+/// the raw-pointer prefix stripped) so the receiver annotates as
+/// `SomeDict`. A bare `RDict` is not that dict. The monomorphized leaf's
+/// hash is not part of the match.
+fn rdict_insert_get_cast_root(
+    segments: &[String],
+    recv_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> Option<String> {
+    if segments.len() < 3 || segments[segments.len() - 2] != "RDict" {
+        return None;
+    }
+    let leaf = crate::front::clause_spec::unspecialized_leaf(segments.last()?);
+    if leaf != "insert" && leaf != "get" {
+        return None;
+    }
+    let spelled = tyref_to_ast_string(recv_ty?, llbc);
+    let spelled = if let Some(rest) = spelled.strip_prefix("*const ") {
+        rest.to_string()
+    } else if let Some(rest) = spelled.strip_prefix("*mut ") {
+        rest.to_string()
+    } else {
+        spelled
+    };
+    if spelled.starts_with("RDict<") {
+        Some(spelled)
+    } else {
+        None
     }
 }
 
