@@ -3005,9 +3005,10 @@ fn build_gc() -> Box<MiniMarkGC> {
             w_dict_view_tid,
         );
         pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_tid);
-        // `W_DictViewObject` is `malloc_typed`-immortal and not a
-        // `#[pyre_class]`, so register its `w_dict` back-pointer offset for the
-        // interpreter's generic immortal-root walker.
+        // `W_DictViewObject` is allocated with `malloc_typed_managed`
+        // (`w_dict_keys_new` / values / items) and is not a `#[pyre_class]`;
+        // register its `w_dict` back-pointer offset for the interpreter's
+        // generic root walker.
         pyre_object::gc_hook::register_pyre_class_offsets(
             tp as *const _ as usize,
             &pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS,

@@ -5010,6 +5010,12 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
 /// — `return self.get_strategy().length(self)`.  Dispatches through
 /// the polymorphic strategy slot.
 ///
+/// No root guard: `length` is `len(unerase(dstorage))` /
+/// `d.num_live_items` (`rordereddict.py ll_dict_len`) and does not
+/// collect, the same reason [`crate::listobject::w_list_len`] reads
+/// `live_len` without `w_list_lock`.  The guard's `push_roots` is
+/// `dont_look_inside`, so taking it residualized every traced `len(dict)`.
+///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -6438,6 +6444,7 @@ impl crate::lltype::GcType for W_DictViewObject {
 /// PyPy's three distinct W_TypeObject identities so
 /// `type(d.keys()) is dict_keys`, `type(d.values()) is dict_values`,
 /// `type(d.items()) is dict_items` all hold.
+#[inline]
 pub fn dict_view_type_for_kind(kind: DictViewKind) -> &'static PyType {
     match kind {
         DictViewKind::Keys => &DICT_KEYS_TYPE,
@@ -6446,34 +6453,60 @@ pub fn dict_view_type_for_kind(kind: DictViewKind) -> &'static PyType {
     }
 }
 
-/// Allocate a fresh dict view bound to `w_dict`.
-pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
-    let tp = dict_view_type_for_kind(kind);
-    let _roots = crate::gc_roots::push_roots();
-    let dict_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(w_dict);
-    let raw =
-        crate::gc_hook::try_gc_alloc_nursery_raw(W_DICT_VIEW_GC_TYPE_ID, W_DICT_VIEW_OBJECT_SIZE);
-    let value = W_DictViewObject {
+/// Allocate a `dict_keys` view.  `W_DictViewKeysObject.__init__`
+/// (`dictmultiobject.py`) is a two-field store of the source dict onto a
+/// class whose type is known at the constructor; `descr_keys` returns
+/// `W_DictViewKeysObject(self)`.  The type pointer is the `DICT_KEYS_TYPE`
+/// singleton so `fuse_boxing_alloc` can rewrite `malloc_typed_managed` to
+/// `new_with_vtable` — a runtime `dict_view_type_for_kind` match leaves
+/// `ob_type` non-constant and the cluster unfused.
+#[inline(always)]
+pub fn w_dict_keys_new(w_dict: PyObjectRef) -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(W_DictViewObject {
         ob_header: PyObject {
-            ob_type: tp as *const PyType,
-            w_class: get_instantiate(tp),
+            ob_type: &DICT_KEYS_TYPE as *const PyType,
+            w_class: get_instantiate(&DICT_KEYS_TYPE),
         },
-        kind,
-        w_dict: crate::gc_roots::shadow_stack_get(dict_slot),
-    };
-    if raw.is_null() {
-        crate::lltype::malloc_typed(value) as PyObjectRef
-    } else {
-        unsafe { std::ptr::write(raw as *mut W_DictViewObject, value) };
-        // The shell is a livevar across the barrier: that call is a `gc_op`,
-        // which leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`) and
-        // roots only its own copy, so a foreign collector can move it there.
-        // Publish it first and return the address the slot carries afterwards.
-        let shell_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
-        crate::gc_hook::try_gc_write_barrier(raw);
-        crate::gc_roots::shadow_stack_get(shell_slot)
+        kind: DictViewKind::Keys,
+        w_dict,
+    }) as PyObjectRef
+}
+
+/// Allocate a `dict_values` view.  `W_DictViewValuesObject.__init__`.
+#[inline(always)]
+pub fn w_dict_values_new(w_dict: PyObjectRef) -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(W_DictViewObject {
+        ob_header: PyObject {
+            ob_type: &DICT_VALUES_TYPE as *const PyType,
+            w_class: get_instantiate(&DICT_VALUES_TYPE),
+        },
+        kind: DictViewKind::Values,
+        w_dict,
+    }) as PyObjectRef
+}
+
+/// Allocate a `dict_items` view.  `W_DictViewItemsObject.__init__`.
+#[inline(always)]
+pub fn w_dict_items_new(w_dict: PyObjectRef) -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(W_DictViewObject {
+        ob_header: PyObject {
+            ob_type: &DICT_ITEMS_TYPE as *const PyType,
+            w_class: get_instantiate(&DICT_ITEMS_TYPE),
+        },
+        kind: DictViewKind::Items,
+        w_dict,
+    }) as PyObjectRef
+}
+
+/// Dispatch to the type-specific constructor.  Residual / non-wrapper
+/// callers that only have a `DictViewKind` still go through a fused
+/// `new_with_vtable` body.
+#[inline(always)]
+pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
+    match kind {
+        DictViewKind::Keys => w_dict_keys_new(w_dict),
+        DictViewKind::Values => w_dict_values_new(w_dict),
+        DictViewKind::Items => w_dict_items_new(w_dict),
     }
 }
 

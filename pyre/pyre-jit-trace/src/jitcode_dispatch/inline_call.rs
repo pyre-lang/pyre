@@ -80,9 +80,8 @@ unsafe fn exact_builtin_len_shortcut_receiver(obj: pyre_object::PyObjectRef) -> 
         || std::ptr::eq(ob_type, &pyre_object::setobject::SET_TYPE)
         || std::ptr::eq(ob_type, &pyre_object::setobject::FROZENSET_TYPE)
         || std::ptr::eq(ob_type, &pyre_object::functional::RANGE_TYPE)
-        // `len_slot` forwards an exact dict and its views to `w_dict_len`.
-        // That leaf stays `dont_look_inside`, so the walk records the call
-        // and does not read strategy storage itself.
+        // `len_slot` forwards an exact dict and its views to `w_dict_len`
+        // (`W_DictMultiObject.length` → `get_strategy().length(self)`).
         || std::ptr::eq(ob_type, &pyre_object::pyobject::DICT_TYPE)
         || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_KEYS_TYPE)
         || std::ptr::eq(ob_type, &pyre_object::dictmultiobject::DICT_VALUES_TYPE)

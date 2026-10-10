@@ -6343,6 +6343,7 @@ pub fn set_dict_backing(obj: PyObjectRef, backing: PyObjectRef) -> bool {
     false
 }
 
+#[inline]
 pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         if is_dict(obj) {
@@ -6641,58 +6642,70 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `w_dict_len` behind it never reach the trace. Upstream has no such split:
 /// `interp2app` turns every builtin method into one of these graphs.
 pub fn __majit_wrap_dict_descr_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 1 {
+        let dict = resolve_dict_backing(args[0]);
+        if !dict.is_null() {
+            return Ok(pyre_object::dictmultiobject::w_dict_keys_new(dict));
+        }
+    }
+    dict_descr_keys_residual(args)
+}
+
+/// Arity / type-error arms of `descr_keys`.  `arity_exact` pulls
+/// `declaring_builtin_type_name` into the graph; the descent's blocker
+/// scan is whole-body, so a runtime branch does not keep it out.
+#[majit_macros::dont_look_inside]
+fn dict_descr_keys_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "keys", 0)?;
     require_receiver(args, "keys")?;
-    let dict = resolve_dict_backing(args[0]);
-    if dict.is_null() {
-        // Type-erased fallback: the receiver isn't a dict, surface
-        // an empty view rather than fabricating a foreign-shaped
-        // list (the view's source-dict slot tolerates PY_NULL via
-        // the read-side guards).
-        return Ok(pyre_object::dictmultiobject::w_dict_view_new(
-            pyre_object::PY_NULL,
-            pyre_object::dictmultiobject::DictViewKind::Keys,
-        ));
-    }
-    Ok(pyre_object::dictmultiobject::w_dict_view_new(
-        dict,
-        pyre_object::dictmultiobject::DictViewKind::Keys,
+    // Type-erased fallback: the receiver isn't a dict, surface
+    // an empty view rather than fabricating a foreign-shaped
+    // list (the view's source-dict slot tolerates PY_NULL via
+    // the read-side guards).
+    Ok(pyre_object::dictmultiobject::w_dict_keys_new(
+        pyre_object::PY_NULL,
     ))
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:descr_values` parity — same
 /// shape as `__majit_wrap_dict_descr_keys`, kind tag `Values`.
 pub fn __majit_wrap_dict_descr_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 1 {
+        let dict = resolve_dict_backing(args[0]);
+        if !dict.is_null() {
+            return Ok(pyre_object::dictmultiobject::w_dict_values_new(dict));
+        }
+    }
+    dict_descr_values_residual(args)
+}
+
+#[majit_macros::dont_look_inside]
+fn dict_descr_values_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "values", 0)?;
     require_receiver(args, "values")?;
-    let dict = resolve_dict_backing(args[0]);
-    if dict.is_null() {
-        return Ok(pyre_object::dictmultiobject::w_dict_view_new(
-            pyre_object::PY_NULL,
-            pyre_object::dictmultiobject::DictViewKind::Values,
-        ));
-    }
-    Ok(pyre_object::dictmultiobject::w_dict_view_new(
-        dict,
-        pyre_object::dictmultiobject::DictViewKind::Values,
+    Ok(pyre_object::dictmultiobject::w_dict_values_new(
+        pyre_object::PY_NULL,
     ))
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:descr_items` parity — same
 /// shape as `__majit_wrap_dict_descr_keys`, kind tag `Items`.
 pub fn __majit_wrap_dict_descr_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 1 {
+        let dict = resolve_dict_backing(args[0]);
+        if !dict.is_null() {
+            return Ok(pyre_object::dictmultiobject::w_dict_items_new(dict));
+        }
+    }
+    dict_descr_items_residual(args)
+}
+
+#[majit_macros::dont_look_inside]
+fn dict_descr_items_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "items", 0)?;
     require_receiver(args, "items")?;
-    let dict = resolve_dict_backing(args[0]);
-    if dict.is_null() {
-        return Ok(pyre_object::dictmultiobject::w_dict_view_new(
-            pyre_object::PY_NULL,
-            pyre_object::dictmultiobject::DictViewKind::Items,
-        ));
-    }
-    Ok(pyre_object::dictmultiobject::w_dict_view_new(
-        dict,
-        pyre_object::dictmultiobject::DictViewKind::Items,
+    Ok(pyre_object::dictmultiobject::w_dict_items_new(
+        pyre_object::PY_NULL,
     ))
 }
 
