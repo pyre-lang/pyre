@@ -57,16 +57,16 @@ fn lowers_straight_line_add() {
         3,
         "straight_line_add takes three i64 args"
     );
-    // Charon nightly-2026.10.04 emits 7 MIR BBs: three overflow Asserts,
-    // a Return, and a dedicated UnwindResume successor per Assert.
-    // `FunDecl::unstructured` drops the three cleanup blocks and appends
-    // one shared UnwindResume, leaving 5. The FunctionGraph adds
-    // startblock(0)/returnblock(1)/exceptblock(2) as canonical sentinels
-    // but the MIR bb0 maps onto startblock, so the total is 5 + 2 = 7.
+    // Charon emits 7 MIR BBs: three overflow Asserts, a Return, and one
+    // cleanup UnwindResume per Assert. `FlowContext.build_flow` records a
+    // block only when `pendingblocks` reaches it, and the lowering never
+    // follows `on_unwind`, so the three cleanup blocks are not recorded.
+    // bb0 maps onto startblock; returnblock and exceptblock are the other
+    // sentinels. 4 reachable MIR blocks + those two sentinels = 6.
     assert_eq!(
         graph.blocks.len(),
-        7,
-        "5 MIR bbs + returnblock + exceptblock"
+        6,
+        "4 reachable MIR bbs + returnblock + exceptblock"
     );
 
     // At least one of the MIR blocks should carry a BinOp operation
@@ -146,9 +146,11 @@ fn lowers_strategy_len_with_discriminant_switch() {
     let llbc = load_corpus();
     let graph = lower_function(llbc, "strategy_len").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::strategy_len");
-    // bb0 Discriminant + Switch, bb1/bb2/bb3 arm bodies + Return,
-    // bb4 Abort → 5 MIR bbs + returnblock + exceptblock = 7.
-    assert_eq!(graph.blocks.len(), 7);
+    // bb0 Discriminant + Switch, bb1/bb2/bb3 arm bodies + Return.
+    // bb4 is the Abort default of that switch, outside the edges the
+    // lowering emits, so it is not recorded. 4 reachable MIR bbs +
+    // returnblock + exceptblock = 6.
+    assert_eq!(graph.blocks.len(), 6);
 }
 
 /// Charon `TerminatorKind::Panic` lowers the same implicit

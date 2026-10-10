@@ -762,7 +762,14 @@ fn collect_ref_enum_instantiations(
         let Some(u) = fd.unstructured() else {
             continue;
         };
-        for bb in &u.body {
+        // Constructor heads that exist only on an `on_unwind` cleanup chain
+        // are not part of the lowered body. The local-type scan below still
+        // sees an instantiation a normal block only reads.
+        let forward_blocks = forward_reachable_mask(llbc, &u);
+        for (bb_idx, bb) in u.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for st in &bb.statements {
                 let Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, _))) = st.stmt_kind_ref()
                 else {
@@ -4877,7 +4884,11 @@ pub fn residual_owner_root_guard_escapes(llbc: &Llbc) -> Vec<(String, String)> {
 /// and the proof cannot drift.
 fn local_def_counts(body: &Unstructured, llbc: &Llbc, n: usize) -> Vec<usize> {
     let mut def_count = vec![0usize; n];
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for st in &bb.statements {
             if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
                 && let &PlaceKind::Local(i) = &place.kind
@@ -5799,6 +5810,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             tombstoned_leaves,
             gc_struct_ids,
         );
+        // `flowcontext.py` `fixeggblocks`, once the body is a finished graph.
+        lo.graph.fixeggblocks();
         Ok(())
     };
     // Framestate-threaded lowering (the GAP-B path that threads locals
@@ -7948,6 +7961,197 @@ pub use majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID;
 /// STRPTR↔GCREF conversion at each item boundary.
 const STRING_GCREF_GCARRAY_TYPE_ID: &str = "[str]";
 
+/// MIR block → the flow-graph block recorded for it.
+///
+/// `FlowContext.build_flow` records a block only when `pendingblocks`
+/// reaches it. Edges [`successor_blocks`] does not emit — every
+/// `on_unwind`, and a `SwitchInt` default whose target is a panic abort —
+/// never enqueue a block, so those MIR blocks have no [`BlockId`] and no
+/// per-block row. `Index` yields the graph block; [`MirBlockMap::row`] is
+/// the dense index into the per-block tables.
+#[derive(Clone)]
+struct MirBlockMap {
+    ids: Vec<Option<BlockId>>,
+    row_of: Vec<u32>,
+    nrows: usize,
+}
+
+impl MirBlockMap {
+    fn from_lowered(graph: &mut FunctionGraph, lowered: &[bool]) -> Self {
+        let n = lowered.len();
+        let mut ids = vec![None; n];
+        let mut row_of = vec![u32::MAX; n];
+        let mut nrows = 0usize;
+        if n > 0 {
+            debug_assert!(lowered[0], "bb0 is the entry of every body");
+            ids[0] = Some(graph.startblock);
+            row_of[0] = 0;
+            nrows = 1;
+            for mir_bb in 1..n {
+                if !lowered[mir_bb] {
+                    continue;
+                }
+                ids[mir_bb] = Some(graph.create_block());
+                row_of[mir_bb] = nrows as u32;
+                nrows += 1;
+            }
+        }
+        Self { ids, row_of, nrows }
+    }
+
+    fn nrows(&self) -> usize {
+        self.nrows
+    }
+
+    fn is_lowered(&self, mir_bb: usize) -> bool {
+        self.ids.get(mir_bb).is_some_and(Option::is_some)
+    }
+
+    fn row(&self, mir_bb: usize) -> usize {
+        let row = self.row_of.get(mir_bb).copied().unwrap_or(u32::MAX);
+        assert!(
+            row != u32::MAX,
+            "MIR bb{mir_bb} is outside the lowered closure"
+        );
+        row as usize
+    }
+
+    /// Move the emit cursor for this MIR block to `id`. The dense row and
+    /// the entry stay fixed: `store_enum_variant` / `copy_enum_switch` split
+    /// the block and only move where the rest of the block is emitted.
+    fn set(&mut self, mir_bb: usize, id: BlockId) {
+        let slot = self
+            .ids
+            .get_mut(mir_bb)
+            .unwrap_or_else(|| panic!("MIR bb{mir_bb} is outside the lowered closure"));
+        assert!(
+            slot.is_some(),
+            "MIR bb{mir_bb} is outside the lowered closure"
+        );
+        *slot = Some(id);
+    }
+
+    fn iter_lowered(&self) -> impl Iterator<Item = (usize, BlockId)> + '_ {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter_map(|(mir, id)| id.map(|id| (mir, id)))
+    }
+}
+
+impl std::ops::Index<usize> for MirBlockMap {
+    type Output = BlockId;
+
+    fn index(&self, mir_bb: usize) -> &BlockId {
+        self.ids[mir_bb]
+            .as_ref()
+            .unwrap_or_else(|| panic!("MIR bb{mir_bb} is outside the lowered closure"))
+    }
+}
+
+fn terminator_is_panic_abort(llbc: &Llbc, body: &Unstructured, bb: u64) -> bool {
+    matches!(
+        body.body
+            .get(bb as usize)
+            .and_then(|block| block.term_ref(llbc).ok()),
+        Some(
+            TermKind::Abort(_)
+                | TermKind::Panic { .. }
+                | TermKind::UnwindResume
+                | TermKind::UnwindTerminate
+                | TermKind::UndefinedBehavior
+        )
+    )
+}
+
+/// Successors [`Lowering::lower_terminator`] materialises, plus — when
+/// `include_panic_default` — a `SwitchInt` default that targets a panic
+/// abort. `on_unwind` is never a successor: a Rust panic propagates out
+/// of the frame, the way an RPython operation with no handler raises to
+/// its caller.
+fn successor_blocks(
+    llbc: &Llbc,
+    body: &Unstructured,
+    mir_bb: usize,
+    include_panic_default: bool,
+) -> Vec<usize> {
+    let n = body.body.len();
+    let Ok(term) = body.body[mir_bb].term_ref(llbc) else {
+        return Vec::new();
+    };
+    let raw: Vec<u64> = match term {
+        TermKind::Goto { target } => vec![*target],
+        TermKind::Call { target, .. }
+        | TermKind::Assert { target, .. }
+        | TermKind::Drop { target, .. } => vec![*target],
+        TermKind::Switch { targets, .. } => match targets {
+            SwitchTargets::If(a, b) => vec![*a, *b],
+            SwitchTargets::SwitchInt(_, arms, default) => {
+                let mut targets: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
+                let panic = terminator_is_panic_abort(llbc, body, *default);
+                if include_panic_default || !panic {
+                    targets.push(*default);
+                }
+                targets
+            }
+        },
+        TermKind::Return
+        | TermKind::UnwindResume
+        | TermKind::UnwindTerminate
+        | TermKind::Abort(_)
+        | TermKind::Panic { .. }
+        | TermKind::UndefinedBehavior
+        | TermKind::Unknown => Vec::new(),
+    };
+    let mut out = Vec::new();
+    for target in raw {
+        let target = target as usize;
+        if target >= n || out.contains(&target) {
+            continue;
+        }
+        if !include_panic_default {
+            debug_assert!(
+                !body.body[target].is_cleanup,
+                "normal edge bb{mir_bb} -> bb{target} enters a cleanup block"
+            );
+        }
+        out.push(target);
+    }
+    out
+}
+
+fn reachable_mask(llbc: &Llbc, body: &Unstructured, include_panic_default: bool) -> Vec<bool> {
+    let n = body.body.len();
+    let mut reached = vec![false; n];
+    if n == 0 {
+        return reached;
+    }
+    reached[0] = true;
+    let mut stack = vec![0usize];
+    while let Some(bb) = stack.pop() {
+        for succ in successor_blocks(llbc, body, bb, include_panic_default) {
+            if !reached[succ] {
+                reached[succ] = true;
+                stack.push(succ);
+            }
+        }
+    }
+    reached
+}
+
+/// Blocks reachable from bb0 along every normal edge, including a
+/// `SwitchInt` default the lowering does not emit. Whole-body scans use
+/// this set: a panic-abort block can still assign a local, and an
+/// `on_unwind` cleanup block cannot.
+pub(crate) fn forward_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
+    reachable_mask(llbc, body, true)
+}
+
+/// Blocks reachable from bb0 along the edges the lowering emits.
+fn lowered_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
+    reachable_mask(llbc, body, false)
+}
+
 /// The `(base, index)` operands of a devirtualized workspace index call,
 /// recorded for the paired `*p = v` write.  Each operand keeps the
 /// resolving-block Variable plus its source MIR local (`None` for a
@@ -8091,14 +8295,17 @@ struct Lowering<'a> {
     /// `slice_next_iter[opt] = Some(iter)` when `opt` is the destination of
     /// `next` on pair-slice iterator local `iter`. One-shot, from the body.
     slice_next_iter: Vec<Option<usize>>,
-    /// `block_id[i]` = FunctionGraph BlockId for MIR basic block `i`.
-    /// Incoming edges always target this entry. A bounds fork does not
-    /// retarget it.
-    block_id: Vec<BlockId>,
+    /// `block_id[i]` = FunctionGraph BlockId for MIR basic block `i`,
+    /// when `i` is in the lowered closure. Incoming edges always target
+    /// this entry. A bounds fork does not retarget it.
+    block_id: MirBlockMap,
     /// Graph block that currently receives operations for MIR `i`. Starts
     /// equal to [`Self::block_id`]; a bounds fork moves it to the in-bounds
     /// tail so later ops and the terminator stay after the guard.
-    emit_block: Vec<BlockId>,
+    emit_block: MirBlockMap,
+    /// [`forward_reachable_mask`] of this body. Scans that classify a
+    /// local from every assignment consult it and skip the rest.
+    forward_reached: Vec<bool>,
     /// MIR locals that are live when entering each block. Non-entry
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
@@ -8989,15 +9196,14 @@ impl<'a> Lowering<'a> {
             .operations
             .extend(input_ops);
 
-        // Pre-allocate a Block for each MIR basic block so terminators
-        // can refer to successors via stable BlockId. MIR bb0 maps to
-        // the FunctionGraph startblock (already exists); the rest are
-        // freshly created.
-        let mut block_id: Vec<BlockId> = Vec::with_capacity(body.body.len());
-        block_id.push(graph.startblock);
-        for _ in 1..body.body.len() {
-            block_id.push(graph.create_block());
-        }
+        // `FlowContext.build_flow` records a block only when `pendingblocks`
+        // reaches it. Edges `successor_blocks` does not emit — every
+        // `on_unwind`, and a `SwitchInt` default whose target is a panic
+        // abort — never enqueue a block, so those MIR blocks get no
+        // `BlockId`, no per-block row, and no dead stub.
+        let forward_reached = forward_reachable_mask(llbc, body);
+        let lowered = lowered_reachable_mask(llbc, body);
+        let block_id = MirBlockMap::from_lowered(&mut graph, &lowered);
         let mut extra_live = compute_index_write_extra_live(body, llbc, gc_struct_ids);
         let interior_live = compute_interior_field_extra_live(body, llbc, tombstoned_leaves);
         if extra_live.len() < interior_live.len() {
@@ -9091,15 +9297,24 @@ impl<'a> Lowering<'a> {
                 matches!(role, Some(RawArrayRole::Storage { .. })).then_some(local)
             }));
         }
+        // Panic-abort blocks stay in the fixpoint above so their uses still
+        // flow into the switch that targets them. Only the lowered closure
+        // keeps a row.
+        let block_live_in: Vec<bit_set::BitSet> = block_live_in
+            .into_iter()
+            .enumerate()
+            .filter(|(mir_bb, _)| lowered.get(*mir_bb).copied().unwrap_or(false))
+            .map(|(_, live)| live)
+            .collect();
+        let nrows = block_id.nrows();
         let mut block_entry_local_var = vec![
             PackedLocalRow {
                 len: n_slots,
                 bound: Vec::new()
             };
-            body.body.len()
+            nrows
         ];
-        let block_entry_positional_aggregate_locals =
-            vec![std::collections::HashMap::new(); body.body.len()];
+        let block_entry_positional_aggregate_locals = vec![std::collections::HashMap::new(); nrows];
         // A `[T; N]` array borrowed as a slice lives in a raw item buffer
         // for the whole body, the frame slot a native frame gives it: the
         // buffer is allocated on entry, reused by every construction of the
@@ -9138,17 +9353,21 @@ impl<'a> Lowering<'a> {
         if !block_entry_local_var.is_empty() {
             block_entry_local_var[0] = PackedLocalRow::pack(&link_words_of(&local_var));
         }
-        for mir_bb in 1..body.body.len() {
+        for (mir_bb, bid) in block_id.iter_lowered() {
+            if mir_bb == 0 {
+                continue;
+            }
+            let row = block_id.row(mir_bb);
             for local_idx in 0..n_slots {
                 if !block_live_in
-                    .get(mir_bb)
+                    .get(row)
                     .is_some_and(|s| s.contains(local_idx))
                 {
                     continue;
                 }
                 let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                graph.push_inputarg_var(block_id[mir_bb], var.clone());
-                block_entry_local_var[mir_bb].set(local_idx, var);
+                graph.push_inputarg_var(bid, var.clone());
+                block_entry_local_var[row].set(local_idx, var);
             }
         }
         Ok(Self {
@@ -9170,27 +9389,22 @@ impl<'a> Lowering<'a> {
             slice_next_iter,
             emit_block: block_id.clone(),
             block_id,
+            forward_reached,
             block_live_in,
             block_entry_local_var,
             input_copied_from: std::collections::HashMap::new(),
             object_vec_headers: std::collections::HashSet::new(),
             block_entry_positional_aggregate_locals,
-            block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
-            block_positional_conflict: vec![
-                bit_set::BitSet::with_capacity(n_locals);
-                body.body.len()
-            ],
+            block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
+            block_positional_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
             block_entry_string_byte_view_locals: vec![
                 bit_set::BitSet::with_capacity(n_locals);
-                body.body.len()
+                nrows
             ],
-            block_byte_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
-            block_byte_view_conflict: vec![
-                bit_set::BitSet::with_capacity(n_locals);
-                body.body.len()
-            ],
+            block_byte_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
+            block_byte_view_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
             positional_aggregate_locals: std::collections::HashMap::new(),
-            binop_result_locals: compute_binop_result_locals(body),
+            binop_result_locals: compute_binop_result_locals(llbc, body),
             builder_mode: false,
             accum: accum.clone(),
             index_elem_alias: std::collections::HashMap::new(),
@@ -9308,92 +9522,16 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Block processing order.  `Linear` is plain MIR index order.
-    /// `ReversePostorder` is the reverse-postorder of the MIR CFG rooted
-    /// at bb0, followed by any blocks unreachable from bb0 (ascending
-    /// index, so the graph stays complete — every block is still
-    /// lowered).  Successors mirror the `lower_terminator` edges exactly
-    /// (normal target *and* `on_unwind` for `Call`/`Assert`/`Drop`; both
-    /// arms of an `If`; every arm plus the default of a `SwitchInt`) so
-    /// this order matches the CFG the classifier diagnostic validated.
+    /// Block processing order over the lowered closure.
+    ///
+    /// `Linear` is MIR index order. `ReversePostorder` is
+    /// [`Self::model_rpo`]: the reverse-postorder of [`Self::model_succs`]
+    /// from bb0. Blocks `pendingblocks` would never reach are absent.
     fn block_processing_order(&self, order: BlockOrder) -> Vec<usize> {
-        let n = self.body.body.len();
         if matches!(order, BlockOrder::Linear) {
-            return (0..n).collect();
+            return self.block_id.iter_lowered().map(|(mir, _)| mir).collect();
         }
-        if n == 0 {
-            return vec![];
-        }
-        let succs = |bb: usize| -> Vec<usize> {
-            let Ok(term) = self.body.body[bb].term_ref(self.llbc) else {
-                return vec![];
-            };
-            let raw: Vec<u64> = match term {
-                TermKind::Goto { target } => vec![*target],
-                TermKind::Call {
-                    target, on_unwind, ..
-                }
-                | TermKind::Assert {
-                    target, on_unwind, ..
-                }
-                | TermKind::Drop {
-                    target, on_unwind, ..
-                } => vec![*target, *on_unwind],
-                TermKind::Switch { targets, .. } => match targets {
-                    SwitchTargets::If(a, b) => vec![*a, *b],
-                    SwitchTargets::SwitchInt(_, arms, default) => {
-                        let mut v: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
-                        v.push(*default);
-                        v
-                    }
-                },
-                TermKind::Return
-                | TermKind::UnwindResume
-                | TermKind::UnwindTerminate
-                | TermKind::Abort(_)
-                | TermKind::Panic { .. }
-                | TermKind::UndefinedBehavior
-                | TermKind::Unknown => vec![],
-            };
-            raw.into_iter()
-                .map(|t| t as usize)
-                .filter(|&t| t < n)
-                .collect()
-        };
-
-        // Iterative DFS recording postorder; reverse-postorder is its
-        // reverse.  `state`: 0 = white (unvisited), 1 = grey (on stack),
-        // 2 = black (done).  Stack entries are `(node, next-succ-index)`.
-        let mut state = vec![0u8; n];
-        let mut postorder: Vec<usize> = Vec::with_capacity(n);
-        let mut stack: Vec<(usize, usize)> = Vec::new();
-        state[0] = 1;
-        stack.push((0, 0));
-        while let Some(&(node, idx)) = stack.last() {
-            let s = succs(node);
-            if idx < s.len() {
-                stack.last_mut().unwrap().1 += 1;
-                let nxt = s[idx];
-                if state[nxt] == 0 {
-                    state[nxt] = 1;
-                    stack.push((nxt, 0));
-                }
-            } else {
-                state[node] = 2;
-                postorder.push(node);
-                stack.pop();
-            }
-        }
-        let mut order: Vec<usize> = postorder.into_iter().rev().collect();
-        // Blocks unreachable from bb0 are still lowered (kept complete),
-        // last and in MIR order — after every reachable def is seeded, so
-        // they can only see *more* bindings than linear order did.
-        for (bb, mark) in state.iter().enumerate().take(n) {
-            if *mark != 2 {
-                order.push(bb);
-            }
-        }
-        order
+        self.model_rpo()
     }
 
     // Framestate-threaded lowering (acyclic GAP-B path)
@@ -9537,39 +9675,7 @@ impl<'a> Lowering<'a> {
     /// `FunctionGraph`, otherwise an orphan cleanup chain would appear as
     /// a live merge predecessor.
     fn model_succs(&self, mir_bb: usize) -> Vec<usize> {
-        let n = self.body.body.len();
-        let Ok(term) = self.body.body[mir_bb].term_ref(self.llbc) else {
-            return vec![];
-        };
-        let raw: Vec<u64> = match term {
-            TermKind::Goto { target } => vec![*target],
-            TermKind::Call { target, .. }
-            | TermKind::Assert { target, .. }
-            | TermKind::Drop { target, .. } => vec![*target],
-            TermKind::Switch { targets, .. } => match targets {
-                SwitchTargets::If(a, b) => vec![*a, *b],
-                SwitchTargets::SwitchInt(_, arms, default) => {
-                    let mut v: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
-                    if !self.switch_default_targets_panic_abort(*default) {
-                        v.push(*default);
-                    }
-                    v
-                }
-            },
-            TermKind::Return
-            | TermKind::UnwindResume
-            | TermKind::UnwindTerminate
-            | TermKind::Abort(_)
-            | TermKind::Panic { .. }
-            | TermKind::UndefinedBehavior
-            | TermKind::Unknown => {
-                vec![]
-            }
-        };
-        raw.into_iter()
-            .map(|t| t as usize)
-            .filter(|&t| t < n)
-            .collect()
+        successor_blocks(self.llbc, self.body, mir_bb, false)
     }
 
     /// True when MIR block `bb`'s terminator is a panic/abort stub
@@ -9580,37 +9686,7 @@ impl<'a> Lowering<'a> {
     /// cleanup chain (with its undefined etype/evalue) out of the produced
     /// graph instead of leaving it as a live, undefined-operand block.
     fn switch_default_targets_panic_abort(&self, bb: u64) -> bool {
-        matches!(
-            self.body
-                .body
-                .get(bb as usize)
-                .and_then(|b| b.term_ref(self.llbc).ok()),
-            Some(TermKind::Abort(_))
-                | Some(TermKind::Panic { .. })
-                | Some(TermKind::UnwindResume)
-                | Some(TermKind::UnwindTerminate)
-                | Some(TermKind::UndefinedBehavior)
-        )
-    }
-
-    /// Blocks reachable from bb0 over [`Self::model_succs`].
-    fn mir_model_reachable(&self) -> Vec<bool> {
-        let n = self.body.body.len();
-        let mut reached = vec![false; n];
-        if n == 0 {
-            return reached;
-        }
-        reached[0] = true;
-        let mut stack = vec![0usize];
-        while let Some(bb) = stack.pop() {
-            for s in self.model_succs(bb) {
-                if !reached[s] {
-                    reached[s] = true;
-                    stack.push(s);
-                }
-            }
-        }
-        reached
+        terminator_is_panic_abort(self.llbc, self.body, bb)
     }
 
     /// Loop headers of the model-reachable component (from bb0 over
@@ -9661,10 +9737,9 @@ impl<'a> Lowering<'a> {
     }
 
     /// Reverse-postorder of the model-reachable component over
-    /// [`Self::model_succs`].  Only blocks reachable from bb0 appear;
-    /// unreachable blocks are handled separately as dead stubs.  In an
-    /// acyclic graph RPO visits every predecessor of a block before the
-    /// block itself, which is exactly the order the two-pass framestate
+    /// [`Self::model_succs`].  Only blocks reachable from bb0 appear.
+    /// In an acyclic graph RPO visits every predecessor of a block before
+    /// the block itself, which is exactly the order the two-pass framestate
     /// threading relies on.
     fn model_rpo(&self) -> Vec<usize> {
         let n = self.body.body.len();
@@ -9695,12 +9770,14 @@ impl<'a> Lowering<'a> {
 
     /// Stub `bb_id` as a dead bare-raise block: clear its body / exits /
     /// exitswitch, close it with a `set_raise`, and mark it `dead`.  Used
-    /// for blocks the framestate threading must not lower — model-
-    /// unreachable orphan `on_unwind` chains and `If`-arms a const-bool
-    /// discriminant folded away (see [`Self::lower_framestate`]).  The
-    /// real-path `function_graph_to_flowspace` prunes `dead` blocks
+    /// for an `If`-arm a const-bool discriminant folded away
+    /// (see [`Self::lower_framestate`]).  That arm is in the lowered
+    /// closure — `model_succs` still lists both arms — so it has a graph
+    /// block, and the fold is what makes the entry empty.  The real-path
+    /// `function_graph_to_flowspace` prunes `dead` blocks
     /// (`remove_dead_blocks` parity), so the stub's orphan etype/evalue
-    /// never reach the rtyper as undefined operands.
+    /// never reach the rtyper as undefined operands.  A block outside the
+    /// closure is never recorded, so it needs no stub.
     fn stub_dead_block(&mut self, bb_id: BlockId) {
         let blk = self.graph.block_mut(bb_id);
         blk.operations.clear();
@@ -9749,14 +9826,13 @@ impl<'a> Lowering<'a> {
     ///   preserving the link's target, exitcase, and the block's
     ///   `exitswitch`.
     ///
-    /// Model-unreachable blocks (orphan `on_unwind` cleanup chains) are
-    /// stubbed as dead raises so the graph stays complete without
-    /// threading dead state — leaving their original content would
-    /// reference the monotonic carry-on `local_var`.  bb0 (the
-    /// startblock) keeps its `OpKind::Input`-paired parameter inputargs
-    /// untouched — the opcode-dispatch arm extractor depends on that
-    /// shape — so a back-edge into bb0 (which would demand reseeding the
-    /// parameter slots as phis) declines to the monotonic fallback.
+    /// Blocks outside the lowered closure are never recorded
+    /// (`FlowContext.build_flow` / `pendingblocks`), so there is no orphan
+    /// cleanup chain to stub.  bb0 (the startblock) keeps its
+    /// `OpKind::Input`-paired parameter inputargs untouched — the
+    /// opcode-dispatch arm extractor depends on that shape — so a
+    /// back-edge into bb0 (which would demand reseeding the parameter
+    /// slots as phis) declines to the monotonic fallback.
     fn lower_framestate(&mut self, loop_headers: &[bool]) -> Result<(), LowerError> {
         let n = self.body.body.len();
         if n == 0 {
@@ -9771,7 +9847,6 @@ impl<'a> Lowering<'a> {
                 "framestate: back-edge into startblock bb0 — declines to monotonic".to_string(),
             ));
         }
-        let reachable = self.mir_model_reachable();
         let rpo = self.model_rpo();
         let returnblock = self.graph.returnblock;
         let exceptblock = self.graph.exceptblock;
@@ -9780,12 +9855,13 @@ impl<'a> Lowering<'a> {
         // non-MIR block) map to `usize::MAX` — they are merge sinks the
         // accumulation skips.
         let mut block_to_mir = vec![usize::MAX; self.graph.blocks.len()];
-        for (mir, bid) in self.block_id.iter().enumerate() {
+        for (mir, bid) in self.block_id.iter_lowered() {
             block_to_mir[bid.0] = mir;
         }
 
-        let mut entry_state: Vec<Option<PackedFrameState>> = vec![None; n];
-        let mut exit_state: Vec<Option<PackedFrameState>> = vec![None; n];
+        let nrows = self.block_id.nrows();
+        let mut entry_state: Vec<Option<PackedFrameState>> = vec![None; nrows];
+        let mut exit_state: Vec<Option<PackedFrameState>> = vec![None; nrows];
         // bb0 enters with the parameter bindings established in `new`.
         entry_state[0] = Some(PackedFrameState::pack(self.getstate()));
 
@@ -9800,9 +9876,10 @@ impl<'a> Lowering<'a> {
         // bb0 is never reseeded (guarded above + it is not in the merge
         // set), so its parameter inputargs / `Input` ops stay intact.
         for (h, &is_header) in loop_headers.iter().enumerate().take(n) {
-            if is_header && h != 0 {
-                entry_state[h] = Some(PackedFrameState::pack(FrameState {
-                    entries: self.block_entry_local_var[h].unpack(),
+            if is_header && h != 0 && self.block_id.is_lowered(h) {
+                let row = self.block_id.row(h);
+                entry_state[row] = Some(PackedFrameState::pack(FrameState {
+                    entries: self.block_entry_local_var[row].unpack(),
                     ..Default::default()
                 }));
             }
@@ -9810,7 +9887,8 @@ impl<'a> Lowering<'a> {
 
         // Pass 1 — RPO walk: setstate, inputargs, lower, snapshot, union.
         for &bb in &rpo {
-            let st = match entry_state[bb].as_ref().map(PackedFrameState::unpack) {
+            let row = self.block_id.row(bb);
+            let st = match entry_state[row].as_ref().map(PackedFrameState::unpack) {
                 Some(st) => st,
                 None => {
                     // No live predecessor edge reached this block.  RPO
@@ -9821,11 +9899,10 @@ impl<'a> Lowering<'a> {
                     // `lower_switch` folded away on a const-bool
                     // discriminant (a translation-time `const` gate such
                     // as `if WITHPREBUILTINT`), so `bb` is unreachable in
-                    // the produced graph even though `mir_model_reachable`
-                    // — which reads the raw terminator, pre-fold — marks
-                    // it reachable.  Stub it dead exactly like the model-
-                    // unreachable orphan chains below; the real-path
-                    // adapter's reachability prune removes it, and
+                    // the produced graph even though the raw `model_succs`
+                    // closure — which reads the terminator before the fold —
+                    // recorded a block for it.  Stub that block dead; the
+                    // real-path adapter's reachability prune removes it, and
                     // threading dead state would only mint phis the legacy
                     // fallback cannot type.  `bb` is never bb0 (the
                     // startblock is seeded and visited first), so a bare
@@ -9856,7 +9933,7 @@ impl<'a> Lowering<'a> {
                 // positional projection of the framestate entries, whose
                 // Variable cells are the same identities `getvariables`
                 // threaded into `inputargs`.
-                self.block_entry_local_var[bb] = PackedLocalRow::pack(&self.link_words());
+                self.block_entry_local_var[row] = PackedLocalRow::pack(&self.link_words());
             }
             self.lower_block(bb)?;
             // A bounds fork or whole-enum move closes this MIR block's
@@ -9888,7 +9965,7 @@ impl<'a> Lowering<'a> {
                     *slot = None;
                 }
             }
-            exit_state[bb] = Some(PackedFrameState::pack(ex.clone()));
+            exit_state[row] = Some(PackedFrameState::pack(ex.clone()));
             // Union this exit into each model successor's entry state.
             // Successors are read off the just-closed exits (the model
             // edges), skipping the return / except sinks and any
@@ -9916,7 +9993,8 @@ impl<'a> Lowering<'a> {
                 if loop_headers.get(tmir).copied().unwrap_or(false) {
                     continue;
                 }
-                let merged = match entry_state[tmir]
+                let trow = self.block_id.row(tmir);
+                let merged = match entry_state[trow]
                     .take()
                     .as_ref()
                     .map(PackedFrameState::unpack)
@@ -9952,32 +10030,13 @@ impl<'a> Lowering<'a> {
                         ))
                     })?,
                 };
-                entry_state[tmir] = Some(PackedFrameState::pack(merged));
+                entry_state[trow] = Some(PackedFrameState::pack(merged));
             }
-        }
-
-        // Model-unreachable blocks: orphan `on_unwind` cleanup chains that
-        // no lowered exit targets — `lower_terminator` strips every unwind
-        // edge (Goto / Assert / Drop / Call all forward to the success
-        // continuation only).  `model_succs` is a *superset* of the
-        // lowered exits — it reads the raw terminator and so still lists an
-        // `If`-arm a const-bool discriminant later folds away — but it is
-        // never a subset, so `reachable[bb]` false (outside the
-        // `model_succs` closure) is a sufficient deadness signal: such a
-        // block is genuinely unreferenced.  (The folded-arm case, where a
-        // block IS in the closure yet has no live lowered predecessor, is
-        // caught in Pass 1 by the empty-entry stub above.)  Mark them
-        // `dead` so the graph stays closed for the legacy fallback path,
-        // which consumes this same `FunctionGraph`.
-        for (bb, is_reachable) in reachable.iter().enumerate().take(n) {
-            if *is_reachable {
-                continue;
-            }
-            self.stub_dead_block(self.block_id[bb]);
         }
 
         // Pass 2 — re-argument the goto / branch links from framestates.
         for &bb in &rpo {
+            let row = self.block_id.row(bb);
             // A block Pass 1 stubbed dead (empty-entry const-fold orphan)
             // has no exit state and a bare-raise body — its links carry no
             // framestate args to re-argument.  Skip it; the final guard
@@ -9986,7 +10045,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             let bb_id = self.emit_bb(bb);
-            let ex = exit_state[bb]
+            let ex = exit_state[row]
                 .as_ref()
                 .map(PackedFrameState::unpack)
                 .ok_or_else(|| {
@@ -10010,7 +10069,7 @@ impl<'a> Lowering<'a> {
                 if tmir == usize::MAX {
                     continue;
                 }
-                let tgt_state = entry_state[tmir]
+                let tgt_state = entry_state[self.block_id.row(tmir)]
                     .as_ref()
                     .map(PackedFrameState::unpack)
                     .ok_or_else(|| {
@@ -10164,10 +10223,11 @@ impl<'a> Lowering<'a> {
 
     fn lower_block(&mut self, mir_bb: usize) -> Result<(), LowerError> {
         let bb: &BasicBlock = &self.body.body[mir_bb];
-        self.local_var = self.hydrate_words(self.block_entry_local_var[mir_bb].unpack());
+        let row = self.block_id.row(mir_bb);
+        self.local_var = self.hydrate_words(self.block_entry_local_var[row].unpack());
         self.positional_aggregate_locals =
-            self.block_entry_positional_aggregate_locals[mir_bb].clone();
-        self.string_byte_view_locals = self.block_entry_string_byte_view_locals[mir_bb]
+            self.block_entry_positional_aggregate_locals[row].clone();
+        self.string_byte_view_locals = self.block_entry_string_byte_view_locals[row]
             .iter()
             .collect();
 
@@ -12568,7 +12628,10 @@ impl<'a> Lowering<'a> {
             return true;
         }
         let mut saw = false;
-        for block in &self.body.body {
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
                     continue;
@@ -12601,7 +12664,10 @@ impl<'a> Lowering<'a> {
     }
 
     fn local_is_call_dest(&self, local: usize) -> bool {
-        self.body.body.iter().any(|block| {
+        self.body.body.iter().enumerate().any(|(bb_idx, block)| {
+            if !self.forward_reached[bb_idx] {
+                return false;
+            }
             let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc) else {
                 return false;
             };
@@ -12617,7 +12683,10 @@ impl<'a> Lowering<'a> {
         groups: &[RawScalarAddressGroup],
         depth: u8,
     ) -> bool {
-        for block in &self.body.body {
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
                     continue;
@@ -12765,7 +12834,10 @@ impl<'a> Lowering<'a> {
         }
         let mut found = None;
         let mut saw = false;
-        for block in &self.body.body {
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
                     continue;
@@ -12790,14 +12862,15 @@ impl<'a> Lowering<'a> {
     }
 
     fn local_has_projected_store(&self, local: usize) -> bool {
-        self.body.body.iter().any(|block| {
-            block.statements.iter().any(|stmt| {
-                let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind() else {
-                    return false;
-                };
-                matches!(dest.kind, PlaceKind::Projection(..))
-                    && place_root_local(&dest) == Some(local)
-            })
+        self.body.body.iter().enumerate().any(|(bb_idx, block)| {
+            self.forward_reached[bb_idx]
+                && block.statements.iter().any(|stmt| {
+                    let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind() else {
+                        return false;
+                    };
+                    matches!(dest.kind, PlaceKind::Projection(..))
+                        && place_root_local(&dest) == Some(local)
+                })
         })
     }
 
@@ -12815,7 +12888,10 @@ impl<'a> Lowering<'a> {
             return SpillAddressSource::Unknown;
         }
         let mut found = None;
-        for block in &self.body.body {
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
                     continue;
@@ -12976,7 +13052,10 @@ impl<'a> Lowering<'a> {
             return Some(self.concrete_borrow_place(clone_place(place)));
         }
         let mut found = None;
-        for block in &self.body.body {
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
                     continue;
@@ -13119,7 +13198,10 @@ impl<'a> Lowering<'a> {
             return Some(clone_place(place));
         }
         let mut found = None;
-        for block in &self.body.body {
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
                     continue;
@@ -15806,7 +15888,7 @@ impl<'a> Lowering<'a> {
         self.graph.set_raise_implicit(fail, "IndexError");
         self.graph
             .set_branch(head, cond, tail, forwarded, fail, Vec::new());
-        self.emit_block[mir_bb] = tail;
+        self.emit_block.set(mir_bb, tail);
         Ok(carry
             .iter()
             .map(|word| {
@@ -21004,7 +21086,11 @@ impl<'a> Lowering<'a> {
         let mut array: Option<(u64, Vec<i64>)> = None;
         let mut borrow: Option<(u64, u64)> = None;
         let mut return_alias: Option<u64> = None;
-        for block in &body.body {
+        let forward_blocks = forward_reachable_mask(self.llbc, &body);
+        for (bb_idx, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 match stmt.stmt_kind_ref() {
                     Ok(StmtKind::StorageLive(_))
@@ -21442,7 +21528,11 @@ impl<'a> Lowering<'a> {
         // owned values, so the type expression is cloned out of the call.
         let mut found: Option<(bool, serde_json::Value)> = None;
         let mut saw_return = false;
-        for block in &body.body {
+        let forward_blocks = forward_reachable_mask(self.llbc, &body);
+        for (bb_idx, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 match stmt.stmt_kind_ref() {
                     Ok(StmtKind::StorageLive(_))
@@ -30947,7 +31037,7 @@ impl<'a> Lowering<'a> {
         let mut links = Vec::with_capacity(plan.arms.len());
         for arm in &plan.arms {
             let arm_bb = self.graph.create_block();
-            self.emit_block[mir_bb] = arm_bb;
+            self.emit_block.set(mir_bb, arm_bb);
             for span in &arm.spans {
                 let part = self.emit_span_read(mir_bb, src, span);
                 self.emit_span_write(mir_bb, slot, span, part);
@@ -30967,7 +31057,7 @@ impl<'a> Lowering<'a> {
         }
         self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
         self.graph.closeblock(head, links);
-        self.emit_block[mir_bb] = join;
+        self.emit_block.set(mir_bb, join);
         Ok(())
     }
 
@@ -31016,7 +31106,7 @@ impl<'a> Lowering<'a> {
         let mut links = Vec::with_capacity(plan.arms.len());
         for arm in &plan.arms {
             let arm_bb = self.graph.create_block();
-            self.emit_block[mir_bb] = arm_bb;
+            self.emit_block.set(mir_bb, arm_bb);
             let mut parts = Vec::with_capacity(1 + arm.spans.len());
             parts.push(tag.clone());
             for span in &arm.spans {
@@ -31045,7 +31135,7 @@ impl<'a> Lowering<'a> {
         }
         self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
         self.graph.closeblock(head, links);
-        self.emit_block[mir_bb] = join;
+        self.emit_block.set(mir_bb, join);
         Ok(Some(phi))
     }
 
@@ -32778,7 +32868,10 @@ impl<'a> Lowering<'a> {
             let mut producers = 0usize;
             let mut followed: Option<usize> = None;
             let mut is_fixed = false;
-            for bb in &self.body.body {
+            for (bb_idx, bb) in self.body.body.iter().enumerate() {
+                if !self.forward_reached[bb_idx] {
+                    continue;
+                }
                 for stmt in &bb.statements {
                     let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                         continue;
@@ -39724,11 +39817,12 @@ impl<'a> Lowering<'a> {
     }
 
     fn target_input_locals(&self, target_bb: usize) -> Result<Vec<usize>, LowerError> {
-        if target_bb >= self.block_id.len() {
+        if !self.block_id.is_lowered(target_bb) {
             return Err(LowerError::Schema(format!(
                 "edge references unknown target bb{target_bb}"
             )));
         }
+        let row = self.block_id.row(target_bb);
         if target_bb == 0 {
             let mut locals = Vec::with_capacity(self.arg_count);
             for local_idx in 1..=self.arg_count {
@@ -39736,7 +39830,7 @@ impl<'a> Lowering<'a> {
                 locals.extend(self.len_shadow[local_idx]);
             }
             locals.extend(self.ret_len_slot_local);
-            if let Some(live_set) = self.block_live_in.get(target_bb) {
+            if let Some(live_set) = self.block_live_in.get(row) {
                 for local_idx in live_set.iter() {
                     if !locals.contains(&local_idx) {
                         return Err(LowerError::Unsupported(format!(
@@ -39749,52 +39843,56 @@ impl<'a> Lowering<'a> {
         }
         Ok(self
             .block_live_in
-            .get(target_bb)
+            .get(row)
             .map(|live_set| live_set.iter().collect())
             .unwrap_or_default())
     }
 
     fn merge_positional_aggregate_state(&mut self, target_bb: usize, local_idx: usize) {
-        if target_bb >= self.block_positional_seen.len()
-            || self.block_positional_conflict[target_bb].contains(local_idx)
-        {
+        if !self.block_id.is_lowered(target_bb) {
+            return;
+        }
+        let row = self.block_id.row(target_bb);
+        if self.block_positional_conflict[row].contains(local_idx) {
             return;
         }
         let incoming = self.positional_aggregate_locals.get(&local_idx).cloned();
-        if !self.block_positional_seen[target_bb].contains(local_idx) {
-            self.block_positional_seen[target_bb].insert(local_idx);
+        if !self.block_positional_seen[row].contains(local_idx) {
+            self.block_positional_seen[row].insert(local_idx);
             if let Some(owner) = incoming {
-                self.block_entry_positional_aggregate_locals[target_bb].insert(local_idx, owner);
+                self.block_entry_positional_aggregate_locals[row].insert(local_idx, owner);
             }
             return;
         }
-        let current = self.block_entry_positional_aggregate_locals[target_bb]
+        let current = self.block_entry_positional_aggregate_locals[row]
             .get(&local_idx)
             .cloned();
         if current != incoming {
-            self.block_positional_conflict[target_bb].insert(local_idx);
-            self.block_entry_positional_aggregate_locals[target_bb].remove(&local_idx);
+            self.block_positional_conflict[row].insert(local_idx);
+            self.block_entry_positional_aggregate_locals[row].remove(&local_idx);
         }
     }
 
     fn merge_string_byte_view_state(&mut self, target_bb: usize, local_idx: usize) {
-        if target_bb >= self.block_byte_view_seen.len()
-            || self.block_byte_view_conflict[target_bb].contains(local_idx)
-        {
+        if !self.block_id.is_lowered(target_bb) {
+            return;
+        }
+        let row = self.block_id.row(target_bb);
+        if self.block_byte_view_conflict[row].contains(local_idx) {
             return;
         }
         let incoming = self.string_byte_view_locals.contains(&local_idx);
-        if !self.block_byte_view_seen[target_bb].contains(local_idx) {
-            self.block_byte_view_seen[target_bb].insert(local_idx);
+        if !self.block_byte_view_seen[row].contains(local_idx) {
+            self.block_byte_view_seen[row].insert(local_idx);
             if incoming {
-                self.block_entry_string_byte_view_locals[target_bb].insert(local_idx);
+                self.block_entry_string_byte_view_locals[row].insert(local_idx);
             }
             return;
         }
-        let current = self.block_entry_string_byte_view_locals[target_bb].contains(local_idx);
+        let current = self.block_entry_string_byte_view_locals[row].contains(local_idx);
         if current != incoming {
-            self.block_byte_view_conflict[target_bb].insert(local_idx);
-            self.block_entry_string_byte_view_locals[target_bb].remove(local_idx);
+            self.block_byte_view_conflict[row].insert(local_idx);
+            self.block_entry_string_byte_view_locals[row].remove(local_idx);
         }
     }
 }
@@ -39841,7 +39939,11 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
             continue;
         };
         let mut bound = vec![None; body.locals.locals.len()];
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
@@ -39997,7 +40099,11 @@ fn operand_produced_by_get_eval_fn(body: &Unstructured, llbc: &Llbc, operand: &O
     let PlaceKind::Local(local) = place.kind else {
         return false;
     };
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -40128,9 +40234,16 @@ fn builtin_code_fn_shape(input: &str, output: &str) -> bool {
 /// anywhere in `body`.  See [`Lowering::binop_result_locals`] for why a
 /// single function-wide set is sound (a local's MIR type is fixed, so a
 /// local bound by `BinaryOp` is a `*Checked` scalar at every read site).
-fn compute_binop_result_locals(body: &Unstructured) -> std::collections::HashSet<usize> {
+fn compute_binop_result_locals(
+    llbc: &Llbc,
+    body: &Unstructured,
+) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -40158,7 +40271,11 @@ fn compute_multi_assigned_locals(
             *counts.entry(i as usize).or_insert(0) += 1;
         }
     };
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
                 bump(&place);
@@ -40449,7 +40566,11 @@ impl AccumulatorFacts {
             if c >= n || !builder_mode[c] {
                 continue;
             }
-            for block in &body.body {
+            let forward_blocks = forward_reachable_mask(llbc, &body);
+            for (bb_idx, block) in body.body.iter().enumerate() {
+                if !forward_blocks[bb_idx] {
+                    continue;
+                }
                 for stmt in &block.statements {
                     let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
                         stmt.stmt_kind_ref()
@@ -40496,7 +40617,11 @@ fn ref_temp_is_sole_append_arg(
     }
     let mut selected = 0usize;
     let mut other = 0usize;
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for st in &bb.statements {
             match st.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
@@ -40598,7 +40723,11 @@ fn clean_accumulator_ref_temps_scan(
     c: usize,
 ) -> Option<Vec<usize>> {
     let mut ref_temps: Vec<usize> = Vec::new();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for st in &bb.statements {
             match st.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
@@ -40797,7 +40926,11 @@ fn sole_string_alias_successor_scan(
     }
     let mut successor: Option<usize> = None;
     let mut other = 0usize;
-    for block in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &block.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
@@ -40905,7 +41038,11 @@ fn append_arg_of_borrow_scan(
     }
     let mut recv: Option<usize> = None;
     let mut other = 0usize;
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for st in &bb.statements {
             match st.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
@@ -41041,7 +41178,11 @@ fn append_piece_accumulator_of_arg_temp(
         if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
             continue;
         }
-        for block in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
                     stmt.stmt_kind_ref()
@@ -41081,7 +41222,11 @@ fn accumulator_materialization_site_count(
     }
     let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
     let mut moves = 0usize;
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for st in &bb.statements {
             if let Ok(StmtKind::Assign(_, rvalue)) = st.stmt_kind_ref() {
                 if let Rvalue::Ref { place: source, .. } = rvalue
@@ -41138,7 +41283,11 @@ fn accumulator_materialization_site_count(
 fn single_def_is_str_builder_ctor(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     let mut defs = 0usize;
     let mut ctor = false;
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for st in &bb.statements {
             if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
                 && matches!(place.kind, PlaceKind::Local(i) if i as usize == c)
@@ -41450,7 +41599,11 @@ fn is_vec_index_mut_call(
 /// the `base` local the slice aliases. See [`str_chars_view_base`].
 fn str_chars_view_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -41563,7 +41716,11 @@ fn operand_place(op: &Operand) -> Option<&Place> {
 fn defining_call(llbc: &Llbc, body: &Unstructured, local: usize) -> Option<CallPayload> {
     let mut found = None;
     let mut producers = 0usize;
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
                 && matches!(place.kind, PlaceKind::Local(i) if i as usize == local)
@@ -41606,7 +41763,11 @@ fn vtable_slot_under_fn_ptr_cast(
 fn defining_assign<'a>(llbc: &Llbc, body: &'a Unstructured, local: usize) -> Option<&'a Rvalue> {
     let mut found = None;
     let mut producers = 0usize;
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref()
                 && matches!(place.kind, PlaceKind::Local(i) if i as usize == local)
@@ -41808,7 +41969,11 @@ fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local
     let mut grew = true;
     while grew {
         grew = false;
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
@@ -41830,13 +41995,16 @@ fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local
     if alias.contains(&0) {
         return true;
     }
-    body.body.iter().any(|bb| {
-        bb.statements
-            .iter()
-            .any(|stmt| stmt_observes_divmod_result(stmt, &alias))
-            || bb
-                .term_ref(llbc)
-                .is_ok_and(|term| term_observes_divmod_result(term, llbc, &alias))
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    body.body.iter().enumerate().any(|(bb_idx, bb)| {
+        forward_blocks[bb_idx]
+            && (bb
+                .statements
+                .iter()
+                .any(|stmt| stmt_observes_divmod_result(stmt, &alias))
+                || bb
+                    .term_ref(llbc)
+                    .is_ok_and(|term| term_observes_divmod_result(term, llbc, &alias)))
     })
 }
 
@@ -42454,7 +42622,11 @@ fn explicit_drop_temp_of_owned_guard(
     local: usize,
     opener: &std::collections::HashMap<usize, usize>,
 ) -> bool {
-    body.body.iter().any(|bb| {
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    body.body.iter().enumerate().any(|(bb_idx, bb)| {
+        if !forward_blocks[bb_idx] {
+            return false;
+        }
         let Some(guard) = explicit_drop_guard_local(bb, llbc, name_of) else {
             return false;
         };
@@ -42509,7 +42681,11 @@ fn place_ty_is_root_scope(place: &Place, llbc: &Llbc) -> bool {
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(term) = bb.term_ref(llbc) else {
             continue;
         };
@@ -42756,7 +42932,11 @@ fn base_traces_to_items_block_accessor_matching(
         let mut producers = 0usize;
         let mut copy_src: Option<usize> = None;
         let mut is_accessor = false;
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref()
                     && matches!(&place.kind, PlaceKind::Local(i) if *i as usize == cur)
@@ -42954,7 +43134,11 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
         write_derefs: 0,
         other: 0,
     };
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
@@ -43145,7 +43329,11 @@ fn struct_field_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> StructF
         fields: 0,
         other: 0,
     };
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
@@ -43329,7 +43517,11 @@ fn operand_root_local(op: &Operand) -> Option<usize> {
 /// A missing or repeated call declines the interior alias.
 fn ptr_add_def_site(llbc: &Llbc, body: &Unstructured, dest: usize) -> Option<(usize, usize)> {
     let mut found = None;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, target, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -43603,7 +43795,11 @@ fn locals_assigned_reachable(
 fn header_producer(body: &Unstructured, llbc: &Llbc, cur: usize) -> Option<HeaderStep> {
     let mut producers = 0usize;
     let mut kind = HeaderProd::Stop;
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -44296,7 +44492,11 @@ impl<'a> RootStackAnalyzer<'a> {
             self.call_returns_owned_scope(reg)
         });
         let covered = owned.covered_blocks(self.llbc, body, &name_of);
+        let forward_blocks = forward_reachable_mask(self.llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             if covered.contains(bb_idx) {
                 continue;
             }
@@ -44491,7 +44691,11 @@ fn owned_root_scopes(
     let moved = MovedOutLocals::new(body, llbc);
     let mut opener = std::collections::HashMap::new();
     let mut twice = bit_set::BitSet::new();
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -44552,7 +44756,11 @@ fn body_returns_owned_scope(
     let mut guards = guards;
     loop {
         let before = guards.count();
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 if let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src), _))) =
                     stmt.stmt_kind()
@@ -44570,7 +44778,11 @@ fn body_returns_owned_scope(
     }
     let mut holders = bit_set::BitSet::new();
     let mut moved_into_result = bit_set::BitSet::new();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() else {
                 continue;
@@ -44615,17 +44827,20 @@ impl OwnedRootScopes {
             return covered;
         }
         let dom = block_dominators(llbc, body);
+        let forward_blocks = forward_reachable_mask(llbc, body);
         for (&scope, &open_bb) in &self.opener {
             let drops: Vec<usize> = body
                 .body
                 .iter()
                 .enumerate()
-                .filter(|(_, bb)| {
-                    bb.term_ref(llbc)
-                        .ok()
-                        .and_then(|term| term_dropped_local(term, name_of))
-                        == Some(scope as u64)
-                        || explicit_drop_guard_local(bb, llbc, name_of) == Some(scope)
+                .filter(|(bb_idx, bb)| {
+                    forward_blocks[*bb_idx]
+                        && (bb
+                            .term_ref(llbc)
+                            .ok()
+                            .and_then(|term| term_dropped_local(term, name_of))
+                            == Some(scope as u64)
+                            || explicit_drop_guard_local(bb, llbc, name_of) == Some(scope))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -44640,7 +44855,11 @@ impl OwnedRootScopes {
                 }
                 work.extend(block_successors(llbc, body, bb));
             }
+            let forward_blocks = forward_reachable_mask(llbc, &body);
             for bb in 0..body.body.len() {
+                if !forward_blocks[bb] {
+                    continue;
+                }
                 if bb != open_bb
                     && dom[bb].contains(open_bb)
                     && !after_close.contains(bb)
@@ -44873,7 +45092,11 @@ fn root_bracket_region_dominators(
 fn root_pin_value_is_stable(llbc: &Llbc, body: &Unstructured, local: usize) -> bool {
     let mut definitions = usize::from(local > 0 && local <= body.locals.arg_count as usize);
     let watched: bit_set::BitSet = std::iter::once(local).collect();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref() {
                 if matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local) {
@@ -44923,7 +45146,11 @@ fn root_pin_value_is_stable_in_bracket(
         _ => None,
     };
     let own_dests: bit_set::BitSet = own_gets.iter().filter_map(|&bb| get_dest(bb)).collect();
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let in_region = region.contains(bb_idx);
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() {
@@ -45110,15 +45337,22 @@ fn mentions_local(v: &serde_json::Value, wanted: &bit_set::BitSet) -> bool {
 /// has to be assigned exactly once, and each element a plain local, or the
 /// pin is not one this pass can answer a read-back for.
 fn pin_roots_slice_values(
+    llbc: &Llbc,
     body: &Unstructured,
     slice: usize,
     assigned: &std::collections::HashMap<usize, usize>,
 ) -> Option<(Vec<usize>, Vec<usize>)> {
+    let forward_blocks = forward_reachable_mask(llbc, body);
     let definition = |local: usize| -> Option<Rvalue> {
         if assigned.get(&local) != Some(&1) {
             return None;
         }
-        body.body.iter().flat_map(|bb| bb.statements.iter()).find_map(|stmt| {
+        body.body
+            .iter()
+            .enumerate()
+            .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
+            .flat_map(|(_, bb)| bb.statements.iter())
+            .find_map(|stmt| {
             match stmt.stmt_kind() {
                 Ok(StmtKind::Assign(place, value))
                     if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
@@ -45173,25 +45407,34 @@ fn pin_roots_slice_values(
 /// `get(base + k)` is `getarrayitem` of that list (`W_CData.call` /
 /// `cdataobj.py descr_call` passes `args_w` through).
 fn pin_roots_incoming_slice(
+    llbc: &Llbc,
     body: &Unstructured,
     slice: usize,
     assigned: &std::collections::HashMap<usize, usize>,
 ) -> Option<(usize, Vec<usize>)> {
     let arg_count = body.locals.arg_count as usize;
+    // `assigned` counts forward blocks only. A cleanup assign must not be
+    // read as that one definition (`forward_reachable_mask`).
+    let forward_blocks = forward_reachable_mask(llbc, body);
     let definition = |local: usize| -> Option<Rvalue> {
         if assigned.get(&local) != Some(&1) {
             return None;
         }
-        body.body.iter().flat_map(|bb| bb.statements.iter()).find_map(|stmt| {
-            match stmt.stmt_kind() {
-                Ok(StmtKind::Assign(place, value))
-                    if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
-                {
-                    Some(value)
+        body.body
+            .iter()
+            .enumerate()
+            .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
+            .flat_map(|(_, bb)| bb.statements.iter())
+            .find_map(|stmt| {
+                match stmt.stmt_kind() {
+                    Ok(StmtKind::Assign(place, value))
+                        if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        })
+            })
     };
     let mut temps = Vec::new();
     let mut local = slice;
@@ -45232,7 +45475,11 @@ fn pin_roots_incoming_slice(
 }
 
 /// The unique `Assign` of `local`, when it has exactly one.
+///
+/// The count in `assigned` is forward-reachable only, so the scan is too:
+/// an `on_unwind` cleanup block is still in the body.
 fn unique_assigned_rvalue(
+    llbc: &Llbc,
     body: &Unstructured,
     local: usize,
     assigned: &std::collections::HashMap<usize, usize>,
@@ -45240,16 +45487,20 @@ fn unique_assigned_rvalue(
     if assigned.get(&local) != Some(&1) {
         return None;
     }
-    body.body.iter().flat_map(|bb| bb.statements.iter()).find_map(|stmt| {
-        match stmt.stmt_kind() {
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    body.body
+        .iter()
+        .enumerate()
+        .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
+        .flat_map(|(_, bb)| bb.statements.iter())
+        .find_map(|stmt| match stmt.stmt_kind() {
             Ok(StmtKind::Assign(place, value))
                 if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
             {
                 Some(value)
             }
             _ => None,
-        }
-    })
+        })
 }
 
 /// A `usize` constant held in `local`, walking `Use` copies.
@@ -45261,7 +45512,7 @@ fn local_usize_literal(
 ) -> Option<u64> {
     let mut local = local;
     for _ in 0..8 {
-        match unique_assigned_rvalue(body, local, assigned)? {
+        match unique_assigned_rvalue(llbc, body, local, assigned)? {
             Rvalue::Use(operand, _) => {
                 if let Some(k) = operand_usize_literal(llbc, &operand) {
                     return Some(k);
@@ -45312,7 +45563,7 @@ fn place_incoming_slice_elem(
     let PlaceKind::Local(slice) = slice_place.kind else {
         return None;
     };
-    pin_roots_incoming_slice(body, slice as usize, assigned).map(|(slice, _)| (slice, k))
+    pin_roots_incoming_slice(llbc, body, slice as usize, assigned).map(|(slice, _)| (slice, k))
 }
 
 /// `pin_root(args_w[k])` / `pin_root(w_arg)` when `w_arg` was loaded from an
@@ -45330,7 +45581,7 @@ fn pin_value_incoming_slice_elem(
 ) -> Option<(usize, u64)> {
     let mut local = value;
     for _ in 0..8 {
-        if let Some(rvalue) = unique_assigned_rvalue(body, local, assigned) {
+        if let Some(rvalue) = unique_assigned_rvalue(llbc, body, local, assigned) {
             match rvalue {
                 Rvalue::Use(operand, _) => {
                     if let Some(place) = operand_place(&operand)
@@ -45511,7 +45762,11 @@ fn classify_root_slot_getter_body(
     let mut getter_arg: Option<Operand> = None;
     let mut getter_call: Option<(usize, usize)> = None;
     let mut calls = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             match stmt.stmt_kind().ok()? {
                 StmtKind::StorageLive(_)
@@ -45615,7 +45870,11 @@ fn getter_returns_follow_call(
         );
     }
     let mut saw_return = false;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
         if !matches!(block.term_ref(llbc), Ok(TermKind::Return)) {
             continue;
         }
@@ -45850,6 +46109,7 @@ struct RootGetterIndex<'a> {
 }
 
 fn single_statement_rvalue(
+    llbc: &Llbc,
     body: &Unstructured,
     assigned: &std::collections::HashMap<usize, usize>,
     local: usize,
@@ -45857,7 +46117,11 @@ fn single_statement_rvalue(
     if assigned.get(&local) != Some(&1) {
         return None;
     }
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind()
                 && matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local)
@@ -45897,6 +46161,7 @@ enum CapturePeel {
 }
 
 fn peel_closure_capture(
+    llbc: &Llbc,
     body: &Unstructured,
     index: &RootGetterIndex<'_>,
     receiver: &Operand,
@@ -45909,7 +46174,7 @@ fn peel_closure_capture(
         if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
             return CapturePeel::Unknown;
         }
-        let Some(value) = single_statement_rvalue(body, index.assigned, local) else {
+        let Some(value) = single_statement_rvalue(llbc, body, index.assigned, local) else {
             return CapturePeel::Unknown;
         };
         carriers.push(local);
@@ -45946,6 +46211,7 @@ fn peel_closure_capture(
 
 /// `(index local, scope, temporaries walked, not including the index)`.
 fn peel_captured_index(
+    llbc: &Llbc,
     body: &Unstructured,
     index: &RootGetterIndex<'_>,
     capture: &Operand,
@@ -45967,7 +46233,7 @@ fn peel_captured_index(
         if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
             return None;
         }
-        let value = single_statement_rvalue(body, index.assigned, local)?;
+        let value = single_statement_rvalue(llbc, body, index.assigned, local)?;
         carriers.push(local);
         match value {
             Rvalue::Use(inner, _) => {
@@ -46025,7 +46291,7 @@ fn peel_getter_addend(
             }),
             2 => Some(PeeledAddend {
                 addend: 0,
-                carriers: peel_empty_unit(body, index, &args[1])?,
+                carriers: peel_empty_unit(llbc, body, index, &args[1])?,
             }),
             _ => None,
         },
@@ -46039,6 +46305,7 @@ fn peel_getter_addend(
 }
 
 fn peel_empty_unit(
+    llbc: &Llbc,
     body: &Unstructured,
     index: &RootGetterIndex<'_>,
     op: &Operand,
@@ -46049,7 +46316,7 @@ fn peel_empty_unit(
         if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
             return None;
         }
-        let value = single_statement_rvalue(body, index.assigned, local)?;
+        let value = single_statement_rvalue(llbc, body, index.assigned, local)?;
         carriers.push(local);
         match value {
             Rvalue::Use(inner, _) => {
@@ -46084,7 +46351,7 @@ fn peel_usize_addend(
     if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
         return None;
     }
-    let value = single_statement_rvalue(body, index.assigned, local)?;
+    let value = single_statement_rvalue(llbc, body, index.assigned, local)?;
     let mut peeled = match value {
         Rvalue::Use(inner, _) => peel_usize_addend(llbc, body, index, &inner, depth + 1)?,
         Rvalue::Aggregate(_, operands) => {
@@ -46108,11 +46375,16 @@ fn local_is_root_index_or_guard(index: &RootGetterIndex<'_>, local: usize) -> bo
 }
 
 fn capture_carriers_stay_inside(
+    llbc: &Llbc,
     body: &Unstructured,
     carriers: &bit_set::BitSet,
     getter_bbs: &bit_set::BitSet,
 ) -> bool {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_)) => {
@@ -46172,7 +46444,11 @@ fn record_root_slot_getter_reads(
 ) -> RootGetterReads {
     let mut call_dests = bit_set::BitSet::new();
     let mut calls: Vec<(usize, CallPayload)> = Vec::new();
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(term) = bb.term(llbc) else {
             continue;
         };
@@ -46210,7 +46486,7 @@ fn record_root_slot_getter_reads(
         let Some(receiver) = call.args.first() else {
             return no_root_getter_reads();
         };
-        let peeled = match peel_closure_capture(body, &index, receiver) {
+        let peeled = match peel_closure_capture(llbc, body, &index, receiver) {
             CapturePeel::Unknown => return no_root_getter_reads(),
             CapturePeel::BadClosure(closure) => {
                 poisoned.insert(closure);
@@ -46219,7 +46495,7 @@ fn record_root_slot_getter_reads(
             CapturePeel::Ready(peeled) => peeled,
         };
         let Some((index_local, scope, index_carriers)) =
-            peel_captured_index(body, &index, &peeled.capture)
+            peel_captured_index(llbc, body, &index, &peeled.capture)
         else {
             poisoned.insert(peeled.closure);
             continue;
@@ -46275,7 +46551,7 @@ fn record_root_slot_getter_reads(
                 carriers.insert(*local);
             }
         }
-        if bad_carrier || !capture_carriers_stay_inside(body, &carriers, &getter_bbs) {
+        if bad_carrier || !capture_carriers_stay_inside(llbc, body, &carriers, &getter_bbs) {
             continue;
         }
         for local in carriers.iter() {
@@ -46379,7 +46655,11 @@ fn analyze_root_brackets_with(
     let mut candidates = bit_set::BitSet::new();
     let mut opener_block: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -46409,7 +46689,11 @@ fn analyze_root_brackets_with(
     }
     // (2) Borrow temporaries, so a receiver operand names its guard.
     let mut aliases: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) = stmt.stmt_kind_ref()
             else {
@@ -46434,7 +46718,11 @@ fn analyze_root_brackets_with(
     //     `_t` where `_t = copy _ob_slot`; without the closure below every
     //     read-back looks like an index this pass cannot name.
     let mut assigned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
                 && let PlaceKind::Local(dest) = place.kind
@@ -46491,7 +46779,11 @@ fn analyze_root_brackets_with(
         std::collections::HashMap::new();
     // A destination two `shadow_stack_len` calls write names no one depth.
     let mut len_poison = bit_set::BitSet::new();
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -46516,9 +46808,9 @@ fn analyze_root_brackets_with(
             let Some(scope) = open_scope_at(bb_idx) else {
                 continue;
             };
-            if let Some(run) = pin_roots_slice_values(body, slice, &assigned) {
+            if let Some(run) = pin_roots_slice_values(llbc, body, slice, &assigned) {
                 pin_runs.insert(bb_idx, (scope, run.0, run.1));
-            } else if let Some(run) = pin_roots_incoming_slice(body, slice, &assigned) {
+            } else if let Some(run) = pin_roots_incoming_slice(llbc, body, slice, &assigned) {
                 slice_runs.insert(bb_idx, (scope, run.0, run.1));
             } else {
                 continue;
@@ -46590,9 +46882,9 @@ fn analyze_root_brackets_with(
             let Some(slice) = operand_local(call.args.get(1)) else {
                 continue;
             };
-            if let Some(run) = pin_roots_slice_values(body, slice, &assigned) {
+            if let Some(run) = pin_roots_slice_values(llbc, body, slice, &assigned) {
                 pin_runs.insert(bb_idx, (scope, run.0, run.1));
-            } else if let Some(run) = pin_roots_incoming_slice(body, slice, &assigned) {
+            } else if let Some(run) = pin_roots_incoming_slice(llbc, body, slice, &assigned) {
                 slice_runs.insert(bb_idx, (scope, run.0, run.1));
             } else {
                 continue;
@@ -46619,15 +46911,20 @@ fn analyze_root_brackets_with(
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref()
                 else {
                     continue;
                 };
-                let (PlaceKind::Local(dest), Some(src)) =
-                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
-                else {
+                let (PlaceKind::Local(dest), Some(src)) = (
+                    &place.kind,
+                    use_operand_slot_src(llbc, body, &assigned, &operand),
+                ) else {
                     continue;
                 };
                 let dest = *dest as usize;
@@ -46655,15 +46952,20 @@ fn analyze_root_brackets_with(
     changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref()
                 else {
                     continue;
                 };
-                let (PlaceKind::Local(dest), Some(src)) =
-                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
-                else {
+                let (PlaceKind::Local(dest), Some(src)) = (
+                    &place.kind,
+                    use_operand_slot_src(llbc, body, &assigned, &operand),
+                ) else {
                     continue;
                 };
                 let dest = *dest as usize;
@@ -46702,7 +47004,11 @@ fn analyze_root_brackets_with(
     let mut sums: std::collections::HashMap<usize, RootSlotSum> = std::collections::HashMap::new();
     let mut offsets: std::collections::HashMap<usize, RootSlotSum> =
         std::collections::HashMap::new();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, Rvalue::BinaryOp(op, lhs, rhs))) = stmt.stmt_kind_ref()
             else {
@@ -46745,7 +47051,11 @@ fn analyze_root_brackets_with(
             };
         }
     }
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref() else {
                 continue;
@@ -46773,15 +47083,20 @@ fn analyze_root_brackets_with(
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref()
                 else {
                     continue;
                 };
-                let (PlaceKind::Local(dest), Some(src)) =
-                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
-                else {
+                let (PlaceKind::Local(dest), Some(src)) = (
+                    &place.kind,
+                    use_operand_slot_src(llbc, body, &assigned, &operand),
+                ) else {
                     continue;
                 };
                 let dest = *dest as usize;
@@ -46848,7 +47163,11 @@ fn analyze_root_brackets_with(
     let mut pins: std::collections::HashMap<usize, Vec<(usize, usize)>> =
         std::collections::HashMap::new();
     let mut gets: Vec<(usize, usize, usize, u64)> = reads.gets;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_))
@@ -46862,7 +47181,7 @@ fn analyze_root_brackets_with(
                 }
                 // `_t = copy _slot`, the argument temporary (2.5) recorded,
                 // and a field of a tuple aggregate that names the same slot.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, &operand)) =>
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(llbc, body, &assigned, &operand)) =>
                 {
                     continue;
                 }
@@ -47489,6 +47808,7 @@ fn indexed_field_parts(payload: &serde_json::Value) -> Option<(Option<u64>, usiz
 /// Operand `N` of a single-assignment tuple aggregate, when `operand` is
 /// `Copy`/`Move` of that aggregate's field `N`.
 fn tuple_aggregate_field_src(
+    llbc: &Llbc,
     body: &Unstructured,
     assigned: &std::collections::HashMap<usize, usize>,
     operand: &Operand,
@@ -47508,7 +47828,8 @@ fn tuple_aggregate_field_src(
     let PlaceKind::Local(tmp) = inner.kind else {
         return None;
     };
-    let Rvalue::Aggregate(kind, operands) = single_statement_rvalue(body, assigned, tmp as usize)?
+    let Rvalue::Aggregate(kind, operands) =
+        single_statement_rvalue(llbc, body, assigned, tmp as usize)?
     else {
         return None;
     };
@@ -47532,11 +47853,13 @@ fn aggregate_kind_is_tuple(kind: &serde_json::Value) -> bool {
 /// The local a Use names: a plain copy, or field `N` of a single-assignment
 /// tuple aggregate whose operand `N` is that local.
 fn use_operand_slot_src(
+    llbc: &Llbc,
     body: &Unstructured,
     assigned: &std::collections::HashMap<usize, usize>,
     operand: &Operand,
 ) -> Option<usize> {
-    operand_local(Some(operand)).or_else(|| tuple_aggregate_field_src(body, assigned, operand))
+    operand_local(Some(operand))
+        .or_else(|| tuple_aggregate_field_src(llbc, body, assigned, operand))
 }
 
 /// The local `_s` of a `_s.<field>` read of a tuple, such as the sum or the
@@ -47834,7 +48157,11 @@ fn analyze_owner_roots_with(
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) =
                     stmt.stmt_kind_ref()
@@ -47873,7 +48200,11 @@ fn analyze_owner_roots_with(
     // Each borrow is read exactly once: by `Deref` or by a reborrow.
     let mut borrow_uses = vec![0usize; n_locals];
     let names_watched = |op: &Operand| operand_local(Some(op)).is_some_and(|l| watched.contains(l));
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_)) => {
@@ -48341,7 +48672,11 @@ fn elaborate_explicit_root_closes(
         dest: usize,
     }
     let mut closes: Vec<Close> = Vec::new();
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
         };
@@ -48396,7 +48731,11 @@ fn elaborate_explicit_root_closes(
     // Opener blocks per guard local.
     let mut openers: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
             && let CallFunc::Regular(reg) = &call.func
             && name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
@@ -48443,7 +48782,11 @@ fn elaborate_explicit_root_closes(
         let dests: bit_set::BitSet = mine.iter().map(|c| c.dest).collect();
         let mut private = temps.clone();
         private.union_with(&dests);
+        let forward_blocks = forward_reachable_mask(llbc, body);
         let mentioned_elsewhere = body.body.iter().enumerate().any(|(bb_idx, bb)| {
+            if !forward_blocks[bb_idx] {
+                return false;
+            }
             let chain = mine.iter().find(|c| c.bb == bb_idx);
             let stmt_hit = bb.statements.iter().enumerate().any(|(i, stmt)| {
                 !chain.is_some_and(|c| c.moves.contains(&i))
@@ -48462,22 +48805,29 @@ fn elaborate_explicit_root_closes(
             continue;
         }
         // The guard's own drop glue, from a `Drop` Charon already wrote for it.
-        // 10.04 puts that `Drop` in an `is_cleanup` block; `unstructured`
-        // leaves those out, so recover the glue from the artefact's
+        // 10.04 puts that `Drop` in an `is_cleanup` block. The forward
+        // scan does not follow `on_unwind`, so when that `Drop` is not
+        // in the forward set, recover the glue from the artefact's
         // `RootScope` `drop_in_place` declaration.
         let Some(template) = body
             .body
             .iter()
-            .find_map(|bb| match bb.term(llbc) {
-                Ok(TermKind::Drop { place, fn_ptr, .. })
-                    if matches!(place.kind, PlaceKind::Local(l) if l as usize == guard || temps.contains(l as usize))
-                        && name_of(&fn_ptr)
-                            .as_deref()
-                            .is_some_and(gc_root_scope_drop_glue_path) =>
-                {
-                    Some(bb.terminator.kind_value().clone())
+            .enumerate()
+            .find_map(|(bb_idx, bb)| {
+                if !forward_blocks[bb_idx] {
+                    return None;
                 }
-                _ => None,
+                match bb.term(llbc) {
+                    Ok(TermKind::Drop { place, fn_ptr, .. })
+                        if matches!(place.kind, PlaceKind::Local(l) if l as usize == guard || temps.contains(l as usize))
+                            && name_of(&fn_ptr)
+                                .as_deref()
+                                .is_some_and(gc_root_scope_drop_glue_path) =>
+                    {
+                        Some(bb.terminator.kind_value().clone())
+                    }
+                    _ => None,
+                }
             })
             .or_else(|| root_scope_drop_glue_template(llbc))
         else {
@@ -48507,7 +48857,11 @@ fn elaborate_explicit_root_closes(
         }
         let mut dead: Vec<usize> = Vec::new();
         let mut sound = mine.iter().all(|c| state[c.bb] == INIT);
+        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             if drop_of(bb) != Some(guard) {
                 continue;
             }
@@ -48534,7 +48888,11 @@ fn elaborate_explicit_root_closes(
             rewrites.push((c.bb, close));
             removed_moves.push((c.bb, c.moves.clone()));
         }
+        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             let is_dead = dead.contains(&bb_idx) || drop_of(bb).is_some_and(|l| temps.contains(l));
             if is_dead && let Ok(TermKind::Drop { target, .. }) = bb.term(llbc) {
                 rewrites.push((bb_idx, serde_json::json!({"Goto": {"target": target}})));
@@ -48637,7 +48995,11 @@ fn local_move_counts(body: &Unstructured, llbc: &Llbc) -> std::collections::Hash
         .collect();
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let mut out = std::collections::HashMap::new();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             scan(stmt.kind_value(), &declared, &mut out);
         }
@@ -48713,7 +49075,11 @@ fn root_scope_drop_sites(
 ) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(term) = bb.term_ref(llbc) else {
             continue;
         };
@@ -48762,7 +49128,11 @@ fn compute_index_write_extra_live(
 ) -> Vec<Vec<usize>> {
     let mut index_call: std::collections::HashMap<usize, (Option<usize>, Option<usize>)> =
         std::collections::HashMap::new();
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -48829,7 +49199,11 @@ fn compute_index_write_extra_live(
     if index_call.is_empty() {
         return extra;
     }
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() else {
                 continue;
@@ -48860,7 +49234,11 @@ fn compute_interior_field_extra_live(
     tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<Vec<usize>> {
     let mut extra = vec![Vec::new(); body.body.len()];
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
@@ -48887,7 +49265,11 @@ fn compute_interior_field_extra_live(
             TracedPtrAddHeader::EntriesItem { local } => local,
             TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,
         };
+        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (use_idx, use_bb) in body.body.iter().enumerate() {
+            if !forward_blocks[use_idx] {
+                continue;
+            }
             if block_has_struct_field_value_use(llbc, use_bb, dest as usize) {
                 extra[use_idx].push(header_local);
                 extra[use_idx].push(traced.index_local);
@@ -48907,12 +49289,27 @@ fn compute_mir_liveness(
 
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
-    let mut uses = vec![BitSet::with_capacity(n_locals); n_blocks];
-    let mut defs = vec![BitSet::with_capacity(n_locals); n_blocks];
+    // Same closure as whole-body scans: a panic-abort default still
+    // contributes uses, and an `on_unwind` cleanup block does not.
+    let forward = forward_reachable_mask(llbc, body);
+    let mut uses = Vec::with_capacity(n_blocks);
+    let mut defs = Vec::with_capacity(n_blocks);
+    for bb_idx in 0..n_blocks {
+        if forward[bb_idx] {
+            uses.push(BitSet::with_capacity(n_locals));
+            defs.push(BitSet::with_capacity(n_locals));
+        } else {
+            uses.push(BitSet::new());
+            defs.push(BitSet::new());
+        }
+    }
     let mut succs = vec![Vec::<usize>::new(); n_blocks];
     let mut preds = vec![Vec::<usize>::new(); n_blocks];
 
     for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward[bb_idx] {
+            continue;
+        }
         for stmt in &bb.statements {
             let Ok(kind) = stmt.stmt_kind_ref() else {
                 continue;
@@ -48989,6 +49386,9 @@ fn compute_mir_liveness(
     // defines them — so the backward fixpoint threads them in from
     // their definition, which dominates the `_p` use.
     for (bb_idx, locals) in extra_live.iter().enumerate().take(n_blocks) {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
         for &local_idx in locals {
             if local_idx < n_locals && !defs[bb_idx].contains(local_idx) {
                 uses[bb_idx].insert(local_idx);
@@ -48996,9 +49396,17 @@ fn compute_mir_liveness(
         }
     }
 
-    let mut live_in = vec![BitSet::with_capacity(n_locals); n_blocks];
-    let mut worklist: std::collections::VecDeque<usize> = (0..n_blocks).rev().collect();
-    let mut in_worklist = vec![true; n_blocks];
+    let mut live_in = Vec::with_capacity(n_blocks);
+    for bb_idx in 0..n_blocks {
+        if forward[bb_idx] {
+            live_in.push(BitSet::with_capacity(n_locals));
+        } else {
+            live_in.push(BitSet::new());
+        }
+    }
+    let mut worklist: std::collections::VecDeque<usize> =
+        (0..n_blocks).rev().filter(|&bb| forward[bb]).collect();
+    let mut in_worklist = forward.clone();
     while let Some(bb_idx) = worklist.pop_front() {
         in_worklist[bb_idx] = false;
         let mut new_in = BitSet::with_capacity(n_locals);
@@ -50261,7 +50669,11 @@ fn unstructured_address_escape(
     let mut changed = true;
     while changed {
         changed = false;
+        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (index, block) in body.body.iter().enumerate() {
+            if !forward_blocks[index] {
+                continue;
+            }
             let mut depths = incoming[index].clone();
             for stmt in &block.statements {
                 match stmt.stmt_kind() {
@@ -62429,7 +62841,11 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
     // calls, multiple assigns) is a computed const left to the
     // accessor path.
     let mut found: Option<serde_json::Value> = None;
-    for blk in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, blk) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for st in &blk.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind() else {
                 continue;
@@ -67712,7 +68128,11 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
                     continue;
@@ -67749,7 +68169,11 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
         }
     }
     let mut out = vec![None; n];
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
         };
@@ -67804,7 +68228,11 @@ fn item_addr_locals(
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
                     continue;
@@ -68209,18 +68637,23 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
     if roles.iter().all(Option::is_none) {
         return roles;
     }
+    let forward_blocks = forward_reachable_mask(llbc, body);
     let assigns = || {
-        body.body.iter().flat_map(|bb| {
-            bb.statements
-                .iter()
-                .filter_map(|stmt| match stmt.stmt_kind() {
-                    Ok(StmtKind::Assign(place, rvalue)) => match place.kind {
-                        PlaceKind::Local(dest) => Some((dest as usize, place, rvalue)),
+        body.body
+            .iter()
+            .enumerate()
+            .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
+            .flat_map(|(_, bb)| {
+                bb.statements
+                    .iter()
+                    .filter_map(|stmt| match stmt.stmt_kind() {
+                        Ok(StmtKind::Assign(place, rvalue)) => match place.kind {
+                            PlaceKind::Local(dest) => Some((dest as usize, place, rvalue)),
+                            _ => None,
+                        },
                         _ => None,
-                    },
-                    _ => None,
-                })
-        })
+                    })
+            })
     };
     let mut poisoned = bit_set::BitSet::with_capacity(n_locals);
     // Borrows, to a fixpoint over `&*b` chains and moves of a borrow.
@@ -68311,7 +68744,11 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
         };
         let wanted = group_locals(&roles, storage);
         let mut ok = true;
-        'blocks: for bb in &body.body {
+        let forward_blocks = forward_reachable_mask(llbc, &body);
+        'blocks: for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             for stmt in &bb.statements {
                 let rvalue_json = stmt
                     .kind_value()
@@ -68600,7 +69037,11 @@ fn local_is_rust_vec_deref(
     llbc: &Llbc,
     local: usize,
 ) -> Option<majit_ir::rvec::VecItemKind> {
-    body.body.iter().find_map(|bb| {
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    body.body.iter().enumerate().find_map(|(bb_idx, bb)| {
+        if !forward_blocks[bb_idx] {
+            return None;
+        }
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             return None;
         };
@@ -68623,7 +69064,11 @@ fn rust_vec_deref_feeds_only_reverse(body: &Unstructured, llbc: &Llbc, local: us
     let mut watched = bit_set::BitSet::new();
     watched.insert(local);
     let mut reverses = 0;
-    for bb in &body.body {
+    let forward_blocks = forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         if bb.statements.iter().any(|stmt| {
             !matches!(
                 stmt.stmt_kind(),

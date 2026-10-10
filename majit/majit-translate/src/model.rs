@@ -8045,6 +8045,17 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
 }
 
 impl FunctionGraph {
+    /// `flowcontext.py` `fixeggblocks`: `del block.framestate` after the
+    /// graph is built ("memory saver"). The MIR front stores that
+    /// construction snapshot on [`Block::framestate`]. The codewriter
+    /// does not read it, and [`copygraph`] would otherwise clone every
+    /// block's dense locals map with the graph.
+    pub fn fixeggblocks(&mut self) {
+        for block in &mut self.blocks {
+            block.framestate = None;
+        }
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         let entry = BlockId(0);
         let returnblock = BlockId(1);
@@ -15907,6 +15918,11 @@ mod tests {
         );
         assert_eq!(&block.inputargs[0], &v_local);
         assert_eq!(&block.inputargs[1], &v_stack);
+        graph.fixeggblocks();
+        assert!(
+            graph.block(merge).framestate.is_none(),
+            "fixeggblocks drops the construction snapshot"
+        );
     }
 
     /// The critical round-trip invariant: predecessor's

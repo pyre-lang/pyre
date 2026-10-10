@@ -3484,15 +3484,11 @@ impl FlowContext {
 
 /// RPython `flowcontext.py` — `fixeggblocks(graph)`.
 ///
-/// Upstream: walks every block and deletes `SpamBlock.framestate`
-/// "memory saver" after graph construction. The Rust port holds
-/// `framestate` inside [`SpamBlock`] owned by the `FlowContext` rather
-/// than on `Block` itself, so there is nothing to drop from the
-/// finished `FunctionGraph`.
-///
-/// Defined as a no-op here to preserve call-site parity with upstream
-/// `objspace.build_flow`; the slot is reserved for the day SpamBlock
-/// migrates onto `Block` and genuinely holds state worth dropping.
+/// Upstream deletes `SpamBlock.framestate` ("memory saver") after graph
+/// construction. This bytecode walker's [`SpamBlock`] still lives on the
+/// `FlowContext`, so the flow graph has nothing to drop. The MIR front
+/// stores the same snapshot on `model::Block::framestate` and drops it
+/// from [`crate::model::FunctionGraph::fixeggblocks`] when the body is finished.
 pub fn fixeggblocks(_graph: &mut FunctionGraph) {
     // no-op — see module doc.
 }

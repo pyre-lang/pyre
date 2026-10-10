@@ -380,7 +380,11 @@ pub(super) fn residual_escape_census(llbc: &Llbc) -> Vec<(String, String)> {
             continue;
         };
         let graph = fd.item_meta.name_path();
-        for bb in &body.body {
+        let forward_blocks = super::forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };

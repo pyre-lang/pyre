@@ -676,7 +676,6 @@ impl CodeWriter {
         // box call receives a proven literal, the interned `W_UnicodeObject`
         // is one Ref constant — not an rstr `Ptr(STR)`.
         crate::translator::rtyper::box_str_const_fold::fold_box_str_constants(&mut graph_owned);
-        let graph = &graph_owned;
 
         // RPython codewriter.py:37 `portal_jd =
         // self.callcontrol.jitdriver_sd_from_portal_graph(graph)` — look
@@ -695,9 +694,9 @@ impl CodeWriter {
         //
         // No `with_type_state(&type_state)` — `dual_gate_type_state`
         // already committed every kind to each backing Variable's
-        // `concretetype` cell, and `Variable::clone` Rc-shares that
-        // cell so jtransform's internal `rewritten = graph.clone()`
-        // carries it through.
+        // `concretetype` cell. `copygraph` shares that `Rc`, and
+        // `Transformer::transform_owned` rewrites this graph in place
+        // (`jtransform.py` `Transformer.transform`).
         //
         // `cpu.rtyper.exceptiondata.fn_exception_match` is cloned out
         // of the dual-gate session before the `&mut CallControl`
@@ -713,7 +712,7 @@ impl CodeWriter {
                     .with_callcontrol(callcontrol)
                     .with_portal_jd(portal_jd_index)
                     .with_excmatch(excmatch.as_ref());
-                transformer.transform(graph)
+                transformer.transform_owned(graph_owned)
             });
         // Transformer is dropped here, releasing the &mut CallControl borrow.
 

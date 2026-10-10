@@ -2705,6 +2705,18 @@ impl<'a> Transformer<'a> {
     /// to hand-set kinds call `FunctionGraph::set_concretetype_of_inline(&var, ct)`
     /// directly.
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
+        // Callers that still read the pre-image (`transform_graph`, tests)
+        // get the one `copygraph` here. The codewriter already made that
+        // copy and calls [`Self::transform_owned`].
+        self.transform_owned(graph.clone())
+    }
+
+    /// Rewrite `graph` in place.
+    ///
+    /// `codewriter.py` `transform_graph_to_jitcode` does one
+    /// `copygraph(graph, shallowvars=True)` and `Transformer.transform`
+    /// rewrites that object.
+    pub fn transform_owned(&mut self, graph: FunctionGraph) -> GraphTransformResult {
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             self.analysis_cache = std::mem::take(&mut cc.analysis_cache);
         }
@@ -2715,8 +2727,7 @@ impl<'a> Transformer<'a> {
         result
     }
 
-    fn transform_body(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
-        let mut rewritten = graph.clone();
+    fn transform_body(&mut self, mut rewritten: FunctionGraph) -> GraphTransformResult {
         join_blocks(&mut rewritten);
 
         // jtransform.py transform_graph starts with

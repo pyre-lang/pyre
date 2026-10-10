@@ -162,25 +162,22 @@ fn straight_line_add_shape() {
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
     assert_eq!(u.locals.arg_count, 3);
-    // Cleanup blocks are left out; every on_unwind edge shares the appended
-    // UnwindResume block. 7 MIR blocks (4 normal + 3 cleanup) become 5.
-    assert_eq!(u.body.len(), 5);
+    assert_eq!(u.body.len(), 7);
+    assert!(
+        u.body.iter().any(|bb| bb.is_cleanup),
+        "cleanup blocks stay in the body the reader returns"
+    );
 
     // bb0 should end in an overflow Assert (AddChecked + Assert).
     let bb0 = &u.body[0];
-    match bb0.term(&llbc).unwrap() {
-        TermKind::Assert { on_unwind, .. } => assert_eq!(on_unwind, 4),
-        other => panic!("bb0 terminator was not Assert: {other:?}"),
-    }
+    assert!(
+        matches!(bb0.term(&llbc).unwrap(), TermKind::Assert { .. }),
+        "bb0 terminator was not Assert",
+    );
 
     // bb3 should be the return block.
     let bb3 = &u.body[3];
     assert!(matches!(bb3.term(&llbc).unwrap(), TermKind::Return));
-
-    assert!(matches!(
-        u.body[4].term(&llbc).unwrap(),
-        TermKind::UnwindResume
-    ));
 }
 
 #[test]
@@ -425,7 +422,8 @@ fn tail_len_inlines_promoted_empty_array() {
 }
 
 /// A body that never reads a promoted constant keeps its block and
-/// statement counts after the splice pass.
+/// statement counts after the splice pass. The counts are the body
+/// Charon wrote, cleanup blocks included.
 #[test]
 fn straight_line_add_unchanged_without_promoted_read() {
     let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
@@ -433,7 +431,11 @@ fn straight_line_add_unchanged_without_promoted_read() {
         .local_fn("straight_line_add")
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
-    assert_eq!(u.body.len(), 5);
+    assert_eq!(u.body.len(), 7);
     let stmt_counts: Vec<usize> = u.body.iter().map(|bb| bb.statements.len()).collect();
-    assert_eq!(stmt_counts, vec![10, 8, 8, 5, 0]);
+    assert_eq!(stmt_counts, vec![10, 8, 8, 5, 0, 0, 0]);
+    assert!(
+        u.body[4].is_cleanup && u.body[5].is_cleanup && u.body[6].is_cleanup,
+        "cleanup blocks stay in the body the reader returns"
+    );
 }

@@ -93,10 +93,6 @@ impl FunDecl {
 
     /// Return the `Unstructured` (basic-block CFG) body if present.
     ///
-    /// Cleanup blocks are reachable only through `on_unwind`, which the
-    /// flow graph does not carry, so they are left out. Every `on_unwind`
-    /// edge points at one terminal `UnwindResume` block.
-    ///
     /// Charon 0.1.281 emits promoted constants as their own global items.
     /// When this declaration was loaded with the artefact table, each read
     /// of an inlinable promoted constant is replaced by the initializer's
@@ -110,7 +106,7 @@ impl FunDecl {
         let body = self.body.as_ref()?;
         let mut u = serde_json::from_str::<Proj>(body.get())
             .ok()
-            .map(|p| strip_cleanup_blocks(p.unstructured))?;
+            .map(|p| p.unstructured)?;
         if let Some(table) = &self.promoted_inits
             && table.iter().any(Option::is_some)
             && body.get().contains("\"Global\"")
@@ -1557,8 +1553,23 @@ struct SpliceCtx<'a> {
     inserts: &'a mut Vec<Statement>,
 }
 
+/// `true` when a block's raw statement or terminator kind spells a
+/// `Global` place. [`splice_promoted_reads`] only rewrites those places;
+/// other blocks are unchanged.
+fn block_raw_has_global(bb: &BasicBlock) -> bool {
+    bb.statements
+        .iter()
+        .any(|st| st.kind.get().contains("\"Global\""))
+        || bb.terminator.kind.get().contains("\"Global\"")
+}
+
 /// Replace each inlinable promoted `Global` read with the initializer
 /// statements and a local holding the init's `_0`.
+///
+/// Blocks with no `Global` in their raw kinds are left untouched.
+/// [`Terminator::kind_value`] caches the parsed tree on the terminator, so
+/// walking every cleanup block of a body that merely mentions some other
+/// `Global` would retain one tree per block.
 fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]) {
     let mut locals = Locals {
         arg_count: body.locals.arg_count,
@@ -1566,6 +1577,9 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]
     };
     let body_span = body.span.clone();
     for bb in &mut body.body {
+        if !block_raw_has_global(bb) {
+            continue;
+        }
         let mut i = 0;
         while i < bb.statements.len() {
             let span = bb.statements[i].span.clone();
@@ -2976,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn unstructured_drops_cleanup_blocks_and_rewrites_unwind_edges() {
+    fn unstructured_keeps_cleanup_blocks_and_edges() {
         let decl = fun_decl_from_blocks(vec![
             bb(call_term(1, 3), false, 0),
             bb(drop_term(2, 4), false, 0),
@@ -2987,23 +3001,164 @@ mod tests {
             bb(serde_json::json!("UnwindTerminate"), true, 0),
         ]);
         let body = decl.unstructured().expect("Unstructured body");
-        assert_eq!(body.body.len(), 4);
+        assert_eq!(body.body.len(), 7);
         assert_eq!(call_edges(&body.body[0]), (1, 3));
-        assert_eq!(drop_edges(&body.body[1]), (2, 3));
+        assert_eq!(drop_edges(&body.body[1]), (2, 4));
         assert_eq!(
             body.body[2].terminator.kind_value(),
             &serde_json::json!("Return")
         );
-        assert_eq!(
-            body.body[3].terminator.kind_value(),
-            &serde_json::json!("UnwindResume")
-        );
-        assert!(body.body[3].statements.is_empty());
-        assert!(!body.body[3].is_cleanup);
+        assert!(body.body[3].is_cleanup);
+        assert_eq!(drop_edges(&body.body[3]), (5, 6));
         assert!(matches!(
             body.body[3].terminator.span,
             Some(SpanRef::Deduplicated(7))
         ));
+        assert!(body.body[4].is_cleanup);
+        assert_eq!(
+            body.body[4].terminator.kind_value(),
+            &serde_json::json!("UnwindResume")
+        );
+        assert!(body.body[5].is_cleanup);
+        assert_eq!(
+            body.body[6].terminator.kind_value(),
+            &serde_json::json!("UnwindTerminate")
+        );
+    }
+
+    /// Cleanup blocks that never name a `Global` stay as extracted, and a
+    /// later block's promoted read is still spliced. Walking those cleanup
+    /// terminators is not required to find the read.
+    #[test]
+    fn splice_skips_cleanup_blocks_without_a_global_read() {
+        let span = serde_json::json!({"Deduplicated": 0});
+        let meta = |name: serde_json::Value| {
+            serde_json::json!({
+                "name": name,
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let local = |index: u64| {
+            serde_json::json!({
+                "index": index,
+                "name": null,
+                "span": span,
+                "ty": {"Deduplicated": 0}
+            })
+        };
+        let bb = |statements: serde_json::Value, kind: serde_json::Value, is_cleanup: bool| {
+            serde_json::json!({
+                "statements": statements,
+                "terminator": {"span": span, "kind": kind},
+                "is_cleanup": is_cleanup
+            })
+        };
+        let assign_global = serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [
+                {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}},
+                {"Use": [
+                    {"Copy": {
+                        "kind": {"Global": {"generics": null, "id": 0}},
+                        "ty": {"Deduplicated": 0}
+                    }},
+                    null
+                ]}
+            ]}
+        });
+        let init_assign = serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [
+                {"kind": {"Local": 0}, "ty": {"Deduplicated": 0}},
+                {"Use": [{"Const": null}, null]}
+            ]}
+        });
+        let fun = |def_id: u64, name: serde_json::Value, body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(name),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": {"Deduplicated": 0}
+                },
+                "body": body
+            })
+        };
+        let subject = serde_json::json!({
+            "span": span,
+            "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
+            "body": [
+                bb(serde_json::json!([]), serde_json::json!({"Goto": {"target": 2}}), true),
+                bb(serde_json::json!([]), serde_json::json!("UnwindResume"), true),
+                bb(serde_json::json!([assign_global]), serde_json::json!("Return"), false),
+                bb(serde_json::json!([]), serde_json::json!({"Goto": {"target": 2}}), true)
+            ]
+        });
+        let init = serde_json::json!({
+            "span": span,
+            "locals": {"arg_count": 0, "locals": [local(0)]},
+            "body": [
+                bb(serde_json::json!([init_assign]), serde_json::json!("Return"), false)
+            ]
+        });
+        let file = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    fun(0, serde_json::json!([{"Ident": ["subject", 0]}]), serde_json::json!({"Unstructured": subject})),
+                    fun(1, serde_json::json!([{"Ident": ["init", 0]}]), serde_json::json!({"Unstructured": init}))
+                ],
+                "global_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(serde_json::json!([{"Builtin": ["PromotedConst", 0]}])),
+                    "global_kind": "AnonConst",
+                    "value": [{"Call": [{"kind": {"Fun": 1}}]}]
+                }]
+            }
+        });
+        let llbc = crate::Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let body = llbc
+            .fn_by_id(0)
+            .unwrap()
+            .unstructured()
+            .expect("subject body");
+        assert_eq!(body.body.len(), 4);
+        assert!(body.body[0].is_cleanup && body.body[1].is_cleanup && body.body[3].is_cleanup);
+        assert!(!body.body[2].is_cleanup);
+        assert_eq!(
+            body.body[0].terminator.kind_value(),
+            &serde_json::json!({"Goto": {"target": 2}})
+        );
+        assert_eq!(
+            body.body[1].terminator.kind_value(),
+            &serde_json::json!("UnwindResume")
+        );
+        assert_eq!(
+            body.body[3].terminator.kind_value(),
+            &serde_json::json!({"Goto": {"target": 2}})
+        );
+        assert!(
+            body.body[2].statements.len() > 1,
+            "promoted read should splice initializer statements"
+        );
+        assert!(
+            body.body[2]
+                .statements
+                .iter()
+                .all(|st| !st.kind.get().contains("\"Global\"")),
+            "promoted Global read should have been rewritten"
+        );
     }
 
     #[test]
@@ -3096,14 +3251,16 @@ mod tests {
     }
 
     #[test]
-    fn unstructured_rewrites_panic_unwind_edges() {
+    fn strip_cleanup_blocks_rewrites_panic_unwind_edges() {
         let decl = fun_decl_from_blocks(vec![
             bb(panic_term(2), false, 0),
             bb(serde_json::json!("Return"), false, 0),
             bb(drop_term(3, 3), true, 7),
             bb(serde_json::json!("UnwindResume"), true, 0),
         ]);
-        let body = decl.unstructured().expect("Unstructured body");
+        // FunDecl::unstructured keeps cleanup blocks. The public strip
+        // still rewrites a Panic on_unwind onto the terminal resume.
+        let body = strip_cleanup_blocks(decl.unstructured().expect("Unstructured body"));
         assert_eq!(body.body.len(), 3);
         let panic = body.body[0].terminator.kind_value().get("Panic").unwrap();
         assert_eq!(panic.get("on_unwind").and_then(Value::as_u64).unwrap(), 2);
