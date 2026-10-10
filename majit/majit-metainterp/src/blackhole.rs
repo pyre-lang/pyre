@@ -1295,7 +1295,12 @@ impl BlackholeInterpreter {
     }
 
     fn runtime_bh_descr(&self, descr_idx: usize) -> Option<&BhDescr> {
-        if let Some(entry) = self.jitcode.exec.descrs.get(descr_idx) {
+        // Same lookup as `read_descr`: per-jitcode `exec.descrs`, then the
+        // process-global build-time pool (`JitCode::descr_at` /
+        // `assembler.py` `Assembler.descrs`), then this interpreter's
+        // `setup_descrs` table. A `from_canonical` helper has an empty
+        // `exec.descrs` and names `d`-args in that shared pool.
+        if let Some(entry) = self.jitcode.descr_at(descr_idx) {
             return entry.as_bh_descr();
         }
         self.descrs.get(descr_idx)

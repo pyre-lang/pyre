@@ -1127,6 +1127,17 @@ impl PyJitCode {
         code_ptr: *const pyre_interpreter::CodeObject,
         has_abort: bool,
     ) -> Self {
+        // Codeless helpers bake `abort/>r` / `abort/>i` into `has_abort` once
+        // (`assembler.abort()` only sets `abort/`). Python (code-keyed)
+        // jitcodes keep the assembler flag: a cold-arm `abort` byte is not
+        // a reason to refuse `blackhole_from_resumedata`.
+        let has_abort = if code_ptr.is_null() {
+            has_abort
+                || crate::jitcode_runtime::decoded_ops(jitcode.code.as_slice())
+                    .any(|op| op.opname.starts_with("abort"))
+        } else {
+            has_abort
+        };
         Self::from_parts(
             jitcode,
             PyJitCodeMetadata::degenerate(),

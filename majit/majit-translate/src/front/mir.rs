@@ -3431,7 +3431,7 @@ fn annotation_struct_field_type(
 /// `ll_fixed_length` / `arraylen_gc` under [`OBJECT_REF_GCARRAY_TYPE_ID`].
 /// An `ItemsBlock` header pointer is the resizable list's `ll_items` and
 /// is not this type.
-fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
+pub(crate) fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
     let normalized = peel_ref_prefix(spelling);
     if normalized.starts_with('[')
         && slice_array_type_id(normalized).as_deref() == Some(OBJECT_REF_GCARRAY_TYPE_ID)
@@ -16890,6 +16890,24 @@ impl<'a> Lowering<'a> {
         header: Variable,
         target: usize,
     ) -> Result<(), LowerError> {
+        let list = self.emit_object_vec_gcarray_value(mir_bb, dest_local, header)?;
+        self.local_var[dest_local] = Some(LocalValue::One(list));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph
+            .set_goto(self.emit_bb(mir_bb), target_bb, link_args);
+        Ok(())
+    }
+
+    /// The shared whole-list object GcArray this tree already uses for
+    /// `&vec` / `&vec[..]` / `as_slice` (`gcarray_from_pyobject_vec`,
+    /// narrowed through the destination `[Class]` ListDef).
+    fn emit_object_vec_gcarray_value(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        header: Variable,
+    ) -> Result<Variable, LowerError> {
         let view = self.emit_path_call(
             mir_bb,
             "pyre_object::gc_roots::gcarray_from_pyobject_vec",
@@ -16919,15 +16937,10 @@ impl<'a> Lowering<'a> {
             ))
         })?;
         let list = self.narrow_value_to_instance_root(bb_id, LinkArg::Value(view), &list_root);
-        self.local_var[dest_local] = Some(LocalValue::One(
-            list.as_variable()
-                .expect("cast_instance of a Variable stays a Variable")
-                .clone(),
-        ));
-        let target_bb = self.block_id[target];
-        let link_args = self.edge_args(mir_bb, target)?;
-        self.graph.set_goto(bb_id, target_bb, link_args);
-        Ok(())
+        Ok(list
+            .as_variable()
+            .expect("cast_instance of a Variable stays a Variable")
+            .clone())
     }
 
     /// `&vec`, `&mut vec`, `&vec[..]`, `&mut vec[..]` of a `Vec<PyObjectRef>`
@@ -16985,6 +16998,107 @@ impl<'a> Lowering<'a> {
         self.graph
             .set_goto(self.block_id[mir_bb], target_bb, link_args);
         Ok(())
+    }
+
+    /// Shared `&vec[start:]` / `&vec[..end]` / `&vec[start..end]` of an
+    /// object-pointer `Vec`. The dest is the one-word object GcArray this
+    /// tree already uses for a whole-list view (`scope_w` / `args_w`);
+    /// `rlist.py` `rtype_getslice` then copies via `ll_listslice_startonly`
+    /// / `ll_listslice_rangeto` / `ll_listslice_startstop`, which
+    /// jtransform mints once the base is that GcArray.
+    ///
+    /// `&mut` dests stay the aliasing `{ptr, len}` view
+    /// (`objectptr_pair_view_locals` / `pair_subslice`). A non-object Vec
+    /// keeps that pair path too.
+    fn try_lower_object_vec_shared_subslice(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+        reg: &RegularCall,
+    ) -> Result<bool, LowerError> {
+        if call.args.len() != 2 {
+            return Ok(false);
+        }
+        let path = regular_call_name_path(reg, self.llbc).unwrap_or_default();
+        let leaf = path.rsplit("::").next().unwrap_or("");
+        if leaf != "index" {
+            return Ok(false);
+        }
+        if !(path.starts_with("alloc::vec::")
+            || vec_index_regular_unchecked_leaf(reg, self.llbc) == Some("index"))
+        {
+            return Ok(false);
+        }
+        let Some(first_ty) = call.args.first().and_then(operand_tyref) else {
+            return Ok(false);
+        };
+        if !tyref_is_object_pointer_rust_vec(first_ty, self.llbc) {
+            return Ok(false);
+        }
+        let dest_ty = &call.dest.ty;
+        if ref_kind_is_mut(dest_ty, self.llbc) {
+            return Ok(false);
+        }
+        if object_pointer_slice_list_root(dest_ty, self.llbc).is_none() {
+            return Ok(false);
+        }
+        let range = self.resolve_operand(mir_bb, call.args[1].clone())?;
+        let (marker_leaf, extra) = if let Some(site) = self
+            .slice_index_rangefrom_sites
+            .iter()
+            .find(|site| site.range_result == range)
+        {
+            ("__getslice_rangefrom", vec![site.start.clone()])
+        } else if let Some(site) = self
+            .slice_index_rangeto_sites
+            .iter()
+            .find(|site| site.range_result == range)
+        {
+            ("__getslice_rangeto", vec![site.end.clone()])
+        } else if let Some(site) = self
+            .slice_index_range_sites
+            .iter()
+            .find(|site| site.range_result == range)
+        {
+            (
+                "__getslice_range",
+                vec![site.start.clone(), site.end.clone()],
+            )
+        } else {
+            return Ok(false);
+        };
+        let header = self.resolve_operand(mir_bb, call.args[0].clone())?;
+        let list = self.emit_object_vec_gcarray_value(mir_bb, dest_local, header)?;
+        let mut args = vec![list.clone()];
+        args.extend(extra);
+        let suffix = crate::codewriter::getslice::listslice_marker_suffix(
+            &ValueType::Ref(None),
+            Some(OBJECT_REF_GCARRAY_TYPE_ID),
+        )
+        .expect("OBJECT_REF_GCARRAY_TYPE_ID sanitizes for listslice_marker_suffix");
+        let segments = vec![marker_leaf.to_string(), suffix];
+        let bb_id = self.emit_bb(mir_bb);
+        let dest = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(dest.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(args),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(dest));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// Emit a call of the helper at `path` and return its result.
@@ -24848,10 +24962,21 @@ impl<'a> Lowering<'a> {
         // `pair-slice local read as one word`. Slice methods on the mut
         // view (`rotate_right`) still take `is_pair_call`, which splits
         // the header.
-        if let CallFunc::Regular(reg) = &call.func
-            && self.try_lower_object_vec_whole_list_view(mir_bb, &call, dest_local, target, reg)?
-        {
-            return Ok(());
+        //
+        // A shared RangeFrom / RangeTo / Range subslice of the same Vec
+        // is that whole-list GcArray plus `rlist.py` `rtype_getslice`
+        // (`ll_listslice_startonly` / `ll_listslice_rangeto` /
+        // `ll_listslice_startstop`). Emit the marker here so a residual
+        // `alloc::vec::<Impl>::index` never reaches
+        // `rewire_one_slice_index_site`. `&mut` dests stay
+        // `pair_subslice`.
+        if let CallFunc::Regular(reg) = &call.func {
+            if self.try_lower_object_vec_whole_list_view(mir_bb, &call, dest_local, target, reg)? {
+                return Ok(());
+            }
+            if self.try_lower_object_vec_shared_subslice(mir_bb, &call, dest_local, target, reg)? {
+                return Ok(());
+            }
         }
         if self.is_pair_call(&call, dest_local) {
             return self.lower_pair_call(mir_bb, call, dest_local, target);
@@ -90370,11 +90495,13 @@ mod tests {
     }
 
     /// `w_range_iter` keeps the word iterator only when
-    /// `start + length * step` still fits i64 (`i64::try_from(i128)`).
-    /// That shell is the same checked Result `c_int_w` writes, with
-    /// `longlongmask` on the Ok payload (`rbuiltin.py`).
+    /// `start + length * step` still fits i64. The gate is
+    /// `length.checked_mul(step)` then `start.checked_add(product)`
+    /// (`functional.rs` `w_range_iter`; [3.14-spec] `rangeobject.c`
+    /// `range_iter`). Signed `checked_*` lifts to `mul_ovf` / `add_ovf`
+    /// (`checked_arith.rs`, `operation.py` `ovfcheck`).
     #[test]
-    fn w_range_iter_i128_try_from_lowers_to_checked_result() {
+    fn w_range_iter_overflow_gate_lifts_to_ovf_ops() {
         use crate::model::{CallTarget, OpKind};
 
         let path = format!(
@@ -90394,25 +90521,27 @@ mod tests {
             }),
             "w_range_iter: i128 try_from must not remain an opaque core call"
         );
-        for expected in ["lt", "gt", "or"] {
+        for residual in ["checked_mul", "checked_add"] {
+            assert!(
+                !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some(residual))
+                }),
+                "w_range_iter: {residual} must lift off the residual call"
+            );
+        }
+        for expected in ["mul_ovf", "add_ovf"] {
             assert!(
                 graph
                     .blocks
                     .iter()
                     .flat_map(|b| &b.operations)
                     .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == expected) }),
-                "w_range_iter: missing checked-narrowing {expected} op"
+                "w_range_iter: missing overflow-gate {expected} op"
             );
         }
-        assert!(
-            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.last().map(String::as_str) == Some("longlongmask"))
-            }),
-            "w_range_iter: Ok payload must go through longlongmask"
-        );
     }
 
     /// Minimal `Llbc` carrying only `trait_impls` — the surface
@@ -97360,6 +97489,297 @@ mod tests {
             }),
             "gcarray_from_pyobject_vec must be narrowed through the position ListDef; ops={ops:?}"
         );
+    }
+
+    /// `f(&v[3..])` on a shared `Vec<*mut PyObject>` is the whole-list
+    /// object GcArray (`gcarray_from_pyobject_vec`) then
+    /// `rlist.py` `rtype_getslice` / `ll_listslice_startonly`: the marker
+    /// `__getslice_rangefrom` with that GcArray as argument 0.
+    #[test]
+    fn object_vec_shared_rangefrom_subslice_is_whole_list_gcarray_then_getslice() {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| {
+                        if *segment == "<Impl>" {
+                            serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                        } else {
+                            serde_json::json!({"Ident": [segment, 0]})
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let named = |path: &[&str], def_id: u64, kind: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(path, false),
+                "kind": kind
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let obj_adt = serde_json::json!({"Adt": {"id": 1, "generics": generics.clone()}});
+        let objptr = serde_json::json!({"RawPtr": [obj_adt, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": {
+                "regions": [], "types": [objptr.clone()], "const_generics": [], "trait_refs": []
+            }}
+        });
+        let recv = serde_json::json!({"Ref": ["_", vec_ty.clone(), "Shared"]});
+        let slice = serde_json::json!({
+            "Ref": ["_", {"Slice": [objptr, null]}, "Shared"]
+        });
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let range_ty = serde_json::json!({"Adt": {"id": 2, "generics": generics.clone()}});
+        let unit = serde_json::json!({"Tuple": []});
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+            serde_json::json!({
+                "index": index, "name": name, "span": span(), "ty": ty
+            })
+        };
+        let start_const = serde_json::json!({
+            "Const": [{"Integer": {"Unsigned": ["Usize", "3"]}}, usize_ty]
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "call_with_object_vec_tail"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [recv.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            local(0, Some("ret"), &unit),
+                            local(1, Some("v"), &recv),
+                            local(2, Some("range"), &range_ty),
+                            local(3, Some("tail"), &slice)
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [{
+                                "span": span(),
+                                "kind": {"Assign": [
+                                    place(2, &range_ty),
+                                    {"Aggregate": [
+                                        {"Adt": [2, null]},
+                                        [start_const]
+                                    ]}
+                                ]}
+                            }],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 1},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [
+                                                {"Copy": place(1, &recv)},
+                                                {"Move": place(2, &range_ty)}
+                                            ],
+                                            "dest": place(3, &slice)
+                                        },
+                                        "target": 1,
+                                        "on_unwind": 3
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 2},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [{"Copy": place(3, &slice)}],
+                                            "dest": place(0, &unit)
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 3
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        }
+                    ]
+                }
+            }
+        });
+        let index = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["alloc", "vec", "<Impl>", "index"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [recv.clone(), range_ty.clone()],
+                "output": slice.clone()
+            },
+            "body": "Opaque"
+        });
+        let take = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "take"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [slice.clone()],
+                "output": unit
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    named(&["alloc", "vec", "Vec"], 0, serde_json::json!({"Struct": []})),
+                    named(&["PyObject"], 1, serde_json::json!({"Struct": []})),
+                    named(
+                        &["core", "ops", "range", "RangeFrom"],
+                        2,
+                        serde_json::json!({"Struct": [{
+                            "name": "start",
+                            "ty": usize_ty,
+                            "attr_info": null
+                        }]})
+                    )
+                ],
+                "fun_decls": [caller, index, take],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes())
+            .expect("object vec RangeFrom subslice fixture parses");
+        let graph = super::lower_function(&llbc, "call_with_object_vec_tail")
+            .expect("lower f(&v[3..]) on Vec<*mut PyObject>");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if crate::front::slice_index::vec_inherent_index_segments(segments)
+                    || segments.last().is_some_and(|leaf| leaf == "index")
+                        && segments.iter().any(|s| s == "vec")
+            )),
+            "shared object-vec RangeFrom must not leave alloc::vec::<Impl>::index; ops={ops:?}"
+        );
+        let gcarray = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.join("::") == "pyre_object::gc_roots::gcarray_from_pyobject_vec"
+            )
+        });
+        let Some(gcarray) = gcarray else {
+            panic!("shared object-vec RangeFrom must call gcarray_from_pyobject_vec; ops={ops:?}");
+        };
+        let view = gcarray
+            .result
+            .as_ref()
+            .expect("gcarray_from_pyobject_vec produces a value");
+        let list = ops
+            .iter()
+            .find_map(|op| {
+                (crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call { args, .. }
+                            if args.first().and_then(LinkArg::as_variable) == Some(view)
+                    ))
+                .then(|| op.result.as_ref().cloned())
+                .flatten()
+            })
+            .expect("gcarray_from_pyobject_vec must be narrowed through the position ListDef");
+        let marker = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__getslice_rangefrom")
+            )
+        });
+        let Some(marker) = marker else {
+            panic!("shared object-vec RangeFrom must emit __getslice_rangefrom; ops={ops:?}");
+        };
+        match &marker.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } => {
+                assert_eq!(
+                    segments.first().map(String::as_str),
+                    Some("__getslice_rangefrom")
+                );
+                assert_eq!(
+                    segments.get(1).map(String::as_str),
+                    crate::codewriter::getslice::listslice_marker_suffix(
+                        &ValueType::Ref(None),
+                        Some(super::OBJECT_REF_GCARRAY_TYPE_ID),
+                    )
+                    .as_deref(),
+                    "marker must carry listslice_marker_suffix(OBJECT_REF_GCARRAY_TYPE_ID); segments={segments:?}"
+                );
+                assert_eq!(
+                    args.first().and_then(LinkArg::as_variable),
+                    Some(&list),
+                    "marker argument 0 must be the whole-list GcArray; args={args:?}"
+                );
+            }
+            other => panic!("expected getslice marker call, got {other:?}"),
+        }
     }
 
     #[test]

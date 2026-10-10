@@ -880,19 +880,12 @@ fn gcarray_length_r(l2: *mut u8) -> usize {
     raw_read_ptr(raw_ptradd(l2 as usize, GCARRAY_LEN_OFFSET))
 }
 
-/// Item `index` of a length-prefixed object GcArray, read from the array
-/// word so a collection that moves `l2` is visible on the next index.
-fn gcarray_getitem_r(l2: *mut u8, index: usize) -> *mut u8 {
-    raw_read_ptr(raw_ptradd(
-        l2 as usize,
-        GCARRAY_ITEMS_OFFSET + index * ITEM_SIZE_R,
-    )) as *mut u8
-}
-
 /// `rlist.ll_extend(l1, l2)` when `l2` is a one-word object slice: the
-/// GcArray word, not a `(items, length)` pair. Length is the array's
-/// header; each item is read by index from `l2` after `_ll_resize_ge`,
-/// which may collect.
+/// GcArray word, not a `(items, length)` pair. Body of `rlist.py ll_extend`:
+/// `len1`, `len2`, `ovfcheck(len1 + len2)`, `_ll_resize_ge`, then one
+/// `ll_arraycopy(l2, l1, 0, len1, len2)`. There is no loop in `ll_extend`;
+/// the copy is [`ll_gcarray_arraycopy_r`], residual like `rgc.ll_arraycopy`
+/// (`OS_ARRAYCOPY`).
 ///
 /// `ovfcheck(len1 + len2)`: a wrapping sum would undersize the resize.
 /// Overflow is MemoryError, the same `Vec capacity overflow` panic as
@@ -904,11 +897,34 @@ pub fn ll_vec_extend_r(l: &mut Vec<*mut u8>, l2: *mut u8) {
         .checked_add(len2)
         .unwrap_or_else(|| panic!("Vec capacity overflow"));
     ll_vec_resize_ge_r(l, newlength);
-    let mut i = 0;
-    while i < len2 {
-        let item = gcarray_getitem_r(l2, i);
-        ll_vec_setitem_fast_r(l, len1 + i, item);
-        i += 1;
+    ll_gcarray_arraycopy_r(l2, ll_vec_items_r(l), 0, len1, len2);
+}
+
+/// `rgc.ll_arraycopy` from a length-prefixed object GcArray into a raw Vec
+/// item buffer. `source` is the GC array word itself (`rgc.ll_arraycopy`
+/// takes the GC arrays), not an interior address; `dest` is the Vec items
+/// address (`ll_items`). Residual like [`ll_slice_arraycopy_r`]:
+/// `ll_arraycopy` is `@jit.oopspec('list.ll_arraycopy(...)')`
+/// (`OS_ARRAYCOPY`). Inside a residual no collection can happen, so
+/// reading `source` once is sound.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_gcarray_arraycopy_r(
+    source: *mut u8,
+    dest: usize,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            slice_item_addr(
+                raw_ptradd(source as usize, GCARRAY_ITEMS_OFFSET),
+                source_start,
+                ITEM_SIZE_R,
+            ) as *const u8,
+            slice_item_addr(dest, dest_start, ITEM_SIZE_R) as *mut u8,
+            item_bytes(length, ITEM_SIZE_R).expect("Vec capacity overflow"),
+        );
     }
 }
 
@@ -1652,6 +1668,8 @@ mod tests {
             "ll_slice_rotate_right_r",
             "ll_slice_rotate_left_f",
             "ll_slice_bounds_panic",
+            "ll_slice_arraycopy_r",
+            "ll_gcarray_arraycopy_r",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(
@@ -1687,6 +1705,27 @@ mod tests {
         let before = ll_vec_length_r(&mut l);
         ll_vec_extend_r(&mut l, &mut empty as *mut GcArrayWord as *mut u8);
         assert_eq!(ll_vec_length_r(&mut l), before);
+    }
+
+    #[test]
+    fn extend_copies_three_gcarray_items_onto_nonempty_vec() {
+        #[repr(C)]
+        struct GcArrayWord {
+            length: usize,
+            items: [*mut u8; 3],
+        }
+        let mut src = GcArrayWord {
+            length: 3,
+            items: [0x10 as *mut u8, 0x20 as *mut u8, 0x30 as *mut u8],
+        };
+        let mut l = ll_vec_newemptylist_r();
+        ll_vec_append_r(&mut l, 0x01 as *mut u8);
+        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as *mut u8);
+        assert_eq!(ll_vec_length_r(&mut l), 4);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 0), 0x01 as *mut u8);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 1), 0x10 as *mut u8);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 2), 0x20 as *mut u8);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 3), 0x30 as *mut u8);
     }
 
     /// `ovfcheck(len1 + len2)` in `ll_extend`: a wrapping sum is MemoryError,

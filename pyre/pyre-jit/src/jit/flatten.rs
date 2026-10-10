@@ -6634,12 +6634,14 @@ pub(crate) mod inline_call_targets {
 /// the JitCode, so a body walk costs O(body) once per callee rather than once
 /// per lowered site.  It follows each `inline_call_*` through the shared
 /// build-time descr pool, which a body assembled at build time does not carry
-/// per-jitcode; the pool is installed first because a scan that resolves no
-/// callee also reports no target, which would read here as a clean body.
+/// per-jitcode. Flattening can run before the first trace, so this path
+/// runs `ensure_finish_setup` (`pyjitpl.py MetaInterpStaticData.finish_setup`)
+/// which installs that pool; a scan that resolves no callee also reports no
+/// target, which would read here as a clean body.
 pub(crate) fn fully_bound_callee_body(
     canonical_path: &'static str,
 ) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+    pyre_jit_trace::state::ensure_finish_setup();
     let jitcode = pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path)?;
     jitcode.startpoints.as_ref()?;
     if !jitcode.reachable_symbolic_residuals().targets.is_empty() {
@@ -13981,7 +13983,7 @@ mod tests {
     /// from the callee registry and the body scan rather than from
     /// `fully_bound_callee_body` (see [`assert_unary_lowering_inlines_bound_body`]).
     fn bound_inline_call_target(canonical_path: &'static str) -> bool {
-        pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+        pyre_jit_trace::state::ensure_finish_setup();
         pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path).is_some_and(
             |jitcode| {
                 jitcode.startpoints.is_some()
@@ -14012,8 +14014,8 @@ mod tests {
     ) {
         let (opname, args, result) = lower_unary_hlop_fixture(op_name, lower);
         // The scan follows `inline_call_*` through the shared build-time descr
-        // pool, so this read needs the same installed pool the gate does.
-        pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+        // pool, so this read runs the same `ensure_finish_setup` the gate does.
+        pyre_jit_trace::state::ensure_finish_setup();
         let body_is_bound =
             pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path)
                 .is_some_and(|jitcode| {

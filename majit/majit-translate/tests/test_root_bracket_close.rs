@@ -122,7 +122,11 @@ fn bracket_closes_for_each_caller_shape() {
             interpreter_llbc,
             "call_function_impl_result",
         ),
-        ("cffi", module_llbc, "do_call"),
+        // `do_call` n>1 is `pin_roots(args_w)` plus `get(args_slot + i)`:
+        // leftover-slice erasure takes that bracket out. `do_call_fargs`
+        // loops `pin_root` of each argument, so the depth is not a
+        // compile-time offset and the imported-crate close stays.
+        ("cffi", module_llbc, "do_call_fargs"),
     ];
     for (name, load, leaf) in cases {
         let Some(llbc) = load() else {
@@ -546,6 +550,41 @@ fn ll_listslice_inner_bracket_is_scalar_replaced() {
     }
 }
 
+/// `funccall_flat_from_args` pins 2..=6 slots per `match nargs` arm, so
+/// the join after that match is `AtMerge`. The erase pass models that
+/// join and takes `push_roots` / `pin_roots` / `get` out of the jitcode.
+#[test]
+fn funccall_flat_from_args_bracket_is_scalar_replaced() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+    let fd = fun_decl_named(llbc, "funccall_flat_from_args");
+    let body = fd
+        .unstructured()
+        .expect("funccall_flat_from_args has a body");
+    let erased = erased_root_bracket_guards(llbc, fd, &body);
+    assert!(
+        !erased.is_empty(),
+        "funccall_flat_from_args must erase its RootScope; guards={erased:?}"
+    );
+    let graph = lower_named(llbc, "funccall_flat_from_args");
+    for leaf in [
+        "push_roots",
+        "pin_roots",
+        "pin_root",
+        "get",
+        "shadow_stack_get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "funccall_flat_from_args still calls {leaf} after the nargs-pin merge was erased"
+        );
+    }
+}
+
 /// `eval_slice_index` opens, pins, and closes on every return. The
 /// path-sensitive walk classifies that body as depth-neutral.
 #[test]
@@ -944,7 +983,8 @@ fn shadow_stack_erase_census() {
 /// Nested exclusive RootScopes in `zip_two_tuple_next` close before they
 /// merge with a sibling that never opened them. Closing must drop that
 /// set's pin-count key; leftover keys refuse the rewrite and leave a
-/// residual unpublished `push_roots` that declines `zip_two_tuple_iters`.
+/// residual unpublished `push_roots`. FOR_ITER over zip already calls
+/// `zip_two_tuple_next` as a residual; the body is not descended.
 #[test]
 fn zip_two_tuple_next_erases_the_nested_root_brackets() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()
@@ -1070,10 +1110,51 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
     );
 }
 
+/// `try_new_for_call_with_closure_and_globals_obj` publishes `live` (the
+/// `[code, globals, closure, *args]` Vec) through `pin_roots`. That is
+/// the incoming-slice shape (`cdataobj.py descr_call` / `W_CData.call`
+/// passes `args_w` through; `pyframe.py Frame.__init__` livevars are
+/// that list), so the scalar replacement takes the bracket out of the
+/// jitcode and the walker is not left with a residual `push_roots`.
+#[test]
+fn try_new_for_call_erases_the_published_slice_bracket() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let graph = lower_named(llbc, "try_new_for_call_with_closure_and_globals_obj");
+    for leaf in ["push_roots", "pin_roots", "root_scope_close"] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "try_new still calls {leaf} after published-slice erasure"
+        );
+    }
+}
+
+/// `finish_for_call_with_globals_obj` publishes a 4-element array then
+/// the incoming `args` slice. Both runs erase; a leftover `push_roots`
+/// would residualize the whole constructor before `new_frame.run`.
+#[test]
+fn finish_for_call_erases_the_published_slice_bracket() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let graph = lower_named(llbc, "finish_for_call_with_globals_obj");
+    for leaf in ["push_roots", "pin_roots", "publish", "root_scope_close"] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "finish_for_call still calls {leaf} after published-slice erasure"
+        );
+    }
+}
+
 /// `do_call` `n == 1` pins `args_w[0]` with `base()` + `pin_root` + `get(base)`.
-/// The pin temporary is `StorageDead` before the get, so erasure has to
-/// rewrite the get as `getarrayitem` of the incoming list. `n > 1` still
-/// loops `get(args_slot + i)` with a non-const index, so that bracket stays.
+/// The pin temporary is `StorageDead` before the get, so erasure rewrites
+/// the get as `getarrayitem` of the incoming list. `n > 1` is
+/// `pin_roots(args_w)` plus `get(args_slot + i)`: leftover-slice erasure
+/// takes that bracket out the same way (`cdataobj.py descr_call` /
+/// `pyframe.py Frame.__init__` livevars).
 #[test]
 fn do_call_erases_the_n1_incoming_elem_bracket() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()
@@ -1097,8 +1178,13 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
     let graph = lower_fun(&module, &context, "do_call");
     assert_eq!(
         calls_to(&graph, "push_roots"),
-        1,
-        "n==1 push_roots must be erased; n>1 loop-index get stays"
+        0,
+        "n==1 incoming-elem and n>1 incoming-slice push_roots must both erase"
+    );
+    assert_eq!(
+        calls_to(&graph, "pin_roots"),
+        0,
+        "n>1 pin_roots(args_w) must be erased as leftover-slice"
     );
     assert_eq!(
         calls_to(&graph, "pin_root"),
@@ -1118,7 +1204,38 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
         .count();
     assert!(
         array_reads > 0,
-        "n==1 get(base) must rewrite to getarrayitem of args_w"
+        "get(base) / get(args_slot + i) must rewrite to getarrayitem of args_w"
+    );
+}
+
+/// `w_code_frame_stores_global` publishes `[obj, w_globals]`, then on the
+/// miss path calls `publish_code_slot_store_rooting` which returns an owned
+/// nested `RootScope`. The leftover is that dest (and ParamSlots methods
+/// of it), so scalar replacement takes the outer bracket out.
+#[test]
+fn w_code_frame_stores_global_erases_the_outer_root_bracket() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let context = LowerContext::new(&interpreter);
+    let graph = lower_fun(&interpreter, &context, "w_code_frame_stores_global");
+    for leaf in ["push_roots", "pin_roots", "publish", "root_scope_close"] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "w_code_frame_stores_global still calls {leaf} after owned-scope erasure"
+        );
+    }
+    assert!(
+        calls_to(&graph, "publish_code_slot_store_rooting") > 0,
+        "the nested owned-scope helper keeps its own bracket"
     );
 }
 

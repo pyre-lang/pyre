@@ -319,7 +319,7 @@ fn unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect() {
 #[test]
 fn portal_reachable_symbolic_residual_scan_is_empty() {
     let _ = crate::jitcode_runtime::all_jitcodes();
-    crate::jitcode_runtime::install_global_build_descr_pool();
+    crate::state::ensure_finish_setup();
     let canonical = crate::jitcode_runtime::portal_jitcode()
         .expect("the build-time table registers the eval portal");
     let portal = crate::jitcode_runtime::get_runtime_jitcode_by_index(canonical.index())
@@ -357,7 +357,7 @@ fn portal_reachable_symbolic_residual_scan_is_empty() {
 #[test]
 fn unpackiterable_portal_reachable_symbolic_residual_scan_is_empty() {
     let _ = crate::jitcode_runtime::all_jitcodes();
-    crate::jitcode_runtime::install_global_build_descr_pool();
+    crate::state::ensure_finish_setup();
     let canonical =
         crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::unpackiterable_portal")
             .expect("the build-time table registers the unpackiterable portal");
@@ -5558,6 +5558,246 @@ fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
         !ops.iter()
             .any(|op| op.contains("cast_uint_to_int") || op.contains("cast_int_to_uint")),
         "usize/i64 length casts must erase; ops={ops:?}"
+    );
+}
+
+fn assert_identity_iter_w_leaf(path: &str) {
+    let jc = crate::jitcode_runtime::pathed_jitcode(path)
+        .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+    let _body = jc
+        .try_body()
+        .unwrap_or_else(|| panic!("{path} body must be assembled"));
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(jc.calldescr().arg_classes, "r", "{path} ops={ops:?}");
+    assert_eq!(jc.calldescr().result_type, 'r', "{path} ops={ops:?}");
+    assert!(
+        ops.iter().any(|op| *op == "ref_return"),
+        "{path} must return the receiver; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op.contains("residual")),
+        "{path} must not residualise; ops={ops:?}"
+    );
+}
+
+#[test]
+fn zip_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Zip.iter_w` is `return self`. Own graph so GET_ITER
+    // records that body (`specialize.rs ZIP_ITER_DESCENT`) instead of a
+    // hand identity.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_zip_iter");
+}
+
+#[test]
+fn map_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Map.iter_w` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_map_iter");
+}
+
+#[test]
+fn filter_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Filter.iter_w` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_filter_iter");
+}
+
+#[test]
+fn seqiter_iter_jitcode_is_the_descr_iter_leaf() {
+    // `iterobject.py W_AbstractSeqIterObject.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::iterobject::w_seqiter_iter");
+}
+
+#[test]
+fn reverseseqiter_iter_jitcode_is_the_descr_iter_leaf() {
+    // `iterobject.py W_ReverseSeqIterObject.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::iterobject::w_reverseseqiter_iter");
+}
+
+#[test]
+fn range_new_stop_jitcode_is_the_descr_new_leaf() {
+    // `functional.py W_Range.descr_new` nargs==1 after arity unpacking.
+    // `specialize.rs RANGE_NEW_STOP_DESCENT` records this body, including
+    // `space.index` (`range_index_bound`).
+    let stop =
+        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::builtins::w_range_new_stop")
+            .expect("w_range_new_stop must be a discovered jitcode");
+    let _body = stop
+        .try_body()
+        .expect("w_range_new_stop body must be assembled");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&stop.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(stop.calldescr().arg_classes, "r", "ops={ops:?}");
+    assert_eq!(stop.calldescr().result_type, 'r', "ops={ops:?}");
+    assert!(
+        ops.iter().any(|op| op.starts_with("inline_call_")),
+        "w_range_new_stop records w_int_new / w_range_new via inline_call; ops={ops:?}"
+    );
+    assert!(
+        !(ops.len() == 1 && ops[0].contains("residual")),
+        "w_range_new_stop must not be a single residual; ops={ops:?}"
+    );
+    assert!(
+        ops.first()
+            .is_none_or(|op| !op.starts_with("residual_call")),
+        "w_range_new_stop must not open on a residual pin; ops={ops:?}"
+    );
+    // rustc does not inline `w_range_new` / `w_range_allocate` into the
+    // arity leaves; the walker follows `inline_call_ir_r`. Allocation is
+    // `allocate_stable` fused to `new_with_vtable` on `w_range_allocate`
+    // (`fuse_boxing_alloc`).
+    let alloc = crate::jitcode_runtime::pathed_jitcode("pyre_object::functional::w_range_allocate")
+        .expect("w_range_allocate must be a discovered jitcode");
+    let alloc_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&alloc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        alloc_ops.iter().any(|op| *op == "new_with_vtable"),
+        "W_Range must box via new_with_vtable; w_range_allocate ops={alloc_ops:?} stop ops={ops:?}"
+    );
+    assert!(
+        !alloc_ops.iter().any(|op| op.contains("residual")),
+        "w_range_allocate must not residualise allocate_stable; ops={alloc_ops:?}"
+    );
+    // `compute_range_length` is `space.lt` / `space.sub` / …; a leading
+    // `pin_root` residual (`with_shadow_stack` closure) aborts the descent.
+    let length =
+        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::builtins::compute_range_length")
+            .expect("compute_range_length must be a discovered jitcode");
+    let length_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&length.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        length_ops.iter().any(|op| op.starts_with("inline_call_")),
+        "compute_range_length records space int ops via inline_call; ops={length_ops:?}"
+    );
+    assert!(
+        length_ops
+            .first()
+            .is_none_or(|op| !op.starts_with("residual_call")),
+        "compute_range_length must not open on a residual pin; ops={length_ops:?}"
+    );
+    let two = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::builtins::w_range_new_start_stop",
+    )
+    .expect("w_range_new_start_stop must be a discovered jitcode");
+    let _two_body = two
+        .try_body()
+        .expect("w_range_new_start_stop body must be assembled");
+    assert_eq!(two.calldescr().arg_classes, "rr");
+    let three = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::builtins::w_range_new_start_stop_step",
+    )
+    .expect("w_range_new_start_stop_step must be a discovered jitcode");
+    let _three_body = three
+        .try_body()
+        .expect("w_range_new_start_stop_step body must be assembled");
+    assert_eq!(three.calldescr().arg_classes, "rrr");
+}
+
+#[test]
+fn zip_two_tuple_next_jitcode_is_the_tuple_iter_leaf() {
+    // `functional.py` `W_Zip.next_w` length==2 arm, recorded by
+    // `specialize.rs ZIP_NEXT_DESCENT`. Inner `space.next` is
+    // `W_FastTupleIterObject.descr_next` over `W_TupleObject`. The product
+    // is `w_specialised_tuple_oo_new` (`fuse_boxing_alloc` → `new_with_vtable`).
+    let zip = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::baseobjspace::zip_two_tuple_next",
+    )
+    .expect("zip_two_tuple_next must be a discovered jitcode");
+    let _body = zip
+        .try_body()
+        .expect("zip_two_tuple_next body must be assembled");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&zip.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(zip.calldescr().arg_classes, "r", "ops={ops:?}");
+    assert_eq!(zip.calldescr().result_type, 'r', "ops={ops:?}");
+    // The item load is `tuple_exact_item`: `wrappeditems` is `[*]`, so the
+    // read is `getarrayitem_gc_r_pure`, not a residual `w_tuple_getitem`.
+    let item =
+        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::baseobjspace::tuple_exact_item")
+            .expect("tuple_exact_item must be a discovered jitcode");
+    let item_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&item.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        item_ops.iter().any(|op| *op == "getarrayitem_gc_r_pure"),
+        "tuple item load must be a pure getarrayitem; ops={item_ops:?}"
+    );
+    assert!(
+        !item_ops.iter().any(|op| op.contains("residual")),
+        "tuple_exact_item must not residualise the load; ops={item_ops:?}"
+    );
+    let oo = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_object::specialisedtupleobject::w_specialised_tuple_oo_new",
+    )
+    .expect("w_specialised_tuple_oo_new must be a discovered jitcode");
+    let oo_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&oo.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        oo_ops.iter().any(|op| *op == "new_with_vtable"),
+        "the pair must box via new_with_vtable; ops={oo_ops:?}"
+    );
+    assert!(
+        !oo_ops.iter().any(|op| op.contains("residual")),
+        "w_specialised_tuple_oo_new must not residualise malloc; ops={oo_ops:?}"
+    );
+    assert!(
+        !(ops.len() == 1 && ops[0].contains("residual")),
+        "zip_two_tuple_next collapsed to one residual; ops={ops:?}"
+    );
+}
+
+#[test]
+fn recipe_consume_boxes_ref_color_is_not_slot_identity() {
+    // pcdep at the resume pc: color 0 -> slot 2, color 2 -> slot 0.
+    // A color-as-slot read of registers_r[0] would return the box of slot 0,
+    // a different variable (`resume.py consume_boxes` indexes MIFrame.registers_r
+    // by color).
+    let pcdep = [(1u8, 0u16, 2u16), (1, 2, 0)];
+    assert_eq!(
+        crate::state::semantic_ref_slot_for_reg_color(3, 0, &pcdep, 0),
+        Some(2),
+    );
+    assert_eq!(
+        crate::state::semantic_ref_slot_for_reg_color(3, 0, &pcdep, 2),
+        Some(0),
+    );
+    let box_slot_0 = OpRef::ref_op(0xA0);
+    let box_slot_2 = OpRef::ref_op(0xA2);
+    let recipe = majit_metainterp::ReconstructRecipe {
+        code_ptr: std::ptr::null(),
+        jitcode_index: 0,
+        jitcode_pc: 0,
+        nlocals: 3,
+        valuestackdepth: 3,
+        registers_i: Vec::new(),
+        registers_r: vec![box_slot_0, OpRef::NONE, box_slot_2],
+        registers_f: Vec::new(),
+        concrete_r: Vec::new(),
+        color_registers_r: vec![box_slot_2, OpRef::NONE, box_slot_0],
+        color_concrete_r: Vec::new(),
+        frame: OpRef::NONE,
+        nargs: 0,
+        return_substitute: None,
+        len_tail: false,
+        rebuilt_frame: None,
+        rebuilt_ec: None,
+    };
+    assert_eq!(
+        crate::state::recipe_consume_boxes_ref_at_color(&recipe, 0),
+        box_slot_2
+    );
+    assert_ne!(
+        crate::state::recipe_consume_boxes_ref_at_color(&recipe, 0),
+        recipe.registers_r[0]
+    );
+    assert_eq!(
+        crate::state::recipe_consume_boxes_ref_at_color(&recipe, 2),
+        box_slot_0
     );
 }
 

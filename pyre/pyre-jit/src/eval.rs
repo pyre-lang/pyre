@@ -7879,7 +7879,6 @@ fn drive_portal_metatrace(
     if driver.meta_interp_mut().is_tracing() {
         return None;
     }
-    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical =
         pyre_jit_trace::jitcode_runtime::portal_jitcode().expect("jd0 portal jitcode must resolve");
     // warmspot.py split_graph_and_record_jitdriver: setup_call takes greens
@@ -8285,7 +8284,6 @@ fn drive_generatorentry_trace(
     let dbg = std::env::var_os("PYRE_JD2_DEBUG").is_some();
     pyre_interpreter::call::genentry_resume_note_arm();
     let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
-    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
         pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
     ) {
@@ -8829,10 +8827,6 @@ fn drive_unpack_iterable_trace(
 ) {
     use majit_metainterp::BackEdgeAction;
 
-    // jd1's extracted portal jitcode carries an empty per-jitcode descr pool;
-    // its inline-call / residual-call `d`/`j` argcodes resolve through the
-    // shared global build-time pool, so install it before the walk reads the
-    // first descr (idempotent OnceLock).
     let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
     // Portal pins are the two slots under this hook. Capture them before
     // ResidualExceptionScope::park can pin a standing exception on top;
@@ -8847,7 +8841,6 @@ fn drive_unpack_iterable_trace(
     // own pending raise — a `StopIteration` surfacing at code that raised
     // nothing.
     let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
-    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
         "baseobjspace::unpackiterable_portal",
     ) {
@@ -8860,8 +8853,9 @@ fn drive_unpack_iterable_trace(
         }
     };
     // The build-time canonical body has an empty per-jitcode descr pool; the
-    // runtime `JitCode` resolves its `d`/`j` argcodes through the shared global
-    // pool installed above (`descr_at`).
+    // runtime `JitCode` resolves its `d`/`j` argcodes through the shared
+    // `Assembler.descrs` pool (`JitCode::descr_at`) that `ensure_finish_setup`
+    // installs.
     let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
 
     // Register the drain (a build-time portal jitcode carrying its baked
@@ -12677,15 +12671,6 @@ fn compile_and_run_once(
         CompileOnceStart::FunctionEntry => 19,
     });
 
-    // LLBC-extracted portal jitcodes resolve `d`/`j` argcodes through
-    // the process-global build-time descr table (`Assembler.descrs`).
-    // jd1 and the metatrace probe already install it; the interpret
-    // arm of `_compile_and_run_once` must too or the first
-    // `inline_call_*` aborts with an empty pool. The `trace_bytecode`
-    // arm does not install it.
-    if portal_interpret_enabled() {
-        pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
-    }
     // warmspot/codewriter ordering: the portal and all drained JitCodes are
     // installed before the marker-driven metainterpreter starts.  Resolve the
     // per-green static entry here; `trace_bytecode` consumes the same sidecar
@@ -15567,6 +15552,23 @@ fn build_resumed_frames(
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
+        // resume.py blackhole_from_resumedata `jitcodes[jitcode_pos]`:
+        // Outermost frame: code from vable resume data.
+        // Inner frames: code from jitcode_index registry (inlined calls).
+        // After `opencoder.py` `framestack.reverse()` parity (encoder at
+        // `trace_opcode.rs::build_framestack_snapshot`), `frames[0]` is the
+        // outermost (caller / JIT-driver) frame and the last entry is the
+        // innermost (deepest callee).
+        let is_outermost = idx == 0;
+        // Helper / continuation jitcodes have no Python `CodeObject`.
+        // `resume.py` `blackhole_from_resumedata` runs that section;
+        // do not rebuild a Python `ResumedFrame` or translate its pc
+        // with `resume_py_pc_for_jitcode_word`.
+        if !is_outermost
+            && pyre_jit_trace::state::raw_code_for_jitcode_index(frame.jitcode_index).is_none()
+        {
+            continue;
+        }
         // resume.py writes jitcode_index and pc. The Python resume pc is
         // `resume_py_pc_for_jitcode_word` (the codewriter forward twin).
         // pc<0 is the no-snapshot sentinel → fall back to the vable next-instr.
@@ -15585,20 +15587,12 @@ fn build_resumed_frames(
         } else {
             vable_ni
         };
-        // resume.py:1339 jitcodes[jitcode_pos]:
-        // Outermost frame: code from vable resume data.
-        // Inner frames: code from jitcode_index registry (inlined calls).
-        // After `opencoder.py` `framestack.reverse()` parity (encoder at
-        // `trace_opcode.rs::build_framestack_snapshot`), `frames[0]` is the
-        // outermost (caller / JIT-driver) frame and the last entry is the
-        // innermost (deepest callee).
-        let is_outermost = idx == 0;
         // `blackhole_from_resumedata` / `rebuild_from_resumedata`: each
         // section's registers hold that level's own reds. The outermost
         // red is the jitdriver virtualizable (`consume_vable_info`). An
         // inlined callee's PyFrame is that section's `portal_frame_reg`
         // (`interp_jit.py` `reds = ['frame', 'ec']`), a virtual the reader
-        // materializes from TAGVIRTUAL.
+        // materializes from TAGVIRTUAL. Helper sections were skipped above.
         let frame_ptr = if is_outermost {
             vable_frame_ptr
         } else {
@@ -18496,5 +18490,114 @@ mod tests {
             assert_subclass_ranges([&tp], |_| None);
         });
         assert!(missing.is_err(), "a published alias cannot disappear");
+    }
+
+    fn live_only_pyjitcode(
+        code_ptr: *const pyre_interpreter::CodeObject,
+        extra: &[u8],
+    ) -> std::sync::Arc<pyre_jit_trace::PyJitCode> {
+        use majit_metainterp::jitcode::insns::BC_LIVE;
+        let live_off =
+            pyre_jit_trace::state::intern_liveness(&[], &[], &[]).expect("empty liveness intern");
+        let mut runtime = majit_metainterp::jitcode::JitCodeBuilder::default().finish();
+        let mut code = vec![BC_LIVE, (live_off & 0xff) as u8, (live_off >> 8) as u8];
+        code.extend_from_slice(extra);
+        runtime.body_mut().code = code;
+        runtime.body_mut().startpoints = Some(if extra.is_empty() {
+            [0usize].into_iter().collect()
+        } else {
+            [0usize, 3].into_iter().collect()
+        });
+        std::sync::Arc::new(pyre_jit_trace::PyJitCode::from_core_degenerate(
+            std::sync::Arc::new(runtime),
+            code_ptr,
+            false,
+        ))
+    }
+
+    #[test]
+    fn build_resumed_frames_skips_helper_section_in_two_section_numbering() {
+        use majit_metainterp::jitcode::insns::BC_ABORT_RESULT_R;
+        use pyre_interpreter::compile_exec;
+
+        let (driver, _) = driver_pair();
+        install_build_time_liveness_before_trace(driver.meta_interp_mut());
+
+        let source = "try:\n    x = 1\nexcept Exception:\n    pass\n";
+        let code = compile_exec(source).expect("try/except module should compile");
+        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::from_ref(&code).cast());
+        let raw = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let portal = live_only_pyjitcode(raw, &[]);
+        pyre_jit_trace::state::install_jitcode_for(w_code.cast(), portal);
+        let portal_index =
+            pyre_jit_trace::state::ensure_jitcode_index(w_code.cast()).expect("portal index");
+        let helper_index = pyre_jit_trace::state::install_codeless_jitcode(live_only_pyjitcode(
+            std::ptr::null(),
+            &[],
+        ));
+        let abort_index = pyre_jit_trace::state::install_codeless_jitcode(live_only_pyjitcode(
+            std::ptr::null(),
+            &[BC_ABORT_RESULT_R, 0],
+        ));
+
+        let mut writer = majit_ir::resumecode::Writer::new(8);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.append_int(portal_index as i64);
+        writer.append_int(0);
+        writer.append_int(helper_index as i64);
+        writer.append_int(0);
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
+
+        let layout = CompiledExitLayout {
+            rd_loop_token: 0,
+            trace_id: 0,
+            fail_index: 0,
+            source_op_index: None,
+            exit_types: Default::default(),
+            is_finish: false,
+            is_exception_exit: false,
+            storage: None,
+        };
+        let mut virtuals_cache = DirectVirtualsCache::new(0);
+        let frames = build_resumed_frames(
+            &[],
+            &rd_numb,
+            &[],
+            &layout,
+            ResumeVableMode::GuardFailureSync,
+            &mut virtuals_cache,
+        );
+        assert_eq!(
+            frames.len(),
+            1,
+            "helper section must not become a Python ResumedFrame"
+        );
+
+        let mut catch_pc = None;
+        for py_pc in 1..=code.instructions.len() {
+            if pyre_interpreter::pycode::lookup_exceptiontable(
+                &code.exceptiontable,
+                (py_pc as u32 - 1) * 2,
+            )
+            .is_some()
+            {
+                catch_pc = Some(py_pc);
+                break;
+            }
+        }
+        let catch_pc = catch_pc.expect("try body should be covered by the exception table");
+        assert_eq!(
+            crate::call_jit::resumed_catch_level(&[(w_code as usize, catch_pc), (0, 0)]),
+            Some(0)
+        );
+        assert!(crate::call_jit::resolve_jitcode_for_blackhole(helper_index, 0).is_some());
+        assert!(crate::call_jit::resolve_jitcode_for_blackhole(abort_index, 0).is_none());
+        assert!(crate::call_jit::resolve_jitcode_for_blackhole(portal_index, 0).is_some());
     }
 }

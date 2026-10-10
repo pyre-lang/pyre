@@ -10714,51 +10714,72 @@ impl<'a> Transformer<'a> {
                 // hardcoded — so a non-pointer element list is not GC-traced
                 // as a pointer array, and a resized result carries the struct
                 // header instead of a bare array (C1).
-                let (detail, kind) =
-                    match newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref()) {
-                        NewlistClearShape::Resized {
-                            item_ty,
-                            array_type_id,
-                        } => (
-                            "newlist_clear → newlist_clear(count, arraydescr) \
-                         [resized list header]",
-                            OpKind::NewListClear {
-                                length,
-                                item_ty,
-                                array_type_id,
-                            },
-                        ),
-                        NewlistClearShape::Fixed {
-                            item_ty,
-                            array_type_id,
-                        } => (
-                            "newlist_clear → new_array_clear(count, arraydescr) \
-                         [fixed array]",
-                            OpKind::NewArrayClear {
-                                length,
-                                item_ty,
-                                array_type_id,
-                            },
-                        ),
-                        // OBJECTPTR / None fallback: a generic `OBJECTPTR`
-                        // result (kind-collapsed `Ptr(GcStruct("object"))`)
-                        // or a missing concretetype.  The allocation is
-                        // still a fixed list of refs, so it names the same
-                        // `GcArray(OBJECTPTR)` ARRAY `cpu.arraydescrof`
-                        // uses for `wrappeditems` — an identity-less descr
-                        // mints `type_id = 0` and the collector cannot
-                        // trace the block.
-                        NewlistClearShape::Fallback => (
-                            "newlist_clear → new_array_clear(count, arraydescr)",
-                            OpKind::NewArrayClear {
-                                length,
-                                item_ty: ValueType::Ref(None),
-                                array_type_id: Some(
-                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
-                                ),
-                            },
+                let mut shape =
+                    newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref());
+                // `do_fixed_newlist_clear`: `ARRAY = op.result.concretetype.TO`
+                // then `cpu.arraydescrof(ARRAY)`. A rust helper returning
+                // `*mut FixedObjectArray` may kind-collapse the Variable to
+                // OBJECTPTR while the Call's result_ty still names that
+                // GcArray. Recover the ARRAY identity from the return type,
+                // never the callee name.
+                if matches!(shape, NewlistClearShape::Fallback)
+                    && let OpKind::Call {
+                        result_ty: ValueType::Ref(Some(owner)),
+                        ..
+                    } = &op.kind
+                    && crate::front::mir::type_spelling_is_fixed_object_array(owner)
+                {
+                    shape = NewlistClearShape::Fixed {
+                        item_ty: ValueType::Ref(None),
+                        array_type_id: Some(
+                            crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                         ),
                     };
+                }
+                let (detail, kind) = match shape {
+                    NewlistClearShape::Resized {
+                        item_ty,
+                        array_type_id,
+                    } => (
+                        "newlist_clear → newlist_clear(count, arraydescr) \
+                         [resized list header]",
+                        OpKind::NewListClear {
+                            length,
+                            item_ty,
+                            array_type_id,
+                        },
+                    ),
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                    } => (
+                        "newlist_clear → new_array_clear(count, arraydescr) \
+                         [fixed array]",
+                        OpKind::NewArrayClear {
+                            length,
+                            item_ty,
+                            array_type_id,
+                        },
+                    ),
+                    // OBJECTPTR / None fallback: a generic `OBJECTPTR`
+                    // result (kind-collapsed `Ptr(GcStruct("object"))`)
+                    // or a missing concretetype.  The allocation is
+                    // still a fixed list of refs, so it names the same
+                    // `GcArray(OBJECTPTR)` ARRAY `cpu.arraydescrof`
+                    // uses for `wrappeditems` — an identity-less descr
+                    // mints `type_id = 0` and the collector cannot
+                    // trace the block.
+                    NewlistClearShape::Fallback => (
+                        "newlist_clear → new_array_clear(count, arraydescr)",
+                        OpKind::NewArrayClear {
+                            length,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(
+                                crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                            ),
+                        },
+                    ),
+                };
                 (
                     detail,
                     vec![SpaceOperation {
@@ -15316,6 +15337,15 @@ fn newlist_clear_shape(
     // concretetype to OBJECTPTR. Recover the ARRAY identity from the
     // registered rust layout of that classdef.
     if let Some(name) = result.and_then(instance_classdef_name) {
+        // `*mut FixedObjectArray` is the frame-locals GcArray
+        // (`do_fixed_newlist_clear` `cpu.arraydescrof(ARRAY)`). The leaf
+        // names that ARRAY even when rust layout is not yet registered.
+        if crate::front::mir::type_spelling_is_fixed_object_array(&name) {
+            return NewlistClearShape::Fixed {
+                item_ty: ValueType::Ref(None),
+                array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+            };
+        }
         let dummy =
             crate::translator::rtyper::lltypesystem::lltype::Struct::gc(name.as_str(), vec![]);
         if object_items_array_id(&dummy, callcontrol).is_some() {
@@ -15378,6 +15408,12 @@ fn newlist_clear_shape(
                 return NewlistClearShape::Fixed {
                     item_ty,
                     array_type_id: Some(array_type_id),
+                };
+            }
+            if crate::front::mir::type_spelling_is_fixed_object_array(&s._name) {
+                return NewlistClearShape::Fixed {
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                 };
             }
             NewlistClearShape::Fallback
@@ -32005,6 +32041,110 @@ mod tests {
             })
             .expect("marked newlist_clear must lower to new_array_clear");
         assert_eq!(new_array_clear, count);
+    }
+
+    /// A call to an `#[oopspec("newlist_clear(count)")]` helper whose
+    /// result is `*mut FixedObjectArray` lowers to `new_array_clear` with
+    /// that GcArray's descr (`OBJECT_REF_GCARRAY_TYPE_ID`, items at
+    /// `FIXED_ARRAY_ITEMS_OFFSET`). The ARRAY identity comes from the
+    /// return type (`do_fixed_newlist_clear` `cpu.arraydescrof(ARRAY)`),
+    /// not the callee name — the path here is not `_ll_alloc_and_clear`.
+    #[test]
+    fn oopspec_newlist_clear_gcarray_result_uses_return_type_arraydescr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let path = crate::parse::CallPath::from_segments([
+            "pyre_interpreter",
+            "pyframe",
+            "alloc_frame_locals_array_clear",
+        ]);
+        let target = CallTarget::function_path([
+            "pyre_interpreter",
+            "pyframe",
+            "alloc_frame_locals_array_clear",
+        ]);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.mark_oopspec(path, "newlist_clear(count)".to_string());
+
+        let items = LowLevelType::Array(Box::new(Array::new(OBJECTPTR.clone())));
+        let block = Struct::gc(
+            "FixedObjectArray",
+            vec![
+                ("len".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items),
+            ],
+        );
+        let block_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+
+        let mut graph = FunctionGraph::new("caller");
+        let count = graph.alloc_value_var();
+        let result = variable_with_lltype("a", block_ptr);
+        FunctionGraph::set_concretetype_of_inline(&count, ConcreteType::Signed);
+        let startblock = graph.startblock;
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target,
+                args: crate::model::call_args(vec![count.clone()]),
+                result_ty: ValueType::Ref(Some("FixedObjectArray".to_string())),
+            },
+            false,
+        );
+        graph
+            .block_mut(startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(result.clone());
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let (length, item_ty, array_type_id) = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::NewArrayClear {
+                    length,
+                    item_ty,
+                    array_type_id,
+                } => Some((length.clone(), item_ty.clone(), array_type_id.clone())),
+                _ => None,
+            })
+            .expect(
+                "oopspec newlist_clear returning *mut FixedObjectArray must lower \
+                 to new_array_clear",
+            );
+        assert_eq!(length, count);
+        assert!(
+            matches!(item_ty, ValueType::Ref(None)),
+            "FixedObjectArray items are GC pointers, got {item_ty:?}"
+        );
+        assert_eq!(
+            array_type_id.as_deref(),
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+            "descr must come from the *mut FixedObjectArray return type"
+        );
+        assert!(
+            transformed
+                .graph
+                .block(startblock)
+                .operations
+                .iter()
+                .all(|op| !matches!(op.kind, OpKind::Call { .. })),
+            "the oopspec call must not residualize"
+        );
     }
 
     /// The `int.*` index comes from the declared oopspec string, so a helper

@@ -6821,59 +6821,6 @@ pub(crate) fn try_walker_orthodox_binary_slice<Sym: WalkSym>(
     )
 }
 
-/// GET_ITER residual: walk `W_Range.descr_iter` (`functional.py`).
-///
-/// Flatten / the bytecode codewriter lower GET_ITER to `bh_get_iter_fn`, a
-/// MayForce pointer with no jitcode of its own. The interpreter body is
-/// `opcode_get_iter` → `space.iter` → `W_Range.descr_iter`; this walks the
-/// last of those (`w_range_iter`), seeded in `helper_graphs` so the path
-/// lookup finds a graph. Tracing it records `new_with_vtable` of
-/// `W_IntRangeOneArgIterator` (or the sibling machine-int shapes) plus the
-/// field stores, the same ops PyPy inlines. Admission is an exact `range`
-/// so a user `__iter__` stays residual. `inline_subwalk` is allowed: the
-/// GET_ITER that needs this path lives in the inlined caller of a list-comp
-/// (`f` on `comprehension_param_range_call_flush`). Not a spec-fold row.
-const GET_ITER_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_object::functional::w_range_iter",
-    commit_label: "get_iter_commit",
-    call_site_label: "get_iter_call_site",
-    decline_tag: "GET-ITER-SUBWALK",
-};
-
-/// Walk `w_range_iter` for GET_ITER. Declines when the body is missing or
-/// the walk does not finish; the residual stays.
-pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    r_args: &[OpRef],
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
-        return Ok(None);
-    }
-    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
-        return Ok(None);
-    };
-    if unsafe { !pyre_object::functional::is_exact_w_range(obj) } {
-        return Ok(None);
-    }
-    // `w_range_iter` is the range arm of `space.iter`, not the dispatching
-    // body: the type test that selects it is recorded here.
-    let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
-    walker_guard_fold_class(ctx, op_pc, r_args[0], range_type_addr)?;
-    try_walker_orthodox_descent(
-        ctx,
-        op_pc,
-        &[],
-        &[(r_args[0], obj)],
-        &[],
-        dst,
-        dst_bank,
-        &GET_ITER_DESCENT,
-    )
-}
-
 /// Empty BUILD_LIST residual: walk `make_empty_list` (`listobject.py`).
 ///
 /// Flatten / the bytecode codewriter lower BUILD_LIST to `new_array_clear`
@@ -6949,6 +6896,86 @@ const RANGE_ITER_DESCENT: HelperDescent = HelperDescent {
     commit_label: "range_iter_commit",
     call_site_label: "range_iter_call_site",
     decline_tag: "RANGE-ITER-SUBWALK",
+};
+
+/// `functional.py W_Range.descr_new` nargs==1 after arity unpacking
+/// (`gateway.py BuiltinCode1.fastcall_1`). Graph key is `w_range_new_stop`
+/// (`builtin_range` / this descent). The leaf applies `space.index`.
+const RANGE_NEW_STOP_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::builtins::w_range_new_stop",
+    commit_label: "range_new_stop_commit",
+    call_site_label: "range_new_stop_call_site",
+    decline_tag: "RANGE-NEW-STOP-SUBWALK",
+};
+
+/// `functional.py W_Range.descr_new` nargs==2 after arity unpacking
+/// (`gateway.py BuiltinCode2.fastcall_2`).
+const RANGE_NEW_START_STOP_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::builtins::w_range_new_start_stop",
+    commit_label: "range_new_start_stop_commit",
+    call_site_label: "range_new_start_stop_call_site",
+    decline_tag: "RANGE-NEW-START-STOP-SUBWALK",
+};
+
+/// `functional.py W_Range.descr_new` nargs==3 after arity unpacking
+/// (`gateway.py BuiltinCode3.fastcall_3`). The leaf applies `space.index`
+/// and the zero-step `ValueError`.
+const RANGE_NEW_STEP_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::builtins::w_range_new_start_stop_step",
+    commit_label: "range_new_step_commit",
+    call_site_label: "range_new_step_call_site",
+    decline_tag: "RANGE-NEW-STEP-SUBWALK",
+};
+
+/// `functional.py W_Zip.iter_w` — `return self`.
+const ZIP_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_zip_iter",
+    commit_label: "zip_iter_commit",
+    call_site_label: "zip_iter_call_site",
+    decline_tag: "ZIP-ITER-SUBWALK",
+};
+
+/// `functional.py W_Zip.next_w`. The graph key is the recordable leaf
+/// `baseobjspace::zip_two_tuple_next` (`zip_next_method` / `zip_next_w`
+/// call it). `jit_next` stays residual, so the descent looks the body
+/// up by this path.
+const ZIP_NEXT_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::baseobjspace::zip_two_tuple_next",
+    commit_label: "zip_next_commit",
+    call_site_label: "zip_next_call_site",
+    decline_tag: "ZIP-NEXT-SUBWALK",
+};
+
+/// `functional.py W_Map.iter_w` — `return self`.
+const MAP_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_map_iter",
+    commit_label: "map_iter_commit",
+    call_site_label: "map_iter_call_site",
+    decline_tag: "MAP-ITER-SUBWALK",
+};
+
+/// `functional.py W_Filter.iter_w` — `return self`.
+const FILTER_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_filter_iter",
+    commit_label: "filter_iter_commit",
+    call_site_label: "filter_iter_call_site",
+    decline_tag: "FILTER-ITER-SUBWALK",
+};
+
+/// `iterobject.py W_AbstractSeqIterObject.descr_iter` — `return self`.
+const SEQITER_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::iterobject::w_seqiter_iter",
+    commit_label: "seqiter_iter_commit",
+    call_site_label: "seqiter_iter_call_site",
+    decline_tag: "SEQITER-ITER-SUBWALK",
+};
+
+/// `iterobject.py W_ReverseSeqIterObject.descr_iter` — `return self`.
+const REVERSESEQITER_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::iterobject::w_reverseseqiter_iter",
+    commit_label: "reverseseqiter_iter_commit",
+    call_site_label: "reverseseqiter_iter_call_site",
+    decline_tag: "REVERSESEQITER-ITER-SUBWALK",
 };
 
 /// Descend a generated cell helper (`write_cell` / `unwrap_cell`) the way
@@ -11205,169 +11232,24 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Record an overflow-checked machine-int operation and guard it.
-///
-/// [`record_int_ovf`] folds a both-constant operand pair to a constant without
-/// recording anything, and `GuardNoOverflow` carries no operands — it reads the
-/// flag of the operation immediately before it — so an unconditional guard
-/// after a folded pair would attach to whatever was recorded last instead.
-/// `None` means the operation cannot be represented and the caller must rewind.
-fn record_int_ovf_guarded<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    opcode: OpCode,
-    b1: OpRef,
-    b2: OpRef,
-) -> Result<Option<OpRef>, DispatchError> {
-    let (result, overflow) = record_int_ovf(ctx, op_pc, opcode, b1, b2, None)?;
-    if overflow {
-        return Ok(None);
-    }
-    if !result.is_constant() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
-    }
-    Ok(Some(result))
-}
-
-/// Fall back to the opaque `range` residual from a decline point that the
-/// specializer only reaches after it has already emitted.
-///
-/// Every decline in `try_walker_specialize_builtin_range` past `pre_emit_pos`
-/// has to rewind: the callable `GuardValue`, the per-bound class guards and
-/// `intval` reads, and — for a bound converted by a user `__index__` — that
-/// callee's whole inlined body sit in the trace, and the residual the caller
-/// falls through to recomputes all of it.  Leaving them behind would pair the
-/// residual with guards for a specialization that no longer exists.
-fn walker_range_decline<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    pre_emit_pos: majit_metainterp::recorder::TracePosition,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-    ctx.trace_ctx.heap_cache_mut().reset();
-    Ok(None)
-}
-
-/// Emit the machine-int trace of `functional.py compute_range_length`
-/// for a path whose converted bounds all fit signed machine words.  Each
-/// source conditional becomes the guard chosen by the recording values; the
-/// overflow guards side-exit to the interpreter's wrapped-int implementation.
-fn walker_emit_range_length<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    start: OpRef,
-    stop: OpRef,
-    step: OpRef,
-    concrete_start: i64,
-    concrete_stop: i64,
-    concrete_step: i64,
-) -> Result<Option<OpRef>, DispatchError> {
-    if concrete_step == 0 {
-        return Ok(None);
-    }
-    let (normalized_start, normalized_stop, normalized_step) = if concrete_step < 0 {
-        let Some(step) = concrete_step.checked_neg() else {
-            return Ok(None);
-        };
-        (concrete_stop, concrete_start, step)
-    } else {
-        (concrete_start, concrete_stop, concrete_step)
-    };
-    let concrete_length = if normalized_start < normalized_stop {
-        let Some(diff) = normalized_stop
-            .checked_sub(normalized_start)
-            .and_then(|diff| diff.checked_sub(1))
-        else {
-            return Ok(None);
-        };
-        let Some(length) = (diff / normalized_step).checked_add(1) else {
-            return Ok(None);
-        };
-        length
-    } else {
-        0
-    };
-
-    let zero = ctx.trace_ctx.const_int(0);
-    let one = ctx.trace_ctx.const_int(1);
-    let step_has_recorded_sign = if concrete_step < 0 {
-        ctx.trace_ctx.record_op(OpCode::IntLt, &[step, zero])
-    } else {
-        ctx.trace_ctx.record_op(OpCode::IntGt, &[step, zero])
-    };
-    ctx.trace_ctx
-        .set_opref_concrete(step_has_recorded_sign, majit_ir::Value::Int(1));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[step_has_recorded_sign])?;
-    let (lo, hi, positive_step) = if concrete_step < 0 {
-        let Some(negated) = record_int_ovf_guarded(ctx, op_pc, OpCode::IntSubOvf, zero, step)?
-        else {
-            return Ok(None);
-        };
-        (stop, start, negated)
-    } else {
-        (start, stop, step)
-    };
-
-    let nonempty = ctx.trace_ctx.record_op(OpCode::IntLt, &[lo, hi]);
-    ctx.trace_ctx.set_opref_concrete(
-        nonempty,
-        majit_ir::Value::Int((normalized_start < normalized_stop) as i64),
-    );
-    if normalized_start >= normalized_stop {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[nonempty])?;
-        return Ok(Some(zero));
-    }
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonempty])?;
-
-    let Some(span) = record_int_ovf_guarded(ctx, op_pc, OpCode::IntSubOvf, hi, lo)? else {
-        return Ok(None);
-    };
-    let Some(diff) = record_int_ovf_guarded(ctx, op_pc, OpCode::IntSubOvf, span, one)? else {
-        return Ok(None);
-    };
-    // `//` through the same `ll_int_py_div` pure call the `BINARY_OP` integer
-    // fold emits.  `OpCode::IntFloorDiv` would be the direct spelling, but the
-    // dynasm backend carries a regalloc arm for it and no assembler arm on
-    // either architecture, so it lowers to nothing and the destination keeps
-    // an operand: this quotient came back as its own dividend for a positive
-    // step and as the divisor for a negative one.  Both operands are
-    // non-negative here (`positive_step` is guarded above and `diff` follows
-    // the ordering guard), where floor and truncation agree, so the two
-    // spellings compute the same value.
-    let (quotient, _) = walker_emit_int_py_div_or_mod(
-        ctx,
-        diff,
-        positive_step,
-        normalized_stop - normalized_start - 1,
-        normalized_step,
-        true,
-    );
-    let Some(length) = record_int_ovf_guarded(ctx, op_pc, OpCode::IntAddOvf, quotient, one)? else {
-        return Ok(None);
-    };
-    ctx.trace_ctx
-        .set_opref_concrete(length, majit_ir::Value::Int(concrete_length));
-    Ok(Some(length))
-}
-
-/// `range(stop)` / `range(start, stop)` / `range(start, stop, step)` with
-/// exact canonical machine-word ints or strict inlinable user `__index__`
-/// conversions: lower the opaque constructor residual
-/// to a virtual `W_Range` and four virtual wrapped-int fields.  This lets the
-/// existing GET_ITER specialization consume the range without forcing either
-/// allocation.  All other callables and argument shapes fall through to the
-/// generic residual.
-pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
+/// Descend `functional.py W_Range.descr_new` for an exact `range(...)`
+/// call. `builtin_range` is the arity check; the walker selects the
+/// matching `w_range_new_stop` / `w_range_new_start_stop` /
+/// `w_range_new_start_stop_step` leaf (`gateway.py BuiltinCode1/2/3.fastcall_N`)
+/// and passes the raw bound boxes. The leaf applies `space.index`, the
+/// zero-step `ValueError`, `compute_range_length`, then `w_range_allocate`.
+/// Not a spec-fold row.
+pub(crate) fn try_walker_orthodox_range_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
-    funcptr: OpRef,
     r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if !(3..=5).contains(&r_args.len()) {
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !(3..=5).contains(&r_args.len()) {
         return Ok(None);
     }
+    let n_bounds = r_args.len() - 2;
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
         (arg_concretes[0], arg_concretes[1])
@@ -11382,268 +11264,49 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let exact_int_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    enum BoundPlan {
-        Exact {
-            op: OpRef,
-            concrete: pyre_object::PyObjectRef,
-        },
-        UserIndex(IndexInlineCandidate),
-    }
-    let mut plans = Vec::with_capacity(r_args.len() - 2);
+    let mut bound_refs = Vec::with_capacity(n_bounds);
     for (&arg_op, concrete) in r_args[2..].iter().zip(&arg_concretes[2..]) {
         let ConcreteValue::Ref(arg_obj) = *concrete else {
             return Ok(None);
         };
-        if walker_is_exact_machine_int_concrete(arg_obj) {
-            plans.push(BoundPlan::Exact {
-                op: arg_op,
-                concrete: arg_obj,
-            });
-        } else if let Some(candidate) = prepare_walker_inline_index(ctx, arg_op, arg_obj) {
-            plans.push(BoundPlan::UserIndex(candidate));
-        } else {
+        if arg_obj.is_null() {
             return Ok(None);
         }
+        bound_refs.push((arg_op, arg_obj));
     }
 
-    // Every non-int bound has been resolved and statically preflighted before
-    // this first emission.  `functional.py W_Range.descr_new` applies
-    // `space.index` independently to start/stop/step; mirror that order and
-    // retain each returned box as an intermediate feeding the constructor.
-    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+    let descent = match n_bounds {
+        1 => &RANGE_NEW_STOP_DESCENT,
+        2 => &RANGE_NEW_START_STOP_DESCENT,
+        3 => &RANGE_NEW_STEP_DESCENT,
+        _ => return Ok(None),
+    };
+    let Some(prep) = prepare_orthodox_descent(ctx, op.pc, descent) else {
+        return Ok(None);
+    };
+
+    let pre_guard = ctx.trace_ctx.get_trace_position();
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
 
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let mut concrete_args = Vec::with_capacity(plans.len());
-    let mut arg_pins = Vec::with_capacity(plans.len());
-    let mut concrete_values = Vec::with_capacity(plans.len());
-    let mut raw_args = Vec::with_capacity(plans.len());
-    for plan in plans {
-        let (arg_op, arg_obj) = match plan {
-            BoundPlan::Exact { op, concrete } => (op, concrete),
-            BoundPlan::UserIndex(candidate) => {
-                let Some((result, ConcreteValue::Ref(concrete))) = try_walker_inline_index(
-                    ctx, op, code, funcptr, r_args, call_descr, dst, candidate,
-                )?
-                else {
-                    return walker_range_decline(ctx, pre_emit_pos);
-                };
-                (result, concrete)
-            }
-        };
-        // `walker_guard_class` / `opimpl_getfield_gc_i` append to
-        // `opencoder.py Trace._ops`. Pin the bound so
-        // `call_function_impl_result` receives the forwarded object.
-        let arg_pin = residual_call::owner_root_if_gc(arg_obj as usize);
-        let arg_obj = arg_pin
-            .as_ref()
-            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-            .unwrap_or(arg_obj);
-        // A trace-constant bound carries its class in the constant itself, so
-        // record the class as known without proving it: `walker_guard_class`
-        // would emit a `GuardClass` that can never fail plus the tagged-operand
-        // low-bit test that guards a later entry's untagged arrival, and a
-        // constant has no later arrival.  A bound returned by an inlined
-        // `__index__` is live and takes the full guard.
-        if arg_op.is_constant() {
-            ctx.trace_ctx.heap_cache_mut().class_now_known(arg_op);
-        } else {
-            walker_guard_class(ctx, op.pc, arg_op, int_type_addr)?;
-        }
-        walker_guard_exact_w_class(ctx, op.pc, arg_op, exact_int_class)?;
-        let arg_obj = arg_pin
-            .as_ref()
-            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-            .unwrap_or(arg_obj);
-        let concrete_value = unsafe { pyre_object::w_int_get_value(arg_obj) };
-        let raw = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            arg_op,
-            crate::descr::int_intval_descr(),
-        );
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Int(concrete_value));
-        concrete_args.push(arg_obj);
-        arg_pins.push(arg_pin);
-        concrete_values.push(concrete_value);
-        raw_args.push(raw);
+    let outcome = run_prepared_orthodox_descent(
+        ctx,
+        op.pc,
+        prep,
+        &[],
+        &bound_refs,
+        &[],
+        dst,
+        'r',
+        descent,
+        None,
+        false,
+    )?;
+    if !matches!(outcome, Some(DispatchOutcome::Continue)) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_guard);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
     }
-    for (arg, pin) in concrete_args.iter_mut().zip(arg_pins.iter()) {
-        if let Some(pin) = pin {
-            *arg = pin.get().0 as pyre_object::PyObjectRef;
-        }
-    }
-
-    // Run only the remaining builtin range body on the converted exact ints;
-    // executing the original arguments here would call user `__index__` a
-    // second time during recording.
-    let authentic_result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_function_impl_result(concrete_callable, &concrete_args)
-    };
-    if concrete_values.len() == 3 && concrete_values[2] == 0 {
-        let Err(mut err) = authentic_result else {
-            return walker_range_decline(ctx, pre_emit_pos);
-        };
-        let exc = err.to_exc_object();
-        let kind = pyre_object::interp_exceptions::ExcKind::ValueError;
-        if !walker_recorded_builtin_raise_is_supported(exc, kind) {
-            return walker_range_decline(ctx, pre_emit_pos);
-        }
-        // The step guard below appends to `opencoder.py Trace._ops` and can
-        // minor-collect; the raise takes the forwarded exception.
-        let exc_pin = residual_call::owner_root_if_gc(exc as usize);
-        let Some(ec) = walker_ensure_execution_context(ctx) else {
-            return walker_range_decline(ctx, pre_emit_pos);
-        };
-        let exc_pin = residual_call::owner_root_if_gc(exc as usize);
-
-        let step_raw = raw_args[2];
-        let zero = ctx.trace_ctx.const_int(0);
-        let is_zero = ctx.trace_ctx.record_op(OpCode::IntEq, &[step_raw, zero]);
-        ctx.trace_ctx
-            .set_opref_concrete(is_zero, majit_ir::Value::Int(1));
-        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[is_zero])?;
-        let exc = pinned_obj(&exc_pin, exc);
-        return Ok(Some(walker_emit_recorded_builtin_raise(ctx, ec, exc, kind)));
-    }
-    let Ok(authentic_range) = authentic_result else {
-        return walker_range_decline(ctx, pre_emit_pos);
-    };
-    // `call_function_impl_result` allocated the range. `wrapint` /
-    // `execute_new_with_vtable` append to `opencoder.py Trace._ops` and
-    // can minor-collect. Pin the range and its four int fields so
-    // `set_opref_concrete` stamps `history.py` `*FrontendOp.value` with
-    // the forwarded address.
-    let range_pin = residual_call::owner_root_if_gc(authentic_range as usize);
-    let authentic_range = range_pin
-        .as_ref()
-        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-        .unwrap_or(authentic_range);
-    let (authentic_start, authentic_stop, authentic_step) =
-        unsafe { pyre_object::functional::w_range_fields(authentic_range) };
-    let authentic_length = unsafe { pyre_object::functional::w_range_length(authentic_range) };
-    let authentic_fields = [
-        authentic_start,
-        authentic_stop,
-        authentic_step,
-        authentic_length,
-    ];
-    let field_pins = authentic_fields.map(|field| residual_call::owner_root_if_gc(field as usize));
-    if authentic_fields.iter().any(|&field| unsafe {
-        !std::ptr::eq((*field).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*field).w_class, exact_int_class)
-    }) {
-        return walker_range_decline(ctx, pre_emit_pos);
-    }
-    let concrete_fields =
-        authentic_fields.map(|field| unsafe { pyre_object::w_int_get_value(field) });
-    let [
-        concrete_start,
-        concrete_stop,
-        concrete_step,
-        concrete_length,
-    ] = concrete_fields;
-
-    let zero = ctx.trace_ctx.const_int(0);
-    let one = ctx.trace_ctx.const_int(1);
-    let (start, stop, step) = match raw_args.as_slice() {
-        [stop] => (zero, *stop, one),
-        [start, stop] => (*start, *stop, one),
-        [start, stop, step] => (*start, *stop, *step),
-        _ => unreachable!("range arity gate admitted an invalid argument count"),
-    };
-    // Trace-constant bounds retain the existing zero-op length.  Every live
-    // bound -- a local read, a loop-carried box, the box a user `__index__`
-    // returned -- follows `compute_range_length`, so its value feeds all four
-    // virtual fields instead of being paired with a stale record-time length.
-    // Where the bound came from is not a property the emitted arithmetic
-    // depends on: it reads the three raw ints and guards the step's sign and
-    // the start/stop ordering it recorded, which is what a live bound needs
-    // whether an `__index__` produced it or a `LOAD_FAST` did.
-    //
-    // A range whose emptiness alternates across iterations fails the ordering
-    // guard and takes a bridge, which is the cost this branch carries and the
-    // reason the shape used to be left to the residual.  The residual is not
-    // cheaper: `range(n)` for a local `n` records a `MayForce` call that
-    // allocates the range for real, forces the virtualizable, and re-reads the
-    // four fields through class guards -- 10006 instructions an iteration in a
-    // hot loop, against 24 for the same loop under pypy.
-    let length = if start.is_constant() && stop.is_constant() && step.is_constant() {
-        ctx.trace_ctx.const_int(concrete_length)
-    } else {
-        let Some(length) = walker_emit_range_length(
-            ctx,
-            op.pc,
-            start,
-            stop,
-            step,
-            concrete_start,
-            concrete_stop,
-            concrete_step,
-        )?
-        else {
-            return walker_range_decline(ctx, pre_emit_pos);
-        };
-        length
-    };
-
-    let new = ctx
-        .trace_ctx
-        .execute_new_with_vtable(crate::descr::w_range_size_descr(), None);
-
-    let field_descrs = [
-        crate::descr::range_start_descr(),
-        crate::descr::range_stop_descr(),
-        crate::descr::range_step_descr(),
-        crate::descr::range_length_descr(),
-    ];
-    let raw_fields = [start, stop, step, length];
-    for (((descr, raw), _concrete_value), (authentic_field, field_pin)) in field_descrs
-        .into_iter()
-        .zip(raw_fields)
-        .zip(concrete_fields)
-        .zip(authentic_fields.iter().copied().zip(field_pins.iter()))
-    {
-        let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
-        let field = field_pin
-            .as_ref()
-            .map(|pin| pin.get().0)
-            .unwrap_or(authentic_field as usize);
-        ctx.trace_ctx
-            .set_opref_concrete(boxed, majit_ir::Value::Ref(majit_ir::GcRef(field)));
-        let descr_index = descr.index();
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::SetfieldGc, &[new, boxed], descr);
-        ctx.trace_ctx
-            .heapcache_setfield_cached(new, descr_index, boxed);
-    }
-
-    // `descr_new`'s `promote_step` — a property of the call shape, not of the
-    // bounds, so it is a constant here.  `descr_iter` reads it to pick the
-    // iterator shape; leaving it unwritten would hand a forced range an
-    // uninitialized byte.
-    let promote_step = ctx.trace_ctx.const_int((raw_args.len() != 3) as i64);
-    let promote_step_descr = crate::descr::range_promote_step_descr();
-    let promote_step_index = promote_step_descr.index();
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new, promote_step],
-        promote_step_descr,
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(new, promote_step_index, promote_step);
-
-    ctx.trace_ctx.heap_cache_mut().class_now_known(new);
-    let authentic_range = range_pin
-        .as_ref()
-        .map(|pin| pin.get().0)
-        .unwrap_or(authentic_range as usize);
-    ctx.trace_ctx
-        .set_opref_concrete(new, majit_ir::Value::Ref(majit_ir::GcRef(authentic_range)));
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', new)?;
-    Ok(Some(DispatchOutcome::Continue))
+    Ok(Some(()))
 }
 
 /// Cut the trace from INSIDE the `locals()` expansion once the recorded
@@ -19215,56 +18878,142 @@ pub(crate) fn try_walker_orthodox_store_subscr<Sym: WalkSym>(
     )
 }
 
-/// Walker-native `GetIter` for an exact machine-word `range`.
+/// GET_ITER of exact `range` / `zip` / `map` / `filter` / sequence iterators.
 ///
-/// Records `W_Range.descr_iter` (`w_range_iter`) so a locally consumed
-/// iterator is the same virtual `New` PyPy traces.
-pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
+/// Records `W_Range.descr_iter` (`w_range_iter`); the body chooses
+/// OneArg / StepOne / IntRange / LongRange via `space.int_w`. Exact
+/// `zip` / `map` / `filter` record `iter_w`. Exact sequence iterators
+/// record `W_AbstractSeqIterObject.descr_iter` (`w_seqiter_iter`) or
+/// `W_ReverseSeqIterObject.descr_iter` (`w_reverseseqiter_iter`).
+/// Admission is the instance typeptr, so a `_getusercls` subclass is
+/// excluded. Not a spec-fold row.
+pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || dst_bank != 'r'
-        || r_args.len() != 1
-        || ctx.fbw_mode.inline_subwalk
-    {
+    // `inline_subwalk` is allowed: the GET_ITER that needs this path lives
+    // in the inlined caller of a list-comp
+    // (`f` on `comprehension_param_range_call_flush`).
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
         return Ok(None);
     }
 
-    let range_op = r_args[0];
-    let Some(range_obj) = walker_concrete_ref_object(ctx, range_op) else {
+    let obj_op = r_args[0];
+    let Some(obj) = walker_concrete_ref_object(ctx, obj_op) else {
         return Ok(None);
     };
+    if obj.is_null() {
+        return Ok(None);
+    }
 
-    // `W_Zip.iter_w` is identity; exact-class guards preserve overrides.
     let zip_type = &pyre_object::functional::ZIP_TYPE as *const pyre_object::PyType;
-    let zip_class = pyre_object::get_instantiate(&pyre_object::functional::ZIP_TYPE);
+    if unsafe { std::ptr::eq((*obj).ob_type, zip_type) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &ZIP_ITER_DESCENT,
+            zip_type as i64,
+        );
+    }
+
+    let map_type = &pyre_object::functional::MAP_TYPE as *const pyre_object::PyType;
+    if unsafe { std::ptr::eq((*obj).ob_type, map_type) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &MAP_ITER_DESCENT,
+            map_type as i64,
+        );
+    }
+
+    let filter_type = &pyre_object::functional::FILTER_TYPE as *const pyre_object::PyType;
+    if unsafe { std::ptr::eq((*obj).ob_type, filter_type) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &FILTER_ITER_DESCENT,
+            filter_type as i64,
+        );
+    }
+
     if unsafe {
-        !range_obj.is_null()
-            && std::ptr::eq((*range_obj).ob_type, zip_type)
-            && std::ptr::eq((*range_obj).w_class, zip_class)
+        pyre_object::is_seq_iter(obj)
+            || pyre_object::is_list_iter(obj)
+            || pyre_object::is_tuple_iter(obj)
     } {
-        walker_guard_exact_instance(ctx, op_pc, range_op, zip_type as i64, zip_class)?;
-        ctx.frame_state.borrow_mut().vstack_last_ref = range_op;
-        return Ok(Some(range_op));
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &SEQITER_ITER_DESCENT,
+            unsafe { (*obj).ob_type as i64 },
+        );
+    }
+
+    if unsafe { pyre_object::is_list_reverse_iter(obj) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &REVERSESEQITER_ITER_DESCENT,
+            &pyre_object::iterobject::LIST_REVERSE_ITER_TYPE as *const _ as i64,
+        );
     }
 
     // `W_Range.descr_iter` itself chooses the iterator shape; the class
     // guard is the only admission (`typedef.acceptable_as_base_class = False`).
-    if unsafe { !pyre_object::functional::is_w_range(range_obj) } {
+    if unsafe { !pyre_object::functional::is_w_range(obj) } {
         return Ok(None);
     }
+    run_get_iter_helper_descent(
+        ctx,
+        op_pc,
+        obj_op,
+        obj,
+        dst,
+        dst_bank,
+        &RANGE_ITER_DESCENT,
+        &pyre_object::functional::RANGE_TYPE as *const _ as i64,
+    )
+}
 
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &RANGE_ITER_DESCENT) else {
+fn run_get_iter_helper_descent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj_op: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+    descent: &HelperDescent,
+    type_addr: i64,
+) -> Result<Option<OpRef>, DispatchError> {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent) else {
         return Ok(None);
     };
 
     let pre_guard = ctx.trace_ctx.get_trace_position();
-    let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
-    walker_guard_fold_class(ctx, op_pc, range_op, range_type_addr)?;
+    walker_guard_fold_class(ctx, op_pc, obj_op, type_addr)?;
 
     let mut produced = None;
     let outcome = run_prepared_orthodox_descent(
@@ -19272,11 +19021,11 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         op_pc,
         prep,
         &[],
-        &[(range_op, range_obj)],
+        &[(obj_op, obj)],
         &[],
         dst,
         dst_bank,
-        &RANGE_ITER_DESCENT,
+        descent,
         Some(&mut produced),
         false,
     )?;
@@ -19292,6 +19041,100 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     };
     ctx.frame_state.borrow_mut().vstack_last_ref = new;
     Ok(Some(new))
+}
+
+/// Descend `functional.py W_Zip.next_w` (`zip_next_method` /
+/// `zip_two_tuple_next`) for FOR_ITER. Admission is the instance
+/// typeptr, so a `_getusercls` subclass is excluded — the GET_ITER
+/// twin (`try_walker_orthodox_get_iter`). Not a spec-fold row.
+///
+/// The body records the length==2 arm: two `space.next` calls into
+/// `W_FastTupleIterObject.descr_next` plus `space.newtuple2`. Tracing
+/// executes those ops (`pyjitpl.py` `execute_and_record` /
+/// `opimpl_setfield_gc`); the subwalk is the executor.
+pub(crate) fn try_walker_orthodox_zip_next<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    _dst: usize,
+    dst_bank: char,
+) -> Result<Option<OpRef>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || dst_bank != 'r'
+        || r_args.len() != 1
+        || ctx.fbw_mode.inline_subwalk
+    {
+        return Ok(None);
+    }
+
+    let zip_op = r_args[0];
+    let Some(zip_obj) = walker_concrete_ref_object(ctx, zip_op) else {
+        return Ok(None);
+    };
+    if zip_obj.is_null() {
+        return Ok(None);
+    }
+    let zip_type = &pyre_object::functional::ZIP_TYPE as *const pyre_object::PyType;
+    if unsafe { !std::ptr::eq((*zip_obj).ob_type, zip_type) } {
+        return Ok(None);
+    }
+
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &ZIP_NEXT_DESCENT) else {
+        return Ok(None);
+    };
+
+    let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body);
+
+    let pre_guard = ctx.trace_ctx.get_trace_position();
+    // One class guard, as `try_walker_orthodox_list_iter_next` does. The
+    // exact-class and cursor checks above are the admission; the helper
+    // body records the list, tuple, and bounds guards.
+    // The guard appends to `opencoder.py Trace._ops` and can minor-collect.
+    let zip_pin = residual_call::owner_root_if_gc(zip_obj as usize);
+    walker_guard_fold_class(ctx, op_pc, zip_op, zip_type as i64)?;
+    let zip_obj = pinned_obj(&zip_pin, zip_obj);
+    ctx.trace_ctx
+        .set_opref_concrete(zip_op, Value::Ref(majit_ir::GcRef(zip_obj as usize)));
+
+    let descent = &ZIP_NEXT_DESCENT;
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        unsafe { &*prep.sym_ptr },
+        &prep.body,
+        prep.nested,
+        descent.commit_label,
+        descent.call_site_label,
+        &[],
+        &[],
+        &[zip_op],
+        &[ConcreteValue::Ref(zip_obj)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] {} pc={pc}", descent.decline_tag);
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_guard);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+
+    if let Some(item) = walker_concrete_ref_object(ctx, result).filter(|item| !item.is_null()) {
+        fbw_foriter_inflight_capture(InflightForiterOwner::current(ctx.session), item, body, true);
+    }
+    Ok(Some(result))
 }
 
 /// Which of the two `step == 1` iterator shapes a FOR_ITER is walking.
@@ -19484,6 +19327,11 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
         return Ok(None);
     };
+    // `functional.py` `W_Zip.next_w` is recorded by
+    // `try_walker_orthodox_zip_next` once this fold declines.
+    if unsafe { pyre_object::functional::is_zip(iter_obj) } {
+        return Ok(None);
+    }
     // `iterobject.py` `W_FastListIterObject.descr_next` is recorded by
     // `try_walker_orthodox_list_iter_next` once this fold declines.
     if unsafe { pyre_object::is_list_iter(iter_obj) } {

@@ -18,11 +18,19 @@
 //! its own.  The references the slots held stay rooted by the jitcode's own
 //! root sets (the jitframe gcmap, the blackhole's `registers_r`, the recorder).
 //!
-//! The rewrite needs every slot index to be a compile-time offset from the
-//! depth the body was entered at, so it runs an abstract interpretation of the
-//! stack depth first.  A callee is assumed to leave the depth where it found
-//! it: a body whose own depth at `Return` is not zero is refused, so the only
-//! functions that could break that assumption are the ones this pass never
+//! Scalar-replaced slots need a compile-time offset from the depth the body
+//! was entered at, or from a merge whose predecessors disagreed on that
+//! offset (`IdxFact::AtMerge`).  `pin_roots` / `publish` of a slice the body
+//! already holds — an incoming `&[T]` parameter, or a slice local it built
+//! — is the same shape with that list as the source: `get(base + k)` is
+//! `getarrayitem` of the list (`cdataobj.py descr_call` / `W_CData.call`
+//! passes `args_w` through; `pyframe.py Frame.__init__` livevars are that
+//! list).  The publish dest is rewritten to `0` so later `base + k`
+//! arithmetic names the `k`-th element, and scalar slot depth is unchanged
+//! because those elements were never interned.  The walk is an abstract
+//! interpretation of the stack depth first.  A callee is assumed to leave the depth where it
+//! found it: a body whose own depth at `Return` is not zero is refused, so the
+//! only functions that could break that assumption are the ones this pass never
 //! rewrites.  A callee that *calls* such a function but still returns at
 //! depth 0 (its own `RootScope` Close rewinds) is depth-neutral: it does not
 //! read the caller's slots by index, and a collection inside it roots the
@@ -34,15 +42,20 @@
 //! and it does not leave extra slots. A LeavesAbove or ParamSlots
 //! callee is the same split for neutrality, but erasure still refuses
 //! — after the rewrite nothing rewinds a leftover
-//! (`_fix_graph_after_inlining`). Anything the interpretation cannot
-//! model refuses the whole body, which then lowers exactly as it did
-//! before.
+//! (`_fix_graph_after_inlining`). A callee that *returns* the leftover
+//! inside an owned guard (`body_returns_owned_scope`; the dest is the
+//! nested `RootScope`, as `RootedItems::new` packages one) is the
+//! nested-Open shape: the leftover is that dest, the caller drops it,
+//! and ParamSlots methods of the dest read the nested bracket the
+//! callee kept rather than this body's slot locals. Anything the
+//! interpretation cannot model refuses the whole body, which then
+//! lowers exactly as it did before.
 //!
 //! Unwind edges are not followed: the flow-graph builder does not lower an
 //! `on_unwind` cleanup chain either, and one chain is shared by calls made at
 //! different depths.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
@@ -171,17 +184,119 @@ fn classify_call(
     Some((kind, false))
 }
 
+/// Shadow-stack depth, or a pin/get index, relative to entry or to a merge.
+///
+/// `Const(d)` is today's case: `d` slots above the body's entry.
+/// `AtMerge { block, k }` is the depth on entry to merge `block`, plus `k`.
+/// A merge whose predecessors carry different `Const` depths takes
+/// `AtMerge { block, 0 }` instead of refusing (`depth-disagrees-at-merge`).
+/// Two `AtMerge` from different merges meeting again, or an `AtMerge`
+/// meeting a `Const` at a block that is not that merge, is still a refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum IdxFact {
+    Const(usize),
+    AtMerge { block: usize, k: usize },
+}
+
+impl IdxFact {
+    fn add(self, n: usize) -> Self {
+        match self {
+            IdxFact::Const(d) => IdxFact::Const(d + n),
+            IdxFact::AtMerge { block, k } => IdxFact::AtMerge { block, k: k + n },
+        }
+    }
+
+    fn checked_sub(self, n: usize) -> Option<Self> {
+        match self {
+            IdxFact::Const(d) => d.checked_sub(n).map(IdxFact::Const),
+            IdxFact::AtMerge { block, k } => {
+                k.checked_sub(n).map(|k| IdxFact::AtMerge { block, k })
+            }
+        }
+    }
+
+    fn as_const(self) -> Option<usize> {
+        match self {
+            IdxFact::Const(d) => Some(d),
+            IdxFact::AtMerge { .. } => None,
+        }
+    }
+
+    fn is_entry(self) -> bool {
+        matches!(self, IdxFact::Const(0))
+    }
+
+    /// True when `self` is a strictly outer Open relative to `closed`.
+    fn strictly_outside(self, closed: IdxFact) -> bool {
+        match (self, closed) {
+            (IdxFact::Const(a), IdxFact::Const(b)) => a < b,
+            (IdxFact::Const(_), IdxFact::AtMerge { .. }) => true,
+            (IdxFact::AtMerge { .. }, IdxFact::Const(_)) => false,
+            (IdxFact::AtMerge { block: b1, k: k1 }, IdxFact::AtMerge { block: b2, k: k2 })
+                if b1 == b2 =>
+            {
+                k1 < k2
+            }
+            (IdxFact::AtMerge { .. }, IdxFact::AtMerge { .. }) => false,
+        }
+    }
+
+    fn close_exceeds(self, current: IdxFact) -> bool {
+        match (self, current) {
+            (IdxFact::Const(g), IdxFact::Const(d)) => g > d,
+            (IdxFact::Const(_), IdxFact::AtMerge { .. }) => false,
+            (IdxFact::AtMerge { block: b1, k: gk }, IdxFact::AtMerge { block: b2, k: dk })
+                if b1 == b2 =>
+            {
+                gk > dk
+            }
+            (IdxFact::AtMerge { .. }, _) => true,
+        }
+    }
+}
+
+/// One scalar-replaced slot: an absolute offset from entry, or a slot
+/// local to merge `block` at relative offset `k`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Slot {
+    Abs(usize),
+    Rel { block: usize, k: usize },
+}
+
 /// What a special local stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Special {
     /// A `RootScope` guard opened at this depth.
-    Guard(usize),
+    Guard(IdxFact),
     /// A borrow of a guard.
     Alias(usize),
-    /// A slot index: the entry depth plus this offset.
-    Index(usize),
-    /// A checked-add pair whose `.0` is this offset.
-    IndexPair(usize),
+    /// A slot index: `Const` from entry, or `AtMerge` from a merge.
+    Index(IdxFact),
+    /// A checked-add pair whose `.0` is this index.
+    IndexPair(IdxFact),
+    /// Dest of a `pin_roots` / `publish` of a slice local.  Rewritten to
+    /// `0`; `get` of it is `getarrayitem` of `slice`.
+    SliceBase { slice: usize },
+    /// `base + k` of a [`Self::SliceBase`].
+    SliceIndex { slice: usize },
+    /// Checked-add pair whose `.0` is a [`Self::SliceIndex`].
+    SliceIndexPair { slice: usize },
+}
+
+fn is_slice_special(special: Special) -> bool {
+    matches!(
+        special,
+        Special::SliceBase { .. } | Special::SliceIndex { .. } | Special::SliceIndexPair { .. }
+    )
+}
+
+fn slice_of_special(special: Special) -> Option<usize> {
+    match special {
+        Special::SliceBase { slice }
+        | Special::SliceIndex { slice }
+        | Special::SliceIndexPair { slice } => Some(slice),
+        _ => None,
+    }
 }
 
 /// A call or assert this pass rewrites to a `Goto`, with the statements that
@@ -202,23 +317,124 @@ struct Plan {
     slot_ty: Option<Value>,
     /// Pins published through each `RootedItems` / `RootScope` guard.
     pin_count: HashMap<usize, usize>,
+    /// Dense ids for [`Slot`] locals, assigned in first-seen order.
+    slot_intern: HashMap<Slot, usize>,
     /// Blocks no path from the entry reaches once the rewritten calls lose
     /// their unwind edges.
     unreachable: Vec<usize>,
+    /// Slice local -> (local ty, `*local` ty) for a [`Special::SliceBase`].
+    slice_src: HashMap<usize, (Value, Value)>,
 }
 
 impl Plan {
-    /// Drop pin-count keys for a guard closed at `closed_depth` and every
-    /// set opened inside it. Nested exclusive RootScopes (`zip_two_tuple_next`)
+    /// Drop pin-count keys for a guard closed at `closed` and every set
+    /// opened inside it. Nested exclusive RootScopes (`zip_two_tuple_next`)
     /// close before they merge with a sibling that never opened them;
     /// leftover keys would refuse that join (`pin-count-disagrees-at-merge`).
-    fn forget_closed_guards(&mut self, closed_depth: usize) {
+    fn forget_closed_guards(&mut self, closed: IdxFact) {
         self.pin_count
             .retain(|other, _| match self.specials.get(other) {
-                Some(Special::Guard(gd)) => *gd < closed_depth,
+                Some(Special::Guard(gd)) => gd.strictly_outside(closed),
                 _ => false,
             });
     }
+
+    fn intern_slot(&mut self, n_locals: usize, slot: Slot) -> usize {
+        let next = self.slot_intern.len();
+        n_locals + *self.slot_intern.entry(slot).or_insert(next)
+    }
+}
+
+enum WalkErr {
+    Refusal(Refusal),
+    NeedMerge(usize),
+}
+
+impl From<Refusal> for WalkErr {
+    fn from(r: Refusal) -> Self {
+        WalkErr::Refusal(r)
+    }
+}
+
+fn note_merge_pred_depth(
+    merge_min: &mut HashMap<usize, usize>,
+    merge_max: &mut HashMap<usize, usize>,
+    block: usize,
+    d: usize,
+) {
+    merge_min
+        .entry(block)
+        .and_modify(|m| *m = (*m).min(d))
+        .or_insert(d);
+    merge_max
+        .entry(block)
+        .and_modify(|m| *m = (*m).max(d))
+        .or_insert(d);
+}
+
+/// Same-key pin maps at an `AtMerge` join keep the per-guard minimum.
+/// Different keys still refuse (`pin-count-disagrees-at-merge`).
+fn join_pin_counts_min(
+    a: &HashMap<usize, usize>,
+    b: &HashMap<usize, usize>,
+) -> Option<HashMap<usize, usize>> {
+    if a == b {
+        return Some(a.clone());
+    }
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut out = HashMap::with_capacity(a.len());
+    for (k, va) in a {
+        let vb = b.get(k)?;
+        out.insert(*k, (*va).min(*vb));
+    }
+    Some(out)
+}
+
+/// Slot a Get/Set of `index` reads at `depth`.
+///
+/// An absolute `Const(j)` below the merge's minimum predecessor depth is
+/// `Slot::Abs(j)` as today. `min <= j < max` is a slot only some
+/// predecessors wrote; the flow-graph builder threads those as undefined
+/// link args (`thread_undefined_op_operands`). `j >= max` would name a
+/// slot no predecessor defined (`read-above-merge-min`).
+fn slot_for_get(
+    index: IdxFact,
+    depth: IdxFact,
+    merge_min: &HashMap<usize, usize>,
+    merge_max: &HashMap<usize, usize>,
+) -> Result<Slot, Refusal> {
+    match index {
+        IdxFact::Const(j) => match depth {
+            IdxFact::Const(d) if j < d => Ok(Slot::Abs(j)),
+            IdxFact::Const(_) => Err("get-above-depth"),
+            IdxFact::AtMerge { block, .. } => {
+                let min = *merge_min.get(&block).ok_or("get-above-depth")?;
+                let max = *merge_max.get(&block).ok_or("get-above-depth")?;
+                if j < min {
+                    Ok(Slot::Abs(j))
+                } else if j < max {
+                    Ok(Slot::Abs(j))
+                } else {
+                    Err("read-above-merge-min")
+                }
+            }
+        },
+        IdxFact::AtMerge { block: ib, k: ik } => match depth {
+            IdxFact::AtMerge { block: db, k: dk } if ib == db && ik < dk => {
+                Ok(Slot::Rel { block: ib, k: ik })
+            }
+            _ => Err("get-above-depth"),
+        },
+    }
+}
+
+fn slots_from_depth(depth: IdxFact, n: usize) -> impl Iterator<Item = Slot> {
+    (0..n).map(move |i| match depth {
+        IdxFact::Const(d) => Slot::Abs(d + i),
+        IdxFact::AtMerge { block, k } => Slot::Rel { block, k: k + i },
+    })
 }
 
 type Refusal = &'static str;
@@ -362,6 +578,46 @@ fn assign_json(dest: Value, rvalue: Value) -> Value {
     json!({ "Assign": [dest, rvalue] })
 }
 
+/// `(*slice)[index]` — `get(base + k)` of a published incoming slice.
+fn slice_index_use(
+    slice: usize,
+    slice_ty: &Value,
+    deref_ty: &Value,
+    index_op: Value,
+    elem_ty: &Value,
+) -> Value {
+    json!({
+        "Use": [{
+            "Copy": {
+                "kind": {"Projection": [
+                    {
+                        "kind": {"Projection": [
+                            {"kind": {"Local": slice}, "ty": slice_ty.clone()},
+                            "Deref"
+                        ]},
+                        "ty": deref_ty.clone()
+                    },
+                    {"Index": {"offset": index_op, "from_end": false}}
+                ]},
+                "ty": elem_ty.clone()
+            }
+        }, "Yes"]
+    })
+}
+
+/// A value of `ty` that is live at entry: the first argument of that type.
+/// Path-dependent slots (`Abs(j)` for `j` at or above a merge min) are live
+/// through the join on every predecessor; lowering's `edge_args` requires
+/// they already be assigned (`thread_undefined_op_operands` runs after).
+fn slot_seed_rvalue(u: &Value, ty: &Value) -> Option<Value> {
+    let locals = u["locals"]["locals"].as_array()?;
+    let arg_count = u["locals"]["arg_count"].as_u64()? as usize;
+    (1..=arg_count).find_map(|i| {
+        (locals.get(i)?.get("ty") == Some(ty))
+            .then(|| json!({ "Use": [{ "Copy": local_place_json(i, ty) }, "Yes"] }))
+    })
+}
+
 /// Locals this place names that are bound as specials, including a
 /// tuple-field or deref of one (`AddChecked` overflow bit, `*guard`).
 #[allow(dead_code)]
@@ -382,6 +638,28 @@ fn specials_in_place(place: &Place, specials: &HashMap<usize, Special>) -> Vec<S
         push(&mut out, l);
     }
     out
+}
+
+/// Like [`super::mentions_local`], but skip an assertion's `check_kind`.
+/// That field is panic-message metadata; the flow-graph builder reads
+/// only `cond`.
+fn mentions_local_skipping_check_kind(v: &Value, wanted: &bit_set::BitSet) -> bool {
+    match v {
+        Value::Object(map) => {
+            if let Some(local) = map.get("Local").and_then(Value::as_u64)
+                && wanted.contains(local as usize)
+            {
+                return true;
+            }
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "check_kind")
+                .any(|(_, nested)| mentions_local_skipping_check_kind(nested, wanted))
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|nested| mentions_local_skipping_check_kind(nested, wanted)),
+        _ => false,
+    }
 }
 
 fn specials_in_json(v: &Value, specials: &HashMap<usize, Special>) -> Vec<Special> {
@@ -436,12 +714,17 @@ fn bounds_check_len_and_index(check_kind: &Value) -> Option<(&Value, &Value)> {
     (arr.len() >= 2).then_some((&arr[0], &arr[1]))
 }
 
-/// Compile-time slot offset named by an operand JSON node.
-fn json_index_offset(v: &Value, specials: &HashMap<usize, Special>) -> Option<usize> {
+/// Compile-time slot index named by an operand JSON node.
+fn json_index_fact(v: &Value, specials: &HashMap<usize, Special>) -> Option<IdxFact> {
     match specials_in_json(v, specials).as_slice() {
         [Special::Index(k)] | [Special::IndexPair(k)] => Some(*k),
         _ => None,
     }
+}
+
+/// Compile-time slot offset named by an operand JSON node.
+fn json_index_offset(v: &Value, specials: &HashMap<usize, Special>) -> Option<usize> {
+    json_index_fact(v, specials).and_then(IdxFact::as_const)
 }
 
 /// Length of the erased slot array: a constant, or `shadow_stack_len`
@@ -451,18 +734,35 @@ fn json_slot_array_len(
     specials: &HashMap<usize, Special>,
     const_locals: &HashMap<usize, usize>,
     llbc: &Llbc,
-) -> Option<usize> {
+) -> Option<IdxFact> {
     if let Some(n) = json_const_usize(v, llbc) {
-        return Some(n);
+        return Some(IdxFact::Const(n));
     }
     if let Some(local) = json_operand_local(v)
         && let Some(n) = const_locals.get(&local)
     {
-        return Some(*n);
+        return Some(IdxFact::Const(*n));
     }
     match specials_in_json(v, specials).as_slice() {
         [Special::Index(d)] | [Special::IndexPair(d)] => Some(*d),
         _ => None,
+    }
+}
+
+fn index_fits_len(index: IdxFact, len: IdxFact, merge_min: &HashMap<usize, usize>) -> bool {
+    match (index, len) {
+        (IdxFact::Const(j), IdxFact::Const(n)) => j < n,
+        (IdxFact::AtMerge { block: b1, k: ik }, IdxFact::AtMerge { block: b2, k: lk })
+            if b1 == b2 =>
+        {
+            ik < lk
+        }
+        (IdxFact::Const(j), IdxFact::AtMerge { block, k: lk }) => {
+            let min = merge_min.get(&block).copied().unwrap_or(0);
+            j < min.saturating_add(lk)
+        }
+        (IdxFact::AtMerge { k: ik, .. }, IdxFact::Const(n)) => ik < n,
+        _ => false,
     }
 }
 
@@ -518,6 +818,7 @@ fn assert_is_slot_index_bounds_check(
     specials: &HashMap<usize, Special>,
     const_locals: &HashMap<usize, usize>,
     llbc: &Llbc,
+    merge_min: &HashMap<usize, usize>,
 ) -> bool {
     if assert_is_erased_index_overflow(assert, specials)
         || assert_is_erased_index_add_overflow(assert, specials)
@@ -530,14 +831,34 @@ fn assert_is_slot_index_bounds_check(
     let Some((len, index)) = bounds_check_len_and_index(&assert.check_kind) else {
         return false;
     };
-    let Some(k) = json_index_offset(index, specials) else {
+    let Some(k) = json_index_fact(index, specials) else {
         return false;
     };
-    json_slot_array_len(len, specials, const_locals, llbc).is_some_and(|n| k < n)
+    json_slot_array_len(len, specials, const_locals, llbc)
+        .is_some_and(|n| index_fits_len(k, n, merge_min))
 }
 
 /// Build the rewrite, or say why this body keeps its bracket.
 fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
+    let mut merge_blocks = HashSet::new();
+    loop {
+        match analyze_with_merges(body, llbc, &merge_blocks) {
+            Err(WalkErr::NeedMerge(t)) => {
+                if !merge_blocks.insert(t) {
+                    return Err("depth-disagrees-at-merge");
+                }
+            }
+            Err(WalkErr::Refusal(r)) => return Err(r),
+            Ok(plan) => return Ok(plan),
+        }
+    }
+}
+
+fn analyze_with_merges(
+    body: &Unstructured,
+    llbc: &Llbc,
+    merge_blocks: &HashSet<usize>,
+) -> Result<Option<Plan>, WalkErr> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
     let mut classified: HashMap<usize, (Leaf, bool)> = HashMap::new();
@@ -556,13 +877,18 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         return Ok(None);
     }
     if !llbc.stack_sensitive_fns_complete() {
-        return Err("callee-stack-effects-unknown");
+        return Err(WalkErr::Refusal("callee-stack-effects-unknown"));
     }
     // A callee that leaves slots, indexes through a parameter or returns
     // an index refuses here, whether or not it also reads below entry:
     // after the rewrite nothing rewinds a leftover
     // (`_fix_graph_after_inlining`). A callee that only reads below entry
     // is checked against the entry depth in the walk below.
+    //
+    // A returned owned guard is that leftover packaged in the dest the
+    // caller drops, so it is not this body's slots. ParamSlots methods
+    // of that dest read the nested bracket.
+    let owned_scope_locals = owned_scope_receiver_locals(body, llbc, &forward_blocks);
     for (bb, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
@@ -572,15 +898,16 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             && callee_path(call, llbc)
                 .as_deref()
                 .is_some_and(|path| callee_effect_of(llbc, path).refuses_erase())
+            && !callee_leftover_is_owned_scope(call, llbc, &owned_scope_locals)
         {
-            return Err("calls-stack-sensitive-fn");
+            return Err(WalkErr::Refusal("calls-stack-sensitive-fn"));
         }
     }
     if classified
         .values()
         .any(|(leaf, _)| leaf_unmodeled_for_erase(*leaf))
     {
-        return Err("unmodeled-stack-op");
+        return Err(WalkErr::Refusal("unmodeled-stack-op"));
     }
 
     let mut plan = Plan {
@@ -591,7 +918,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         slot_count: 0,
         slot_ty: None,
         pin_count: HashMap::new(),
+        slot_intern: HashMap::new(),
         unreachable: Vec::new(),
+        slice_src: HashMap::new(),
     };
     // `RootedItems::get(i)` takes a compile-time offset from the set's
     // open depth, often as `_t = const i`.  Follow those locals.
@@ -602,43 +931,84 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             Some(previous) if previous != special => Err("special-rebound"),
             _ => Ok(()),
         };
-    let slot_local = |k: usize| n_locals + k;
 
     let def_counts = local_def_counts(body, llbc, &forward_blocks);
     let single_def = |dest: usize| def_counts.get(dest).copied() == Some(1);
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
-    let mut depth_in: Vec<Option<usize>> = vec![None; n_blocks];
+    let mut depth_in: Vec<Option<IdxFact>> = vec![None; n_blocks];
     let mut pin_count_in: Vec<Option<HashMap<usize, usize>>> = vec![None; n_blocks];
+    let mut merge_min: HashMap<usize, usize> = HashMap::new();
+    let mut merge_max: HashMap<usize, usize> = HashMap::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
     if n_blocks == 0 {
         return Ok(None);
     }
-    depth_in[0] = Some(0);
+    depth_in[0] = Some(IdxFact::Const(0));
     pin_count_in[0] = Some(HashMap::new());
     queue.push_back(0);
     let mut visited = vec![false; n_blocks];
-    let reach = |depth_in: &mut Vec<Option<usize>>,
+    let reach = |depth_in: &mut Vec<Option<IdxFact>>,
                  pin_count_in: &mut Vec<Option<HashMap<usize, usize>>>,
                  queue: &mut VecDeque<usize>,
+                 visited: &mut [bool],
+                 merge_min: &mut HashMap<usize, usize>,
+                 merge_max: &mut HashMap<usize, usize>,
                  target: u64,
-                 depth: usize,
+                 depth: IdxFact,
                  pins: &HashMap<usize, usize>|
-     -> Result<(), Refusal> {
+     -> Result<(), WalkErr> {
         let target = target as usize;
         if target >= n_blocks {
             return Ok(());
         }
+        let incoming = if merge_blocks.contains(&target) {
+            match depth {
+                IdxFact::Const(d) => {
+                    note_merge_pred_depth(merge_min, merge_max, target, d);
+                    IdxFact::AtMerge {
+                        block: target,
+                        k: 0,
+                    }
+                }
+                IdxFact::AtMerge { block, k: 0 } if block == target => depth,
+                _ => return Err(WalkErr::Refusal("depth-disagrees-at-merge")),
+            }
+        } else {
+            depth
+        };
         match depth_in[target] {
-            Some(d) if d != depth => return Err("depth-disagrees-at-merge"),
-            Some(_) => {}
+            Some(old) if old == incoming => {}
+            Some(IdxFact::Const(_)) => match incoming {
+                IdxFact::Const(_) => return Err(WalkErr::NeedMerge(target)),
+                _ => return Err(WalkErr::Refusal("depth-disagrees-at-merge")),
+            },
+            Some(IdxFact::AtMerge { .. }) => {
+                return Err(WalkErr::Refusal("depth-disagrees-at-merge"));
+            }
             None => {
-                depth_in[target] = Some(depth);
+                depth_in[target] = Some(incoming);
                 queue.push_back(target);
             }
         }
         match &pin_count_in[target] {
-            Some(prev) if prev != pins => Err("pin-count-disagrees-at-merge"),
+            Some(prev) if prev != pins => {
+                if merge_blocks.contains(&target) {
+                    let Some(joined) = join_pin_counts_min(prev, pins) else {
+                        return Err(WalkErr::Refusal("pin-count-disagrees-at-merge"));
+                    };
+                    if &joined != prev {
+                        pin_count_in[target] = Some(joined);
+                        if visited[target] {
+                            visited[target] = false;
+                            queue.push_back(target);
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(WalkErr::Refusal("pin-count-disagrees-at-merge"))
+                }
+            }
             Some(_) => Ok(()),
             None => {
                 pin_count_in[target] = Some(pins.clone());
@@ -652,6 +1022,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             continue;
         }
         visited[bb] = true;
+        plan.removed.remove(&bb);
+        plan.terms.remove(&bb);
+        plan.inserted_after.retain(|k, _| k.0 != bb);
         let mut depth = depth_in[bb].expect("queued blocks have a depth");
         plan.pin_count = pin_count_in[bb]
             .clone()
@@ -742,11 +1115,20 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                                     Some(Special::Index(k)) => Some(Special::Index(*k)),
                                     Some(Special::Alias(g)) => Some(Special::Alias(*g)),
                                     Some(Special::Guard(d)) => Some(Special::Guard(*d)),
+                                    Some(Special::SliceBase { slice }) => {
+                                        Some(Special::SliceBase { slice: *slice })
+                                    }
+                                    Some(Special::SliceIndex { slice }) => {
+                                        Some(Special::SliceIndex { slice: *slice })
+                                    }
                                     _ => None,
                                 }
                             } else if let Some((pair, 0)) = tuple_field_of_local(src) {
                                 match plan.specials.get(&pair) {
                                     Some(Special::IndexPair(k)) => Some(Special::Index(*k)),
+                                    Some(Special::SliceIndexPair { slice }) => {
+                                        Some(Special::SliceIndex { slice: *slice })
+                                    }
                                     _ => None,
                                 }
                             } else {
@@ -764,27 +1146,45 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                                 _ => None,
                             })
                         };
+                        let slice_of = |o: &Operand| {
+                            operand_local(o)
+                                .and_then(|l| plan.specials.get(&l).copied())
+                                .and_then(slice_of_special)
+                        };
                         // `len + k` and `len - k` are compile-time offsets
                         // from the depth at the Len/Base. `zip_two_tuple_next`
                         // names a just-pinned slot as `shadow_stack_len() - 1`.
                         let offset = match (arith, index_of(lhs), index_of(rhs)) {
                             (IndexArith::Add { checked }, Some(k), None) => {
-                                const_usize(rhs, llbc).map(|c| (k + c, checked))
+                                const_usize(rhs, llbc).map(|c| (k.add(c), checked))
                             }
                             (IndexArith::Add { checked }, None, Some(k)) => {
-                                const_usize(lhs, llbc).map(|c| (k + c, checked))
+                                const_usize(lhs, llbc).map(|c| (k.add(c), checked))
                             }
                             (IndexArith::Sub { checked }, Some(k), None) => const_usize(rhs, llbc)
                                 .and_then(|c| k.checked_sub(c).map(|n| (n, checked))),
                             _ => None,
                         };
-                        offset.map(|(k, checked)| {
-                            if checked {
+                        if let Some((k, checked)) = offset {
+                            Some(if checked {
                                 Special::IndexPair(k)
                             } else {
                                 Special::Index(k)
-                            }
-                        })
+                            })
+                        } else if matches!(arith, IndexArith::Add { .. })
+                            && let Some(slice) = slice_of(lhs).or_else(|| slice_of(rhs))
+                        {
+                            // `base + k` of a published slice: the dest of
+                            // that publish is 0, so the add is the element
+                            // index. Keep the statement; `get` uses it.
+                            Some(if matches!(arith, IndexArith::Add { checked: true }) {
+                                Special::SliceIndexPair { slice }
+                            } else {
+                                Special::SliceIndex { slice }
+                            })
+                        } else {
+                            None
+                        }
                     }
                     None => None,
                 },
@@ -792,7 +1192,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             };
             if let Some(special) = special {
                 bind(&mut plan.specials, dest, special)?;
-                plan.removed.entry(bb).or_default().push(si);
+                if !is_slice_special(special) {
+                    plan.removed.entry(bb).or_default().push(si);
+                }
             }
         }
         let term_json = block.terminator.kind_value();
@@ -805,14 +1207,17 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     if callee_path(call, llbc)
                         .as_deref()
                         .is_some_and(|path| callee_effect_of(llbc, path).observes)
-                        && depth == 0
+                        && depth.is_entry()
                     {
-                        return Err("calls-stack-sensitive-fn");
+                        return Err(WalkErr::Refusal("calls-stack-sensitive-fn"));
                     }
                     reach(
                         &mut depth_in,
                         &mut pin_count_in,
                         &mut queue,
+                        &mut visited,
+                        &mut merge_min,
+                        &mut merge_max,
                         *target,
                         depth,
                         &plan.pin_count,
@@ -827,7 +1232,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     let receiver = call.args.first().and_then(operand_local);
                     match receiver.and_then(|l| plan.specials.get(&l)) {
                         Some(Special::Alias(g)) => Some(*g),
-                        _ => return Err("receiver-not-a-guard-borrow"),
+                        _ => return Err(WalkErr::Refusal("receiver-not-a-guard-borrow")),
                     }
                 } else {
                     None
@@ -836,7 +1241,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     Some(Special::Guard(d)) => Ok(*d),
                     _ => Err("guard-not-opened"),
                 };
-                let index_arg = |i: usize| -> Result<usize, Refusal> {
+                let index_arg = |i: usize| -> Result<IdxFact, Refusal> {
                     match call
                         .args
                         .get(i)
@@ -856,8 +1261,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     }
                     Leaf::Close | Leaf::ItemsClose => {
                         let d = guard_depth(guard.ok_or("close-without-guard")?)?;
-                        if d > depth {
-                            return Err("close-above-depth");
+                        if d.close_exceeds(depth) {
+                            return Err(WalkErr::Refusal("close-above-depth"));
                         }
                         plan.forget_closed_guards(d);
                         depth = d;
@@ -887,8 +1292,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             .ok_or("pin-value-untyped")?;
                         plan.slot_ty.get_or_insert(ty.clone());
                         let copied = copy_operand_json(value);
+                        let slot = slots_from_depth(depth, 1)
+                            .next()
+                            .expect("n=1 yields one slot");
                         stmts.push(assign_json(
-                            local_place_json(slot_local(depth), &ty),
+                            local_place_json(plan.intern_slot(n_locals, slot), &ty),
                             json!({ "Use": [copied.clone(), "Yes"] }),
                         ));
                         // `pin_root` answers the value; `RootedItems::push`
@@ -899,39 +1307,66 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                                 json!({ "Use": [copied, "Yes"] }),
                             ));
                         }
-                        depth += 1;
-                        plan.slot_count = plan.slot_count.max(depth);
+                        depth = depth.add(1);
                         if let Some(g) = guard {
                             *plan.pin_count.entry(g).or_insert(0) += 1;
                         }
                     }
                     Leaf::Publish => {
                         let slice = call.args.get(arg0).and_then(operand_local);
-                        let (agg_si, operands) = resolve_published_array(block, slice)
-                            .ok_or("publish-array-unresolved")?;
-                        let mut inserted = Vec::new();
-                        for (i, element) in operands.iter().enumerate() {
-                            let ty = element
-                                .as_object()
-                                .and_then(|m| m.values().next())
-                                .and_then(|p| p.get("ty"))
-                                .cloned()
-                                .ok_or("publish-element-untyped")?;
-                            plan.slot_ty.get_or_insert(ty.clone());
-                            inserted.push(assign_json(
-                                local_place_json(slot_local(depth + i), &ty),
-                                json!({ "Use": [copy_operand_json(element), "Yes"] }),
-                            ));
+                        match resolve_published(body, block, slice, llbc)
+                            .ok_or("publish-array-unresolved")?
+                        {
+                            Published::Array {
+                                stmt_index: agg_si,
+                                operands,
+                            } => {
+                                let mut inserted = Vec::new();
+                                for (slot, element) in
+                                    slots_from_depth(depth, operands.len()).zip(operands.iter())
+                                {
+                                    let ty = element
+                                        .as_object()
+                                        .and_then(|m| m.values().next())
+                                        .and_then(|p| p.get("ty"))
+                                        .cloned()
+                                        .ok_or("publish-element-untyped")?;
+                                    plan.slot_ty.get_or_insert(ty.clone());
+                                    inserted.push(assign_json(
+                                        local_place_json(plan.intern_slot(n_locals, slot), &ty),
+                                        json!({ "Use": [copy_operand_json(element), "Yes"] }),
+                                    ));
+                                }
+                                plan.inserted_after
+                                    .entry((bb, agg_si))
+                                    .or_default()
+                                    .extend(inserted);
+                                if let Some(dest) = dest {
+                                    bind(&mut plan.specials, dest, Special::Index(depth))?;
+                                }
+                                depth = depth.add(operands.len());
+                            }
+                            Published::Slice {
+                                local: slice_local,
+                                ty,
+                                deref_ty,
+                            } => {
+                                plan.slice_src.insert(slice_local, (ty, deref_ty));
+                                if let Some(dest) = dest {
+                                    bind(
+                                        &mut plan.specials,
+                                        dest,
+                                        Special::SliceBase { slice: slice_local },
+                                    )?;
+                                }
+                                // Slice-relative base is 0 so later
+                                // `base + k` names element `k`.
+                                stmts.push(assign_json(
+                                    dest_json.clone(),
+                                    json!({ "Use": [{ "Const": [{ "Integer": { "Unsigned": ["Usize", "0"] } }, dest_json["ty"].clone()] }, "Yes"] }),
+                                ));
+                            }
                         }
-                        plan.inserted_after
-                            .entry((bb, agg_si))
-                            .or_default()
-                            .extend(inserted);
-                        if let Some(dest) = dest {
-                            bind(&mut plan.specials, dest, Special::Index(depth))?;
-                        }
-                        depth += operands.len();
-                        plan.slot_count = plan.slot_count.max(depth);
                     }
                     Leaf::Normalize | Leaf::ItemsNop => {}
                     Leaf::NormalizeMoved => {
@@ -942,20 +1377,38 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         ));
                     }
                     Leaf::Get => {
-                        let k = index_arg(arg0)?;
-                        if k >= depth {
-                            return Err("get-above-depth");
+                        let index_local = call.args.get(arg0).and_then(operand_local);
+                        if let Some(slice) = index_local
+                            .and_then(|l| plan.specials.get(&l).copied())
+                            .and_then(slice_of_special)
+                        {
+                            let (slice_ty, deref_ty) =
+                                plan.slice_src.get(&slice).ok_or("slice-src-missing")?;
+                            let index_op = copy_operand_json(&args_json[arg0]);
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                slice_index_use(
+                                    slice,
+                                    slice_ty,
+                                    deref_ty,
+                                    index_op,
+                                    &dest_json["ty"],
+                                ),
+                            ));
+                        } else {
+                            let k = index_arg(arg0)?;
+                            let slot = slot_for_get(k, depth, &merge_min, &merge_max)?;
+                            let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [{ "Copy": local_place_json(plan.intern_slot(n_locals, slot), &ty) }, "Yes"] }),
+                            ));
                         }
-                        let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
-                        stmts.push(assign_json(
-                            dest_json.clone(),
-                            json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
-                        ));
                     }
                     Leaf::ItemsGet => {
                         // `take` has no index; the rewrite has no Vec constructor.
                         let Some(index_op) = call.args.get(arg0) else {
-                            return Err("unmodeled-stack-op");
+                            return Err(WalkErr::Refusal("unmodeled-stack-op"));
                         };
                         // `RootedItems::get(i)`: `i` is an offset from the
                         // set's open depth (`gc_roots.rs` `RootedItems::get`).
@@ -968,37 +1421,43 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         let d = guard_depth(g)?;
                         let pins = *plan.pin_count.get(&g).unwrap_or(&0);
                         if rel >= pins {
-                            return Err("get-out-of-set");
+                            return Err(WalkErr::Refusal("get-out-of-set"));
                         }
-                        let k = d.checked_add(rel).ok_or("get-offset-overflow")?;
-                        if k >= depth {
-                            return Err("get-above-depth");
-                        }
+                        let k = d.add(rel);
+                        let slot = slot_for_get(k, depth, &merge_min, &merge_max)?;
                         let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
                         stmts.push(assign_json(
                             dest_json.clone(),
-                            json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                            json!({ "Use": [{ "Copy": local_place_json(plan.intern_slot(n_locals, slot), &ty) }, "Yes"] }),
                         ));
                     }
                     Leaf::Set => {
                         let k = index_arg(arg0)?;
-                        if k >= depth {
-                            return Err("set-above-depth");
-                        }
+                        let slot = slot_for_get(k, depth, &merge_min, &merge_max).map_err(|r| {
+                            if r == "get-above-depth" {
+                                "set-above-depth"
+                            } else {
+                                r
+                            }
+                        })?;
                         let ty = plan.slot_ty.clone().ok_or("set-before-any-pin")?;
                         stmts.push(assign_json(
-                            local_place_json(slot_local(k), &ty),
+                            local_place_json(plan.intern_slot(n_locals, slot), &ty),
                             json!({ "Use": [copy_operand_json(&args_json[arg0 + 1]), "Yes"] }),
                         ));
                     }
                     Leaf::ReloadTop => {
-                        if depth == 0 {
-                            return Err("reload-empty-stack");
-                        }
+                        let slot = match depth {
+                            IdxFact::Const(0) | IdxFact::AtMerge { k: 0, .. } => {
+                                return Err(WalkErr::Refusal("reload-empty-stack"));
+                            }
+                            IdxFact::Const(d) => Slot::Abs(d - 1),
+                            IdxFact::AtMerge { block, k } => Slot::Rel { block, k: k - 1 },
+                        };
                         let ty = plan.slot_ty.clone().ok_or("reload-before-any-pin")?;
                         stmts.push(assign_json(
                             dest_json.clone(),
-                            json!({ "Use": [{ "Copy": local_place_json(slot_local(depth - 1), &ty) }, "Yes"] }),
+                            json!({ "Use": [{ "Copy": local_place_json(plan.intern_slot(n_locals, slot), &ty) }, "Yes"] }),
                         ));
                     }
                     Leaf::Unmodeled | Leaf::CopyRange => unreachable!("refused above"),
@@ -1014,6 +1473,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     &mut depth_in,
                     &mut pin_count_in,
                     &mut queue,
+                    &mut visited,
+                    &mut merge_min,
+                    &mut merge_max,
                     *target,
                     depth,
                     &plan.pin_count,
@@ -1027,8 +1489,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 }) {
                     // A drop flag the artefact does not carry can leave the
                     // guard unopened on this path; the depth says so.
-                    if d > depth {
-                        return Err("close-above-depth");
+                    if d.close_exceeds(depth) {
+                        return Err(WalkErr::Refusal("close-above-depth"));
                     }
                     plan.forget_closed_guards(d);
                     depth = d;
@@ -1043,17 +1505,23 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         &mut depth_in,
                         &mut pin_count_in,
                         &mut queue,
+                        &mut visited,
+                        &mut merge_min,
+                        &mut merge_max,
                         *target,
                         depth,
                         &plan.pin_count,
                     )?;
                 } else if dropped.is_some_and(|l| is_root_scope_local(body, llbc, l)) {
-                    return Err("drop-of-unopened-guard");
+                    return Err(WalkErr::Refusal("drop-of-unopened-guard"));
                 } else {
                     reach(
                         &mut depth_in,
                         &mut pin_count_in,
                         &mut queue,
+                        &mut visited,
+                        &mut merge_min,
+                        &mut merge_max,
                         *target,
                         depth,
                         &plan.pin_count,
@@ -1061,7 +1529,13 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 }
             }
             Ok(TermKind::Assert { assert, target, .. }) => {
-                if assert_is_slot_index_bounds_check(assert, &plan.specials, &const_locals, llbc) {
+                if assert_is_slot_index_bounds_check(
+                    assert,
+                    &plan.specials,
+                    &const_locals,
+                    llbc,
+                    &merge_min,
+                ) {
                     plan.terms.insert(
                         bb,
                         TermRewrite {
@@ -1074,6 +1548,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     &mut depth_in,
                     &mut pin_count_in,
                     &mut queue,
+                    &mut visited,
+                    &mut merge_min,
+                    &mut merge_max,
                     *target,
                     depth,
                     &plan.pin_count,
@@ -1083,6 +1560,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 &mut depth_in,
                 &mut pin_count_in,
                 &mut queue,
+                &mut visited,
+                &mut merge_min,
+                &mut merge_max,
                 *target,
                 depth,
                 &plan.pin_count,
@@ -1093,6 +1573,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         &mut depth_in,
                         &mut pin_count_in,
                         &mut queue,
+                        &mut visited,
+                        &mut merge_min,
+                        &mut merge_max,
                         *a,
                         depth,
                         &plan.pin_count,
@@ -1101,6 +1584,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         &mut depth_in,
                         &mut pin_count_in,
                         &mut queue,
+                        &mut visited,
+                        &mut merge_min,
+                        &mut merge_max,
                         *b,
                         depth,
                         &plan.pin_count,
@@ -1112,6 +1598,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             &mut depth_in,
                             &mut pin_count_in,
                             &mut queue,
+                            &mut visited,
+                            &mut merge_min,
+                            &mut merge_max,
                             *t,
                             depth,
                             &plan.pin_count,
@@ -1121,6 +1610,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         &mut depth_in,
                         &mut pin_count_in,
                         &mut queue,
+                        &mut visited,
+                        &mut merge_min,
+                        &mut merge_max,
                         *default,
                         depth,
                         &plan.pin_count,
@@ -1128,7 +1620,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 }
             },
             Ok(TermKind::Return) => {
-                if depth != 0 {
+                if !depth.is_entry() {
                     // 10.04 `Drop` of the guard lives in an `is_cleanup`
                     // block. `FunDecl::unstructured` keeps those blocks, so
                     // `UnwindResume` is among them and a later
@@ -1139,9 +1631,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         .iter()
                         .any(|bb| matches!(bb.term_ref(llbc), Ok(TermKind::UnwindResume)))
                     {
-                        depth = 0;
+                        depth = IdxFact::Const(0);
                     } else {
-                        return Err("returns-with-published-slots");
+                        return Err(WalkErr::Refusal("returns-with-published-slots"));
                     }
                 }
             }
@@ -1152,7 +1644,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 | TermKind::Panic { .. }
                 | TermKind::UndefinedBehavior,
             ) => {}
-            _ => return Err("unknown-terminator"),
+            _ => return Err(WalkErr::Refusal("unknown-terminator")),
         }
     }
 
@@ -1168,14 +1660,19 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         plan.specials.get(&0),
         Some(Special::Index(_) | Special::IndexPair(_))
     ) {
-        return Err("returns-slot-index");
+        return Err(WalkErr::Refusal("returns-slot-index"));
     }
 
     // Every surviving mention of a guard, borrow or index has to be one of the
     // shapes rewritten above; anything else would read a local no block binds.
     let mut watched = bit_set::BitSet::new();
-    for local in plan.specials.keys() {
-        watched.insert(*local);
+    for (local, special) in &plan.specials {
+        // Slice bases stay assigned (`dest = 0`) and their `base + k`
+        // arithmetic is kept, so a surviving mention is a use of a
+        // bound local. Guard / Alias / Index defs are stripped.
+        if !is_slice_special(*special) {
+            watched.insert(*local);
+        }
     }
     for (bb, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb] {
@@ -1196,13 +1693,17 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 continue;
             }
             if super::mentions_local(stmt.kind_value(), &watched) {
-                return Err("unmodeled-use-in-statement");
+                return Err(WalkErr::Refusal("unmodeled-use-in-statement"));
             }
         }
         if plan.terms.contains_key(&bb) {
             continue;
         }
-        if super::mentions_local(block.terminator.kind_value(), &watched) {
+        // `check_kind` is panic-message metadata; lowering reads only
+        // `cond` (`mentions_local_outside_raw_array_items`). A later
+        // `args[i]` BoundsCheck may still name a guard-borrow local in
+        // that metadata after Charon reused the id.
+        if mentions_local_skipping_check_kind(block.terminator.kind_value(), &watched) {
             // BoundsCheck / overflow asserts on erased slot-index
             // arithmetic (`shadow_stack_len` + `+ k`, or the array
             // index of `publish_roots(&[...])`). Failure is the
@@ -1216,11 +1717,12 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         &plan.specials,
                         &const_locals,
                         llbc,
+                        &merge_min,
                     ) =>
                 {
                     *target
                 }
-                _ => return Err("unmodeled-use-in-terminator"),
+                _ => return Err(WalkErr::Refusal("unmodeled-use-in-terminator")),
             };
             plan.terms.insert(
                 bb,
@@ -1232,6 +1734,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         }
     }
     plan.unreachable = (0..n_blocks).filter(|bb| !visited[*bb]).collect();
+    plan.slot_count = plan.slot_intern.len();
     Ok(Some(plan))
 }
 
@@ -1264,17 +1767,38 @@ pub(super) fn is_root_scope_local(body: &Unstructured, llbc: &Llbc, local: usize
         })
 }
 
+/// A `pin_roots` / `publish` argument this pass can answer `get` from.
+enum Published {
+    /// Same-block `[x, y, ..]` aggregate: scalar-replaced into slot locals.
+    Array {
+        stmt_index: usize,
+        operands: Vec<Value>,
+    },
+    /// A slice local the body already holds. `get(base + k)` is
+    /// `getarrayitem` of that list (`pin_roots_incoming_slice` /
+    /// `cdataobj.py descr_call`).
+    Slice {
+        local: usize,
+        ty: Value,
+        deref_ty: Value,
+    },
+}
+
 /// Follow a published slice back to the array literal it borrows, in the same
-/// block: `_a = [x, y]; _r = &_a; _s = &*_r; _p = _s as &[_]`.  Returns the
-/// literal's statement index and its element operands.
+/// block: `_a = [x, y]; _r = &_a; _s = &*_r; _p = _s as &[_]`.  A leftover
+/// local after that walk is the list itself — an incoming `&[T]` or a slice
+/// the body built — which is the `pin_roots_incoming_slice` shape.
 ///
-/// The index is this block's own statement index. Cleanup blocks stay in the
-/// body at their extracted indices and are not renumbered out of the way.
-fn resolve_published_array(
+/// The array's statement index is this block's own. Cleanup blocks stay in
+/// the body at their extracted indices and are not renumbered out of the way.
+fn resolve_published(
+    body: &Unstructured,
     block: &majit_charon_reader::ullbc::BasicBlock,
     slice: Option<usize>,
-) -> Option<(usize, Vec<Value>)> {
+    llbc: &Llbc,
+) -> Option<Published> {
     let mut want = slice?;
+    let mut last_deref_ty: Option<Value> = None;
     for (si, stmt) in block.statements.iter().enumerate().rev() {
         let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
             continue;
@@ -1287,18 +1811,36 @@ fn resolve_published_array(
                 want = operand_local(op)?;
             }
             Rvalue::Ref { place: src, .. } => {
-                want = place_local(src).or_else(|| deref_of_local(src))?;
+                if let Some(d) = deref_of_local(src) {
+                    last_deref_ty = Some(ty_ref_json(&src.ty));
+                    want = d;
+                } else {
+                    want = place_local(src)?;
+                }
             }
             Rvalue::Aggregate(kind, _) if kind.get("Array").is_some() => {
                 let operands = stmt.kind_value()["Assign"][1]["Aggregate"][1]
                     .as_array()?
                     .clone();
-                return Some((si, operands));
+                return Some(Published::Array {
+                    stmt_index: si,
+                    operands,
+                });
             }
             _ => return None,
         }
     }
-    None
+    if is_root_scope_local(body, llbc, want) {
+        return None;
+    }
+    let loc = body.locals.locals.get(want)?;
+    let ty = ty_ref_json(&loc.ty);
+    let deref_ty = last_deref_ty.unwrap_or_else(|| ty.clone());
+    Some(Published::Slice {
+        local: want,
+        ty,
+        deref_ty,
+    })
 }
 
 /// Rewrite `fd`'s body with its root brackets scalar-replaced.
@@ -1333,9 +1875,12 @@ pub(super) fn erase_shadow_stack(
     };
     let mut u = unstructured_json_from_body(body);
     let span = u["span"].clone();
-    // The slot locals.
-    if plan.slot_count > 0 {
+    // The slot locals. Seed them in bb0 so a merge whose predecessors
+    // pinned different counts still has every `Abs(j)` assigned on the
+    // short arms (`funccall_flat_from_args` match nargs).
+    let slot_seed = if plan.slot_count > 0 {
         let ty = plan.slot_ty.clone().ok_or("slot-untyped")?;
+        let seed = slot_seed_rvalue(&u, &ty);
         let locals = u["locals"]["locals"].as_array_mut().ok_or("body-json")?;
         let base = locals.len();
         for k in 0..plan.slot_count {
@@ -1343,10 +1888,13 @@ pub(super) fn erase_shadow_stack(
                 "index": base + k,
                 "name": null,
                 "span": span,
-                "ty": ty,
+                "ty": ty.clone(),
             }));
         }
-    }
+        Some((base, ty, seed))
+    } else {
+        None
+    };
     let blocks = u["body"].as_array_mut().ok_or("body-json")?;
     for (bb, block) in blocks.iter_mut().enumerate() {
         // An unreachable block may still name a guard or an index whose
@@ -1359,7 +1907,8 @@ pub(super) fn erase_shadow_stack(
         let removed = plan.removed.get(&bb);
         let term = plan.terms.get(&bb);
         let has_inserts = plan.inserted_after.keys().any(|(b, _)| *b == bb);
-        if removed.is_none() && term.is_none() && !has_inserts {
+        let seed_here = bb == 0 && slot_seed.as_ref().is_some_and(|(_, _, s)| s.is_some());
+        if removed.is_none() && term.is_none() && !has_inserts && !seed_here {
             continue;
         }
         let stmt_span = block["terminator"]["span"].clone();
@@ -1371,7 +1920,15 @@ pub(super) fn erase_shadow_stack(
             })
         };
         let old = block["statements"].as_array().cloned().unwrap_or_default();
-        let mut new = Vec::with_capacity(old.len());
+        let mut new = Vec::with_capacity(old.len() + plan.slot_count);
+        if seed_here && let Some((base, ty, Some(rv))) = &slot_seed {
+            for k in 0..plan.slot_count {
+                new.push(make_stmt(assign_json(
+                    local_place_json(*base + k, ty),
+                    rv.clone(),
+                )));
+            }
+        }
         for (si, stmt) in old.into_iter().enumerate() {
             if !removed.is_some_and(|r| r.contains(&si)) {
                 new.push(stmt);
@@ -1758,6 +2315,106 @@ fn callee_path(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> O
     };
     let id = super::regular_call_fun_decl_id(&reg.kind)?;
     llbc.fn_by_id(id).map(|fd| fd.item_meta.name_path())
+}
+
+fn call_fun_decl_id(call: &majit_charon_reader::ullbc::CallPayload) -> Option<u64> {
+    let majit_charon_reader::ullbc::CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    super::regular_call_fun_decl_id(&reg.kind)
+}
+
+fn call_returns_owned_scope(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> bool {
+    call_fun_decl_id(call).is_some_and(|id| super::fn_returns_owned_scope(llbc, id))
+}
+
+/// Locals that hold a nested owned guard this body received, plus the
+/// borrows and copies the artefact passes as the method receiver.
+fn owned_scope_receiver_locals(
+    body: &Unstructured,
+    llbc: &Llbc,
+    forward_blocks: &[bool],
+) -> HashSet<usize> {
+    let mut owned = HashSet::new();
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
+        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
+            && classify_call(call, llbc).is_none()
+            && callee_path(call, llbc)
+                .as_deref()
+                .is_some_and(|path| callee_effect_of(llbc, path).refuses_erase())
+            && call_returns_owned_scope(call, llbc)
+            && let Some(dest) = place_local(&call.dest)
+        {
+            owned.insert(dest);
+        }
+    }
+    if owned.is_empty() {
+        return owned;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (bb, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb] {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let Some(dest) = place_local(place) else {
+                    continue;
+                };
+                if owned.contains(&dest) {
+                    continue;
+                }
+                let src = match rvalue {
+                    Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+                        place_local(src).or_else(|| deref_of_local(src))
+                    }
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                        place_local(src).or_else(|| deref_of_local(src))
+                    }
+                    _ => None,
+                };
+                if src.is_some_and(|l| owned.contains(&l)) {
+                    owned.insert(dest);
+                    changed = true;
+                }
+            }
+        }
+    }
+    owned
+}
+
+/// The leftover this call publishes is a nested owned guard the caller
+/// holds, or a ParamSlots read of that guard, not this body's slot locals.
+fn callee_leftover_is_owned_scope(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    owned: &HashSet<usize>,
+) -> bool {
+    let effect = callee_path(call, llbc)
+        .as_deref()
+        .map(|path| callee_effect_of(llbc, path))
+        .unwrap_or_else(CalleeEffect::none);
+    if effect.observes {
+        return false;
+    }
+    if call_returns_owned_scope(call, llbc) {
+        return true;
+    }
+    !effect.param_slots.is_empty()
+        && !effect.leaves_above
+        && !effect.returns_index
+        && call
+            .args
+            .first()
+            .and_then(operand_local)
+            .is_some_and(|l| owned.contains(&l))
 }
 
 /// Result of the per-path shadow-stack walk.
@@ -2713,6 +3370,7 @@ mod tests {
     use super::*;
     use majit_charon_reader::Llbc;
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
 
     fn span() -> Value {
         json!({
@@ -2946,7 +3604,8 @@ mod tests {
                     opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
                     opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
                     opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
-                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque"))
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(5, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque"))
                 ]
             }
         });
@@ -3242,6 +3901,187 @@ mod tests {
             Ok(Some(_)) => {}
             Ok(None) => panic!("expected accepted erase, got no bracket"),
             Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    /// `match nargs` pins a different count per arm, then joins before
+    /// Close (`funccall_flat_from_args`). The join is `AtMerge`, not a
+    /// refusal.
+    #[test]
+    fn analyze_accepts_merge_of_different_const_pin_counts() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            5,
+            vec![
+                term_bb(call_fun(1, vec![], 1, 1)),
+                term_bb(call_fun(4, vec![copy(0)], 2, 2)),
+                term_bb(json!({"Switch": {
+                    "discr": {"Copy": place(0)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                term_bb(json!({"Goto": {"target": 5}})),
+                term_bb(call_fun(4, vec![copy(0)], 3, 5)),
+                term_bb(drop_local(1, 6)),
+                term_bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected erasure of nargs-pin merge"),
+            Err(reason) => panic!("expected erasure of nargs-pin merge, got {reason}"),
+        }
+    }
+
+    /// `pin_roots(&*args)` of an incoming `&[T]` (`cdataobj.py descr_call`,
+    /// `pyframe.py Frame.__init__` livevars). `get(base)` is `getarrayitem`
+    /// of that list; the publish dest is 0.
+    #[test]
+    fn analyze_accepts_publish_of_incoming_slice() {
+        let llbc = stack_ops_llbc();
+        let mv = |i| json!({"Move": place(i)});
+        let copy = |i| json!({"Copy": place(i)});
+        let deref_ref = json!({"Ref": {
+            "place": {
+                "kind": {"Projection": [place(1), "Deref"]},
+                "ty": ty()
+            },
+            "kind": "Shared",
+            "ptr_metadata": null
+        }});
+        let body = body_of_args(
+            1,
+            6,
+            vec![
+                term_bb(call_fun(1, vec![], 2, 1)),
+                bb_stmts(
+                    vec![assign_local(3, deref_ref)],
+                    call_fun(5, vec![mv(3)], 4, 2),
+                ),
+                term_bb(call_fun(2, vec![copy(4)], 5, 3)),
+                term_bb(drop_local(2, 4)),
+                term_bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected erasure of incoming-slice publish"),
+            Err(reason) => panic!("expected erasure of incoming-slice publish, got {reason}"),
+        }
+    }
+
+    /// After that merge, `get` of an index below the minimum predecessor
+    /// depth reads the absolute slot. A pin at the merge writes a
+    /// relative slot; `len - 1` names it for the subsequent `get`.
+    #[test]
+    fn analyze_accepts_get_below_merge_min_and_pin_after_merge() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            10,
+            vec![
+                term_bb(call_fun(1, vec![], 1, 1)),
+                // Index(Const(0)) at the Open depth, below every arm's pins.
+                term_bb(call_fun(3, vec![], 2, 2)),
+                term_bb(call_fun(4, vec![copy(0)], 3, 3)),
+                term_bb(json!({"Switch": {
+                    "discr": {"Copy": place(0)},
+                    "targets": {"If": [4, 5]}
+                }})),
+                term_bb(json!({"Goto": {"target": 6}})),
+                term_bb(call_fun(4, vec![copy(0)], 4, 6)),
+                term_bb(call_fun(2, vec![copy(2)], 5, 7)),
+                term_bb(call_fun(4, vec![copy(0)], 6, 8)),
+                term_bb(call_fun(3, vec![], 7, 9)),
+                bb_stmts(
+                    vec![assign_local(
+                        8,
+                        json!({"BinaryOp": [json!("Sub"), copy(7), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![copy(8)], 9, 10),
+                ),
+                term_bb(drop_local(1, 11)),
+                term_bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected erasure of get-below-min plus post-merge pin"),
+            Err(reason) => {
+                panic!("expected erasure of get-below-min plus post-merge pin, got {reason}")
+            }
+        }
+    }
+
+    /// An `AtMerge` successor meeting a `Const` predecessor at a later
+    /// join is still `depth-disagrees-at-merge`.
+    #[test]
+    fn analyze_refuses_atmerge_meeting_const() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            5,
+            vec![
+                term_bb(call_fun(1, vec![], 1, 1)),
+                term_bb(json!({"Switch": {
+                    "discr": {"Copy": place(0)},
+                    "targets": {"If": [2, 6]}
+                }})),
+                term_bb(call_fun(4, vec![copy(0)], 2, 3)),
+                term_bb(json!({"Switch": {
+                    "discr": {"Copy": place(0)},
+                    "targets": {"If": [4, 5]}
+                }})),
+                term_bb(call_fun(4, vec![copy(0)], 3, 5)),
+                term_bb(json!({"Goto": {"target": 7}})),
+                term_bb(call_fun(4, vec![copy(0)], 4, 7)),
+                term_bb(drop_local(1, 8)),
+                term_bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("depth-disagrees-at-merge") => {}
+            Ok(Some(_)) => panic!("expected depth-disagrees-at-merge, got accepted"),
+            Ok(None) => panic!("expected depth-disagrees-at-merge, got no bracket"),
+            Err(reason) => panic!("expected depth-disagrees-at-merge, got {reason}"),
+        }
+    }
+
+    /// Absolute `get(Const(j))` after a merge with `j >= max` predecessor
+    /// depth names a slot no arm defined.
+    #[test]
+    fn analyze_refuses_read_above_merge_max() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            7,
+            vec![
+                term_bb(call_fun(1, vec![], 1, 1)),
+                term_bb(call_fun(3, vec![], 2, 2)),
+                bb_stmts(
+                    vec![assign_local(
+                        3,
+                        json!({"BinaryOp": [json!("Add"), copy(2), usize_lit(2)]}),
+                    )],
+                    json!({"Switch": {
+                        "discr": {"Copy": place(0)},
+                        "targets": {"If": [3, 4]}
+                    }}),
+                ),
+                term_bb(call_fun(4, vec![copy(0)], 4, 5)),
+                term_bb(call_fun(4, vec![copy(0)], 4, 6)),
+                term_bb(json!({"Goto": {"target": 7}})),
+                term_bb(call_fun(4, vec![copy(0)], 5, 7)),
+                term_bb(call_fun(2, vec![copy(3)], 6, 8)),
+                term_bb(drop_local(1, 9)),
+                term_bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("read-above-merge-min") => {}
+            Ok(Some(_)) => panic!("expected read-above-merge-min, got accepted"),
+            Ok(None) => panic!("expected read-above-merge-min, got no bracket"),
+            Err(reason) => panic!("expected read-above-merge-min, got {reason}"),
         }
     }
 
@@ -3909,7 +4749,7 @@ mod tests {
 
     #[test]
     fn bounds_check_against_unrelated_length_is_refused() {
-        let specials = HashMap::from([(5usize, Special::Index(0))]);
+        let specials = HashMap::from([(5usize, Special::Index(IdxFact::Const(0)))]);
         let assert: majit_charon_reader::ullbc::AssertStmt = serde_json::from_value(json!({
             "cond": {"Copy": place(5)},
             "expected": true,
@@ -3924,7 +4764,8 @@ mod tests {
                 &assert,
                 &specials,
                 &HashMap::new(),
-                &fixture_llbc()
+                &fixture_llbc(),
+                &HashMap::new(),
             ),
             "BoundsCheck against a length that is not the erased slot array must refuse"
         );
@@ -3932,7 +4773,10 @@ mod tests {
 
     #[test]
     fn bounds_check_of_erased_slot_index_against_slot_len_is_accepted() {
-        let specials = HashMap::from([(5usize, Special::Index(0)), (6usize, Special::Index(3))]);
+        let specials = HashMap::from([
+            (5usize, Special::Index(IdxFact::Const(0))),
+            (6usize, Special::Index(IdxFact::Const(3))),
+        ]);
         let assert: majit_charon_reader::ullbc::AssertStmt = serde_json::from_value(json!({
             "cond": {"Copy": place(5)},
             "expected": true,
@@ -3943,7 +4787,13 @@ mod tests {
         }))
         .expect("assert");
         assert!(
-            assert_is_slot_index_bounds_check(&assert, &specials, &HashMap::new(), &fixture_llbc()),
+            assert_is_slot_index_bounds_check(
+                &assert,
+                &specials,
+                &HashMap::new(),
+                &fixture_llbc(),
+                &HashMap::new(),
+            ),
             "index 0 of a 3-slot erased array is true by construction"
         );
     }
@@ -4463,5 +5313,93 @@ mod tests {
             paths.iter().any(|p| p.ends_with("::new")),
             "unerased body should still call RootedItems::new, got {paths:?}"
         );
+    }
+
+    /// A callee that opens a nested `RootScope` and returns it in the dest,
+    /// then ParamSlots methods of that dest. The leftover is the dest the
+    /// caller drops, not this body's slots.
+    fn owned_scope_llbc() -> Llbc {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(5, &["other", "owned_scope_ctor"], json!("Opaque")),
+                    opaque_fun(6, &["other", "owned_scope_get"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.fn_by_id(5)
+            .expect("owned_scope_ctor")
+            .returns_owned_scope
+            .store(true, Ordering::Relaxed);
+        llbc.register_stack_sensitive_fns([
+            "other::owned_scope_ctor".into(),
+            "other::owned_scope_get".into(),
+        ]);
+        llbc.register_stack_returns_index_fns(["other::owned_scope_ctor".into()]);
+        llbc.register_stack_param_slots_fns([("other::owned_scope_get".into(), vec![0])]);
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    fn returned_owned_scope_body() -> Unstructured {
+        let copy = |i| json!({"Copy": place(i)});
+        body_of(
+            5,
+            vec![
+                term_bb(call_fun(1, vec![], 1, 1)),
+                term_bb(call_fun(4, vec![copy(0)], 2, 2)),
+                term_bb(call_fun(5, vec![], 3, 3)),
+                bb_stmts(
+                    vec![assign_local(
+                        4,
+                        json!({"Ref": {
+                            "place": place(3),
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }}),
+                    )],
+                    call_fun(6, vec![copy(4)], 2, 4),
+                ),
+                term_bb(drop_local(3, 5)),
+                term_bb(drop_local(1, 6)),
+                term_bb(json!("Return")),
+            ],
+        )
+    }
+
+    #[test]
+    fn analyze_accepts_returned_owned_scope_inside_open() {
+        let llbc = owned_scope_llbc();
+        match analyze(&returned_owned_scope_body(), &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!(
+                "expected erasure of Open/Pin/owned-scope dest/ParamSlots/Close, got {reason}"
+            ),
+        }
+    }
+
+    #[test]
+    fn analyze_refuses_returns_index_that_is_not_an_owned_scope() {
+        let llbc = owned_scope_llbc();
+        llbc.fn_by_id(5)
+            .expect("owned_scope_ctor")
+            .returns_owned_scope
+            .store(false, Ordering::Relaxed);
+        match analyze(&returned_owned_scope_body(), &llbc) {
+            Err("calls-stack-sensitive-fn") => {}
+            Ok(Some(_)) => panic!("expected calls-stack-sensitive-fn, got accepted"),
+            Ok(None) => panic!("expected calls-stack-sensitive-fn, got no bracket"),
+            Err(reason) => panic!("expected calls-stack-sensitive-fn, got {reason}"),
+        }
     }
 }

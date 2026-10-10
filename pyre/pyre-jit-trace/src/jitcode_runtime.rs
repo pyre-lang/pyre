@@ -2788,7 +2788,10 @@ impl majit_metainterp::RuntimeDescrTable for LazyRuntimeDescrTable {
 
 static LAZY_RUNTIME_DESCR_TABLE: LazyRuntimeDescrTable = LazyRuntimeDescrTable;
 
-pub fn install_global_build_descr_pool() {
+/// Process-global `Assembler.descrs` analog. Called only from
+/// [`crate::state::ensure_finish_setup`] (`pyjitpl.py
+/// MetaInterpStaticData.finish_setup`).
+pub(crate) fn install_global_build_descr_pool() {
     majit_metainterp::init_global_build_descr_pool(&LAZY_RUNTIME_DESCR_TABLE);
 }
 

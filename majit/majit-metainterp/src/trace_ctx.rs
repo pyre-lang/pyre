@@ -902,11 +902,11 @@ pub struct TraceCtx {
 /// then `prepare_resume_from_failure`). The concrete `PyFrame` stays
 /// deferred to the drain so it is not held unrooted across a collection.
 ///
-/// The bank vectors are indexed by pyre's semantic register index: pyre
-/// traces Python bytecode, so these are `locals_cells_stack_w` positions,
-/// NOT RPython regalloc colors, and align with LOAD_FAST's `nlocals +
-/// stack_idx`. `concrete_r` is parallel to `registers_r` and seeds the
-/// assembled frame's `locals_cells_stack_w`.
+/// `registers_i` / `registers_f` are post-regalloc color. `registers_r` is
+/// slot-indexed (`locals_cells_stack_w`) and seeds the assembled frame;
+/// `color_registers_r` is color-indexed (`MIFrame.registers_r` /
+/// `resume.py consume_boxes`). `concrete_r` is parallel to `registers_r`;
+/// `color_concrete_r` is parallel to `color_registers_r`.
 #[derive(Clone)]
 pub struct ReconstructRecipe {
     /// Raw `CodeObject*` identity of the callee (NOT the PyCode wrapper).
@@ -924,9 +924,13 @@ pub struct ReconstructRecipe {
     pub nlocals: usize,
     pub valuestackdepth: usize,
     pub registers_i: Vec<OpRef>,
+    /// Slot-indexed (`locals_cells_stack_w`).
     pub registers_r: Vec<OpRef>,
     pub registers_f: Vec<OpRef>,
     pub concrete_r: Vec<majit_ir::Value>,
+    /// Color-indexed Ref bank (`MIFrame.registers_r` / `resume.py consume_boxes`).
+    pub color_registers_r: Vec<OpRef>,
+    pub color_concrete_r: Vec<majit_ir::Value>,
     /// The level's `frame` red, decoded from its resume section like every
     /// other live register (`resume.py consume_boxes`).  The walk resumes the
     /// callee on this box, so the frame the parent trace entered — the one its
@@ -977,11 +981,29 @@ pub struct BridgeInlineCarrier {
     pub recipes: Vec<ReconstructRecipe>,
 }
 
+fn refresh_recipe_ref_concretes(ctx: &TraceCtx, registers: &[OpRef], concretes: &mut [Value]) {
+    for (k, slot) in concretes.iter_mut().enumerate() {
+        if !matches!(slot, Value::Ref(_)) {
+            continue;
+        }
+        let Some(&opref) = registers.get(k) else {
+            continue;
+        };
+        if opref.is_none() {
+            continue;
+        }
+        if let Some(value @ Value::Ref(_)) = ctx.concrete_of_opref(opref) {
+            *slot = value;
+        }
+    }
+}
+
 impl ReconstructRecipe {
     /// Every box this level holds.
     pub fn for_each_box(&self, mut f: impl FnMut(OpRef)) {
         self.registers_r
             .iter()
+            .chain(self.color_registers_r.iter())
             .chain(std::iter::once(&self.frame))
             .chain(self.return_substitute.iter())
             .chain(self.rebuilt_frame.iter())
@@ -2588,20 +2610,12 @@ impl TraceCtx {
         recipe: &ReconstructRecipe,
     ) -> ReconstructRecipe {
         let mut current = recipe.clone();
-        for (k, slot) in current.concrete_r.iter_mut().enumerate() {
-            if !matches!(slot, Value::Ref(_)) {
-                continue;
-            }
-            let Some(&opref) = recipe.registers_r.get(k) else {
-                continue;
-            };
-            if opref.is_none() {
-                continue;
-            }
-            if let Some(value @ Value::Ref(_)) = self.concrete_of_opref(opref) {
-                *slot = value;
-            }
-        }
+        refresh_recipe_ref_concretes(self, &recipe.registers_r, &mut current.concrete_r);
+        refresh_recipe_ref_concretes(
+            self,
+            &recipe.color_registers_r,
+            &mut current.color_concrete_r,
+        );
         current
     }
 
@@ -2617,7 +2631,11 @@ impl TraceCtx {
             return;
         };
         for recipe in &mut carrier.recipes {
-            for value in &mut recipe.concrete_r {
+            for value in recipe
+                .concrete_r
+                .iter_mut()
+                .chain(recipe.color_concrete_r.iter_mut())
+            {
                 if let majit_ir::Value::Ref(r) = value
                     && !r.is_null()
                     && *r != majit_ir::GcRef::NO_CONCRETE
