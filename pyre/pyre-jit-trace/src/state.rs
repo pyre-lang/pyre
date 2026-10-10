@@ -17191,7 +17191,11 @@ pub(crate) fn setup_reconstructed_callee_frame(
     if w_code.is_null() {
         return None;
     }
-    let mut live_stack_concrete: Option<Vec<majit_ir::Value>> = None;
+    // Allocate-path stack pins stay live until after `set_opref_concrete`.
+    // `store_reconstructed_callee_array_image` and `assemble_bridge_inline_pending`
+    // can minor-collect; a `Vec<Value>` copy of those refs is not a root.
+    let mut held_callee_roots: Option<pyre_object::gc_roots::RootScope> = None;
+    let mut stack_slot_root = 0usize;
     let concrete_frame_ptr = if let Some((_, ptr)) = resumed {
         ptr
     } else {
@@ -17355,19 +17359,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 ) as usize))
             })
             .collect();
-        let stack_temp_root = closure_root
+        stack_slot_root = closure_root
             .map(|i| i + 1)
             .unwrap_or(slot_root + stack_base);
-        let mut live_stack = vec![majit_ir::Value::Void; valuestackdepth];
-        for k in stack_base..valuestackdepth.min(recipe.concrete_r.len()) {
-            live_stack[k] = match recipe.concrete_r[k] {
-                majit_ir::Value::Ref(_) => majit_ir::Value::Ref(majit_ir::GcRef(
-                    pyre_object::gc_roots::shadow_stack_get(stack_temp_root + (k - stack_base))
-                        as usize,
-                )),
-                other => other,
-            };
-        }
         store_reconstructed_callee_array_image(
             ctx,
             frame_vable,
@@ -17376,9 +17370,11 @@ pub(crate) fn setup_reconstructed_callee_frame(
             &live_prefix,
             stack_base,
         );
-        live_stack_concrete = Some(live_stack);
         drop(concrete_frame);
-        drop(concrete_roots);
+        // Keep the pins across `assemble_bridge_inline_pending` and the
+        // `set_opref_concrete` loop. Re-read via `shadow_stack_get`, matching
+        // `store_reconstructed_callee_array_image` / `consume_boxes`.
+        held_callee_roots = Some(concrete_roots);
         concrete_frame_ptr
     };
 
@@ -17422,10 +17418,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
     let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
-    // The allocate path re-reads Refs from roots taken before FrameBox::new;
-    // the resume path captured with no allocation in between, so
-    // recipe.concrete_r is still current.
-    let slot_concrete = live_stack_concrete.as_deref().unwrap_or(&recipe.concrete_r);
+    // The allocate path re-reads Refs from the still-live shadow-stack pins
+    // after every collecting call. The resume path uses the recorder cell
+    // (`rooted_recipe_ref`) so a copy in `recipe.concrete_r` cannot go stale
+    // across `assemble_bridge_inline_pending`.
     for k in stack_base..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
@@ -17455,9 +17451,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // any resumed operand. Skips constants (`constants.get_value` is
         // authoritative) and non-value (`Void`) slots.
         if !opref.is_constant() {
-            if let Some(v @ majit_ir::Value::Int(_)) = slot_concrete.get(k).copied() {
+            if let Some(v @ majit_ir::Value::Int(_)) = recipe.concrete_r.get(k).copied() {
                 ctx.set_opref_concrete(opref, v);
-            } else if let Some(v @ majit_ir::Value::Ref(gc)) = slot_concrete.get(k).copied()
+            } else if let Some(majit_ir::Value::Ref(gc)) = recipe.concrete_r.get(k).copied()
                 && !gc.is_null()
                 && gc != majit_ir::GcRef::NO_CONCRETE
             {
@@ -17466,10 +17462,23 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 // Keep any stronger fact already attached to the OpRef (for
                 // example the non-null callable pinned by GUARD_VALUE), just
                 // as the locals-prefix restamp above does.
-                ctx.set_opref_concrete(opref, v);
+                let live = if held_callee_roots.is_some() {
+                    majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::gc_roots::shadow_stack_get(
+                        stack_slot_root + (k - stack_base),
+                    ) as usize))
+                } else {
+                    rooted_recipe_ref(ctx, opref, majit_ir::Value::Ref(gc))
+                };
+                if let majit_ir::Value::Ref(g) = live
+                    && !g.is_null()
+                    && g != majit_ir::GcRef::NO_CONCRETE
+                {
+                    ctx.set_opref_concrete(opref, live);
+                }
             }
         }
     }
+    drop(held_callee_roots);
 
     Some((pending, argboxes_r))
 }
