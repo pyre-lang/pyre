@@ -1998,6 +1998,12 @@ pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
 ///
 /// Census classification only.  No lowering decision reads it.
 pub(crate) fn non_arm_skip_category(msg: &str) -> Option<&'static str> {
+    if msg.contains("two-phase: AccessDirect graph was never a prepass subject") {
+        return Some("two-phase-accessdirect-never-a-subject");
+    }
+    if msg.contains("two-phase: AccessDirect PyGraph missing from FunctionDesc cache") {
+        return Some("two-phase-accessdirect-pygraph-missing");
+    }
     if msg.contains("two-phase: graph was never a prepass subject") {
         return Some("two-phase-never-a-subject");
     }
@@ -2366,6 +2372,14 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if function_graphs.declared_funcobj(&path).is_some() {
             continue;
         }
+        // `{name}__AccessDirect_None` is `description.py cachedgraph`'s
+        // alt_name for the `(AccessDirect, key)` copy of the same
+        // FunctionDesc. Register it as an alias after this pass; inserting
+        // it as canonical would make `CallRegistry.alias` panic and would
+        // give the copy its own desc.
+        if crate::codewriter::call::is_access_directly_path(&path) {
+            continue;
+        }
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
         let canonical_strip = canonical_dedup_key(&path);
         if let Some(reason) = registration_decline(&canonical_strip) {
@@ -2402,6 +2416,27 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // varies run-to-run; sorting by the path key makes the passes below
     // reproducible.
     pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
+    // Point each AccessDirect path at the origin FunctionDesc
+    // (`cachedgraph` stores both graphs on one desc). Skip when the
+    // origin was never registered (a declined callable has no desc to
+    // alias onto). `alias` panics if the AD key is already canonical,
+    // which the skip in the loop above prevents.
+    for (path, _) in function_graphs.iter_declared() {
+        if !crate::codewriter::call::is_access_directly_path(&path) {
+            continue;
+        }
+        let Some(origin) = crate::codewriter::call::access_directly_origin_path(&path) else {
+            continue;
+        };
+        let origin_strip = canonical_dedup_key(&origin);
+        let Some(canonical_key) = by_canonical_path.get(&origin_strip) else {
+            continue;
+        };
+        let alias_key = FunctionPathKey::from_segments(path.segments.iter().cloned());
+        if &alias_key != canonical_key {
+            registry.alias(alias_key, canonical_key);
+        }
+    }
     // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
     // Pass 2 (callee lift).  A stub carries the crate-included
     // `name_path()` spelling that the pass above does not register; without
@@ -4222,8 +4257,9 @@ fn emit_determinism_trace(phase: &str, index: usize, canonical_key: &str) {
 /// so the flag is first readable after Phase A. Upstream walks
 /// `collect_called_graphs(entry_point_graph)`; the graphs the annotator
 /// reached are the ones its `FunctionDesc`s cached. The JIT graph set is
-/// taken per function: a candidate's `(AccessDirect, key)` copy belongs to
-/// it, since the BFS that chose the candidates ran before the copy existed.
+/// taken per function: a candidate `{name}__AccessDirect_None` path maps
+/// to that function's FunctionDesc (the `(AccessDirect, key)` PyGraph
+/// lives on the same desc as the regular graph).
 fn check_access_directly_sanity(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
@@ -4232,8 +4268,10 @@ fn check_access_directly_sanity(
         candidate_graphs
             .iter()
             .filter_map(|path| {
+                let origin = crate::codewriter::call::access_directly_origin_path(path)
+                    .unwrap_or_else(|| path.clone());
                 call_registry.lookup(&FunctionPathKey::from_segments(
-                    path.segments.iter().cloned(),
+                    origin.segments.iter().cloned(),
                 ))
             })
             .map(|entry| Rc::as_ptr(&entry.function_desc))
@@ -4267,7 +4305,10 @@ fn run_two_phase_prepass_inner(
 
     // Deterministic order (R3): candidate_graphs is a HashSet; iterating it
     // directly would make classdef numbering (and thus Match/Skip
-    // classification) vary run-to-run.
+    // classification) vary run-to-run. AccessDirect copies are first-class
+    // subjects keyed by their derived `{name}__AccessDirect_None` CallPath
+    // (`specialize.py default_specialize` / `cachedgraph`); they must not
+    // reuse the regular graph's subject.
     let mut paths: Vec<&crate::parse::CallPath> = candidate_graphs
         .iter()
         .filter(|p| function_graphs.get(p).is_some())
@@ -5060,6 +5101,26 @@ fn reconcile_projection_aliases(
     }
 }
 
+/// Whether `FunctionDesc.cache` holds a `(AccessDirect, key)` PyGraph for
+/// the callable `diag_key` names. The AccessDirect copy shares that
+/// FunctionDesc (`cachedgraph`); a miss means the annotator never
+/// specialized a call as AccessDirect even if the codewriter cloned a
+/// `{name}__AccessDirect_None` graph.
+fn function_desc_has_access_direct_pygraph(call_registry: &CallRegistry, diag_key: &str) -> bool {
+    let path = crate::parse::CallPath::from_segments(diag_key.split("::"));
+    let origin = crate::codewriter::call::access_directly_origin_path(&path).unwrap_or(path);
+    let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
+        origin.segments.iter().cloned(),
+    )) else {
+        return false;
+    };
+    let desc = entry.function_desc.borrow();
+    desc.cache
+        .borrow()
+        .keys()
+        .any(crate::annotator::description::GraphCacheKey::is_access_direct)
+}
+
 /// Two-phase publish: derive the [`DualGateOutcome`] for `legacy` from the
 /// prepass cache instead of re-running the real path. Mirrors
 /// [`dual_gate_check_with_registry`]'s legacy-baseline comparison (the
@@ -5088,21 +5149,38 @@ pub(crate) fn dual_gate_outcome_from_cache(
     // concretetypes. `FunctionGraph::source_identity` is the unique
     // funcobj key.
     let cached = {
+        let is_ad = crate::parse::CallPath::from_segments(diag_key.split("::"));
+        let is_ad = crate::codewriter::call::is_access_directly_path(&is_ad);
         let tp = call_registry.two_phase();
         match tp.subjects.get(diag_key) {
-            Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => Ok((
-                subj.graph.clone(),
-                subj.value_to_var.clone(),
-                subj.value_to_var_candidates.clone(),
-                subj.constant_concretetypes.clone(),
-                subj.constant_hlvalues.clone(),
-            )),
+            Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => {
+                // An AccessDirect candidate must publish the annotator's
+                // `(AccessDirect, key)` PyGraph of the same FunctionDesc.
+                // Falling back to the regular graph's subject would type
+                // the copy as if it were the unflagged specialization.
+                if is_ad && !function_desc_has_access_direct_pygraph(call_registry, diag_key) {
+                    Err(
+                        "two-phase: AccessDirect PyGraph missing from FunctionDesc cache"
+                            .to_string(),
+                    )
+                } else {
+                    Ok((
+                        subj.graph.clone(),
+                        subj.value_to_var.clone(),
+                        subj.value_to_var_candidates.clone(),
+                        subj.constant_concretetypes.clone(),
+                        subj.constant_hlvalues.clone(),
+                    ))
+                }
+            }
             Some(_) => Err("two-phase: subject rtype-skipped in prepass".to_string()),
             None => {
                 if let Some(reason) = tp.annotate_skipped.get(diag_key) {
                     Err(format!(
                         "two-phase: subject annotate-skipped in prepass: {reason}"
                     ))
+                } else if is_ad {
+                    Err("two-phase: AccessDirect graph was never a prepass subject".to_string())
                 } else {
                     Err("two-phase: graph was never a prepass subject".to_string())
                 }

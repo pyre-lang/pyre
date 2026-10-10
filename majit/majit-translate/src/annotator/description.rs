@@ -144,6 +144,18 @@ impl From<String> for GraphCacheKey {
     }
 }
 
+impl GraphCacheKey {
+    /// `specialize.py default_specialize` / `getuniquenondirectgraph`:
+    /// the `(AccessDirect, key)` cache key `cachedgraph` stores.
+    pub(crate) fn is_access_direct(&self) -> bool {
+        matches!(
+            self,
+            GraphCacheKey::Tuple(parts)
+                if parts.len() == 2 && matches!(parts[0], GraphCacheKey::AccessDirect)
+        )
+    }
+}
+
 /// RPython `class CallFamily(object)` (description.py).
 ///
 /// "A family of Desc objects that could be called from common call
@@ -1636,12 +1648,7 @@ impl FunctionDesc {
         self.build_source_graph();
         let mut result = Vec::new();
         for (key, graph) in self.cache.borrow().iter() {
-            let is_access_direct = matches!(
-                key,
-                GraphCacheKey::Tuple(parts)
-                    if parts.len() == 2 && matches!(parts[0], GraphCacheKey::AccessDirect)
-            );
-            if !is_access_direct {
+            if !key.is_access_direct() {
                 result.push(graph.clone());
             }
         }
