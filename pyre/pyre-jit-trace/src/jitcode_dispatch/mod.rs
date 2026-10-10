@@ -3218,6 +3218,18 @@ pub enum DispatchError {
     /// sibling `emit_namespace_cell_fold` answers the same window with a
     /// plain decline, which is why only this site needs a class of its own.
     KwonlyDefaultsMappingRacedRecord { pc: usize },
+    /// The callee's `code?` field moved between the record-time resolve and
+    /// the marker that watches it.
+    /// `resolve_inlinable_callee` reads `function_get_code` up front, and the
+    /// emit installs `record_quasiimmut_field` on `code?` only once the
+    /// assembler token / inlined body is committed to; a `f.__code__ = ...`
+    /// store from another thread in that window writes a value no watcher is
+    /// registered against yet, so the token and frame would bake the
+    /// pre-store code and never be told.  The emit is past the point it can
+    /// decline from -- IR for this call is already recorded -- so the walk
+    /// gives the trace up instead.  Sibling of
+    /// [`Self::KwonlyDefaultsMappingRacedRecord`].
+    FunctionCodeRacedRecord { pc: usize },
     /// Record-time construction of a concrete shadow object failed after the
     /// specialization had emitted IR. Falling through to the generic residual
     /// would retain that partial prologue, so abort the whole walk.
@@ -3469,6 +3481,7 @@ impl DispatchError {
             Self::VableArrayIndexNotConcrete { .. } => "VableArrayIndexNotConcrete",
             Self::AbortMarkerReached { .. } => "AbortMarkerReached",
             Self::KwonlyDefaultsMappingRacedRecord { .. } => "KwonlyDefaultsMappingRacedRecord",
+            Self::FunctionCodeRacedRecord { .. } => "FunctionCodeRacedRecord",
             Self::ConcreteShadowAllocationFailed { .. } => "ConcreteShadowAllocationFailed",
             Self::AbortPermanentMarkerReached { .. } => "AbortPermanentMarkerReached",
             Self::MayForceNullRefArgUnsupported { .. } => "MayForceNullRefArgUnsupported",
@@ -3555,6 +3568,7 @@ impl DispatchError {
             | Self::ConcreteShadowAllocationFailed { pc, .. }
             | Self::AbortPermanentMarkerReached { pc, .. }
             | Self::KwonlyDefaultsMappingRacedRecord { pc, .. }
+            | Self::FunctionCodeRacedRecord { pc, .. }
             | Self::MayForceNullRefArgUnsupported { pc, .. }
             | Self::VableEscapedDuringResidualCall { pc, .. }
             | Self::GuardSnapshotVableUntyped { pc, .. }
@@ -11669,12 +11683,34 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
 /// that keeps the guard arm off a constant callable.  Both reads resolve the
 /// owner by raw address, so the caller refuses a callee the collector can
 /// relocate.
+///
+/// After the marker is installed, re-read `function_get_code` and abort when
+/// it differs from `expected_code` — the body already used for the assembler
+/// token or inlined jitcode. `QuasiImmutDescr.__init__` installs the qmut
+/// then `get_current_constant_fieldvalue`; `Function.getcode` uses that
+/// post-install read. Pinning before the token mint would record IR on a
+/// path that can still decline with `Ok(None)`.
 fn walker_pin_function_code<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     callable: pyre_object::PyObjectRef,
+    expected_code: *const (),
 ) -> Result<(), DispatchError> {
-    walker_pin_function_quasi_field(ctx, op_pc, callable, crate::descr::function_code_descr())
+    walker_pin_function_quasi_field(ctx, op_pc, callable, crate::descr::function_code_descr())?;
+    // QuasiImmutDescr.__init__ installs the qmut then
+    // get_current_constant_fieldvalue. Function.getcode
+    // (`_immutable_fields_ = ['code?']`) uses that post-install read.
+    // The caller already chose a body from an earlier
+    // `function_get_code` (`resolve_inlinable_callee`); a `__code__`
+    // store in between is not seen by the watcher. Re-read now and
+    // abort if it moved, the same window KwonlyDefaultsMappingRacedRecord
+    // covers for w_kw_defs. Pinning before the assembler token mint would
+    // record IR on a path that can still decline with Ok(None).
+    let now = unsafe { pyre_interpreter::function_get_code(callable) };
+    if now != expected_code {
+        return Err(DispatchError::FunctionCodeRacedRecord { pc: op_pc });
+    }
+    Ok(())
 }
 
 /// `function.py:34 _immutable_fields_ = ['code?', 'w_func_globals?', ...]`
