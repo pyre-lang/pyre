@@ -2317,13 +2317,17 @@ fn lltype_direct_ptradd(
 }
 
 fn raw_alloc_ptr_somevalue() -> SomeValue {
-    use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, SomePtr};
-    let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
-    let placeholder_ptr = Ptr::from_container_type(
-        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Opaque(Box::new(opaque)),
-    )
-    .expect("Opaque container yields a valid Ptr");
-    SomeValue::Ptr(SomePtr::new(placeholder_ptr))
+    use crate::annotator::model::SomePtr;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+    // `alloc_zeroed` / `<*mut u8>::add` is `CCHARP` (`lltype.py`).
+    // `getkind` of a raw pointer is Signed (`history.py`
+    // `TYPE.TO._gckind == 'raw'`), the int bank `push_direct_ptradd`
+    // stamps on the result. A gc opaque would kind as GcRef and diverge.
+    let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+        unreachable!("CCHARP is a pointer");
+    };
+    SomeValue::Ptr(SomePtr::new(*ptr_ty))
 }
 
 /// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`
@@ -4287,7 +4291,14 @@ mod tests {
         let s_shell = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
         let shelled = lltype_direct_ptradd(&bk(), &[Some(s_shell), Some(s_n.clone())], &no_kwds())
             .expect("classdef-less instance is the alloc_zeroed shell");
-        assert!(matches!(shelled, SomeValue::Ptr(_)));
+        let SomeValue::Ptr(shelled_ptr) = &shelled else {
+            panic!("classdef-less direct_ptradd returns SomePtr, got {shelled:?}");
+        };
+        assert_eq!(
+            crate::model::getkind(&LowLevelType::Ptr(Box::new(shelled_ptr.ll_ptrtype.clone()))),
+            crate::model::ConcreteType::Signed,
+            "raw alloc pointer kinds as Signed"
+        );
 
         let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
         let s_inst =

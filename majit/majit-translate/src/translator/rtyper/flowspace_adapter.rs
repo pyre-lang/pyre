@@ -1682,6 +1682,110 @@ fn instantiate_op(class_host: HostObject, result: Hlvalue) -> Result<FlowspaceOp
     ))
 }
 
+/// A per-instantiation enum payload read (`Option<T>::Some.__pos_0`).
+///
+/// The annotated receiver is often the bare `Option::Some` template: a
+/// suffixed `Some` joined with another instantiation commonbases to the
+/// discriminant-only leaf, and narrowing mints that template, whose
+/// `__pos_0` was never projected. The `FieldRead` owner is the
+/// instantiation the producer wrote. Cast the receiver to that variant
+/// before `getattr`, after [`Bookkeeper::getuniqueclassdef_for_enum_variant`]
+/// has interned it with the enum base. `getuniqueclassdef_for_struct_root`
+/// interns by qualname and the first mint wins; a cast that minted the
+/// variant first would freeze it without bases.
+///
+/// Returns `None` when the owner is not a registered per-instantiation
+/// payload row. A path that only contains `<Impl>` is not an enum
+/// instantiation (`bufferview::<Impl>::stride0::closure#1`): the parent
+/// has to be a registered discriminant-only enum base
+/// (`StructFieldRegistry::is_enum_base`). Other `__pos_` reads stay a
+/// plain `getattr`.
+fn enum_payload_getattr_ops(
+    base_hl: Hlvalue,
+    field: &crate::model::FieldDescriptor,
+    result: Hlvalue,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Option<Vec<FlowspaceOp>>, TyperError> {
+    let Some(owner) = field.owner_root.as_deref() else {
+        return Ok(None);
+    };
+    if !field.name.starts_with("__pos_") || !owner.contains('<') {
+        return Ok(None);
+    }
+    let registered = call_registry
+        .bookkeeper()
+        .struct_fields
+        .borrow()
+        .as_ref()
+        .is_some_and(|reg| {
+            reg.fields
+                .get(owner)
+                .is_some_and(|rows| rows.iter().any(|(name, _)| name == &field.name))
+        });
+    if !registered {
+        return Ok(None);
+    }
+    let parts = crate::model::split_qualified_path(owner);
+    let Some((variant, root_parts)) = parts.split_last() else {
+        return Ok(None);
+    };
+    if root_parts.is_empty() {
+        return Ok(None);
+    }
+    let enum_root = root_parts.join("::");
+    // `getuniqueclassdef_for_enum_variant` interns the variant under
+    // `enum_root`. A closure capture is not a variant of that path, and
+    // the first mint would freeze the closure without its own fields.
+    // Borrow of `struct_fields` ends before the intern call, which borrows
+    // the same registry.
+    let enum_payload = {
+        let fields = call_registry.bookkeeper().struct_fields.borrow();
+        fields.as_ref().is_some_and(|reg| {
+            reg.is_enum_base(&enum_root) || reg.enum_base_registry_key(&enum_root).is_some()
+        })
+    };
+    if !enum_payload {
+        return Ok(None);
+    }
+    call_registry
+        .bookkeeper()
+        .getuniqueclassdef_for_enum_variant(&enum_root, variant)
+        .map_err(|err| {
+            TyperError::message(format!(
+                "enum payload {owner}.{}: {}",
+                field.name,
+                err.msg.unwrap_or_default()
+            ))
+        })?;
+    let callable_host = HOST_ENV
+        .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+        .ok_or_else(|| {
+            TyperError::message(
+                "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+            )
+        })?;
+    let narrowed = Hlvalue::Variable(Variable::new());
+    Ok(Some(vec![
+        FlowspaceOp::new(
+            "simple_call",
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                base_hl,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(owner))),
+            ],
+            narrowed.clone(),
+        ),
+        FlowspaceOp::new(
+            "getattr",
+            vec![
+                narrowed,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+            ],
+            result,
+        ),
+    ]))
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -2110,6 +2214,17 @@ pub fn translate_op(
                     ],
                     result,
                 )]);
+            }
+            // Registered per-instantiation `__pos_` rows
+            // (`Option<T>::Some.__pos_0`) intern the variant first
+            // (`Bookkeeper.getuniqueclassdef` via
+            // `getuniqueclassdef_for_enum_variant`): the first mint of a
+            // qualname wins, so the cast must not be that mint. Other
+            // enum-base owners fall through to the parent narrowing.
+            if let Some(ops) =
+                enum_payload_getattr_ops(base_hl.clone(), field, result.clone(), call_registry)?
+            {
+                return Ok(ops);
             }
             // A variant payload is not a field of the enum base. Narrow to
             // the variant class before `getattr`, so `__pos_0` keeps that
@@ -9564,6 +9679,70 @@ mod tests {
             name_const.value,
             ConstValue::ByteStr(ref bytes) if bytes == b"f"
         ));
+    }
+
+    #[test]
+    fn translate_op_enum_payload_field_narrows_before_getattr() {
+        let owner = "core::option::Option<i64>::Some";
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        // The variant row is what `enum_payload_getattr_ops` matches
+        // exactly. The discriminant-only base is what decides the cast:
+        // `is_enum_base` after `strip_generic_args`.
+        fields.fields.insert(
+            "core::option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk);
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", Some(owner.into())),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("payload field must narrow");
+        assert_eq!(
+            translated
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["simple_call", "getattr"]
+        );
+        let Hlvalue::Constant(ref root) = translated[0].args[2] else {
+            panic!("cast root");
+        };
+        assert!(matches!(
+            root.value,
+            ConstValue::ByteStr(ref bytes) if bytes == owner.as_bytes()
+        ));
+        let Hlvalue::Variable(ref narrowed) = translated[0].result else {
+            panic!("narrowed receiver");
+        };
+        let Hlvalue::Variable(ref getattr_base) = translated[1].args[0] else {
+            panic!("getattr base");
+        };
+        assert_eq!(narrowed.id(), getattr_base.id());
+
+        // No registered row: the same owner stays a single getattr.
+        let bare = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let translated = translate_op(&op, &value_map, &bare).expect("unregistered payload");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getattr");
     }
 
     #[test]

@@ -1143,4 +1143,77 @@ mod tests {
             "no range() builtin emitted"
         );
     }
+
+    /// The header phi is the ctor result itself. The entry edge still
+    /// passes the end bound and must be retargeted to `iter()`, because
+    /// that block defines the iterator. The latch passes a carried local
+    /// and does not define the preheader `iter()` result, so its link arg
+    /// stays put.
+    #[test]
+    fn rewrite_retargets_entry_end_bound_and_keeps_latch_arg() {
+        let mut g = FunctionGraph::new("test_range_iter_latch_arg");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: range_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "start", &a),
+        });
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "end", &b),
+        });
+
+        let (h, _) = g.create_block_with_arg_vars(1);
+        // Framestate threads the range value as this block's inputarg, so
+        // the phi variable is the ctor result, not a fresh name.
+        g.block_mut(h).inputargs = vec![range.clone()];
+        let opt = g
+            .push_op_var(
+                h,
+                OpKind::Call {
+                    target: CallTarget::method("next", Some("Range".to_string())),
+                    args: crate::model::call_args(vec![range.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(h, Some(opt.clone()));
+        // Entry still names the end bound. The latch carries its own local.
+        g.set_goto(n, h, vec![b.clone()]);
+        let (latch, latch_args) = g.create_block_with_arg_vars(1);
+        let carried = latch_args[0].clone();
+        g.set_goto(latch, h, vec![carried.clone()]);
+
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range.clone(),
+            }],
+            &[opt],
+        );
+        assert_eq!(rewritten, 1, "the range for-loop must be diverted");
+        let entry_arg = &g.block(n).exits[0].args[0];
+        assert!(
+            matches!(entry_arg, LinkArg::Value(v) if v == &range),
+            "entry edge that defines the iterator must pass it, got {entry_arg:?}"
+        );
+        let latch_arg = &g.block(latch).exits[0].args[0];
+        assert!(
+            matches!(latch_arg, LinkArg::Value(v) if v == &carried),
+            "latch must keep the carried iterator, got {latch_arg:?}"
+        );
+    }
 }

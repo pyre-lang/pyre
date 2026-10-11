@@ -1090,6 +1090,20 @@ fn projected_contains_list(value: &SomeValue) -> bool {
     }
 }
 
+/// `FixedObjectArray._items` is the flexible object array (`rlist.py`
+/// `l.items`). `ItemsBlock` keeps its `capacity` field, so it stays a
+/// struct: projecting it to the item list makes `getattr("capacity")` miss.
+fn fixed_object_array_items_field(canonical: &str) -> Option<&'static str> {
+    let leaf = canonical
+        .rsplit("::")
+        .next()
+        .unwrap_or(canonical)
+        .split('<')
+        .next()
+        .unwrap_or(canonical);
+    (leaf == "FixedObjectArray").then_some("_items")
+}
+
 impl Bookkeeper {
     /// RPython `Bookkeeper.__init__(self, annotator)` (bookkeeper.py).
     /// Once the annotator driver lands, this constructor takes an
@@ -4038,15 +4052,13 @@ impl Bookkeeper {
         // projections of this field share that attribute rather than
         // minting a second `ListDef`.
         let canonical_stripped = majit_ir::descr::canonical_struct_name(stripped);
-        if canonical_stripped == "FixedObjectArray"
-            || canonical_stripped == "object_array::FixedObjectArray"
-            || canonical_stripped.ends_with("::object_array::FixedObjectArray")
-        {
+        let items_field = fixed_object_array_items_field(&canonical_stripped);
+        if let Some(items_field) = items_field {
             let items_ty = self
                 .struct_fields
                 .borrow()
                 .as_ref()
-                .and_then(|reg| reg.field_type(stripped, "_items").map(str::to_string));
+                .and_then(|reg| reg.field_type(stripped, items_field).map(str::to_string));
             if let Some(items_ty) = items_ty {
                 if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(stripped)
                     && let Some(s_items) =

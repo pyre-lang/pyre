@@ -3318,11 +3318,14 @@ impl ClassDef {
         if let Some(sv) = s_value {
             newattr.s_value = sv;
         }
-        // A discriminant-only enum base does not own variant payloads.
-        // `locate_attribute` on that base still generalizes `__pos_N`, and
-        // pulling every variant's payload into one attribute unions
-        // `PyError` with `Integer`.  Leave a payload that does not union
-        // on its variant.
+        // `rclass.py` sum-type subclasses keep each variant's payload on
+        // that subclass. An enum base's only row is `__discriminant`
+        // (`StructFieldRegistry::is_enum_base`). A successful merge used
+        // to delete every variant `__pos_N` and rtype the payload through
+        // the one base field. Leave the variant attribute in place.
+        // `getfieldrepr` reads it before `rbase`. The base still receives
+        // the merged attribute: `locate_attribute` on the base returns
+        // that class, and `find_attribute` requires the slot to exist.
         let payload_on_enum_base = attr.starts_with("__pos_") && {
             let cd = this.borrow();
             let name = cd.name.clone();
@@ -3347,17 +3350,23 @@ impl ClassDef {
             if let Some(subattr) = existing {
                 match newattr.merge(&subattr, this) {
                     Ok(()) => {
-                        subdef.borrow_mut().attrs.remove(attr);
+                        if !payload_on_enum_base {
+                            subdef.borrow_mut().attrs.remove(attr);
+                        }
                     }
                     Err(e) if !payload_on_enum_base => return Err(e),
                     Err(_) => {}
                 }
             }
-            // accumulate attr_sources from all subclasses.
-            let taken = subdef.borrow_mut().attr_sources.remove(attr);
-            if let Some(sources) = taken {
-                for source in sources {
-                    constant_sources.push((subdef.clone(), source));
+            // A variant payload keeps its constant sources. Moving them
+            // onto the base would leave the surviving attribute without
+            // the constants `add_constant_source` recorded on it.
+            if !payload_on_enum_base {
+                let taken = subdef.borrow_mut().attr_sources.remove(attr);
+                if let Some(sources) = taken {
+                    for source in sources {
+                        constant_sources.push((subdef.clone(), source));
+                    }
                 }
             }
         }
