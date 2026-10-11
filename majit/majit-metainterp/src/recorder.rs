@@ -1767,12 +1767,14 @@ impl Trace {
                 qd.walk_const_ptr_refs(visitor);
             }
         }
-        for vs in &self.value_slots {
-            if let Some(Value::Ref(mut gcref)) = vs.concrete.get() {
-                visitor(&mut gcref);
-                vs.concrete.set(Some(Value::Ref(gcref)));
-            }
-        }
+        // history.py `RefFrontendOp._resref` is a field of the FrontendOp
+        // Python object. The collector traces it only while that box is
+        // still reachable (`MIFrame.registers_r`, `pushed_box`, heapcache
+        // boxes, …). `value_slots` is the dense FrontendOp table and is
+        // not a root list; walking every `.concrete` would keep residual
+        // CALL results alive for the whole trace. Live boxes are forwarded
+        // by `MetaInterp::walk_active_trace_refs` via
+        // `forward_concrete_ref`.
         for rec in &mut self.inputarg_heapc {
             rec.walk_const_ptr_refs(visitor);
         }
@@ -1915,6 +1917,36 @@ impl Trace {
             true
         } else {
             false
+        }
+    }
+
+    /// history.py `RefFrontendOp._resref`: forward the concrete GCREF of
+    /// one live FrontendOp / InputArg. `ConstPtr` values live on the
+    /// OpRef itself and are walked separately.
+    pub(crate) fn forward_concrete_ref(&self, opref: OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if opref.is_constant() {
+            return;
+        }
+        let Some(Value::Ref(mut gcref)) = self.concrete_at(opref.raw()) else {
+            return;
+        };
+        visitor(&mut gcref);
+        self.set_concrete_at(opref.raw(), Value::Ref(gcref));
+    }
+
+    /// history.py `RefFrontendOp._heapc_deps` — boxes stored on a live
+    /// FrontendOp are reachable through that object's fields.
+    pub(crate) fn heapc_dep_boxes(&self, opref: OpRef) -> Vec<OpRef> {
+        match <Self as majit_trace::heapcache::HeapcBoxes>::heapc(self, opref)
+            .and_then(|rec| rec.deps.as_ref())
+        {
+            Some(deps) => deps
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|d| !d.is_constant())
+                .collect(),
+            None => Vec::new(),
         }
     }
 

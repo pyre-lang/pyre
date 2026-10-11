@@ -111,6 +111,7 @@ unsafe fn walk_register_list(data: *const (), visitor: &mut dyn FnMut(&mut majit
     if let Some(values) = list.borrow_mut().as_mut() {
         for value in values {
             value.walk_const_ptr_refs_mut(visitor);
+            majit_metainterp::forward_live_frontend_resref(*value, visitor);
         }
     }
 }

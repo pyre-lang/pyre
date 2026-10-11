@@ -1311,10 +1311,11 @@ impl TraceCtx {
     ///
     /// Rooting contract: the result is returned unrooted, and the caller must
     /// stamp it onto the op it records for this allocation
-    /// (`set_opref_concrete`) before performing any GC allocation.  That stamp
-    /// is what makes the object a root — `MetaInterp::walk_active_trace_refs`
-    /// forwards every recorder `Op`/`InputArg` `value` cell holding a
-    /// `Value::Ref`, which is the `history.py` `*FrontendOp(pos,
+    /// (`set_opref_concrete`) before performing any GC allocation.  The
+    /// result box is then written into `MIFrame.registers_r`; that live
+    /// box is what makes the object a root — `MetaInterp::walk_active_trace_refs`
+    /// forwards `RefFrontendOp._resref` of boxes still reachable from
+    /// registers / heapcache, matching the `history.py` `*FrontendOp(pos,
     /// value)` slot upstream reaches through the object graph.  Between the
     /// `bh_new` here and that stamp there is no root at all, so the caller's
     /// window must contain no GC allocation; recording the op and populating

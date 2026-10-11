@@ -256,32 +256,37 @@ pub(crate) struct WalkFrameStateRoot {
     _owner: WalkFrameState,
 }
 
+fn walk_frame_box(op: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+    op.walk_const_ptr_refs_mut(visitor);
+    majit_metainterp::forward_live_frontend_resref(*op, visitor);
+}
+
 unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
     let cell = unsafe { &*(data as *const RefCell<WalkFrameStateData>) };
     let mut data = cell
         .try_borrow_mut()
         .expect("walk frame state borrow held across collection");
     for value in &mut data.outer_active_boxes {
-        value.walk_const_ptr_refs_mut(visitor);
+        walk_frame_box(value, visitor);
     }
     if let Some((_, boxes)) = &mut data.list_iter_class_guard_resume {
         for value in boxes {
-            value.walk_const_ptr_refs_mut(visitor);
+            walk_frame_box(value, visitor);
         }
     }
     for value in &mut data.vstack_boxes {
-        value.walk_const_ptr_refs_mut(visitor);
+        walk_frame_box(value, visitor);
     }
-    data.vstack_last_ref.walk_const_ptr_refs_mut(visitor);
+    walk_frame_box(&mut data.vstack_last_ref, visitor);
     if let Some((_, _, boxes, _)) = &mut data.vstack_reorder_saved {
         for value in boxes {
-            value.walk_const_ptr_refs_mut(visitor);
+            walk_frame_box(value, visitor);
         }
     }
     if let Some(shadow) = &mut data.callee_shadow {
-        shadow.frame_box.walk_const_ptr_refs_mut(visitor);
+        walk_frame_box(&mut shadow.frame_box, visitor);
         for value in shadow.opref.values_mut() {
-            value.walk_const_ptr_refs_mut(visitor);
+            walk_frame_box(value, visitor);
         }
         for entry in shadow.concrete.values_mut() {
             if let Value::Ref(root) = &mut entry.value {
@@ -297,7 +302,7 @@ unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut G
         // The JitCode code-root publication traces that code's GC fields.
     }
     if let Some(value) = &mut data.current_exception_seed {
-        value.walk_const_ptr_refs_mut(visitor);
+        walk_frame_box(value, visitor);
     }
     let mut exception = GcRef(data.current_exception_seed_concrete as usize);
     visitor(&mut exception);

@@ -3706,6 +3706,34 @@ impl<M: Clone> MetaInterp<M> {
         // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
         // storage needs an explicit walker. Independent of `self.tracing`:
         // frames are pushed for both recording and recursive-portal calls.
+        //
+        // history.py `RefFrontendOp._resref` is a field of the FrontendOp
+        // Python object. The collector traces it only while that box is
+        // reachable (`registers_r`, `pushed_box`, heapcache boxes, …).
+        // Collect those live boxes here; `forward_concrete_ref` runs after
+        // the recorder is in hand. `cleanup_registers` (pyjitpl.py) drops
+        // `registers_r` for the same reason: leftover boxes must not keep
+        // GCREFs alive.
+        let mut live_boxes: Vec<OpRef> = Vec::new();
+        for frame in self.framestack.frames.iter() {
+            for slot in frame.ref_regs.iter().flatten() {
+                if !slot.is_constant() {
+                    live_boxes.push(*slot);
+                }
+            }
+            if let Some(op) = frame.pushed_box {
+                if !op.is_constant() {
+                    live_boxes.push(op);
+                }
+            }
+        }
+        // pyjitpl.py `MetaInterp.last_exc_box` is a Box, so `_resref` /
+        // `ConstPtr.value` stay reachable while the exception is pending.
+        if let Some(op) = self.last_exc_box {
+            if !op.is_constant() {
+                live_boxes.push(op);
+            }
+        }
         for frame in self.framestack.frames.iter_mut() {
             for slot in frame.ref_regs.iter_mut() {
                 // Forward the inline `ConstPtr` gcref in place; non-Const
@@ -3714,6 +3742,9 @@ impl<M: Clone> MetaInterp<M> {
                     visitor(gcref);
                 }
             }
+        }
+        if let Some(OpRef::ConstPtr(gcref)) = self.last_exc_box.as_mut() {
+            visitor(gcref);
         }
         if let (Some(values), Some(types)) = (
             self.pending_frontend_boxes.as_mut(),
@@ -3758,10 +3789,35 @@ impl<M: Clone> MetaInterp<M> {
         for snapshot in trace_ctx.snapshots.iter_mut() {
             snapshot.walk_const_ptr_refs(&mut visitor);
         }
+        // resume.py snapshots hold the Box objects themselves, so a
+        // `SnapshotTagged::Box` FrontendOp keeps `_resref` alive after the
+        // register is overwritten.
+        for snapshot in &trace_ctx.snapshots {
+            let tagged = snapshot
+                .frames
+                .iter()
+                .flat_map(|frame| frame.boxes.iter())
+                .chain(snapshot.vable_boxes.iter())
+                .chain(snapshot.vref_boxes.iter());
+            for t in tagged {
+                if let crate::recorder::SnapshotTagged::Box(op, Type::Ref) = t
+                    && !op.is_constant()
+                {
+                    live_boxes.push(*op);
+                }
+            }
+        }
         // `initialize_state_from_start` `self.virtualizable_boxes` stores
         // ordinary BoxPtr objects whose concrete refs the GC traces through
         // the object graph. Forward ConstPtr gcrefs in the box list and the
-        // sync-target cell; InputArg/`*FrontendOp` refs are walked above.
+        // sync-target cell; InputArg/`*FrontendOp` refs are walked below.
+        if let Some(boxes) = trace_ctx.virtualizable_boxes.as_ref() {
+            for slot in boxes {
+                if !slot.is_constant() {
+                    live_boxes.push(*slot);
+                }
+            }
+        }
         trace_ctx.walk_virtualizable_value_refs(&mut visitor);
         // heapcache.py CacheEntry — the heapcache caches field values /
         // replacements / loop-invariant results as `OpRef`. With inline
@@ -3770,7 +3826,20 @@ impl<M: Clone> MetaInterp<M> {
         // emitted into the op-graph, so a stale gcref is a use-after-move.
         // Forward them in place. Heapcache key ownership is a separate census
         // from the independently rooted CALL_PURE constants below.
+        trace_ctx.heap_cache.for_each_cached_box(|op| {
+            if !op.is_constant() {
+                live_boxes.push(op);
+            }
+        });
         trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
+        let nseed = live_boxes.len();
+        for i in 0..nseed {
+            let op = live_boxes[i];
+            live_boxes.extend(trace_ctx.recorder.heapc_dep_boxes(op));
+        }
+        for op in live_boxes {
+            trace_ctx.recorder.forward_concrete_ref(op, &mut visitor);
+        }
         // util.py args_dict / history.py ConstPtr.value: CALL_PURE's keys and
         // results own collector-updated Const slots. Compile/optimizer handles
         // share that same dictionary; its roots survive even after this trace
@@ -3780,6 +3849,18 @@ impl<M: Clone> MetaInterp<M> {
         // `InputArgRef`, whose attached concrete value was forwarded above.
         // `registers_r[i]` is that Box and `getref_base()` reads its
         // updated `_resref`; there is no second value to refresh.
+    }
+
+    /// history.py `RefFrontendOp._resref` of one live Box, plus one level of
+    /// `_heapc_deps` stored on that FrontendOp.
+    pub fn forward_frontend_resref(&self, opref: OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+        let Some(trace_ctx) = self.tracing.as_ref().or(self.compile_tracing.as_ref()) else {
+            return;
+        };
+        trace_ctx.recorder.forward_concrete_ref(opref, visitor);
+        for dep in trace_ctx.recorder.heapc_dep_boxes(opref) {
+            trace_ctx.recorder.forward_concrete_ref(dep, visitor);
+        }
     }
 
     /// GC walker for ConstPtr GcRefs from snapshot maps during
@@ -29922,9 +30003,12 @@ mod tests {
 
     #[test]
     fn walk_active_trace_refs_forwards_op_value_ref() {
-        // The recorder stamps the concrete runtime result onto
-        // `Op.value` (`set_concrete_at`). A minor collection during tracing
-        // must forward a `Value::Ref` there; a non-Ref `Value` is untouched.
+        // Materialized-ops path (`trb is none`): the recorder stamps the
+        // concrete runtime result onto `Op.value` (`set_concrete_at`). A
+        // minor collection during tracing must forward a `Value::Ref`
+        // there; a non-Ref `Value` is untouched. Production traces keep
+        // `_resref` on `value_slots` and only forward boxes still
+        // reachable from `registers_r` / heapcache.
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
         let op = mk_op(

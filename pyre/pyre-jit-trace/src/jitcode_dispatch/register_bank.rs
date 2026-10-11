@@ -69,7 +69,10 @@ unsafe fn walk_register_slots(data: *const (), visitor: &mut dyn FnMut(&mut maji
     let slots = unsafe { &*(data as *const RegisterSlots) };
     for slot in slots.iter() {
         let mut value = slot.get();
+        // history.py `ConstPtr.value` is inline on the Box; `RefFrontendOp._resref`
+        // is a field of that same Box in `MIFrame.registers_r`.
         value.walk_const_ptr_refs_mut(visitor);
+        majit_metainterp::forward_live_frontend_resref(value, visitor);
         slot.set(value);
     }
 }

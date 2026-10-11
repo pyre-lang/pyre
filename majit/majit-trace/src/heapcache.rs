@@ -1055,6 +1055,31 @@ impl HeapCache {
     ///
     /// `FO_REPLACED_WITH_CONST` and `_heapc_deps` live on the FrontendOp
     /// record; the recorder walks those ConstPtrs.
+    pub fn for_each_cached_box(&self, mut visit: impl FnMut(OpRef)) {
+        fn visit_entry(entry: &CacheEntry, visit: &mut impl FnMut(OpRef)) {
+            for &value in entry.cache_anything.values() {
+                visit(value);
+            }
+            for &value in entry.cache_seen_allocation.values() {
+                visit(value);
+            }
+            if let Some(slot) = entry.last_const_box {
+                visit(slot);
+            }
+        }
+        for entry in self.heap_cache.values() {
+            visit_entry(entry, &mut visit);
+        }
+        for index_map in self.heap_array_cache.values() {
+            for entry in index_map.values() {
+                visit_entry(entry, &mut visit);
+            }
+        }
+        if let Some(slot) = self.loopinvariant_result {
+            visit(slot);
+        }
+    }
+
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
             if let OpRef::ConstPtr(gcref) = slot {

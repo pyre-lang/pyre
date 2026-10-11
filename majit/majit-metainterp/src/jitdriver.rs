@@ -9043,6 +9043,16 @@ impl<S: JitState> JitDriver<S> {
         self.meta.walk_active_trace_refs(visitor);
     }
 
+    /// history.py `RefFrontendOp._resref` of one live Box still reachable
+    /// from a translated `MIFrame.registers_r`.
+    pub fn forward_frontend_resref(
+        &self,
+        opref: majit_ir::OpRef,
+        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
+        self.meta.forward_frontend_resref(opref, visitor);
+    }
+
     /// GC walker for ConstPtr GcRefs in snapshot maps that are
     /// live during compilation. See `MetaInterp::walk_compile_snapshot_refs`.
     pub fn walk_compile_snapshot_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
