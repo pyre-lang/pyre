@@ -3,7 +3,11 @@
 //! `genop_float_abs`, `_cmp_guard_gc_type`, `genop_guard_guard_is_object`,
 //! `genop_guard_guard_subclass`, `_binaryop`, `_cmpop_float`,
 //! `_store_force_index`, `store_force_descr`, `genop_guard_guard_no_exception`,
-//! `cond_call` / `CondCallSlowPath`.
+//! `cond_call` / `CondCallSlowPath`, `generate_quick_failure`,
+//! `_build_failure_recovery`, `malloc_cond`,
+//! `malloc_cond_varsize_frame`, `malloc_cond_varsize`,
+//! `_binaryop_or_lea`, `flush_cc`, `addr_add_const`, `genop_finish`,
+//! `closing_jump`.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -22,7 +26,7 @@ use majit_ir::forwarding::bound_operand_from_opref as rb;
 use majit_ir::operand::Operand;
 use majit_ir::{
     CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, InputArgRc,
-    LoopTokenDescr, OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value,
+    LoopTokenDescr, OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value, make_loop_target_descr,
 };
 
 fn compile_and_run_int(opcode: OpCode, extra: Option<i64>, input: i64, token_id: u64) -> i64 {
@@ -653,7 +657,9 @@ fn may_force_guard_not_forced_reads_failarg() {
     // alone. A helper that does not force falls through `GUARD_NOT_FORCED`
     // (`CMP [jf_descr], 0`). A helper that forces copies that descr into
     // `jf_descr`, so the guard fails and the live fail arg is readable both
-    // during `force` and on the side exit.
+    // during `force` and on the side exit. That failure stub loads and
+    // clears the process-wide exception cells.
+    let _lock = lock_exception_cells();
     let (finished, after, during) = run_may_force(force_nop);
     assert!(during.is_none(), "nop helper must not force");
     assert!(finished, "GUARD_NOT_FORCED must pass when nothing forces");
@@ -710,7 +716,18 @@ fn guard_not_forced_2_constant_failarg_is_hole() {
     assert_eq!(backend.get_int_value(&forced, 1), 0);
 }
 
-static COND_CALL_EXC_LOCK: Mutex<()> = Mutex::new(());
+/// `JIT_EXC_VALUE` / `JIT_EXC_TYPE` (`pos_exc_value` / `pos_exception`).
+/// The cells are process-wide and the JIT clears them with plain stores,
+/// so every test that pre-raises or whose executed code reaches them
+/// shares this lock.
+static EXCEPTION_CELLS_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_exception_cells() -> std::sync::MutexGuard<'static, ()> {
+    EXCEPTION_CELLS_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
 static EXC_OBJ: [i64; 2] = [0x5151_0D11, 0];
 
 struct ClearExc;
@@ -764,9 +781,7 @@ fn cond_call_guard_no_exception_checks_the_call_path() {
     // pre-raised exception is still pending at `FINISH`. The call path runs
     // `CMP [pos_exception], 0` and, on failure, `grab_exc_value` reads the
     // value the recovery stub stashed.
-    let _lock = COND_CALL_EXC_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_exception_cells();
     let _clear = ClearExc;
     majit_backend_dynasm::jit_exc_clear();
 
@@ -1065,6 +1080,290 @@ fn cond_call_value_zero_writes_the_helper_result() {
         GcRef(helper_bits as usize)
     );
     assert_eq!(VALUE_R_TAKE_HITS.load(Ordering::SeqCst), 1);
+}
+
+static CALLER_SAVED_HITS: AtomicUsize = AtomicUsize::new(0);
+static CALLEE_SAVED_HITS: AtomicUsize = AtomicUsize::new(0);
+
+clobber_hits!(cond_call_caller_saved_hit, CALLER_SAVED_HITS);
+clobber_hits!(cond_call_callee_saved_hit, CALLEE_SAVED_HITS);
+
+/// One `INT_ADD` whose result is the only value live across `COND_CALL`.
+/// No float op, so `xrm.reg_bindings` is empty. The result is the first
+/// GPR allocation, which is in `save_around_call_regs`.
+fn compile_caller_saved_cond_call(func: i64) -> (DynasmBackend, JitCellToken, usize) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(1))]);
+    add.pos().set(OpRef::int_op(1));
+    let call = Op::new(
+        OpCode::CondCallN,
+        &[rb(OpRef::const_int(1)), rb(OpRef::const_int(func))],
+    );
+    call.pos().set(OpRef::void_op(0));
+    let ops = vec![
+        OpRc::new(add),
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    let info = backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile caller-saved COND_CALL: {err:?}"));
+    (backend, token, info.code_size)
+}
+
+#[test]
+fn cond_call_only_caller_saved_lives_survive() {
+    // No live float. The only live core register is the add result, and
+    // that register is in `save_around_call_regs`. `cond_call` selects
+    // `cond_call_slowpath[1]` (`callee_only`, no floats).
+    let func = cond_call_caller_saved_hit as *const () as usize as i64;
+    CALLER_SAVED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token, code_size) = compile_caller_saved_cond_call(func);
+    assert_eq!(
+        cond_call_slowpath_index(loop_code(&token, code_size), func as u64),
+        1
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(40)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 41);
+    assert_eq!(CALLER_SAVED_HITS.load(Ordering::SeqCst), 1);
+}
+
+fn compile_callee_saved_cond_call(func: i64) -> (DynasmBackend, JitCellToken, usize) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    for n in 1..=4 {
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[rb(i0), rb(OpRef::const_int(i64::from(n)))],
+        );
+        add.pos().set(OpRef::int_op(n));
+        ops.push(add);
+        live.push(rb(OpRef::int_op(n)));
+    }
+    let call = Op::new(
+        OpCode::CondCallN,
+        &[rb(OpRef::const_int(1)), rb(OpRef::const_int(func))],
+    );
+    call.pos().set(OpRef::void_op(0));
+    ops.push(call);
+    // `genop_finish` writes only arglocs[0] into frame slot 0, and the
+    // finish descr leaves `rd_locs` empty. A failing guard records every
+    // live register there, which is what `get_int_value` reads.
+    let eq = Op::new(
+        OpCode::IntEq,
+        &[rb(OpRef::int_op(1)), rb(OpRef::const_int(0))],
+    );
+    eq.pos().set(OpRef::int_op(5));
+    ops.push(eq);
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(5))]);
+    guard.pos().set(OpRef::void_op(6));
+    guard.setdescr(make_resume_guard_descr_typed(vec![Type::Int; 4]));
+    guard.set_fail_arg_types(vec![Type::Int; 4]);
+    guard.setfailargs(live.into());
+    ops.push(guard);
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    let info = backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile callee-saved COND_CALL: {err:?}"));
+    (backend, token, info.code_size)
+}
+
+#[test]
+fn cond_call_live_callee_saved_survives() {
+    // Four live adds. `ebx` is outside `save_around_call_regs`, so
+    // `callee_only` is false. No live float. `cond_call` selects
+    // `cond_call_slowpath[0]` (every core register, no floats). The
+    // naked callee xors `ebx`/`esi`/`edi`/`r12`/`r14`/`r15`.
+    let func = cond_call_callee_saved_hit as *const () as usize as i64;
+    CALLEE_SAVED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token, code_size) = compile_callee_saved_cond_call(func);
+    assert_eq!(
+        cond_call_slowpath_index(loop_code(&token, code_size), func as u64),
+        0
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(10)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(CALLEE_SAVED_HITS.load(Ordering::SeqCst), 1);
+    for (index, expected) in [11, 12, 13, 14].into_iter().enumerate() {
+        assert_eq!(
+            backend.get_int_value(&frame, index),
+            expected,
+            "live add {index}"
+        );
+    }
+}
+
+fn loop_code(token: &JitCellToken, code_size: usize) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(token.ll_raw_start() as *const u8, code_size) }
+}
+
+/// `generate_cond_call_slowpath` loads the helper with `mov r11, imm64`
+/// and `call r11`. `push_gcmap` forgets the scratch cache first, so
+/// `load_scratch` is that `movabs`, not an `lea`.
+fn cond_call_slowpath_index(code: &[u8], func: u64) -> usize {
+    let needle = func.to_le_bytes();
+    let at = code
+        .windows(8)
+        .position(|window| window == needle)
+        .unwrap_or_else(|| panic!("cond_call func immediate is missing"));
+    let tail = &code[at..];
+    let mut i = 0;
+    while i + 13 <= tail.len() {
+        if tail[i] == 0x49
+            && tail[i + 1] == 0xBB
+            && tail[i + 10] == 0x41
+            && tail[i + 11] == 0xFF
+            && tail[i + 12] == 0xD3
+        {
+            let helper = u64::from_le_bytes(tail[i + 2..i + 10].try_into().unwrap());
+            return classify_cond_call_helper(helper);
+        }
+        i += 1;
+    }
+    panic!("cond_call_slowpath call is missing after the func immediate");
+}
+
+/// `_build_cond_call_slowpath` prologue: GPR `mov [rbp+slot], reg`, then
+/// XMM stores when `supports_floats`, then `sub rsp, align`. `ebx` is in
+/// `all_regs` and not in `save_around_call_regs`, so a store of it means
+/// `callee_only` is false.
+fn classify_cond_call_helper(addr: u64) -> usize {
+    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, 192) };
+    let mut saves_ebx = false;
+    let mut saves_xmm = false;
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if bytes[i] == 0x48 && bytes[i + 1] == 0x83 && bytes[i + 2] == 0xEC {
+            break;
+        }
+        if bytes[i] == 0xF2 {
+            saves_xmm = true;
+            let modrm_at = if bytes[i + 1] == 0x0F { i + 3 } else { i + 4 };
+            i = modrm_at + 1 + disp_after_modrm(bytes[modrm_at]);
+            continue;
+        }
+        if (bytes[i] == 0x48 || bytes[i] == 0x4C) && bytes[i + 1] == 0x89 {
+            let modrm = bytes[i + 2];
+            let reg = ((bytes[i] & 0x04) << 1) | ((modrm >> 3) & 7);
+            if reg == 3 {
+                saves_ebx = true;
+            }
+            i += 3 + disp_after_modrm(modrm);
+            continue;
+        }
+        panic!(
+            "cond_call helper prologue byte {:#x} at {i} (addr {addr:#x})",
+            bytes[i]
+        );
+    }
+    usize::from(saves_xmm) * 2 + usize::from(!saves_ebx)
+}
+
+fn disp_after_modrm(modrm: u8) -> usize {
+    match modrm >> 6 {
+        1 => 1,
+        2 => 4,
+        _ => 0,
+    }
+}
+
+/// `INT_ADD`, `FLOAT_NEG`, and the input int stay live as fail-args.
+/// `exc` is `GUARD_NO_EXCEPTION`; otherwise `INT_EQ` / `GUARD_TRUE` fails.
+/// Failargs are not constants (`compute_vars_longevity`).
+fn compile_guard_fail_with_float(exc: bool) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Float, 1),
+    ];
+    let i0 = inputargs[0].opref();
+    let f0 = inputargs[1].opref();
+    let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(1))]);
+    add.pos().set(OpRef::int_op(1));
+    let neg = Op::new(OpCode::FloatNeg, &[rb(f0)]);
+    neg.pos().set(OpRef::float_op(2));
+    let mut ops = vec![add, neg];
+    let guard = if exc {
+        let guard = Op::new(OpCode::GuardNoException, &[]);
+        guard.pos().set(OpRef::void_op(3));
+        guard
+    } else {
+        let eq = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(1))]);
+        eq.pos().set(OpRef::int_op(3));
+        ops.push(eq);
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(3))]);
+        guard.pos().set(OpRef::void_op(4));
+        guard
+    };
+    guard.setdescr(make_resume_guard_descr_typed(vec![
+        Type::Int,
+        Type::Float,
+        Type::Int,
+    ]));
+    guard.set_fail_arg_types(vec![Type::Int, Type::Float, Type::Int]);
+    guard.setfailargs(vec![rb(OpRef::int_op(1)), rb(OpRef::float_op(2)), rb(i0)].into());
+    ops.push(guard);
+    ops.push(finish(5));
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile guard failure exc={exc}: {err:?}"));
+    (backend, token)
+}
+
+fn assert_guard_failargs(backend: &DynasmBackend, frame: &majit_backend::DeadFrame) {
+    assert!(!backend.get_latest_descr(frame).is_finish());
+    assert_eq!(backend.get_int_value(frame, 0), 8);
+    assert_float_bits(
+        backend.get_float_value(frame, 1),
+        2.5,
+        "guard float failarg",
+    );
+    assert_eq!(backend.get_int_value(frame, 2), 7);
+}
+
+#[test]
+fn failure_recovery_reads_failargs_without_an_exception() {
+    // `GUARD_TRUE` fails. No pending exception, and a float fail-arg, so
+    // `store_info_on_descr` selects `failure_recovery_code[2]`
+    // (`exc=false`, `withfloats=true`).
+    let _lock = lock_exception_cells();
+    let _clear = ClearExc;
+    majit_backend_dynasm::jit_exc_clear();
+    let (backend, token) = compile_guard_fail_with_float(false);
+    let frame = backend.execute_token(&token, &[Value::Int(7), Value::Float(-2.5)]);
+    assert_guard_failargs(&backend, &frame);
+    assert_eq!(backend.grab_exc_value(&frame), GcRef(0));
+    assert!(!majit_backend_dynasm::jit_exc_is_pending());
+}
+
+#[test]
+fn failure_recovery_captures_a_pending_exception() {
+    // `GUARD_NO_EXCEPTION` with a float fail-arg selects
+    // `failure_recovery_code[3]` (`exc=true`, `withfloats=true`).
+    // `_build_failure_recovery` stores `pos_exc_value` in `jf_guard_exc`
+    // and clears both cells.
+    let _lock = lock_exception_cells();
+    let _clear = ClearExc;
+    majit_backend_dynasm::jit_exc_clear();
+    majit_backend_dynasm::jit_exc_raise(EXC_OBJ.as_ptr() as i64);
+    let (backend, token) = compile_guard_fail_with_float(true);
+    let frame = backend.execute_token(&token, &[Value::Int(7), Value::Float(-2.5)]);
+    assert_guard_failargs(&backend, &frame);
+    assert_eq!(
+        backend.grab_exc_value(&frame),
+        GcRef(EXC_OBJ.as_ptr() as usize)
+    );
+    assert!(!majit_backend_dynasm::jit_exc_is_pending());
 }
 
 fn no_collect_effect() -> EffectInfo {
@@ -1862,9 +2161,7 @@ fn check_memory_error_nonzero_falls_through() {
 fn check_memory_error_null_propagates() {
     let (backend, token) = compile_check_memory_error();
     // `generate_propagate_error_64` clears the process-wide exception cells.
-    let _lock = COND_CALL_EXC_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_exception_cells();
     let top = shadow_top();
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
     assert_propagate(&backend, &frame);
@@ -2238,7 +2535,9 @@ fn bridge_frame_depth_reallocates_when_short() {
     );
     // `execute_token` sizes from `jfi_frame_depth`. Put the loop's depth
     // back so the bridge's `jl` is taken and `realloc_frame` runs.
+    // `build_frame_realloc_slowpath` clears both exception cells for that call.
     store_frame_info(&token, loop_depth, loop_size);
+    let _lock = lock_exception_cells();
     let (seen, tip) = run_bridged(&mut backend, &token);
     assert_ne!(seen, tip, "realloc_frame forwards the jitframe");
     store_frame_info(&token, loop_depth, loop_size);
@@ -2345,9 +2644,7 @@ fn stack_check_slowpath_once_per_process() {
     let token = compile_input_finish(&mut backend);
     assert_stack_probe(compiled_bytes(&token));
 
-    let _lock = COND_CALL_EXC_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_exception_cells();
     let _clear = ClearExc;
     STACK_END.store(0, Ordering::Release);
     STACK_LENGTH.store(0, Ordering::Release);
@@ -2390,4 +2687,854 @@ fn stack_check_slowpath_once_per_process() {
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 7);
     assert_eq!(STACK_CALLS.with(|calls| calls.get()), 0);
+}
+
+fn nursery_backend(nursery_size: usize, threshold: usize) -> DynasmBackend {
+    let gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size,
+        large_object_threshold: threshold,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    wb_backend(gc)
+}
+
+fn finish_ref(obj: OpRef, pos: u32) -> Op {
+    // `genop_finish` publishes one result at `jf_frame[0]`.
+    let op = Op::new(OpCode::Finish, &[rb(obj)]);
+    op.pos().set(OpRef::void_op(pos));
+    op.set_fail_arg_types(vec![Type::Ref]);
+    op.setfailargs(vec![rb(obj)].into());
+    op
+}
+
+fn compile_ops(
+    backend: &mut DynasmBackend,
+    inputargs: &[InputArgRc],
+    ops: Vec<Op>,
+) -> JitCellToken {
+    let token = JitCellToken::new(next_token_id());
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile malloc nursery: {err:?}"));
+    token
+}
+
+fn finished_ref(backend: &DynasmBackend, frame: &majit_backend::DeadFrame) -> majit_ir::GcRef {
+    assert!(
+        backend.get_latest_descr(frame).is_finish(),
+        "malloc nursery trace must finish"
+    );
+    backend.get_ref_value(frame, 0)
+}
+
+fn store_sum(obj: OpRef, sum: OpRef, pos: u32) -> Op {
+    op_at(
+        OpCode::GcStore,
+        &[obj, OpRef::const_int(0), sum, OpRef::const_int(8)],
+        OpRef::void_op(pos),
+    )
+}
+
+/// `malloc_cond` when the bump fits. The live sum is stored into the object
+/// after the bump, so it has to survive the allocation.
+#[test]
+fn call_malloc_nursery_fits_and_keeps_live_int() {
+    let mut backend = nursery_backend(1 << 20, 1 << 20);
+    let a = OpRef::input_arg_int(0);
+    let b = OpRef::input_arg_int(1);
+    let sum = OpRef::int_op(2);
+    let obj = OpRef::ref_op(3);
+    let ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(64)], obj),
+        store_sum(obj, sum, 4),
+        finish_ref(obj, 5),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(
+        majit_gc::can_move(ptr),
+        "a 64-byte bump stays in the nursery"
+    );
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
+}
+
+/// `malloc_cond` when the bump passes `nursery_top`. The slow path calls
+/// `malloc_slowpath_fixed`; the live sum is stored afterwards.
+#[test]
+fn call_malloc_nursery_overflow_keeps_live_int() {
+    let mut backend = nursery_backend(4096, 1 << 20);
+    let a = OpRef::input_arg_int(0);
+    let b = OpRef::input_arg_int(1);
+    let sum = OpRef::int_op(2);
+    let obj = OpRef::ref_op(3);
+    let ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(8192)], obj),
+        store_sum(obj, sum, 4),
+        finish_ref(obj, 5),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(
+        !majit_gc::can_move(ptr),
+        "8192 bytes do not fit a 4096-byte nursery"
+    );
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
+}
+
+/// `malloc_cond_varsize`: a short array takes the bump; a length past
+/// `maxlength` calls `malloc_slowpath_varsize`. The live sum is stored at
+/// the first item.
+#[test]
+fn call_malloc_nursery_varsize_small_and_large() {
+    let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size: 1 << 20,
+        large_object_threshold: 4096,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    let array_tid = gc.register_type(majit_gc::TypeInfo::varsize(8, 8, 0, false, Vec::new()));
+    let mut backend = wb_backend(gc);
+    let a = OpRef::input_arg_int(0);
+    let b = OpRef::input_arg_int(1);
+    let len = OpRef::input_arg_int(2);
+    let sum = OpRef::int_op(3);
+    let obj = OpRef::ref_op(4);
+    let alloc = op_at(
+        OpCode::CallMallocNurseryVarsize,
+        &[OpRef::const_int(0), OpRef::const_int(8), len],
+        obj,
+    );
+    alloc.setdescr(Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        8,
+        8,
+        array_tid,
+        Type::Int,
+    )));
+    let ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        alloc,
+        op_at(
+            OpCode::GcStore,
+            &[obj, OpRef::const_int(0), len, OpRef::const_int(8)],
+            OpRef::void_op(5),
+        ),
+        op_at(
+            OpCode::GcStore,
+            &[obj, OpRef::const_int(8), sum, OpRef::const_int(8)],
+            OpRef::void_op(6),
+        ),
+        finish_ref(obj, 7),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+
+    let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22), Value::Int(3)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 3);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+    drop(frame);
+
+    let large = 140_000;
+    let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22), Value::Int(large)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(!majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, large);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+}
+
+fn run_varsize_frame(nursery_size: usize, alloc_size: i64) -> majit_ir::GcRef {
+    let mut backend = nursery_backend(nursery_size, 1 << 20);
+    let size = OpRef::input_arg_int(0);
+    let a = OpRef::input_arg_int(1);
+    let b = OpRef::input_arg_int(2);
+    let sum = OpRef::int_op(3);
+    let obj = OpRef::ref_op(4);
+    let ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        op_at(OpCode::CallMallocNurseryVarsizeFrame, &[size], obj),
+        store_sum(obj, sum, 5),
+        finish_ref(obj, 6),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(alloc_size), Value::Int(20), Value::Int(22)],
+    );
+    finished_ref(&backend, &frame)
+}
+
+/// `malloc_cond_varsize_frame` bump, and the same op when the size does not fit.
+#[test]
+fn call_malloc_nursery_varsize_frame_fit_and_overflow() {
+    let ptr = run_varsize_frame(1 << 20, 32);
+    assert!(!ptr.is_null());
+    assert!(majit_gc::can_move(ptr));
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
+
+    let ptr = run_varsize_frame(4096, 8192);
+    assert!(!ptr.is_null());
+    assert!(!majit_gc::can_move(ptr));
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
+}
+
+fn finish_int(value: OpRef, pos: u32) -> Op {
+    let op = Op::new(OpCode::Finish, &[rb(value)]);
+    op.pos().set(OpRef::void_op(pos));
+    op.set_fail_arg_types(vec![Type::Int]);
+    op.setfailargs(vec![rb(value)].into());
+    op
+}
+
+/// `TypeInfo::simple` is registered before the jitframe type so a zero
+/// header is not traced as a frame. `tid` is that simple type.
+fn nursery_backend_with_simple(
+    nursery_size: usize,
+    threshold: usize,
+    payload: usize,
+) -> (DynasmBackend, u32) {
+    let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size,
+        large_object_threshold: threshold,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    let tid = gc.register_type(majit_gc::TypeInfo::simple(payload));
+    (wb_backend(gc), tid)
+}
+
+fn gc_store(base: OpRef, ofs: i64, value: OpRef, size: i64, pos: u32) -> Op {
+    op_at(
+        OpCode::GcStore,
+        &[base, OpRef::const_int(ofs), value, OpRef::const_int(size)],
+        OpRef::void_op(pos),
+    )
+}
+
+/// `malloc_cond` overflow. The young object stays live across
+/// `MallocCondSlowPath`. The collection promotes it and the register
+/// must hold the updated pointer, with the marker still in the first word.
+#[test]
+fn call_malloc_nursery_slowpath_updates_live_ref() {
+    let (mut backend, tid) = nursery_backend_with_simple(4096, 1 << 20, 64);
+    let young = OpRef::ref_op(1);
+    let ops = vec![
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(2048)], young),
+        gc_store(
+            young,
+            -(GcHeader::SIZE as i64),
+            OpRef::const_int(i64::from(tid)),
+            8,
+            3,
+        ),
+        gc_store(young, 0, OpRef::const_int(0x5A5A), 8, 4),
+        op_at(
+            OpCode::CallMallocNursery,
+            &[OpRef::const_int(3000)],
+            OpRef::ref_op(5),
+        ),
+        finish_ref(young, 6),
+    ];
+    let token = compile_ops(&mut backend, &[], ops);
+    let frame = backend.execute_token(&token, &[]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(
+        !majit_gc::can_move(ptr),
+        "live ref {:#x} was not updated out of the nursery",
+        ptr.0
+    );
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 0x5A5A);
+    assert!(
+        !unsafe { (*header_of(ptr.0)).has_flag(GcFlags::GCFLAG_HAS_SHADOW) },
+        "promoted object kept HAS_SHADOW"
+    );
+}
+
+/// Header word after the fast path and a 4-byte type-id store.
+/// `FORWARDED_MARKER` was planted at that slot. The high half stays set
+/// until `malloc_cond_varsize_frame` clears the word.
+#[test]
+fn call_malloc_nursery_varsize_frame_fast_path_header_word() {
+    let (mut backend, tid) = nursery_backend_with_simple(1 << 20, 1 << 20, 64);
+    let size = OpRef::input_arg_int(0);
+    let pad = OpRef::ref_op(1);
+    let young = OpRef::ref_op(2);
+    let hdr = OpRef::int_op(3);
+    let ops = vec![
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(64)], pad),
+        gc_store(
+            pad,
+            56,
+            OpRef::const_int(majit_gc::header::FORWARDED_MARKER as i64),
+            8,
+            4,
+        ),
+        op_at(OpCode::CallMallocNurseryVarsizeFrame, &[size], young),
+        gc_store(
+            young,
+            -(GcHeader::SIZE as i64),
+            OpRef::const_int(i64::from(tid)),
+            (majit_gc::header::TYPE_ID_BITS / 8) as i64,
+            5,
+        ),
+        op_at(
+            OpCode::GcLoadI,
+            &[
+                young,
+                OpRef::const_int(-(GcHeader::SIZE as i64)),
+                OpRef::const_int(8),
+            ],
+            hdr,
+        ),
+        finish_int(hdr, 6),
+    ];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(64)]);
+    let word = backend.get_int_value(&frame, 0) as u64;
+    assert_eq!(
+        word >> 32,
+        0,
+        "recycled header flags survived the fast path: {word:#x}"
+    );
+    assert_eq!(word as u32, tid);
+}
+
+/// `malloc_cond_varsize_frame` fast path, then a 4-byte type-id store
+/// (`gen_initialize_tid_keep_flags`). The slot is planted with
+/// `FORWARDED_MARKER`. That word's flag half includes `GCFLAG_PINNED`
+/// and `GCFLAG_HAS_SHADOW`, so a nursery-overflowing `malloc_cond`
+/// leaves the live register pointing at the nursery slot. Clearing the
+/// header word lets the collection promote the object and rewrite it.
+#[test]
+fn call_malloc_nursery_varsize_frame_live_ref_across_recycled_header() {
+    let (mut backend, tid) = nursery_backend_with_simple(4096, 1 << 20, 64);
+    let size = OpRef::input_arg_int(0);
+    let pad = OpRef::ref_op(1);
+    let young = OpRef::ref_op(2);
+    let header_plant = majit_gc::header::FORWARDED_MARKER as i64;
+    let ops = vec![
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(64)], pad),
+        gc_store(pad, 56, OpRef::const_int(header_plant), 8, 4),
+        op_at(OpCode::CallMallocNurseryVarsizeFrame, &[size], young),
+        gc_store(
+            young,
+            -(GcHeader::SIZE as i64),
+            OpRef::const_int(i64::from(tid)),
+            (majit_gc::header::TYPE_ID_BITS / 8) as i64,
+            5,
+        ),
+        gc_store(young, 0, OpRef::const_int(0x5A5A), 8, 6),
+        op_at(
+            OpCode::CallMallocNursery,
+            &[OpRef::const_int(4000)],
+            OpRef::ref_op(7),
+        ),
+        finish_ref(young, 8),
+    ];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(64)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(
+        !majit_gc::can_move(ptr),
+        "live ref {:#x} was not updated out of the nursery",
+        ptr.0
+    );
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 0x5A5A);
+    let hdr = unsafe { *header_of(ptr.0) };
+    assert!(
+        !hdr.has_flag(GcFlags::GCFLAG_HAS_SHADOW),
+        "recycled header kept HAS_SHADOW: {:#x}",
+        hdr.tid_and_flags
+    );
+}
+
+const ZERO_ARRAY_BASEOFS: usize = 16;
+const ZERO_ARRAY_UNROLL_LIMIT: i64 = 16 * 8;
+
+fn zero_array_descr() -> DescrRef {
+    Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        ZERO_ARRAY_BASEOFS,
+        1,
+        1,
+        Type::Int,
+    ))
+}
+
+fn run_zero_array(nbytes: i64, start: i64, start_in_reg: bool) {
+    let prefix = ZERO_ARRAY_BASEOFS + start as usize;
+    let total = prefix + nbytes as usize + 8;
+    let mut buf = vec![0xAAu8; total];
+    for slot in buf.iter_mut().take(prefix + nbytes as usize).skip(prefix) {
+        *slot = 0xBB;
+    }
+    let ptr = buf.as_mut_ptr() as usize;
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let mut inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let mut zero_args = vec![
+        rb(OpRef::input_arg_ref(0)),
+        rb(OpRef::const_int(start)),
+        rb(OpRef::const_int(nbytes)),
+        rb(OpRef::const_int(1)),
+        rb(OpRef::const_int(1)),
+    ];
+    if start_in_reg {
+        inputargs.push(InputArg::from_type_rc(Type::Int, 1));
+        zero_args[1] = rb(OpRef::input_arg_int(1));
+    }
+    let zero = Op::new(OpCode::ZeroArray, &zero_args);
+    zero.pos().set(OpRef::void_op(1));
+    zero.setdescr(zero_array_descr());
+    let ops = vec![OpRc::new(zero), OpRc::new(finish(2))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile ZERO_ARRAY nbytes={nbytes}: {err:?}"));
+    let mut values = vec![Value::Ref(GcRef(ptr))];
+    if start_in_reg {
+        values.push(Value::Int(start));
+    }
+    let frame = backend.execute_token(&token, &values);
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "ZERO_ARRAY nbytes={nbytes} must finish"
+    );
+    assert!(
+        buf[..prefix].iter().all(|&b| b == 0xAA),
+        "bytes before the range must stay set, nbytes={nbytes}: {:02x?}",
+        &buf[..prefix]
+    );
+    assert!(
+        buf[prefix..prefix + nbytes as usize]
+            .iter()
+            .all(|&b| b == 0),
+        "ZERO_ARRAY must clear nbytes={nbytes}: {:02x?}",
+        &buf[prefix..prefix + nbytes as usize]
+    );
+    assert!(
+        buf[prefix + nbytes as usize..].iter().all(|&b| b == 0xAA),
+        "bytes after the range must stay set, nbytes={nbytes}: {:02x?}",
+        &buf[prefix + nbytes as usize..]
+    );
+}
+
+#[test]
+fn zero_array_unroll_and_memset_leave_neighbors() {
+    for nbytes in [0, 8, 16, 24, 136, ZERO_ARRAY_UNROLL_LIMIT + 16] {
+        run_zero_array(nbytes, 0, false);
+    }
+    run_zero_array(16, 4, true);
+}
+
+static CALL_ENTRY_RSP: AtomicUsize = AtomicUsize::new(0);
+
+fn assert_call_entry_aligned() {
+    let rsp = CALL_ENTRY_RSP.load(Ordering::SeqCst);
+    assert_ne!(rsp, 0, "callee must record entry rsp");
+    assert_eq!(
+        (rsp + 8) % 16,
+        0,
+        "rsp at entry minus the return address must be 16-byte aligned, rsp={rsp:#x}"
+    );
+}
+
+macro_rules! aligned_int_callee {
+    ($entry:ident, $real:ident $(, $arg:ident: $ty:ty = $expect:expr)*) => {
+        #[unsafe(naked)]
+        extern "C" fn $entry() {
+            naked_asm!(
+                "mov [rip + {seen}], rsp",
+                "jmp {real}",
+                seen = sym CALL_ENTRY_RSP,
+                real = sym $real,
+            );
+        }
+        extern "C" fn $real($($arg: $ty),*) -> i64 {
+            let ok = true $(&& $arg == $expect)*;
+            ok as i64
+        }
+    };
+}
+
+aligned_int_callee!(call_align_0, call_align_0_real);
+aligned_int_callee!(
+    call_align_4,
+    call_align_4_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4
+);
+aligned_int_callee!(
+    call_align_6,
+    call_align_6_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4,
+    a4: i64 = 5,
+    a5: i64 = 6
+);
+aligned_int_callee!(
+    call_align_7,
+    call_align_7_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4,
+    a4: i64 = 5,
+    a5: i64 = 6,
+    a6: i64 = 7
+);
+aligned_int_callee!(
+    call_align_9,
+    call_align_9_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4,
+    a4: i64 = 5,
+    a5: i64 = 6,
+    a6: i64 = 7,
+    a7: i64 = 8,
+    a8: i64 = 9
+);
+
+#[unsafe(naked)]
+extern "C" fn call_align_float() {
+    naked_asm!(
+        "mov [rip + {seen}], rsp",
+        "jmp {real}",
+        seen = sym CALL_ENTRY_RSP,
+        real = sym call_align_float_real,
+    );
+}
+
+extern "C" fn call_align_float_real(a: f64, b: f64) -> i64 {
+    (a == 1.5 && b == 2.25) as i64
+}
+
+fn run_aligned_call(func: i64, args: &[Operand], types: Vec<Type>) {
+    CALL_ENTRY_RSP.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_call(
+        OpCode::CallI,
+        func,
+        args,
+        types,
+        OpRef::int_op(1),
+        Type::Int,
+        true,
+        8,
+    );
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        1,
+        "callee must see every argument"
+    );
+    assert_call_entry_aligned();
+}
+
+fn int_args(n: i64) -> (Vec<Operand>, Vec<Type>) {
+    let args = (1..=n).map(|i| rb(OpRef::const_int(i))).collect();
+    (args, vec![Type::Int; n as usize])
+}
+
+#[test]
+fn call_subtract_esp_aligned_passes_args() {
+    let (args, types) = int_args(0);
+    run_aligned_call(call_align_0 as usize as i64, &args, types);
+    let (args, types) = int_args(4);
+    run_aligned_call(call_align_4 as usize as i64, &args, types);
+    let (args, types) = int_args(6);
+    run_aligned_call(call_align_6 as usize as i64, &args, types);
+    let (args, types) = int_args(7);
+    run_aligned_call(call_align_7 as usize as i64, &args, types);
+    let (args, types) = int_args(9);
+    run_aligned_call(call_align_9 as usize as i64, &args, types);
+    run_aligned_call(
+        call_align_float as usize as i64,
+        &[rb(OpRef::const_float(1.5)), rb(OpRef::const_float(2.25))],
+        vec![Type::Float, Type::Float],
+    );
+}
+
+fn compile_add_regs(lhs: i64, rhs: i64) -> i64 {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[rb(inputargs[0].opref()), rb(inputargs[1].opref())],
+    );
+    add.pos().set(OpRef::int_op(1));
+    let ops = vec![
+        OpRc::new(add),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile reg/reg INT_ADD: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Int(lhs), Value::Int(rhs)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    backend.get_int_value(&frame, 0)
+}
+
+/// LHS stays live past the add, and the immediate fits a disp32, so
+/// `_consider_lea` puts the sum in a register other than the LHS.
+/// A failing guard publishes both; `genop_finish` only stores its first arg.
+/// Returns `(sum, lhs)`.
+fn compile_add_fresh(imm: i64, input: i64) -> (i64, i64) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(imm))]);
+    add.pos().set(OpRef::int_op(1));
+    // `input` is never 0, so this compare fails and the guard exits.
+    let eq = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(0))]);
+    eq.pos().set(OpRef::int_op(2));
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+    guard.pos().set(OpRef::void_op(3));
+    guard.setdescr(make_resume_guard_descr_typed(vec![Type::Int, Type::Int]));
+    guard.set_fail_arg_types(vec![Type::Int, Type::Int]);
+    guard.setfailargs(vec![rb(OpRef::int_op(1)), rb(i0)].into());
+    let ops = vec![
+        OpRc::new(add),
+        OpRc::new(eq),
+        OpRc::new(guard),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 4)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile fresh INT_ADD: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Int(input)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    (
+        backend.get_int_value(&frame, 0),
+        backend.get_int_value(&frame, 1),
+    )
+}
+
+/// `_binaryop_or_lea`: ADD when the result reuses the first operand's
+/// register, LEA when the sum is a fresh register. Both wrap.
+#[test]
+fn int_add_reuses_lhs_or_leas_into_a_fresh_reg() {
+    assert_eq!(compile_add_regs(20, 22), 42);
+    assert_eq!(compile_add_regs(i64::MAX, 1), i64::MIN);
+    let (sum, saved) = compile_add_fresh(3, 10);
+    assert_eq!((sum, saved), (13, 10));
+    let (sum, saved) = compile_add_fresh(1, i64::MAX);
+    assert_eq!((sum, saved), (i64::MIN, i64::MAX));
+}
+
+/// `flush_cc` materialises every comparison condition into a register.
+#[test]
+fn flush_cc_materializes_every_condition() {
+    let cases = [
+        (OpCode::IntLt, -2, -1, 1),
+        (OpCode::IntLt, 2, 2, 0),
+        (OpCode::IntLe, 2, 2, 1),
+        (OpCode::IntLe, 3, 2, 0),
+        (OpCode::IntGt, 3, 2, 1),
+        (OpCode::IntGt, 2, 2, 0),
+        (OpCode::IntGe, 2, 2, 1),
+        (OpCode::IntGe, 1, 2, 0),
+        (OpCode::IntEq, 5, 5, 1),
+        (OpCode::IntEq, 5, 6, 0),
+        (OpCode::IntNe, 5, 6, 1),
+        (OpCode::IntNe, 5, 5, 0),
+        (OpCode::UintLt, 1, -1, 1),
+        (OpCode::UintLt, -1, 1, 0),
+        (OpCode::UintLe, -1, -1, 1),
+        (OpCode::UintLe, -1, 1, 0),
+        (OpCode::UintGt, -1, 1, 1),
+        (OpCode::UintGt, 1, -1, 0),
+        (OpCode::UintGe, -1, -1, 1),
+        (OpCode::UintGe, 1, -1, 0),
+    ];
+    for (op, input, rhs, expected) in cases {
+        let got = compile_and_run_int(op, Some(rhs), input, next_token_id());
+        assert_eq!(got, expected, "{op:?}({input}, {rhs})");
+    }
+}
+
+fn imm_base_encoded(code: &[u8], addr: i64) -> bool {
+    let bytes = (addr as u64).to_le_bytes();
+    if code.windows(8).any(|window| window == bytes) {
+        return true;
+    }
+    if (-2147483648..=2147483647).contains(&addr)
+        && code.windows(4).any(|window| window == &bytes[..4])
+    {
+        return true;
+    }
+    // `_addr_as_reg_offset` reuses r11: an earlier imm64 plus a disp32.
+    code.windows(8).any(|window| {
+        let base = i64::from_le_bytes(window.try_into().unwrap());
+        let delta = addr.wrapping_sub(base);
+        (-2147483648..=2147483647).contains(&delta)
+            && code
+                .windows(4)
+                .any(|disp| disp == (delta as i32).to_le_bytes())
+    })
+}
+
+/// `addr_add_const` of an immediate base: flag clear falls through, flag
+/// set pushes that immediate and calls the helper.
+#[test]
+fn write_barrier_immediate_base_checks_the_flag_byte() {
+    for clear_flag in [true, false] {
+        let mut gc = MiniMarkGC::new();
+        let tid = gc.register_type(majit_gc::TypeInfo::object(16));
+        let old = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, tid, 16);
+        unsafe {
+            let hdr = &mut *header_of(old.0);
+            hdr.set_flag(GcFlags::GCFLAG_NO_HEAP_PTRS);
+            if clear_flag {
+                hdr.clear_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+            } else {
+                assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+            }
+        }
+        let mut backend = wb_backend(gc);
+        let addr = old.0 as i64;
+        let ops = vec![
+            op_at(
+                OpCode::CondCallGcWb,
+                &[OpRef::const_int(addr)],
+                OpRef::void_op(1),
+            ),
+            finish(2),
+        ];
+        let token = JitCellToken::new(next_token_id());
+        let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+        backend
+            .compile_loop(&[], &ops, &token)
+            .unwrap_or_else(|err| panic!("compile immediate write barrier: {err:?}"));
+        let byteofs = majit_gc::WriteBarrierDescr::for_current_gc().jit_wb_if_flag_byteofs;
+        let flag_addr = addr.wrapping_add(i64::from(byteofs));
+        assert!(
+            imm_base_encoded(compiled_bytes(&token), flag_addr),
+            "TEST8 must encode the immediate flag address {flag_addr:#x}"
+        );
+        let frame = backend.execute_token(&token, &[]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let hdr = unsafe { &*header_of(old.0) };
+        assert!(!hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert_eq!(
+            hdr.has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS),
+            clear_flag,
+            "helper runs only when the flag byte is set (clear_flag={clear_flag})"
+        );
+    }
+}
+
+/// `genop_finish` stores a ref and a float, and the rip-relative descr
+/// word still classifies the exit.
+#[test]
+fn finish_returns_ref_and_float() {
+    let mut gc = MiniMarkGC::new();
+    let tid = gc.register_type(majit_gc::TypeInfo::object(16));
+    let obj = gc.alloc_with_type(tid, 16);
+    let mut backend = wb_backend(gc);
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let ops = vec![OpRc::new(finish_of(inputargs[0].opref(), Type::Ref, 1))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile FINISH ref: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Ref(obj)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_ref_value(&frame, 0), obj);
+
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+    let ops = vec![OpRc::new(finish_of(inputargs[0].opref(), Type::Float, 1))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile FINISH float: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Float(-2.25)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_float_value(&frame, 0), -2.25);
+}
+
+/// `closing_jump` to another loop's relocated token runs that loop.
+/// A target that was never compiled stays below `MIN_RELOCATED_JUMP_TARGET`
+/// and `check_unrelocated_jump_target` fails the compile.
+#[test]
+fn jump_to_another_loop_target_token() {
+    let mut backend = fresh_backend();
+    let unresolved = make_loop_target_descr(next_token_id(), false);
+    let jump = Op::new(OpCode::Jump, &[]);
+    jump.pos().set(OpRef::void_op(1));
+    jump.setdescr(unresolved);
+    let token = JitCellToken::new(next_token_id());
+    let err = backend
+        .compile_loop(&[], &[OpRc::new(jump)], &token)
+        .expect_err("unrelocated JUMP must fail to compile");
+    assert!(
+        err.to_string()
+            .contains("is not a relocated executable address"),
+        "{err}"
+    );
+
+    let descr = make_loop_target_descr(next_token_id(), false);
+    let target = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let label = Op::new(OpCode::Label, &[rb(i0)]);
+    label.pos().set(OpRef::void_op(1));
+    label.setdescr(descr.clone());
+    let ops = vec![OpRc::new(label), OpRc::new(finish_of(i0, Type::Int, 2))];
+    backend
+        .compile_loop(&inputargs, &ops, &target)
+        .unwrap_or_else(|err| panic!("compile jump target: {err:?}"));
+
+    let source = JitCellToken::new(next_token_id());
+    let jump = Op::new(OpCode::Jump, &[rb(i0)]);
+    jump.pos().set(OpRef::void_op(1));
+    jump.setdescr(descr);
+    backend
+        .compile_loop(&inputargs, &[OpRc::new(jump)], &source)
+        .unwrap_or_else(|err| panic!("compile JUMP: {err:?}"));
+    let frame = backend.execute_token(&source, &[Value::Int(42)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 42);
+    // Keep the target buffer mapped across the jump.
+    drop(target);
 }

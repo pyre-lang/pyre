@@ -6764,14 +6764,29 @@ impl<'a> RegAlloc<'a> {
         // `gcmap = self._regalloc.get_gcmap([res_loc])` — exclude the result
         // register; on the miss path it is overwritten with the helper word.
         let gcmap = self.get_gcmap(&[res_reg], false) as usize;
-        self.perform_with_gcmap_ptr(i, [argloc, resloc], Some(resloc), gcmap, output);
+        // `cond_call` reads `rm.reg_bindings` / `xrm.reg_bindings` here,
+        // after `force_result_in_reg` and before `possibly_free_vars_for_op`.
+        // The walk frees those bindings before emit, so the
+        // `floats * 2 + callee_only` index travels as a trailing immediate.
+        // aarch64 has one slow path and does not read it.
+        #[cfg(target_arch = "x86_64")]
+        let locs = {
+            let mut locs = vec![argloc, resloc];
+            locs.push(Loc::immed(self.cond_call_slowpath_variant()));
+            locs
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let locs = [argloc, resloc];
+        self.perform_with_gcmap_ptr(i, locs, Some(resloc), gcmap, output);
     }
 
     /// `aarch64/opassembler.py _emit_op_cond_call`:
     /// `gcmap = self._regalloc.get_gcmap([res_loc])`. CondCallN has no
-    /// result. The assembler spills every register into the jitframe on
-    /// the taken path and publishes this map so `force_now` allocations
-    /// forward those slots.
+    /// result. aarch64 spills every register into the jitframe on the
+    /// taken path and publishes this map so `force_now` allocations
+    /// forward those slots. x86 `cond_call` instead calls
+    /// `cond_call_slowpath[floats * 2 + callee_only]`; that index is the
+    /// trailing immediate, captured while the bindings are still live.
     fn consider_cond_call_n(&mut self, args: &[OpRef], i: usize, output: &mut Vec<RegAllocOp>) {
         let mut locs = Vec::new();
         for &arg in args {
@@ -6779,7 +6794,26 @@ impl<'a> RegAlloc<'a> {
             locs.push(self.loc(arg, tp));
         }
         let gcmap = self.get_gcmap(&[], false) as usize;
+        #[cfg(target_arch = "x86_64")]
+        locs.push(Loc::immed(self.cond_call_slowpath_variant()));
         self.perform_with_gcmap_ptr(i, locs, None, gcmap, output);
+    }
+
+    /// `cond_call`: `variant_num = floats * 2 + callee_only`.
+    /// The for/else over `rm.reg_bindings` sets `callee_only` when every
+    /// bound core register is in `save_around_call_regs` (no bindings
+    /// takes that arm). `floats` is `len(xrm.reg_bindings) != 0`.
+    #[cfg(target_arch = "x86_64")]
+    fn cond_call_slowpath_variant(&self) -> i64 {
+        let mut callee_only = true;
+        for (_, reg) in self.rm.reg_bindings_iter() {
+            if !self.rm.save_around_call_regs.contains(&reg) {
+                callee_only = false;
+                break;
+            }
+        }
+        let floats = self.xrm.reg_bindings_len() > 0;
+        (usize::from(floats) * 2 + usize::from(callee_only)) as i64
     }
 
     /// Generic discard with N args

@@ -884,6 +884,15 @@ pub fn test8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     writeimm8(mc, immed);
 }
 
+/// `TEST8_ji` — `test byte [abs32], imm8`. `encode_abs`: modrm `0x04`, sib `0x25`, disp32.
+pub fn test8_ji(mc: &mut Assembler, abs_addr: i32, immed: i32) {
+    DynasmApi::push(mc, 0xF6);
+    DynasmApi::push(mc, 0x04);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
+    writeimm8(mc, immed);
+}
+
 /// `TEST8_ai` — `test byte [base + index*scale + ofs], imm8`.
 pub(crate) fn test8_ai(mc: &mut Assembler, addr: (i16, u8, u8, i32), immed: i32) {
     encode_rex_opt(mc, rex_mem_reg_plus_scaled_reg_plus_const(addr));
@@ -900,12 +909,42 @@ pub fn or8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     writeimm8(mc, immed);
 }
 
+/// `OR8_ji` — `or byte [abs32], imm8`. `encode_abs` with `/1`.
+pub fn or8_ji(mc: &mut Assembler, abs_addr: i32, immed: i32) {
+    DynasmApi::push(mc, 0x80);
+    DynasmApi::push(mc, 0x0C);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
+    writeimm8(mc, immed);
+}
+
 /// `BTS_mr` — `bts qword [base + ofs], r64`.
 ///
 /// `rx86.py`: `BTS_mr = insn(rex_w, '\x0F\xAB', register(2,8), mem_reg_plus_const(1))`.
 /// WriteBarrierSlowPath uses this with a signed bit offset in the register.
 pub fn bts_mr(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::W, 0, &[0x0F, 0xAB], src, mem.0, mem.1);
+}
+
+/// `BTS_jr` — `bts qword [abs32], r64`. `encode_abs`.
+pub fn bts_jr(mc: &mut Assembler, abs_addr: i32, src: u8) {
+    emit_prefix_rex(mc, 0, RexKind::W, rex_register(src, 8));
+    push_bytes(mc, &[0x0F, 0xAB]);
+    let orbyte = reg_number_3bits(src) << 3;
+    DynasmApi::push(mc, 0x04 | orbyte);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
+}
+
+/// `SET_ir` — `setcc r8`. `rex_fw` forces a REX so `rsi`/`rdi`/`rbp`/`rsp`
+/// address `sil`/`dil`/`bpl`/`spl`. `hw_cond` is the hardware condition
+/// (`0x90 + hw_cond` is the opcode).
+pub(crate) fn set_ir(mc: &mut Assembler, hw_cond: u8, byte_reg: u8) {
+    let reg = byte_reg & !BYTE_REG_FLAG;
+    emit_prefix_rex(mc, 0, RexKind::Fw, rex_byte_register(byte_reg, 1));
+    DynasmApi::push(mc, 0x0F);
+    DynasmApi::push(mc, 0x90 | hw_cond);
+    DynasmApi::push(mc, 0xC0 | reg_number_3bits(reg));
 }
 
 /// `IMUL_rb` — `imul r64, [rbp + ofs]`.
@@ -930,6 +969,25 @@ pub(crate) fn push_b(mc: &mut Assembler, offset: i32) {
 pub(crate) fn pop_b(mc: &mut Assembler, offset: i32) {
     DynasmApi::push(mc, 0x8F);
     encode_stack_bp(mc, offset, false, 0);
+}
+
+/// `PUS1_r` — `push r64`. `rex_nw`: REX.B for `r8`–`r15`, no REX.W.
+/// The opcode low bits carry the register (`0x50 + reg`).
+pub(crate) fn push_r(mc: &mut Assembler, reg: u8) {
+    encode_rex_opt(mc, rex_register(reg, 1));
+    DynasmApi::push(mc, 0x50 | reg_number_3bits(reg));
+}
+
+/// `PUS1_i8` — `push imm8` (`0x6A`).
+pub(crate) fn push_i8(mc: &mut Assembler, imm: i8) {
+    DynasmApi::push(mc, 0x6A);
+    DynasmApi::push(mc, imm as u8);
+}
+
+/// `PUS1_i32` — `push imm32` (`0x68`).
+pub(crate) fn push_i32(mc: &mut Assembler, imm: i32) {
+    DynasmApi::push(mc, 0x68);
+    writeimm32(mc, imm);
 }
 
 // SSE
@@ -1007,6 +1065,11 @@ pub fn movss_ax(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
 /// `MOVUPS_mx` — `movups [base + ofs], xmm`.
 pub fn movups_mx(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0, &[0x0F, 0x11], src, mem.0, mem.1);
+}
+
+/// `MOVUPS_ax` — `movups [base + index*scale + ofs], xmm`.
+pub fn movups_ax(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
+    op_addr(mc, RexKind::Nw, 0, &[0x0F, 0x11], src, addr);
 }
 
 /// `MOVQ_mx` — `movq [base + ofs], xmm`.
@@ -1698,5 +1761,42 @@ mod tests {
             ; bts QWORD [r13 - 8], r11
         );
         assert_same(&got, &finish(d));
+    }
+
+    #[test]
+    fn test8_ji_or8_ji_and_bts_jr_encode_abs() {
+        // `encode_abs` on x86-64: modrm `0x04|orbyte`, sib `0x25`, disp32.
+        let addr = 0x1234_5678_i32;
+        assert_eq!(
+            enc(|mc| test8_ji(mc, addr, 0x63)),
+            [0xF6, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12, 0x63]
+        );
+        assert_eq!(
+            enc(|mc| or8_ji(mc, addr, 0x01)),
+            [0x80, 0x0C, 0x25, 0x78, 0x56, 0x34, 0x12, 0x01]
+        );
+        // r11 is register field 3 with REX.W|REX.R.
+        assert_eq!(
+            enc(|mc| bts_jr(mc, addr, R11)),
+            [0x4C, 0x0F, 0xAB, 0x1C, 0x25, 0x78, 0x56, 0x34, 0x12]
+        );
+    }
+
+    #[test]
+    fn set_ir_forces_rex_for_the_low_byte() {
+        // `SET_ir`: `rex_fw`, `0x0F`, `0x90+cond`, ModRM `0xC0|reg`.
+        // sete al, setl sil, setg r8b.
+        assert_eq!(
+            enc(|mc| set_ir(mc, 4, EAX | BYTE_REG_FLAG)),
+            [0x40, 0x0F, 0x94, 0xC0]
+        );
+        assert_eq!(
+            enc(|mc| set_ir(mc, 12, ESI | BYTE_REG_FLAG)),
+            [0x40, 0x0F, 0x9C, 0xC6]
+        );
+        assert_eq!(
+            enc(|mc| set_ir(mc, 15, R8 | BYTE_REG_FLAG)),
+            [0x41, 0x0F, 0x9F, 0xC0]
+        );
     }
 }

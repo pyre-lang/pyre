@@ -3365,6 +3365,10 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_headerless = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_headerless(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_varsize = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_varsize(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
         // `setup_once`: `propagate_exception_path`, `_frame_realloc_slowpath`,
@@ -3384,6 +3388,9 @@ impl Backend for DynasmBackend {
         // `setup_once` builds `cond_call_slowpath` after `wb_slowpath`.
         #[cfg(target_arch = "x86_64")]
         let cond_call_slowpath = self.arch_cpu_ext.ensure_cond_call_slowpath();
+        // `setup_once` builds `failure_recovery_code` before the slow paths.
+        #[cfg(target_arch = "x86_64")]
+        let failure_recovery_code = self.arch_cpu_ext.ensure_failure_recovery();
         let mut asm = Asm::new(
             Arc::clone(&self.asm_memory_manager),
             trace_id,
@@ -3400,6 +3407,8 @@ impl Backend for DynasmBackend {
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_varsize,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
@@ -3410,6 +3419,8 @@ impl Backend for DynasmBackend {
             stack_check_slowpath,
             #[cfg(target_arch = "x86_64")]
             cond_call_slowpath,
+            #[cfg(target_arch = "x86_64")]
+            failure_recovery_code,
             inputargs,
             &prepared_ops,
         );
@@ -3661,6 +3672,10 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_headerless = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_headerless(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_varsize = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_varsize(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
         // Same once-per-CPU helpers as `compile_loop`.
@@ -3677,6 +3692,9 @@ impl Backend for DynasmBackend {
         // Same once-per-CPU `cond_call_slowpath` as `compile_loop`.
         #[cfg(target_arch = "x86_64")]
         let cond_call_slowpath = self.arch_cpu_ext.ensure_cond_call_slowpath();
+        // Same once-per-CPU `failure_recovery_code` as `compile_loop`.
+        #[cfg(target_arch = "x86_64")]
+        let failure_recovery_code = self.arch_cpu_ext.ensure_failure_recovery();
         let mut asm = Asm::new(
             Arc::clone(&self.asm_memory_manager),
             trace_id,
@@ -3693,6 +3711,8 @@ impl Backend for DynasmBackend {
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_varsize,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
@@ -3703,6 +3723,8 @@ impl Backend for DynasmBackend {
             stack_check_slowpath,
             #[cfg(target_arch = "x86_64")]
             cond_call_slowpath,
+            #[cfg(target_arch = "x86_64")]
+            failure_recovery_code,
             &inputargs,
             &prepared_ops,
         );
