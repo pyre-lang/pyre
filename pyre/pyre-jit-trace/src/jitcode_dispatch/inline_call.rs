@@ -17191,6 +17191,12 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             .profiler()
             .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
     }
+    // `bhimpl_inline_call_*` writes the callee's result into the op's
+    // `>r` / `>i` / `>f` register and goes on at the next op, so that is the
+    // coordinate `convert_and_run_from_pyjitpl` continues this frame from
+    // when the callee forces the virtualizable (`vable_after_residual_call`).
+    let blackhole_result =
+        call_opcode_result_dst(code, pc).map(|(bank, dst, next_pc)| (next_pc, bank, dst));
     let resid = super::residual_call::try_execute_residual_call_via_executor(
         ctx,
         call_opcode,
@@ -17198,7 +17204,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
         call_descr,
         recorded,
         pc,
-        None,
+        blackhole_result,
         false,
     )?;
     let resid_raised = match resid {
