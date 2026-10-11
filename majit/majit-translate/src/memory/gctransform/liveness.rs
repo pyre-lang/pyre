@@ -2566,20 +2566,32 @@ pub fn scan(
                 }
             }
         }
-        // Locals a block reassigns before its terminator runs: the pin still
-        // holds the word the local used to carry, which is not the one the
-        // call is about to use.
-        let mut stmt_kills: Vec<HashSet<u64>> = vec![HashSet::new(); n];
+        // Statement-order pin transfer. An alias assign is only a copy:
+        // `dest = src` clears `dest` and writes `src`'s bits, so `a = a`
+        // keeps the pin. A non-alias assign kills the destination. The
+        // call destination is killed after these statements, because
+        // `BaseFrameworkGCTransformer.gct_direct_call` reads livevars at
+        // the collecting op (`push_roots`), after the block's statements
+        // and before the call overwrites its destination.
+        enum RawPinXfer {
+            Kill(u64),
+            Copy { src: u64, dest: u64 },
+        }
+        let mut stmt_xfers: Vec<Vec<RawPinXfer>> = (0..n).map(|_| Vec::new()).collect();
         for (b, blk) in body.body.iter().enumerate() {
             for st in &blk.statements {
                 match st.stmt_kind() {
-                    Ok(StmtKind::Assign(place, _)) => {
+                    Ok(StmtKind::Assign(place, rvalue)) => {
                         if let Some(d) = bare_local(&place) {
-                            stmt_kills[b].insert(d);
+                            if let Some(PinSrc::Alias(src)) = pin_src(&rvalue) {
+                                stmt_xfers[b].push(RawPinXfer::Copy { src, dest: d });
+                            } else {
+                                stmt_xfers[b].push(RawPinXfer::Kill(d));
+                            }
                         }
                     }
                     Ok(StmtKind::StorageLive(i)) | Ok(StmtKind::StorageDead(i)) => {
-                        stmt_kills[b].insert(i);
+                        stmt_xfers[b].push(RawPinXfer::Kill(i));
                     }
                     _ => {}
                 }
@@ -2640,22 +2652,33 @@ pub fn scan(
             })
             .collect();
         // What each block does to the set, resolved once so the rounds below
-        // are word operations: the pairs it clears by local, the owners it
-        // retires, and the pairs its terminator adds.  Clears commute, so the
-        // call destination joins the statement kills rather than taking a
-        // pass of its own.
+        // are word operations. Statement transfers stay in order. The call
+        // destination is killed after them: a copy into that local must not
+        // restore a pin the call is about to overwrite.
+        enum PinXfer {
+            Kill(usize),
+            Copy { src: usize, dest: usize },
+        }
         struct BlockEdit {
-            kill_locals: Vec<usize>,
+            stmts: Vec<PinXfer>,
+            call_dest_kill: Option<usize>,
             retire_scopes: Vec<usize>,
             retire_all: bool,
             add_bits: Vec<usize>,
         }
         let edits: Vec<BlockEdit> = (0..n)
             .map(|b| {
-                let mut kill_locals: Vec<usize> = stmt_kills[b]
+                let stmts: Vec<PinXfer> = stmt_xfers[b]
                     .iter()
-                    .filter_map(|l| local_at.get(l).copied())
+                    .filter_map(|xfer| match *xfer {
+                        RawPinXfer::Kill(local) => local_at.get(&local).copied().map(PinXfer::Kill),
+                        RawPinXfer::Copy { src, dest } => Some(PinXfer::Copy {
+                            src: *local_at.get(&src)?,
+                            dest: *local_at.get(&dest)?,
+                        }),
+                    })
                     .collect();
+                let mut call_dest_kill = None;
                 let mut retire_scopes: Vec<usize> = Vec::new();
                 let mut retire_all = false;
                 if term_closes_root_scope[b] {
@@ -2681,7 +2704,7 @@ pub fn scan(
                     && let Some(d) = bare_local(&call.dest)
                     && let Some(&di) = local_at.get(&d)
                 {
-                    kill_locals.push(di);
+                    call_dest_kill = Some(di);
                 }
                 let add_bits = match owner_at[b].and_then(|o| scope_at.get(&o).copied()) {
                     Some(si) => term_pins[b]
@@ -2691,13 +2714,44 @@ pub fn scan(
                     None => Vec::new(),
                 };
                 BlockEdit {
-                    kill_locals,
+                    stmts,
+                    call_dest_kill,
                     retire_scopes,
                     retire_all,
                     add_bits,
                 }
             })
             .collect();
+        // `PinXfer` is local to this analysis, so the transfer lives in
+        // closures rather than free functions. A copy saves the source bits
+        // before clearing the destination, which is what keeps `a = a`.
+        let clear_local_pins = |bits: &mut [u64], li: usize| {
+            for si in 0..nscopes {
+                let i = li * nscopes + si;
+                bits[i / 64] &= !(1u64 << (i % 64));
+            }
+        };
+        let apply_pin_statements = |bits: &mut [u64], stmts: &[PinXfer]| {
+            for xfer in stmts {
+                match *xfer {
+                    PinXfer::Kill(li) => clear_local_pins(bits, li),
+                    PinXfer::Copy { src, dest } => {
+                        let mut saved = vec![false; nscopes];
+                        for si in 0..nscopes {
+                            let i = src * nscopes + si;
+                            saved[si] = bits[i / 64] >> (i % 64) & 1 == 1;
+                        }
+                        clear_local_pins(bits, dest);
+                        for si in 0..nscopes {
+                            if saved[si] {
+                                let i = dest * nscopes + si;
+                                bits[i / 64] |= 1u64 << (i % 64);
+                            }
+                        }
+                    }
+                }
+            }
+        };
         // Block-indexed buffers, allocated once rather than per round.
         let mut pinned_in = vec![0u64; n * words];
         for b in 0..n {
@@ -2722,11 +2776,9 @@ pub fn scan(
                 outs[at..at + words].copy_from_slice(&pinned_in[at..at + words]);
                 let e = &edits[b];
                 let o = &mut outs[at..at + words];
-                for &li in &e.kill_locals {
-                    for si in 0..nscopes {
-                        let i = li * nscopes + si;
-                        o[i / 64] &= !(1u64 << (i % 64));
-                    }
+                apply_pin_statements(o, &e.stmts);
+                if let Some(li) = e.call_dest_kill {
+                    clear_local_pins(o, li);
                 }
                 if e.retire_all {
                     o.fill(0);
@@ -2968,13 +3020,18 @@ pub fn scan(
                 // Drop the owner here: coverage asks only whether the local
                 // is pinned by *some* live guard.
                 let blk = &pinned_in[b * words..(b + 1) * words];
+                // Pins at the call, after this block's statements and the
+                // call-destination kill. Not the block-exit set: that also
+                // retires scopes and adds the terminator's own pins.
+                let mut at_call = blk.to_vec();
+                apply_pin_statements(&mut at_call, &edits[b].stmts);
+                if let Some(li) = edits[b].call_dest_kill {
+                    clear_local_pins(&mut at_call, li);
+                }
                 let held: HashSet<u64> = locals
                     .iter()
                     .enumerate()
-                    .filter(|(li, l)| {
-                        !stmt_kills[b].contains(l)
-                            && (0..nscopes).any(|si| bit_get(blk, li * nscopes + si))
-                    })
+                    .filter(|(li, _)| (0..nscopes).any(|si| bit_get(&at_call, li * nscopes + si)))
                     .map(|(_, l)| *l)
                     .collect();
                 let mut missing: Vec<String> = after

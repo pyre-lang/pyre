@@ -164,6 +164,24 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                 );
                 continue;
             }
+            // `#[specialize_argtype(N)]` emits
+            // `_annspecialcase_argtype_<fn> = "specialize:argtype(N)"`.
+            // The const value is the whole hint (`specialize.py`
+            // `specialize_argtype`); do not prefix it again.
+            if leaf.starts_with("_annspecialcase_argtype_") {
+                let hint = global_marker_str(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "specialize:argtype marker `{path}` has an undecodable \
+                         string initializer; this signals a marker encoding/decoder drift"
+                    )
+                });
+                push_hint(
+                    &mut out,
+                    marker_path_to_fn_path(&path, "_annspecialcase_argtype_", &function_paths),
+                    &hint,
+                );
+                continue;
+            }
             for (prefix, hints) in CONST_PREFIX_HINTS {
                 if leaf.starts_with(prefix) {
                     // `elidable_promote` renames the decorated body to

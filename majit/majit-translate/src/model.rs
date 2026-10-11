@@ -8981,6 +8981,79 @@ impl FunctionGraph {
         true
     }
 
+    /// Fallible twin of [`Self::ensure_variable_at_block`].
+    ///
+    /// Returns false when no predecessor chain reaches a real definition,
+    /// including a cycle that only mentions itself. A block already on the
+    /// stack is a back edge, not a definition: the commit pushes the
+    /// inputarg before recursing, matching `ensure_variable_at_block`.
+    pub fn try_ensure_variable_at_block(
+        &mut self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+    ) -> bool {
+        let mut saw_def = false;
+        if !self.can_thread_variable(block, var, &mut HashSet::new(), &mut saw_def) || !saw_def {
+            return false;
+        }
+        self.ensure_variable_at_block(block, var)
+    }
+
+    /// Carry `var` into every block whose `FieldRead` names it before that
+    /// block defines it. Runs after the CFG is closed: threading during
+    /// lowering adds an inputarg that a later edge does not know about.
+    pub fn thread_undefined_field_bases(&mut self) {
+        let mut needed = Vec::new();
+        for block in &self.blocks {
+            for op in &block.operations {
+                if let OpKind::FieldRead { base, .. } = &op.kind
+                    && !self.variable_defined_in_block(block.id, base)
+                {
+                    needed.push((block.id, base.clone()));
+                }
+            }
+        }
+        for (block, base) in needed {
+            if !self.variable_defined_in_block(block, &base) {
+                let _ = self.try_ensure_variable_at_block(block, &base);
+            }
+        }
+    }
+
+    fn can_thread_variable(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        visiting: &mut HashSet<usize>,
+        saw_def: &mut bool,
+    ) -> bool {
+        if self.variable_defined_in_block(block, var) {
+            *saw_def = true;
+            return true;
+        }
+        // A block already on the stack will receive `var` as an inputarg
+        // if this walk commits (`ensure_variable_at_block` pushes before
+        // recursing). That back edge is not itself a definition.
+        if !visiting.insert(block.0) {
+            return true;
+        }
+        let preds: Vec<BlockId> = self
+            .blocks
+            .iter()
+            .filter(|b| b.exits.iter().any(|exit| exit.target == block))
+            .map(|b| b.id)
+            .collect();
+        if preds.is_empty() {
+            visiting.remove(&block.0);
+            return false;
+        }
+        let ok = preds
+            .iter()
+            .all(|pred| self.can_thread_variable(*pred, var, visiting, saw_def));
+        visiting.remove(&block.0);
+        ok
+    }
+
     /// `true` iff `var` is defined inside `block` — either as a
     /// `Block.inputargs` entry or as the result of one of its
     /// `operations`.  `flowspace/model.py:checkgraph` —

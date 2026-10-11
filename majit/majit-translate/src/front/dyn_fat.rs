@@ -494,14 +494,23 @@ fn ensure_meta_inner(
         field: fat.field.clone(),
         pure: fat.pure,
     });
-    if let Some(fat) = fat {
-        return Some(emit_fat_len(graph, env, &fat));
+    // The metadata word is an operand of the block that reads it
+    // (`flowspace/model.py` `checkgraph`, `lookup_operand`). A fat
+    // field or copy that lives in another block has to be carried in;
+    // returning the producer's variable leaves a Signed base with no
+    // definition here.
+    if let Some(fat) = fat
+        && fat.block == block
+    {
+        return emit_fat_len(graph, env, &fat);
     }
     let copy = env
         .copies
         .get(&var.id())
         .map(|copy| (copy.block, copy.operand.clone()));
-    if let Some((copy_block, operand)) = copy {
+    if let Some((copy_block, operand)) = copy
+        && copy_block == block
+    {
         return ensure_meta(graph, env, copy_block, &operand);
     }
     let inputarg_len = graph.blocks.get(block.0)?.inputargs.len();
@@ -585,9 +594,17 @@ fn ensure_meta_inner(
     Some(phi)
 }
 
-fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) -> Variable {
+fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) -> Option<Variable> {
     if let Some(existing) = env.fat_len.get(&fat.var_id) {
-        return existing.clone();
+        return Some(existing.clone());
+    }
+    // `fat.base` is the container the field was read from. After a splice
+    // that container can be defined only in a predecessor. Thread it
+    // (`ensure_variable_at_block`) before emitting the length word. A base
+    // with no reaching definition stays the operand it already was: the
+    // length word is still this field's metadata.
+    if !graph.variable_defined_in_block(fat.block, &fat.base) {
+        let _ = graph.try_ensure_variable_at_block(fat.block, &fat.base);
     }
     let meta = graph.alloc_value_var_with_type(ConcreteType::Signed);
     let field = fat.field.clone().with_vec_part(VecFieldPart::FatLen);
@@ -632,7 +649,7 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
         None => block.operations.push(op),
     }
     env.fat_len.insert(fat.var_id, meta.clone());
-    meta
+    Some(meta)
 }
 
 #[cfg(test)]
@@ -828,6 +845,14 @@ mod tests {
             std::slice::from_ref(&LinkArg::Value(meta.clone()))
         );
         assert!(graph.variable_defined_in_block(later, &meta));
+        assert_eq!(graph.blocks[entry.0].exits[0].args.len(), 2);
+        let entry_meta = graph.blocks[entry.0].exits[0].args[1]
+            .as_variable()
+            .expect("entry metadata");
+        assert_eq!(
+            FunctionGraph::concretetype_of(entry_meta),
+            ConcreteType::Signed
+        );
     }
 
     #[test]
@@ -915,6 +940,48 @@ mod tests {
                 .and_then(LinkArg::as_variable),
             Some(&meta)
         );
+    }
+
+    #[test]
+    fn metadata_of_a_fat_field_is_an_inputarg_of_a_later_use() {
+        let mut graph = FunctionGraph::new("later_fat");
+        let base = graph.alloc_value_var();
+        let data = graph.alloc_value_var();
+        let entry = graph.startblock;
+        let later = graph.create_block();
+        let field = FieldDescriptor::new("imp", Some("DictStrategyRef".into()));
+        graph.blocks[entry.0].operations.push(SpaceOperation {
+            result: Some(data.clone()),
+            kind: OpKind::FieldRead {
+                base: base.clone(),
+                field: field.clone(),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        graph.set_goto(entry, later, vec![]);
+        let mut env = empty_env(
+            data.id(),
+            Some(FatField {
+                block: entry,
+                var_id: data.id(),
+                base,
+                field,
+                pure: false,
+            }),
+        );
+        let meta = ensure_meta(&mut graph, &mut env, later, &data).expect("later metadata");
+        assert_eq!(FunctionGraph::concretetype_of(&meta), ConcreteType::Signed);
+        assert_eq!(graph.blocks[later.0].inputargs.as_slice(), &[meta.clone()]);
+        assert_eq!(graph.blocks[entry.0].exits[0].args.len(), 1);
+        let entry_meta = graph.blocks[entry.0].exits[0].args[0]
+            .as_variable()
+            .expect("entry metadata");
+        assert_eq!(
+            FunctionGraph::concretetype_of(entry_meta),
+            ConcreteType::Signed
+        );
+        assert_eq!(entry_meta, &meta);
     }
 
     #[test]

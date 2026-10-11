@@ -6377,7 +6377,13 @@ impl<'a> Transformer<'a> {
         // `PyObject` pointer; a `New` that has not stamped the typeptr
         // then reads `[null+8]` for `w_class`. A one-word FLAG_STRUCT is
         // a transparent newtype and stays an ordinary load.
-        if !field.taken_by_address
+        //
+        // `vec_part` already names one header word (`fielddescrof` adds
+        // `vec_layout`'s offset). `signature.py` `num_argnames` reads
+        // that word of an inline `Vec`; replacing it with the parent
+        // pointer would make `len(argnames)` the container itself.
+        if field.vec_part.is_none()
+            && !field.taken_by_address
             && let Some((offset, size)) = self
                 .callcontrol
                 .as_deref()

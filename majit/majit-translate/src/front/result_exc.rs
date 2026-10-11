@@ -44,9 +44,11 @@
 //! - **Returned-shell rule** ([`unwrap_returned_scalar_result_shells`]):
 //!   the same callee can `return` an `Option<Result<T, PyError>>::Some`
 //!   payload it did not construct.  That aggregate is `Ref`, so
-//!   `graph_result_kind` would report `r` against the scalar
-//!   `FUNC.RESULT`.  `Ok` forwards `T`; `Err` raises.  A return that is
-//!   already `T`, or a `Ref` this pass cannot prove is that shell, stays.
+//!   `graph_result_kind` would report `r` against a scalar
+//!   `FUNC.RESULT`, and a `PyObject` payload would meet the `Result`
+//!   shell at `returnblock`.  `Ok` forwards `T`; `Err` raises.  A return
+//!   that is already `T`, or a `Ref` this pass cannot prove is that
+//!   shell, stays.
 //!
 //! - **Caller rule** ([`rewire_result_exc_call_sites`]): a `?` on a
 //!   call to a scoped callee lowers in MIR as a
@@ -895,15 +897,17 @@ fn has_tail_forwarded_call_result(graph: &FunctionGraph) -> bool {
     false
 }
 
-/// A scoped `Result<scalar, PyError>` callee can return a shell it did not
+/// A scoped `Result<T, PyError>` callee can return a shell it did not
 /// build. `return Ok(v)` / `return Err(e)` are rewritten by
 /// [`lower_result_exc_returns`]; `return v` where `v` is the `Some` payload
 /// of `Option<Result<T, PyError>>` (`space.index_w`'s `as_index_value`
-/// fast path) never constructs a ctor in this graph, so the returnblock
-/// keeps the `Result` aggregate. Every aggregate is `Ref`, and
-/// `graph_result_kind` then reports `r` against the `i64` `FUNC.RESULT`
-/// stamp (`dont_look_inside_return_token` projects `Result<i64, PyError>`
-/// through `i64`).
+/// fast path, `baseobjspace.getdict`'s `local_getdict`) never constructs a
+/// ctor in this graph, so the returnblock keeps the `Result` aggregate.
+/// Every aggregate is `Ref`. For a scalar `T`, `graph_result_kind` then
+/// reports `r` against the `i64` `FUNC.RESULT` stamp
+/// (`dont_look_inside_return_token` projects `Result<i64, PyError>`
+/// through `i64`). For `PyObject`, the shell meets the unwrapped `Ok`
+/// payload at `returnblock`.
 ///
 /// `exceptiontransform.py` `transform_completely` never returns that shell:
 /// the normal edge carries `T` and the error edge raises. Split each such
@@ -915,8 +919,7 @@ fn has_tail_forwarded_call_result(graph: &FunctionGraph) -> bool {
 /// that is not this `Result`. A copy, a cast, or a block argument is the
 /// same value, so the class is the fixed point of those forwards. A cycle
 /// adds no class of its own: a loop of shells stays a shell, and a mix
-/// with the scalar payload is left, because that payload has no
-/// discriminant.
+/// with the payload is left, because that payload has no discriminant.
 pub(crate) fn unwrap_returned_scalar_result_shells(
     graph: &mut FunctionGraph,
     result_owner: &str,
@@ -925,7 +928,7 @@ pub(crate) fn unwrap_returned_scalar_result_shells(
     ok_ty: &ValueType,
     err_ty: &ValueType,
 ) -> Result<(), String> {
-    if scalar_result_kind(ok_ty).is_none() {
+    if scalar_result_kind(ok_ty).is_none() && !matches!(ok_ty, ValueType::Ref(_)) {
         return Ok(());
     }
     // `from_residual` only raises. When its result joins `Option::Some`
@@ -12899,6 +12902,58 @@ mod unwrap_returned_scalar_shell_tests {
                 .exits
                 .iter()
                 .all(|link| link.target != graph.exceptblock)
+        }));
+    }
+
+    #[test]
+    fn a_ref_payload_some_shell_forwards_the_object_and_raises() {
+        // `getdict`'s `return w_dict` is `Option<Result<PyObjectRef, PyError>>::Some`.
+        // `transform_completely` carries the object and raises the carrier.
+        let mut graph = FunctionGraph::new("ret_ref_shell");
+        let base = graph.alloc_value_var();
+        let shell = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("Option<Result<PyObjectRef,PyError>>::Some".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("some payload");
+        graph.set_return(graph.startblock, Some(shell));
+        unwrap_returned_scalar_result_shells(
+            &mut graph,
+            "core::result::Result<PyObjectRef,PyError>",
+            "core::result::Result<PyObjectRef,PyError>::Ok",
+            "core::result::Result<PyObjectRef,PyError>::Err",
+            &ValueType::Ref(None),
+            &ValueType::Ref(None),
+        )
+        .expect("unwrap");
+        let returns = return_vars(&graph);
+        assert_eq!(returns.len(), 1);
+        match producer(&graph, &returns[0]) {
+            Some(OpKind::FieldRead { field, ty, .. }) => {
+                assert_eq!(field.name, "__pos_0");
+                assert_eq!(
+                    field.owner_root.as_deref(),
+                    Some("core::result::Result<PyObjectRef,PyError>::Ok")
+                );
+                assert_eq!(ty, &ValueType::Ref(None));
+            }
+            other => panic!("ok return producer {other:?}"),
+        }
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock)
         }));
     }
 

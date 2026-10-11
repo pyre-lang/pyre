@@ -5825,6 +5825,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             tombstoned_leaves,
             gc_struct_ids,
         );
+        // Field reads emitted while blocks were still being closed name a
+        // base defined only in a predecessor. Thread once every edge exists.
+        // Doing so earlier leaves a later edge short one link arg
+        // (`simplify.py` `len(link.args) == len(link.target.inputargs)`).
+        lo.graph.thread_undefined_field_bases();
         // `flowcontext.py` `fixeggblocks`, once the body is a finished graph.
         lo.graph.fixeggblocks();
         Ok(())

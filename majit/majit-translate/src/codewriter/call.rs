@@ -1810,11 +1810,17 @@ impl StoreCore {
     }
 
     /// The formal parameter [`Signature`] of the funcobj `path` names —
-    /// the `FunctionDesc` signature upstream takes from `code.signature`.
+    /// the `FunctionDesc` signature upstream takes from `code.signature`,
+    /// without building the body. A graph already built keeps the
+    /// signature taken at that build. An unbuilt funcobj reads the
+    /// declared header (`pygraph.py` `PyGraph.__init__`).
     pub(crate) fn signature(&self, path: &CallPath) -> Option<Signature> {
         let slot = self.slot_for(path)?;
-        let signature = self.slot_graph(&slot)?.signature.clone();
-        Some(signature)
+        if let Some(built) = slot.graph.get() {
+            return built.as_ref().map(|built| built.signature.clone());
+        }
+        let header = self.slot_declaration(&slot)?;
+        Some(Self::signature_from_graph(&header))
     }
 
     /// Whether `path` names a registered funcobj, built or not. Never
@@ -12132,6 +12138,16 @@ mod tests {
         );
     }
 
+    /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
+    /// The unknown-name fallback would bank it as a word-sized Ref.
+    #[test]
+    fn get_type_flag_char_is_unsigned_int_of_four_bytes() {
+        let (flag, ty, size) = get_type_flag("char");
+        assert_eq!(flag, majit_ir::descr::ArrayFlag::Unsigned);
+        assert_eq!(ty, majit_ir::value::Type::Int);
+        assert_eq!(size, 4);
+    }
+
     /// An earlier alias's hint set is unioned with a later one, not replaced.
     #[test]
     fn graph_store_unions_hints_across_alias_inserts() {
@@ -17234,6 +17250,40 @@ mod tests {
             &graph,
             &cc.function_graphs.get(&first).expect("registered graph")
         ));
+        assert_eq!(builds.get(), 1);
+    }
+
+    /// `code.signature` is on the code object. Reading it must not build
+    /// the function body.
+    #[test]
+    fn signature_of_an_unbuilt_funcobj_reads_the_header() {
+        let builds = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = builds.clone();
+        let mut header = FunctionGraph::new("helper");
+        header
+            .block_mut(header.startblock)
+            .inputargs
+            .push(crate::flowspace::model::Variable::new());
+        let funcobj = crate::model::LazyGraph::deferred(header, move || {
+            counter.set(counter.get() + 1);
+            Some(FunctionGraph::new("built"))
+        });
+        let path = CallPath::from_segments(["helper"]);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(
+            path.clone(),
+            GraphSource::Lazy {
+                graph: funcobj,
+                transform: GraphTransform::default(),
+            },
+        );
+        let signature = cc
+            .function_graphs
+            .signature(&path)
+            .expect("header signature");
+        assert_eq!(signature.argnames, ["arg0"]);
+        assert_eq!(builds.get(), 0, "signature must not build the body");
+        assert!(cc.function_graphs.get(&path).is_some());
         assert_eq!(builds.get(), 1);
     }
 

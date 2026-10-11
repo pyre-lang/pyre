@@ -982,6 +982,48 @@ fn rebucket_args(
     }
 }
 
+/// `goto_if_not_int_*` reads the int bank (`blackhole.py`
+/// `bhhandler_goto_if_not_ii`). A fused operand whose cell is `GcRef`
+/// is `cast_ptr_to_int` (`rbuiltin.py rtype_cast_ptr_to_int`) and the
+/// guard reads that int.
+pub(crate) fn reint_fused_int_ref_operands(graph: &mut FunctionGraph) {
+    for block_index in 0..graph.blocks.len() {
+        let Some(crate::model::ExitSwitch::Fused { opname, args }) =
+            graph.blocks[block_index].exitswitch.clone()
+        else {
+            continue;
+        };
+        if !opname.starts_with("int_") {
+            continue;
+        }
+        let mut new_args = args;
+        let mut changed = false;
+        for arg in &mut new_args {
+            if FunctionGraph::concretetype_of(arg) != ConcreteType::GcRef {
+                continue;
+            }
+            let casted = graph.alloc_value_var();
+            FunctionGraph::set_concretetype_of_inline(&casted, ConcreteType::Signed);
+            graph.blocks[block_index].operations.push(SpaceOperation {
+                result: Some(casted.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "cast_ptr_to_int".into(),
+                    operand: arg.clone(),
+                    result_ty: ValueType::Int,
+                },
+            });
+            *arg = casted;
+            changed = true;
+        }
+        if changed {
+            graph.blocks[block_index].exitswitch = Some(crate::model::ExitSwitch::Fused {
+                opname,
+                args: new_args,
+            });
+        }
+    }
+}
+
 fn stamp_gc_ref_base(base: &crate::flowspace::model::Variable, graph_name: &str) {
     match FunctionGraph::concretetype_of(base) {
         ConcreteType::GcRef => {}
@@ -1045,6 +1087,50 @@ mod tests {
             .unwrap();
         graph.push_inputarg_var(graph.startblock, var.clone());
         var
+    }
+
+    #[test]
+    fn reint_fused_int_lt_casts_a_ref_operand() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        let mut graph = FunctionGraph::new("fused_ir_lt");
+        let lhs = push_input(&mut graph, "p", ValueType::Ref(None));
+        let rhs = push_input(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::Signed);
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        graph.set_return(if_false, None);
+        graph.set_return(if_true, None);
+        graph.block_mut(graph.startblock).exitswitch = Some(ExitSwitch::Fused {
+            opname: "int_lt".into(),
+            args: vec![lhs.clone(), rhs.clone()],
+        });
+        graph.block_mut(graph.startblock).exits = vec![
+            Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+            Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
+        ];
+
+        reint_fused_int_ref_operands(&mut graph);
+
+        let ExitSwitch::Fused { opname, args } =
+            graph.block(graph.startblock).exitswitch.clone().unwrap()
+        else {
+            panic!("fused guard");
+        };
+        assert_eq!(opname, "int_lt");
+        assert_eq!(args[1], rhs);
+        assert_ne!(args[0], lhs);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&args[0]),
+            ConcreteType::Signed
+        );
+        assert!(graph.block(graph.startblock).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_ptr_to_int" && *operand == lhs
+            )
+        }));
     }
 
     #[test]

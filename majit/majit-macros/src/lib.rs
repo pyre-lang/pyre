@@ -3491,6 +3491,50 @@ impl Parse for ElidablePromoteArgs {
     }
 }
 
+/// `specialize:argtype(N)` (`annotator/specialize.py` `specialize_argtype`).
+///
+/// The index is stored as `_annspecialcase_argtype_<fn>: &'static str =
+/// "specialize:argtype(N)"`. `harvest_hints_from_llbcs` reads that const
+/// the same way it reads an `oopspec_` string.
+///
+/// Usage: `#[specialize_argtype(0)]`
+#[proc_macro_attribute]
+pub fn specialize_argtype(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let index: syn::LitInt = parse_macro_input!(attr as syn::LitInt);
+    let func = parse_macro_input!(item as ItemFn);
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+    let hint = format!("specialize:argtype({})", index.base10_digits());
+    let body_name = format_ident!("_annspecialcase_argtype_{}", sig.ident);
+    // A free function can carry the const beside the item. An inherent
+    // method cannot: a trait impl rejects a foreign associated item.
+    // Charon promotes the body-local const under `<method>::<const>`, and
+    // `marker_path_to_fn_path` binds that parent when it is the function.
+    let module_const = if sig.receiver().is_none() {
+        let const_name = body_name.clone();
+        Some(quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #const_name: &'static str = #hint;
+        })
+    } else {
+        None
+    };
+    let expanded = quote! {
+        #(#attrs)*
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals, dead_code)]
+            const #body_name: &'static str = #hint;
+            #block
+        }
+        #module_const
+    };
+    expanded.into()
+}
+
 /// The JIT compiler won't look inside this decorated function,
 /// but instead during translation, rewrites it according to the handler in
 /// the codewriter/jtransform.

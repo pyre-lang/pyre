@@ -26,9 +26,9 @@
 /// When `tid == 0` or no GC hook is installed (unit tests and pre-init), this
 /// falls back to [`crate::lltype::malloc_raw`]. In that case the caller's
 /// existing manual-free path remains responsible for the allocation.
-// One extracted body would meet every `T` (`RDict` and a `Tuple` payload
-// share this graph). The call stays residual; each caller keeps its own
-// payload class.
+// `specialize:argtype(0)` (`specialize.py` `specialize_argtype`) gives each
+// payload shape its own residual graph. The call stays residual.
+#[majit_macros::specialize_argtype(0)]
 #[majit_macros::dont_look_inside]
 #[inline(never)]
 pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
