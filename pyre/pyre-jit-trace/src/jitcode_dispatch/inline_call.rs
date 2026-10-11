@@ -5988,138 +5988,21 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         builtin_inline_decline!(decline, fnaddr);
         return Ok(None);
     }
-    let nested_helper = ctx.fbw_mode.inline_subwalk;
-    // A translated helper is transparent to blackhole execution, but its
-    // Python caller is not, so a nested inline preserves that caller at the
-    // helper's CALL entry.
-    //
-    // The root portal frame does NOT get the same treatment.  Pushing an entry
-    // frame there makes `parent_frames` non-empty, which is exactly the
-    // precondition `walker_capture_transparent_helper_snapshot` needs, so
-    // root-level helper guards start emitting a two-section snapshot whose
-    // innermost section is the helper JitCode with the no-Python-coordinate
-    // `py_pc`.  pyre's resume chain is Python-level: `build_resumed_frames`
-    // (`pyre-jit/src/eval.rs`) turns each section into a `ResumedFrame` and has
-    // nothing that executes a JitCode section, so the helper section decodes to
-    // a null `code`, borrows the caller's `vable_ni`, and — by making
-    // `resumed_frames.len() > 1` — reroutes the guard onto the multi-frame
-    // resume, where `resumed_catch_level` bails at the null `code` and the
-    // Python-level values come back wrong (`synth/gc_deque_backing_list`
-    // reported `grow_each_round 987334` against `2966`, and `test.test_pickle`
-    // lost its memo/`struct` round trip).  Keep the root level on the
-    // caller-boundary resume until the resume side can carry a non-Python
-    // section.
-    //
-    // Inside another canonical helper body there is no Python caller to
-    // preserve at this CALL: the enclosing helper already published its own
-    // caller's resume point, and this call inherits it
-    // (`specialize::HelperEntry::EnclosingHelper`).
-    let nested_helper_entry = if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
-        match compute_inline_helper_call_entry_frame(ctx, op.pc) {
-            Ok(frame) => Some(frame),
-            Err(_) => {
-                builtin_inline_decline!("no entry frame for the nested helper call", fnaddr);
-                return Ok(None);
-            }
-        }
-    } else {
-        None
-    };
-    // Guards inside the generated wrapper must resume at the outer Python
-    // CALL, because helper JitCodes have no blackhole entry point of their
-    // own.  The full-body symbol is the authority for that caller frame's
-    // liveness and resume coordinate (the same setup used by the orthodox
-    // w_list_append descent below).  Resolve it before recording any guards
-    // or synthetic allocations so a missing coordinate is a clean decline.
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        builtin_inline_decline!("walk carries no snapshot symbol", fnaddr);
+    let Some(site) = capture_builtin_wrapper_call_site(
+        ctx,
+        op,
+        callable,
+        callable_operand,
+        fnaddr,
+        "builtin_call",
+        "builtin_wrapper_call_site",
+    ) else {
         return Ok(None);
-    }
-    // SAFETY: snapshot_sym is installed for the lifetime of the enclosing
-    // full-body walk and is read-only here.
-    let sym = unsafe { &*sym_ptr };
-    if sym.jitcode().is_null() {
-        builtin_inline_decline!("snapshot symbol names no jitcode", fnaddr);
-        return Ok(None);
-    }
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
-        (
-            ctx.entry_py_pc(),
-            0,
-            ctx.outer_jitcode_index,
-            ctx.outer_resume_marker_jit_pc,
-        )
-    } else {
-        unsafe {
-            let jc = &*sym.jitcode();
-            let jc_index = jc.index as u32;
-            let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-            // Forward py twin first (#73 phase-3): equals the
-            // containing coordinate plus trivia normalization by
-            // construction; the containing lookup survives for the
-            // empty-twin class, and the trivia skip below is an identity
-            // on the twin path.
-            let mut py = jc
-                .payload
-                .forward_py_pc_for_jitcode_pc(op.pc)
-                .unwrap_or_else(|| {
-                    crate::py_coord::note_empty_twin_fallback(
-                        "builtin_call",
-                        jc.index,
-                        op.pc as i32,
-                    );
-                    crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
-                });
-            if jc.payload.code_ptr.is_null() {
-                (py, sym.valuestackdepth() as i64, jc_index, marker)
-            } else {
-                let codeobj = &*jc.payload.code_ptr;
-                py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                let depth = if jc.payload.depth_trivia_populated() {
-                    jc.payload.depth_trivia_for_jitcode_pc(op.pc)
-                } else {
-                    crate::liveness::liveness_for(jc.payload.code_ptr)
-                        .depth_at_py_pc()
-                        .get(py as usize)
-                        .copied()
-                };
-                let vsd = depth
-                    .map(|d| (sym.nlocals() + d as usize) as i64)
-                    .unwrap_or(sym.valuestackdepth() as i64);
-                (py, vsd, jc_index, marker)
-            }
-        }
     };
     // Rewind point for the un-lowered-helper decline below.  Nothing above
     // this line records IR or touches the heap cache, so cutting back to it
     // leaves the caller's trace exactly as the ordinary residual call found it.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let call_site_active = if nested_helper_entry.is_some() {
-        ctx.frame_state.borrow().outer_active_boxes.clone()
-    } else {
-        let call_site_word = call_site_marker
-            .map(|marker| marker as i32)
-            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
-        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
-        collect_outer_active_boxes(
-            sym,
-            ctx.trace_ctx,
-            ctx.registers_i,
-            ctx.registers_r,
-            ctx.registers_f,
-            outer_jitcode_index,
-            false,
-            call_site_word,
-            op.pc as i32,
-            OuterActiveBoxesEntryTwin::Plain,
-            "builtin_wrapper_call_site",
-            vstack,
-            &[],
-            None,
-        )
-    };
 
     let mut callable_guard_op = r_args[0];
     let mut receiver_op = method_form.then_some(r_args[1]);
@@ -6264,7 +6147,270 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         wrapper_items.extend_from_slice(&r_args[2..]);
         wrapper_item_concretes.extend_from_slice(&arg_concretes[2..]);
     }
-    for (&item, concrete) in wrapper_items.iter().zip(&wrapper_item_concretes) {
+    walk_translated_builtin_wrapper(
+        ctx,
+        op,
+        code,
+        jitcode.as_ref(),
+        &body,
+        &wrapper_items,
+        &wrapper_item_concretes,
+        dst,
+        callable,
+        pre_fold_pos,
+        site,
+        type_call_init.map(|tp_init| BuiltinWrapperTypeCallInit {
+            tp_init,
+            r_args,
+            arg_concretes: &arg_concretes,
+            exception_type_call,
+        }),
+    )
+}
+
+/// Resume site for a translated builtin-wrapper sub-walk.
+///
+/// CALL captures this before its callable/type/bound-method guards so a
+/// missing coordinate is a clean decline; LOAD_ATTR captures it after the
+/// type pin.  The walk itself is [`walk_translated_builtin_wrapper`].
+struct BuiltinWrapperCallSite {
+    nested_helper: bool,
+    nested_helper_entry: Option<InlineParentFrame>,
+    call_site_py_pc: u32,
+    vsd_value: i64,
+    outer_jitcode_index: u32,
+    call_site_marker: Option<usize>,
+    call_site_active: Vec<OpRef>,
+    owns_virtualizable_shadow: bool,
+}
+
+/// `typeobject.py descr_call`'s `__init__` half, walked after `__new__`.
+struct BuiltinWrapperTypeCallInit<'a> {
+    tp_init: pyre_object::PyObjectRef,
+    r_args: &'a [OpRef],
+    arg_concretes: &'a [ConcreteValue],
+    exception_type_call: bool,
+}
+
+/// Entry frame, snapshot symbol, and outer CALL-site boxes for a wrapper
+/// descent.  Nothing here records IR.
+fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    callable: pyre_object::PyObjectRef,
+    callable_operand: pyre_object::PyObjectRef,
+    fnaddr: usize,
+    twin_tag: &'static str,
+    active_tag: &'static str,
+) -> Option<BuiltinWrapperCallSite> {
+    let nested_helper = ctx.fbw_mode.inline_subwalk;
+    // A translated helper is transparent to blackhole execution, but its
+    // Python caller is not, so a nested inline preserves that caller at the
+    // helper's CALL entry.
+    //
+    // The root portal frame does NOT get the same treatment.  Pushing an entry
+    // frame there makes `parent_frames` non-empty, which is exactly the
+    // precondition `walker_capture_transparent_helper_snapshot` needs, so
+    // root-level helper guards start emitting a two-section snapshot whose
+    // innermost section is the helper JitCode with the no-Python-coordinate
+    // `py_pc`.  pyre's resume chain is Python-level: `build_resumed_frames`
+    // (`pyre-jit/src/eval.rs`) turns each section into a `ResumedFrame` and has
+    // nothing that executes a JitCode section, so the helper section decodes to
+    // a null `code`, borrows the caller's `vable_ni`, and — by making
+    // `resumed_frames.len() > 1` — reroutes the guard onto the multi-frame
+    // resume, where `resumed_catch_level` bails at the null `code` and the
+    // Python-level values come back wrong (`synth/gc_deque_backing_list`
+    // reported `grow_each_round 987334` against `2966`, and `test.test_pickle`
+    // lost its memo/`struct` round trip).  Keep the root level on the
+    // caller-boundary resume until the resume side can carry a non-Python
+    // section.
+    //
+    // Inside another canonical helper body there is no Python caller to
+    // preserve at this CALL: the enclosing helper already published its own
+    // caller's resume point, and this call inherits it
+    // (`specialize::HelperEntry::EnclosingHelper`).
+    let nested_helper_entry = if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
+        match compute_inline_helper_call_entry_frame(ctx, op.pc) {
+            Ok(frame) => Some(frame),
+            Err(_) => {
+                if fbw_inline_diag_enabled() {
+                    let name = if unsafe { pyre_interpreter::is_function(callable) } {
+                        unsafe { pyre_interpreter::function_get_name(callable) }
+                    } else {
+                        ""
+                    };
+                    eprintln!(
+                        "[builtin-inline-decline] pc={} why=no entry frame for the nested helper call callable={} operand={} fnaddr={:#x} name={}",
+                        op.pc,
+                        unsafe { pyre_object::type_name_of(callable) },
+                        unsafe { pyre_object::type_name_of(callable_operand) },
+                        fnaddr,
+                        name,
+                    );
+                }
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    // Guards inside the generated wrapper must resume at the outer Python
+    // CALL, because helper JitCodes have no blackhole entry point of their
+    // own.  The full-body symbol is the authority for that caller frame's
+    // liveness and resume coordinate (the same setup used by the orthodox
+    // w_list_append descent below).  Resolve it before recording any guards
+    // or synthetic allocations so a missing coordinate is a clean decline.
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        if fbw_inline_diag_enabled() {
+            let name = if unsafe { pyre_interpreter::is_function(callable) } {
+                unsafe { pyre_interpreter::function_get_name(callable) }
+            } else {
+                ""
+            };
+            eprintln!(
+                "[builtin-inline-decline] pc={} why=walk carries no snapshot symbol callable={} operand={} fnaddr={:#x} name={}",
+                op.pc,
+                unsafe { pyre_object::type_name_of(callable) },
+                unsafe { pyre_object::type_name_of(callable_operand) },
+                fnaddr,
+                name,
+            );
+        }
+        return None;
+    }
+    // SAFETY: snapshot_sym is installed for the lifetime of the enclosing
+    // full-body walk and is read-only here.
+    let sym = unsafe { &*sym_ptr };
+    if sym.jitcode().is_null() {
+        if fbw_inline_diag_enabled() {
+            let name = if unsafe { pyre_interpreter::is_function(callable) } {
+                unsafe { pyre_interpreter::function_get_name(callable) }
+            } else {
+                ""
+            };
+            eprintln!(
+                "[builtin-inline-decline] pc={} why=snapshot symbol names no jitcode callable={} operand={} fnaddr={:#x} name={}",
+                op.pc,
+                unsafe { pyre_object::type_name_of(callable) },
+                unsafe { pyre_object::type_name_of(callable_operand) },
+                fnaddr,
+                name,
+            );
+        }
+        return None;
+    }
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
+        (
+            ctx.entry_py_pc(),
+            0,
+            ctx.outer_jitcode_index,
+            ctx.outer_resume_marker_jit_pc,
+        )
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode();
+            let jc_index = jc.index as u32;
+            let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+            // Forward py twin first (#73 phase-3): equals the
+            // containing coordinate plus trivia normalization by
+            // construction; the containing lookup survives for the
+            // empty-twin class, and the trivia skip below is an identity
+            // on the twin path.
+            let mut py = jc
+                .payload
+                .forward_py_pc_for_jitcode_pc(op.pc)
+                .unwrap_or_else(|| {
+                    crate::py_coord::note_empty_twin_fallback(twin_tag, jc.index, op.pc as i32);
+                    crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
+                });
+            if jc.payload.code_ptr.is_null() {
+                (py, sym.valuestackdepth() as i64, jc_index, marker)
+            } else {
+                let codeobj = &*jc.payload.code_ptr;
+                py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                let depth = if jc.payload.depth_trivia_populated() {
+                    jc.payload.depth_trivia_for_jitcode_pc(op.pc)
+                } else {
+                    crate::liveness::liveness_for(jc.payload.code_ptr)
+                        .depth_at_py_pc()
+                        .get(py as usize)
+                        .copied()
+                };
+                let vsd = depth
+                    .map(|d| (sym.nlocals() + d as usize) as i64)
+                    .unwrap_or(sym.valuestackdepth() as i64);
+                (py, vsd, jc_index, marker)
+            }
+        }
+    };
+    let call_site_active = if nested_helper_entry.is_some() {
+        ctx.frame_state.borrow().outer_active_boxes.clone()
+    } else {
+        let call_site_word = call_site_marker
+            .map(|marker| marker as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
+        collect_outer_active_boxes(
+            sym,
+            ctx.trace_ctx,
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            outer_jitcode_index,
+            false,
+            call_site_word,
+            op.pc as i32,
+            OuterActiveBoxesEntryTwin::Plain,
+            active_tag,
+            vstack,
+            &[],
+            None,
+        )
+    };
+    Some(BuiltinWrapperCallSite {
+        nested_helper,
+        nested_helper_entry,
+        call_site_py_pc,
+        vsd_value,
+        outer_jitcode_index,
+        call_site_marker,
+        call_site_active,
+        owns_virtualizable_shadow: sym.owns_virtualizable_shadow(),
+    })
+}
+
+/// Stamp wrapper arguments, walk the generated body, restore the caller
+/// frame, and handle SubReturn / SubRaise.  Shared by CALL
+/// (`try_walker_inline_builtin_call`) and LOAD_ATTR
+/// (`try_walker_descend_builtin_getattribute`).
+#[allow(clippy::too_many_arguments)]
+fn walk_translated_builtin_wrapper<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    jitcode: &majit_metainterp::jitcode::JitCode,
+    body: &SubJitCodeBody,
+    wrapper_items: &[OpRef],
+    wrapper_item_concretes: &[ConcreteValue],
+    dst: usize,
+    callable: pyre_object::PyObjectRef,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    site: BuiltinWrapperCallSite,
+    type_call_init: Option<BuiltinWrapperTypeCallInit<'_>>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let BuiltinWrapperCallSite {
+        nested_helper,
+        nested_helper_entry,
+        call_site_py_pc,
+        vsd_value,
+        outer_jitcode_index,
+        call_site_marker,
+        call_site_active,
+        owns_virtualizable_shadow,
+    } = site;
+    for (&item, concrete) in wrapper_items.iter().zip(wrapper_item_concretes) {
         if let ConcreteValue::Ref(value) = concrete
             && !value.is_null()
         {
@@ -6301,7 +6447,7 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
             .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
     }
 
-    let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
+    let saved_vable = if !nested_helper && owns_virtualizable_shadow {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
         let last_instr = call_site_py_pc as i64 - 1;
         let last_instr_op = ctx.trace_ctx.const_int(last_instr);
@@ -6391,7 +6537,7 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
-        &body,
+        body,
         &[],
         &[],
         &[args_array],
@@ -6510,17 +6656,17 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
                         .map(ConcreteValue::Ref)
                         .unwrap_or(other),
                 };
-                if let Some(tp_init) = type_call_init {
+                if let Some(init) = type_call_init {
                     let inlined = try_walker_inline_type_call_builtin_init(
                         ctx,
                         op,
                         code,
-                        r_args,
+                        init.r_args,
                         dst,
-                        tp_init,
+                        init.tp_init,
                         value,
                         concrete,
-                        &arg_concretes,
+                        init.arg_concretes,
                         rewind,
                     )?;
                     // An instance `descr_new_base_exception` allocated in
@@ -6529,7 +6675,7 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
                     // its `w_context` is still null and nothing else holds
                     // it.  One a residual arm returned has escaped and keeps
                     // the `normalize_raise_varargs` residual.
-                    if exception_type_call
+                    if init.exception_type_call
                         && matches!(
                             inlined,
                             Some((DispatchOutcome::Continue, next)) if next == op.next_pc
@@ -12370,6 +12516,109 @@ unsafe fn resolve_attribute_hook(
     (!resolved.0.is_null()).then_some(resolved)
 }
 
+/// Walk a builtin interp2app `__getattribute__` wrapper with `[obj, name]`.
+///
+/// `descroperation.py getattr` traces `get_and_call_function` of the slot
+/// `space.lookup` selected; for `W_LibObject` that slot is
+/// `interp2app(descr_getattribute)`.  pyre's fused `load_attr_fn` residual
+/// otherwise hides the wrapper, so `_get_attr_elidable` never sees the
+/// promoted Lib and name.  The wrapper is the same two-phase
+/// `__majit_wrap_*` subject `try_walker_inline_builtin_call` enters for a
+/// CALL; LOAD_ATTR's residual shape cannot reuse that entry, so the walk
+/// is the same generated body with the two getattr arguments.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_descend_builtin_getattribute<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    callable: pyre_object::PyObjectRef,
+    wrapper_items: &[OpRef],
+    wrapper_item_concretes: &[ConcreteValue],
+    dst: usize,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
+        return Ok(None);
+    }
+    let builtin_code =
+        unsafe { pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef };
+    if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
+        return Ok(None);
+    }
+    let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
+    let Some(jitcode) = crate::state::bytecode_for_address(fnaddr) else {
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[builtin-getattribute-decline] pc={} why=no jitcode for address fnaddr={:#x} name={}",
+                op.pc,
+                fnaddr,
+                unsafe { pyre_interpreter::function_get_name(callable) },
+            );
+        }
+        return Ok(None);
+    };
+    let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
+        return Ok(None);
+    };
+    if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
+        return Ok(None);
+    }
+    if body.num_regs_r < 1 {
+        return Ok(None);
+    }
+    // Same scan CALL uses (`descent_decline`). No name-based bypass.
+    if let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_items.len())]) {
+        if matches!(decline, DescentDecline::Helper(_)) {
+            log_descent_unlowered_helper_blockers(jitcode.index());
+        }
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[builtin-getattribute-decline] pc={} why={} fnaddr={:#x} name={}",
+                op.pc,
+                decline,
+                fnaddr,
+                unsafe { pyre_interpreter::function_get_name(callable) },
+            );
+        }
+        return Ok(None);
+    }
+
+    if fbw_inline_diag_enabled() {
+        eprintln!(
+            "[builtin-getattribute] pc={} jitcode={} name={}",
+            op.pc,
+            jitcode.index(),
+            unsafe { pyre_interpreter::function_get_name(callable) },
+        );
+    }
+
+    let Some(site) = capture_builtin_wrapper_call_site(
+        ctx,
+        op,
+        callable,
+        callable,
+        fnaddr,
+        "builtin_getattribute",
+        "builtin_getattribute_call_site",
+    ) else {
+        return Ok(None);
+    };
+    walk_translated_builtin_wrapper(
+        ctx,
+        op,
+        code,
+        jitcode.as_ref(),
+        &body,
+        wrapper_items,
+        wrapper_item_concretes,
+        dst,
+        callable,
+        pre_fold_pos,
+        site,
+        None,
+    )
+}
+
 /// Inline a custom Python `__getattribute__` selected by LOAD_ATTR / the
 /// attribute half of LOAD_METHOD.
 ///
@@ -12422,10 +12671,19 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     } else {
         None
     };
+    let own_hook = if instance_hook.is_none() && type_hook.is_none() {
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::own_getattribute_fast_path(concrete_obj)
+        }
+    } else {
+        None
+    };
     let (w_type, version_tag, receiver_map, w_getattribute, attr_cell) =
         if let Some((w_type, version_tag, map, w_getattribute, attr_cell)) = instance_hook {
             (w_type, version_tag, Some(map), w_getattribute, attr_cell)
         } else if let Some((w_type, version_tag, w_getattribute, attr_cell)) = type_hook {
+            (w_type, version_tag, None, w_getattribute, attr_cell)
+        } else if let Some((w_type, version_tag, w_getattribute, attr_cell)) = own_hook {
             (w_type, version_tag, None, w_getattribute, attr_cell)
         } else {
             return Ok(None);
@@ -12435,19 +12693,125 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
-        return Ok(None);
-    };
-    if nparams != usize::from(!matches!(leading, HookLeading::None)) + 1 {
+    let python_callee = unsafe { resolve_inlinable_callee(w_func) };
+    if python_callee.is_none() && !matches!(leading, HookLeading::Receiver) {
         return Ok(None);
     }
-    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return Ok(None);
-    };
-    if body_facts.owns_loop_header {
-        return Ok(None);
+    if let Some((w_code, nparams, has_closure)) = python_callee {
+        if nparams != usize::from(!matches!(leading, HookLeading::None)) + 1 {
+            return Ok(None);
+        }
+        let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+            return Ok(None);
+        };
+        if body_facts.owns_loop_header {
+            return Ok(None);
+        }
+
+        let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+        if let Some(map) = receiver_map {
+            walker_guard_mapdict_instance_shape(
+                ctx,
+                op.pc,
+                obj,
+                concrete_obj,
+                w_type,
+                version_tag,
+                map,
+            )?;
+        } else {
+            // The receiver is the class. `GuardClass` only names the shared
+            // type layout, so pin the metaclass through `w_class`.
+            walker_guard_exception_attr_slot(ctx, op.pc, obj, concrete_obj, w_type, version_tag)?;
+        }
+        // The version-tag pin above does not cover an in-place cell write.  Same
+        // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
+        // on `ExceptionInlineReceiverGuard::attr_cell`.
+        if !attr_cell.is_null() {
+            super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattribute)?;
+        }
+        if let Some(field) = wrapper_field {
+            walker_pin_descriptor_slot(ctx, op.pc, w_getattribute, field.quasi_descr())?;
+        }
+
+        let name_obj =
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
+                as pyre_object::PyObjectRef;
+        let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+        let leading_arg = match leading {
+            HookLeading::Receiver => Some((obj, concrete_obj)),
+            HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
+            HookLeading::None => None,
+        };
+        let mut arg_concretes = vec![ConcreteValue::Ref(w_func), ConcreteValue::Null];
+        let mut callee_args = Vec::with_capacity(2);
+        let mut callee_arg_concretes = Vec::with_capacity(2);
+        if let Some((arg, concrete)) = leading_arg {
+            arg_concretes.push(ConcreteValue::Ref(concrete));
+            callee_args.push(arg);
+            callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+        }
+        arg_concretes.push(ConcreteValue::Ref(name_obj));
+        callee_args.push(name_const);
+        callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
+        let hook_const = ctx.trace_ctx.const_ref(w_func as i64);
+        let inlined = try_walker_inline_resolved_user_call_inner(
+            ctx,
+            op,
+            code,
+            hook_const,
+            r_args,
+            call_descr,
+            'r',
+            dst,
+            w_func,
+            hook_const,
+            w_func,
+            arg_concretes,
+            callee_args,
+            callee_arg_concretes,
+            true,
+            None,
+            w_code,
+            nparams,
+            has_closure,
+            None,
+            None,
+            true,
+            false,
+            None,
+            None,
+            false,
+            None,
+            // pyre's `getattr_str` (`baseobjspace.rs`) enriches the whole
+            // `__getattribute__` / `__getattr__` chain, so the `load_attr_fn`
+            // residual this route replaces filled the pair in here as well.
+            // `StdObjSpace.getattr` (`objspace/std/objspace.py`) returns
+            // through `_handle_getattribute` without enriching, so the interpreter
+            // this trace has to agree with is ahead of upstream on this arm; the
+            // difference is the interpreter's to settle, not the trace's.
+            Some(AttributeErrorInlineContext {
+                obj,
+                obj_concrete: concrete_obj,
+                name: name_const,
+                name_concrete: name_obj,
+            }),
+            None,
+            None,
+            Vec::new(),
+            None,
+        )?;
+        if inlined.is_none() {
+            cut_declined_subwalk(ctx, pre_fold_pos);
+        }
+        return Ok(inlined);
     }
 
+    // Builtin interp2app `__getattribute__` (`W_LibObject.descr_getattribute`).
+    // The Python-callee path above needs a PyCode; this slot is a BuiltinCode
+    // whose generated wrapper is the same two-phase subject CALL already
+    // descends.  Pin the type, then walk `[obj, name]`.  The scan is
+    // `descent_decline` inside that walk, the same one CALL uses.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     if let Some(map) = receiver_map {
         walker_guard_mapdict_instance_shape(
@@ -12460,86 +12824,27 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             map,
         )?;
     } else {
-        // The receiver is the class. `GuardClass` only names the shared
-        // type layout, so pin the metaclass through `w_class`.
         walker_guard_exception_attr_slot(ctx, op.pc, obj, concrete_obj, w_type, version_tag)?;
     }
-    // The version-tag pin above does not cover an in-place cell write.  Same
-    // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
-    // on `ExceptionInlineReceiverGuard::attr_cell`.
     if !attr_cell.is_null() {
         super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattribute)?;
     }
-    if let Some(field) = wrapper_field {
-        walker_pin_descriptor_slot(ctx, op.pc, w_getattribute, field.quasi_descr())?;
-    }
-
     let name_obj =
         pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
             as pyre_object::PyObjectRef;
     let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
-    let leading_arg = match leading {
-        HookLeading::Receiver => Some((obj, concrete_obj)),
-        HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
-        HookLeading::None => None,
-    };
-    let mut arg_concretes = vec![ConcreteValue::Ref(w_func), ConcreteValue::Null];
-    let mut callee_args = Vec::with_capacity(2);
-    let mut callee_arg_concretes = Vec::with_capacity(2);
-    if let Some((arg, concrete)) = leading_arg {
-        arg_concretes.push(ConcreteValue::Ref(concrete));
-        callee_args.push(arg);
-        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
-    }
-    arg_concretes.push(ConcreteValue::Ref(name_obj));
-    callee_args.push(name_const);
-    callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
-    let hook_const = ctx.trace_ctx.const_ref(w_func as i64);
-    let inlined = try_walker_inline_resolved_user_call_inner(
+    let inlined = try_walker_descend_builtin_getattribute(
         ctx,
         op,
         code,
-        hook_const,
-        r_args,
-        call_descr,
-        'r',
+        w_func,
+        &[obj, name_const],
+        &[
+            ConcreteValue::Ref(concrete_obj),
+            ConcreteValue::Ref(name_obj),
+        ],
         dst,
-        w_func,
-        hook_const,
-        w_func,
-        arg_concretes,
-        callee_args,
-        callee_arg_concretes,
-        true,
-        None,
-        w_code,
-        nparams,
-        has_closure,
-        None,
-        None,
-        true,
-        false,
-        None,
-        None,
-        false,
-        None,
-        // pyre's `getattr_str` (`baseobjspace.rs`) enriches the whole
-        // `__getattribute__` / `__getattr__` chain, so the `load_attr_fn`
-        // residual this route replaces filled the pair in here as well.
-        // `StdObjSpace.getattr` (`objspace/std/objspace.py`) returns
-        // through `_handle_getattribute` without enriching, so the interpreter
-        // this trace has to agree with is ahead of upstream on this arm; the
-        // difference is the interpreter's to settle, not the trace's.
-        Some(AttributeErrorInlineContext {
-            obj,
-            obj_concrete: concrete_obj,
-            name: name_const,
-            name_concrete: name_obj,
-        }),
-        None,
-        None,
-        Vec::new(),
-        None,
+        pre_fold_pos,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);

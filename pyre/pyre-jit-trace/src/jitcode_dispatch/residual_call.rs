@@ -3202,7 +3202,7 @@ pub(crate) fn ensure_residual_call_args_bound(
 /// | `is_call_release_gil()` | (early-routed to [`direct_call_release_gil`], records `CALL_RELEASE_GIL_*`) | executed as `CallMayForce*` on the **original** `allboxes` via [`try_execute_residual_call_via_executor`] |
 /// | `check_forces_virtual_or_virtualizable()` | `CallMayForce*` + `GuardNotForced` | executed via [`try_execute_residual_call_via_executor`] (active vable bracketed by the token protocol) |
 /// | `extraeffect == LoopInvariant` | `CallLoopinvariant*` | executed on cache miss; [`loopinvariant_lookup`] reuses the cached OpRef on hit (no execute, no record) |
-/// | `check_is_elidable()` | `CallPure*` | cannot-raise calls use [`try_fold_pure_call_via_executor`]; can-raise calls use [`try_execute_residual_call_via_executor`] so the exception is transcribed |
+/// | `check_is_elidable()` | `CallPure*` | cannot-raise calls use [`try_fold_pure_call_via_executor`]; can-raise calls use [`try_execute_residual_call_via_executor`] so the exception is transcribed, then [`record_result_of_executed_pure_call`] (`record_result_of_call_pure`; skip `GUARD_NO_EXCEPTION` when the result is a `Const`) |
 /// | default | `Call*` + (`GuardNoException` iff can_raise) | executed via [`try_execute_residual_call_via_executor`] |
 ///
 /// All three dispatch entry points — [`dispatch_residual_call_iRd_kind`]
@@ -3211,7 +3211,9 @@ pub(crate) fn ensure_residual_call_args_bound(
 /// (`_opimpl_residual_call3`) — call [`select_residual_call_opcode`],
 /// `record_op_with_descr`, then [`try_fold_pure_call_via_executor`] (the
 /// cannot-raise pure fast path) + [`try_execute_residual_call_via_executor`]
-/// (all other calls, including can-raise pure calls).  The executor
+/// (all other calls, including can-raise pure calls) +
+/// [`record_result_of_executed_pure_call`] (`record_result_of_call_pure` after a
+/// successful can-raise execute).  The executor
 /// self-gates and degrades to recording-only when a precondition fails
 /// (non-authoritative walk, non-const funcbox, unpatched symbolic fnaddr).
 ///
@@ -3314,6 +3316,8 @@ pub(crate) fn select_residual_call_opcode(
 /// [`try_execute_residual_call_via_executor`]
 /// with raised exceptions surfaced through `BH_LAST_EXC_VALUE` so
 /// `eval_loop_jit` can route them into the bytecode exception handler.
+/// A successful can-raise execute then goes through
+/// [`record_result_of_executed_pure_call`] (`pyjitpl.py record_result_of_call_pure`).
 ///
 /// RPython upstream `MIFrame.execute_varargs` invokes
 /// `executor.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
@@ -4285,7 +4289,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // (`pyjitpl.py`).  The cannot-raise half is already executed by
     // `try_fold_pure_call_via_executor`; the can-raise half deliberately
     // reaches this full executor so `BH_LAST_EXC_VALUE` is transcribed into the
-    // walker's exception state instead of being swallowed.
+    // walker's exception state instead of being swallowed.  The dispatcher
+    // then runs `record_result_of_executed_pure_call` (`record_result_of_call_pure`).
     let is_pure = matches!(
         call_opcode,
         OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN

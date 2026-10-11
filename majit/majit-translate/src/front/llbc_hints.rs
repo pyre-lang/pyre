@@ -70,6 +70,22 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
             .collect();
         for gd in llbc.iter_global_decls() {
             let path = gd.item_meta.name_path();
+            // Charon emits a crate-less duplicate Ident for some
+            // body-local markers (`_elidable_function_invert` next to
+            // `rbigint::RBigInt::invert::_elidable_function_invert`).
+            // `call.py` reads `_elidable_function_` off that funcobj; a
+            // single-segment name is not a funcobj path. Harvesting it
+            // as the bare leaf lets `apply_harvested_funcobj_hints`
+            // stamp `DecoratorAttr::Elidable` onto every free function
+            // registered under that leaf (`descroperation::invert` via
+            // `free_function_alias_paths`), so `policy.py
+            // _reject_function` / `look_inside_graph` residualizes it
+            // and `graphs_from` never enters `invert_inner` /
+            // `_int_invert`. Crate-root markers keep the crate Ident
+            // (`majit_rlib::_elidable_function_foo`) and still harvest.
+            if !path.contains("::") {
+                continue;
+            }
             let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
             if let Some(fn_leaf) = leaf.strip_prefix("_jit_look_inside_") {
                 if should_skip_generated_elidable_helper(fn_leaf) {
@@ -686,6 +702,46 @@ mod tests {
                 &functions,
             ),
             "rordereddict::<Impl>::lookup"
+        );
+    }
+
+    #[test]
+    fn module_less_elidable_marker_is_not_harvested_as_bare_leaf() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/majit-rlib.ullbc"
+        );
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load majit-rlib.ullbc");
+        let harvested = super::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+        let invert_keys: Vec<_> = harvested
+            .iter()
+            .filter(|(k, hints)| k.contains("invert") && hints.iter().any(|h| h == "elidable"))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert!(
+            harvested.get("invert").is_none(),
+            "module-less Charon duplicate must not harvest as bare invert: invert_keys={invert_keys:?}"
+        );
+        assert!(
+            harvested.get("neg").is_none(),
+            "module-less Charon duplicate must not harvest as bare neg"
+        );
+        assert!(
+            invert_keys
+                .iter()
+                .any(|k| k.ends_with("invert") && k.contains("rbigint")),
+            "body-local RBigInt::invert marker: invert_keys={invert_keys:?}"
+        );
+        let neg_keys: Vec<_> = harvested
+            .iter()
+            .filter(|(k, hints)| {
+                k.rsplit("::").next() == Some("neg") && hints.iter().any(|h| h == "elidable")
+            })
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert!(
+            neg_keys.iter().any(|k| k.contains("rbigint")),
+            "body-local RBigInt::neg marker: neg_keys={neg_keys:?}"
         );
     }
 
