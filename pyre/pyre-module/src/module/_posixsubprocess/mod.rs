@@ -13,9 +13,8 @@ mod imp {
     use super::*;
     use core::{convert::Infallible, ffi::CStr, marker::PhantomData};
     use pyre_interpreter::PyError;
-    use rustpython_host_env::posix as host_posix;
     use std::ffi::CString;
-    use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
     /// Null-terminated `*const c_char` array, kept alive by the borrowed
     /// `CString`s it points into.  `argv`/`envp` for `exec*`.
@@ -47,6 +46,217 @@ mod imp {
 
     fn io_err(e: std::io::Error) -> PyError {
         PyError::os_error_with_errno(e.raw_os_error().unwrap_or(0), e.to_string())
+    }
+
+    fn last_err() -> std::io::Error {
+        std::io::Error::last_os_error()
+    }
+
+    fn set_inheritable(fd: BorrowedFd<'_>, inheritable: bool) -> std::io::Result<()> {
+        let current = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if current < 0 {
+            return Err(last_err());
+        }
+        let new = if inheritable {
+            current & !libc::FD_CLOEXEC
+        } else {
+            current | libc::FD_CLOEXEC
+        };
+        if new != current && unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, new) } < 0 {
+            return Err(last_err());
+        }
+        Ok(())
+    }
+
+    fn close_raw(fd: i32) -> std::io::Result<()> {
+        if unsafe { libc::close(fd) } < 0 {
+            Err(last_err())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn dup_raw(fd: i32) -> std::io::Result<i32> {
+        let n = unsafe { libc::dup(fd) };
+        if n < 0 { Err(last_err()) } else { Ok(n) }
+    }
+
+    fn dup2_raw(fd: i32, newfd: i32) -> std::io::Result<()> {
+        if unsafe { libc::dup2(fd, newfd) } < 0 {
+            Err(last_err())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn dup_into_stdio(fd: i32, io_fd: i32) -> std::io::Result<()> {
+        if fd < 0 {
+            return Ok(());
+        }
+        if fd == io_fd {
+            set_inheritable(unsafe { BorrowedFd::borrow_raw(fd) }, true)
+        } else {
+            dup2_raw(fd, io_fd)
+        }
+    }
+
+    fn setup_child_fds(
+        fds_to_keep: &[BorrowedFd<'_>],
+        errpipe_write: BorrowedFd<'_>,
+        p2cread: i32,
+        p2cwrite: i32,
+        c2pread: i32,
+        c2pwrite: i32,
+        errread: i32,
+        errwrite: i32,
+        errpipe_read: i32,
+    ) -> std::io::Result<()> {
+        for &fd in fds_to_keep {
+            if fd.as_raw_fd() != errpipe_write.as_raw_fd() {
+                set_inheritable(fd, true)?;
+            }
+        }
+        for fd in [p2cwrite, c2pread, errread] {
+            if fd >= 0 {
+                close_raw(fd)?;
+            }
+        }
+        close_raw(errpipe_read)?;
+        let c2pwrite = if c2pwrite == 0 {
+            let dup = dup_raw(c2pwrite)?;
+            set_inheritable(unsafe { BorrowedFd::borrow_raw(dup) }, true)?;
+            dup
+        } else {
+            c2pwrite
+        };
+        let mut errwrite = errwrite;
+        while errwrite == 0 || errwrite == 1 {
+            let dup = dup_raw(errwrite)?;
+            set_inheritable(unsafe { BorrowedFd::borrow_raw(dup) }, true)?;
+            errwrite = dup;
+        }
+        dup_into_stdio(p2cread, 0)?;
+        dup_into_stdio(c2pwrite, 1)?;
+        dup_into_stdio(errwrite, 2)?;
+        Ok(())
+    }
+
+    fn should_keep(above: i32, keep: &[BorrowedFd<'_>], fd: i32) -> bool {
+        fd > above
+            && keep
+                .binary_search_by_key(&fd, BorrowedFd::as_raw_fd)
+                .is_err()
+    }
+
+    fn close_dir_fds(above: i32, keep: &[BorrowedFd<'_>]) -> std::io::Result<()> {
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+        ))]
+        {
+            #[cfg(any(
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_vendor = "apple",
+            ))]
+            let fd_dir_name = c"/dev/fd";
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let fd_dir_name = c"/proc/self/fd";
+            let dir = unsafe { libc::opendir(fd_dir_name.as_ptr()) };
+            if dir.is_null() {
+                return Err(last_err());
+            }
+            let dirfd = unsafe { libc::dirfd(dir) };
+            loop {
+                majit_rlib::rposix::_set_errno(0);
+                let entry = unsafe { libc::readdir(dir) };
+                if entry.is_null() {
+                    break;
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+                let Some(fd) = name.to_bytes().iter().try_fold(0i32, |n, &c| {
+                    let digit = (c as char).to_digit(10)?;
+                    n.checked_mul(10)?.checked_add(digit as i32)
+                }) else {
+                    continue;
+                };
+                if fd != dirfd && should_keep(above, keep, fd) {
+                    let _ = close_raw(fd);
+                }
+            }
+            let _ = unsafe { libc::closedir(dir) };
+            Ok(())
+        }
+        #[cfg(not(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+        )))]
+        {
+            let _ = (above, keep);
+            Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+        }
+    }
+
+    fn close_fds_brute_force(above: i32, keep: &[BorrowedFd<'_>]) {
+        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let max_fd = if max_fd > 0 { max_fd as i32 } else { 256 };
+        let mut prev = above;
+        for fd in keep
+            .iter()
+            .map(BorrowedFd::as_raw_fd)
+            .chain(core::iter::once(max_fd))
+        {
+            for candidate in prev + 1..fd {
+                let _ = unsafe { libc::close(candidate) };
+            }
+            prev = fd;
+        }
+    }
+
+    fn close_fds(above: i32, keep: &[BorrowedFd<'_>]) {
+        if close_dir_fds(above, keep).is_ok() {
+            return;
+        }
+        close_fds_brute_force(above, keep);
+    }
+
+    fn restore_signals() {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            libc::signal(libc::SIGXFSZ, libc::SIG_DFL);
+        }
+    }
+
+    fn exec_replace(
+        exec_list: &[CString],
+        argv: *const *const libc::c_char,
+        envp: Option<*const *const libc::c_char>,
+    ) -> i32 {
+        let mut first_err = None;
+        for exec in exec_list {
+            if let Some(envp) = envp {
+                unsafe { libc::execve(exec.as_ptr(), argv, envp) };
+            } else {
+                unsafe { libc::execv(exec.as_ptr(), argv) };
+            }
+            let e = last_err().raw_os_error().unwrap_or(0);
+            if e != libc::ENOENT && e != libc::ENOTDIR && first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+        first_err.unwrap_or_else(|| last_err().raw_os_error().unwrap_or(0))
     }
 
     fn is_none_obj(o: PyObjectRef) -> bool {
@@ -238,7 +448,7 @@ mod imp {
         // `interp_subprocess.fork_exec` rejects the sequence before allocating
         // its raw gid_t array.  POSIX permits sysconf to be indeterminate;
         // PyPy's configure-time fallback for that case is 64.
-        let configured_max = host_posix::sysconf(host_posix::_SC_NGROUPS_MAX).unwrap_or(-1);
+        let configured_max = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
         let max_groups = if configured_max < 0 {
             64
         } else {
@@ -321,7 +531,7 @@ mod imp {
 
     fn exec_inner(d: &Decoded<'_>, ctx: &mut ExecErrorContext) -> std::io::Result<Infallible> {
         let errpipe_write = unsafe { BorrowedFd::borrow_raw(d.errpipe_write) };
-        host_posix::setup_child_fds(
+        setup_child_fds(
             d.fds_to_keep,
             errpipe_write.as_fd(),
             d.p2cread,
@@ -334,20 +544,45 @@ mod imp {
         )?;
 
         if let Some(cwd) = d.cwd {
-            host_posix::chdir(cwd.as_c_str()).inspect_err(|_| *ctx = ExecErrorContext::ChDir)?;
+            if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
+                *ctx = ExecErrorContext::ChDir;
+                return Err(last_err());
+            }
         }
 
-        host_posix::set_umask(d.child_umask);
+        if d.child_umask >= 0 {
+            unsafe { libc::umask(d.child_umask as libc::mode_t) };
+        }
 
         if d.restore_signals {
-            host_posix::restore_signals();
+            restore_signals();
         }
 
-        host_posix::setsid_if_needed(d.call_setsid)?;
-        host_posix::setpgid_if_needed(d.pgid_to_set)?;
-        host_posix::setgroups_if_needed(d.extra_groups)?;
-        host_posix::setregid_if_needed(d.gid)?;
-        host_posix::setreuid_if_needed(d.uid)?;
+        if d.call_setsid && unsafe { libc::setsid() } < 0 {
+            return Err(last_err());
+        }
+        if d.pgid_to_set > -1 && unsafe { libc::setpgid(0, d.pgid_to_set) } < 0 {
+            return Err(last_err());
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "redox")))]
+        if let Some(groups) = d.extra_groups {
+            let ret = unsafe {
+                libc::setgroups(groups.len() as _, groups.as_ptr().cast::<libc::gid_t>())
+            };
+            if ret < 0 {
+                return Err(last_err());
+            }
+        }
+        if let Some(gid) = d.gid.filter(|&x| x != u32::MAX)
+            && unsafe { libc::setregid(gid as libc::gid_t, gid as libc::gid_t) } < 0
+        {
+            return Err(last_err());
+        }
+        if let Some(uid) = d.uid.filter(|&x| x != u32::MAX)
+            && unsafe { libc::setreuid(uid as libc::uid_t, uid as libc::uid_t) } < 0
+        {
+            return Err(last_err());
+        }
 
         // Call preexec_fn after all process setup but before closing FDs.
         if let Some(preexec_fn) = d.preexec_fn {
@@ -363,11 +598,11 @@ mod imp {
         *ctx = ExecErrorContext::Exec;
 
         if d.close_fds {
-            host_posix::close_fds(2, d.fds_to_keep);
+            close_fds(2, d.fds_to_keep);
         }
 
-        let err = host_posix::exec_replace(d.exec_list, d.argv, d.envp);
-        Err(std::io::Error::from_raw_os_error(err as i32))
+        let err = exec_replace(d.exec_list, d.argv, d.envp);
+        Err(std::io::Error::from_raw_os_error(err))
     }
 
     fn exec(d: &Decoded<'_>) -> ! {
@@ -384,8 +619,8 @@ mod imp {
                     let errno = e.raw_os_error().unwrap_or(0);
                     format!("OSError:{errno:x}:{}", ctx.as_msg())
                 };
-                let _ = host_posix::write_fd(errpipe.as_fd(), msg.as_bytes());
-                rustpython_host_env::os::exit(255)
+                let _ = unsafe { libc::write(errpipe.as_raw_fd(), msg.as_ptr().cast(), msg.len()) };
+                unsafe { libc::_exit(255) }
             }
         }
     }
@@ -480,9 +715,12 @@ mod imp {
             errpipe_write,
         };
 
-        match host_posix::fork().map_err(io_err)? {
+        // `rposix.c_fork` is `_nowrapper`, so the live errno is the failure.
+        let pid = unsafe { majit_rlib::rposix::c_fork() };
+        match pid {
             0 => exec(&decoded),
-            child => Ok(w_int_new(child as i64)),
+            pid if pid > 0 => Ok(w_int_new(pid as i64)),
+            _ => Err(io_err(last_err())),
         }
     }
 }

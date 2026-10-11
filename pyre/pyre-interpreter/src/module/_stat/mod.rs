@@ -57,21 +57,10 @@ const S_IFMT: Mode = libc_const!(unix, S_IFMT, 0o170000);
 /// constant and its `S_IS*` macro as a literal `0`, which [`is_format`]
 /// reproduces — comparing against `0` instead would answer "yes" for every
 /// mode carrying no type bits.
-#[cfg(feature = "host_env")]
-const S_IFDOOR: Mode = rustpython_host_env::os::S_IFDOOR as Mode;
-#[cfg(not(feature = "host_env"))]
 const S_IFDOOR: Mode = 0;
-#[cfg(feature = "host_env")]
-const S_IFPORT: Mode = rustpython_host_env::os::S_IFPORT as Mode;
-#[cfg(not(feature = "host_env"))]
 const S_IFPORT: Mode = 0;
 
 /// `libc` carries no `S_IFWHT`; the value is the one the Apple headers use.
-/// host_env publishes 0o160000 only on macOS, so other Apple targets keep
-/// the previous header value.
-#[cfg(all(feature = "host_env", target_os = "macos"))]
-const S_IFWHT: Mode = rustpython_host_env::os::S_IFWHT as Mode;
-#[cfg(not(all(feature = "host_env", target_os = "macos")))]
 const S_IFWHT: Mode = if cfg!(target_vendor = "apple") {
     0o160000
 } else {
@@ -106,54 +95,24 @@ const S_IEXEC: Mode = libc_const!(target_vendor = "apple", S_IEXEC, 0o0100);
 // Names for file flags.  These are BSD `chflags` bits, so only the Apple
 // targets have header definitions; everywhere else `_stat.c`'s defaults are
 // all there is.
-#[cfg(feature = "host_env")]
-const UF_SETTABLE: u32 = rustpython_host_env::os::UF_SETTABLE;
-#[cfg(not(feature = "host_env"))]
 const UF_SETTABLE: u32 = libc_const!(target_vendor = "apple", UF_SETTABLE, 0x0000ffff);
-#[cfg(feature = "host_env")]
-use rustpython_host_env::os::{
-    SF_APPEND, SF_ARCHIVED, SF_IMMUTABLE, UF_APPEND, UF_COMPRESSED, UF_HIDDEN, UF_IMMUTABLE,
-    UF_NODUMP, UF_OPAQUE,
-};
-#[cfg(not(feature = "host_env"))]
 const UF_NODUMP: u32 = libc_const!(target_vendor = "apple", UF_NODUMP, 0x00000001);
-#[cfg(not(feature = "host_env"))]
 const UF_IMMUTABLE: u32 = libc_const!(target_vendor = "apple", UF_IMMUTABLE, 0x00000002);
-#[cfg(not(feature = "host_env"))]
 const UF_APPEND: u32 = libc_const!(target_vendor = "apple", UF_APPEND, 0x00000004);
-#[cfg(not(feature = "host_env"))]
 const UF_OPAQUE: u32 = libc_const!(target_vendor = "apple", UF_OPAQUE, 0x00000008);
-#[cfg(not(feature = "host_env"))]
 const UF_COMPRESSED: u32 = libc_const!(target_vendor = "apple", UF_COMPRESSED, 0x00000020);
-#[cfg(feature = "host_env")]
-const UF_TRACKED: u32 = rustpython_host_env::os::UF_TRACKED;
-#[cfg(not(feature = "host_env"))]
 const UF_TRACKED: u32 = libc_const!(target_vendor = "apple", UF_TRACKED, 0x00000040);
-#[cfg(not(feature = "host_env"))]
 const UF_HIDDEN: u32 = libc_const!(target_vendor = "apple", UF_HIDDEN, 0x00008000);
-#[cfg(not(feature = "host_env"))]
 const SF_ARCHIVED: u32 = libc_const!(target_vendor = "apple", SF_ARCHIVED, 0x00010000);
-#[cfg(not(feature = "host_env"))]
 const SF_IMMUTABLE: u32 = libc_const!(target_vendor = "apple", SF_IMMUTABLE, 0x00020000);
-#[cfg(not(feature = "host_env"))]
 const SF_APPEND: u32 = libc_const!(target_vendor = "apple", SF_APPEND, 0x00040000);
 
 // Flags `libc` does not carry for any target pyre builds for.
-#[cfg(feature = "host_env")]
-use rustpython_host_env::os::{
-    SF_DATALESS, SF_FIRMLINK, SF_NOUNLINK, SF_SNAPSHOT, UF_DATAVAULT, UF_NOUNLINK,
-};
-#[cfg(not(feature = "host_env"))]
 const UF_NOUNLINK: u32 = 0x00000010;
-#[cfg(not(feature = "host_env"))]
 const UF_DATAVAULT: u32 = 0x00000080;
-#[cfg(not(feature = "host_env"))]
 const SF_NOUNLINK: u32 = 0x00100000;
-#[cfg(not(feature = "host_env"))]
 const SF_SNAPSHOT: u32 = 0x00200000;
-#[cfg(not(feature = "host_env"))]
 const SF_FIRMLINK: u32 = 0x00800000;
-#[cfg(not(feature = "host_env"))]
 const SF_DATALESS: u32 = 0x40000000;
 
 /// The Apple headers reserve the top two flag bits for the synthetic flags,
@@ -163,25 +122,12 @@ const SF_DATALESS: u32 = 0x40000000;
 /// parameter is a C `long`.  `0xffff0000` does not fit the 32-bit `long` of an
 /// LLP64 target, so Windows publishes these bits as `-65536` while an LP64
 /// target publishes `4294901760`.
-#[cfg(feature = "host_env")]
-const SF_SETTABLE: std::ffi::c_long = rustpython_host_env::os::SF_SETTABLE as std::ffi::c_long;
-#[cfg(not(feature = "host_env"))]
 const SF_SETTABLE: std::ffi::c_long =
     libc_const!(target_vendor = "apple", SF_SETTABLE, 0xffff_0000u32) as std::ffi::c_long;
 
-#[cfg(all(target_os = "macos", feature = "host_env"))]
-const SF_SUPPORTED: u32 = rustpython_host_env::os::SF_SUPPORTED;
-#[cfg(all(
-    target_vendor = "apple",
-    not(all(target_os = "macos", feature = "host_env"))
-))]
+#[cfg(target_vendor = "apple")]
 const SF_SUPPORTED: u32 = 0x009f0000;
-#[cfg(all(target_os = "macos", feature = "host_env"))]
-const SF_SYNTHETIC: u32 = rustpython_host_env::os::SF_SYNTHETIC;
-#[cfg(all(
-    target_vendor = "apple",
-    not(all(target_os = "macos", feature = "host_env"))
-))]
+#[cfg(target_vendor = "apple")]
 const SF_SYNTHETIC: u32 = 0xc0000000;
 
 /// The `st_*` field positions of the 10-tuple form of a stat result.
@@ -483,10 +429,7 @@ pyre_interpreter::py_module! {
         for (position, name) in ST_CONSTANTS.iter().enumerate() {
             crate::__pyre_store!(ns, name, w_int_new(position as i64));
         }
-        #[cfg(any(
-            all(target_os = "macos", feature = "host_env"),
-            all(target_vendor = "apple", not(feature = "host_env"))
-        ))]
+        #[cfg(target_vendor = "apple")]
         {
             crate::__pyre_store!(ns, "SF_SUPPORTED", w_int_new(i64::from(SF_SUPPORTED)));
             crate::__pyre_store!(ns, "SF_SYNTHETIC", w_int_new(i64::from(SF_SYNTHETIC)));

@@ -1450,6 +1450,34 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `_resource_build.py` CFFI `wait3` / `wait4`, reached from
+// `lib_pypy/_pypy_wait.py`. The declarations are the libc forms; errno is
+// saved because a `-1` pid is the failure.
+#[cfg(unix)]
+crate::rffi::external_compilation_info! {
+    const WAIT_ECI = {
+        includes: ["sys/types.h", "sys/time.h", "sys/resource.h", "sys/wait.h"],
+    };
+}
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_wait3 = "wait3",
+    [*mut libc::c_int, crate::rffi::INT, *mut libc::rusage],
+    libc::pid_t,
+    compilation_info = WAIT_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_wait4 = "wait4",
+    [libc::pid_t, *mut libc::c_int, crate::rffi::INT, *mut libc::rusage],
+    libc::pid_t,
+    compilation_info = WAIT_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 // `rposix.c_getlogin` is `releasegil=False` and saves errno.
 #[cfg(unix)]
 crate::rffi::llexternal!(
@@ -2477,6 +2505,45 @@ pub fn sendfile(
     Ok(len)
 }
 
+/// Darwin `sendfile(2)` with an optional `sf_hdtr`. Same EAGAIN/EBUSY
+/// sbytes rescue as [`sendfile`].
+#[cfg(target_os = "macos")]
+pub fn sendfile_hdtr(
+    out_fd: crate::rffi::INT,
+    in_fd: crate::rffi::INT,
+    offset: libc::off_t,
+    count: libc::off_t,
+    headers: Option<&[libc::iovec]>,
+    trailers: Option<&[libc::iovec]>,
+    flags: crate::rffi::INT,
+) -> Result<libc::off_t, i32> {
+    let mut len = count;
+    let mut hdtr = libc::sf_hdtr {
+        headers: headers
+            .map(|h| h.as_ptr() as *mut libc::iovec)
+            .unwrap_or(core::ptr::null_mut()),
+        hdr_cnt: headers.map(|h| h.len() as libc::c_int).unwrap_or(0),
+        trailers: trailers
+            .map(|t| t.as_ptr() as *mut libc::iovec)
+            .unwrap_or(core::ptr::null_mut()),
+        trl_cnt: trailers.map(|t| t.len() as libc::c_int).unwrap_or(0),
+    };
+    let hdtr_ptr = if headers.is_none() && trailers.is_none() {
+        core::ptr::null_mut()
+    } else {
+        (&raw mut hdtr).cast()
+    };
+    let res = unsafe { c_sendfile(in_fd, out_fd, offset, &mut len, hdtr_ptr, flags) };
+    if res != 0 {
+        let errno = get_saved_errno();
+        if matches!(errno, libc::EAGAIN | libc::EBUSY) && len != 0 {
+            return Ok(len);
+        }
+        return Err(errno);
+    }
+    Ok(len)
+}
+
 // `rposix.c_memfd_create` saves errno. `sys/mman.h` declares it.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::external_compilation_info! {
@@ -2492,6 +2559,167 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = MMAN_ECI,
     save_err = RFFI_SAVE_ERRNO
+);
+
+// posix_spawn(3) family. The C functions return errno as the result (0
+// success), so they do not save errno. There is no rpython/pypy
+// `posix_spawn` owner; these declarations sit next to the other
+// process-control externals.
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::external_compilation_info! {
+    const SPAWN_ECI = {
+        includes: ["spawn.h"],
+    };
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawn = "posix_spawn",
+    [
+        *mut libc::pid_t,
+        *const libc::c_char,
+        *const libc::posix_spawn_file_actions_t,
+        *const libc::posix_spawnattr_t,
+        *const *const libc::c_char,
+        *const *const libc::c_char
+    ],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnp = "posix_spawnp",
+    [
+        *mut libc::pid_t,
+        *const libc::c_char,
+        *const libc::posix_spawn_file_actions_t,
+        *const libc::posix_spawnattr_t,
+        *const *const libc::c_char,
+        *const *const libc::c_char
+    ],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnattr_init = "posix_spawnattr_init",
+    [*mut libc::posix_spawnattr_t],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnattr_destroy = "posix_spawnattr_destroy",
+    [*mut libc::posix_spawnattr_t],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnattr_setflags = "posix_spawnattr_setflags",
+    [*mut libc::posix_spawnattr_t, libc::c_short],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnattr_setpgroup = "posix_spawnattr_setpgroup",
+    [*mut libc::posix_spawnattr_t, libc::pid_t],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnattr_setsigmask = "posix_spawnattr_setsigmask",
+    [*mut libc::posix_spawnattr_t, *const libc::sigset_t],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnattr_setsigdefault = "posix_spawnattr_setsigdefault",
+    [*mut libc::posix_spawnattr_t, *const libc::sigset_t],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "freebsd"),
+    not(target_env = "musl")
+))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnattr_setschedpolicy = "posix_spawnattr_setschedpolicy",
+    [*mut libc::posix_spawnattr_t, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "freebsd"),
+    not(target_env = "musl")
+))]
+crate::rffi::llexternal!(
+    pub c_posix_spawnattr_setschedparam = "posix_spawnattr_setschedparam",
+    [*mut libc::posix_spawnattr_t, *const libc::sched_param],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawn_file_actions_init = "posix_spawn_file_actions_init",
+    [*mut libc::posix_spawn_file_actions_t],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawn_file_actions_destroy = "posix_spawn_file_actions_destroy",
+    [*mut libc::posix_spawn_file_actions_t],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawn_file_actions_addopen = "posix_spawn_file_actions_addopen",
+    [
+        *mut libc::posix_spawn_file_actions_t,
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::INT,
+        libc::mode_t
+    ],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawn_file_actions_addclose = "posix_spawn_file_actions_addclose",
+    [*mut libc::posix_spawn_file_actions_t, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
+);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_posix_spawn_file_actions_adddup2 = "posix_spawn_file_actions_adddup2",
+    [
+        *mut libc::posix_spawn_file_actions_t,
+        crate::rffi::INT,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = SPAWN_ECI
 );
 
 // `rposix.py` xattr family under `sys.platform.startswith('linux')`.

@@ -24891,26 +24891,17 @@ fn fileio_close_owned_fd(fd: i32) {
 /// PyPy `_open_inhcache.set_non_inheritable(fd)` / `rposix.set_inheritable`.
 /// A caller-supplied integer descriptor is deliberately excluded: FileIO must
 /// preserve that descriptor's existing inheritance flag.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate::PyError> {
-    use std::os::fd::BorrowedFd;
-
-    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-    rustpython_host_env::posix::set_inheritable(fd, false).map_err(|error| {
-        crate::PyError::os_error_syscall(error.raw_os_error().unwrap_or(0), w_name)
-    })
-}
-
-#[cfg(all(unix, not(feature = "host_env"), not(feature = "sandbox")))]
-fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate::PyError> {
-    let current = crt_call!(libc::fcntl(fd, libc::F_GETFD));
-    if current < 0 {
-        return Err(crate::PyError::os_error_syscall(crt_errno(), w_name));
-    }
-    if current & libc::FD_CLOEXEC == 0
-        && crt_call!(libc::fcntl(fd, libc::F_SETFD, current | libc::FD_CLOEXEC)) < 0
-    {
-        return Err(crate::PyError::os_error_syscall(crt_errno(), w_name));
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn fileio_set_non_inheritable(fd: i32, mut w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    // `rposix._c_set_inheritable` releases the GIL and saves errno.
+    let ret = pyre_object::with_roots!(w_name => unsafe {
+        majit_rlib::rposix::_c_set_inheritable(fd, 0)
+    });
+    if ret < 0 {
+        return Err(crate::PyError::os_error_syscall(
+            majit_rlib::rposix::get_saved_errno(),
+            w_name,
+        ));
     }
     Ok(())
 }
@@ -25658,7 +25649,10 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         };
-        if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
+        // `_c_set_inheritable` releases the GIL; `path_obj` is live here.
+        if let Err(error) = pyre_object::with_roots!(path_obj => {
+            fileio_set_non_inheritable(fd, resolved_path.w_path())
+        }) {
             fileio_close_owned_fd(fd);
             return Err(error);
         }

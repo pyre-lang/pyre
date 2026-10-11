@@ -1875,13 +1875,18 @@ fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
 
 /// The calling thread's identity.
 ///
-/// The host thread id is read fresh on every call and is never a build-time
-/// constant, so the front end residualizes the read instead of tracing into
-/// `rustpython_host_env::thread::current_thread_id`.  This is the single
-/// in-tree seam every traced caller reaches it through.
+/// `rthread.get_ident` reads `tlfield_thread_ident`, filled from
+/// `pthread_self` in `threadlocal.c`. The host thread id is read fresh on
+/// every call and is never a build-time constant, so the front end
+/// residualizes the read instead of tracing into it.
 #[majit_macros::dont_look_inside]
 pub fn current_ident() -> i64 {
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    {
+        return unsafe { libc::pthread_self() } as u64 as i64;
+    }
     #[cfg(all(
+        windows,
         feature = "host_env",
         not(target_arch = "wasm32"),
         not(feature = "sandbox")

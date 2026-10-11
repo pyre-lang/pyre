@@ -1406,12 +1406,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         check_signum_in_range(sig)?;
                         let sig = sig as i32;
                         let flag = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                        rustpython_host_env::signal::siginterrupt(sig, flag).map_err(|e| {
-                            crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("siginterrupt: {e}"),
-                            )
-                        })?;
+                        // `rsignal.c_siginterrupt` is `pypysig_siginterrupt`
+                        // and saves errno.
+                        if unsafe { majit_rlib::rsignal::c_siginterrupt(sig, flag) } < 0 {
+                            let errno = majit_rlib::rposix::get_saved_errno();
+                            return Err(crate::PyError::os_error_with_errno(
+                                errno,
+                                format!(
+                                    "siginterrupt: {}",
+                                    std::io::Error::from_raw_os_error(errno)
+                                ),
+                            ));
+                        }
                         Ok(pyre_object::w_none())
                     }
                     #[cfg(not(feature = "host_env"))]
