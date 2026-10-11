@@ -1472,16 +1472,17 @@ const _: () = assert!(
 /// follows needs no remembered-set barrier outside the JIT.
 #[inline(never)]
 #[majit_macros::oopspec("newlist(length)")]
-pub(crate) unsafe fn ll_new_int_items(count: i64) -> *mut TypedItemsBlock {
-    unsafe { alloc_typed_items_block(count as usize, gc_int_array_gc_type_id()) }
+pub(crate) unsafe fn ll_new_int_items(length: i64) -> *mut TypedItemsBlock {
+    unsafe { alloc_typed_items_block(length as usize, gc_int_array_gc_type_id()) }
 }
 
 /// [`ll_new_int_items`] for `GcArray(Float)`.
 #[inline(never)]
 #[majit_macros::oopspec("newlist(length)")]
-pub(crate) unsafe fn ll_new_float_items(count: i64) -> *mut FloatItemsBlock {
+pub(crate) unsafe fn ll_new_float_items(length: i64) -> *mut FloatItemsBlock {
     unsafe {
-        alloc_typed_items_block(count as usize, gc_float_array_gc_type_id()) as *mut FloatItemsBlock
+        alloc_typed_items_block(length as usize, gc_float_array_gc_type_id())
+            as *mut FloatItemsBlock
     }
 }
 

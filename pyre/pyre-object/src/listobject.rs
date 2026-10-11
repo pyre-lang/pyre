@@ -3197,20 +3197,32 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
-    let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > ll_list_int_capacity(list) as i64 {
-        let target_cap = crate::object_array::rlist_overallocate_signed(newsize) as usize;
-        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let list = &*(obj as *const W_ListObject);
-        let newitems = grow_int_items_block(
-            ll_list_int_items(list),
-            target_cap,
-            ll_list_int_length(list),
-        );
-        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    if newsize <= 0 {
+        debug_assert!(newsize == 0, "negative list length");
         let list = &mut *(obj as *mut W_ListObject);
-        ll_list_int_set_items(list, newitems);
+        ll_list_int_set_len(list, 0);
+        ll_list_int_set_items(
+            list,
+            crate::object_array::ll_prebuilt_empty_int_items_block(),
+        );
+        return;
     }
+    let new_allocated = if overallocate {
+        crate::object_array::rlist_overallocate_signed(newsize)
+    } else {
+        newsize
+    };
+    let list = &*(obj as *const W_ListObject);
+    let before_len = ll_list_int_length(list);
+    let p = if (before_len as i64) < newsize {
+        before_len
+    } else {
+        newsize as usize
+    };
+    let newitems = grow_int_items_block(ll_list_int_items(list), new_allocated as usize, p);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    ll_list_int_set_items(list, newitems);
 }
 
 /// `rlist.py _ll_list_resize_ge` for Integer storage.
@@ -3324,20 +3336,32 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
-    let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > ll_list_float_capacity(list) as i64 {
-        let target_cap = crate::object_array::rlist_overallocate_signed(newsize) as usize;
-        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let list = &*(obj as *const W_ListObject);
-        let newitems = grow_float_items_block(
-            ll_list_float_items(list),
-            target_cap,
-            ll_list_float_length(list),
-        );
-        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    if newsize <= 0 {
+        debug_assert!(newsize == 0, "negative list length");
         let list = &mut *(obj as *mut W_ListObject);
-        ll_list_float_set_items(list, newitems);
+        ll_list_float_set_len(list, 0);
+        ll_list_float_set_items(
+            list,
+            crate::object_array::ll_prebuilt_empty_float_items_block(),
+        );
+        return;
     }
+    let new_allocated = if overallocate {
+        crate::object_array::rlist_overallocate_signed(newsize)
+    } else {
+        newsize
+    };
+    let list = &*(obj as *const W_ListObject);
+    let before_len = ll_list_float_length(list);
+    let p = if (before_len as i64) < newsize {
+        before_len
+    } else {
+        newsize as usize
+    };
+    let newitems = grow_float_items_block(ll_list_float_items(list), new_allocated as usize, p);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    ll_list_float_set_items(list, newitems);
 }
 
 /// `rlist.py _ll_list_resize_ge` for Float storage.
