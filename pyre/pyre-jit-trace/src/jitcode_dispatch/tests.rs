@@ -270,6 +270,32 @@ fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     assert!(!session.claim_abort_coordinate(false));
 }
 
+#[test]
+fn discarding_a_staged_abort_releases_the_coordinate_claim() {
+    let session = std::cell::RefCell::new(WalkSession::default());
+    assert!(session.borrow_mut().claim_abort_coordinate(true));
+    assert!(session.borrow().abort_in_subwalk);
+    discard_staged_abort(&session);
+    assert!(!session.borrow().abort_in_subwalk);
+    assert!(session.borrow_mut().claim_abort_coordinate(true));
+}
+
+#[test]
+fn every_continuation_parent_carries_the_pending_result_placeholder() {
+    for tail in [
+        crate::operator_continuation::OperatorTail::Format,
+        crate::operator_continuation::OperatorTail::Len,
+        crate::operator_continuation::OperatorTail::Truth,
+    ] {
+        let parent = operator_continuation_parent_frame(tail).expect("tail installs");
+        assert_eq!(
+            parent.boxes.len(),
+            1,
+            "{tail:?}: resume-pc liveness names r0, so the parent snapshot needs a matching box",
+        );
+    }
+}
+
 /// One `residual_call_r_i/iRd>i` with an empty argument varlist, whose funcbox
 /// operand names the Int-bank slot `funcbox`.
 fn residual_call_with_funcbox(funcbox: u8) -> Vec<u8> {

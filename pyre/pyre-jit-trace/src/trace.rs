@@ -3582,8 +3582,15 @@ fn try_adopt_multi_frame_blackhole(
         };
         let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
         if frame_reg == u16::MAX {
-            mfdbg!("frame {index}: jitcode {jitcode_index} has no portal frame reg");
-            return false;
+            // Codeless continuation (`ctor_continuation`, `OperatorTail`):
+            // no portal red frame, so no PyFrame to validate. Keep a
+            // `(0, 0)` slot aligned with the framestack so
+            // `convert_and_run_from_pyjitpl` (`blackhole.py`) still has
+            // the level for `_setup_return_value_r`. Same skip as
+            // `multi_frame_blackhole_preflight`.
+            mfdbg!("frame {index}: jitcode {jitcode_index} codeless continuation");
+            per_frame.push((0, 0));
+            continue;
         }
         let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
             mfdbg!("frame {index}: reg {frame_reg} unstamped");
@@ -3648,11 +3655,17 @@ fn try_adopt_multi_frame_blackhole(
     // than rely on the absence.  The chain is two or three levels, so the
     // pairwise scan is free.
     for i in 0..per_frame.len() {
+        if per_frame[i].0 == 0 {
+            continue;
+        }
         if i > 0 && per_frame[i].0 == root_addr as i64 {
             mfdbg!("frame {i}: is the walked frame {root_addr:#x}");
             return false;
         }
-        if per_frame[..i].iter().any(|&(ptr, _)| ptr == per_frame[i].0) {
+        if per_frame[..i]
+            .iter()
+            .any(|&(ptr, _)| ptr != 0 && ptr == per_frame[i].0)
+        {
             mfdbg!("frame {i}: {:#x} repeats an earlier level", per_frame[i].0);
             return false;
         }
@@ -3689,10 +3702,14 @@ fn try_adopt_multi_frame_blackhole(
             .collect::<Vec<_>>()
             .join(", "),
     );
-    if per_frame.first().map(|&(frame_ptr, _)| frame_ptr) != Some(root_addr as i64) {
+    let first_pyframe = per_frame
+        .iter()
+        .find(|&&(ptr, _)| ptr != 0)
+        .map(|&(p, _)| p);
+    if first_pyframe != Some(root_addr as i64) {
         mfdbg!(
             "chain rooted at {:#x}, not the walked frame {root_addr:#x}",
-            per_frame.first().map(|&(p, _)| p).unwrap_or(0),
+            first_pyframe.unwrap_or(0),
         );
         return false;
     }
@@ -3727,12 +3744,17 @@ fn try_adopt_multi_frame_blackhole(
     )> = Vec::with_capacity(per_frame.len());
     unsafe {
         for i in 0..per_frame.len() {
+            if per_frame[i].0 == 0 {
+                continue;
+            }
             let callee = per_frame[i].0 as *mut pyre_interpreter::PyFrame;
-            let f_back = if i == 0 {
-                root_addr as i64
-            } else {
-                per_frame[i - 1].0
-            } as *mut pyre_interpreter::PyFrame;
+            let f_back = per_frame[..i]
+                .iter()
+                .rev()
+                .find(|&&(ptr, _)| ptr != 0)
+                .map(|&(ptr, _)| ptr)
+                .unwrap_or(root_addr as i64)
+                as *mut pyre_interpreter::PyFrame;
             if std::ptr::eq(callee, f_back) {
                 continue;
             }
@@ -3894,8 +3916,13 @@ fn try_adopt_multi_frame_blackhole(
     // `virtualizable_ptr` slot against.
     let live_root = majit_gc::shadow_stack::push(majit_ir::GcRef(root_addr));
     // `enter`: publish `ec.topframeref = <this level's frame>` before it runs.
-    let set_topframeref = |frame_ptr: i64| unsafe {
-        (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
+    let set_topframeref = |frame_ptr: i64| {
+        if frame_ptr == 0 {
+            return;
+        }
+        unsafe {
+            (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
+        }
     };
     // `pyopcode.py RETURN_VALUE` / `pyopcode.py
     // handle_operation_error`: mark each level finished as it returns to its
@@ -3916,21 +3943,32 @@ fn try_adopt_multi_frame_blackhole(
         per_frame
             .iter()
             .skip(1)
-            .map(|&(frame_ptr, _)| {
-                pyre_interpreter::call::enter_recursive_frame(
-                    frame_ptr as *const pyre_interpreter::PyFrame,
-                )
+            .filter_map(|&(frame_ptr, _)| {
+                (frame_ptr != 0).then(|| {
+                    pyre_interpreter::call::enter_recursive_frame(
+                        frame_ptr as *const pyre_interpreter::PyFrame,
+                    )
+                })
             })
             .collect::<Vec<_>>(),
     );
     let finish_level = |frame_ptr: i64| {
         crate::state::finish_blackhole_level_frame(frame_ptr);
         // Levels return innermost-first, so this pops the guards in the order
-        // they were taken, reversed.
-        level_recursion.borrow_mut().pop();
+        // they were taken, reversed. A codeless continuation has no PyFrame
+        // and was never charged.
+        if frame_ptr != 0 {
+            level_recursion.borrow_mut().pop();
+        }
     };
     // EXPERIMENT: multi-frame runs full outer-frame bodies, so it needs a
     // full-coverage dispatch table, not the inline-call-only builder.
+    if per_frame.iter().any(|&(ptr, _)| ptr == 0) {
+        crate::jitcode_dispatch::census_record("CodelessContinuationAdopted");
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[s2-adopt-state] codeless continuation kept in framestack");
+        }
+    }
     let (mut mf_builder, _unwired) =
         crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
     mf_builder.set_cpu(
@@ -5343,13 +5381,14 @@ fn run_perfn_walk<Sym: WalkSym>(
         if !walk_abort_adopted
             && let Some((abort_jit_pc, is_marker_abort, entry_carrier_only)) = midbody_or_abortpc
         {
-            // A supported abort fired inside a TOP-level inline sub-walk.
-            // WalkAbort already converted the live framestack through
-            // `convert_and_run_from_pyjitpl` (`blackhole.py`) when the image
-            // was complete.  A MidBody carrier still rebuilds the callee at
-            // its abort pc; a marker abort without a carrier resumes at the
-            // abort pc itself.  Kept-stack aborts must not consume a MidBody
-            // payload latched for a different abort.
+            // A supported abort fired inside a TOP-level inline sub-walk,
+            // and this block is under `!walk_abort_adopted`: WalkAbort did
+            // not convert the live framestack through
+            // `convert_and_run_from_pyjitpl` (`blackhole.py`). A MidBody
+            // carrier still rebuilds the callee at its abort pc; a marker
+            // abort without a carrier resumes at the abort pc itself.
+            // Kept-stack aborts must not consume a MidBody payload latched
+            // for a different abort.
             let carrier = crate::jitcode_dispatch::fbw_abort_carrier_clone();
             match carrier.as_ref() {
                 Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
@@ -5400,14 +5439,31 @@ fn run_perfn_walk<Sym: WalkSym>(
                             );
                         }
                         Err(MidBodyDecline::BeforeRun(_)) => {
-                            // WalkAbort already ran; an incomplete rebuild
-                            // image keeps the unflushed abort.
+                            // WalkAbort did not run. The original walk already
+                            // executed the callee up to the abort pc; the
+                            // rebuild never reached `execute_frame`. Falling
+                            // through leaves entry replay, which re-runs that
+                            // prefix. Remaining BeforeRun cases are incomplete
+                            // images that could not latch a convert-in-place
+                            // chain (`convert_and_run_from_pyjitpl`).
+                            crate::jitcode_dispatch::census_record("MidBodyDeclineBeforeRun");
                         }
                         Err(MidBodyDecline::AfterRun(_)) => {
-                            // The callee body already executed.  WalkAbort
-                            // already ran the live framestack through
-                            // `convert_and_run_from_pyjitpl` (`blackhole.py`);
-                            // taking another flush would re-enter that body.
+                            // WalkAbort did not run. The rebuild's
+                            // `execute_frame` already ran the remaining
+                            // callee body, then
+                            // `flush_walk_end_state_after_outer_call`
+                            // declined — the invariant
+                            // `try_commit_midbody_abort_inner` marks with
+                            // `debug_assert`. Entry replay would re-execute
+                            // that body. Commit AfterApplied so the rebuilt
+                            // run stands.
+                            crate::jitcode_dispatch::census_record("MidBodyDeclineAfterRun");
+                            let _ = commit_walk_end(
+                                flush_committed,
+                                WalkEndCommitLeg::CalleeRebuild,
+                                WalkEndResume::AfterApplied,
+                            );
                         }
                     }
                 }

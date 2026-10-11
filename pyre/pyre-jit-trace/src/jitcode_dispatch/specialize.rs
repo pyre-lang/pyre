@@ -15310,10 +15310,11 @@ fn rollback_list_append_attempt<Sym: WalkSym>(
     if !promoted && unsafe { pyre_object::w_list_len(list) } > len_before {
         fbw_rewind_unjournaled_list_append(list, len_before, allocated_before);
     }
-    // A declined inlined callee may have latched a blackhole image. This
-    // recovery continues the walk, so that image must not answer for a
-    // later abort (`abort_blackhole_latched`).
-    reset_single_frame_blackhole();
+    // A declined inlined callee may have latched a blackhole image and
+    // claimed the abort coordinate. This recovery continues the walk, so
+    // neither the image nor the claim may answer for a later abort
+    // (`abort_blackhole_latched`, `claim_abort_coordinate`).
+    discard_staged_abort(ctx.session);
 }
 
 /// `Ok(false)` rolls the attempt back to the residual.  A resume coordinate

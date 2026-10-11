@@ -2690,7 +2690,7 @@ fn create_segmented_trace<Sym: WalkSym>(
     // which then records none of its own and adopts this merge point instead of
     // its own stop — dropping everything executed in between.
     if !latched_single_frame_mirror_publishable() {
-        reset_single_frame_blackhole();
+        discard_staged_abort(ctx.session);
         census_record("SegmentTrace::MirrorStackRefused");
         return Ok(None);
     }
@@ -4840,7 +4840,7 @@ pub fn walk<Sym: WalkSym>(
                 && !ctx.fbw_mode.inline_subwalk
                 && !latched_single_frame_mirror_publishable()
             {
-                reset_single_frame_blackhole();
+                discard_staged_abort(ctx.session);
                 blackhole_latched = false;
             }
             if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
@@ -8054,9 +8054,9 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
 /// `crate::operator_continuation`'s, and that module's doc carries why the
 /// level has to exist at all.
 ///
-/// `boxes` is empty because the level's whole state is the pending
-/// call-result slot the dunder is about to fill, and a resume section never
-/// carries one (`get_list_of_active_boxes(in_a_call=True)`). `blackhole` is
+/// Resume-pc liveness names r0 so a post-return guard can carry the
+/// result; in-dunder snapshots still need a matching placeholder that
+/// `_setup_return_value_r` (`blackhole.py`) overwrites. `blackhole` is
 /// `None` because the level owns no register banks to force, and
 /// `call_stack_overrides` is empty because it has no operand stack.
 pub(crate) fn operator_continuation_parent_frame(
@@ -8064,6 +8064,7 @@ pub(crate) fn operator_continuation_parent_frame(
 ) -> Option<InlineParentFrame> {
     let jitcode_index = crate::operator_continuation::jitcode_index(tail)?;
     let resume_pc = crate::operator_continuation::resume_pc(tail)?;
+    let boxes = vec![OpRef::const_ptr(majit_ir::GcRef::NULL)];
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
@@ -8074,7 +8075,7 @@ pub(crate) fn operator_continuation_parent_frame(
         // a frame, which is the existing spelling for "no Python coordinate".
         resume_coord: ParentResumeCoord::Backxlat(resume_pc),
         resume_marker_jit_pc: Some(resume_pc),
-        boxes: Vec::new(),
+        boxes,
         registers_r: None,
         registers_i: None,
         registers_f: None,

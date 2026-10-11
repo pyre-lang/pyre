@@ -9344,6 +9344,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // a paused caller image.  `compute_inline_caller_frame` failures were
     // residualized before the seed, so there is no caller-boundary collapse.
     let parent_frame = precomputed_parent_frame;
+    // Cloned before the sub-walk moves `parent_frame` into the inline
+    // frame guard. After the dunder returns, a post-return guard or a
+    // post-return abort snapshots the caller plus the operator tail, and
+    // `_inline_frame` has already dropped.
+    let operator_tail_caller = operator_tail.is_some().then(|| parent_frame.clone());
     let callee_frame_materialized_has_resume = callee_frame_seeded;
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
@@ -10218,10 +10223,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         // rewind the attempt and emit the faithful residual.
                         return resolved_inline_decline(op.pc, line!());
                     }
-                    // descroperation.py checks the app-level result before
-                    // returning from `space.str` / `space.repr`. Abort so
-                    // `convert_and_run_from_pyjitpl` (`blackhole.py`) raises
-                    // the faithful TypeError from the live framestack.
+                    // The dunder has returned a non-str after running an
+                    // effect. Latch caller + Format tail with the box pending
+                    // so `convert_and_run_from_pyjitpl` (`blackhole.py`)
+                    // continues in the tail and raises the TypeError without
+                    // re-entering `__format__`.
+                    if let Some(tail) = operator_tail {
+                        return abort_operator_tail_after_return(
+                            ctx,
+                            op.pc,
+                            operator_tail_caller.as_ref(),
+                            tail,
+                            value,
+                        );
+                    }
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 if require_exact_int_result
@@ -10243,36 +10258,44 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // loop's trace, which `callee_inline_unsupported` would.
                     return resolved_inline_decline(op.pc, line!());
                 }
-                if operator_tail == Some(crate::operator_continuation::OperatorTail::Format)
-                    && fbw_executed_effect_count() == executed_effects_before
-                {
+                if operator_tail == Some(crate::operator_continuation::OperatorTail::Format) {
                     // `descroperation.py format` checks `isinstance_w(w_res,
                     // w_unicode)` after `__format__` returns. Pin the observed
-                    // str class before the destination write so a later
-                    // non-str deopts with the FORMAT_WITH_SPEC result slot
-                    // still pending; `OperatorTail::Format` is the resume
-                    // level that runs the same check when a guard inside the
-                    // inlined body fails (`crate::operator_continuation`).
-                    // This GuardClass itself resumes at `op.pc`, so a deopt
-                    // re-runs FORMAT_WITH_SPEC. Emit it only over a body that
-                    // committed nothing. An effectful body cannot decline
-                    // here: `cut_declined_subwalk` drops recorded ops and
-                    // does not undo the effect, so the FORMAT_WITH_SPEC
-                    // residual would run `__format__` again. Skip the pin
-                    // and keep the recorded prefix.
+                    // class so a later non-str deopts. Resume is the Format
+                    // tail with the result as the pending return — not
+                    // `op.pc` (FORMAT_WITH_SPEC), which would re-run the
+                    // dunder. The same pin covers an effect-free body and an
+                    // effectful one; `_setup_return_value_r` (`blackhole.py`)
+                    // lands in the tail either way.
                     let concrete = match concrete_for_shadow {
                         ConcreteValue::Ref(obj) if !obj.is_null() => obj,
-                        _ => return resolved_inline_decline(op.pc, line!()),
+                        _ => {
+                            if fbw_executed_effect_count() == executed_effects_before {
+                                return resolved_inline_decline(op.pc, line!());
+                            }
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                operator_tail_caller.as_ref(),
+                                crate::operator_continuation::OperatorTail::Format,
+                                value,
+                            );
+                        }
                     };
                     let result_type = unsafe { (*concrete).ob_type } as i64;
                     let result_type_const = ctx.trace_ctx.const_int(result_type);
-                    walker_emit_guard_with_snapshot(
+                    let Some(caller) = operator_tail_caller.as_ref() else {
+                        return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    };
+                    walker_emit_operator_tail_result_guard(
                         ctx,
                         op.pc,
+                        crate::operator_continuation::OperatorTail::Format,
+                        caller,
+                        value,
                         OpCode::GuardClass,
                         &[value, result_type_const],
                     )?;
-                    ctx.trace_ctx.heap_cache_mut().class_now_known(value);
                 }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
                     // `len` runs `space.index` on what `__len__` returned,
@@ -10293,54 +10316,90 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         }
                         _ => None,
                     };
-                    // Two refusals, one exit.  A length this route cannot
-                    // answer — a long, a bool, an int subclass, something
-                    // carrying `__index__`, a negative — owes the interpreter
-                    // its faithful conversion or error.  A body whose sub-walk
-                    // moved the executed-effect odometer owes it the operator
-                    // too: the guard below resumes at the CALL boundary with
-                    // the result slot pending, so the blackhole re-runs the
-                    // whole operator, `__len__` included, and the odometer is
-                    // what says that re-run is not free.  The traced prefix is
-                    // the only prefix a deopt can have, so it answers the
-                    // question exactly, and the guard is emitted only over a
-                    // body that committed nothing.
-                    //
-                    // Both leave by declining, not aborting.  Declining cuts
-                    // the emission and lets the caller's residual run the
-                    // whole operator; aborting would ban the enclosing loop
-                    // for a `__len__` that answers this way every iteration,
-                    // which is worse than the residual this route was opened
-                    // to replace.
-                    if !len_value.is_some_and(|value| value >= 0)
-                        || fbw_executed_effect_count() != executed_effects_before
-                    {
+                    // A length this route cannot answer — a long, a bool, an
+                    // int subclass, something carrying `__index__`, a
+                    // negative — owes the interpreter its faithful conversion
+                    // or error. No effect has run, so the residual is free.
+                    // A body that already ran an effect cannot decline: the
+                    // residual would re-run `__len__`. Convert in place
+                    // through `OperatorTail::Len` so `_setup_return_value_r`
+                    // (`blackhole.py`) lands in the tail. A valid nonnegative
+                    // machine int is the traced path itself (`_check_len_result`
+                    // as the guard below); aborting it after `_inline_frame`
+                    // drops would replay the CALL (`LoopBearingCalleeInlineUnsupported`
+                    // with no latch) and run `__len__` twice.
+                    let Some(caller) = operator_tail_caller.as_ref() else {
+                        return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    };
+                    if !len_value.is_some_and(|value| value >= 0) {
+                        if fbw_executed_effect_count() != executed_effects_before {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                Some(caller),
+                                crate::operator_continuation::OperatorTail::Len,
+                                value,
+                            );
+                        }
                         return resolved_inline_decline(op.pc, line!());
                     }
                     // Both checks as guards, before the destination write, so a
                     // later iteration whose `__len__` answers differently
-                    // resumes with the CALL's result slot still pending rather
-                    // than carrying a length the operator would have refused.
+                    // resumes in `OperatorTail::Len` with the result pending
+                    // rather than carrying a length the operator would have
+                    // refused — and rather than re-entering `__len__`.
                     let concrete = match concrete_for_shadow {
                         ConcreteValue::Ref(obj) => obj,
                         _ => pyre_object::PY_NULL,
                     };
-                    let (int_type, intval_descr) =
-                        crate::state::int_or_bool_unbox_type_descr(concrete);
-                    let expected_class = walker_numeric_builtin_class(concrete);
-                    let raw = walker_unbox_int_exact(
-                        ctx,
-                        op.pc,
-                        value,
-                        int_type,
-                        intval_descr,
-                        expected_class,
-                    )?;
+                    let raw = if pyre_object::tagged_int::CAN_BE_TAGGED
+                        && pyre_object::tagged_int::is_tagged_int(concrete)
+                    {
+                        let lowbit =
+                            crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, value, true);
+                        walker_emit_operator_tail_result_guard(
+                            ctx,
+                            op.pc,
+                            crate::operator_continuation::OperatorTail::Len,
+                            caller,
+                            value,
+                            OpCode::GuardTrue,
+                            &[lowbit],
+                        )?;
+                        crate::helpers::emit_untag_int(
+                            ctx.trace_ctx,
+                            value,
+                            pyre_object::tagged_int::untag_int(concrete),
+                        )
+                    } else {
+                        let result_type = unsafe { (*concrete).ob_type } as i64;
+                        let result_type_const = ctx.trace_ctx.const_int(result_type);
+                        walker_emit_operator_tail_result_guard(
+                            ctx,
+                            op.pc,
+                            crate::operator_continuation::OperatorTail::Len,
+                            caller,
+                            value,
+                            OpCode::GuardClass,
+                            &[value, result_type_const],
+                        )?;
+                        let (int_type, intval_descr) =
+                            crate::state::int_or_bool_unbox_type_descr(concrete);
+                        walker_unbox_int_typed(ctx, op.pc, value, int_type, intval_descr)?
+                    };
                     let zero = ctx.trace_ctx.const_int(0);
                     let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw, zero]);
                     ctx.trace_ctx
                         .set_opref_concrete(nonnegative, majit_ir::Value::Int(1));
-                    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[nonnegative])?;
+                    walker_emit_operator_tail_result_guard(
+                        ctx,
+                        op.pc,
+                        crate::operator_continuation::OperatorTail::Len,
+                        caller,
+                        value,
+                        OpCode::GuardTrue,
+                        &[nonnegative],
+                    )?;
                 }
                 // `descr_call` discards `__init__`'s result after checking it is
                 // None and returns the instance instead (`check_init_returned_none`).
@@ -10359,24 +10418,35 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     None => (value, concrete_for_shadow),
                 };
                 // `is_true` after `__bool__` answers an int, not the bool
-                // object. A non-bool owes the TypeError, and a body that
-                // already ran an effect cannot be cut and re-executed by the
-                // Truth residual. Both decline, the same way `Len` does.
-                let (value, concrete_for_shadow) =
-                    if operator_tail == Some(crate::operator_continuation::OperatorTail::Truth) {
-                        match truth_bool_result_int(
-                            ctx,
-                            op.pc,
-                            value,
-                            concrete_for_shadow,
-                            executed_effects_before,
-                        )? {
-                            Some(pair) => pair,
-                            None => return resolved_inline_decline(op.pc, line!()),
-                        }
-                    } else {
-                        (value, concrete_for_shadow)
+                // object. A non-bool owes the TypeError; a body that already
+                // ran an effect converts in place through `OperatorTail::Truth`
+                // rather than declining into a residual that would re-run it.
+                // A bool result continues even when the body ran: the unbox
+                // guards are the traced path.
+                let (value, concrete_for_shadow) = if operator_tail
+                    == Some(crate::operator_continuation::OperatorTail::Truth)
+                {
+                    let Some(caller) = operator_tail_caller.as_ref() else {
+                        return Err(DispatchError::callee_inline_unsupported(op.pc));
                     };
+                    match truth_bool_result_int(ctx, op.pc, value, concrete_for_shadow, caller)? {
+                        Some(pair) => pair,
+                        None => {
+                            if fbw_executed_effect_count() != executed_effects_before {
+                                return abort_operator_tail_after_return(
+                                    ctx,
+                                    op.pc,
+                                    Some(caller),
+                                    crate::operator_continuation::OperatorTail::Truth,
+                                    value,
+                                );
+                            }
+                            return resolved_inline_decline(op.pc, line!());
+                        }
+                    }
+                } else {
+                    (value, concrete_for_shadow)
+                };
                 if let Some(result) = intermediate_result {
                     // The caller stays pinned at its own CALL boundary, so a guard
                     // it emits after this hand-off resumes by re-entering that CALL
@@ -13429,33 +13499,58 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     Ok(inlined)
 }
 
+/// Latch caller + operator tail after the dunder has returned, then abort.
+///
+/// `_inline_frame` has already dropped, so without this latch the abort
+/// recovers as an entry replay and re-runs the dunder. The convert image
+/// is the same one a post-return guard snapshots: caller + tail with the
+/// returned box pending.
+fn abort_operator_tail_after_return<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    caller: Option<&InlineParentFrame>,
+    tail: crate::operator_continuation::OperatorTail,
+    result: OpRef,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if let Some(caller) = caller {
+        let _ = super::residual_call::latch_operator_tail_return(ctx, caller, tail, result);
+    }
+    Err(DispatchError::callee_inline_unsupported(op_pc))
+}
+
 /// Turn `__bool__`'s returned box into the int `is_true` answers.
 ///
 /// `descroperation.py is_true` accepts only `w_False` and `w_True`. The
 /// unbox guards that class and reads `intval`, so a later iteration that
 /// returns the other singleton or a non-bool resumes the Truth residual
 /// with its result slot still pending. `None` is a decline: the caller cuts
-/// the emission and the residual runs `is_true_lookup`.
+/// the emission and the residual runs `is_true_lookup`, or latches the
+/// Truth tail when an effect has already run.
 fn truth_bool_result_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     value: OpRef,
     concrete_for_shadow: ConcreteValue,
-    executed_effects_before: usize,
+    caller: &InlineParentFrame,
 ) -> Result<Option<(OpRef, ConcreteValue)>, DispatchError> {
-    if fbw_executed_effect_count() != executed_effects_before {
-        return Ok(None);
-    }
-    let ConcreteValue::Ref(obj) = concrete_for_shadow else {
-        return Ok(None);
+    let obj = match concrete_for_shadow {
+        ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_bool(obj) } => obj,
+        _ => return Ok(None),
     };
-    if obj.is_null() || unsafe { !pyre_object::is_bool(obj) } {
-        return Ok(None);
-    }
+    let result_type = unsafe { (*obj).ob_type } as i64;
+    let result_type_const = ctx.trace_ctx.const_int(result_type);
+    walker_emit_operator_tail_result_guard(
+        ctx,
+        op_pc,
+        crate::operator_continuation::OperatorTail::Truth,
+        caller,
+        value,
+        OpCode::GuardClass,
+        &[value, result_type_const],
+    )?;
     let bit = i64::from(unsafe { pyre_object::w_bool_get_value(obj) });
     let (int_type, intval_descr) = crate::state::int_or_bool_unbox_type_descr(obj);
-    let expected_class = walker_numeric_builtin_class(obj);
-    let raw = walker_unbox_int_exact(ctx, op_pc, value, int_type, intval_descr, expected_class)?;
+    let raw = walker_unbox_int_typed(ctx, op_pc, value, int_type, intval_descr)?;
     Ok(Some((raw, ConcreteValue::Int(bit))))
 }
 
@@ -16301,12 +16396,13 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         None,
         // FORMAT_WITH_SPEC is not a Python CALL. A record-time non-str
         // declines to the residual (`require_str_result`); a guard inside
-        // the inlined body resumes through `OperatorTail::Format`, which
-        // runs `DescrOperation.format`'s post-call str check.
+        // the inlined body, and the post-return `GuardClass`, resume
+        // through `OperatorTail::Format`, which runs `descroperation.py
+        // format`'s post-call str check.
         false,
         // `__format__` returning a non-string is a TypeError
         // `call_format_dispatch_w` raises; `require_str_result` keeps that
-        // at record time, and `OperatorTail::Format` keeps it on deopt.
+        // at record time, and the Format-tail `GuardClass` keeps it on deopt.
         true,
         None,
         None,

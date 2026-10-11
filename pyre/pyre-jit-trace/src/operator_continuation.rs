@@ -34,7 +34,7 @@
 //!
 //! ```text
 //!   0:          inline_call_r_r <placeholder> -> dunder_result
-//!   resume_pc:  -live-                        [nothing live, r0 pending]
+//!   resume_pc:  -live-                        [r0 live — post-return GuardClass / GuardTrue]
 //!               residual_call_r_r  bh_len_tail(dunder_result) -> answer
 //!               -live-                        [nothing live]
 //!               ref_return         answer
@@ -43,6 +43,12 @@
 //! The second `-live-` is the resume coordinate of the residual's exception
 //! guard. Nothing is live there: a failing guard carries the exception, and
 //! `ref_return` runs only on the trace that passed the guard.
+//!
+//! Every tail's resume `-live-` names r0 so a post-return guard can resume
+//! here with the dunder result already in the pending-return slot
+//! (`descroperation.py format` `isinstance_w`, `len` `_check_len_result`,
+//! `is_true` bool-ness). An in-dunder abort still fills that slot through
+//! `_setup_return_value_r` (`blackhole.py`).
 //!
 //! Pushed as a paused parent level under the caller (`InlineFrame::parents`,
 //! outermost-first), so the chain is `caller -> tail -> __len__ -> ...` and
@@ -60,9 +66,11 @@
 //! CONVERGENCE PATH: the same as `ctor_continuation`'s.  Entering
 //! `builtins::builtin_len`'s generated jitcode as an ordinary callee frame,
 //! with the `__len__` call inlined at the `get_and_call_function` inside it,
-//! makes steps 2-4 that graph's own jitcode and deletes this module.  The
-//! blocker is documented on `try_walker_orthodox_descent`: a mid-descent
-//! decline does not rewind an effect the sub-walk already executed.
+//! makes steps 2-4 that graph's own jitcode and deletes this module.  Format
+//! is the same gap for `descroperation.py format`: `bh_format_tail` stays
+//! until the walker can enter that generated graph.  The blocker is
+//! documented on `try_walker_orthodox_descent`: a mid-descent decline does
+//! not rewind an effect the sub-walk already executed.
 
 use crate::PyJitCode;
 use majit_metainterp::jitcode::{JitCallArg, JitCodeBuilder};
@@ -98,7 +106,7 @@ impl OperatorTail {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             OperatorTail::Len => "len_tail",
             OperatorTail::Truth => "truth_bool_tail",
@@ -118,10 +126,8 @@ impl OperatorTail {
 }
 
 /// Where the inlined dunder's return lands when it leaves the blackhole
-/// (`_setup_return_value_r` → `call_result_reg`).  Never carried by the
-/// resume section: `get_list_of_active_boxes(in_a_call=True)` (`pyjitpl.py`)
-/// clears a caller's pending call-result slot, and this register is exactly
-/// that slot.
+/// (`_setup_return_value_r` → `call_result_reg`). Resume `-live-` names
+/// it so a post-return guard can carry the result already in this slot.
 const DUNDER_RESULT_REG: u16 = 0;
 
 /// The operator's finished answer, in whichever bank [`OperatorTail::tail_call`]
@@ -244,12 +250,18 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
     let resume_pc = builder.current_pos();
     // `-live-` operands are 2-byte offsets into the ONE shared
     // `MetaInterpStaticData.liveness_info` pool (`pyjitpl.py`), so the triple
-    // is interned there rather than in a private assembler buffer.  Nothing
-    // is live: the level's whole state is the pending call-result slot, which
-    // a resume section never carries.
-    let liveness_offset = crate::state::intern_liveness(&[], &[], &[])?;
+    // is interned there rather than in a private assembler buffer.
+    //
+    // A post-return guard (`GuardClass` / nonnegative `GuardTrue`) resumes
+    // HERE with the dunder result already in r0, so that register is live
+    // at the resume `-live-`. An in-dunder abort still fills the slot
+    // through `_setup_return_value_r` (`blackhole.py`); the residual's own
+    // `-live-` stays empty: a failing `GUARD_NO_EXCEPTION` carries the
+    // exception.
+    let live_empty = crate::state::intern_liveness(&[], &[], &[])?;
+    let live_at_resume = crate::state::intern_liveness(&[], &[DUNDER_RESULT_REG as u8], &[])?;
     let live_patch = builder.live_placeholder();
-    builder.patch_live_offset(live_patch, liveness_offset);
+    builder.patch_live_offset(live_patch, live_at_resume);
 
     let (funcptr, result_type) = tail.tail_call();
     let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
@@ -267,13 +279,13 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
         'r' => {
             builder.residual_call_ref_canonical_typed_args(funcptr, &args, calldescr, ANSWER_REG);
             let after_call = builder.live_placeholder();
-            builder.patch_live_offset(after_call, liveness_offset);
+            builder.patch_live_offset(after_call, live_empty);
             builder.ref_return(ANSWER_REG);
         }
         'i' => {
             builder.residual_call_int_canonical_typed_args(funcptr, &args, calldescr, ANSWER_REG);
             let after_call = builder.live_placeholder();
-            builder.patch_live_offset(after_call, liveness_offset);
+            builder.patch_live_offset(after_call, live_empty);
             builder.int_return(ANSWER_REG);
         }
         _ => return None,
@@ -369,6 +381,26 @@ mod tests {
                 Some(resume_pc),
                 "{tail:?}: the parent loop must resolve the anchor to itself",
             );
+        }
+    }
+
+    /// Every tail's resume `-live-` names r0 so a post-return guard can
+    /// carry the dunder result. An in-dunder abort still fills that slot
+    /// through `_setup_return_value_r`.
+    #[test]
+    fn every_resume_pc_liveness_names_the_dunder_result() {
+        let with_r0 = crate::state::intern_liveness(&[], &[DUNDER_RESULT_REG as u8], &[])
+            .expect("r0 liveness interned") as usize;
+        for tail in OperatorTail::ALL {
+            let Some((index, resume_pc)) = level(tail) else {
+                continue;
+            };
+            let payload = crate::state::pyjitcode_for_jitcode_index(index)
+                .expect("the tail was just installed at this index");
+            let offset = payload
+                .jitcode
+                .get_live_vars_info(resume_pc, crate::state::op_live());
+            assert_eq!(offset, with_r0, "{tail:?}: resume-pc liveness must name r0",);
         }
     }
 
