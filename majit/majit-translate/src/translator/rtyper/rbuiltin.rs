@@ -524,6 +524,24 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "malloc_raw",
             rtype_malloc_raw,
         ),
+        // `majit_gc::header` varsize immortal helpers (`malloc_varsize` +
+        // `init_gc_object_immortal`). Residual `direct_call`, like
+        // `malloc_raw`: no vtable to fuse into `NewWithVtable`.
+        (
+            crate::runtime_names::modules::GC_HEADER,
+            "alloc_varsize_with_gc_header_immortal",
+            rtype_alloc_varsize_gc_header_immortal,
+        ),
+        (
+            crate::runtime_names::modules::GC_HEADER,
+            "alloc_varsize_with_gc_header_immortal_zeroed",
+            rtype_alloc_varsize_gc_header_immortal_zeroed,
+        ),
+        (
+            crate::runtime_names::modules::GC_HEADER,
+            "dealloc_varsize_with_gc_header",
+            rtype_dealloc_varsize_gc_header,
+        ),
     ];
     for (module_name, attr_name, typer) in module_entries {
         if let Some(host) = HOST_ENV
@@ -1923,6 +1941,118 @@ pub fn rtype_malloc_raw(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
     vlist.extend(hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?);
 
     Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
+}
+
+/// `@typer_for(majit_gc.header.alloc_varsize_with_gc_header_immortal)`.
+fn rtype_alloc_varsize_gc_header_immortal(
+    hop: &HighLevelOp,
+    kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_alloc_varsize_gc_header(hop, kwds_i, "alloc_varsize_with_gc_header_immortal")
+}
+
+/// `@typer_for(majit_gc.header.alloc_varsize_with_gc_header_immortal_zeroed)`.
+fn rtype_alloc_varsize_gc_header_immortal_zeroed(
+    hop: &HighLevelOp,
+    kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_alloc_varsize_gc_header(hop, kwds_i, "alloc_varsize_with_gc_header_immortal_zeroed")
+}
+
+/// Residual `direct_call` for the varsize immortal header allocators
+/// (`malloc_varsize` + `init_gc_object_immortal`). Two positional
+/// arguments (`payload_size`, `type_id`); result is the `*mut u8`
+/// payload pointer. Allocation failure returns null rather than
+/// raising, so `exception_cannot_occur`.
+fn rtype_alloc_varsize_gc_header(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+    external_name: &str,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        self, FuncType, functionptr_with_external_name,
+    };
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    if hop.nb_args() != 2 {
+        return Err(TyperError::message(format!(
+            "{external_name}: expected 2 arguments, got {}",
+            hop.nb_args()
+        )));
+    }
+    let r_size = arg_repr(hop, 0)?;
+    let r_tid = arg_repr(hop, 1)?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message(format!("{external_name}: r_result missing")))?;
+    let result_lltype = r_result.lowleveltype().clone();
+    let funcptr = functionptr_with_external_name(
+        FuncType {
+            args: vec![r_size.lowleveltype().clone(), r_tid.lowleveltype().clone()],
+            result: result_lltype,
+        },
+        external_name,
+        Some(external_name.to_string()),
+    );
+    let funcptr_lltype = LowLevelType::Ptr(Box::new(lltype::typeOf(&funcptr)));
+
+    hop.exception_cannot_occur()?;
+
+    let v_func = HighLevelOp::inputconst(&funcptr_lltype, &ConstValue::LLPtr(Box::new(funcptr)))?;
+    let mut vlist = vec![Hlvalue::Constant(v_func)];
+    vlist.extend(hop.inputargs(vec![
+        ConvertedTo::Repr(r_size.as_ref()),
+        ConvertedTo::Repr(r_tid.as_ref()),
+    ])?);
+
+    Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
+}
+
+/// `@typer_for(majit_gc.header.dealloc_varsize_with_gc_header)` — void
+/// residual `direct_call`, like `std.alloc.dealloc`.
+fn rtype_dealloc_varsize_gc_header(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        self, FuncType, functionptr_with_external_name,
+    };
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    if hop.nb_args() != 2 {
+        return Err(TyperError::message(format!(
+            "dealloc_varsize_with_gc_header: expected 2 arguments, got {}",
+            hop.nb_args()
+        )));
+    }
+    let r_payload = arg_repr(hop, 0)?;
+    let r_size = arg_repr(hop, 1)?;
+    let funcptr = functionptr_with_external_name(
+        FuncType {
+            args: vec![
+                r_payload.lowleveltype().clone(),
+                r_size.lowleveltype().clone(),
+            ],
+            result: LowLevelType::Void,
+        },
+        "dealloc_varsize_with_gc_header",
+        Some("dealloc_varsize_with_gc_header".to_string()),
+    );
+    let funcptr_lltype = LowLevelType::Ptr(Box::new(lltype::typeOf(&funcptr)));
+
+    hop.exception_cannot_occur()?;
+
+    let v_func = HighLevelOp::inputconst(&funcptr_lltype, &ConstValue::LLPtr(Box::new(funcptr)))?;
+    let mut vlist = vec![Hlvalue::Constant(v_func)];
+    vlist.extend(hop.inputargs(vec![
+        ConvertedTo::Repr(r_payload.as_ref()),
+        ConvertedTo::Repr(r_size.as_ref()),
+    ])?);
+    let _ = hop.genop("direct_call", vlist, GenopResult::Void);
+    let void_const = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::None)?;
+    Ok(Some(Hlvalue::Constant(void_const)))
 }
 
 /// RPython `@typer_for(hasattr) def rtype_builtin_hasattr(hop)`
@@ -5563,6 +5693,24 @@ mod tests {
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `lltype.malloc`"
         );
+    }
+
+    #[test]
+    fn install_default_typers_registers_varsize_gc_header_allocs() {
+        for leaf in [
+            "alloc_varsize_with_gc_header_immortal",
+            "alloc_varsize_with_gc_header_immortal_zeroed",
+            "dealloc_varsize_with_gc_header",
+        ] {
+            let host = HOST_ENV
+                .import_module(crate::runtime_names::modules::GC_HEADER)
+                .and_then(|m| m.module_get(leaf))
+                .unwrap_or_else(|| panic!("HOST_ENV missing majit_gc.header.{leaf}"));
+            assert!(
+                lookup_typer(&host).is_some(),
+                "BUILTIN_TYPER missing entry for `majit_gc.header.{leaf}`"
+            );
+        }
     }
 
     #[test]

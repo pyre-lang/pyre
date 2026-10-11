@@ -2267,6 +2267,25 @@ fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
     {
         return Some(SKIP_PTR_COPY_NONOVERLAPPING);
     }
+    // `majit_gc::header::alloc_varsize_with_gc_header_immortal[_zeroed]`
+    // / `dealloc_varsize_with_gc_header` are `malloc_varsize` operations
+    // (`init_gc_object_immortal`), not graphs. Their bodies walk
+    // `std::alloc::Layout` / `GcHeader::write`, which poisons every
+    // string/bytes payload allocator that calls them. Skip the user-graph
+    // entry so Layer-3b reaches the HOST_ENV builtin (`alloc_varsize_gc_header`).
+    // `majit_gc` is not a local extract crate, so `canonical_dedup_key`
+    // keeps the crate root; the crate-stripped and leaf-only aliases are
+    // the same callable (`is_jit_conditional_call_residual` shape).
+    if is_varsize_gc_header_alloc(canonical_strip) {
+        return Some(SKIP_VARSIZE_GC_HEADER_ALLOC);
+    }
+    // `core::slice::ascii::<Impl>::is_ascii` / `core::str::<Impl>::is_ascii`
+    // are opaque std scans (`FOREIGN_STDLIB_EXTERNALS` Bool residual). A
+    // harvested user graph would beat that stub and re-skip every
+    // `W_UnicodeObject.is_ascii` constructor (`w_str_new`).
+    if is_str_or_slice_is_ascii(canonical_strip) {
+        return Some(SKIP_STR_OR_SLICE_IS_ASCII);
+    }
     None
 }
 
@@ -2275,6 +2294,13 @@ const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
 
 /// [`registration_decline`] reason for `rlib/jit.py ConditionalCallEntry`.
 const SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY: &str = "skip-jit-conditional-call-extregistry";
+
+/// [`registration_decline`] reason for `slice::ascii` / `str` `is_ascii`.
+const SKIP_STR_OR_SLICE_IS_ASCII: &str = "skip-str-or-slice-is-ascii";
+
+/// [`registration_decline`] reason for `majit_gc::header` varsize immortal
+/// allocators (`malloc_varsize` / `init_gc_object_immortal`).
+const SKIP_VARSIZE_GC_HEADER_ALLOC: &str = "skip-varsize-gc-header-alloc";
 
 /// Residual `majit_rlib::jit::conditional_call0..4` /
 /// `conditional_call_elidable1`. `canonical_dedup_key` strips the crate
@@ -2297,6 +2323,54 @@ fn is_jit_conditional_call_residual(canonical_strip: &[String]) -> bool {
             | "conditional_call3"
             | "conditional_call4"
             | "conditional_call_elidable1"
+    )
+}
+
+/// Residual `core::slice::ascii::<Impl>::is_ascii` / `core::str::<Impl>::is_ascii`.
+fn is_str_or_slice_is_ascii(canonical_strip: &[String]) -> bool {
+    match canonical_strip {
+        [crate_name, module, ascii, impl_seg, leaf]
+            if (crate_name == "core" || crate_name == "std")
+                && module == "slice"
+                && ascii == "ascii"
+                && impl_seg == "<Impl>"
+                && leaf == "is_ascii" =>
+        {
+            true
+        }
+        [crate_name, module, impl_seg, leaf]
+            if (crate_name == "core" || crate_name == "std")
+                && ((module == "str" && impl_seg == "<Impl>")
+                    || (module == "slice" && impl_seg == "<Impl>"))
+                && leaf == "is_ascii" =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Residual `majit_gc::header::alloc_varsize_with_gc_header_immortal*` /
+/// `dealloc_varsize_with_gc_header`. `canonical_dedup_key` keeps `majit_gc`
+/// (not a local extract crate), so both `["majit_gc","header",leaf]` and
+/// the crate-stripped `["header",leaf]` / leaf-only aliases name the same
+/// HOST_ENV entry.
+fn is_varsize_gc_header_alloc(canonical_strip: &[String]) -> bool {
+    let leaf = match canonical_strip {
+        [crate_name, module, leaf] if crate_name == "majit_gc" && module == "header" => {
+            leaf.as_str()
+        }
+        [module, leaf] if module == "header" => leaf.as_str(),
+        [leaf] => leaf.as_str(),
+        _ => return false,
+    };
+    matches!(
+        leaf,
+        "alloc_varsize_with_gc_header_immortal"
+            | "alloc_varsize_with_gc_header_immortal_zeroed"
+            | "alloc_varsize_with_gc_header_immortal_zeroed_flag"
+            | "dealloc_varsize_with_gc_header"
+            | "varsize_immortal_layout"
     )
 }
 
@@ -3458,6 +3532,25 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (
         &["core", "slice", "<Impl>", "contains"],
         &["self", "x"],
+        LowLevelType::Bool,
+    ),
+    // `[u8]::is_ascii` / `str::is_ascii` — word-at-a-time std scans. Opaque
+    // residual Bool, same fidelity as `slice::<Impl>::is_empty`. Charon's
+    // extracted body (SIMD / arch tables) is not a graph; Layer-1 would
+    // otherwise skip every `W_UnicodeObject.is_ascii` constructor.
+    (
+        &["core", "slice", "ascii", "<Impl>", "is_ascii"],
+        &["self"],
+        LowLevelType::Bool,
+    ),
+    (
+        &["core", "slice", "<Impl>", "is_ascii"],
+        &["self"],
+        LowLevelType::Bool,
+    ),
+    (
+        &["core", "str", "<Impl>", "is_ascii"],
+        &["self"],
         LowLevelType::Bool,
     ),
     (
@@ -5668,6 +5761,98 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("HOST_ENV must resolve majit_rlib.jit.{leaf}"));
             assert!(crate::annotator::builtin::is_registered(host.qualname()));
+        }
+    }
+
+    /// Residual `majit_gc::header` varsize immortal allocators are
+    /// `malloc_varsize` operations, not graphs. Layer-1 would otherwise
+    /// beat HOST_ENV and the annotator would walk `std::alloc::Layout`.
+    #[test]
+    fn varsize_gc_header_allocs_are_declined_and_host_env_wins() {
+        let public_leaves = [
+            "alloc_varsize_with_gc_header_immortal",
+            "alloc_varsize_with_gc_header_immortal_zeroed",
+            "dealloc_varsize_with_gc_header",
+        ];
+        let private_leaves = [
+            "alloc_varsize_with_gc_header_immortal_zeroed_flag",
+            "varsize_immortal_layout",
+        ];
+        for leaf in public_leaves.iter().chain(private_leaves.iter()) {
+            assert_eq!(
+                registration_decline(&["majit_gc".into(), "header".into(), (*leaf).into()]),
+                Some(SKIP_VARSIZE_GC_HEADER_ALLOC),
+                "{leaf}"
+            );
+            assert_eq!(
+                registration_decline(&["header".into(), (*leaf).into()]),
+                Some(SKIP_VARSIZE_GC_HEADER_ALLOC),
+                "header::{leaf}"
+            );
+            assert_eq!(
+                registration_decline(&[(*leaf).into()]),
+                Some(SKIP_VARSIZE_GC_HEADER_ALLOC),
+                "leaf {leaf}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["majit_gc".into(), "header".into(), "header_of".into()]),
+            None
+        );
+        assert_eq!(
+            registration_decline(&[
+                "core".into(),
+                "slice".into(),
+                "ascii".into(),
+                "<Impl>".into(),
+                "is_ascii".into()
+            ]),
+            Some(SKIP_STR_OR_SLICE_IS_ASCII)
+        );
+        assert_eq!(
+            registration_decline(&[
+                "core".into(),
+                "str".into(),
+                "<Impl>".into(),
+                "is_ascii".into()
+            ]),
+            Some(SKIP_STR_OR_SLICE_IS_ASCII)
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for leaf in public_leaves {
+            let path = crate::parse::CallPath::from_segments(["majit_gc", "header", leaf]);
+            let mut graph = LegacyGraph::new(leaf);
+            graph.set_return(graph.startblock, None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for leaf in public_leaves {
+            let key = FunctionPathKey::from_segments(["majit_gc", "header", leaf]);
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {leaf}"
+            );
+            let host = crate::flowspace::model::host_env_callable(
+                &["majit_gc", "header", leaf]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|| panic!("HOST_ENV must resolve majit_gc.header.{leaf}"));
+            assert!(crate::annotator::builtin::is_registered(host.qualname()));
+            let stripped = crate::flowspace::model::host_env_callable(
+                &["header", leaf]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|| panic!("HOST_ENV must resolve header.{leaf}"));
+            assert!(crate::annotator::builtin::is_registered(
+                stripped.qualname()
+            ));
         }
     }
 

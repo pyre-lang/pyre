@@ -1637,6 +1637,15 @@ impl CrateLoweringState {
             // `external_buffer_view` is an Acquire load of a multi-word
             // aggregate. This caller returns one exception-bridge word.
             "typedef::buffer_as_bytes_like",
+            // `majit_gc::header` varsize immortal helpers (`malloc_varsize`
+            // + `init_gc_object_immortal`). Stamp here so the dispatcher
+            // does not look inside; `collect_policy_opaque` still harvests
+            // only LLBC hints, so HOST_ENV keeps Layer-3b.
+            "header::alloc_varsize_with_gc_header_immortal",
+            "header::alloc_varsize_with_gc_header_immortal_zeroed",
+            "header::alloc_varsize_with_gc_header_immortal_zeroed_flag",
+            "header::dealloc_varsize_with_gc_header",
+            "header::varsize_immortal_layout",
         ] {
             dont_look_inside.insert(path.to_string());
         }

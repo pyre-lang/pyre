@@ -2522,6 +2522,34 @@ impl HostEnv {
             HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_RAW),
         );
 
+        // `majit_gc::header::alloc_varsize_with_gc_header_immortal[_zeroed]`
+        // / `dealloc_varsize_with_gc_header` — concrete `malloc_varsize`
+        // analogues (`init_gc_object_immortal`). Generic `alloc_with_gc_header`
+        // has no look-inside graph; these do, so they are host builtins the
+        // way `malloc_typed` is. `canonical_dedup_key` keeps the `majit_gc`
+        // crate root (it is not a local extract crate), so Layer-3b resolves
+        // prefix `majit_gc.header`. The crate-stripped alias `header` is the
+        // same HostObject Arc (`BUILTIN_TYPER` is identity-keyed).
+        let gc_header_module = HostObject::new_module(crate::runtime_names::modules::GC_HEADER);
+        gc_header_module.module_set(
+            "alloc_varsize_with_gc_header_immortal",
+            HostObject::new_builtin_callable(
+                crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_IMMORTAL,
+            ),
+        );
+        gc_header_module.module_set(
+            "alloc_varsize_with_gc_header_immortal_zeroed",
+            HostObject::new_builtin_callable(
+                crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_IMMORTAL_ZEROED,
+            ),
+        );
+        gc_header_module.module_set(
+            "dealloc_varsize_with_gc_header",
+            HostObject::new_builtin_callable(
+                crate::runtime_names::modules::DEALLOC_VARSIZE_GC_HEADER,
+            ),
+        );
+
         let mut mods = self.modules.lock();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
@@ -2572,6 +2600,11 @@ impl HostEnv {
             crate::runtime_names::modules::OBJECT_LLTYPE.into(),
             lltype_module,
         );
+        mods.insert(
+            crate::runtime_names::modules::GC_HEADER.into(),
+            gc_header_module.clone(),
+        );
+        mods.insert("header".into(), gc_header_module);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.
