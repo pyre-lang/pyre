@@ -710,15 +710,9 @@ impl AssemblerExt for Assembler {
             jit_merge_point_offset: state.jit_merge_point_offset,
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
-            // `jitcode.py` `JitCode._ssarepr` feeds `dump()` only. The
-            // serialized body skips the field, so the prepass does not keep
-            // a flattened copy of every assembled graph. In-crate tests
-            // still read the portal's `jit_merge_point` off it.
-            _ssarepr: if cfg!(test) {
-                Some(std::sync::Arc::new(ssarepr.clone()) as _)
-            } else {
-                None
-            },
+            // dump() reads `_ssarepr`. Assembler.assemble always assigns
+            // `jitcode._ssarepr = ssarepr`. The serialized body skips the field.
+            _ssarepr: Some(std::sync::Arc::new(ssarepr.clone())),
         };
 
         self.count_jitcodes += 1;

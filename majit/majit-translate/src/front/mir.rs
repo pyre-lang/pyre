@@ -7965,10 +7965,13 @@ const STRING_GCREF_GCARRAY_TYPE_ID: &str = "[str]";
 ///
 /// `FlowContext.build_flow` records a block only when `pendingblocks`
 /// reaches it. Edges [`successor_blocks`] does not emit — every
-/// `on_unwind`, and a `SwitchInt` default whose target is a panic abort —
-/// never enqueue a block, so those MIR blocks have no [`BlockId`] and no
-/// per-block row. `Index` yields the graph block; [`MirBlockMap::row`] is
-/// the dense index into the per-block tables.
+/// `on_unwind`, and a `SwitchInt` panic default whose arms are outside
+/// the niche shape — never enqueue a block, so those MIR blocks have no
+/// [`BlockId`] and no per-block row. A niche-shaped `SwitchInt` keeps
+/// that default so [`Lowering::lower_niche_option_switch`] can emit it
+/// as the missing 0/1 arm.
+/// `Index` yields the graph block; [`MirBlockMap::row`] is the dense
+/// index into the per-block tables.
 #[derive(Clone)]
 struct MirBlockMap {
     ids: Vec<Option<BlockId>>,
@@ -8066,9 +8069,16 @@ fn terminator_is_panic_abort(llbc: &Llbc, body: &Unstructured, bb: u64) -> bool 
 
 /// Successors [`Lowering::lower_terminator`] materialises, plus — when
 /// `include_panic_default` — a `SwitchInt` default that targets a panic
-/// abort. `on_unwind` is never a successor: a Rust panic propagates out
-/// of the frame, the way an RPython operation with no handler raises to
-/// its caller.
+/// abort. A niche-shaped `SwitchInt` ([`switch_int_niche_emits_default`])
+/// keeps that default even when `include_panic_default` is false, because
+/// [`Lowering::lower_niche_option_switch`] may emit it as the missing 0/1
+/// arm. `on_unwind` is never a successor: a Rust panic propagates out of
+/// the frame, the way an RPython operation with no handler raises to its
+/// caller.
+///
+/// A normal successor may be a cleanup block:
+/// `kept_block_normal_successor_is_cleanup` is why `strip_cleanup_blocks`
+/// left those bodies unchanged.
 fn successor_blocks(
     llbc: &Llbc,
     body: &Unstructured,
@@ -8089,7 +8099,7 @@ fn successor_blocks(
             SwitchTargets::SwitchInt(_, arms, default) => {
                 let mut targets: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
                 let panic = terminator_is_panic_abort(llbc, body, *default);
-                if include_panic_default || !panic {
+                if include_panic_default || !panic || switch_int_niche_emits_default(llbc, arms) {
                     targets.push(*default);
                 }
                 targets
@@ -8109,15 +8119,39 @@ fn successor_blocks(
         if target >= n || out.contains(&target) {
             continue;
         }
-        if !include_panic_default {
-            debug_assert!(
-                !body.body[target].is_cleanup,
-                "normal edge bb{mir_bb} -> bb{target} enters a cleanup block"
-            );
-        }
         out.push(target);
     }
     out
+}
+
+/// True when the panic default of a `SwitchInt` is kept as a successor
+/// because [`Lowering::lower_niche_option_switch`] may emit it as the
+/// missing 0/1 arm of a niche `Option` `If`.
+///
+/// Shape-only over-approximation: a single `Ref` arm, or exactly one of
+/// the 0/1 integer arms and nothing else. Niche routing is decided during
+/// lowering (`niche_disc_vars`), and the mask is computed before that set
+/// is filled. The generic `SwitchInt` path still filters the panic default
+/// link, so an over-included panic block just becomes a lowered block with
+/// no incoming link.
+fn switch_int_niche_emits_default(llbc: &Llbc, arms: &[(serde_json::Value, u64)]) -> bool {
+    if arms.len() == 1 && arms[0].0.get("Ref").is_some() {
+        return true;
+    }
+    niche_option_switch_missing_01_arm(llbc, arms)
+}
+
+fn niche_option_switch_missing_01_arm(llbc: &Llbc, arms: &[(serde_json::Value, u64)]) -> bool {
+    let mut has0 = false;
+    let mut has1 = false;
+    for (scalar, _) in arms {
+        match scalar_to_const_value(scalar, llbc) {
+            Some(ConstValue::Int(0)) => has0 = true,
+            Some(ConstValue::Int(1)) => has1 = true,
+            _ => return false,
+        }
+    }
+    has0 != has1
 }
 
 fn reachable_mask(llbc: &Llbc, body: &Unstructured, include_panic_default: bool) -> Vec<bool> {
@@ -8150,6 +8184,124 @@ pub(crate) fn forward_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bo
 /// Blocks reachable from bb0 along the edges the lowering emits.
 fn lowered_reachable_mask(llbc: &Llbc, body: &Unstructured) -> Vec<bool> {
     reachable_mask(llbc, body, false)
+}
+
+#[cfg(test)]
+mod reachable_mask_tests {
+    use super::{forward_reachable_mask, lowered_reachable_mask, successor_blocks};
+    use majit_charon_reader::{Llbc, ullbc::Unstructured};
+    use serde_json::{Value, json};
+
+    fn span() -> Value {
+        json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 0, "col": 0},
+                "end": {"line": 0, "col": 0}
+            },
+            "generated_from_span": null
+        })
+    }
+
+    fn ty() -> Value {
+        json!({"Deduplicated": 0})
+    }
+
+    fn place(i: u64) -> Value {
+        json!({"kind": {"Local": i}, "ty": ty()})
+    }
+
+    fn bb(kind: Value, is_cleanup: bool) -> Value {
+        json!({
+            "statements": [],
+            "terminator": {"span": span(), "kind": kind},
+            "is_cleanup": is_cleanup
+        })
+    }
+
+    fn body_of(blocks: Vec<Value>) -> (Llbc, Unstructured) {
+        let llbc = Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[]}}"#,
+        )
+        .expect("empty artefact");
+        let raw = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [{"index": 0, "name": null, "span": span(), "ty": ty()}]
+            },
+            "body": blocks
+        });
+        let body: Unstructured = serde_json::from_value(raw).expect("fixture body");
+        (llbc, body)
+    }
+
+    /// A one-arm `Ref` SwitchInt is niche-shaped; the panic default is a
+    /// successor the lowered mask keeps.
+    #[test]
+    fn lowered_mask_keeps_niche_option_panic_default() {
+        let switch = json!({"Switch": {
+            "discr": {"Copy": place(0)},
+            "targets": {"SwitchInt": [
+                null,
+                [[{"Ref": [{"Body": 18}, {"DynTrait": {"id": 0}}, "Mut"]}, 1]],
+                2
+            ]}
+        }});
+        let (llbc, body) = body_of(vec![
+            bb(switch, false),
+            bb(json!("Return"), false),
+            bb(json!({"Abort": "UndefinedBehavior"}), false),
+        ]);
+        let lowered = lowered_reachable_mask(&llbc, &body);
+        assert_eq!(
+            lowered,
+            vec![true, true, true],
+            "niche Option panic default is an emitted If arm"
+        );
+        let forward = forward_reachable_mask(&llbc, &body);
+        assert_eq!(forward, vec![true, true, true]);
+    }
+
+    /// Arms {0, 1} plus a panic default sit outside the niche shape, so
+    /// the lowered mask drops that default.
+    #[test]
+    fn lowered_mask_drops_generic_switchint_panic_default() {
+        let switch = json!({"Switch": {
+            "discr": {"Copy": place(0)},
+            "targets": {"SwitchInt": [
+                null,
+                [
+                    [{"Scalar": {"Unsigned": ["U8", "0"]}}, 1],
+                    [{"Scalar": {"Unsigned": ["U8", "1"]}}, 1]
+                ],
+                2
+            ]}
+        }});
+        let (llbc, body) = body_of(vec![
+            bb(switch, false),
+            bb(json!("Return"), false),
+            bb(json!({"Abort": "UndefinedBehavior"}), false),
+        ]);
+        let lowered = lowered_reachable_mask(&llbc, &body);
+        assert_eq!(
+            lowered,
+            vec![true, true, false],
+            "SwitchInt arms {{0, 1}} leave the panic default off the lowered mask"
+        );
+    }
+
+    /// `strip_cleanup_blocks` left bodies unchanged when a normal successor
+    /// targets a cleanup block (`kept_block_normal_successor_is_cleanup`).
+    #[test]
+    fn successor_blocks_keeps_a_normal_edge_into_cleanup() {
+        let (llbc, body) = body_of(vec![
+            bb(json!({"Goto": {"target": 1}}), false),
+            bb(json!("UnwindResume"), true),
+        ]);
+        let succs = successor_blocks(&llbc, &body, 0, false);
+        assert_eq!(succs, vec![1]);
+    }
 }
 
 /// The `(base, index)` operands of a devirtualized workspace index call,
@@ -9198,9 +9350,11 @@ impl<'a> Lowering<'a> {
 
         // `FlowContext.build_flow` records a block only when `pendingblocks`
         // reaches it. Edges `successor_blocks` does not emit — every
-        // `on_unwind`, and a `SwitchInt` default whose target is a panic
-        // abort — never enqueue a block, so those MIR blocks get no
-        // `BlockId`, no per-block row, and no dead stub.
+        // `on_unwind`, and a `SwitchInt` panic default whose arms are
+        // outside the niche shape — never enqueue a block, so those MIR
+        // blocks get no `BlockId`, no per-block row, and no dead stub. A
+        // niche-shaped `SwitchInt` keeps that default
+        // (`lower_niche_option_switch`).
         let forward_reached = forward_reachable_mask(llbc, body);
         let lowered = lowered_reachable_mask(llbc, body);
         let block_id = MirBlockMap::from_lowered(&mut graph, &lowered);
@@ -40562,11 +40716,11 @@ impl AccumulatorFacts {
             }
         }
         let mut append_piece_accumulator = vec![None; n];
+        let forward_blocks = forward_reachable_mask(llbc, &body);
         for c in owned_dests {
             if c >= n || !builder_mode[c] {
                 continue;
             }
-            let forward_blocks = forward_reachable_mask(llbc, &body);
             for (bb_idx, block) in body.body.iter().enumerate() {
                 if !forward_blocks[bb_idx] {
                     continue;
@@ -41174,11 +41328,11 @@ fn append_piece_accumulator_of_arg_temp(
 ) -> Option<usize> {
     let cache = ScanCache::new(body.locals.locals.len());
     cache.precompute_fresh(body, llbc);
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for candidate in owned_builder_dest_locals(body, llbc) {
         if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
             continue;
         }
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, block) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -41967,9 +42121,9 @@ fn rvalue_copied_local(rvalue: &Rvalue) -> Option<usize> {
 fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local: usize) -> bool {
     let mut alias = vec![dest_local];
     let mut grew = true;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     while grew {
         grew = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -41995,7 +42149,6 @@ fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local
     if alias.contains(&0) {
         return true;
     }
-    let forward_blocks = forward_reachable_mask(llbc, body);
     body.body.iter().enumerate().any(|(bb_idx, bb)| {
         forward_blocks[bb_idx]
             && (bb
@@ -44754,9 +44907,9 @@ fn body_returns_owned_scope(
     // Follow plain moves of a guard (`_21 = move _3`) to the local that
     // enters the aggregate.
     let mut guards = guards;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     loop {
         let before = guards.count();
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -44778,7 +44931,6 @@ fn body_returns_owned_scope(
     }
     let mut holders = bit_set::BitSet::new();
     let mut moved_into_result = bit_set::BitSet::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -44855,7 +45007,6 @@ impl OwnedRootScopes {
                 }
                 work.extend(block_successors(llbc, body, bb));
             }
-            let forward_blocks = forward_reachable_mask(llbc, &body);
             for bb in 0..body.body.len() {
                 if !forward_blocks[bb] {
                     continue;
@@ -45479,15 +45630,14 @@ fn pin_roots_incoming_slice(
 /// The count in `assigned` is forward-reachable only, so the scan is too:
 /// an `on_unwind` cleanup block is still in the body.
 fn unique_assigned_rvalue(
-    llbc: &Llbc,
     body: &Unstructured,
     local: usize,
     assigned: &std::collections::HashMap<usize, usize>,
+    forward_blocks: &[bool],
 ) -> Option<Rvalue> {
     if assigned.get(&local) != Some(&1) {
         return None;
     }
-    let forward_blocks = forward_reachable_mask(llbc, body);
     body.body
         .iter()
         .enumerate()
@@ -45509,10 +45659,11 @@ fn local_usize_literal(
     body: &Unstructured,
     local: usize,
     assigned: &std::collections::HashMap<usize, usize>,
+    forward_blocks: &[bool],
 ) -> Option<u64> {
     let mut local = local;
     for _ in 0..8 {
-        match unique_assigned_rvalue(llbc, body, local, assigned)? {
+        match unique_assigned_rvalue(body, local, assigned, forward_blocks)? {
             Rvalue::Use(operand, _) => {
                 if let Some(k) = operand_usize_literal(llbc, &operand) {
                     return Some(k);
@@ -45532,12 +45683,19 @@ fn index_offset_usize(
     body: &Unstructured,
     offset: &serde_json::Value,
     assigned: &std::collections::HashMap<usize, usize>,
+    forward_blocks: &[bool],
 ) -> Option<u64> {
     let op: Operand = serde_json::from_value(offset.clone()).ok()?;
     if let Some(k) = operand_usize_literal(llbc, &op) {
         return Some(k);
     }
-    local_usize_literal(llbc, body, operand_local(Some(&op))?, assigned)
+    local_usize_literal(
+        llbc,
+        body,
+        operand_local(Some(&op))?,
+        assigned,
+        forward_blocks,
+    )
 }
 
 /// `(*args_w)[k]` / `args_w[k]` when `args_w` is an incoming parameter and
@@ -45547,6 +45705,7 @@ fn place_incoming_slice_elem(
     body: &Unstructured,
     place: &Place,
     assigned: &std::collections::HashMap<usize, usize>,
+    forward_blocks: &[bool],
 ) -> Option<(usize, u64)> {
     let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
         return None;
@@ -45555,7 +45714,7 @@ fn place_incoming_slice_elem(
     if index.get("from_end").and_then(serde_json::Value::as_bool) == Some(true) {
         return None;
     }
-    let k = index_offset_usize(llbc, body, index.get("offset")?, assigned)?;
+    let k = index_offset_usize(llbc, body, index.get("offset")?, assigned, forward_blocks)?;
     let slice_place = match &inner.kind {
         PlaceKind::Projection(base, ProjectionElem::Atom(atom)) if atom == "Deref" => base.as_ref(),
         _ => inner.as_ref(),
@@ -45578,21 +45737,25 @@ fn pin_value_incoming_slice_elem(
     body: &Unstructured,
     value: usize,
     assigned: &std::collections::HashMap<usize, usize>,
+    forward_blocks: &[bool],
 ) -> Option<(usize, u64)> {
     let mut local = value;
     for _ in 0..8 {
-        if let Some(rvalue) = unique_assigned_rvalue(llbc, body, local, assigned) {
+        if let Some(rvalue) = unique_assigned_rvalue(body, local, assigned, forward_blocks) {
             match rvalue {
                 Rvalue::Use(operand, _) => {
                     if let Some(place) = operand_place(&operand)
-                        && let Some(elem) = place_incoming_slice_elem(llbc, body, place, assigned)
+                        && let Some(elem) =
+                            place_incoming_slice_elem(llbc, body, place, assigned, forward_blocks)
                     {
                         return Some(elem);
                     }
                     local = operand_local(Some(&operand))?;
                 }
                 Rvalue::Ref { place, .. } => {
-                    if let Some(elem) = place_incoming_slice_elem(llbc, body, &place, assigned) {
+                    if let Some(elem) =
+                        place_incoming_slice_elem(llbc, body, &place, assigned, forward_blocks)
+                    {
                         return Some(elem);
                     }
                     match place.kind {
@@ -45625,13 +45788,20 @@ fn incoming_elem_pins(
     body: &Unstructured,
     scope_pins: &[(usize, usize)],
     assigned: &std::collections::HashMap<usize, usize>,
+    forward_blocks: &[bool],
 ) -> Option<(usize, Vec<u64>)> {
     if scope_pins.is_empty() {
         return None;
     }
     let mut elems = Vec::with_capacity(scope_pins.len());
     for &(_, value) in scope_pins {
-        elems.push(pin_value_incoming_slice_elem(llbc, body, value, assigned)?);
+        elems.push(pin_value_incoming_slice_elem(
+            llbc,
+            body,
+            value,
+            assigned,
+            forward_blocks,
+        )?);
     }
     let slice = elems[0].0;
     if elems.iter().any(|&(s, _)| s != slice) {
@@ -46106,18 +46276,18 @@ struct RootGetterIndex<'a> {
     candidates: &'a bit_set::BitSet,
     aliases: &'a std::collections::HashMap<usize, usize>,
     call_dests: &'a bit_set::BitSet,
+    forward_blocks: &'a [bool],
 }
 
 fn single_statement_rvalue(
-    llbc: &Llbc,
     body: &Unstructured,
     assigned: &std::collections::HashMap<usize, usize>,
     local: usize,
+    forward_blocks: &[bool],
 ) -> Option<Rvalue> {
     if assigned.get(&local) != Some(&1) {
         return None;
     }
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46161,7 +46331,7 @@ enum CapturePeel {
 }
 
 fn peel_closure_capture(
-    llbc: &Llbc,
+    _llbc: &Llbc,
     body: &Unstructured,
     index: &RootGetterIndex<'_>,
     receiver: &Operand,
@@ -46174,7 +46344,9 @@ fn peel_closure_capture(
         if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
             return CapturePeel::Unknown;
         }
-        let Some(value) = single_statement_rvalue(llbc, body, index.assigned, local) else {
+        let Some(value) =
+            single_statement_rvalue(body, index.assigned, local, index.forward_blocks)
+        else {
             return CapturePeel::Unknown;
         };
         carriers.push(local);
@@ -46211,7 +46383,7 @@ fn peel_closure_capture(
 
 /// `(index local, scope, temporaries walked, not including the index)`.
 fn peel_captured_index(
-    llbc: &Llbc,
+    _llbc: &Llbc,
     body: &Unstructured,
     index: &RootGetterIndex<'_>,
     capture: &Operand,
@@ -46233,7 +46405,7 @@ fn peel_captured_index(
         if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
             return None;
         }
-        let value = single_statement_rvalue(llbc, body, index.assigned, local)?;
+        let value = single_statement_rvalue(body, index.assigned, local, index.forward_blocks)?;
         carriers.push(local);
         match value {
             Rvalue::Use(inner, _) => {
@@ -46305,7 +46477,7 @@ fn peel_getter_addend(
 }
 
 fn peel_empty_unit(
-    llbc: &Llbc,
+    _llbc: &Llbc,
     body: &Unstructured,
     index: &RootGetterIndex<'_>,
     op: &Operand,
@@ -46316,7 +46488,7 @@ fn peel_empty_unit(
         if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
             return None;
         }
-        let value = single_statement_rvalue(llbc, body, index.assigned, local)?;
+        let value = single_statement_rvalue(body, index.assigned, local, index.forward_blocks)?;
         carriers.push(local);
         match value {
             Rvalue::Use(inner, _) => {
@@ -46351,7 +46523,7 @@ fn peel_usize_addend(
     if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
         return None;
     }
-    let value = single_statement_rvalue(llbc, body, index.assigned, local)?;
+    let value = single_statement_rvalue(body, index.assigned, local, index.forward_blocks)?;
     let mut peeled = match value {
         Rvalue::Use(inner, _) => peel_usize_addend(llbc, body, index, &inner, depth + 1)?,
         Rvalue::Aggregate(_, operands) => {
@@ -46375,12 +46547,11 @@ fn local_is_root_index_or_guard(index: &RootGetterIndex<'_>, local: usize) -> bo
 }
 
 fn capture_carriers_stay_inside(
-    llbc: &Llbc,
     body: &Unstructured,
     carriers: &bit_set::BitSet,
     getter_bbs: &bit_set::BitSet,
+    forward_blocks: &[bool],
 ) -> bool {
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46444,9 +46615,8 @@ fn record_root_slot_getter_reads(
 ) -> RootGetterReads {
     let mut call_dests = bit_set::BitSet::new();
     let mut calls: Vec<(usize, CallPayload)> = Vec::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        if !forward_blocks[bb_idx] {
+        if !index.forward_blocks[bb_idx] {
             continue;
         }
         let Ok(term) = bb.term(llbc) else {
@@ -46551,7 +46721,9 @@ fn record_root_slot_getter_reads(
                 carriers.insert(*local);
             }
         }
-        if bad_carrier || !capture_carriers_stay_inside(llbc, body, &carriers, &getter_bbs) {
+        if bad_carrier
+            || !capture_carriers_stay_inside(body, &carriers, &getter_bbs, index.forward_blocks)
+        {
             continue;
         }
         for local in carriers.iter() {
@@ -46689,7 +46861,6 @@ fn analyze_root_brackets_with(
     }
     // (2) Borrow temporaries, so a receiver operand names its guard.
     let mut aliases: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46718,7 +46889,6 @@ fn analyze_root_brackets_with(
     //     `_t` where `_t = copy _ob_slot`; without the closure below every
     //     read-back looks like an index this pass cannot name.
     let mut assigned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46779,7 +46949,6 @@ fn analyze_root_brackets_with(
         std::collections::HashMap::new();
     // A destination two `shadow_stack_len` calls write names no one depth.
     let mut len_poison = bit_set::BitSet::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46911,7 +47080,6 @@ fn analyze_root_brackets_with(
     let mut changed = true;
     while changed {
         changed = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -46923,7 +47091,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(llbc, body, &assigned, &operand),
+                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -46952,7 +47120,6 @@ fn analyze_root_brackets_with(
     changed = true;
     while changed {
         changed = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -46964,7 +47131,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(llbc, body, &assigned, &operand),
+                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -47004,7 +47171,6 @@ fn analyze_root_brackets_with(
     let mut sums: std::collections::HashMap<usize, RootSlotSum> = std::collections::HashMap::new();
     let mut offsets: std::collections::HashMap<usize, RootSlotSum> =
         std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -47051,7 +47217,6 @@ fn analyze_root_brackets_with(
             };
         }
     }
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -47083,7 +47248,6 @@ fn analyze_root_brackets_with(
     let mut changed = true;
     while changed {
         changed = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -47095,7 +47259,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(llbc, body, &assigned, &operand),
+                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -47156,6 +47320,7 @@ fn analyze_root_brackets_with(
         candidates: &candidates,
         aliases: &aliases,
         call_dests: &call_dests,
+        forward_blocks: &forward_blocks,
     };
     // Closure reads are collected before step 3 retires a guard: the `&index`
     // that builds the capture is a mention the whitelist below keeps.
@@ -47163,7 +47328,6 @@ fn analyze_root_brackets_with(
     let mut pins: std::collections::HashMap<usize, Vec<(usize, usize)>> =
         std::collections::HashMap::new();
     let mut gets: Vec<(usize, usize, usize, u64)> = reads.gets;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -47181,7 +47345,7 @@ fn analyze_root_brackets_with(
                 }
                 // `_t = copy _slot`, the argument temporary (2.5) recorded,
                 // and a field of a tuple aggregate that names the same slot.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(llbc, body, &assigned, &operand)) =>
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, &operand, &forward_blocks)) =>
                 {
                     continue;
                 }
@@ -47443,9 +47607,9 @@ fn analyze_root_brackets_with(
     let surviving: Vec<usize> = candidates.iter().collect();
     for scope in surviving {
         let opener = opener_block[&scope];
-        let incoming_elem = pins
-            .get(&scope)
-            .and_then(|scope_pins| incoming_elem_pins(llbc, body, scope_pins, &assigned));
+        let incoming_elem = pins.get(&scope).and_then(|scope_pins| {
+            incoming_elem_pins(llbc, body, scope_pins, &assigned, &forward_blocks)
+        });
         let pins_are_incoming_slice = slice_runs
             .values()
             .any(|(run_scope, _, _)| *run_scope == scope)
@@ -47808,10 +47972,10 @@ fn indexed_field_parts(payload: &serde_json::Value) -> Option<(Option<u64>, usiz
 /// Operand `N` of a single-assignment tuple aggregate, when `operand` is
 /// `Copy`/`Move` of that aggregate's field `N`.
 fn tuple_aggregate_field_src(
-    llbc: &Llbc,
     body: &Unstructured,
     assigned: &std::collections::HashMap<usize, usize>,
     operand: &Operand,
+    forward_blocks: &[bool],
 ) -> Option<usize> {
     let (Operand::Copy(place) | Operand::Move(place)) = operand else {
         return None;
@@ -47829,7 +47993,7 @@ fn tuple_aggregate_field_src(
         return None;
     };
     let Rvalue::Aggregate(kind, operands) =
-        single_statement_rvalue(llbc, body, assigned, tmp as usize)?
+        single_statement_rvalue(body, assigned, tmp as usize, forward_blocks)?
     else {
         return None;
     };
@@ -47853,13 +48017,13 @@ fn aggregate_kind_is_tuple(kind: &serde_json::Value) -> bool {
 /// The local a Use names: a plain copy, or field `N` of a single-assignment
 /// tuple aggregate whose operand `N` is that local.
 fn use_operand_slot_src(
-    llbc: &Llbc,
     body: &Unstructured,
     assigned: &std::collections::HashMap<usize, usize>,
     operand: &Operand,
+    forward_blocks: &[bool],
 ) -> Option<usize> {
     operand_local(Some(operand))
-        .or_else(|| tuple_aggregate_field_src(llbc, body, assigned, operand))
+        .or_else(|| tuple_aggregate_field_src(body, assigned, operand, forward_blocks))
 }
 
 /// The local `_s` of a `_s.<field>` read of a tuple, such as the sum or the
@@ -48155,9 +48319,9 @@ fn analyze_owner_roots_with(
     // reborrow `_u = &(*_t)` MIR inserts for an auto-deref receiver.
     let mut borrow_of: Vec<Option<usize>> = vec![None; n_locals];
     let mut changed = true;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     while changed {
         changed = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -48200,7 +48364,6 @@ fn analyze_owner_roots_with(
     // Each borrow is read exactly once: by `Deref` or by a reborrow.
     let mut borrow_uses = vec![0usize; n_locals];
     let names_watched = |op: &Operand| operand_local(Some(op)).is_some_and(|l| watched.contains(l));
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -48731,7 +48894,6 @@ fn elaborate_explicit_root_closes(
     // Opener blocks per guard local.
     let mut openers: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -48782,7 +48944,6 @@ fn elaborate_explicit_root_closes(
         let dests: bit_set::BitSet = mine.iter().map(|c| c.dest).collect();
         let mut private = temps.clone();
         private.union_with(&dests);
-        let forward_blocks = forward_reachable_mask(llbc, body);
         let mentioned_elsewhere = body.body.iter().enumerate().any(|(bb_idx, bb)| {
             if !forward_blocks[bb_idx] {
                 return false;
@@ -48857,7 +49018,6 @@ fn elaborate_explicit_root_closes(
         }
         let mut dead: Vec<usize> = Vec::new();
         let mut sound = mine.iter().all(|c| state[c.bb] == INIT);
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -48888,7 +49048,6 @@ fn elaborate_explicit_root_closes(
             rewrites.push((c.bb, close));
             removed_moves.push((c.bb, c.moves.clone()));
         }
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -49199,7 +49358,6 @@ fn compute_index_write_extra_live(
     if index_call.is_empty() {
         return extra;
     }
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -49265,7 +49423,6 @@ fn compute_interior_field_extra_live(
             TracedPtrAddHeader::EntriesItem { local } => local,
             TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,
         };
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (use_idx, use_bb) in body.body.iter().enumerate() {
             if !forward_blocks[use_idx] {
                 continue;
@@ -50667,9 +50824,9 @@ fn unstructured_address_escape(
     // summary reads this once the join has settled.
     let mut returned_at = vec![None; n];
     let mut changed = true;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     while changed {
         changed = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (index, block) in body.body.iter().enumerate() {
             if !forward_blocks[index] {
                 continue;
@@ -68126,9 +68283,9 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
     // loop.
     let mut referent = vec![None; n];
     let mut changed = true;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     while changed {
         changed = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -68169,7 +68326,6 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
         }
     }
     let mut out = vec![None; n];
-    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -68226,9 +68382,9 @@ fn item_addr_locals(
     let n = body.locals.locals.len();
     let mut addr = vec![false; n];
     let mut changed = true;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     while changed {
         changed = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -68744,7 +68900,6 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
         };
         let wanted = group_locals(&roles, storage);
         let mut ok = true;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         'blocks: for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;

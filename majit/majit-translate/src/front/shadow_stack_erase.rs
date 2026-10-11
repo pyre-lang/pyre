@@ -982,12 +982,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             Ok(TermKind::Return) => {
                 if depth != 0 {
                     // 10.04 `Drop` of the guard lives in an `is_cleanup`
-                    // block; `unstructured` leaves those out and appends
-                    // one `UnwindResume`. Return is then the normal closer.
+                    // block. `FunDecl::unstructured` keeps those blocks, so
+                    // `UnwindResume` is among them and a later
+                    // `UnwindTerminate` can be last. Return is then the
+                    // normal closer.
                     if body
                         .body
-                        .last()
-                        .is_some_and(|bb| matches!(bb.term(llbc), Ok(TermKind::UnwindResume)))
+                        .iter()
+                        .any(|bb| matches!(bb.term_ref(llbc), Ok(TermKind::UnwindResume)))
                     {
                         depth = 0;
                     } else {
@@ -1027,7 +1029,6 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     for local in plan.specials.keys() {
         watched.insert(*local);
     }
-    let forward_blocks = super::forward_reachable_mask(llbc, &body);
     for (bb, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
@@ -2832,6 +2833,14 @@ mod tests {
         })
     }
 
+    fn bb_cleanup(kind: Value) -> Value {
+        json!({
+            "statements": [],
+            "terminator": {"span": span(), "kind": kind},
+            "is_cleanup": true
+        })
+    }
+
     fn call_fun(fun: u64, args: Vec<Value>, dest: u64, target: u64) -> Value {
         json!({"Call": {
             "call": {
@@ -3057,6 +3066,31 @@ mod tests {
             is_neutral(&body, &llbc),
             "len-1 of a just-pinned slot must be depth-neutral"
         );
+    }
+
+    /// `Drop` of the guard lives in an `is_cleanup` block. `unstructured`
+    /// keeps those blocks, so a later `UnwindTerminate` can be last while
+    /// `UnwindResume` remains in the body. Return with published slots is
+    /// accepted when a retained block is `UnwindResume`.
+    #[test]
+    fn analyze_accepts_return_with_slots_when_unwind_resume_is_not_last() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            3,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![copy(0)], 2, 2)),
+                bb(json!("Return")),
+                bb_cleanup(json!("UnwindResume")),
+                bb_cleanup(json!("UnwindTerminate")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
     }
 
     /// `pin_self`: pin, `len - 1`, return that index. The return place is
