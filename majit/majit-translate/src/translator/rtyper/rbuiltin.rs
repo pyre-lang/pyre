@@ -2133,6 +2133,7 @@ pub fn rtype_WindowsError__init__(
 
 /// Pack a live `Repr` into `ConstValue::Repr`. The box is leaked so the
 /// pointer stays valid for the process and `ConstValue` stays `Send`.
+#[cfg(test)]
 pub(crate) fn repr_const(
     repr: Arc<dyn crate::translator::rtyper::rmodel::Repr>,
 ) -> crate::flowspace::model::ConstValue {

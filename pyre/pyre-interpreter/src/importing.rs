@@ -5349,6 +5349,7 @@ pub fn init_importlib_bootstrap(
 /// seed `sys.modules`; a name already present skips `_builtin_from_name` and
 /// keeps the natively-registered module object authoritative.
 #[cfg(feature = "host_env")]
+#[cfg(test)]
 fn seed_importlib_bootstrap_builtins(
     execution_context: *const PyExecutionContext,
 ) -> Result<(), crate::PyError> {
