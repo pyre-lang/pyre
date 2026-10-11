@@ -1214,16 +1214,14 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "write() missing buffer",
                         ));
                     }
-                    let mut obj = args[0];
                     let roots = pyre_object::gc_roots::push_roots();
-                    let obj_slot = roots.pin_roots(&[obj]);
                     let args_base = roots.pin_roots(args);
-                    let access = mmap_get_attr_i64(roots.get(obj_slot), "_access");
+                    let access = mmap_get_attr_i64(roots.get(args_base), "_access");
                     if access == MMAP_ACCESS_READ {
                         return Err(pyre_interpreter::PyError::type_error("mmap is read-only"));
                     }
                     let arg1 = roots.get(args_base + 1);
-                    obj = roots.get(obj_slot);
+                    let mut obj = roots.get(args_base);
                     drop(roots);
                     let buf = {
                         if !pyre_object::bytesobject::is_bytes_like(arg1) {
@@ -1266,16 +1264,14 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "write_byte() missing arg",
                         ));
                     }
-                    let mut obj = args[0];
                     let roots = pyre_object::gc_roots::push_roots();
-                    let obj_slot = roots.pin_roots(&[obj]);
                     let args_base = roots.pin_roots(args);
-                    let access = mmap_get_attr_i64(roots.get(obj_slot), "_access");
+                    let access = mmap_get_attr_i64(roots.get(args_base), "_access");
                     if access == MMAP_ACCESS_READ {
                         return Err(pyre_interpreter::PyError::type_error("mmap is read-only"));
                     }
                     let arg1 = roots.get(args_base + 1);
-                    obj = roots.get(obj_slot);
+                    let mut obj = roots.get(args_base);
                     drop(roots);
                     // `interp_mmap.py write_byte(byte=int)` —
                     // `@unwrap_spec(byte=int)` rejects non-ints, then
@@ -1604,8 +1600,12 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             let nargs = args.len();
             let roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = roots.pin_roots(&[obj]);
-            let args_base = roots.pin_roots(args);
+            let args_base = if args.is_empty() {
+                roots.pin_roots(&[obj])
+            } else {
+                roots.pin_roots(args)
+            };
+            let obj_slot = args_base;
             let _ = mmap_ptr(roots.get(obj_slot))?;
             if nargs < 2 {
                 return Err(pyre_interpreter::PyError::type_error(
@@ -1672,23 +1672,22 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "move() requires dest, src, count",
                         ));
                     }
-                    let mut obj = args[0];
                     // `interp_mmap.py move(dest, src, count)` —
                     // `@unwrap_spec(dest=int, src=int, count=int)` plus
                     // `self.check_writeable()` upfront.  We require all
                     // three args use the index protocol and reject ACCESS_READ.
                     let roots = pyre_object::gc_roots::push_roots();
-                    let obj_slot = roots.pin_roots(&[obj]);
                     let args_base = roots.pin_roots(args);
-                    if mmap_get_attr_i64(roots.get(obj_slot), "_access") == MMAP_ACCESS_READ {
+                    if mmap_get_attr_i64(roots.get(args_base), "_access") == MMAP_ACCESS_READ {
                         return Err(pyre_interpreter::PyError::type_error("mmap is read-only"));
                     }
                     let dest =
-                        mmap_index_w(roots.get(obj_slot), roots.get(args_base + 1))? as usize;
-                    let src = mmap_index_w(roots.get(obj_slot), roots.get(args_base + 2))? as usize;
+                        mmap_index_w(roots.get(args_base), roots.get(args_base + 1))? as usize;
+                    let src =
+                        mmap_index_w(roots.get(args_base), roots.get(args_base + 2))? as usize;
                     let count =
-                        mmap_index_w(roots.get(obj_slot), roots.get(args_base + 3))? as usize;
-                    obj = roots.get(obj_slot);
+                        mmap_index_w(roots.get(args_base), roots.get(args_base + 3))? as usize;
+                    let obj = roots.get(args_base);
                     drop(roots);
                     let (p, total) = mmap_ptr(obj)?;
                     if dest.saturating_add(count) > total || src.saturating_add(count) > total {
@@ -2550,7 +2549,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 fn register_posix_constants(ns: pyre_object::PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,

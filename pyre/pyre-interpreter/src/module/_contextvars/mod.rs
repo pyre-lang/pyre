@@ -16,14 +16,7 @@ pub(crate) fn context_var_type() -> PyObjectRef {
         let tp = pyre_interpreter::typedef::make_builtin_type("_contextvars.ContextVar", |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
-            let store = |name: &str, value: PyObjectRef| unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                    name,
-                    value,
-                );
-            };
+            let _ = pyre_object::gc_roots::pin_root(ns);
             let signature = pyre_interpreter::gateway::Signature::new(
                 vec!["cls", "name", "default"],
                 None,
@@ -31,14 +24,16 @@ pub(crate) fn context_var_type() -> PyObjectRef {
                 1,
                 2,
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__new__",
                 pyre_interpreter::typedef::make_new_descr_with_signature(
                     context_var_new,
-                    signature.clone(),
-                ),
+                    signature.clone()
+                )
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__init__",
                 pyre_interpreter::make_builtin_function_with_signature(
                     "__init__",
@@ -49,43 +44,61 @@ pub(crate) fn context_var_type() -> PyObjectRef {
                         None,
                         1,
                         2,
-                    ),
-                ),
+                    )
+                )
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "get",
-                pyre_interpreter::make_builtin_function("get", context_var_get),
+                pyre_interpreter::make_builtin_function("get", context_var_get)
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "set",
-                pyre_interpreter::make_builtin_function_with_arity("set", context_var_set, 2),
+                pyre_interpreter::make_builtin_function_with_arity("set", context_var_set, 2)
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "reset",
-                pyre_interpreter::make_builtin_function_with_arity("reset", context_var_reset, 2),
+                pyre_interpreter::make_builtin_function_with_arity("reset", context_var_reset, 2)
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__repr__",
-                pyre_interpreter::make_builtin_function_with_arity("__repr__", context_var_repr, 1),
+                pyre_interpreter::make_builtin_function_with_arity("__repr__", context_var_repr, 1)
             );
-            store(
-                "name",
-                pyre_interpreter::typedef::make_getset_descriptor_named(
-                    pyre_interpreter::make_builtin_function_with_arity(
-                        "name",
-                        context_var_name_get,
-                        2,
-                    ),
+            {
+                let getter = pyre_interpreter::make_builtin_function_with_arity(
                     "name",
-                ),
-            );
-            store(
-                "__class_getitem__",
-                pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
+                    context_var_name_get,
+                    2,
+                );
+                let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(getter);
+                crate::__pyre_put_new!(
+                    ns_slot,
+                    "name",
+                    pyre_interpreter::typedef::make_getset_descriptor_named(
+                        pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                        "name"
+                    )
+                );
+            }
+            {
+                let func = pyre_interpreter::make_builtin_function(
                     "__class_getitem__",
                     pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
-                )),
-            );
+                );
+                let func_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(func);
+                crate::__pyre_put_new!(
+                    ns_slot,
+                    "__class_getitem__",
+                    pyre_object::function::w_classmethod_new(
+                        pyre_object::gc_roots::shadow_stack_get(func_slot)
+                    )
+                );
+            }
         });
         unsafe { typeobject::w_type_set_hasdict(tp, true) };
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
@@ -372,60 +385,78 @@ fn token_type() -> PyObjectRef {
         let tp = pyre_interpreter::typedef::make_builtin_type("_contextvars.Token", |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
-            let store = |name: &str, value: PyObjectRef| unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                    name,
-                    value,
-                );
-            };
-            store("MISSING", w_instance_new(token_missing_type()));
-            store(
-                "var",
-                pyre_interpreter::typedef::make_getset_descriptor_named(
-                    pyre_interpreter::make_builtin_function_with_arity("var", token_var_get, 2),
+            let _ = pyre_object::gc_roots::pin_root(ns);
+            crate::__pyre_put_new!(ns_slot, "MISSING", w_instance_new(token_missing_type()));
+            {
+                let getter =
+                    pyre_interpreter::make_builtin_function_with_arity("var", token_var_get, 2);
+                let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(getter);
+                crate::__pyre_put_new!(
+                    ns_slot,
                     "var",
-                ),
-            );
-            store(
-                "old_value",
-                pyre_interpreter::typedef::make_getset_descriptor_named(
-                    pyre_interpreter::make_builtin_function_with_arity(
-                        "old_value",
-                        token_old_value_get,
-                        2,
-                    ),
+                    pyre_interpreter::typedef::make_getset_descriptor_named(
+                        pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                        "var"
+                    )
+                );
+            }
+            {
+                let getter = pyre_interpreter::make_builtin_function_with_arity(
                     "old_value",
-                ),
-            );
-            store(
+                    token_old_value_get,
+                    2,
+                );
+                let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(getter);
+                crate::__pyre_put_new!(
+                    ns_slot,
+                    "old_value",
+                    pyre_interpreter::typedef::make_getset_descriptor_named(
+                        pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                        "old_value"
+                    )
+                );
+            }
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__repr__",
-                pyre_interpreter::make_builtin_function_with_arity("__repr__", token_repr, 1),
+                pyre_interpreter::make_builtin_function_with_arity("__repr__", token_repr, 1)
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__enter__",
-                pyre_interpreter::make_builtin_function_with_arity("__enter__", token_enter, 1),
+                pyre_interpreter::make_builtin_function_with_arity("__enter__", token_enter, 1)
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__exit__",
-                pyre_interpreter::make_builtin_function_with_arity("__exit__", token_exit, 4),
+                pyre_interpreter::make_builtin_function_with_arity("__exit__", token_exit, 4)
             );
-            store(
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__new__",
                 pyre_interpreter::typedef::make_new_descr(|_| {
                     Err(pyre_interpreter::PyError::type_error(
                         "Tokens can only be created by ContextVars",
                     ))
-                }),
+                })
             );
-            store(
-                "__class_getitem__",
-                pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
+            {
+                let func = pyre_interpreter::make_builtin_function(
                     "__class_getitem__",
                     pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
-                )),
-            );
+                );
+                let func_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(func);
+                crate::__pyre_put_new!(
+                    ns_slot,
+                    "__class_getitem__",
+                    pyre_object::function::w_classmethod_new(
+                        pyre_object::gc_roots::shadow_stack_get(func_slot)
+                    )
+                );
+            }
         });
         unsafe { typeobject::w_type_set_hasdict(tp, true) };
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
@@ -439,19 +470,16 @@ fn token_missing_type() -> PyObjectRef {
         let tp = pyre_interpreter::typedef::make_builtin_type("_contextvars.Token.MISSING", |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
-            let value = pyre_interpreter::make_builtin_function_with_arity(
+            let _ = pyre_object::gc_roots::pin_root(ns);
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__repr__",
-                |_| Ok(w_str_new_managed("<Token.MISSING>")),
-                1,
-            );
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                pyre_interpreter::make_builtin_function_with_arity(
                     "__repr__",
-                    value,
-                );
-            }
+                    |_| Ok(w_str_new_managed("<Token.MISSING>")),
+                    1
+                )
+            );
         });
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
         tp

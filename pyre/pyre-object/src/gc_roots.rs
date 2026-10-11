@@ -1466,8 +1466,10 @@ pub fn clear_prebuilt_roots_dirty() {
 /// The flowspace translator now inserts and colours this bracket from graph
 /// liveness, just as PyPy does. Native interpreter code is also compiled
 /// directly by rustc, so source paths on that execution side still use this
-/// macro. It publishes `$local`s as one livevar set, runs `$body`, and then
-/// assigns each forwarded word back into its own local. What it buys over
+/// macro. It publishes `$local`s as one livevar set, assigns each forwarded
+/// word back into its own local (`ShadowStackFrameworkGCTransformer.pop_roots`)
+/// so `$body` does not see the pre-pin words — `pin_roots` is itself a
+/// safepoint — and then assigns again after `$body`. What it buys over
 /// hand-written slot arithmetic is `gc_restore_root`'s guarantee -- after the
 /// bracket the local *is* the live word, so there is no stale binding left in
 /// scope for a later read to find, and no slot index to get wrong.
@@ -1490,9 +1492,10 @@ pub fn clear_prebuilt_roots_dirty() {
 /// guard's close between the call and its `Result` switch, which the
 /// `Result`-to-exception rewrite does not see through.
 ///
-/// An early exit out of `$body` (a `?`, a `return`) skips the restore and that
-/// is correct: [`push_roots`]'s scope guard pops the slots on the way out, and
-/// the locals it would have restored are going out of scope with it.
+/// An early exit out of `$body` (a `?`, a `return`) skips the restore after
+/// `$body` and that is correct: [`push_roots`]'s scope guard pops the slots
+/// on the way out, and the locals it would have restored are going out of
+/// scope with it. The restore after `pin_roots` has already run.
 ///
 /// A macro rather than a helper taking `impl FnOnce`: a closure has no lifted
 /// counterpart, so every graph that reached one would stop there. Bracketing a
@@ -1503,8 +1506,15 @@ macro_rules! with_roots {
     ($($local:ident),+ $(,)? => $body:expr) => {{
         let _scope = $crate::gc_roots::push_roots();
         let __roots_base = _scope.pin_roots(&[$($local),+]);
+        #[allow(unused_assignments)]
+        {
+            $crate::__with_roots_restore!(_scope, __roots_base; $($local),+);
+        }
         let __roots_result = $body;
-        $crate::__with_roots_restore!(_scope, __roots_base; $($local),+);
+        #[allow(unused_assignments)]
+        {
+            $crate::__with_roots_restore!(_scope, __roots_base; $($local),+);
+        }
         __roots_result
     }};
 }

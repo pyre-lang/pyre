@@ -39,10 +39,19 @@ pyre_interpreter::py_module! {
             // Call arguments evaluate left to right, so the key and the value
             // are built first: reading the dict slot inline with them would
             // read it before those allocations and hand over a pre-move word.
-            let w_code = pyre_object::w_int_new(value);
-            let w_name = pyre_object::w_str_new(name);
+            // Each newborn is pinned before the next allocation, then the
+            // store reads both from their slots (`RootScope::pin_root`).
+            let _pair_roots = pyre_object::gc_roots::push_roots();
+            let code_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(value));
+            let name_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(name));
             unsafe {
-                pyre_object::w_dict_store(roots.get(errorcode_slot), w_code, w_name);
+                pyre_object::w_dict_store(
+                    roots.get(errorcode_slot),
+                    pyre_object::gc_roots::shadow_stack_get(code_slot),
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                );
             }
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]

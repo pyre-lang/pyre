@@ -1338,7 +1338,7 @@ mod imp {
     pub fn install(ns: PyObjectRef) {
         let _root_scope = pyre_object::gc_roots::push_roots();
         let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-        let ns = pyre_object::gc_roots::pin_root(ns);
+        let _ = pyre_object::gc_roots::pin_root(ns);
         // The handle type is bound under one name only: the class calls itself
         // `PyHKEY`, and `winreg` publishes it as `HKEYType`.
         crate::__pyre_put_new!(ns_slot, "HKEYType", type_object());
@@ -1348,13 +1348,16 @@ mod imp {
         // directly.
         unsafe {
             let ty = type_object();
-            let class_ns = pyre_object::w_type_get_dict_ptr(ty) as PyObjectRef;
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                class_ns,
+            let class_ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(
+                pyre_object::w_type_get_dict_ptr(ty) as PyObjectRef
+            );
+            crate::__pyre_put_new!(
+                class_ns_slot,
                 "__doc__",
                 w_str_new(
                     "PyHKEY Object - A Python object, representing a win32 registry key.\n\nThis object wraps a Windows HKEY object, automatically closing it when\nthe object is destroyed.  To guarantee cleanup, you can call either\nthe Close() method on the PyHKEY, or the CloseKey() method.\n\nAll functions which accept a handle object also accept an integer --\nhowever, use of the handle object is encouraged.\n\nFunctions:\nClose() - Closes the underlying handle.\nDetach() - Returns the integer Win32 handle, detaching it from the object\n\nProperties:\nhandle - The integer Win32 handle.\n\nOperations:\n__bool__ - Handles with an open object return true, otherwise false.\n__int__ - Converting a handle to an integer returns the Win32 handle.\n__enter__, __exit__ - Context manager support for 'with' statement,\nautomatically closes handle.",
-                ),
+                )
             );
             for (method, signature) in [
                 ("Close", "($self, /)"),
@@ -1362,12 +1365,19 @@ mod imp {
                 ("__enter__", "($self, /)"),
                 ("__exit__", "($self, exc_type, exc_value, traceback, /)"),
             ] {
-                let Some(function) = pyre_object::w_dict_getitem_str(class_ns, method) else {
+                let Some(function) = pyre_object::w_dict_getitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(class_ns_slot),
+                    method,
+                ) else {
                     continue;
                 };
+                let function_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(function);
+                let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_str_new(signature));
                 pyre_interpreter::function::fset_func_text_signature(
-                    function,
-                    w_str_new(signature),
+                    pyre_object::gc_roots::shadow_stack_get(function_slot),
+                    pyre_object::gc_roots::shadow_stack_get(signature_slot),
                 );
             }
         }
@@ -1534,13 +1544,21 @@ mod imp {
             ),
         ] {
             let function = pyre_interpreter::make_builtin_function_with_doc(name, func, doc);
+            let function_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(function);
+            let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(signature));
             unsafe {
                 pyre_interpreter::function::fset_func_text_signature(
-                    function,
-                    pyre_object::w_str_new(signature),
+                    pyre_object::gc_roots::shadow_stack_get(function_slot),
+                    pyre_object::gc_roots::shadow_stack_get(signature_slot),
                 );
             }
-            crate::__pyre_put_new!(ns_slot, name, function);
+            crate::__pyre_put_new!(
+                ns_slot,
+                name,
+                pyre_object::gc_roots::shadow_stack_get(function_slot)
+            );
         }
     }
 }

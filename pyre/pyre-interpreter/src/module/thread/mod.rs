@@ -2583,7 +2583,7 @@ fn except_hook_args_type() -> PyObjectRef {
             let ns = pyre_object::w_type_get_dict_ptr(ty) as PyObjectRef;
             let _root_scope = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 "__doc__",

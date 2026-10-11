@@ -252,11 +252,10 @@ impl Drop for BufferedLockGuard {
 static UNSUPPORTED_OPERATION_TYPE: pyre_object::gc_roots::RootedOnceRef =
     pyre_object::gc_roots::RootedOnceRef::new();
 
-fn type_method(ns: PyObjectRef, name: &str, function: PyObjectRef) {
-    let _root_scope = pyre_object::gc_roots::push_roots();
-    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, name, function) }
+fn type_method(mut ns: PyObjectRef, name: &str, mut function: PyObjectRef) {
+    // Both words already exist. Sequential `pin_root(ns)` would be a
+    // safepoint while `function` is still unpublished (`RootScope::pin_roots`).
+    crate::__pyre_store!(ns, name, function);
 }
 
 fn io_closed(obj: PyObjectRef) -> bool {
@@ -1064,10 +1063,10 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_list_new(lines))
 }
 
-fn init_iobase_type(mut ns: PyObjectRef) {
+fn init_iobase_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // interp_iobase.py W_IOBase.typedef declares both descriptors
     // in the raw typedef.  They must be present before the type/layout is
     // built: setting only the hasdict/weakrefable flags afterwards leaves
@@ -1083,11 +1082,13 @@ fn init_iobase_type(mut ns: PyObjectRef) {
         crate::typedef::weakref_descr(),
     );
     let closed_getter = crate::make_builtin_function_with_arity("closed", iobase_closed_get, 2);
+    let closed_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(closed_getter);
     type_method(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "closed",
         crate::typedef::make_getset_property_named_doc(
-            closed_getter,
+            pyre_object::gc_roots::shadow_stack_get(closed_getter_slot),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             "True if the file is closed",
@@ -1383,7 +1384,7 @@ fn rawiobase_readall(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&output))
 }
 
-fn init_rawiobase_type(mut ns: PyObjectRef) {
+fn init_rawiobase_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let mut ns = pyre_object::gc_roots::pin_root(ns);
     crate::__pyre_store!(
@@ -1469,7 +1470,7 @@ fn buffered_iobase_readinto1(args: &[PyObjectRef]) -> crate::PyResult {
     buffered_iobase_readinto_impl(args, true)
 }
 
-fn init_buffered_iobase_type(mut ns: PyObjectRef) {
+fn init_buffered_iobase_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let mut ns = pyre_object::gc_roots::pin_root(ns);
     crate::__pyre_store!(
@@ -1534,7 +1535,7 @@ fn text_iobase_none_get(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
-fn init_text_iobase_type(mut ns: PyObjectRef) {
+fn init_text_iobase_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let mut ns = pyre_object::gc_roots::pin_root(ns);
     crate::__pyre_store!(
@@ -1558,10 +1559,15 @@ fn init_text_iobase_type(mut ns: PyObjectRef) {
     }
     for name in ["encoding", "newlines", "errors"] {
         let getter = crate::make_builtin_function_with_arity(name, text_iobase_none_get, 2);
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_store!(
             ns,
             name,
-            crate::typedef::make_getset_descriptor_named(getter, name)
+            crate::typedef::make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                name
+            )
         );
     }
 }
@@ -1624,8 +1630,10 @@ pub(crate) fn fileio_type() -> PyObjectRef {
         let tp = interp_fileio::type_object();
         let type_ns = unsafe { pyre_object::w_type_get_dict_ptr(tp) } as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
-        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(type_ns);
+        // Both words already exist. Sequential `pin_root(type_ns)` would be a
+        // safepoint while `tp` is still unpublished (`RootScope::pin_roots`).
+        let tp_base = pyre_object::gc_roots::pin_roots(&[tp, type_ns]);
+        let ns_slot = tp_base + 1;
         crate::builtins::init_file_wrapper_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
         crate::builtins::init_fileio_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
         let init_fn = crate::make_builtin_function("__init__", crate::builtins::fileio_init);
@@ -1636,7 +1644,7 @@ pub(crate) fn fileio_type() -> PyObjectRef {
             "__init__",
             pyre_object::gc_roots::shadow_stack_get(init_slot),
         );
-        tp
+        pyre_object::gc_roots::shadow_stack_get(tp_base)
     })
 }
 
@@ -1756,6 +1764,9 @@ crate::py_module! {
     },
     extra_init: |ns| {
         let mut ns = ns;
+        let extra_ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(ns);
+        ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
         // `Modules/_io/_iomodule.c`:
         //   UnsupportedOperation = class UnsupportedOperation(OSError, ValueError)
         // A real exception class so `raise`/`except` and io.py's
@@ -1789,27 +1800,35 @@ crate::py_module! {
         // unpublished (`RootScope::pin_roots`).
         let unsupported_base = pyre_object::gc_roots::pin_roots(&[ns, unsupported]);
         ns = pyre_object::gc_roots::shadow_stack_get(unsupported_base);
-        let unsupported = pyre_object::gc_roots::shadow_stack_get(unsupported_base + 1);
+        let mut unsupported = pyre_object::gc_roots::shadow_stack_get(unsupported_base + 1);
         UNSUPPORTED_OPERATION_TYPE.set(unsupported);
         crate::__pyre_store!(ns, "UnsupportedOperation", unsupported);
 
         // `_io.BlockingIOError` aliases the builtin BlockingIOError.
-        if let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") {
+        if let Some(mut blocking) = crate::builtins::lookup_exc_class("BlockingIOError") {
             crate::__pyre_store!(ns, "BlockingIOError", blocking);
         }
 
         // Abstract base classes as W_TypeObject (required for io.py class inheritance).
         // PyPy hierarchy: RawIOBase/BufferedIOBase/TextIOBase all derive IOBase.
-        let io_base = io_base_type();
-        let raw_base = raw_iobase_type();
-        let buffered_base = buffered_iobase_type();
-        let text_base = text_iobase_type();
-        for (name, typ) in [
-            ("_IOBase", io_base),
-            ("_RawIOBase", raw_base),
-            ("_BufferedIOBase", buffered_base),
-            ("_TextIOBase", text_base),
+        // Each type is published before the next `type()` call: those builds
+        // allocate (`ShadowStackFrameworkGCTransformer.push_roots`).
+        let io_base_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(io_base_type());
+        let raw_base_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(raw_iobase_type());
+        let buffered_base_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(buffered_iobase_type());
+        let text_base_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(text_iobase_type());
+        ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
+        for (name, slot) in [
+            ("_IOBase", io_base_slot),
+            ("_RawIOBase", raw_base_slot),
+            ("_BufferedIOBase", buffered_base_slot),
+            ("_TextIOBase", text_base_slot),
         ] {
+            let mut typ = pyre_object::gc_roots::shadow_stack_get(slot);
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(typ, true);
                 pyre_object::w_type_set_weakrefable(typ, true);
@@ -1824,19 +1843,31 @@ crate::py_module! {
         // test_io), so they must be real types, not function stubs.
         // `FileIO` derives from `_RawIOBase`; the buffered classes from
         // `_BufferedIOBase` (`Modules/_io/_iomodule.c` PyInit__io).
-        let file_io = fileio_type();
-        let buffered_reader = interp_bufferedio::type_object();
-        let buffered_writer = buffered_writer::type_object();
-        let buffered_rwpair = buffered_rwpair::type_object();
-        for (name, t) in [
-            ("FileIO", file_io),
-            ("BytesIO", interp_bytesio::type_object()),
-            ("StringIO", interp_stringio::type_object()),
-            ("BufferedReader", buffered_reader),
-            ("BufferedWriter", buffered_writer),
-            ("BufferedRWPair", buffered_rwpair),
-            ("BufferedRandom", buffered_random::type_object()),
+        let file_io_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(fileio_type());
+        let bytes_io_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(interp_bytesio::type_object());
+        let string_io_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(interp_stringio::type_object());
+        let buffered_reader_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(interp_bufferedio::type_object());
+        let buffered_writer_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(buffered_writer::type_object());
+        let buffered_rwpair_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(buffered_rwpair::type_object());
+        let buffered_random_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(buffered_random::type_object());
+        ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
+        for (name, slot) in [
+            ("FileIO", file_io_slot),
+            ("BytesIO", bytes_io_slot),
+            ("StringIO", string_io_slot),
+            ("BufferedReader", buffered_reader_slot),
+            ("BufferedWriter", buffered_writer_slot),
+            ("BufferedRWPair", buffered_rwpair_slot),
+            ("BufferedRandom", buffered_random_slot),
         ] {
+            let mut t = pyre_object::gc_roots::shadow_stack_get(slot);
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(t, true);
                 pyre_object::typeobject::w_type_set_hasdict(t, true);
@@ -1850,7 +1881,10 @@ crate::py_module! {
         // live on that one stream object.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
-            let console_io = interp_win32consoleio::type_object();
+            let console_io_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(interp_win32consoleio::type_object());
+            ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
+            let mut console_io = pyre_object::gc_roots::shadow_stack_get(console_io_slot);
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(console_io, true);
                 pyre_object::typeobject::w_type_set_hasdict(console_io, true);
@@ -1863,7 +1897,10 @@ crate::py_module! {
         // (`class StdIOBuffer(io.TextIOWrapper)`).  Its `__init__` configures
         // the underlying buffer + encoding so `TextIOWrapper(buffer, ...)`
         // and a subclass's `super().__init__(...)` both work.
-        let text_io_wrapper = crate::builtins::text_io_wrapper_type();
+        let text_io_wrapper_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(crate::builtins::text_io_wrapper_type());
+        ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
+        let mut text_io_wrapper = pyre_object::gc_roots::shadow_stack_get(text_io_wrapper_slot);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(text_io_wrapper, true);
         }
@@ -1873,13 +1910,16 @@ crate::py_module! {
         // before this source runs; that is what puts
         // this install here rather than in the `appleveldefs:` table, which
         // the macro expands ahead of `extra_init`.
-        crate::importing::appleveldef_install_seeded(
+        pyre_object::with_roots!(ns => crate::importing::appleveldef_install_seeded(
             ns,
             include_str!("_io_app.py"),
             "_io_app.py",
             "_io",
             &["IncrementalNewlineDecoder"],
-            &[("_TextIOBase", text_base)],
-        )?;
+            &[(
+                "_TextIOBase",
+                pyre_object::gc_roots::shadow_stack_get(text_base_slot),
+            )],
+        ))?;
     }
 }

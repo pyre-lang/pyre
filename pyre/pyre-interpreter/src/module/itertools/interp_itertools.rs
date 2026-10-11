@@ -5,7 +5,7 @@
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // `W_Count.typedef` and the sibling classes are module TypeDefs.  Empty
     // startup does not import itertools, so `init_typeobjects` does not
     // build them. Pin `ns` first: this build collects and can drop the GIL.

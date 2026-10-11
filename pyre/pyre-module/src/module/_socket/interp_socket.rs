@@ -388,7 +388,7 @@ fn socket_writebuf(
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // `_rsocket_rffi.py:1150 rwin32.get_wsa_error`'s companion: WinSock has to
     // be started before any of its entry points answers, so the module takes
     // that cost at import rather than leaving the first call to fail with
@@ -1469,6 +1469,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // gethostbyname_ex(name) → (name, aliases, addresses)
         // `interp_func.py` — same lookup as gethostbyname but
         // returns the full hostent triple.
+        // `__pyre_put_new!` stores only forwarded `ns_slot`
+        // (`ShadowStackFrameworkGCTransformer.pop_roots`).
+        let mut ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         pyre_interpreter::__pyre_store!(
             ns,
             "gethostbyname_ex",
@@ -1698,13 +1701,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         .expect("OSError must be installed before _socket init");
     let err_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_os_error);
+    let mut ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     pyre_interpreter::__pyre_store!(
         ns,
         "error",
         pyre_object::gc_roots::shadow_stack_get(err_slot)
     );
     w_os_error = pyre_object::gc_roots::shadow_stack_get(err_slot);
-    let w_herror = pyre_object::with_roots!(ns, w_os_error => pyre_interpreter::builtins::new_exception_class(
+    let mut w_herror = pyre_object::with_roots!(ns, w_os_error => pyre_interpreter::builtins::new_exception_class(
         "socket.herror",
         pyre_interpreter::builtins::exc_os_error_new,
         w_os_error,
@@ -1714,13 +1718,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // rewriting this local. Reload before the next constructor
     // (`ShadowStackFrameworkGCTransformer.pop_roots`).
     w_os_error = pyre_object::gc_roots::shadow_stack_get(err_slot);
-    let w_gaierror = pyre_object::with_roots!(ns, w_os_error => pyre_interpreter::builtins::new_exception_class(
+    let mut w_gaierror = pyre_object::with_roots!(ns, w_os_error => pyre_interpreter::builtins::new_exception_class(
         "socket.gaierror",
         pyre_interpreter::builtins::exc_os_error_new,
         w_os_error,
     ));
     pyre_interpreter::__pyre_store!(ns, "gaierror", w_gaierror);
-    let w_timeout_error = pyre_interpreter::builtins::lookup_exc_class("TimeoutError")
+    let mut w_timeout_error = pyre_interpreter::builtins::lookup_exc_class("TimeoutError")
         .expect("TimeoutError must be installed before _socket init");
     pyre_interpreter::__pyre_store!(ns, "timeout", w_timeout_error);
 
@@ -2150,6 +2154,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // stdlib's `class socket(_socket.socket):` pattern works.
         let socket_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(socket_tp);
+        ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         pyre_interpreter::__pyre_store!(
             ns,
             "socket",

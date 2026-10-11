@@ -307,7 +307,9 @@ macro_rules! __pyre_store {
             ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy($ns, $name, __pyre_value);
         }
         $ns = ::pyre_object::gc_roots::shadow_stack_get(__pyre_base);
-        let $value = ::pyre_object::gc_roots::shadow_stack_get(__pyre_base + 1);
+        // Restore the caller's binding (`ShadowStackFrameworkGCTransformer.pop_roots`).
+        #[allow(unused_assignments)]
+        let () = $value = ::pyre_object::gc_roots::shadow_stack_get(__pyre_base + 1);
     }};
     ($ns:ident, $name:expr, $value:expr) => {{
         // The newborn does not exist yet. This bracket pins `$ns` only while
@@ -388,12 +390,12 @@ macro_rules! py_module {
     ) => {
         #[allow(dead_code)]
         pub fn init(
-            mut ns: ::pyre_object::PyObjectRef,
+            ns: ::pyre_object::PyObjectRef,
         ) -> ::std::result::Result<(), $crate::PyError> {
             let _name = $name;
             let _root_scope = ::pyre_object::gc_roots::push_roots();
             let ns_slot = ::pyre_object::gc_roots::shadow_stack_len();
-            let mut ns = ::pyre_object::gc_roots::pin_root(ns);
+            let _ = ::pyre_object::gc_roots::pin_root(ns);
             $($(
                 $crate::__pyre_put_new!(ns_slot, $key, $value);
             )*)?
@@ -431,14 +433,16 @@ macro_rules! py_module {
             // .py file is statically linked into the binary rather than
             // read off the filesystem at module-init time.
             $($(
-                ::pyre_object::with_roots!(ns => $crate::importing::appleveldef_install(
-                    ns,
-                    include_str!($appfile),
-                    $appfile,
-                    $name,
-                    &[ $( $appname ),* ],
-                ))?;
-                let mut ns = ::pyre_object::gc_roots::shadow_stack_get(ns_slot);
+                {
+                    let mut ns = ::pyre_object::gc_roots::shadow_stack_get(ns_slot);
+                    ::pyre_object::with_roots!(ns => $crate::importing::appleveldef_install(
+                        ns,
+                        include_str!($appfile),
+                        $appfile,
+                        $name,
+                        &[ $( $appname ),* ],
+                    ))?;
+                }
             )*)?
             // inline_app: PyPy `applevel(r'''…''')` (gateway.py) —
             // embed a Python snippet inline; the runtime executes it the
@@ -447,14 +451,16 @@ macro_rules! py_module {
             // file.  Names listed in the `=> [...]` brackets get copied
             // out of the app namespace into the module dict.
             $($(
-                ::pyre_object::with_roots!(ns => $crate::importing::appleveldef_install(
-                    ns,
-                    $inline_src,
-                    "<inline>",
-                    $name,
-                    &[ $( $inline_name ),* ],
-                ))?;
-                let mut ns = ::pyre_object::gc_roots::shadow_stack_get(ns_slot);
+                {
+                    let mut ns = ::pyre_object::gc_roots::shadow_stack_get(ns_slot);
+                    ::pyre_object::with_roots!(ns => $crate::importing::appleveldef_install(
+                        ns,
+                        $inline_src,
+                        "<inline>",
+                        $name,
+                        &[ $( $inline_name ),* ],
+                    ))?;
+                }
             )*)?
             // inline_functions: `#[pyre_function]` typed defs whose name +
             // arity are derived from the signature.  Replaces the

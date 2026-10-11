@@ -7,7 +7,7 @@
 
 use crate::{
     make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
-    make_module_builtin_function_with_arity, module_ns_store,
+    make_module_builtin_function_with_arity,
 };
 use pyre_object::interp_sre::{
     W_SRE_Match, W_SRE_Pattern, W_SRE_Scanner, W_SRE_Template, is_sre_match, is_sre_pattern,
@@ -22,7 +22,7 @@ use sre_engine::string::{StrDrive, StringCursor};
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // `W_SRE_Pattern.typedef` and the sibling classes are module TypeDefs.
     // Empty startup does not import `_sre`, so `init_typeobjects` does not
     // build them. Pin `ns` first: this build collects and can drop the GIL.
@@ -179,18 +179,20 @@ fn sre_match_receiver(args: &[PyObjectRef]) -> Result<*const W_SRE_Match, crate:
 pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // interp_sre.py `__new__ = interp2app(SRE_Pattern__new__)`.
-    unsafe {
+    {
+        let func = make_builtin_function("__new__", sre_pattern_new);
+        let func_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(func);
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            pyre_object::function::w_staticmethod_new(make_builtin_function(
-                "__new__",
-                sre_pattern_new
-            ),)
-        )
-    };
+            pyre_object::function::w_staticmethod_new(pyre_object::gc_roots::shadow_stack_get(
+                func_slot
+            ))
+        );
+    }
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -296,91 +298,106 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
     };
     unsafe { crate::__pyre_put_new!(ns_slot, "__weakref__", crate::typedef::weakref_descr()) };
     // interp_sre.py:667-668 `generic_alias_class_getitem` as classmethod.
-    unsafe {
+    {
+        let func = make_builtin_function(
+            "__class_getitem__",
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
+        );
+        let func_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(func);
         crate::__pyre_put_new!(
             ns_slot,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            pyre_object::function::w_classmethod_new(pyre_object::gc_roots::shadow_stack_get(
+                func_slot
             ))
-        )
-    };
+        );
+    }
     // interp_sre.py:662-663 `flags = interp_attrproperty('flags', ...,
     // wrapfn="newint")`.
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "flags",
+            |args| Ok(w_int_new(unsafe { (*sre_pattern_receiver(args)?).flags })),
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "flags",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "flags",
-                    |args| Ok(w_int_new(unsafe { (*sre_pattern_receiver(args)?).flags })),
-                    2,
-                ),
-                "flags",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "flags"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py `groupindex = GetSetProperty(fget_groupindex)`
     // (:202-206 — a dict groupindex is exposed through a dictproxy).
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "groupindex",
+            |args| {
+                let w_groupindex = unsafe { (*sre_pattern_receiver(args)?).w_groupindex };
+                if unsafe { is_dict(w_groupindex) } {
+                    return Ok(pyre_object::dictproxyobject::w_dict_proxy_new(w_groupindex));
+                }
+                Ok(w_groupindex)
+            },
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "groupindex",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "groupindex",
-                    |args| {
-                        let w_groupindex = unsafe { (*sre_pattern_receiver(args)?).w_groupindex };
-                        if unsafe { is_dict(w_groupindex) } {
-                            return Ok(pyre_object::dictproxyobject::w_dict_proxy_new(
-                                w_groupindex,
-                            ));
-                        }
-                        Ok(w_groupindex)
-                    },
-                    2,
-                ),
-                "groupindex",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "groupindex"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py:665-666 `groups = interp_attrproperty('num_groups',
     // ..., wrapfn="newint")`.
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "groups",
+            |args| {
+                Ok(w_int_new(unsafe {
+                    (*sre_pattern_receiver(args)?).num_groups
+                }))
+            },
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "groups",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "groups",
-                    |args| {
-                        Ok(w_int_new(unsafe {
-                            (*sre_pattern_receiver(args)?).num_groups
-                        }))
-                    },
-                    2,
-                ),
-                "groups",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "groups"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py:667 `pattern = interp_attrproperty_w('w_pattern', ...)`.
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "pattern",
+            |args| Ok(unsafe { (*sre_pattern_receiver(args)?).w_pattern }),
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "pattern",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "pattern",
-                    |args| Ok(unsafe { (*sre_pattern_receiver(args)?).w_pattern }),
-                    2,
-                ),
-                "pattern",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "pattern"
             )
-        )
-    };
+        );
+    }
 }
 
 /// W_SRE_Match.typedef (interp_sre.py): methods + the `re` /
@@ -389,7 +406,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
 pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -467,144 +484,169 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
         )
     };
     // interp_sre.py:887 `re = interp_attrproperty_w('srepat', ...)`.
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "re",
+            |args| Ok(unsafe { (*sre_match_receiver(args)?).w_srepat }),
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "re",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "re",
-                    |args| Ok(unsafe { (*sre_match_receiver(args)?).w_srepat }),
-                    2,
-                ),
-                "re",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "re"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py `string = GetSetProperty(fget_string)` (:866-867).
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "string",
+            |args| Ok(unsafe { (*sre_match_receiver(args)?).w_string }),
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "string",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "string",
-                    |args| Ok(unsafe { (*sre_match_receiver(args)?).w_string }),
-                    2,
-                ),
-                "string",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "string"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py `pos = GetSetProperty(fget_pos)` (:851-852).
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "pos",
+            |args| Ok(w_int_new(unsafe { (*sre_match_receiver(args)?).pos })),
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "pos",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "pos",
-                    |args| Ok(w_int_new(unsafe { (*sre_match_receiver(args)?).pos })),
-                    2,
-                ),
-                "pos",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "pos"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py `endpos = GetSetProperty(fget_endpos)` (:854-855).
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "endpos",
+            |args| Ok(w_int_new(unsafe { (*sre_match_receiver(args)?).endpos })),
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "endpos",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "endpos",
-                    |args| Ok(w_int_new(unsafe { (*sre_match_receiver(args)?).endpos })),
-                    2,
-                ),
-                "endpos",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "endpos"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py `lastgroup = GetSetProperty(fget_lastgroup)`
     // (:831-839 — the group name from `w_indexgroup[lastindex]`).
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "lastgroup",
+            |args| {
+                let m = sre_match_receiver(args)?;
+                let lastindex = unsafe { (*m).lastindex };
+                if lastindex < 0 {
+                    return Ok(w_none());
+                }
+                let w_indexgroup = unsafe { (*(*m).w_srepat.cast::<W_SRE_Pattern>()).w_indexgroup };
+                let found = unsafe {
+                    if is_list(w_indexgroup) {
+                        w_list_getitem(w_indexgroup, lastindex)
+                    } else if is_tuple(w_indexgroup) {
+                        w_tuple_getitem(w_indexgroup, lastindex)
+                    } else {
+                        None
+                    }
+                };
+                Ok(found.unwrap_or_else(w_none))
+            },
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "lastgroup",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "lastgroup",
-                    |args| {
-                        let m = sre_match_receiver(args)?;
-                        let lastindex = unsafe { (*m).lastindex };
-                        if lastindex < 0 {
-                            return Ok(w_none());
-                        }
-                        let w_indexgroup =
-                            unsafe { (*(*m).w_srepat.cast::<W_SRE_Pattern>()).w_indexgroup };
-                        let found = unsafe {
-                            if is_list(w_indexgroup) {
-                                w_list_getitem(w_indexgroup, lastindex)
-                            } else if is_tuple(w_indexgroup) {
-                                w_tuple_getitem(w_indexgroup, lastindex)
-                            } else {
-                                None
-                            }
-                        };
-                        Ok(found.unwrap_or_else(w_none))
-                    },
-                    2,
-                ),
-                "lastgroup",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "lastgroup"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py `lastindex = GetSetProperty(fget_lastindex)`
     // (:841-845).
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "lastindex",
+            |args| {
+                let lastindex = unsafe { (*sre_match_receiver(args)?).lastindex };
+                if lastindex >= 0 {
+                    Ok(w_int_new(lastindex))
+                } else {
+                    Ok(w_none())
+                }
+            },
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "lastindex",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "lastindex",
-                    |args| {
-                        let lastindex = unsafe { (*sre_match_receiver(args)?).lastindex };
-                        if lastindex >= 0 {
-                            Ok(w_int_new(lastindex))
-                        } else {
-                            Ok(w_none())
-                        }
-                    },
-                    2,
-                ),
-                "lastindex",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "lastindex"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py `regs = GetSetProperty(W_SRE_Match.fget_regs)`.
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity("regs", sre_match_regs, 2);
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "regs",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity("regs", sre_match_regs, 2),
-                "regs",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "regs"
             )
-        )
-    };
+        );
+    }
     // interp_sre.py:894-895 `generic_alias_class_getitem` as classmethod.
-    unsafe {
+    {
+        let func = make_builtin_function(
+            "__class_getitem__",
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
+        );
+        let func_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(func);
         crate::__pyre_put_new!(
             ns_slot,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            pyre_object::function::w_classmethod_new(pyre_object::gc_roots::shadow_stack_get(
+                func_slot
             ))
-        )
-    };
+        );
+    }
 }
 
 /// `_sre.SRE_Template` has no methods (`sre.c template_slots` is dealloc /
@@ -617,7 +659,7 @@ pub(crate) fn init_sre_template_type(_ns: PyObjectRef) {}
 pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -647,29 +689,32 @@ pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
         )
     };
     // interp_sre.py:955 `pattern = interp_attrproperty_w('srepat', ...)`.
-    unsafe {
+    {
+        let getter = make_builtin_function_with_arity(
+            "pattern",
+            |args| {
+                let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if unsafe { is_sre_scanner(self_) } {
+                    Ok(unsafe { (*(self_ as *const W_SRE_Scanner)).w_srepat })
+                } else {
+                    Err(crate::PyError::type_error(
+                        "descriptor is for '_sre.SRE_Scanner'",
+                    ))
+                }
+            },
+            2,
+        );
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::__pyre_put_new!(
             ns_slot,
             "pattern",
             crate::typedef::make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "pattern",
-                    |args| {
-                        let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                        if unsafe { is_sre_scanner(self_) } {
-                            Ok(unsafe { (*(self_ as *const W_SRE_Scanner)).w_srepat })
-                        } else {
-                            Err(crate::PyError::type_error(
-                                "descriptor is for '_sre.SRE_Scanner'",
-                            ))
-                        }
-                    },
-                    2,
-                ),
-                "pattern",
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                "pattern"
             )
-        )
-    };
+        );
+    }
 }
 
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)

@@ -1824,10 +1824,14 @@ pub mod unpack_iter {
         static TYPE_SETUP: std::sync::Once = std::sync::Once::new();
         let iter_type = type_object();
         TYPE_SETUP.call_once(|| unsafe {
-            let ns = pyre_object::w_type_get_dict_ptr(iter_type) as PyObjectRef;
             let _root_scope = pyre_object::gc_roots::push_roots();
+            let type_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(iter_type);
+            let ns = pyre_object::w_type_get_dict_ptr(pyre_object::gc_roots::shadow_stack_get(
+                type_slot,
+            )) as PyObjectRef;
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             crate::__pyre_put_new!(ns_slot, "__module__", w_str_new("_struct"));
             crate::__pyre_put_new!(
                 ns_slot,
@@ -1835,14 +1839,19 @@ pub mod unpack_iter {
                 crate::make_builtin_function_with_arity(
                     "__getattribute__",
                     unpack_iter_getattribute,
-                    2,
+                    2
                 )
             );
             // W_UnpackIter.typedef has no `__new__` in PyPy.  Preserve that
             // TypeDef shape: the implementation type is returned by `type(it)`
             // but cannot be instantiated or used as a base class.
-            pyre_object::w_type_set_acceptable_as_base_class(iter_type, false);
-            pyre_object::w_type_set_disallow_instantiation(iter_type);
+            pyre_object::w_type_set_acceptable_as_base_class(
+                pyre_object::gc_roots::shadow_stack_get(type_slot),
+                false,
+            );
+            pyre_object::w_type_set_disallow_instantiation(
+                pyre_object::gc_roots::shadow_stack_get(type_slot),
+            );
         });
         // `readbuf_w` may dispatch a Python-level `__buffer__` hook.  Keep
         // both operands rooted across that call and the stable allocation:
@@ -1973,7 +1982,7 @@ crate::py_module! {
         let mut base = crate::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _struct init");
         let mut ns = ns;
-        let error = pyre_object::with_roots!(ns, base => crate::builtins::new_exception_class(
+        let mut error = pyre_object::with_roots!(ns, base => crate::builtins::new_exception_class(
             "struct.error",
             crate::builtins::exc_exception_new,
             base,
@@ -2019,7 +2028,11 @@ crate::py_module! {
         // `interpleveldefs` entry has already built the type.
         let struct_type = type_object();
         let struct_dict = unsafe { pyre_object::w_type_get_dict_ptr(struct_type) } as PyObjectRef;
-        let struct_dict = pyre_object::gc_roots::pin_root(struct_dict);
+        // Both words already exist. Sequential `pin_root(struct_dict)` would
+        // be a safepoint while `struct_type` is still unpublished
+        // (`RootScope::pin_roots`).
+        let struct_base = pyre_object::gc_roots::pin_roots(&[struct_type, struct_dict]);
+        let struct_dict_slot = struct_base + 1;
         unsafe {
             // [3.14-spec] PyPy's `W_Struct.typedef` installs the public
             // `make_weakref_descr(W_Struct)` descriptor, while CPython 3.14's
@@ -2031,36 +2044,33 @@ crate::py_module! {
             // object-owned lifeline and omit only that observable descriptor
             // spelling; `W_Struct` carries no JIT or immutability hint over
             // the weakref lifeline.
-            pyre_object::w_type_set_weakrefable(struct_type, true);
-            {
-                let pack = crate::make_builtin_function("pack", __majit_wrap_struct_pack);
-                let pack = pyre_object::gc_roots::pin_root(pack);
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(struct_dict, "pack", pack);
-            }
-            {
-                let unpack = crate::make_builtin_function("unpack", __majit_wrap_struct_unpack);
-                let unpack = pyre_object::gc_roots::pin_root(unpack);
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    struct_dict, "unpack", unpack,
-                );
-            }
-            {
-                let pack_into = crate::make_builtin_function_maybe_sig(
-                    "pack_into",
-                    struct_pack_into,
-                    Some(sig_posonly_then_varargs(
-                        "pack_into",
-                        &["self", "buffer", "offset"],
-                        "args",
-                    )),
-                );
-                let pack_into = pyre_object::gc_roots::pin_root(pack_into);
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    struct_dict,
-                    "pack_into",
-                    pack_into,
-                );
-            }
+            pyre_object::w_type_set_weakrefable(
+                pyre_object::gc_roots::shadow_stack_get(struct_base),
+                true,
+            );
         }
+        crate::__pyre_put_new!(
+            struct_dict_slot,
+            "pack",
+            crate::make_builtin_function("pack", __majit_wrap_struct_pack)
+        );
+        crate::__pyre_put_new!(
+            struct_dict_slot,
+            "unpack",
+            crate::make_builtin_function("unpack", __majit_wrap_struct_unpack)
+        );
+        crate::__pyre_put_new!(
+            struct_dict_slot,
+            "pack_into",
+            crate::make_builtin_function_maybe_sig(
+                "pack_into",
+                struct_pack_into,
+                Some(sig_posonly_then_varargs(
+                    "pack_into",
+                    &["self", "buffer", "offset"],
+                    "args",
+                ))
+            )
+        );
     },
 }

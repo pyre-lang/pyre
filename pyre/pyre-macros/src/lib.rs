@@ -3318,7 +3318,7 @@ fn expand_pyre_methods(
                         |ns| {
                             let _root_scope = ::pyre_object::gc_roots::push_roots();
                             let ns_slot = ::pyre_object::gc_roots::shadow_stack_len();
-                            let ns = ::pyre_object::gc_roots::pin_root(ns);
+                            let _ = ::pyre_object::gc_roots::pin_root(ns);
                             #(#registrations)*
                         },
                         #base_expr,

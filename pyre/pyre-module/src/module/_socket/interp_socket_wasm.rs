@@ -32,7 +32,7 @@ fn socket_type() -> PyObjectRef {
 fn init_socket_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // Allocation is separate from initialisation here as it is everywhere
     // else: `socket.py`'s subclass calls `_socket.socket.__init__` itself, so
     // `__new__` must hand back an instance without having opened anything.
@@ -221,13 +221,23 @@ const CONSTANTS: &[(&str, i64)] = &[
 pub(super) fn register_names(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     for (name, value) in CONSTANTS {
         pyre_interpreter::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(*value));
     }
     let socket_tp = socket_type();
-    pyre_interpreter::__pyre_put_new!(ns_slot, "socket", socket_tp);
-    pyre_interpreter::__pyre_put_new!(ns_slot, "SocketType", socket_tp);
+    let socket_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(socket_tp);
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "socket",
+        pyre_object::gc_roots::shadow_stack_get(socket_slot)
+    );
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "SocketType",
+        pyre_object::gc_roots::shadow_stack_get(socket_slot)
+    );
     // `gethostname` needs no socket layer -- wasi answers it out of `uname` --
     // and `platform._node` calls it, so `platform.uname()` depends on it.
     pyre_interpreter::__pyre_put_new!(

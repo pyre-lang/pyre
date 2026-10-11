@@ -262,7 +262,7 @@ impl Drop for InstanceRoot {
 fn init_weakref_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // [3.14-spec] PyPy `W_Weakref.typedef` supplies a descriptive string,
     // while CPython 3.14 `_PyWeakref_RefType.tp_doc` is null.  Leave the key
     // to `ensure_common_attributes`, which publishes the observable
@@ -380,7 +380,7 @@ pub fn weakref_type() -> PyObjectRef {
 fn init_proxy_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -445,7 +445,7 @@ pub fn proxy_type() -> PyObjectRef {
 fn init_callable_proxy_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -1154,19 +1154,20 @@ pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
     // that arbitrary call, then use the native identity-checked deletion
     // primitive exactly as `delitem_if_value_is(d, key, wr)` does upstream.
     let _roots = pyre_object::gc_roots::push_roots();
-    let backing_root = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(backing);
-    let key_root = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(key);
-    let stored_root = pyre_object::gc_roots::shadow_stack_len();
-    let stored = pyre_object::gc_roots::pin_root(stored);
-    let result = crate::call::call_function_impl_result(stored, &[])?;
+    // All three words already exist. Sequential `pin_root` would normalize
+    // after the first write and leave the later values unpublished
+    // (`RootScope::pin_roots`).
+    let base = pyre_object::gc_roots::pin_roots(&[backing, key, stored]);
+    let result = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &[],
+    )?;
     if !unsafe { pyre_object::is_none(result) } {
         return Ok(pyre_object::w_none());
     }
-    let backing = pyre_object::gc_roots::shadow_stack_get(backing_root);
-    let key = pyre_object::gc_roots::shadow_stack_get(key_root);
-    let stored = pyre_object::gc_roots::shadow_stack_get(stored_root);
+    let backing = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let stored = pyre_object::gc_roots::shadow_stack_get(base + 2);
     crate::baseobjspace::dict_delitem_if_value_is(backing, key, stored)?;
     Ok(pyre_object::w_none())
 }
@@ -2077,7 +2078,7 @@ pub fn proxy_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 fn register_proxy_typedef_dict(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // Forward + reflected binary arithmetic — interp__weakref.py:376-389.
     unsafe {
         crate::__pyre_put_new!(
@@ -2897,7 +2898,7 @@ mod tests {
         let user_type = crate::typedef::make_builtin_type("Checker", |ns| {
             let _root_scope = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             unsafe {
                 crate::__pyre_put_new!(
                     ns_slot,
@@ -2921,7 +2922,7 @@ mod tests {
         let user_type = crate::typedef::make_builtin_type("ClassChecker", |ns| {
             let _root_scope = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             unsafe {
                 crate::__pyre_put_new!(
                     ns_slot,
@@ -2952,7 +2953,7 @@ mod tests {
         let lhs_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
             let _root_scope = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             unsafe {
                 crate::__pyre_put_new!(
                     ns_slot,
@@ -2996,7 +2997,7 @@ mod tests {
         let lhs_type = crate::typedef::make_builtin_type("Pow3Lhs", |ns| {
             let _root_scope = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             unsafe {
                 crate::__pyre_put_new!(
                     ns_slot,
@@ -3038,7 +3039,7 @@ mod tests {
         let lhs_type = crate::typedef::make_builtin_type("DivmodLhsNI", |ns| {
             let _root_scope = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             unsafe {
                 crate::__pyre_put_new!(
                     ns_slot,

@@ -196,7 +196,7 @@ fn sys_namespace_type() -> PyObjectRef {
         let tp = crate::typedef::make_builtin_type("sys.namespace", |ns| {
             let _root_scope = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             unsafe {
                 crate::__pyre_put_new!(
                     ns_slot,
@@ -1709,10 +1709,10 @@ crate::builtin_wrapper_descriptor!(
     __majit_wrap_sys_exception
 );
 
-pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
     crate::__pyre_put_new!(ns_slot, "maxsize", w_int_new(i64::MAX));
     crate::__pyre_put_new!(ns_slot, "maxunicode", w_int_new(0x10FFFF));
     #[cfg(all(
@@ -1720,17 +1720,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         not(feature = "sandbox"),
         any(target_os = "macos", target_os = "linux")
     ))]
-    crate::cpyext::register_sys_dlopenflags(ns);
+    crate::cpyext::register_sys_dlopenflags(pyre_object::gc_roots::shadow_stack_get(ns_slot));
     // Each decoded argv string is pinned before the next decode, then the
     // list is built from those slots (`RootedItems`). `w_list_new` of a
-    // `Vec` built first would leave every element unpublished.
-    let w_orig_argv = pyre_object::with_roots!(ns => {
+    // `Vec` built first would leave every element unpublished. `ns` lives in
+    // `ns_slot` across those allocations (`ShadowStackFrameworkGCTransformer.push_roots`).
+    let mut ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+    let mut w_orig_argv = {
         let mut items = pyre_object::gc_roots::RootedItems::new();
         for arg in crate::importing::sys_orig_argv().iter() {
             items.push(crate::gateway::fsdecode_os_str(arg));
         }
         w_list_new(items.take())
-    });
+    };
     crate::__pyre_store!(ns, "orig_argv", w_orig_argv);
     // pypy/interpreter/app_main.py:785-786:
     //   sys._xoptions = dict(x.split('=', 1) if '=' in x else (x, True)
@@ -4646,10 +4648,12 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             Err(reject_non_str(args))
         })
     };
+    let write_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(write_fn);
     crate::baseobjspace::setdictvalue_native(
         pyre_object::gc_roots::shadow_stack_get(stream_slot),
         "write",
-        write_fn,
+        pyre_object::gc_roots::shadow_stack_get(write_slot),
     );
     // `flush` stands in for `TextIOWrapper.flush`, which starts at
     // `CHECK_CLOSED`, so the descriptor picks the stream to ask -- a bare `fn`
@@ -4669,10 +4673,12 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             flush_std_descriptors()
         }),
     };
+    let flush_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(flush_fn);
     crate::baseobjspace::setdictvalue_native(
         pyre_object::gc_roots::shadow_stack_get(stream_slot),
         "flush",
-        flush_fn,
+        pyre_object::gc_roots::shadow_stack_get(flush_slot),
     );
     // PyPy's W_TextIOWrapper.isatty_w delegates to its live buffer, which in
     // turn delegates to the raw descriptor.  Do not install an instance
@@ -4694,10 +4700,12 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             Ok(w_int_new(1))
         }),
     };
+    let fileno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(fileno_fn);
     crate::baseobjspace::setdictvalue_native(
         pyre_object::gc_roots::shadow_stack_get(stream_slot),
         "fileno",
-        fileno_fn,
+        pyre_object::gc_roots::shadow_stack_get(fileno_slot),
     );
     // A buffered layer delegates the query that names its own direction down to
     // the raw descriptor, which refuses once the stream is closed, and answers
@@ -4714,8 +4722,9 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             Ok(w_bool_from(true))
         }),
     };
-    let writable_fn = pyre_object::gc_roots::pin_root(writable_fn);
-    let mut readable_fn = match fd {
+    let writable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(writable_fn);
+    let readable_fn = match fd {
         0 => crate::make_builtin_function("readable", |_| {
             stdio_check_closed("__stdin__", CLOSED_RAW_LAYER)?;
             Ok(w_bool_from(true))
@@ -4723,15 +4732,17 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         2 => crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
         _ => crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
     };
-    pyre_object::with_roots!(readable_fn => crate::baseobjspace::setdictvalue_native(
+    let readable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(readable_fn);
+    crate::baseobjspace::setdictvalue_native(
         pyre_object::gc_roots::shadow_stack_get(stream_slot),
         "writable",
-        writable_fn,
-    ));
+        pyre_object::gc_roots::shadow_stack_get(writable_slot),
+    );
     crate::baseobjspace::setdictvalue_native(
         pyre_object::gc_roots::shadow_stack_get(stream_slot),
         "readable",
-        readable_fn,
+        pyre_object::gc_roots::shadow_stack_get(readable_slot),
     );
     pyre_object::gc_roots::shadow_stack_get(stream_slot)
 }

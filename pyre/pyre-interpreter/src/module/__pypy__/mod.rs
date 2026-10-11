@@ -236,23 +236,20 @@ fn move_to_end(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
             None => true,
         };
     let _roots = pyre_object::gc_roots::push_roots();
-    let d_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(d);
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(key);
-    let backing = dict_backing_or_type_error(
-        pyre_object::gc_roots::shadow_stack_get(d_slot),
-        "move_to_end",
-    )?;
+    // Both words already exist. Sequential `pin_root` would normalize after
+    // `d` and leave `key` unpublished (`RootScope::pin_roots`).
+    let base = pyre_object::gc_roots::pin_roots(&[d, key]);
+    let backing =
+        dict_backing_or_type_error(pyre_object::gc_roots::shadow_stack_get(base), "move_to_end")?;
     if crate::baseobjspace::dict_move_to_end(
         backing,
-        pyre_object::gc_roots::shadow_stack_get(key_slot),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
         last,
     )? {
         Ok(pyre_object::w_none())
     } else {
         Err(crate::PyError::key_error_with_key(
-            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
         ))
     }
 }
@@ -352,13 +349,13 @@ crate::py_module! {
         // Mark as a package so `from __pypy__.builders import ...`
         // treats `__pypy__` as a package with submodules.
         let mut ns = ns;
-        let w_path = pyre_object::with_roots!(ns => pyre_object::w_list_new(vec![]));
+        let mut w_path = pyre_object::with_roots!(ns => pyre_object::w_list_new(vec![]));
         crate::__pyre_store!(ns, "__path__", w_path);
         // Snapshot the canonical `identity_dict` type before any app code can
         // reassign `__pypy__.identity_dict`, keyed so attribute access cannot
         // reach it.  `objects_in_repr` builds its recursion guard from this
         // snapshot, matching PyPy's direct `W_IdentityDict` construction.
-        if let Some(ty) = crate::module_ns_get(ns, "identity_dict") {
+        if let Some(mut ty) = crate::module_ns_get(ns, "identity_dict") {
             crate::__pyre_store!(ns, CANONICAL_IDENTITY_DICT_KEY, ty);
         }
     }

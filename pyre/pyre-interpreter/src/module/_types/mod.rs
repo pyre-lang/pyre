@@ -2,11 +2,10 @@
 
 use pyre_object::*;
 
-fn store(ns: PyObjectRef, name: &str, ty: PyObjectRef) {
-    let _root_scope = pyre_object::gc_roots::push_roots();
-    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
-    crate::__pyre_put_new!(ns_slot, name, ty);
+fn store(mut ns: PyObjectRef, name: &str, mut ty: PyObjectRef) {
+    // Both words already exist. Sequential `pin_root(ns)` would be a
+    // safepoint while `ty` is still unpublished (`RootScope::pin_roots`).
+    crate::__pyre_store!(ns, name, ty);
 }
 
 #[cfg(all(
@@ -33,7 +32,7 @@ fn capsule_type() -> PyObjectRef {
         let tp = crate::typedef::make_builtin_type("PyCapsule", |ns| unsafe {
             let _root_scope = pyre_object::gc_roots::push_roots();
             let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let ns = pyre_object::gc_roots::pin_root(ns);
+            let _ = pyre_object::gc_roots::pin_root(ns);
             crate::__pyre_put_new!(
                 ns_slot,
                 "__new__",
@@ -53,127 +52,145 @@ fn capsule_type() -> PyObjectRef {
 }
 
 pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    let function_type = crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    let function_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(crate::typedef::gettypeobject(
+        &crate::function::FUNCTION_TYPE,
+    ));
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "AsyncGeneratorType",
         crate::typedef::gettypeobject(&pyre_object::generator::ASYNC_GENERATOR_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "BuiltinFunctionType",
         crate::typedef::gettypeobject(&crate::function::BUILTIN_FUNCTION_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "BuiltinMethodType",
         crate::typedef::gettypeobject(&crate::function::BUILTIN_FUNCTION_TYPE),
     );
-    store(ns, "CapsuleType", capsule_type());
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "CapsuleType",
+        capsule_type(),
+    );
+    store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "CellType",
         crate::typedef::gettypeobject(&pyre_object::nestedscope::CELL_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "ClassMethodDescriptorType",
         crate::typedef::gettypeobject(&crate::function::CLASSMETHOD_DESCRIPTOR_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "CodeType",
         crate::typedef::gettypeobject(&crate::pycode::CODE_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "CoroutineType",
         crate::typedef::gettypeobject(&pyre_object::generator::COROUTINE_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "EllipsisType",
         crate::typedef::gettypeobject(&pyre_object::ELLIPSIS_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "FrameType",
         crate::typedef::gettypeobject(&crate::pyframe::FRAME_TYPE),
     );
-    store(ns, "FunctionType", function_type);
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "FunctionType",
+        pyre_object::gc_roots::shadow_stack_get(function_slot),
+    );
+    store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "GeneratorType",
         crate::typedef::gettypeobject(&pyre_object::generator::GENERATOR_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "GenericAlias",
         crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "GetSetDescriptorType",
         crate::typedef::gettypeobject(&pyre_object::typedef::GETSET_DESCRIPTOR_TYPE),
     );
-    store(ns, "LambdaType", function_type);
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "LambdaType",
+        pyre_object::gc_roots::shadow_stack_get(function_slot),
+    );
+    store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "MappingProxyType",
         crate::typedef::gettypeobject(&pyre_object::MAPPING_PROXY_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "MemberDescriptorType",
         crate::typedef::gettypeobject(&pyre_object::typedef::MEMBER_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "MethodDescriptorType",
         crate::typedef::gettypeobject(&crate::function::METHOD_DESCRIPTOR_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "MethodType",
         crate::typedef::gettypeobject(&pyre_object::function::METHOD_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "MethodWrapperType",
         crate::typedef::gettypeobject(&crate::function::METHOD_WRAPPER_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "ModuleType",
         crate::typedef::gettypeobject(&pyre_object::MODULE_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "NoneType",
         crate::typedef::gettypeobject(&pyre_object::NONE_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "NotImplementedType",
         crate::typedef::gettypeobject(&pyre_object::NOTIMPLEMENTED_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "SimpleNamespace",
         crate::module::sys::vm::simple_namespace_type(),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "TracebackType",
         crate::typedef::gettypeobject(&crate::pytraceback::PYTRACEBACK_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "UnionType",
         crate::typedef::gettypeobject(&pyre_object::UNION_TYPE),
     );
     store(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "WrapperDescriptorType",
         crate::typedef::gettypeobject(&crate::function::SLOT_WRAPPER_TYPE),
     );
