@@ -632,15 +632,13 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     let root_base = roots.publish(&[w_code, w_func_globals_obj]);
     roots.normalize(root_base, 2);
     let w_code = roots.get(root_base);
-    // `Function.__init__` sets `self.name = code.co_name`; realize the shared wrapped
-    // name first so Function.name can name its `STR` payload (a header-bearing
-    // rstr leaf), not an interior pointer into `CodeObject.obj_name`.
-    let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
-    let name = if w_name.is_null() {
-        FunctionName::Owned(String::new())
-    } else {
-        FunctionName::Borrowed(w_name)
-    };
+    // `Function.__init__` sets `self.name = code.co_name`; realize the shared
+    // wrapped name first so Function.name can name its `STR` payload (a
+    // header-bearing rstr leaf), not an interior pointer into
+    // `CodeObject.obj_name`. `w_code_qualname_obj` may collect, so the
+    // `Borrowed` capture below reloads the wrapper and reads `_utf8` off
+    // that forwarded object.
+    let _ = unsafe { crate::pycode::w_code_name_obj(w_code) };
     // `function.py self.qualname = qualname or self.name`.  The code object
     // realizes one wrapped qualname and every function built from it names that
     // object, so a later `__code__ = new_code` assignment leaves
@@ -649,6 +647,12 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     // runs while no unrooted function is live.
     unsafe { crate::pycode::w_code_qualname_obj(roots.get(root_base)) };
     let w_code = roots.get(root_base);
+    let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
+    let name = if w_name.is_null() {
+        FunctionName::Owned(String::new())
+    } else {
+        FunctionName::Borrowed(w_name)
+    };
     let func = function_new_impl(
         &FUNCTION_TYPE,
         w_code as *const (),

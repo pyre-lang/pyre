@@ -5988,11 +5988,11 @@ fn walker_const_bool<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, observed:
 /// from. `code` comes from a `LOAD_CONST`, and the remaining slots are
 /// derived from the operands:
 ///
-/// * `name` — `function.py:51 self.name = code.co_name`, a pointer into the
-///   `Box::into_raw`'d `CodeObject`, which is never rewritten in place nor
-///   freed.  This is the same pointer the residual stores
-///   (`function_new_from_code` borrows it too), so a materialized function is
-///   indistinguishable from an interpreted one.
+/// * `name` — `Function.__init__` `self.name = code.co_name`, the rstr `STR`
+///   payload of the realized `co_name` wrapper (`w_str_storage`).  The
+///   residual (`function_new_from_code` `FunctionName::Borrowed`) stores
+///   that same payload, so a materialized function is indistinguishable
+///   from an interpreted one.
 /// * `w_name` / `w_qualname` — the code object's single realized `co_name` and
 ///   `co_qualname`, shared by every function built from it.
 /// * `w_builtins` — CPython 3.14 `_PyEval_BuiltinsFromGlobals`, frozen at
@@ -6093,6 +6093,25 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // `w_dict_getitem_str` above may collect. Reload the realized wrappers
+    // from the pinned code object so the baked `ConstPtr`s name the
+    // forwarded objects. `function.py self.name = code.co_name` is the
+    // wrapper's `_utf8` `STR`, not an interior pointer into
+    // `CodeObject.obj_name`.
+    let w_code = code_roots.get(code_slot);
+    let w_name = unsafe { pyre_interpreter::pycode::w_code_name_obj(w_code) };
+    if w_name.is_null() {
+        return Ok(None);
+    }
+    let w_qualname = unsafe { pyre_interpreter::pycode::w_code_qualname_obj(w_code) };
+    if w_qualname.is_null() {
+        return Ok(None);
+    }
+    let name_storage = unsafe { pyre_object::unicodeobject::w_str_storage(w_name) };
+    if name_storage.is_null() {
+        return Ok(None);
+    }
+
     // commit to the fold: emit IR (no further declines)
     // `globals['__builtins__']` may be rebound after this function is built,
     // and a later iteration must then see the new mapping.  Pinning the
@@ -6103,9 +6122,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
         .const_ref(pyre_object::get_instantiate(&pyre_interpreter::FUNCTION_TYPE) as i64);
     // `function.py can_change_code = True` for a plain `def`.
     let can_change_code = ctx.trace_ctx.const_int(1);
-    let name = ctx
-        .trace_ctx
-        .const_ref(unsafe { &(*code_ptr).obj_name } as *const String as i64);
+    let name = ctx.trace_ctx.const_ref(name_storage as i64);
     let w_name_const = ctx.trace_ctx.const_ref(w_name as i64);
     let w_builtins_const = ctx.trace_ctx.const_ref(w_builtins as i64);
     let w_qualname_const = ctx.trace_ctx.const_ref(w_qualname as i64);
