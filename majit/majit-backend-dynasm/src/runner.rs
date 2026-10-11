@@ -3388,6 +3388,9 @@ impl Backend for DynasmBackend {
         // `setup_once` builds `cond_call_slowpath` after `wb_slowpath`.
         #[cfg(target_arch = "x86_64")]
         let cond_call_slowpath = self.arch_cpu_ext.ensure_cond_call_slowpath();
+        // `setup_once` builds `failure_recovery_code` before the slow paths.
+        #[cfg(target_arch = "x86_64")]
+        let failure_recovery_code = self.arch_cpu_ext.ensure_failure_recovery();
         let mut asm = Asm::new(
             Arc::clone(&self.asm_memory_manager),
             trace_id,
@@ -3416,6 +3419,8 @@ impl Backend for DynasmBackend {
             stack_check_slowpath,
             #[cfg(target_arch = "x86_64")]
             cond_call_slowpath,
+            #[cfg(target_arch = "x86_64")]
+            failure_recovery_code,
             inputargs,
             &prepared_ops,
         );
@@ -3687,6 +3692,9 @@ impl Backend for DynasmBackend {
         // Same once-per-CPU `cond_call_slowpath` as `compile_loop`.
         #[cfg(target_arch = "x86_64")]
         let cond_call_slowpath = self.arch_cpu_ext.ensure_cond_call_slowpath();
+        // Same once-per-CPU `failure_recovery_code` as `compile_loop`.
+        #[cfg(target_arch = "x86_64")]
+        let failure_recovery_code = self.arch_cpu_ext.ensure_failure_recovery();
         let mut asm = Asm::new(
             Arc::clone(&self.asm_memory_manager),
             trace_id,
@@ -3715,6 +3723,8 @@ impl Backend for DynasmBackend {
             stack_check_slowpath,
             #[cfg(target_arch = "x86_64")]
             cond_call_slowpath,
+            #[cfg(target_arch = "x86_64")]
+            failure_recovery_code,
             &inputargs,
             &prepared_ops,
         );

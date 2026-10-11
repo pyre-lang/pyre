@@ -932,6 +932,25 @@ pub(crate) fn pop_b(mc: &mut Assembler, offset: i32) {
     encode_stack_bp(mc, offset, false, 0);
 }
 
+/// `PUS1_r` — `push r64`. `rex_nw`: REX.B for `r8`–`r15`, no REX.W.
+/// The opcode low bits carry the register (`0x50 + reg`).
+pub(crate) fn push_r(mc: &mut Assembler, reg: u8) {
+    encode_rex_opt(mc, rex_register(reg, 1));
+    DynasmApi::push(mc, 0x50 | reg_number_3bits(reg));
+}
+
+/// `PUS1_i8` — `push imm8` (`0x6A`).
+pub(crate) fn push_i8(mc: &mut Assembler, imm: i8) {
+    DynasmApi::push(mc, 0x6A);
+    DynasmApi::push(mc, imm as u8);
+}
+
+/// `PUS1_i32` — `push imm32` (`0x68`).
+pub(crate) fn push_i32(mc: &mut Assembler, imm: i32) {
+    DynasmApi::push(mc, 0x68);
+    writeimm32(mc, imm);
+}
+
 // SSE
 
 /// `MOVSD_xm` — `movsd xmm, [base + ofs]`.

@@ -824,6 +824,59 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
     dynasm!(asm ; .arch x64 ; ret);
 }
 
+/// `_build_failure_recovery(exc, withfloats)`.
+///
+/// Entered by `jmp`, not `call`, with the two words `generate_quick_failure`
+/// pushed still on the stack (`jf_descr` underneath `jf_gcmap`). Saves every
+/// managed GPR and, only when `withfloats`, the XMMs. On `exc`, loads
+/// `pos_exc_value` into `ebx` (already saved), clears `pos_exception` then
+/// `pos_exc_value`, and stores `ebx` to `jf_guard_exc`. Pops the two words
+/// into `jf_gcmap` and `jf_descr`, then `_call_footer`. Index in
+/// `failure_recovery_code` is `exc + 2 * withfloats`.
+fn emit_failure_recovery(mc: &mut Assembler, exc: bool, withfloats: bool) {
+    push_all_regs_to_jitframe_raw(mc, &[], withfloats, false);
+    if exc {
+        let exc_value_addr = crate::jit_exc_value_addr() as i64;
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        // `MOV(ebx, heap(pos_exc_value))`. The cell does not fit a disp32,
+        // so the address goes through `r11` (`_addr_as_reg_offset`).
+        rx86::mov_ri(mc, rx86::R11, exc_value_addr);
+        rx86::mov_rm(mc, rx86::EBX, (rx86::R11, 0));
+        rx86::mov_ri(mc, rx86::R11, exc_type_addr);
+        rx86::mov_mi(mc, (rx86::R11, 0), 0);
+        rx86::mov_ri(mc, rx86::R11, exc_value_addr);
+        rx86::mov_mi(mc, (rx86::R11, 0), 0);
+        rx86::mov_br(mc, JF_GUARD_EXC_OFS, rx86::EBX);
+    }
+    // Top of stack is the gcmap, then the descr (`generate_quick_failure`).
+    rx86::pop_b(mc, JF_GCMAP_OFS);
+    rx86::pop_b(mc, JF_DESCR_OFS);
+    emit_call_footer_raw(mc);
+}
+
+/// `setup_once`'s four `_build_failure_recovery` entries:
+/// `(exc, withfloats)` = `(False, False)`, `(True, False)`,
+/// `(False, True)`, `(True, True)`.
+pub(crate) fn build_failure_recoveries(
+    arena: &Arc<AsmMemoryManager>,
+) -> (Vec<codebuf::ArenaExecutableBuffer>, [usize; 4]) {
+    let mut buffers = Vec::with_capacity(4);
+    let mut addrs = [0usize; 4];
+    for (index, (exc, withfloats)) in [(false, false), (true, false), (false, true), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut mc = Assembler::new(0);
+        emit_failure_recovery(&mut mc, exc, withfloats);
+        let buffer = codebuf::finalize_executable(mc, arena).expect("failure_recovery: finalize");
+        let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+        assert!(ptr != 0, "failure_recovery_code[{index}] entry is null");
+        addrs[index] = ptr;
+        buffers.push(buffer);
+    }
+    (buffers, addrs)
+}
+
 /// `assembler.py:328 _build_propagate_exception_path` parity —
 /// pure builder.  Caching/ownership is the caller's responsibility:
 /// `X86CpuExt::ensure_propagate_exception_path` (`x86/cpu_ext.rs`)
@@ -1136,6 +1189,8 @@ pub(crate) fn build_cond_call_slowpaths(
         0,
         0,
         0,
+        [0; 4],
+        // This helper assembler never emits `generate_quick_failure`.
         [0; 4],
         &inputargs,
         &operations,
@@ -1888,15 +1943,6 @@ enum SlowPathKind {
     },
 }
 
-/// `cond_call`: `variant_num = floats * 2 + callee_only`.
-/// Index 2 is `(supports_floats=True, callee_only=False)`. The regalloc
-/// bindings `cond_call` reads are gone by emit, so every site calls this
-/// variant. It saves every managed register the narrower helpers save,
-/// except `cond_call_register_arguments + [eax]`, which the per-site body
-/// spills. Those home slots sit below `JITFRAME_FIXED_SIZE` and do not
-/// overlap spills, so a dead register written there is not a live spill.
-const COND_CALL_SLOWPATH_FLOATS_ALL: usize = 2;
-
 /// assembler.py Assembler386.
 /// In Rust, this is a transient builder — created per compilation,
 /// not a long-lived object like RPython's.
@@ -2081,6 +2127,9 @@ pub struct Assembler386<'a> {
     /// `_build_cond_call_slowpath` entries. Index is
     /// `floats * 2 + callee_only`.
     cond_call_slowpath: [usize; 4],
+    /// `Assembler386.failure_recovery_code`, the four
+    /// `_build_failure_recovery` entries. Index is `exc + 2 * withfloats`.
+    failure_recovery_code: [usize; 4],
     /// `assembler.py reserve_gcref_table`: one label per slot of the
     /// reference-constant table reserved at the start of this code block,
     /// which the `LoadFromGcTable` genop reads PC-relative. Empty when the
@@ -2277,6 +2326,7 @@ impl<'a> Assembler386<'a> {
         frame_realloc_slowpath: usize,
         stack_check_slowpath: usize,
         cond_call_slowpath: [usize; 4],
+        failure_recovery_code: [usize; 4],
         inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
@@ -2335,6 +2385,7 @@ impl<'a> Assembler386<'a> {
             frame_realloc_slowpath,
             stack_check_slowpath,
             cond_call_slowpath,
+            failure_recovery_code,
             gcref_table: Vec::new(),
             datablockwrapper,
             scratch_register_value: -1,
@@ -3429,7 +3480,7 @@ impl<'a> Assembler386<'a> {
     /// which look up positions in the same Win64-aware lists.  This
     /// mirrors `regalloc.py all_reg_indexes`, which is built from the
     /// post-`remove(r13)` `all_regs` on Win64 (so R14→10, R15→11).
-    /// `save_regs_label`, the `core_reg_index`-driven gcmap, and the
+    /// `_build_failure_recovery`, the `core_reg_index`-driven gcmap, and the
     /// post-call pop all consume positions through this same Win64-aware
     /// list, keeping the three in agreement.
     fn push_all_regs_to_jitframe(
@@ -3530,6 +3581,20 @@ impl<'a> Assembler386<'a> {
         emit_footer_shadowstack_raw(&mut self.mc);
         // `emit_footer_shadowstack_raw` writes `X86_64_SCRATCH_REG`.
         self.forget_scratch_register();
+    }
+
+    /// `regloc.py` `_unaryop` for `PUSH(imm)`: `PUSH_i8` / `PUSH_i32`, or
+    /// `_load_scratch` and `PUSH_r` of `X86_64_SCRATCH_REG` when the word
+    /// does not fit a signed imm32. `r11` still holds `value` afterwards.
+    fn push_imm(&mut self, value: i64) {
+        if rx86::single_byte(value) {
+            rx86::push_i8(&mut self.mc, value as i8);
+        } else if rx86::fits_in_32bits(value) {
+            rx86::push_i32(&mut self.mc, value as i32);
+        } else {
+            self.load_scratch(value);
+            rx86::push_r(&mut self.mc, crate::regloc::X86_64_SCRATCH_REG.value);
+        }
     }
 
     /// assembler.py:993 push_gcmap.
@@ -7086,15 +7151,15 @@ impl<'a> Assembler386<'a> {
 
     // assembler.py:652 write_pending_failure_recoveries
 
-    /// assembler.py:982 generate_quick_failure.
+    /// `generate_quick_failure`.
     ///
-    /// RPython parity: the quick-failure stub saves managed registers into the
-    /// fixed jitframe prefix before publishing jf_descr and returning.
-    fn generate_quick_failure(
-        &mut self,
-        guard_token: GuardToken,
-        save_regs_label: DynamicLabel,
-    ) -> RecoveryStub {
+    /// Immediate fail-args are extra frame slots (`const_stores`). They are
+    /// written here, before the two pushes, so `rd_locs` still names them.
+    /// `restore_scratch_register_known_value` is skipped: `GuardToken` has no
+    /// `known_scratch_value`, and `_build_failure_recovery` clobbers `r11`.
+    /// Then `PUSH` the descr and the gcmap and `JMP`
+    /// `failure_recovery_code[exc + 2 * withfloats]` (`store_info_on_descr`).
+    fn generate_quick_failure(&mut self, guard_token: GuardToken) -> RecoveryStub {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
@@ -7104,51 +7169,50 @@ impl<'a> Assembler386<'a> {
                 &format!("recovery stub: binding {fail_label:?}"),
             );
         }
+        // The fail label is a join. The fallthrough scratch cache does not
+        // describe this edge.
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>fail_label);
 
-        dynasm!(self.mc ; .arch x64 ; call =>save_regs_label);
-        self.forget_after_call_or_jmp();
-
-        // llsupport/assembler.py store_info_on_descr — must_save_exception
-        // guards run the exc=True failure-recovery variant: stage pos_exc_value
-        // into jf_guard_exc and clear both globals so grab_exc_value reads the
-        // value off the deadframe (assembler.py:2089-2096 _build_failure_recovery).
-        // rax / scratch are call-clobbered and reused by the descr store below,
-        // so using them here (before that store) is safe.
-        if guard_token.must_save_exception {
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            let exc_value_addr = crate::jit_exc_value_addr() as i64;
-            let exc_type_addr = crate::jit_exc_type_addr() as i64;
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, exc_value_addr);
-            rx86::mov_rm(&mut self.mc, rx86::EAX, (scratch, 0)); // rax = *pos_exc_value
-            rx86::mov_mi(&mut self.mc, (scratch, 0), 0); // *pos_exc_value = 0
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, exc_type_addr);
-            rx86::mov_mi(&mut self.mc, (scratch, 0), 0); // *pos_exception = 0
-            rx86::mov_br(&mut self.mc, JF_GUARD_EXC_OFS, rx86::EAX); // jf_guard_exc = excval
-        }
-
-        let descr_ptr = guard_token.fail_cell_ptr as i64;
-        rx86::mov_ri(&mut self.mc, rx86::EAX, descr_ptr);
-        rx86::mov_br(&mut self.mc, JF_DESCR_OFS, rx86::EAX);
-        self.push_gcmap(guard_token.gcmap);
-
         for &(slot, val) in &guard_token.const_stores {
             let ofs = Self::slot_offset(slot);
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             self.load_scratch(val);
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             rx86::mov_br(&mut self.mc, ofs, scratch);
         }
 
-        self._call_footer();
+        // `PUSH` descr, then `PUSH` gcmap. The recovery pops gcmap first.
+        self.push_imm(guard_token.fail_cell_ptr as i64);
+        self.push_imm(guard_token.gcmap as i64);
+
+        let index = Self::failure_recovery_index(&guard_token);
+        let target = self.failure_recovery_code[index];
+        assert!(
+            target != 0,
+            "failure_recovery_code[{index}] was not built (_build_failure_recovery)"
+        );
+        // `JMP(imm)` is `mov r11, imm; jmp r11` (`_relative_unaryop`).
+        self.load_scratch(target as i64);
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64 ; jmp Rq(scratch));
+        self.forget_after_call_or_jmp();
         RecoveryStub {
             fail_descr: guard_token.fail_descr,
             pos_recovery_stub: stub_start.0,
             pos_jump_offset: guard_token.pos_jump_offset,
             guard_not_invalidated: guard_token.guard_not_invalidated,
         }
+    }
+
+    /// `store_info_on_descr`: `exc + 2 * withfloats`. `withfloats` is set
+    /// when a failarg type is FLOAT. `store_info_on_descr` also treats
+    /// VECTOR that way; `Type` has no vector variant.
+    fn failure_recovery_index(guard_token: &GuardToken) -> usize {
+        let withfloats = guard_token
+            .fail_descr
+            .as_fail_descr()
+            .is_some_and(|fd| fd.fail_arg_types().iter().any(|tp| *tp == Type::Float));
+        usize::from(guard_token.must_save_exception) + 2 * usize::from(withfloats)
     }
 
     /// `SlowPath.__init__`: emit `J_il` to `slow_label` and record the r11
@@ -7544,28 +7608,6 @@ impl<'a> Assembler386<'a> {
         // `flush_pending_slowpaths` before the stub loop: a slow-path body
         // may append a guard token to `pending_guard_tokens`.
         self.flush_pending_slowpaths();
-        // Emit a shared _push_all_regs_to_frame routine once, then let each
-        // generate_quick_failure() stub call it.  Iterate `ALL_CORE_REGS`
-        // / `ALL_FLOAT_REGS` (Win64-aware: R13 dropped from GPRs, XMM5..14
-        // dropped from FPRs) so save_regs_label, the gcmap built off
-        // `core_reg_index`, and the post-call pop all agree on slot
-        // assignments.
-        let save_regs_label = self.mc.new_dynamic_label();
-        self.forget_scratch_register();
-        dynasm!(self.mc ; .arch x64 ; =>save_regs_label);
-        for &reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
-            let save_slot = core_reg_position(reg).expect("managed x86_64 GPR");
-            let ofs = Self::slot_offset(save_slot);
-            rx86::mov_br(&mut self.mc, ofs, reg.value);
-        }
-        for &reg in crate::x86::regalloc::ALL_FLOAT_REGS.iter() {
-            let save_slot = float_reg_position(reg).expect("managed x86_64 XMM");
-            let ofs = Self::slot_offset(save_slot);
-            rx86::movsd_bx(&mut self.mc, ofs, reg.value);
-        }
-        dynasm!(self.mc ; .arch x64 ; ret);
-        self.forget_after_call_or_jmp();
-
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] write_pending_failure_recoveries: {} tokens",
@@ -7574,7 +7616,7 @@ impl<'a> Assembler386<'a> {
         }
         let mut stub_offsets = Vec::new();
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
-            stub_offsets.push(self.generate_quick_failure(guard_token, save_regs_label));
+            stub_offsets.push(self.generate_quick_failure(guard_token));
         }
         if majit_ir::debug::have_debug_prints() {
             majit_ir::debug::log_one(
@@ -10752,8 +10794,10 @@ impl<'a> Assembler386<'a> {
     /// `CC_NE` only when no compare is pending. The call, the gcmap, and
     /// `generate_guard_no_exception` live in `CondCallSlowPath`.
     fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
-        if arglocs.len() < 2 {
-            panic!("cond_call arglocs are predicate, func, extras; got {arglocs:?}");
+        if arglocs.len() < 3 {
+            panic!(
+                "cond_call arglocs are predicate, func, extras, variant (consider_cond_call_n); got {arglocs:?}"
+            );
         }
         self.load_condition_into_cc(&arglocs[0]);
         let cc = self
@@ -10761,8 +10805,11 @@ impl<'a> Assembler386<'a> {
             .take()
             .expect("cond_call requires guard_success_cc (load_condition_into_cc)");
         // Predicate at 0, func at 1. Extras are remapped onto
-        // `cond_call_register_arguments` in the slow path.
-        self.enqueue_cond_call(op, op_index, cc, arglocs[2..].to_vec(), None);
+        // `cond_call_register_arguments` in the slow path. The last
+        // immediate is `cond_call`'s `floats * 2 + callee_only`.
+        let variant_num = Self::cond_call_variant_num(arglocs);
+        let extras = &arglocs[2..arglocs.len() - 1];
+        self.enqueue_cond_call(op, op_index, cc, extras.to_vec(), None, variant_num);
     }
 
     /// `cond_call` for `COND_CALL_VALUE_I` / `COND_CALL_VALUE_R`.
@@ -10781,7 +10828,20 @@ impl<'a> Assembler386<'a> {
             "cond_call value does not consume guard_success_cc"
         );
         self.emit_test_loc(&resloc);
-        self.enqueue_cond_call(op, op_index, CC_E, Vec::new(), Some(resloc));
+        let variant_num = Self::cond_call_variant_num(arglocs);
+        self.enqueue_cond_call(op, op_index, CC_E, Vec::new(), Some(resloc), variant_num);
+    }
+
+    /// Trailing immediate from `consider_cond_call_n` /
+    /// `consider_cond_call_value_j2`: `cond_call`'s
+    /// `floats * 2 + callee_only`.
+    fn cond_call_variant_num(arglocs: &[Loc]) -> usize {
+        match arglocs.last() {
+            Some(Loc::Immed(imm)) if (0..4).contains(&imm.value) => imm.value as usize,
+            other => {
+                panic!("cond_call variant_num is the trailing immediate (cond_call), got {other:?}")
+            }
+        }
     }
 
     /// `cond_call`: queue `CondCallSlowPath` and bind the continue point
@@ -10793,6 +10853,7 @@ impl<'a> Assembler386<'a> {
         cc: u8,
         arglocs: Vec<Loc>,
         resloc: Option<Loc>,
+        variant_num: usize,
     ) {
         let imm_func = match self.resolve_opref(op.arg(1).to_opref()) {
             ResolvedArg::Const(val) => val,
@@ -10815,7 +10876,7 @@ impl<'a> Assembler386<'a> {
                 imm_func,
                 arglocs,
                 resloc,
-                variant_num: COND_CALL_SLOWPATH_FLOATS_ALL,
+                variant_num,
                 guard_token_no_exception: None,
                 expects_guard_no_exception,
             },

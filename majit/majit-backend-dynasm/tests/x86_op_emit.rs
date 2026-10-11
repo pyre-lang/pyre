@@ -3,7 +3,8 @@
 //! `genop_float_abs`, `_cmp_guard_gc_type`, `genop_guard_guard_is_object`,
 //! `genop_guard_guard_subclass`, `_binaryop`, `_cmpop_float`,
 //! `_store_force_index`, `store_force_descr`, `genop_guard_guard_no_exception`,
-//! `cond_call` / `CondCallSlowPath`, `malloc_cond`,
+//! `cond_call` / `CondCallSlowPath`, `generate_quick_failure`,
+//! `_build_failure_recovery`, `malloc_cond`,
 //! `malloc_cond_varsize_frame`, `malloc_cond_varsize`.
 
 #![cfg(target_arch = "x86_64")]
@@ -1077,6 +1078,290 @@ fn cond_call_value_zero_writes_the_helper_result() {
         GcRef(helper_bits as usize)
     );
     assert_eq!(VALUE_R_TAKE_HITS.load(Ordering::SeqCst), 1);
+}
+
+static CALLER_SAVED_HITS: AtomicUsize = AtomicUsize::new(0);
+static CALLEE_SAVED_HITS: AtomicUsize = AtomicUsize::new(0);
+
+clobber_hits!(cond_call_caller_saved_hit, CALLER_SAVED_HITS);
+clobber_hits!(cond_call_callee_saved_hit, CALLEE_SAVED_HITS);
+
+/// One `INT_ADD` whose result is the only value live across `COND_CALL`.
+/// No float op, so `xrm.reg_bindings` is empty. The result is the first
+/// GPR allocation, which is in `save_around_call_regs`.
+fn compile_caller_saved_cond_call(func: i64) -> (DynasmBackend, JitCellToken, usize) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(1))]);
+    add.pos().set(OpRef::int_op(1));
+    let call = Op::new(
+        OpCode::CondCallN,
+        &[rb(OpRef::const_int(1)), rb(OpRef::const_int(func))],
+    );
+    call.pos().set(OpRef::void_op(0));
+    let ops = vec![
+        OpRc::new(add),
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    let info = backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile caller-saved COND_CALL: {err:?}"));
+    (backend, token, info.code_size)
+}
+
+#[test]
+fn cond_call_only_caller_saved_lives_survive() {
+    // No live float. The only live core register is the add result, and
+    // that register is in `save_around_call_regs`. `cond_call` selects
+    // `cond_call_slowpath[1]` (`callee_only`, no floats).
+    let func = cond_call_caller_saved_hit as *const () as usize as i64;
+    CALLER_SAVED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token, code_size) = compile_caller_saved_cond_call(func);
+    assert_eq!(
+        cond_call_slowpath_index(loop_code(&token, code_size), func as u64),
+        1
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(40)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 41);
+    assert_eq!(CALLER_SAVED_HITS.load(Ordering::SeqCst), 1);
+}
+
+fn compile_callee_saved_cond_call(func: i64) -> (DynasmBackend, JitCellToken, usize) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    for n in 1..=4 {
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[rb(i0), rb(OpRef::const_int(i64::from(n)))],
+        );
+        add.pos().set(OpRef::int_op(n));
+        ops.push(add);
+        live.push(rb(OpRef::int_op(n)));
+    }
+    let call = Op::new(
+        OpCode::CondCallN,
+        &[rb(OpRef::const_int(1)), rb(OpRef::const_int(func))],
+    );
+    call.pos().set(OpRef::void_op(0));
+    ops.push(call);
+    // `genop_finish` writes only arglocs[0] into frame slot 0, and the
+    // finish descr leaves `rd_locs` empty. A failing guard records every
+    // live register there, which is what `get_int_value` reads.
+    let eq = Op::new(
+        OpCode::IntEq,
+        &[rb(OpRef::int_op(1)), rb(OpRef::const_int(0))],
+    );
+    eq.pos().set(OpRef::int_op(5));
+    ops.push(eq);
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(5))]);
+    guard.pos().set(OpRef::void_op(6));
+    guard.setdescr(make_resume_guard_descr_typed(vec![Type::Int; 4]));
+    guard.set_fail_arg_types(vec![Type::Int; 4]);
+    guard.setfailargs(live.into());
+    ops.push(guard);
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    let info = backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile callee-saved COND_CALL: {err:?}"));
+    (backend, token, info.code_size)
+}
+
+#[test]
+fn cond_call_live_callee_saved_survives() {
+    // Four live adds. `ebx` is outside `save_around_call_regs`, so
+    // `callee_only` is false. No live float. `cond_call` selects
+    // `cond_call_slowpath[0]` (every core register, no floats). The
+    // naked callee xors `ebx`/`esi`/`edi`/`r12`/`r14`/`r15`.
+    let func = cond_call_callee_saved_hit as *const () as usize as i64;
+    CALLEE_SAVED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token, code_size) = compile_callee_saved_cond_call(func);
+    assert_eq!(
+        cond_call_slowpath_index(loop_code(&token, code_size), func as u64),
+        0
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(10)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(CALLEE_SAVED_HITS.load(Ordering::SeqCst), 1);
+    for (index, expected) in [11, 12, 13, 14].into_iter().enumerate() {
+        assert_eq!(
+            backend.get_int_value(&frame, index),
+            expected,
+            "live add {index}"
+        );
+    }
+}
+
+fn loop_code(token: &JitCellToken, code_size: usize) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(token.ll_raw_start() as *const u8, code_size) }
+}
+
+/// `generate_cond_call_slowpath` loads the helper with `mov r11, imm64`
+/// and `call r11`. `push_gcmap` forgets the scratch cache first, so
+/// `load_scratch` is that `movabs`, not an `lea`.
+fn cond_call_slowpath_index(code: &[u8], func: u64) -> usize {
+    let needle = func.to_le_bytes();
+    let at = code
+        .windows(8)
+        .position(|window| window == needle)
+        .unwrap_or_else(|| panic!("cond_call func immediate is missing"));
+    let tail = &code[at..];
+    let mut i = 0;
+    while i + 13 <= tail.len() {
+        if tail[i] == 0x49
+            && tail[i + 1] == 0xBB
+            && tail[i + 10] == 0x41
+            && tail[i + 11] == 0xFF
+            && tail[i + 12] == 0xD3
+        {
+            let helper = u64::from_le_bytes(tail[i + 2..i + 10].try_into().unwrap());
+            return classify_cond_call_helper(helper);
+        }
+        i += 1;
+    }
+    panic!("cond_call_slowpath call is missing after the func immediate");
+}
+
+/// `_build_cond_call_slowpath` prologue: GPR `mov [rbp+slot], reg`, then
+/// XMM stores when `supports_floats`, then `sub rsp, align`. `ebx` is in
+/// `all_regs` and not in `save_around_call_regs`, so a store of it means
+/// `callee_only` is false.
+fn classify_cond_call_helper(addr: u64) -> usize {
+    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, 192) };
+    let mut saves_ebx = false;
+    let mut saves_xmm = false;
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if bytes[i] == 0x48 && bytes[i + 1] == 0x83 && bytes[i + 2] == 0xEC {
+            break;
+        }
+        if bytes[i] == 0xF2 {
+            saves_xmm = true;
+            let modrm_at = if bytes[i + 1] == 0x0F { i + 3 } else { i + 4 };
+            i = modrm_at + 1 + disp_after_modrm(bytes[modrm_at]);
+            continue;
+        }
+        if (bytes[i] == 0x48 || bytes[i] == 0x4C) && bytes[i + 1] == 0x89 {
+            let modrm = bytes[i + 2];
+            let reg = ((bytes[i] & 0x04) << 1) | ((modrm >> 3) & 7);
+            if reg == 3 {
+                saves_ebx = true;
+            }
+            i += 3 + disp_after_modrm(modrm);
+            continue;
+        }
+        panic!(
+            "cond_call helper prologue byte {:#x} at {i} (addr {addr:#x})",
+            bytes[i]
+        );
+    }
+    usize::from(saves_xmm) * 2 + usize::from(!saves_ebx)
+}
+
+fn disp_after_modrm(modrm: u8) -> usize {
+    match modrm >> 6 {
+        1 => 1,
+        2 => 4,
+        _ => 0,
+    }
+}
+
+/// `INT_ADD`, `FLOAT_NEG`, and the input int stay live as fail-args.
+/// `exc` is `GUARD_NO_EXCEPTION`; otherwise `INT_EQ` / `GUARD_TRUE` fails.
+/// Failargs are not constants (`compute_vars_longevity`).
+fn compile_guard_fail_with_float(exc: bool) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Float, 1),
+    ];
+    let i0 = inputargs[0].opref();
+    let f0 = inputargs[1].opref();
+    let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(1))]);
+    add.pos().set(OpRef::int_op(1));
+    let neg = Op::new(OpCode::FloatNeg, &[rb(f0)]);
+    neg.pos().set(OpRef::float_op(2));
+    let mut ops = vec![add, neg];
+    let guard = if exc {
+        let guard = Op::new(OpCode::GuardNoException, &[]);
+        guard.pos().set(OpRef::void_op(3));
+        guard
+    } else {
+        let eq = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(1))]);
+        eq.pos().set(OpRef::int_op(3));
+        ops.push(eq);
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(3))]);
+        guard.pos().set(OpRef::void_op(4));
+        guard
+    };
+    guard.setdescr(make_resume_guard_descr_typed(vec![
+        Type::Int,
+        Type::Float,
+        Type::Int,
+    ]));
+    guard.set_fail_arg_types(vec![Type::Int, Type::Float, Type::Int]);
+    guard.setfailargs(vec![rb(OpRef::int_op(1)), rb(OpRef::float_op(2)), rb(i0)].into());
+    ops.push(guard);
+    ops.push(finish(5));
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile guard failure exc={exc}: {err:?}"));
+    (backend, token)
+}
+
+fn assert_guard_failargs(backend: &DynasmBackend, frame: &majit_backend::DeadFrame) {
+    assert!(!backend.get_latest_descr(frame).is_finish());
+    assert_eq!(backend.get_int_value(frame, 0), 8);
+    assert_float_bits(
+        backend.get_float_value(frame, 1),
+        2.5,
+        "guard float failarg",
+    );
+    assert_eq!(backend.get_int_value(frame, 2), 7);
+}
+
+#[test]
+fn failure_recovery_reads_failargs_without_an_exception() {
+    // `GUARD_TRUE` fails. No pending exception, and a float fail-arg, so
+    // `store_info_on_descr` selects `failure_recovery_code[2]`
+    // (`exc=false`, `withfloats=true`).
+    let _lock = lock_exception_cells();
+    let _clear = ClearExc;
+    majit_backend_dynasm::jit_exc_clear();
+    let (backend, token) = compile_guard_fail_with_float(false);
+    let frame = backend.execute_token(&token, &[Value::Int(7), Value::Float(-2.5)]);
+    assert_guard_failargs(&backend, &frame);
+    assert_eq!(backend.grab_exc_value(&frame), GcRef(0));
+    assert!(!majit_backend_dynasm::jit_exc_is_pending());
+}
+
+#[test]
+fn failure_recovery_captures_a_pending_exception() {
+    // `GUARD_NO_EXCEPTION` with a float fail-arg selects
+    // `failure_recovery_code[3]` (`exc=true`, `withfloats=true`).
+    // `_build_failure_recovery` stores `pos_exc_value` in `jf_guard_exc`
+    // and clears both cells.
+    let _lock = lock_exception_cells();
+    let _clear = ClearExc;
+    majit_backend_dynasm::jit_exc_clear();
+    majit_backend_dynasm::jit_exc_raise(EXC_OBJ.as_ptr() as i64);
+    let (backend, token) = compile_guard_fail_with_float(true);
+    let frame = backend.execute_token(&token, &[Value::Int(7), Value::Float(-2.5)]);
+    assert_guard_failargs(&backend, &frame);
+    assert_eq!(
+        backend.grab_exc_value(&frame),
+        GcRef(EXC_OBJ.as_ptr() as usize)
+    );
+    assert!(!majit_backend_dynasm::jit_exc_is_pending());
 }
 
 fn no_collect_effect() -> EffectInfo {

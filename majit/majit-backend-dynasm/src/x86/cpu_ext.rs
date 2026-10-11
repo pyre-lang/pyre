@@ -71,6 +71,11 @@ pub(crate) struct X86CpuExt {
     /// helper does not bake `propagate_exception_descr`.
     cond_call_slowpath: [usize; 4],
     _cond_call_slowpath_buffers: Vec<ArenaExecutableBuffer>,
+    /// `Assembler386.failure_recovery_code`: four `_build_failure_recovery`
+    /// entries, index `exc + 2 * withfloats`. `0` until
+    /// `ensure_failure_recovery`. The helper does not bake a descr pointer.
+    failure_recovery_code: [usize; 4],
+    _failure_recovery_buffers: Vec<ArenaExecutableBuffer>,
 }
 
 impl X86CpuExt {
@@ -93,6 +98,8 @@ impl X86CpuExt {
             _wb_slowpath_buffers: Vec::new(),
             cond_call_slowpath: [0; 4],
             _cond_call_slowpath_buffers: Vec::new(),
+            failure_recovery_code: [0; 4],
+            _failure_recovery_buffers: Vec::new(),
         }
     }
 
@@ -198,6 +205,24 @@ impl X86CpuExt {
         );
         self._cond_call_slowpath_buffers = buffers;
         self.cond_call_slowpath = addrs;
+        addrs
+    }
+
+    /// `_build_failure_recovery` for `(exc, withfloats)` in index order
+    /// `exc + 2 * withfloats`, memoised once per CPU. No propagate or
+    /// write-barrier dependency: the body only reads the process-wide
+    /// exception cells.
+    pub(crate) fn ensure_failure_recovery(&mut self) -> [usize; 4] {
+        if self.failure_recovery_code[0] != 0 {
+            return self.failure_recovery_code;
+        }
+        let (buffers, addrs) = super::assembler::build_failure_recoveries(&self.asm_memory_manager);
+        assert!(
+            addrs.iter().all(|addr| *addr != 0),
+            "build_failure_recoveries returned a null entry"
+        );
+        self._failure_recovery_buffers = buffers;
+        self.failure_recovery_code = addrs;
         addrs
     }
 
