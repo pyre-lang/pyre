@@ -1910,16 +1910,19 @@ enum SlowPathKind {
     /// captured (`*mut usize` stored as `usize` so the queue stays `Send`).
     IncreaseStack { gcmap: usize },
     /// `CondCallSlowPath`. `gcmap` is the map `cond_call` read
-    /// (`*mut usize` stored as `usize`). `arglocs` are what
-    /// `remap_frame_layout` writes into `cond_call_register_arguments`:
-    /// the void form's extras, or an empty list for `COND_CALL_VALUE_*`.
-    /// `variant_num` indexes `cond_call_slowpath` (`floats * 2 + callee_only`).
+    /// (`*mut usize` stored as `usize`). `arglocs` are the extra-arg
+    /// locations `consider_cond_call` captured; `generate_body` remaps
+    /// them into `cond_call_register_arguments`. `variant_num` indexes
+    /// `cond_call_slowpath` (`floats * 2 + callee_only`).
+    /// `should_be_saved` is `rm.reg_bindings.values()` as a bitmask
+    /// over GPR numbers (`1 << gpr.value`).
     CondCall {
         gcmap: usize,
         imm_func: i64,
         arglocs: Vec<Loc>,
         resloc: Option<Loc>,
         variant_num: usize,
+        should_be_saved: i64,
         guard_token_no_exception: Option<GuardToken>,
         expects_guard_no_exception: bool,
     },
@@ -7329,6 +7332,7 @@ impl<'a> Assembler386<'a> {
                 arglocs,
                 resloc,
                 variant_num,
+                should_be_saved,
                 guard_token_no_exception,
                 expects_guard_no_exception,
             } => {
@@ -7338,6 +7342,7 @@ impl<'a> Assembler386<'a> {
                     arglocs,
                     resloc,
                     variant_num,
+                    should_be_saved,
                     guard_token_no_exception,
                     expects_guard_no_exception,
                 );
@@ -7438,8 +7443,9 @@ impl<'a> Assembler386<'a> {
         self.flush_pending_slowpaths();
     }
 
-    /// `CondCallSlowPath.generate_body`. Spill the five registers the helper
-    /// does not save (except `resloc`), remap arguments, `mov eax, imm_func`,
+    /// `CondCallSlowPath.generate_body`. Spill `cond_call_register_arguments
+    /// + [eax]` when the GPR is in `should_be_saved` and is not `resloc`,
+    /// remap extra args, `mov eax, imm_func`,
     /// `call cond_call_slowpath[variant_num]`, move the result, restore eax,
     /// then `generate_guard_no_exception` when the token is present.
     fn generate_cond_call_slowpath(
@@ -7449,6 +7455,7 @@ impl<'a> Assembler386<'a> {
         arglocs: Vec<Loc>,
         resloc: Option<Loc>,
         variant_num: usize,
+        should_be_saved: i64,
         guard_token_no_exception: Option<GuardToken>,
         expects_guard_no_exception: bool,
     ) {
@@ -7468,7 +7475,10 @@ impl<'a> Assembler386<'a> {
         };
         let mut restore_eax = false;
         for gpr in gprs {
-            if res_reg == Some(gpr) {
+            // `CondCallSlowPath.generate_body`: save only when
+            // `gpr in should_be_saved and gpr is not self.resloc`.
+            let bound = (should_be_saved & (1i64 << gpr.value)) != 0;
+            if !bound || res_reg == Some(gpr) {
                 continue;
             }
             let slot = core_reg_position(gpr).expect("cond_call gpr is a managed register");
@@ -10810,9 +10820,9 @@ impl<'a> Assembler386<'a> {
     /// `CC_NE` only when no compare is pending. The call, the gcmap, and
     /// `generate_guard_no_exception` live in `CondCallSlowPath`.
     fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
-        if arglocs.len() < 3 {
+        if arglocs.len() < 4 {
             panic!(
-                "cond_call arglocs are predicate, func, extras, variant (consider_cond_call_n); got {arglocs:?}"
+                "cond_call arglocs are predicate, func, extras, variant, should_be_saved (consider_cond_call_n); got {arglocs:?}"
             );
         }
         self.load_condition_into_cc(&arglocs[0]);
@@ -10821,42 +10831,64 @@ impl<'a> Assembler386<'a> {
             .take()
             .expect("cond_call requires guard_success_cc (load_condition_into_cc)");
         // Predicate at 0, func at 1. Extras are remapped onto
-        // `cond_call_register_arguments` in the slow path. The last
-        // immediate is `cond_call`'s `floats * 2 + callee_only`.
-        let variant_num = Self::cond_call_variant_num(arglocs);
-        let extras = &arglocs[2..arglocs.len() - 1];
-        self.enqueue_cond_call(op, op_index, cc, extras.to_vec(), None, variant_num);
+        // `cond_call_register_arguments` in the slow path
+        // (`CondCallSlowPath.generate_body`). Trailing immediates are
+        // `cond_call`'s `variant_num` and `should_be_saved` bitmask.
+        let (variant_num, should_be_saved) = Self::cond_call_variant_and_saved(arglocs);
+        let extras = &arglocs[2..arglocs.len() - 2];
+        self.enqueue_cond_call(
+            op,
+            op_index,
+            cc,
+            extras.to_vec(),
+            None,
+            variant_num,
+            should_be_saved,
+        );
     }
 
     /// `cond_call` for `COND_CALL_VALUE_I` / `COND_CALL_VALUE_R`.
     /// `consider_cond_call` tests `resloc` and calls when it is zero.
-    /// Extras already sit in `cond_call_register_arguments`, so the remap
-    /// list is empty. Does not consume `guard_success_cc`.
+    /// Extra-arg locations follow `[argloc, resloc]`; the slow path remaps
+    /// them into `cond_call_register_arguments`. Does not consume
+    /// `guard_success_cc`.
     fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
-        let resloc = match arglocs {
-            [_, resloc, ..] => *resloc,
-            other => panic!(
-                "COND_CALL_VALUE arglocs are [argloc, resloc] (consider_cond_call), got {other:?}"
-            ),
-        };
+        if arglocs.len() < 4 {
+            panic!(
+                "COND_CALL_VALUE arglocs are [argloc, resloc, extras, variant, should_be_saved] (consider_cond_call), got {arglocs:?}"
+            );
+        }
+        let resloc = arglocs[1];
         assert!(
             self.guard_success_cc.is_none(),
             "cond_call value does not consume guard_success_cc"
         );
         self.emit_test_loc(&resloc);
-        let variant_num = Self::cond_call_variant_num(arglocs);
-        self.enqueue_cond_call(op, op_index, CC_E, Vec::new(), Some(resloc), variant_num);
+        let (variant_num, should_be_saved) = Self::cond_call_variant_and_saved(arglocs);
+        let extras = arglocs[2..arglocs.len() - 2].to_vec();
+        self.enqueue_cond_call(
+            op,
+            op_index,
+            CC_E,
+            extras,
+            Some(resloc),
+            variant_num,
+            should_be_saved,
+        );
     }
 
-    /// Trailing immediate from `consider_cond_call_n` /
+    /// Trailing immediates from `consider_cond_call_n` /
     /// `consider_cond_call_value_j2`: `cond_call`'s
-    /// `floats * 2 + callee_only`.
-    fn cond_call_variant_num(arglocs: &[Loc]) -> usize {
-        match arglocs.last() {
-            Some(Loc::Immed(imm)) if (0..4).contains(&imm.value) => imm.value as usize,
-            other => {
-                panic!("cond_call variant_num is the trailing immediate (cond_call), got {other:?}")
+    /// `variant_num = floats * 2 + callee_only`, then the
+    /// `should_be_saved` bitmask over GPR numbers.
+    fn cond_call_variant_and_saved(arglocs: &[Loc]) -> (usize, i64) {
+        match arglocs {
+            [.., Loc::Immed(variant), Loc::Immed(saved)] if (0..4).contains(&variant.value) => {
+                (variant.value as usize, saved.value)
             }
+            other => panic!(
+                "cond_call trailing immediates are variant_num and should_be_saved (cond_call), got {other:?}"
+            ),
         }
     }
 
@@ -10870,6 +10902,7 @@ impl<'a> Assembler386<'a> {
         arglocs: Vec<Loc>,
         resloc: Option<Loc>,
         variant_num: usize,
+        should_be_saved: i64,
     ) {
         let imm_func = match self.resolve_opref(op.arg(1).to_opref()) {
             ResolvedArg::Const(val) => val,
@@ -10893,6 +10926,7 @@ impl<'a> Assembler386<'a> {
                 arglocs,
                 resloc,
                 variant_num,
+                should_be_saved,
                 guard_token_no_exception: None,
                 expects_guard_no_exception,
             },

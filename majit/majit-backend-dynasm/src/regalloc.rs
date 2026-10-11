@@ -747,9 +747,12 @@ use crate::x86::regalloc as arch_regalloc;
 
 use arch_regalloc::{
     MALLOC_NURSERY_CLOBBER, MALLOC_NURSERY_RESULT, all_core_regs, all_float_regs, call_result_fpr,
-    call_result_gpr, cond_call_argument_regs, core_reg_index, frame_reg,
-    save_around_call_core_regs,
+    call_result_gpr, core_reg_index, frame_reg, save_around_call_core_regs,
 };
+// aarch64 `_prepare_op_cond_call` forces extras into `argument_regs`.
+// x86 `consider_cond_call` captures current locations instead.
+#[cfg(target_arch = "aarch64")]
+use arch_regalloc::cond_call_argument_regs;
 
 // Per-arch reghint pass.  Upstream RPython ships reghint only under
 // `rpython/jit/backend/x86/`; there is no AArch64 counterpart here.
@@ -6715,9 +6718,8 @@ impl<'a> RegAlloc<'a> {
     /// (`prepare_op_cond_call_value_r` is the same) and x86/regalloc.py
     /// `consider_cond_call` (aliased as `consider_cond_call_value_i` / `_r`).
     ///
-    /// Extra args (from index 2) go into `argument_regs`. The result shares
-    /// args[0]'s register via `force_result_in_reg` (`forbidden_vars=args[2:]`).
-    /// Arglocs are `[argloc, resloc]`; the callee address stays an Immed on
+    /// The result shares args[0]'s register via `force_result_in_reg`
+    /// (`forbidden_vars=args[2:]`). The callee address stays an Immed on
     /// the op. The helper returns a plain word — no `before_call` / raw-call
     /// result-in-x0 rewrite.
     fn consider_cond_call_value_j2(
@@ -6733,6 +6735,78 @@ impl<'a> RegAlloc<'a> {
             (2..=6).contains(&args.len()),
             "COND_CALL_VALUE takes 0..=4 extra arguments (aarch64/regalloc.py _prepare_op_cond_call)"
         );
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.consider_cond_call_value_x86(dst, args, op, i, output);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.consider_cond_call_value_aarch64(dst, args, op, i, output);
+        }
+    }
+
+    /// x86/regalloc.py `consider_cond_call` COND_CALL_VALUE arm.
+    /// Extra-arg locations are captured before `force_result_in_reg`;
+    /// `CondCallSlowPath.generate_body` remaps them into
+    /// `cond_call_register_arguments` on the taken path only.
+    /// `cond_call` then snapshots `rm.reg_bindings` for the save mask.
+    #[cfg(target_arch = "x86_64")]
+    fn consider_cond_call_value_x86(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let extra_locs: Vec<Loc> = args[2..]
+            .iter()
+            .map(|&arg| self.loc(arg, self.tp(arg)))
+            .collect();
+        let value = args[0];
+        let result_v = dst.unwrap_or(op.pos().get());
+        let forbidden: Vec<OpRef> = args[2..].to_vec();
+        let resloc = self.rm.force_result_in_reg(
+            result_v,
+            value,
+            self.tp(value),
+            &forbidden,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        let res_reg = match resloc {
+            Loc::Reg(r) => r,
+            other => panic!(
+                "force_result_in_reg must return a register (consider_cond_call), got {other:?}"
+            ),
+        };
+        let gcmap = self.get_gcmap(&[res_reg], false) as usize;
+        // Assembler prefix stays `[argloc, resloc]`; x86 tests `resloc`.
+        // Trailing immediates are `cond_call`'s `variant_num` and
+        // `should_be_saved` bitmask over GPR numbers, captured after
+        // `force_result_in_reg` while the bindings are still live.
+        let mut locs = Vec::with_capacity(extra_locs.len() + 4);
+        locs.push(resloc);
+        locs.push(resloc);
+        locs.extend(extra_locs);
+        locs.push(Loc::immed(self.cond_call_slowpath_variant()));
+        locs.push(Loc::immed(self.cond_call_should_be_saved()));
+        self.perform_with_gcmap_ptr(i, locs, Some(resloc), gcmap, output);
+    }
+
+    /// aarch64/regalloc.py `_prepare_op_cond_call`: extra args (from index 2)
+    /// go into `argument_regs`. Arglocs are `[argloc, resloc]`.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn consider_cond_call_value_aarch64(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
         let argument_regs = cond_call_argument_regs();
         let mut args_so_far: Vec<OpRef> = Vec::new();
         for (j, &arg) in args.iter().enumerate().skip(2) {
@@ -6764,18 +6838,6 @@ impl<'a> RegAlloc<'a> {
         // `gcmap = self._regalloc.get_gcmap([res_loc])` — exclude the result
         // register; on the miss path it is overwritten with the helper word.
         let gcmap = self.get_gcmap(&[res_reg], false) as usize;
-        // `cond_call` reads `rm.reg_bindings` / `xrm.reg_bindings` here,
-        // after `force_result_in_reg` and before `possibly_free_vars_for_op`.
-        // The walk frees those bindings before emit, so the
-        // `floats * 2 + callee_only` index travels as a trailing immediate.
-        // aarch64 has one slow path and does not read it.
-        #[cfg(target_arch = "x86_64")]
-        let locs = {
-            let mut locs = vec![argloc, resloc];
-            locs.push(Loc::immed(self.cond_call_slowpath_variant()));
-            locs
-        };
-        #[cfg(not(target_arch = "x86_64"))]
         let locs = [argloc, resloc];
         self.perform_with_gcmap_ptr(i, locs, Some(resloc), gcmap, output);
     }
@@ -6785,9 +6847,14 @@ impl<'a> RegAlloc<'a> {
     /// result. aarch64 spills every register into the jitframe on the
     /// taken path and publishes this map so `force_now` allocations
     /// forward those slots. x86 `cond_call` instead calls
-    /// `cond_call_slowpath[floats * 2 + callee_only]`; that index is the
-    /// trailing immediate, captured while the bindings are still live.
+    /// `cond_call_slowpath[floats * 2 + callee_only]`; that index is a
+    /// trailing immediate, captured while the bindings are still live,
+    /// next to the `should_be_saved` GPR bitmask (`cond_call`).
     fn consider_cond_call_n(&mut self, args: &[OpRef], i: usize, output: &mut Vec<RegAllocOp>) {
+        // x86/regalloc.py `consider_cond_call`: extra-arg locations first
+        // (`self.loc` of args[2:]), then the gcmap. The predicate and func
+        // sit in the assembler prefix; extras are remapped on the taken
+        // path only (`CondCallSlowPath.generate_body`).
         let mut locs = Vec::new();
         for &arg in args {
             let tp = self.tp(arg);
@@ -6795,7 +6862,10 @@ impl<'a> RegAlloc<'a> {
         }
         let gcmap = self.get_gcmap(&[], false) as usize;
         #[cfg(target_arch = "x86_64")]
-        locs.push(Loc::immed(self.cond_call_slowpath_variant()));
+        {
+            locs.push(Loc::immed(self.cond_call_slowpath_variant()));
+            locs.push(Loc::immed(self.cond_call_should_be_saved()));
+        }
         self.perform_with_gcmap_ptr(i, locs, None, gcmap, output);
     }
 
@@ -6814,6 +6884,18 @@ impl<'a> RegAlloc<'a> {
         }
         let floats = self.xrm.reg_bindings_len() > 0;
         (usize::from(floats) * 2 + usize::from(callee_only)) as i64
+    }
+
+    /// `cond_call`: `should_be_saved = rm.reg_bindings.values()`, encoded
+    /// as a bitmask over GPR numbers (`1 << gpr.value`). Travels as the
+    /// trailing immediate next to `variant_num`.
+    #[cfg(target_arch = "x86_64")]
+    fn cond_call_should_be_saved(&self) -> i64 {
+        let mut mask = 0i64;
+        for (_, reg) in self.rm.reg_bindings_iter() {
+            mask |= 1i64 << reg.value;
+        }
+        mask
     }
 
     /// Generic discard with N args

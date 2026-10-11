@@ -14,7 +14,7 @@
 use std::arch::naked_asm;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use majit_backend::{Backend, JitCellToken, make_resume_guard_descr_typed};
@@ -1199,6 +1199,383 @@ fn cond_call_live_callee_saved_survives() {
             "live add {index}"
         );
     }
+}
+
+const LIVE_ADD_COUNT: u32 = 16;
+const EXTRA_ADD_NS: [u32; 3] = [14, 15, 16];
+const COND_CALL_EXTRA_HELPER_RESULT: i64 = 0x5A5A_5A5A_5A5A_5A5A_u64 as i64;
+
+static COND_CALL_EXTRA0: AtomicI64 = AtomicI64::new(0);
+static COND_CALL_EXTRA1: AtomicI64 = AtomicI64::new(0);
+static COND_CALL_EXTRA2: AtomicI64 = AtomicI64::new(0);
+static COND_CALL_EXTRA_HITS: AtomicUsize = AtomicUsize::new(0);
+static COND_CALL_VALUE_EXTRA_HITS: AtomicUsize = AtomicUsize::new(0);
+static EAX_LIVE_HITS: AtomicUsize = AtomicUsize::new(0);
+
+fn reset_cond_call_extras() {
+    COND_CALL_EXTRA0.store(0, Ordering::SeqCst);
+    COND_CALL_EXTRA1.store(0, Ordering::SeqCst);
+    COND_CALL_EXTRA2.store(0, Ordering::SeqCst);
+    COND_CALL_EXTRA_HITS.store(0, Ordering::SeqCst);
+    COND_CALL_VALUE_EXTRA_HITS.store(0, Ordering::SeqCst);
+}
+
+fn live_add_ops(base: OpRef) -> (Vec<Op>, Vec<Operand>) {
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    for n in 1..=LIVE_ADD_COUNT {
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[rb(base), rb(OpRef::const_int(i64::from(n)))],
+        );
+        add.pos().set(OpRef::int_op(n));
+        ops.push(add);
+        live.push(rb(OpRef::int_op(n)));
+    }
+    (ops, live)
+}
+
+fn extra_operands() -> [Operand; 3] {
+    EXTRA_ADD_NS.map(|n| rb(OpRef::int_op(n)))
+}
+
+fn extra_expected(base: i64) -> [i64; 3] {
+    EXTRA_ADD_NS.map(|n| base + i64::from(n))
+}
+
+fn failing_guard_with_lives(
+    lives: Vec<Operand>,
+    types: Vec<Type>,
+    pos_eq: u32,
+    pos_guard: u32,
+) -> [Op; 2] {
+    let eq = Op::new(
+        OpCode::IntEq,
+        &[rb(OpRef::int_op(1)), rb(OpRef::const_int(0))],
+    );
+    eq.pos().set(OpRef::int_op(pos_eq));
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(pos_eq))]);
+    guard.pos().set(OpRef::void_op(pos_guard));
+    guard.setdescr(make_resume_guard_descr_typed(types.clone()));
+    guard.set_fail_arg_types(types);
+    guard.setfailargs(lives.into());
+    [eq, guard]
+}
+
+fn assert_live_adds(
+    backend: &DynasmBackend,
+    frame: &majit_backend::DeadFrame,
+    base: i64,
+    offset: usize,
+) {
+    for n in 1..=LIVE_ADD_COUNT {
+        assert_eq!(
+            backend.get_int_value(frame, offset + (n as usize - 1)),
+            base + i64::from(n),
+            "live add {n}"
+        );
+    }
+}
+
+fn assert_recorded_extras(expected: [i64; 3]) {
+    assert_eq!(COND_CALL_EXTRA0.load(Ordering::SeqCst), expected[0]);
+    assert_eq!(COND_CALL_EXTRA1.load(Ordering::SeqCst), expected[1]);
+    assert_eq!(COND_CALL_EXTRA2.load(Ordering::SeqCst), expected[2]);
+}
+
+/// Record the three extra arguments, then clobber every managed register.
+/// Extra args live in non-ABI registers / frame slots, so the taken path
+/// must remap them (`CondCallSlowPath.generate_body`).
+#[cfg(not(target_os = "windows"))]
+#[unsafe(naked)]
+extern "C" fn cond_call_extra_clobber() {
+    naked_asm!(
+        "lock inc qword ptr [rip + {hits}]",
+        "mov qword ptr [rip + {e0}], rdi",
+        "mov qword ptr [rip + {e1}], rsi",
+        "mov qword ptr [rip + {e2}], rdx",
+        "xor eax, eax",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor ebx, ebx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r14, r14",
+        "xor r15, r15",
+        "ret",
+        hits = sym COND_CALL_EXTRA_HITS,
+        e0 = sym COND_CALL_EXTRA0,
+        e1 = sym COND_CALL_EXTRA1,
+        e2 = sym COND_CALL_EXTRA2,
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[unsafe(naked)]
+extern "C" fn cond_call_extra_clobber() {
+    naked_asm!(
+        "lock inc qword ptr [rip + {hits}]",
+        "mov qword ptr [rip + {e0}], rcx",
+        "mov qword ptr [rip + {e1}], rdx",
+        "mov qword ptr [rip + {e2}], r8",
+        "xor eax, eax",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor ebx, ebx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r14, r14",
+        "xor r15, r15",
+        "ret",
+        hits = sym COND_CALL_EXTRA_HITS,
+        e0 = sym COND_CALL_EXTRA0,
+        e1 = sym COND_CALL_EXTRA1,
+        e2 = sym COND_CALL_EXTRA2,
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[unsafe(naked)]
+extern "C" fn cond_call_value_extra_clobber() {
+    naked_asm!(
+        "lock inc qword ptr [rip + {hits}]",
+        "mov qword ptr [rip + {e0}], rdi",
+        "mov qword ptr [rip + {e1}], rsi",
+        "mov qword ptr [rip + {e2}], rdx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor ebx, ebx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r14, r14",
+        "xor r15, r15",
+        "mov rax, 0x5A5A5A5A5A5A5A5A",
+        "ret",
+        hits = sym COND_CALL_VALUE_EXTRA_HITS,
+        e0 = sym COND_CALL_EXTRA0,
+        e1 = sym COND_CALL_EXTRA1,
+        e2 = sym COND_CALL_EXTRA2,
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[unsafe(naked)]
+extern "C" fn cond_call_value_extra_clobber() {
+    naked_asm!(
+        "lock inc qword ptr [rip + {hits}]",
+        "mov qword ptr [rip + {e0}], rcx",
+        "mov qword ptr [rip + {e1}], rdx",
+        "mov qword ptr [rip + {e2}], r8",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor ebx, ebx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r14, r14",
+        "xor r15, r15",
+        "mov rax, 0x5A5A5A5A5A5A5A5A",
+        "ret",
+        hits = sym COND_CALL_VALUE_EXTRA_HITS,
+        e0 = sym COND_CALL_EXTRA0,
+        e1 = sym COND_CALL_EXTRA1,
+        e2 = sym COND_CALL_EXTRA2,
+    );
+}
+
+clobber_hits!(cond_call_eax_live_hit, EAX_LIVE_HITS);
+
+fn compile_cond_call_three_extras(predicate: i64, func: i64) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let base = inputargs[0].opref();
+    let (mut ops, lives) = live_add_ops(base);
+    let [e0, e1, e2] = extra_operands();
+    let call = Op::new(
+        OpCode::CondCallN,
+        &[
+            rb(OpRef::const_int(predicate)),
+            rb(OpRef::const_int(func)),
+            e0,
+            e1,
+            e2,
+        ],
+    );
+    call.pos().set(OpRef::void_op(0));
+    ops.push(call);
+    let types = vec![Type::Int; LIVE_ADD_COUNT as usize];
+    ops.extend(failing_guard_with_lives(
+        lives,
+        types,
+        LIVE_ADD_COUNT + 1,
+        LIVE_ADD_COUNT + 2,
+    ));
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile COND_CALL extras: {err:?}"));
+    (backend, token)
+}
+
+fn compile_cond_call_value_three_extras(func: i64) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let value = inputargs[0].opref();
+    let base = inputargs[1].opref();
+    let (mut ops, mut lives) = live_add_ops(base);
+    let [e0, e1, e2] = extra_operands();
+    let result = OpRef::int_op(LIVE_ADD_COUNT + 1);
+    let call = Op::new(
+        OpCode::CondCallValueI,
+        &[rb(value), rb(OpRef::const_int(func)), e0, e1, e2],
+    );
+    call.pos().set(result);
+    call.setdescr(call_descr(
+        vec![Type::Int, Type::Int, Type::Int],
+        Type::Int,
+        true,
+        8,
+    ));
+    ops.push(call);
+    let mut failargs = vec![rb(result)];
+    failargs.append(&mut lives);
+    let types = vec![Type::Int; LIVE_ADD_COUNT as usize + 1];
+    ops.extend(failing_guard_with_lives(
+        failargs,
+        types,
+        LIVE_ADD_COUNT + 2,
+        LIVE_ADD_COUNT + 3,
+    ));
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile COND_CALL_VALUE extras: {err:?}"));
+    (backend, token)
+}
+
+#[test]
+fn cond_call_three_extras_remap_on_taken_path() {
+    // Sixteen live adds fill the GPR pool, so extras 14..=16 sit in frame
+    // slots. `consider_cond_call` keeps those locations; the taken path
+    // remaps them into `cond_call_register_arguments`.
+    let func = cond_call_extra_clobber as *const () as usize as i64;
+    let base = 10i64;
+    let expected = extra_expected(base);
+
+    reset_cond_call_extras();
+    let (backend, token) = compile_cond_call_three_extras(0, func);
+    let frame = backend.execute_token(&token, &[Value::Int(base)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COND_CALL_EXTRA_HITS.load(Ordering::SeqCst), 0);
+    assert_live_adds(&backend, &frame, base, 0);
+
+    reset_cond_call_extras();
+    let (backend, token) = compile_cond_call_three_extras(1, func);
+    let frame = backend.execute_token(&token, &[Value::Int(base)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COND_CALL_EXTRA_HITS.load(Ordering::SeqCst), 1);
+    assert_recorded_extras(expected);
+    assert_live_adds(&backend, &frame, base, 0);
+}
+
+#[test]
+fn cond_call_value_i_three_extras_taken_and_not_taken() {
+    // Same spilled extras as the void form. Not-taken keeps `args[0]`;
+    // taken remaps extras and writes the helper word into `resloc`.
+    let func = cond_call_value_extra_clobber as *const () as usize as i64;
+    let base = 10i64;
+    let expected = extra_expected(base);
+    let live_value = 0x1111_2222_3333_4444i64;
+
+    reset_cond_call_extras();
+    let (backend, token) = compile_cond_call_value_three_extras(func);
+    let frame = backend.execute_token(&token, &[Value::Int(live_value), Value::Int(base)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COND_CALL_VALUE_EXTRA_HITS.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.get_int_value(&frame, 0), live_value);
+    assert_live_adds(&backend, &frame, base, 1);
+
+    reset_cond_call_extras();
+    let (backend, token) = compile_cond_call_value_three_extras(func);
+    let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(base)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COND_CALL_VALUE_EXTRA_HITS.load(Ordering::SeqCst), 1);
+    assert_recorded_extras(expected);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        COND_CALL_EXTRA_HELPER_RESULT
+    );
+    assert_live_adds(&backend, &frame, base, 1);
+}
+
+extern "C" fn eax_live_return() -> i64 {
+    0x1111_2222_3333_4444
+}
+
+fn compile_eax_live_across_cond_call(func: i64) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let call = Op::new(
+        OpCode::CallI,
+        &[rb(OpRef::const_int(
+            eax_live_return as *const () as usize as i64,
+        ))],
+    );
+    call.pos().set(OpRef::int_op(1));
+    call.setdescr(call_descr(vec![], Type::Int, true, 8));
+    let cond = Op::new(
+        OpCode::CondCallN,
+        &[rb(OpRef::const_int(1)), rb(OpRef::const_int(func))],
+    );
+    cond.pos().set(OpRef::void_op(0));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(cond),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile eax-live COND_CALL: {err:?}"));
+    (backend, token)
+}
+
+#[test]
+fn cond_call_taken_restores_live_eax() {
+    // `after_call` leaves the CALL_I result in eax. That value is not the
+    // cond-call result (`resloc` is None). `CondCallSlowPath.generate_body`
+    // saves eax because it is in `should_be_saved`, then restores it after
+    // the helper (`restore_eax`).
+    let func = cond_call_eax_live_hit as *const () as usize as i64;
+    EAX_LIVE_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_eax_live_across_cond_call(func);
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(EAX_LIVE_HITS.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.get_int_value(&frame, 0), 0x1111_2222_3333_4444);
 }
 
 fn loop_code(token: &JitCellToken, code_size: usize) -> &[u8] {
