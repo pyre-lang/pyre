@@ -6117,11 +6117,15 @@ fn pin_frame_local_slots(slots: &[(usize, Value)]) -> Vec<PinnedFrameLocal> {
 }
 
 fn write_frame_local_word(frame_now: usize, abs: usize, word: PyObjectRef) -> bool {
+    if frame_now == 0 {
+        return false;
+    }
     // A reused nursery slot's forwarding word is the debug fill. That
     // address is not a live object; writing through it faults.
-    if frame_now == 0
-        || !pyre_object::gc_hook::try_gc_owns_object(frame_now as pyre_object::gc_hook::GCREF)
-    {
+    // `gc_owns_object` is also false when no collector exists, which is
+    // the host-frame path `PyFrame::new` tests use; refuse only while a
+    // backend is live and does not own the frame.
+    if majit_gc::gc_owns_object_hook_installed() && !majit_gc::gc_owns_object(frame_now) {
         return false;
     }
     let arr_ptr = unsafe {

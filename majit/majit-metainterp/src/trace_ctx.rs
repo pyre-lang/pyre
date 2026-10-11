@@ -3991,10 +3991,18 @@ impl TraceCtx {
         let Some(vable_ptr) = self.standard_virtualizable_ptr() else {
             return;
         };
+        // `record_op_with_descr_value` grows `Trace._ops`
+        // (`opencoder.py Trace._double_ops`) and can minor-collect.
+        // RPython traces the vable and each Ref field as GC locals; the
+        // copied addresses here are not. Pin them for the whole rebuild
+        // and re-read after the last append before publishing `values`.
+        let vable_pin = majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(vable_ptr));
         let lengths = self.virtualizable_array_lengths.clone().unwrap_or_default();
         let capacity = info.static_fields.len() + lengths.iter().sum::<usize>() + 1;
         let mut boxes = Vec::with_capacity(capacity);
         let mut values = Vec::with_capacity(capacity);
+        let mut field_pins: Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>> =
+            Vec::with_capacity(capacity);
 
         for (field_index, field) in info.static_fields.iter().enumerate() {
             let opcode = match field.field_type {
@@ -4003,8 +4011,14 @@ impl TraceCtx {
                 Type::Float => OpCode::GetfieldGcF,
                 Type::Void => continue,
             };
-            let bits = unsafe { info.read_field(vable_ptr as *const u8, field_index) };
+            let bits = unsafe { info.read_field(vable_pin.get().0 as *const u8, field_index) };
             let concrete = crate::pyjitpl::heap_value_for_pub(field.field_type, bits);
+            let field_pin = match concrete {
+                Value::Ref(r) if !r.is_null() => {
+                    Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+                }
+                _ => None,
+            };
             let opref = self.record_op_with_descr_value(
                 opcode,
                 &[vable],
@@ -4013,6 +4027,7 @@ impl TraceCtx {
             );
             boxes.push(opref);
             values.push(concrete);
+            field_pins.push(field_pin);
         }
         for (array_index, &length) in lengths.iter().enumerate() {
             let field_descr = info.array_pointer_field_descr(array_index);
@@ -4020,7 +4035,7 @@ impl TraceCtx {
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable], field_descr.clone());
             self.stamp_vable_array_base(
                 array_ref,
-                Some(Value::Ref(majit_ir::GcRef(vable_ptr))),
+                Some(Value::Ref(GcRef(vable_pin.get().0))),
                 &field_descr,
             );
             let array_ref = self.vable_embedded_items_base(array_ref, array_index);
@@ -4035,9 +4050,15 @@ impl TraceCtx {
             for item_index in 0..length {
                 let index = self.const_int(item_index as i64);
                 let bits = unsafe {
-                    info.read_array_item(vable_ptr as *const u8, array_index, item_index)
+                    info.read_array_item(vable_pin.get().0 as *const u8, array_index, item_index)
                 };
                 let concrete = crate::pyjitpl::heap_value_for_pub(item_type, bits);
+                let item_pin = match concrete {
+                    Value::Ref(r) if !r.is_null() => {
+                        Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+                    }
+                    _ => None,
+                };
                 let opref = self.record_op_with_descr_value(
                     item_opcode,
                     &[array_ref, index],
@@ -4046,10 +4067,23 @@ impl TraceCtx {
                 );
                 boxes.push(opref);
                 values.push(concrete);
+                field_pins.push(item_pin);
+            }
+        }
+        debug_assert_eq!(field_pins.len(), values.len());
+        for ((value, pin), opref) in values
+            .iter_mut()
+            .zip(field_pins.iter())
+            .zip(boxes.iter().copied())
+        {
+            if let Some(pin) = pin {
+                let live = Value::Ref(pin.get());
+                *value = live;
+                self.set_opref_concrete(opref, live);
             }
         }
         boxes.push(vable);
-        values.push(Value::Ref(majit_ir::GcRef(vable_ptr)));
+        values.push(Value::Ref(GcRef(vable_pin.get().0)));
         self.set_virtualizable_boxes_with_info(boxes, values, &info, &lengths);
     }
 

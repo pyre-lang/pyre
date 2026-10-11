@@ -4989,16 +4989,18 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                         pinned_obj(&list_pin, concrete_list) as usize
                     )),
                 );
+                let concrete_list = pinned_obj(&list_pin, concrete_list);
                 (list, list_pin, concrete_list)
             } else {
-                (value, None, concrete_value)
+                let concrete_value = pinned_obj(&value_pin, concrete_value);
+                let stored_pin = residual_call::owner_root_if_gc(concrete_value as usize);
+                (value, stored_pin, concrete_value)
             };
         let concrete_obj = pinned_obj(&obj_pin, concrete_obj);
         let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
         let field_descr = crate::descr::w_exception_attr_slot_descr_for(kind, slot, user);
         let field_index = field_descr.index();
         let obj_pin = residual_call::owner_root_if_gc(concrete_obj as usize);
-        let stored_pin = residual_call::owner_root_if_gc(concrete_stored as usize);
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, stored_value], field_descr);
         ctx.trace_ctx
@@ -14028,7 +14030,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         decline!("walk carries no EC red");
     };
 
-    let (concrete_class, kind, concrete_tb, concrete_tb_frame, concrete_tuple, concrete_layout) =
+    let (concrete_class, kind, concrete_tb, concrete_tb_frame, concrete_layout) =
         if slot_is_exception {
             let concrete_class = pyre_interpreter::baseobjspace::exception_getclass(concrete_exc);
             if concrete_class.is_null() || unsafe { (*concrete_exc).w_class } != concrete_class {
@@ -14059,50 +14061,29 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
             } else {
                 (pyre_object::w_none(), std::ptr::null_mut())
             };
-            let concrete_tuple = pyre_object::w_tuple_new_array_backed(vec![
-                concrete_class,
-                concrete_exc,
-                concrete_tb,
-            ]);
-            if concrete_tuple.is_null() {
-                decline!("concrete three-tuple allocation failed");
-            }
             let concrete_layout = unsafe { (*concrete_exc).ob_type } as *const _ as i64;
             (
                 concrete_class,
                 Some(kind),
                 concrete_tb,
                 concrete_tb_frame,
-                concrete_tuple,
                 concrete_layout,
             )
         } else {
-            let concrete_tuple = pyre_object::w_tuple_new_array_backed(vec![
-                pyre_object::w_none(),
-                pyre_object::w_none(),
-                pyre_object::w_none(),
-            ]);
-            if concrete_tuple.is_null() {
-                decline!("concrete none-tuple allocation failed");
-            }
             (
                 std::ptr::null_mut(),
                 None,
                 pyre_object::w_none(),
                 std::ptr::null_mut(),
-                concrete_tuple,
                 0,
             )
         };
 
-    // The tuple (and the exception/traceback words copied into it) are
-    // nursery objects. `record_op*` / `emit_object_tuple_inline` below
-    // append to `opencoder.py Trace._ops` and can minor-collect
-    // (`stress_trace_pool_alloc`). Pin them the way a translated GCREF
-    // local (`history.py *FrontendOp.value`) would, and re-read the
-    // slot at every stamp.
+    // Pin the tuple inputs before `w_tuple_new_array_backed`. That
+    // allocation can minor-collect; the constructor's item slots are
+    // rooted, the caller's copies are not. Then pin the tuple itself.
     let _tuple_roots = pyre_object::gc_roots::push_roots();
-    let mut live = vec![concrete_tuple];
+    let mut live = Vec::new();
     let exc_off = (!concrete_exc.is_null()).then(|| {
         live.push(concrete_exc);
         live.len() - 1
@@ -14128,6 +14109,27 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         off.map(|o| pyre_object::gc_roots::shadow_stack_get(live_base + o))
             .unwrap_or(fallback)
     };
+    let concrete_tuple = pyre_object::w_tuple_new_array_backed(vec![
+        if slot_is_exception {
+            live_at(class_off, concrete_class)
+        } else {
+            pyre_object::w_none()
+        },
+        if slot_is_exception {
+            live_at(exc_off, concrete_exc)
+        } else {
+            pyre_object::w_none()
+        },
+        if slot_is_exception {
+            live_at(tb_off, concrete_tb)
+        } else {
+            pyre_object::w_none()
+        },
+    ]);
+    if concrete_tuple.is_null() {
+        decline!("concrete tuple allocation failed");
+    }
+    let tuple_base = pyre_object::gc_roots::pin_roots(&[concrete_tuple]);
 
     // commit: no declines below this point
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
@@ -14161,7 +14163,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         ctx.trace_ctx.set_opref_concrete(
             tuple,
             majit_ir::Value::Ref(majit_ir::GcRef(
-                pyre_object::gc_roots::shadow_stack_get(live_base) as usize,
+                pyre_object::gc_roots::shadow_stack_get(tuple_base) as usize,
             )),
         );
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
@@ -16797,20 +16799,12 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     // the helper instead, matching `inline_call.rs` rolling a declined
     // descent back to the ordinary residual.
     //
-    // `MayForceNullRefArgUnsupported` is the same class inside a helper.
-    // `getitem_str` / `binary_slice_values_inner` look inside
-    // `get_and_call_function(w_descr, w_obj, w_type, args_w)` and residualize
-    // it as `CALL_MAY_FORCE` with four Ref args; `args_w` is `&[]`, whose
-    // zero-length shaped-array constant is interned as `history.CONST_NULL`
-    // (`ConstPtr(0)` at arg_index 3). The portal guard
-    // `walker_abort_if_mayforce_null_ref_arg` exists to refuse a specialized
-    // *Python* entry with a PUSH_NULL globals/closure slot. An empty extra-args
-    // slice is not that slot: residualize the helper so the FOR_ITER consume
-    // stays journaled (`_copy_data_from_miframe` is not reached with a
-    // dropped item).
+    // `perform_call` does not refuse a null ref argument. A
+    // `MayForceNullRefArgUnsupported` from an empty extra-args array interned
+    // as `CONST_NULL` is a representation defect; converting it here would
+    // residualize the helper instead of recording the body.
     let walk_result = match walk_result {
-        Err(DispatchError::AbortMarkerReached { pc })
-        | Err(DispatchError::MayForceNullRefArgUnsupported { pc }) => {
+        Err(DispatchError::AbortMarkerReached { pc }) => {
             Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
         }
         other => other,

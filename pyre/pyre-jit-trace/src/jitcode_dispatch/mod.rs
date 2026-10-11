@@ -1196,12 +1196,18 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
         // `w_pytraceback_new` collect; the exception word stays on the
         // shadow stack `journaled_concrete_traceback_attach` publishes.
         let old = exc_ptr;
+        // `flush_locals_region_to_frame` and `w_pytraceback_new` collect.
+        // `walk_session_roots` traces `recording_frame_ptr`; the Copy here
+        // is not that slot. Pin and re-read across the flush and attach.
+        let frame_pin = (frame_ptr != 0)
+            .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame_ptr)));
+        let live_frame = || frame_pin.as_ref().map(|pin| pin.get().0).unwrap_or(0);
         journaled_concrete_traceback_attach(&mut exc_ptr, |slot| {
-            crate::state::flush_locals_region_to_frame(ctx.trace_ctx, frame_ptr);
+            crate::state::flush_locals_region_to_frame(ctx.trace_ctx, live_frame());
             let live = pyre_object::gc_roots::shadow_stack_get(slot);
             majit_metainterp::record_application_traceback_for_recording(
                 live as usize as i64,
-                frame_ptr as i64,
+                live_frame() as i64,
                 jitcode_index,
                 opcode_position as i32,
             );
@@ -1211,7 +1217,7 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
             ctx,
             node,
             exc_ptr,
-            frame_ptr as *mut pyre_interpreter::PyFrame,
+            live_frame() as *mut pyre_interpreter::PyFrame,
         );
     }
     let hook = majit_metainterp::record_application_traceback_hook_address();
@@ -8419,6 +8425,11 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
     }
     if let ConcreteValue::Ref(value) = &mut session.tmpreg_r_concrete {
         walk_ptr(value, visitor);
+    }
+    if session.recording_frame_ptr != 0 {
+        let mut root = majit_ir::GcRef(session.recording_frame_ptr);
+        visitor(&mut root);
+        session.recording_frame_ptr = root.0;
     }
     for frame in session.framestack.iter_mut() {
         for parent in frame.parents.iter_mut() {

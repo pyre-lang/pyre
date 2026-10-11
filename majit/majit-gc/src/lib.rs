@@ -3996,6 +3996,16 @@ pub fn gc_owns_object(addr: usize) -> bool {
     }
 }
 
+/// Whether a backend has installed [`gc_owns_object`].
+///
+/// [`gc_owns_object`] is `false` both when no collector exists and when a
+/// collector exists but does not own `addr`. Callers that write into host
+/// frames (`PyFrame::new` in tests) need the first case to proceed and the
+/// second to refuse.
+pub fn gc_owns_object_hook_installed() -> bool {
+    ACTIVE_GC_OWNS_OBJECT.get().is_some()
+}
+
 /// `llop.shrink_array(Bool, p, smallerlength)`: record that the varsize object
 /// at `addr` is shorter than it was, in place.
 ///
