@@ -11,9 +11,7 @@
 use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_interpreter::baseobjspace::{float_w, int_w, uint_w};
 use pyre_interpreter::objspace::descroperation::{CompareOp, compare};
-use pyre_interpreter::{
-    PyError, PyErrorKind, PyResult, make_builtin_function_with_arity, module_ns_store,
-};
+use pyre_interpreter::{PyError, PyErrorKind, PyResult, make_builtin_function_with_arity};
 use pyre_object::interp_array as arr;
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
@@ -2289,142 +2287,117 @@ const ARRAY_TYPE_DOC: &str = concat!(
 
 /// Register all `array.array` methods/getsets into the type namespace.
 pub fn init_array_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__doc__",
-            pyre_object::w_str_new(ARRAY_TYPE_DOC),
-        )
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_put_new!(ns_slot, "__doc__", pyre_object::w_str_new(ARRAY_TYPE_DOC));
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr(array_descr_new)
+    );
+    let m = |name: &'static str, f: fn(&[PyObjectRef]) -> PyResult, arity: u16| {
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
+            name,
+            make_builtin_function_with_arity(name, f, arity)
+        );
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            pyre_interpreter::typedef::make_new_descr(array_descr_new),
-        )
-    };
-    let m = |ns: PyObjectRef, name: &'static str, f: fn(&[PyObjectRef]) -> PyResult, arity: u16| {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                make_builtin_function_with_arity(name, f, arity),
-            )
-        };
-    };
-    m(ns, "__len__", array_len, 1);
-    m(ns, "__iter__", array_iter, 1);
-    m(ns, "__getitem__", array_getitem, 2);
-    m(ns, "__setitem__", array_setitem, 3);
-    m(ns, "__delitem__", array_delitem, 2);
-    m(ns, "__contains__", array_contains_method, 2);
-    m(ns, "__repr__", array_repr_method, 1);
-    m(ns, "__eq__", array_eq_method, 2);
-    m(ns, "__ne__", array_ne_method, 2);
-    m(ns, "__lt__", array_lt_method, 2);
-    m(ns, "__le__", array_le_method, 2);
-    m(ns, "__gt__", array_gt_method, 2);
-    m(ns, "__ge__", array_ge_method, 2);
-    m(ns, "__add__", array_add_method, 2);
-    m(ns, "__iadd__", array_iadd_method, 2);
-    m(ns, "__mul__", array_mul_method, 2);
-    m(ns, "__rmul__", array_rmul_method, 2);
-    m(ns, "__imul__", array_imul_method, 2);
-    m(ns, "__reduce_ex__", array_reduce_ex_method, 2);
+    m("__len__", array_len, 1);
+    m("__iter__", array_iter, 1);
+    m("__getitem__", array_getitem, 2);
+    m("__setitem__", array_setitem, 3);
+    m("__delitem__", array_delitem, 2);
+    m("__contains__", array_contains_method, 2);
+    m("__repr__", array_repr_method, 1);
+    m("__eq__", array_eq_method, 2);
+    m("__ne__", array_ne_method, 2);
+    m("__lt__", array_lt_method, 2);
+    m("__le__", array_le_method, 2);
+    m("__gt__", array_gt_method, 2);
+    m("__ge__", array_ge_method, 2);
+    m("__add__", array_add_method, 2);
+    m("__iadd__", array_iadd_method, 2);
+    m("__mul__", array_mul_method, 2);
+    m("__rmul__", array_rmul_method, 2);
+    m("__imul__", array_imul_method, 2);
+    m("__reduce_ex__", array_reduce_ex_method, 2);
     // `append` owns its CPython 3.14 fixed-owner keyword/arity gateway.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "append",
-            pyre_interpreter::make_builtin_function("append", array_append_method),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "extend",
-            pyre_interpreter::make_builtin_function("extend", array_extend_method),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "append",
+        pyre_interpreter::make_builtin_function("append", array_append_method)
+    );
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "extend",
+        pyre_interpreter::make_builtin_function("extend", array_extend_method)
+    );
     // `insert` uses the PyArg_UnpackTuple arity wording and the fixed
     // `array.insert` keyword owner, both supplied by its gateway body.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "insert",
-            pyre_interpreter::make_builtin_function("insert", array_insert_method),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "insert",
+        pyre_interpreter::make_builtin_function("insert", array_insert_method)
+    );
     // `remove` owns its CPython 3.14 fixed-owner keyword/arity gateway.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "remove",
-            pyre_interpreter::make_builtin_function("remove", array_remove_method),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "remove",
+        pyre_interpreter::make_builtin_function("remove", array_remove_method)
+    );
     // `index` accepts optional start/stop.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "index",
-            pyre_interpreter::make_builtin_function("index", array_index_method),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "index",
+        pyre_interpreter::make_builtin_function("index", array_index_method)
+    );
     // `count` owns its CPython 3.14 fixed-owner keyword/arity gateway.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "count",
-            pyre_interpreter::make_builtin_function("count", array_count_method),
-        )
-    };
-    m(ns, "clear", array_clear_method, 1);
-    m(ns, "__release_buffer__", array_release_buffer, 2);
-    m(ns, "__buffer__", array_buffer, 2);
-    m(ns, "reverse", array_reverse_method, 1);
-    m(ns, "tolist", array_tolist_method, 1);
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "count",
+        pyre_interpreter::make_builtin_function("count", array_count_method)
+    );
+    m("clear", array_clear_method, 1);
+    m("__release_buffer__", array_release_buffer, 2);
+    m("__buffer__", array_buffer, 2);
+    m("reverse", array_reverse_method, 1);
+    m("tolist", array_tolist_method, 1);
     // `fromlist` owns its CPython 3.14 fixed-owner keyword/arity gateway.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "fromlist",
-            pyre_interpreter::make_builtin_function("fromlist", array_fromlist_method),
-        )
-    };
-    m(ns, "tobytes", array_tobytes_method, 1);
-    m(ns, "frombytes", array_frombytes_method, 2);
-    m(ns, "tofile", array_tofile_method, 2);
-    m(ns, "fromfile", array_fromfile_method, 3);
-    m(ns, "tounicode", array_tounicode_method, 1);
-    m(ns, "fromunicode", array_fromunicode_method, 2);
-    m(ns, "buffer_info", array_buffer_info_method, 1);
-    m(ns, "byteswap", array_byteswap_method, 1);
-    m(ns, "__copy__", array_copy_method, 1);
-    m(ns, "__deepcopy__", array_deepcopy_method, 2);
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "fromlist",
+        pyre_interpreter::make_builtin_function("fromlist", array_fromlist_method)
+    );
+    m("tobytes", array_tobytes_method, 1);
+    m("frombytes", array_frombytes_method, 2);
+    m("tofile", array_tofile_method, 2);
+    m("fromfile", array_fromfile_method, 3);
+    m("tounicode", array_tounicode_method, 1);
+    m("fromunicode", array_fromunicode_method, 2);
+    m("buffer_info", array_buffer_info_method, 1);
+    m("byteswap", array_byteswap_method, 1);
+    m("__copy__", array_copy_method, 1);
+    m("__deepcopy__", array_deepcopy_method, 2);
     // CPython 3.14 arraymodule.c:2471 — Py_GenericAlias with METH_CLASS.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__class_getitem__",
+        pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
-                "__class_getitem__",
-                pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
-        )
-    };
+            pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
+        ))
+    );
     // `pop` accepts an optional index.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "pop",
-            pyre_interpreter::make_builtin_function("pop", array_pop_method),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "pop",
+        pyre_interpreter::make_builtin_function("pop", array_pop_method)
+    );
     // typecode / itemsize read-only properties.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "typecode",
             pyre_object::w_property_new(
                 make_builtin_function_with_arity(
@@ -2439,12 +2412,12 @@ pub fn init_array_type(ns: PyObjectRef) {
                 PY_NULL,
                 PY_NULL,
                 PY_NULL,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "itemsize",
             pyre_object::w_property_new(
                 make_builtin_function_with_arity(
@@ -2458,31 +2431,50 @@ pub fn init_array_type(ns: PyObjectRef) {
                 PY_NULL,
                 PY_NULL,
                 PY_NULL,
-            ),
+            )
         )
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__weakref__",
-            pyre_interpreter::typedef::make_weakref_descr(PY_NULL),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__weakref__",
+        pyre_interpreter::typedef::make_weakref_descr(PY_NULL)
+    );
 }
 
 /// `array` module init — `moduledef.py interpleveldefs`.
 pub fn init_array_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // `W_Array.typedef` (`interp_array.py`) is a module TypeDef.  Empty
-    // startup does not import array.
+    // startup does not import array. Pin `ns` first: this build collects
+    // and can drop the GIL.
     pyre_interpreter::typedef::ensure_array_typeobjects();
     let type_obj = pyre_interpreter::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
-    module_ns_store(ns, "array", type_obj);
-    module_ns_store(ns, "ArrayType", type_obj);
-    module_ns_store(ns, "typecodes", pyre_object::w_str_new(arr::TYPECODES));
-    module_ns_store(
-        ns,
+    {
+        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+        let __pyre_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(type_obj);
+        unsafe {
+            ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                "array",
+                pyre_object::gc_roots::shadow_stack_get(__pyre_slot),
+            )
+        };
+        unsafe {
+            ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                "ArrayType",
+                pyre_object::gc_roots::shadow_stack_get(__pyre_slot),
+            )
+        };
+    };
+    pyre_interpreter::__pyre_put_new!(ns_slot, "typecodes", pyre_object::w_str_new(arr::TYPECODES));
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
         "_array_reconstructor",
-        pyre_interpreter::make_builtin_function("_array_reconstructor", array_reconstructor),
+        pyre_interpreter::make_builtin_function("_array_reconstructor", array_reconstructor)
     );
     Ok(())
 }

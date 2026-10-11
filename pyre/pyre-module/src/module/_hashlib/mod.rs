@@ -340,15 +340,18 @@ fn hash_xof_type() -> PyObjectRef {
     TYPE.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_hashlib.HASHXOF",
-            |ns| unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
+            |ns| {
+                let _root_scope = pyre_object::gc_roots::push_roots();
+                let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(ns);
+                pyre_interpreter::__pyre_put_new!(
+                    ns_slot,
                     "__new__",
                     pyre_interpreter::typedef::make_new_descr(|_| {
                         Err(pyre_interpreter::PyError::type_error(
                             "cannot create '_hashlib.HASHXOF' instances",
                         ))
-                    }),
+                    })
                 )
             },
             hash_state_class::type_object(),
@@ -1288,6 +1291,9 @@ pyre_interpreter::py_module! {
             ("openssl_shake_128", "shake_128"),
             ("openssl_shake_256", "shake_256"),
         ] {
+            // Function and name pins live across this one `setitem`. `ns` and
+            // the mapping dict stay on `_roots`.
+            let _pyre_store_roots = gc_roots::push_roots();
             let function =
                 pyre_interpreter::module_ns_get(gc_roots::shadow_stack_get(ns_slot), constructor)
                 .expect("_hashlib constructor installed before extra_init");
@@ -1302,11 +1308,10 @@ pyre_interpreter::py_module! {
             )
             .expect("populate _hashlib._constructors");
         }
-        let w_proxy = pyre_object::w_dict_proxy_new(gc_roots::shadow_stack_get(mapping_slot));
-        pyre_interpreter::module_ns_store(
-            gc_roots::shadow_stack_get(ns_slot),
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "_constructors",
-            w_proxy,
+            pyre_object::w_dict_proxy_new(gc_roots::shadow_stack_get(mapping_slot))
         );
     },
 }

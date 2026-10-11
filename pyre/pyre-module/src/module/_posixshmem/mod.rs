@@ -143,10 +143,8 @@ pyre_interpreter::py_module! {
     extra_init: |ns| {
         #[cfg(feature = "host_env")]
         {
-            pyre_interpreter::module_ns_store(ns, "shm_open",
-                pyre_interpreter::make_builtin_function("shm_open", shm_open));
-            pyre_interpreter::module_ns_store(ns, "shm_unlink",
-                pyre_interpreter::make_builtin_function_with_arity("shm_unlink", shm_unlink, 1));
+            pyre_interpreter::__pyre_store!(ns, "shm_open", pyre_interpreter::make_builtin_function("shm_open", shm_open));
+            pyre_interpreter::__pyre_store!(ns, "shm_unlink", pyre_interpreter::make_builtin_function_with_arity("shm_unlink", shm_unlink, 1));
         }
         #[cfg(not(feature = "host_env"))]
         let _ = ns;

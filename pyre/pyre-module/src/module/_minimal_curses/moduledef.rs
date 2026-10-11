@@ -20,8 +20,8 @@ pyre_interpreter::py_module! {
             let name_cstr = unsafe { std::ffi::CStr::from_ptr(fficurses::rpy_curses_int_name(index)) };
             let name = name_cstr.to_str().expect("curses constant name");
             let value = unsafe { fficurses::rpy_curses_int_value(index) } as i64;
-            let stored = pyre_object::with_roots!(ns => pyre_object::w_int_new(value));
-            pyre_interpreter::module_ns_store(ns, name, stored);
+            let mut stored = pyre_object::with_roots!(ns => pyre_object::w_int_new(value));
+            pyre_interpreter::__pyre_store!(ns, name, stored);
         }
         fn install(
             mut ns: pyre_object::PyObjectRef,
@@ -30,13 +30,13 @@ pyre_interpreter::py_module! {
             arity: u16,
             sig: Option<pyre_interpreter::Signature>,
         ) -> pyre_object::PyObjectRef {
-            let value = pyre_object::with_roots!(ns => pyre_interpreter::gateway::with_module(
+            let mut value = pyre_object::with_roots!(ns => pyre_interpreter::gateway::with_module(
                 "_minimal_curses",
                 pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                     name, func, arity, sig,
                 ),
             ));
-            pyre_interpreter::module_ns_store(ns, name, value);
+            pyre_interpreter::__pyre_store!(ns, name, value);
             ns
         }
         ns = install(

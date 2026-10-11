@@ -3527,13 +3527,22 @@ pyre_interpreter::py_module! {
         "_test_decode_cert" / 1 = test_decode_cert
     },
     extra_init: |ns| {
+        // `py_module!` pins the module dict in `ns_slot`, which this body
+        // cannot name. Publish that live word into a slot the constructor
+        // below can reload (`ShadowStackFrameworkGCTransformer.pop_roots`).
+        let ns_here = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(ns);
         // [3.14-spec] CPython 3.14 rejects each of these immutable module
         // heap types as a base.  PyPy's shared public pair, `MemoryBIO` and
         // `SSLSession`, remain app-level classes in `_cffi_ssl._stdssl`;
         // preserve those owner/storage choices and suppress only the
         // caller-visible per-type BASETYPE capability.
         for name in ["MemoryBIO", "SSLSession", "Certificate", "_SSLSocket"] {
-            let ty = pyre_interpreter::module_ns_get(ns, name).expect("_ssl type installed");
+            let ty = pyre_interpreter::module_ns_get(
+                pyre_object::gc_roots::shadow_stack_get(ns_here),
+                name,
+            )
+            .expect("_ssl type installed");
             unsafe { pyre_object::w_type_suppress_cpython_basetype(ty) };
         }
         // The Windows-only store readers. They live here rather than in
@@ -3550,28 +3559,35 @@ pyre_interpreter::py_module! {
                 pyre_interpreter::py_module_fn!("enum_crls", 1, cert_store::enum_crls),
             ),
         ] {
-            pyre_interpreter::module_ns_store(ns, name, pyre_interpreter::gateway::with_module("_ssl", func));
+            pyre_interpreter::__pyre_put_new!(ns_here, name, pyre_interpreter::gateway::with_module("_ssl", func));
         }
         let ssl_error = pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError")
             .expect("SSLError installed");
         let ssl_error_dict =
             unsafe { pyre_object::w_type_get_dict_ptr(ssl_error) as PyObjectRef };
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ssl_error_dict,
-                "__str__",
-                pyre_interpreter::make_builtin_function_with_arity("__str__", ssl_error_str, 1),
-            );
-        }
-        let value_error = pyre_interpreter::builtins::lookup_exc_class("ValueError")
+        // Publish the class and its dict together. Sequential `pin_root`
+        // would query after the first write and leave the other word
+        // invisible (`RootScope::pin_roots`).
+        let ssl_error_base = pyre_object::gc_roots::pin_roots(&[ssl_error, ssl_error_dict]);
+        pyre_interpreter::__pyre_put_new!(
+            ssl_error_base + 1,
+            "__str__",
+            pyre_interpreter::make_builtin_function_with_arity("__str__", ssl_error_str, 1)
+        );
+        let mut value_error = pyre_interpreter::builtins::lookup_exc_class("ValueError")
             .expect("ValueError installed");
-        let mut ns = ns;
-        let cert_error = pyre_object::with_roots!(ns => pyre_interpreter::builtins::make_exc_type_multi(
-            "ssl.SSLCertVerificationError",
-            pyre_interpreter::builtins::exc_os_error_new,
-            &[ssl_error, value_error],
-        ));
-        pyre_interpreter::module_ns_store(ns, "SSLCertVerificationError", cert_error);
+        // The constructor below reloads both bases
+        // (`ShadowStackFrameworkGCTransformer.pop_roots`).
+        let mut ns = pyre_object::gc_roots::shadow_stack_get(ns_here);
+        let mut ssl_error = pyre_object::gc_roots::shadow_stack_get(ssl_error_base);
+        let mut cert_error = pyre_object::with_roots!(ns, ssl_error, value_error => {
+            pyre_interpreter::builtins::make_exc_type_multi(
+                "ssl.SSLCertVerificationError",
+                pyre_interpreter::builtins::exc_os_error_new,
+                &[ssl_error, value_error],
+            )
+        });
+        pyre_interpreter::__pyre_store!(ns, "SSLCertVerificationError", cert_error);
         for (name, value) in [
             ("ALERT_DESCRIPTION_CLOSE_NOTIFY", 0),
             ("ALERT_DESCRIPTION_UNEXPECTED_MESSAGE", 10),
@@ -3608,7 +3624,7 @@ pyre_interpreter::py_module! {
             ("ALERT_DESCRIPTION_CERTIFICATE_REQUIRED", 116),
             ("ALERT_DESCRIPTION_NO_APPLICATION_PROTOCOL", 120),
         ] {
-            pyre_interpreter::module_ns_store(ns, name, w_int_new(value));
+            pyre_interpreter::__pyre_store!(ns, name, w_int_new(value));
         }
     },
 }

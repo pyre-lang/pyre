@@ -77,13 +77,13 @@ pyre_interpreter::py_module! {
             arity: u16,
             sig: Option<pyre_interpreter::Signature>,
         ) -> PyObjectRef {
-            let value = pyre_object::with_roots!(ns => pyre_interpreter::gateway::with_module(
+            let mut value = pyre_object::with_roots!(ns => pyre_interpreter::gateway::with_module(
                 "gc",
                 pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                     name, func, arity, sig,
                 ),
             ));
-            pyre_interpreter::module_ns_store(ns, name, value);
+            pyre_interpreter::__pyre_store!(ns, name, value);
             ns
         }
         ns = install(

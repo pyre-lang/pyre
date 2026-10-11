@@ -500,25 +500,27 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 /// fcntl(fd, cmd, arg=0) / ioctl(fd, request, arg=0) / flock(fd, op) /
 /// lockf(fd, cmd, len=0, start=0, whence=0).
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    pyre_interpreter::module_ns_store(
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(
         ns,
         "fcntl",
-        pyre_interpreter::make_builtin_function("fcntl", __majit_wrap_fcntl_fcntl),
+        pyre_interpreter::make_builtin_function("fcntl", __majit_wrap_fcntl_fcntl)
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "ioctl",
-        pyre_interpreter::make_builtin_function("ioctl", __majit_wrap_fcntl_ioctl),
+        pyre_interpreter::make_builtin_function("ioctl", __majit_wrap_fcntl_ioctl)
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "flock",
-        pyre_interpreter::make_builtin_function_with_arity("flock", __majit_wrap_fcntl_flock, 2),
+        pyre_interpreter::make_builtin_function_with_arity("flock", __majit_wrap_fcntl_flock, 2)
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "lockf",
-        pyre_interpreter::make_builtin_function("lockf", __majit_wrap_fcntl_lockf),
+        pyre_interpreter::make_builtin_function("lockf", __majit_wrap_fcntl_lockf)
     );
     // `interp_fcntl.py constant_names` — POSIX subset always
     // exposed; Linux-specific block gated below.  I_* (System V
@@ -533,7 +535,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         use rustpython_host_env::fcntl as host_fcntl;
         macro_rules! cst {
             ($name:literal, $val:expr) => {
-                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                pyre_interpreter::__pyre_store!(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         cst!("F_GETFD", host_fcntl::F_GETFD);

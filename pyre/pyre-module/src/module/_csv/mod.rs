@@ -506,7 +506,7 @@ impl W_Dialect {
     /// `W_Dialect___new__`.
     #[staticmethod]
     fn __new__(
-        mut cls: PyObjectRef,
+        cls: PyObjectRef,
         #[default(pyre_object::PY_NULL)] dialect: PyObjectRef,
         #[default(pyre_object::PY_NULL)] delimiter: PyObjectRef,
         #[default(pyre_object::PY_NULL)] doublequote: PyObjectRef,
@@ -1361,19 +1361,19 @@ pyre_interpreter::py_module! {
         // is therefore the one module exception class that is not
         // weak-referenceable, together with `ssl.SSLError`.
         let mut ns = ns;
-        let w_error = pyre_object::with_roots!(ns => pyre_interpreter::builtins::make_exc_type(
+        let mut w_error = pyre_object::with_roots!(ns => pyre_interpreter::builtins::make_exc_type(
             "_csv.Error",
             pyre_interpreter::builtins::exc_exception_new,
             pyre_interpreter::builtins::lookup_exc_class("Exception")
                 .expect("Exception must be installed before _csv init"),
         ));
-        pyre_interpreter::module_ns_store(ns, "Error", w_error);
+        pyre_interpreter::__pyre_store!(ns, "Error", w_error);
         // `app_csv._dialects = {}` — the registry mapping.  It is stored in
         // the module namespace under the name PyPy gives it and published to
         // the state the accelerator reads, which is what keeps it reachable
         // once the module is not.
-        let dialects = pyre_object::w_dict_new();
-        pyre_interpreter::module_ns_store(ns, "_dialects", dialects);
+        let mut dialects = pyre_object::with_roots!(ns => pyre_object::w_dict_new());
+        pyre_interpreter::__pyre_store!(ns, "_dialects", dialects);
         publish_csv_dialects(dialects);
     },
 }

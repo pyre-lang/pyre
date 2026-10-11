@@ -1243,19 +1243,22 @@ pyre_interpreter::py_module! {
         }
     },
     extra_init: |ns| {
+        let mut ns = ns;
         // The handle sentinel is `(HANDLE)-1` (handleapi.h), which prints as
         // the unsigned value and so does not fit the `int_constants` table.
-        pyre_interpreter::module_ns_store(
-            ns,
-            "INVALID_HANDLE_VALUE",
-            w_handle(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE),
-        );
+        pyre_interpreter::__pyre_store!(ns, "INVALID_HANDLE_VALUE", w_handle(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE));
         // The launch half, registered by hand: the module is built without
         // `host_env` too, and there it stops at the constants and the calls
         // above.
         #[cfg(feature = "host_env")]
         {
-            host::install(ns);
+            // `py_module!` pins the module dict in `ns_slot`, which this body
+            // cannot name. Publish that live word into a slot `host::install`
+            // can reload (`ShadowStackFrameworkGCTransformer.pop_roots`).
+            let ns_here = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ns);
+            host::install(pyre_object::gc_roots::shadow_stack_get(ns_here));
+            ns = pyre_object::gc_roots::shadow_stack_get(ns_here);
             for (name, arity, function) in [
                 ("GetStdHandle", 1, process::get_std_handle as pyre_interpreter::BuiltinCodeFn),
                 ("GetCurrentProcess", 0, process::get_current_process),
@@ -1265,23 +1268,16 @@ pyre_interpreter::py_module! {
                 ("TerminateProcess", 2, process::terminate_process),
                 ("CreatePipe", 2, process::create_pipe),
             ] {
-                pyre_interpreter::module_ns_store(
-                    ns,
-                    name,
-                    pyre_interpreter::gateway::with_module(
+                pyre_interpreter::__pyre_store!(ns, name, pyre_interpreter::gateway::with_module(
                         "_winapi",
                         pyre_interpreter::make_module_builtin_function_with_arity(name, function, arity),
-                    ),
-                );
+                    ));
             }
             // Fixed-arity builtin fast paths only cover zero through four
             // arguments (`gateway.py BuiltinCode0..BuiltinCode4`), and
             // CreateProcess takes nine. It still needs an exact-arity check, so
             // register it through the general call path with a checked body.
-            pyre_interpreter::module_ns_store(
-                ns,
-                "CreateProcess",
-                pyre_interpreter::gateway::with_module(
+            pyre_interpreter::__pyre_store!(ns, "CreateProcess", pyre_interpreter::gateway::with_module(
                     "_winapi",
                     pyre_interpreter::make_module_builtin_function(
                         "CreateProcess",
@@ -1291,21 +1287,16 @@ pyre_interpreter::py_module! {
                             process::create_process
                         ),
                     ),
-                ),
-            );
+                ));
             // `options` is the one argument with a default (`0`), so the
             // count is not fixed.
-            pyre_interpreter::module_ns_store(
-                ns,
-                "DuplicateHandle",
-                pyre_interpreter::gateway::with_module(
+            pyre_interpreter::__pyre_store!(ns, "DuplicateHandle", pyre_interpreter::gateway::with_module(
                     "_winapi",
                     pyre_interpreter::make_module_builtin_function(
                         "DuplicateHandle",
                         process::duplicate_handle,
                     ),
-                ),
-            );
+                ));
         }
     },
 }

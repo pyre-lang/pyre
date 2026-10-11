@@ -978,6 +978,9 @@ fn ffi_list_types(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     for i in 0..ctx.num_typenames as isize {
         let typename = unsafe { *ctx.typenames.offset(i) };
         let name = unsafe { CStr::from_ptr(typename.name) }.to_string_lossy();
+        // The name pin lives across this one append. The typedef list stays
+        // on `roots`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
         unsafe {
@@ -990,6 +993,9 @@ fn ffi_list_types(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         if name.starts_with('$') {
             continue;
         }
+        // The name pin lives across this one append. The struct and union
+        // lists stay on `roots`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
         let target = if su.flags & parse_c_type::CffiTypeFlags::UNION.bits() != 0 {
@@ -1297,9 +1303,11 @@ function or global variable."#
 }
 
 fn init_ffi_type(ns: PyObjectRef) {
-    let store = |name: &str, value: PyObjectRef| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
-    };
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    let store =
+        |name: &str, value: PyObjectRef| pyre_interpreter::__pyre_put_new!(ns_slot, name, value);
     store(
         "__new__",
         pyre_interpreter::typedef::make_new_descr(ffi_new),
@@ -1354,12 +1362,18 @@ fn init_ffi_type(ns: PyObjectRef) {
         ),
     );
     let getter = pyre_interpreter::make_builtin_function_with_arity("errno", errno_get, 2);
+    let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(getter);
     let setter = pyre_interpreter::make_builtin_function_with_arity("errno", errno_set, 3);
+    let setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(setter);
+    // The setter's allocation can forward the getter. The descriptor reads
+    // both slots (`ShadowStackFrameworkGCTransformer.pop_roots`).
     store(
         "errno",
         pyre_interpreter::typedef::make_getset_property_named(
-            getter,
-            setter,
+            pyre_object::gc_roots::shadow_stack_get(getter_slot),
+            pyre_object::gc_roots::shadow_stack_get(setter_slot),
             pyre_object::PY_NULL,
             "errno",
         ),
@@ -1367,9 +1381,9 @@ fn init_ffi_type(ns: PyObjectRef) {
     store("CData", super::cdataobj::cdata_type());
     store("CType", super::ctypeobj::ctype_type());
     let roots = pyre_object::gc_roots::push_roots();
-    let ns_slot = roots.base();
-    let _ = roots.pin_root(ns);
-    let voidp_slot = ns_slot + 1;
+    let saved = roots.base();
+    let _ = roots.pin_root(pyre_object::gc_roots::shadow_stack_get(ns_slot));
+    let voidp_slot = saved + 1;
     let _ = roots.pin_root(newtype::new_voidp_type().expect("void pointer type must build"));
     // `store` inserts into the module dict, which allocates, so the cdata is
     // rooted rather than held only in a Rust local across it.
@@ -1377,10 +1391,9 @@ fn init_ffi_type(ns: PyObjectRef) {
         ctypeobj::cast(roots.get(voidp_slot), pyre_object::w_int_new(0))
             .expect("zero must cast to void pointer"),
     );
-    let ns = roots.get(ns_slot);
-    let store = |name: &str, value: PyObjectRef| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
-    };
+    let ns = roots.get(saved);
+    let store =
+        |name: &str, value: PyObjectRef| pyre_interpreter::__pyre_put_new!(ns_slot, name, value);
     store("NULL", roots.get(voidp_slot + 1));
     store("error", newtype::ffi_error());
     store("buffer", cbuffer::buffer_type());

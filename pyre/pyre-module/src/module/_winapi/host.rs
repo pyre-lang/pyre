@@ -879,10 +879,10 @@ pub fn _mimetypes_read_windows_registry(
 /// keyword call the upstream module turns away; silently substituting the
 /// default for what the caller wrote would be the worse answer.
 macro_rules! install {
-    ($ns:expr, keywords: [$($kw:ident),* $(,)?], positional: [$($pos:ident),* $(,)?]) => {
+    ($ns_slot:expr, keywords: [$($kw:ident),* $(,)?], positional: [$($pos:ident),* $(,)?]) => {
         $(
-            pyre_interpreter::module_ns_store(
-                $ns,
+            pyre_interpreter::__pyre_put_new!(
+                $ns_slot,
                 stringify!($kw),
                 pyre_interpreter::gateway::with_module(
                     "_winapi",
@@ -892,12 +892,12 @@ macro_rules! install {
                         ::paste::paste! { [<$kw _pyre_arity>]() },
                         ::paste::paste! { [<$kw _pyre_sig>]() },
                     ),
-                ),
+                )
             );
         )*
         $(
-            pyre_interpreter::module_ns_store(
-                $ns,
+            pyre_interpreter::__pyre_put_new!(
+                $ns_slot,
                 stringify!($pos),
                 pyre_interpreter::gateway::with_module(
                     "_winapi",
@@ -907,29 +907,36 @@ macro_rules! install {
                         ::paste::paste! { [<$pos _pyre_arity>]() },
                         ::std::option::Option::None,
                     ),
-                ),
+                )
             );
         )*
     };
 }
 
 pub fn install(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // `LOCALE_NAME_USER_DEFAULT` is the null locale name, which is `None`
     // rather than a string; the other two are the reserved names themselves.
-    pyre_interpreter::module_ns_store(ns, "LOCALE_NAME_INVARIANT", pyre_object::w_str_new(""));
-    pyre_interpreter::module_ns_store(
-        ns,
+    pyre_interpreter::__pyre_put_new!(ns_slot, "LOCALE_NAME_INVARIANT", pyre_object::w_str_new(""));
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
         "LOCALE_NAME_SYSTEM_DEFAULT",
-        pyre_object::w_str_new("!x-sys-default-locale"),
+        pyre_object::w_str_new("!x-sys-default-locale")
     );
-    pyre_interpreter::module_ns_store(ns, "LOCALE_NAME_USER_DEFAULT", w_none());
+    pyre_interpreter::__pyre_put_new!(ns_slot, "LOCALE_NAME_USER_DEFAULT", w_none());
     #[cfg(not(feature = "sandbox"))]
     {
-        pyre_interpreter::module_ns_store(ns, "Overlapped", super::overlapped::overlapped_type());
-        install!(ns, keywords: [ConnectNamedPipe, ReadFile, WriteFile], positional: []);
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
+            "Overlapped",
+            super::overlapped::overlapped_type()
+        );
+        install!(ns_slot, keywords: [ConnectNamedPipe, ReadFile, WriteFile], positional: []);
     }
     install!(
-        ns,
+        ns_slot,
         keywords: [
             BatchedWaitForMultipleObjects,
             CopyFile2,

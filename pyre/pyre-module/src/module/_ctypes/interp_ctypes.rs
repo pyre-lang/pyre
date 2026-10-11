@@ -27,7 +27,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 // ──────────────────────────────────────────────────────────────────────
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
+fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     use rustpython_host_env::ctypes as host_ctypes;
 
     // ── dlopen flags ──
@@ -39,52 +42,54 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
     // caller and stay with the platform that defines them.
     #[cfg(unix)]
     {
-        pyre_interpreter::module_ns_store(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "RTLD_LOCAL",
-            pyre_object::w_int_new(libc::RTLD_LOCAL as i64),
+            pyre_object::w_int_new(libc::RTLD_LOCAL as i64)
         );
-        pyre_interpreter::module_ns_store(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "RTLD_GLOBAL",
-            pyre_object::w_int_new(libc::RTLD_GLOBAL as i64),
+            pyre_object::w_int_new(libc::RTLD_GLOBAL as i64)
         );
-        pyre_interpreter::module_ns_store(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "RTLD_LAZY",
-            pyre_object::w_int_new(libc::RTLD_LAZY as i64),
+            pyre_object::w_int_new(libc::RTLD_LAZY as i64)
         );
-        pyre_interpreter::module_ns_store(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "RTLD_NOW",
-            pyre_object::w_int_new(libc::RTLD_NOW as i64),
+            pyre_object::w_int_new(libc::RTLD_NOW as i64)
         );
     }
     #[cfg(not(unix))]
     {
-        pyre_interpreter::module_ns_store(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "RTLD_LOCAL",
-            pyre_object::w_int_new(host_ctypes::RTLD_LOCAL as i64),
+            pyre_object::w_int_new(host_ctypes::RTLD_LOCAL as i64)
         );
-        pyre_interpreter::module_ns_store(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "RTLD_GLOBAL",
-            pyre_object::w_int_new(host_ctypes::RTLD_GLOBAL as i64),
+            pyre_object::w_int_new(host_ctypes::RTLD_GLOBAL as i64)
         );
     }
-    pyre_interpreter::module_ns_store(
-        ns,
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
         "DEFAULT_MODE",
-        pyre_object::w_int_new(host_ctypes::dlopen_mode(None) as i64),
+        pyre_object::w_int_new(host_ctypes::dlopen_mode(None) as i64)
     );
 
     #[cfg(windows)]
-    register_windows_loader(ns);
+    register_windows_loader(pyre_object::gc_roots::shadow_stack_get(ns_slot));
+
+    let mut ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     // ── dlopen(name, mode=DEFAULT_MODE) → integer handle into host libcache ──
     #[cfg(unix)]
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "dlopen",
         pyre_interpreter::make_builtin_function("dlopen", |args| {
@@ -141,12 +146,12 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                     pyre_interpreter::PyError::os_error(msg)
                 })?;
             Ok(pyre_object::w_int_new(h as i64))
-        }),
+        })
     );
 
     // ── dlsym(handle, name) → address (int) ──
     #[cfg(unix)]
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "dlsym",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -182,12 +187,12 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_int_new(addr as i64))
             },
             2,
-        ),
+        )
     );
 
     // ── dlclose(handle) → None ──
     #[cfg(unix)]
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "dlclose",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -203,11 +208,11 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
+        )
     );
 
     // ── get_errno / set_errno — routed through host_env's ctypes-local errno ──
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "get_errno",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -218,9 +223,9 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 ))
             },
             0,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "set_errno",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -236,11 +241,11 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_int_new(prev as i64))
             },
             1,
-        ),
+        )
     );
 
     // ── sizeof / alignment of raw type codes ('i', 'l', 'd', …) ──
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "_sizeof_typecode",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -260,9 +265,9 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 }
             },
             1,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "_alignof_typecode",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -282,11 +287,11 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 }
             },
             1,
-        ),
+        )
     );
 
     // ── string_at(ptr, size=-1) → bytes ──
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "string_at",
         pyre_interpreter::make_builtin_function("string_at", |args| {
@@ -318,50 +323,50 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
                 pyre_interpreter::PyError::os_error(format!("string_at: {msg}"))
             })?;
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
-        }),
+        })
     );
 
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "SIZEOF_TIME_T",
-        pyre_object::w_int_new(rustpython_host_env::ctypes::SIZEOF_TIME_T as i64),
+        pyre_object::w_int_new(rustpython_host_env::ctypes::SIZEOF_TIME_T as i64)
     );
 
     // The callable `_CData.__reduce__` names.  It has to be reachable by name
     // for a pickle of a ctypes value to load at all, since that is what the
     // stream carries.
-    pyre_interpreter::module_ns_store(ns, "_unpickle", super::cdata::unpickle_function());
+    pyre_interpreter::__pyre_store!(ns, "_unpickle", super::cdata::unpickle_function());
 
     // ── import-time constants ──
-    pyre_interpreter::module_ns_store(ns, "__version__", pyre_object::w_str_new("1.1.0"));
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(ns, "__version__", pyre_object::w_str_new("1.1.0"));
+    pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_CDECL",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_CDECL)),
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_CDECL))
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_PYTHONAPI",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_PYTHONAPI)),
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_PYTHONAPI))
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_USE_ERRNO",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_USE_ERRNO)),
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_USE_ERRNO))
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_USE_LASTERROR",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_USE_LASTERROR)),
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_USE_LASTERROR))
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "CTYPES_MAX_ARGCOUNT",
-        pyre_object::w_int_new(host_ctypes::CTYPES_MAX_ARGCOUNT as i64),
+        pyre_object::w_int_new(host_ctypes::CTYPES_MAX_ARGCOUNT as i64)
     );
 
     #[cfg(target_os = "macos")]
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "_dyld_shared_cache_contains_path",
         pyre_interpreter::make_builtin_function("_dyld_shared_cache_contains_path", |args| {
@@ -380,87 +385,91 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
             let found = host_ctypes::dyld_shared_cache_contains_path(path)
                 .map_err(|_| pyre_interpreter::PyError::value_error("path contains null byte"))?;
             Ok(pyre_object::w_bool_from(found))
-        }),
+        })
     );
 
     // Real addresses so `memmove`/`memset = CFUNCTYPE(...)(_memmove_addr)`
     // build callable foreign functions; the other three are import-only
     // sentinels (cast/string_at/memoryview PYFUNCTYPE targets are not
     // exercised by this slice).
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "_memmove_addr",
-        pyre_object::w_int_new(host_ctypes::memmove_addr() as i64),
+        pyre_object::w_int_new(host_ctypes::memmove_addr() as i64)
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "_memset_addr",
-        pyre_object::w_int_new(host_ctypes::memset_addr() as i64),
+        pyre_object::w_int_new(host_ctypes::memset_addr() as i64)
     );
     // RustPython's internal non-FFI targets.  CFuncPtr.__call__ recognizes
     // these values before entering libffi, exactly like function.rs.
-    pyre_interpreter::module_ns_store(ns, "_cast_addr", pyre_object::w_int_new(1));
-    pyre_interpreter::module_ns_store(ns, "_string_at_addr", pyre_object::w_int_new(2));
-    pyre_interpreter::module_ns_store(ns, "_wstring_at_addr", pyre_object::w_int_new(3));
-    pyre_interpreter::module_ns_store(ns, "_memoryview_at_addr", pyre_object::w_int_new(4));
+    pyre_interpreter::__pyre_store!(ns, "_cast_addr", pyre_object::w_int_new(1));
+    pyre_interpreter::__pyre_store!(ns, "_string_at_addr", pyre_object::w_int_new(2));
+    pyre_interpreter::__pyre_store!(ns, "_wstring_at_addr", pyre_object::w_int_new(3));
+    pyre_interpreter::__pyre_store!(ns, "_memoryview_at_addr", pyre_object::w_int_new(4));
 
     // ── ArgumentError — a real Exception subclass ──
-    let w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
+    let mut w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _ctypes init");
-    let argument_error = pyre_object::with_roots!(ns => pyre_interpreter::builtins::new_exception_class(
+    let mut argument_error = pyre_object::with_roots!(ns, w_exception => pyre_interpreter::builtins::new_exception_class(
         "ArgumentError",
         pyre_interpreter::builtins::exc_exception_new,
         w_exception,
     ));
     // Both CPython's module exception and PyPy's app-level ArgumentError are
     // mutable heap classes, unlike the immutable native `_ctypes` types.
-    let argument_error = super::finish_cpython_type(argument_error, "ctypes", false);
-    pyre_interpreter::module_ns_store(ns, "ArgumentError", argument_error);
+    let mut argument_error = pyre_object::with_roots!(ns, argument_error => super::finish_cpython_type(
+        argument_error,
+        "ctypes",
+        false,
+    ));
+    pyre_interpreter::__pyre_store!(ns, "ArgumentError", argument_error);
 
     // ── aggregate + array/pointer types: real `Structure`/`Union`/`Array`/
     //    `_Pointer`/`CField` ──
     use super::metaclass;
-    let structure_tp = metaclass::structure_type();
-    let union_tp = metaclass::union_type();
-    let array_tp = metaclass::array_type();
-    let pointer_tp = metaclass::pointer_base_type();
-    pyre_interpreter::module_ns_store(ns, "Structure", structure_tp);
-    pyre_interpreter::module_ns_store(ns, "Union", union_tp);
-    pyre_interpreter::module_ns_store(ns, "Array", array_tp);
-    pyre_interpreter::module_ns_store(ns, "_Pointer", pointer_tp);
-    pyre_interpreter::module_ns_store(ns, "CField", metaclass::cfield_type());
+    let mut structure_tp = pyre_object::with_roots!(ns => metaclass::structure_type());
+    pyre_interpreter::__pyre_store!(ns, "Structure", structure_tp);
+    let mut union_tp = pyre_object::with_roots!(ns => metaclass::union_type());
+    pyre_interpreter::__pyre_store!(ns, "Union", union_tp);
+    let mut array_tp = pyre_object::with_roots!(ns => metaclass::array_type());
+    pyre_interpreter::__pyre_store!(ns, "Array", array_tp);
+    let mut pointer_tp = pyre_object::with_roots!(ns => metaclass::pointer_base_type());
+    pyre_interpreter::__pyre_store!(ns, "_Pointer", pointer_tp);
+    pyre_interpreter::__pyre_store!(ns, "CField", metaclass::cfield_type());
 
     // ── the functional scalar + foreign-function types ──
-    let simplecdata_tp = super::cdata::simplecdata_type();
-    pyre_interpreter::module_ns_store(ns, "_SimpleCData", simplecdata_tp);
-    let cfuncptr_tp = super::funcptr::cfuncptr_type();
-    pyre_interpreter::module_ns_store(ns, "CFuncPtr", cfuncptr_tp);
+    let mut simplecdata_tp = pyre_object::with_roots!(ns => super::cdata::simplecdata_type());
+    pyre_interpreter::__pyre_store!(ns, "_SimpleCData", simplecdata_tp);
+    let mut cfuncptr_tp = pyre_object::with_roots!(ns => super::funcptr::cfuncptr_type());
+    pyre_interpreter::__pyre_store!(ns, "CFuncPtr", cfuncptr_tp);
 
     // ── sizeof / addressof / byref / alignment / resize ──
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "sizeof",
-        pyre_interpreter::make_builtin_function("sizeof", ctypes_sizeof),
+        pyre_interpreter::make_builtin_function("sizeof", ctypes_sizeof)
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "alignment",
-        pyre_interpreter::make_builtin_function("alignment", ctypes_alignment),
+        pyre_interpreter::make_builtin_function("alignment", ctypes_alignment)
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "addressof",
-        pyre_interpreter::make_builtin_function("addressof", ctypes_addressof),
+        pyre_interpreter::make_builtin_function("addressof", ctypes_addressof)
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "byref",
-        pyre_interpreter::make_builtin_function("byref", ctypes_byref),
+        pyre_interpreter::make_builtin_function("byref", ctypes_byref)
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "resize",
-        pyre_interpreter::make_builtin_function("resize", ctypes_resize),
+        pyre_interpreter::make_builtin_function("resize", ctypes_resize)
     );
     // `call_function` / `call_cdeclfunction` are the module's own
     // "so that we can call CFunction instances" pair, described as debugging
@@ -468,14 +477,14 @@ fn register_host_ctypes(mut ns: pyre_object::PyObjectRef) {
     // is why they are still here.  The two differ by the calling convention
     // they pass, which x86-64 has one of.
     for name in ["call_function", "call_cdeclfunction"] {
-        pyre_interpreter::module_ns_store(
+        pyre_interpreter::__pyre_store!(
             ns,
             name,
             pyre_interpreter::make_builtin_function_with_arity(
                 name,
                 super::funcptr::call_function,
                 2,
-            ),
+            )
         );
     }
 }
@@ -552,22 +561,22 @@ fn last_win32_error() -> pyre_interpreter::PyError {
 /// `host_env` library cache the posix `dlopen` uses, so what differs is the
 /// module surface, not the machinery below it.
 #[cfg(all(windows, feature = "host_env"))]
-fn register_windows_loader(ns: pyre_object::PyObjectRef) {
+fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
     use rustpython_host_env::ctypes as host_ctypes;
 
     // `_ctypes.h`: `STDCALL` is the absence of the `CDECL` bit, and `HRESULT`
     // marks a return value `_check_HRESULT` inspects.  Both sit inside the
     // same `#ifdef MS_WIN32` as the functions below, so neither is defined on
     // the posix side.
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_STDCALL",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_STDCALL)),
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_STDCALL))
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_HRESULT",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_HRESULT)),
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_HRESULT))
     );
 
     // ── LoadLibrary(name, load_flags=0) → HMODULE ──
@@ -585,7 +594,7 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     // flags parameter, and its raw-handle door is unix-only.  Keeping the
     // module handle is also what `_ctypes.c` stores, so `FreeLibrary` and the
     // symbol lookup in [`lookup_symbol`] are the plain Win32 calls on it.
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "LoadLibrary",
         pyre_interpreter::make_builtin_function("LoadLibrary", |args| {
@@ -637,11 +646,11 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                 }
             };
             Ok(pyre_object::w_int_new(module as isize as i64))
-        }),
+        })
     );
 
     // ── FreeLibrary(handle) → None ──
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "FreeLibrary",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -657,11 +666,11 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
+        )
     );
 
     // ── FormatError(code=GetLastError()) → str ──
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "FormatError",
         pyre_interpreter::make_builtin_function("FormatError", |args| {
@@ -680,23 +689,23 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
             let message = host_ctypes::format_error_message(code)
                 .unwrap_or_else(|| "<no description>".to_string());
             Ok(pyre_object::w_str_new_managed(&message))
-        }),
+        })
     );
 
     // ── get_last_error / set_last_error — the ctypes-local copy, which is
     //    separate from the thread's own Win32 last error.  The setter answers
     //    with the value it replaced, the same contract `set_errno` above
     //    carries and the one the documented signature promises. ──
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "get_last_error",
         pyre_interpreter::make_builtin_function_with_arity(
             "get_last_error",
             |_| Ok(pyre_object::w_int_new(host_ctypes::get_last_error() as i64)),
             0,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "set_last_error",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -713,7 +722,7 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_int_new(previous as i64))
             },
             1,
-        ),
+        )
     );
 
     // ── _check_HRESULT(hr) → hr, or the Win32 error it names ──
@@ -721,7 +730,7 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     // `HRESULT`'s `_check_retval_`.  `FAILED(hr)` is the sign bit, and the
     // raise is `PyErr_SetFromWindowsErr(hr)` — the code lands in `.winerror`
     // and the errmap picks `.errno`.
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "_check_HRESULT",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -743,7 +752,7 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_int_new(hr as i64))
             },
             1,
-        ),
+        )
     );
 
     // ── CopyComPointer(src, dst) → HRESULT ──
@@ -752,7 +761,7 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     // carrier already resolved; `src` is a COM interface pointer held in a
     // cdata buffer.  The `AddRef` before the store is what makes this a copy
     // rather than a move.
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "CopyComPointer",
         pyre_interpreter::make_builtin_function_with_arity(
@@ -792,21 +801,21 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                 ))
             },
             2,
-        ),
+        )
     );
 
     // ── COMError — `args` is the (text, details) tail, not the whole tuple ──
-    let w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
+    let mut w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _ctypes init");
-    let comerror = pyre_interpreter::builtins::make_exc_type_with_init(
+    let mut comerror = pyre_object::with_roots!(ns, w_exception => pyre_interpreter::builtins::make_exc_type_with_init(
         "COMError",
         Some("Raised when a COM method call failed."),
         pyre_interpreter::builtins::exc_exception_new,
         Some(comerror_init),
         w_exception,
-    );
+    ));
     COMERROR_TYPE_OBJ.set(comerror);
-    pyre_interpreter::module_ns_store(ns, "COMError", comerror);
+    pyre_interpreter::__pyre_store!(ns, "COMError", comerror);
 }
 
 #[cfg(all(windows, feature = "host_env"))]
@@ -1038,7 +1047,9 @@ static CARG_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
 pub(super) fn carg_type() -> pyre_object::PyObjectRef {
     CARG_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type("CArgObject", |ns| {
-            super::type_ns_store(
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let mut ns = pyre_object::gc_roots::pin_root(ns);
+            pyre_interpreter::__pyre_store!(
                 ns,
                 "__repr__",
                 pyre_interpreter::make_builtin_function("__repr__", |args| {
@@ -1049,7 +1060,7 @@ pub(super) fn carg_type() -> pyre_object::PyObjectRef {
                     Ok(pyre_object::w_str_from_wtf8_managed(
                         pyre_interpreter::display::wtf8_format!("<cparam ", rendered, ">"),
                     ))
-                }),
+                })
             );
         });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
@@ -1111,23 +1122,25 @@ pub(super) fn carg_ptr(carg: pyre_object::PyObjectRef) -> usize {
 
 #[cfg(not(all(any(unix, windows), feature = "host_env")))]
 fn register_stub_ctypes(ns: pyre_object::PyObjectRef) {
-    pyre_interpreter::module_ns_store(ns, "ArgumentError", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "_Pointer", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "Structure", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "Union", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "Array", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "CField", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "CFuncPtr", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "_SimpleCData", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "sizeof", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "alignment", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "addressof", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "byref", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "resize", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(ns, "call_function", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::module_ns_store(
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(ns, "ArgumentError", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "_Pointer", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "Structure", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "Union", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "Array", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "CField", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "CFuncPtr", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "_SimpleCData", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "sizeof", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "alignment", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "addressof", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "byref", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "resize", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(ns, "call_function", pyre_interpreter::typedef::w_object());
+    pyre_interpreter::__pyre_store!(
         ns,
         "call_cdeclfunction",
-        pyre_interpreter::typedef::w_object(),
+        pyre_interpreter::typedef::w_object()
     );
 }

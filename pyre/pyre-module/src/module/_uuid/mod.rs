@@ -53,21 +53,13 @@ fn uuid_create(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
 pyre_interpreter::py_module! {
     "_uuid",
     extra_init: |ns| {
-        pyre_interpreter::module_ns_store(
-            ns,
-            "UuidCreate",
-            pyre_interpreter::gateway::with_module(
+        pyre_interpreter::__pyre_store!(ns, "UuidCreate", pyre_interpreter::gateway::with_module(
                 "_uuid",
                 pyre_interpreter::make_module_builtin_function_with_arity("UuidCreate", uuid_create, 0),
-            ),
-        );
+            ));
         // `generate_time_safe` is the libuuid entry point and is not in the
         // method table of a Windows build, so the flag that guards it is 0.
-        pyre_interpreter::module_ns_store(ns, "has_uuid_generate_time_safe", pyre_object::w_int_new(0));
-        pyre_interpreter::module_ns_store(
-            ns,
-            "has_stable_extractable_node",
-            pyre_object::w_int_new(i64::from(has_stable_node())),
-        );
+        pyre_interpreter::__pyre_store!(ns, "has_uuid_generate_time_safe", pyre_object::w_int_new(0));
+        pyre_interpreter::__pyre_store!(ns, "has_stable_extractable_node", pyre_object::w_int_new(i64::from(has_stable_node())));
     },
 }

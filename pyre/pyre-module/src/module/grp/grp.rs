@@ -121,11 +121,14 @@ impl Drop for EndgrentOnDrop {
 /// `c_endgrent`.
 #[cfg(unix)]
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // `lib_pypy/grp.py class struct_group` — exposed as
     // `grp.struct_group`; every result type uses this same class.
-    pyre_interpreter::module_ns_store(ns, "struct_group", struct_group_type());
-    pyre_interpreter::module_ns_store(
-        ns,
+    pyre_interpreter::__pyre_put_new!(ns_slot, "struct_group", struct_group_type());
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
         "getgrgid",
         pyre_interpreter::make_builtin_function_with_arity(
             "getgrgid",
@@ -164,10 +167,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
         "getgrnam",
         pyre_interpreter::make_builtin_function_with_arity(
             "getgrnam",
@@ -206,10 +209,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
         "getgrall",
         pyre_interpreter::make_builtin_function_with_arity(
             "getgrall",
@@ -230,7 +233,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_list_new(items.take()))
             },
             0,
-        ),
+        )
     );
     Ok(())
 }

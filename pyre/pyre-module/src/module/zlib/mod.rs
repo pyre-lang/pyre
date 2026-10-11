@@ -243,7 +243,10 @@ fn compress_type() -> PyObjectRef {
 }
 
 fn init_compress_type(ns: PyObjectRef) {
-    publish_cpython_module(ns);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    publish_cpython_module(pyre_object::gc_roots::shadow_stack_get(ns_slot));
     let new_sig = {
         let mut b = pyre_interpreter::SignatureBuilder::default();
         b.append("cls");
@@ -256,16 +259,14 @@ fn init_compress_type(ns: PyObjectRef) {
         b.append("zdict");
         b.signature()
     };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr_maybe_sig(compress_new, Some(new_sig))
+    );
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            pyre_interpreter::typedef::make_new_descr_maybe_sig(compress_new, Some(new_sig)),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "compress",
             pyre_interpreter::make_builtin_function_with_arity(
                 "compress",
@@ -287,28 +288,24 @@ fn init_compress_type(ns: PyObjectRef) {
                     Ok(bytesobject::w_bytes_from_bytes(&out))
                 },
                 2,
-            ),
+            )
         )
     };
     for name in ["copy", "__copy__"] {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                pyre_interpreter::make_builtin_function_with_arity(name, compress_copy, 1),
-            )
-        };
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
+            name,
+            pyre_interpreter::make_builtin_function_with_arity(name, compress_copy, 1)
+        );
     }
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__deepcopy__",
+        pyre_interpreter::make_builtin_function_with_arity("__deepcopy__", compress_copy, 2,)
+    );
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__deepcopy__",
-            pyre_interpreter::make_builtin_function_with_arity("__deepcopy__", compress_copy, 2),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "flush",
             pyre_interpreter::make_builtin_function("flush", |args| {
                 if args.is_empty() {
@@ -333,7 +330,7 @@ fn init_compress_type(ns: PyObjectRef) {
                 let mut c = { &*this.backend }.lock();
                 let out = c.flush(mode).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
-            }),
+            })
         )
     };
 }
@@ -484,16 +481,17 @@ fn decompress_getset(
     name: &'static str,
     f: pyre_interpreter::gateway::BuiltinCodeFn,
 ) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        name,
+        pyre_interpreter::typedef::make_getset_descriptor_named(
+            pyre_interpreter::make_builtin_function_with_arity(name, f, 2),
             name,
-            pyre_interpreter::typedef::make_getset_descriptor_named(
-                pyre_interpreter::make_builtin_function_with_arity(name, f, 2),
-                name,
-            ),
         )
-    };
+    );
 }
 
 // interp_zlib.py `decompress(self, data, __posonly__=None,
@@ -535,7 +533,10 @@ fn decompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inter
 }
 
 fn init_decompress_type(ns: PyObjectRef) {
-    publish_cpython_module(ns);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    publish_cpython_module(pyre_object::gc_roots::shadow_stack_get(ns_slot));
     let new_sig = {
         let mut b = pyre_interpreter::SignatureBuilder::default();
         b.append("cls");
@@ -544,13 +545,11 @@ fn init_decompress_type(ns: PyObjectRef) {
         b.append("zdict");
         b.signature()
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            pyre_interpreter::typedef::make_new_descr_maybe_sig(decompress_new, Some(new_sig)),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr_maybe_sig(decompress_new, Some(new_sig))
+    );
     let decompress_sig = {
         let mut b = pyre_interpreter::SignatureBuilder::default();
         b.append("self");
@@ -559,36 +558,30 @@ fn init_decompress_type(ns: PyObjectRef) {
         b.append("max_length");
         b.signature()
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "decompress",
+        pyre_interpreter::make_builtin_function_maybe_sig(
             "decompress",
-            pyre_interpreter::make_builtin_function_maybe_sig(
-                "decompress",
-                decompress_decompress,
-                Some(decompress_sig),
-            ),
+            decompress_decompress,
+            Some(decompress_sig),
         )
-    };
+    );
     for name in ["copy", "__copy__"] {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                pyre_interpreter::make_builtin_function_with_arity(name, decompress_copy, 1),
-            )
-        };
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
+            name,
+            pyre_interpreter::make_builtin_function_with_arity(name, decompress_copy, 1)
+        );
     }
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__deepcopy__",
+        pyre_interpreter::make_builtin_function_with_arity("__deepcopy__", decompress_copy, 2,)
+    );
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__deepcopy__",
-            pyre_interpreter::make_builtin_function_with_arity("__deepcopy__", decompress_copy, 2),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "flush",
             pyre_interpreter::make_builtin_function("flush", |args| {
                 if args.is_empty() {
@@ -616,33 +609,45 @@ fn init_decompress_type(ns: PyObjectRef) {
                 let mut d = { &*this.backend }.lock();
                 let out = d.flush(length).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
-            }),
+            })
         )
     };
-    decompress_getset(ns, "unused_data", |args| {
-        let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
-        let data = if this.backend.is_null() {
-            Vec::new()
-        } else {
-            unsafe { &*this.backend }.lock().unused_data().to_vec()
-        };
-        Ok(bytesobject::w_bytes_from_bytes(&data))
-    });
-    decompress_getset(ns, "unconsumed_tail", |args| {
-        let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
-        let data = if this.backend.is_null() {
-            Vec::new()
-        } else {
-            unsafe { &*this.backend }.lock().unconsumed_tail().to_vec()
-        };
-        Ok(bytesobject::w_bytes_from_bytes(&data))
-    });
-    decompress_getset(ns, "eof", |args| {
-        let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
-        Ok(w_bool_from(
-            !this.backend.is_null() && unsafe { &*this.backend }.lock().eof(),
-        ))
-    });
+    decompress_getset(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "unused_data",
+        |args| {
+            let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+            let data = if this.backend.is_null() {
+                Vec::new()
+            } else {
+                unsafe { &*this.backend }.lock().unused_data().to_vec()
+            };
+            Ok(bytesobject::w_bytes_from_bytes(&data))
+        },
+    );
+    decompress_getset(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "unconsumed_tail",
+        |args| {
+            let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+            let data = if this.backend.is_null() {
+                Vec::new()
+            } else {
+                unsafe { &*this.backend }.lock().unconsumed_tail().to_vec()
+            };
+            Ok(bytesobject::w_bytes_from_bytes(&data))
+        },
+    );
+    decompress_getset(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "eof",
+        |args| {
+            let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+            Ok(w_bool_from(
+                !this.backend.is_null() && unsafe { &*this.backend }.lock().eof(),
+            ))
+        },
+    );
 }
 
 fn decompress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -765,16 +770,17 @@ fn zdecompress_getset(
     name: &'static str,
     f: pyre_interpreter::gateway::BuiltinCodeFn,
 ) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        name,
+        pyre_interpreter::typedef::make_getset_descriptor_named(
+            pyre_interpreter::make_builtin_function_with_arity(name, f, 2),
             name,
-            pyre_interpreter::typedef::make_getset_descriptor_named(
-                pyre_interpreter::make_builtin_function_with_arity(name, f, 2),
-                name,
-            ),
         )
-    };
+    );
 }
 
 // _ZlibDecompressor(wbits=MAX_WBITS, zdict=b'') — the DecompressReader factory
@@ -854,7 +860,10 @@ fn zdecompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inte
 }
 
 fn init_zdecompress_type(ns: PyObjectRef) {
-    publish_cpython_module(ns);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    publish_cpython_module(pyre_object::gc_roots::shadow_stack_get(ns_slot));
     let new_sig = {
         let mut b = pyre_interpreter::SignatureBuilder::default();
         b.append("cls");
@@ -863,25 +872,21 @@ fn init_zdecompress_type(ns: PyObjectRef) {
         b.append("zdict");
         b.signature()
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            pyre_interpreter::typedef::make_new_descr_maybe_sig(zdecompress_new, Some(new_sig)),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr_maybe_sig(zdecompress_new, Some(new_sig))
+    );
     for name in ["__reduce__", "__reduce_ex__"] {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                pyre_interpreter::make_builtin_function(name, |_| {
-                    Err(pyre_interpreter::PyError::type_error(
-                        "cannot pickle 'zlib._ZlibDecompressor' object",
-                    ))
-                }),
-            )
-        };
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
+            name,
+            pyre_interpreter::make_builtin_function(name, |_| {
+                Err(pyre_interpreter::PyError::type_error(
+                    "cannot pickle 'zlib._ZlibDecompressor' object",
+                ))
+            })
+        );
     }
     let decompress_sig = {
         let mut b = pyre_interpreter::SignatureBuilder::default();
@@ -891,38 +896,48 @@ fn init_zdecompress_type(ns: PyObjectRef) {
         b.append("max_length");
         b.signature()
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "decompress",
+        pyre_interpreter::make_builtin_function_maybe_sig(
             "decompress",
-            pyre_interpreter::make_builtin_function_maybe_sig(
-                "decompress",
-                zdecompress_decompress,
-                Some(decompress_sig),
-            ),
+            zdecompress_decompress,
+            Some(decompress_sig),
         )
-    };
-    zdecompress_getset(ns, "unused_data", |args| {
-        let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
-        let data = if this.backend.is_null() {
-            Vec::new()
-        } else {
-            unsafe { &*this.backend }.lock().unused_data().to_vec()
-        };
-        Ok(bytesobject::w_bytes_from_bytes(&data))
-    });
-    zdecompress_getset(ns, "eof", |args| {
-        let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
-        Ok(w_bool_from(
-            !this.backend.is_null() && unsafe { &*this.backend }.lock().eof(),
-        ))
-    });
-    zdecompress_getset(ns, "needs_input", |args| {
-        let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
-        Ok(w_bool_from(
-            this.backend.is_null() || unsafe { &*this.backend }.lock().needs_input(),
-        ))
-    });
+    );
+    zdecompress_getset(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "unused_data",
+        |args| {
+            let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+            let data = if this.backend.is_null() {
+                Vec::new()
+            } else {
+                unsafe { &*this.backend }.lock().unused_data().to_vec()
+            };
+            Ok(bytesobject::w_bytes_from_bytes(&data))
+        },
+    );
+    zdecompress_getset(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "eof",
+        |args| {
+            let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+            Ok(w_bool_from(
+                !this.backend.is_null() && unsafe { &*this.backend }.lock().eof(),
+            ))
+        },
+    );
+    zdecompress_getset(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "needs_input",
+        |args| {
+            let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+            Ok(w_bool_from(
+                this.backend.is_null() || unsafe { &*this.backend }.lock().needs_input(),
+            ))
+        },
+    );
 }
 
 pyre_interpreter::py_module! {

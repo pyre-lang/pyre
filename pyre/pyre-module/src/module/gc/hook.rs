@@ -620,24 +620,27 @@ fn collect_step_stats_setattr(
 pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     TYPE.get_or_init(|| {
-        let tp = pyre_interpreter::typedef::make_builtin_type("GcCollectStepStats", |ns| unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+        let tp = pyre_interpreter::typedef::make_builtin_type("GcCollectStepStats", |ns| {
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ns);
+            pyre_interpreter::__pyre_put_new!(
+                ns_slot,
                 "__getattribute__",
                 pyre_interpreter::make_builtin_function_with_arity(
                     "__getattribute__",
                     collect_step_stats_getattribute,
                     2,
-                ),
+                )
             );
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_interpreter::__pyre_put_new!(
+                ns_slot,
                 "__setattr__",
                 pyre_interpreter::make_builtin_function_with_arity(
                     "__setattr__",
                     collect_step_stats_setattr,
                     3,
-                ),
+                )
             );
             for (name, value) in [
                 ("STATE_SCANNING", STATE_SCANNING),
@@ -646,18 +649,15 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
                 ("STATE_FINALIZING", STATE_FINALIZING),
                 ("STATE_USERDEL", STATE_USERDEL),
             ] {
-                pyre_object::w_dict_setitem_str_no_proxy(ns, name, w_int_new(value as i64));
+                pyre_interpreter::__pyre_put_new!(ns_slot, name, w_int_new(value as i64));
             }
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
-                "GC_STATES",
-                w_tuple_new(
-                    ["SCANNING", "MARKING", "SWEEPING", "FINALIZING", "USERDEL"]
-                        .into_iter()
-                        .map(w_str_new)
-                        .collect(),
-                ),
-            );
+            {
+                let mut names = pyre_object::gc_roots::RootedItems::new();
+                for s in ["SCANNING", "MARKING", "SWEEPING", "FINALIZING", "USERDEL"] {
+                    names.push(w_str_new(s));
+                }
+                pyre_interpreter::__pyre_put_new!(ns_slot, "GC_STATES", w_tuple_new(names.take()));
+            }
             for (name, getter) in [
                 (
                     "count",
@@ -670,13 +670,13 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
                 ("newstate", collect_step_newstate),
                 ("major_is_done", collect_step_major_is_done),
             ] {
-                pyre_object::w_dict_setitem_str_no_proxy(
-                    ns,
+                pyre_interpreter::__pyre_put_new!(
+                    ns_slot,
                     name,
                     pyre_interpreter::typedef::make_getset_descriptor_named(
                         pyre_interpreter::make_builtin_function_with_arity(name, getter, 2),
                         name,
-                    ),
+                    )
                 );
             }
         });
@@ -806,29 +806,32 @@ fn make_private_stats_type(
     name: &'static str,
     fields: &[(&'static str, pyre_interpreter::gateway::BuiltinCodeFn)],
 ) -> PyObjectRef {
-    let tp = pyre_interpreter::typedef::make_builtin_type(name, |ns| unsafe {
-        pyre_object::w_dict_setitem_str_no_proxy(
-            ns,
+    let tp = pyre_interpreter::typedef::make_builtin_type(name, |ns| {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(ns);
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "__getattribute__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__getattribute__",
                 stats_getattribute,
                 2,
-            ),
+            )
         );
-        pyre_object::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
             "__setattr__",
-            pyre_interpreter::make_builtin_function_with_arity("__setattr__", stats_setattr, 3),
+            pyre_interpreter::make_builtin_function_with_arity("__setattr__", stats_setattr, 3)
         );
         for &(field, getter) in fields {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_interpreter::__pyre_put_new!(
+                ns_slot,
                 field,
                 pyre_interpreter::typedef::make_getset_descriptor_named(
                     pyre_interpreter::make_builtin_function_with_arity(field, getter, 2),
                     field,
-                ),
+                )
             );
         }
     });
@@ -911,6 +914,9 @@ fn initialize_stats(
     let stats_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_instance_new(stats_type));
     for (name, value) in fields {
+        // The value pin lives across this one store. The instance stays on
+        // `_roots`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(value.materialize());
         let stored = unsafe {

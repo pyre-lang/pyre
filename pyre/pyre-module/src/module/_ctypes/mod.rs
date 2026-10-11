@@ -10,13 +10,6 @@
 
 pyre_interpreter::pyre_module_init!(interp_ctypes);
 
-/// Store into a builtin type's namespace — the dict `make_builtin_type` hands
-/// its init closure.  The type-namespace sibling of `module_ns_store`.
-#[cfg(all(any(unix, windows), feature = "host_env"))]
-fn type_ns_store(ns: pyre_object::PyObjectRef, name: &str, value: pyre_object::PyObjectRef) {
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) }
-}
-
 /// CPython 3.14 constructs the native `_ctypes` type family from immutable
 /// `PyType_Spec`s (`Modules/_ctypes/_ctypes.c:6270-6318` and
 /// `callproc.c:carg_spec`).  PyPy implements the same family as ordinary

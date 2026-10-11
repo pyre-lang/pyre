@@ -34,21 +34,17 @@ pyre_interpreter::py_module! {
         // implementations with the module callables.
         // Install the TypeDef before allocation so the generated allocator
         // can stamp the canonical Python class in `w_class`.
-        let ucd_type = interp_ucd::type_object();
+        let mut ns = ns;
+        let ucd_type = pyre_object::with_roots!(ns => interp_ucd::type_object());
         // `interp_ucd.py UCD.typedef` declares no `__new__`, so the two
         // database instances the module exports are the only ones that exist;
         // reaching generic allocation would hand back a `UCD` with no
         // database at all.
         unsafe { pyre_object::w_type_set_disallow_instantiation(ucd_type) };
-        let ucd = interp_ucd::ucd_3_2_0();
         // Installing the module attribute can allocate; keep the freshly
         // allocated instance rooted until the namespace owns it.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(ucd);
-        let ucd = pyre_object::gc_roots::shadow_stack_get(
-            pyre_object::gc_roots::shadow_stack_len() - 1,
-        );
-        pyre_interpreter::module_ns_store(ns, "ucd_3_2_0", ucd);
+        let mut ucd = pyre_object::with_roots!(ns => interp_ucd::ucd_3_2_0());
+        pyre_interpreter::__pyre_store!(ns, "ucd_3_2_0", ucd);
     },
 }
 

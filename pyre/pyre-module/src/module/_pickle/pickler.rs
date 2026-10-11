@@ -2517,6 +2517,10 @@ fn batch_appends(
         return Ok(());
     }
 
+    // `_batch_appends` keeps `w_it` as a local of this operation.
+    // `ShadowStackFrameworkGCTransformer.push_roots` already covers the
+    // caller's live set; pin the iterator there. The inner batch bracket
+    // matches locals that die at the end of a batch.
     let w_iter =
         pyre_interpreter::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(slot))?;
     let _ = pyre_object::gc_roots::pin_root(w_iter);
@@ -2667,6 +2671,10 @@ fn batch_setitems(
     slot: usize,
     obj_slot: Option<usize>,
 ) -> Result<(), PyError> {
+    // `_batch_setitems` keeps `w_it` as a local of this operation.
+    // `ShadowStackFrameworkGCTransformer.push_roots` already covers the
+    // caller's live set; pin the iterator there. The inner pair and batch
+    // brackets match locals that die at the end of a batch.
     let w_iter =
         pyre_interpreter::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(slot))?;
     let _ = pyre_object::gc_roots::pin_root(w_iter);

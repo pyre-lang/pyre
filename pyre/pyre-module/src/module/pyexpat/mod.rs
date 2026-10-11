@@ -2314,14 +2314,14 @@ pyre_interpreter::py_module! {
         // with the module it is declared in.  Both `error` and `ExpatError`
         // name the one class.
         let mut ns = ns;
-        let err = pyre_object::with_roots!(ns => pyre_interpreter::builtins::new_exception_class(
+        let mut err = pyre_object::with_roots!(ns => pyre_interpreter::builtins::new_exception_class(
             EXPAT_ERROR_NAME,
             pyre_interpreter::builtins::exc_exception_new,
             pyre_interpreter::builtins::lookup_exc_class("Exception")
                 .expect("Exception must be installed before pyexpat init"),
         ));
-        pyre_interpreter::module_ns_store(ns, "error", err);
-        pyre_interpreter::module_ns_store(ns, "ExpatError", err);
+        pyre_interpreter::__pyre_store!(ns, "error", err);
+        pyre_interpreter::__pyre_store!(ns, "ExpatError", err);
 
         // model — content-model integer constants.
         // Each submodule object is a fresh instance named only by its local
@@ -2332,17 +2332,21 @@ pyre_interpreter::py_module! {
         // The module dict is read after every one of those allocations too.
         let ns_slot = ns_roots.base();
         let _ = ns_roots.pin_root(ns);
-        let model = make_namespace("pyexpat.model");
-        let model = ns_roots.pin_root(model);
+        let model_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(make_namespace("pyexpat.model"));
         for (name, value) in MODEL_CONSTANTS {
-            pyre_interpreter::baseobjspace::setdictvalue_native(model, name, w_int_new(*value));
+            pyre_interpreter::baseobjspace::setdictvalue_native(
+                ns_roots.get(model_slot),
+                name,
+                w_int_new(*value),
+            );
         }
-        pyre_interpreter::module_ns_store(ns_roots.get(ns_slot), "model", model);
+        pyre_interpreter::__pyre_put_new!(ns_slot, "model", ns_roots.get(model_slot));
 
         // errors — XML_ERROR_* message strings plus the `codes`
         // (message -> code) and `messages` (code -> message) maps.
-        let errors = make_namespace("pyexpat.errors");
-        let errors = ns_roots.pin_root(errors);
+        let errors_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(make_namespace("pyexpat.errors"));
         // Both maps are dicts, whose headers move, and every iteration of the
         // loop allocates: the message string, the code objects, the key strings
         // the stores build, and each dict's own storage as it grows.  They are
@@ -2360,26 +2364,45 @@ pyre_interpreter::py_module! {
             if idx == 0 {
                 continue;
             }
+            // The message pin lives across this iteration's stores. The two
+            // maps stay on `error_map_roots`.
+            let _pyre_store_roots = pyre_object::gc_roots::push_roots();
             let (msg, code) = ERROR_TABLE[idx - 1];
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = error_map_roots.pin_root(w_str_new(msg));
             pyre_interpreter::baseobjspace::setdictvalue_native(
-                errors,
+                ns_roots.get(errors_slot),
                 name,
                 error_map_roots.get(msg_slot),
             );
-            let w_code = w_int_new(code);
+            let code_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = error_map_roots.pin_root(w_int_new(code));
             let codes = error_map_roots.get(codes_slot);
-            unsafe { w_dict_setitem_str(codes, msg, w_code) };
-            let w_key = w_int_new(code);
+            unsafe { w_dict_setitem_str(codes, msg, error_map_roots.get(code_slot)) };
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = error_map_roots.pin_root(w_int_new(code));
             let messages = error_map_roots.get(messages_slot);
-            unsafe { w_dict_store(messages, w_key, error_map_roots.get(msg_slot)) };
+            unsafe {
+                w_dict_store(
+                    messages,
+                    error_map_roots.get(key_slot),
+                    error_map_roots.get(msg_slot),
+                )
+            };
         }
         let codes = error_map_roots.get(codes_slot);
-        pyre_interpreter::baseobjspace::setdictvalue_native(errors, "codes", codes);
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            ns_roots.get(errors_slot),
+            "codes",
+            codes,
+        );
         let messages = error_map_roots.get(messages_slot);
-        pyre_interpreter::baseobjspace::setdictvalue_native(errors, "messages", messages);
-        pyre_interpreter::module_ns_store(ns_roots.get(ns_slot), "errors", errors);
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            ns_roots.get(errors_slot),
+            "messages",
+            messages,
+        );
+        pyre_interpreter::__pyre_put_new!(ns_slot, "errors", ns_roots.get(errors_slot));
 
         // features — list of (name, value) capability tuples.
         // Each name, value and tuple allocates while the pieces already built
@@ -2403,7 +2426,10 @@ pyre_interpreter::py_module! {
             };
             feature_items.push(entry);
         }
-        let features = w_list_new(feature_items.take());
-        pyre_interpreter::module_ns_store(ns_roots.get(ns_slot), "features", features);
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
+            "features",
+            w_list_new(feature_items.take())
+        );
     },
 }

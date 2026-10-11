@@ -236,13 +236,14 @@ fn overlapped_new(_args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 }
 
 fn init_overlapped_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            pyre_interpreter::typedef::make_new_descr(overlapped_new),
-        )
-    };
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr(overlapped_new)
+    );
     for (name, arity, function) in [
         (
             "GetOverlappedResult",
@@ -252,33 +253,29 @@ fn init_overlapped_type(ns: PyObjectRef) {
         ("getbuffer", 1, overlapped_getbuffer),
         ("cancel", 1, overlapped_cancel),
     ] {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                pyre_interpreter::make_builtin_function_with_arity(name, function, arity),
-            )
-        };
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
+            name,
+            pyre_interpreter::make_builtin_function_with_arity(name, function, arity)
+        );
     }
     // `event` is the record's own `hEvent`, which a caller waits on; it is
     // read-only because the operation was started against that handle.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "event",
-            pyre_interpreter::typedef::make_getset_descriptor_named(
-                pyre_interpreter::make_builtin_function_with_arity(
-                    "event",
-                    |args: &[PyObjectRef]| -> pyre_interpreter::PyResult {
-                        let state = native(arg(args, 1, "event")?)?.lock();
-                        Ok(super::w_handle(state.overlapped.hEvent))
-                    },
-                    2,
-                ),
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "event",
+        pyre_interpreter::typedef::make_getset_descriptor_named(
+            pyre_interpreter::make_builtin_function_with_arity(
                 "event",
+                |args: &[PyObjectRef]| -> pyre_interpreter::PyResult {
+                    let state = native(arg(args, 1, "event")?)?.lock();
+                    Ok(super::w_handle(state.overlapped.hEvent))
+                },
+                2,
             ),
+            "event",
         )
-    };
+    );
 }
 
 static OVERLAPPED_RUNTIME_TYPE: pyre_object::gc_roots::RootedOnceRef =

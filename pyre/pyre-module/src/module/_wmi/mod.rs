@@ -101,17 +101,13 @@ const EXEC_QUERY_DOC: &str = "Runs a WMI query against the local machine.\n\nThi
 pyre_interpreter::py_module! {
     "_wmi",
     extra_init: |ns| {
-        pyre_interpreter::module_ns_store(
-            ns,
-            "exec_query",
-            pyre_interpreter::gateway::with_module(
+        pyre_interpreter::__pyre_store!(ns, "exec_query", pyre_interpreter::gateway::with_module(
                 "_wmi",
                 pyre_interpreter::make_module_builtin_function_with_doc(
                     "exec_query",
                     exec_query,
                     EXEC_QUERY_DOC,
                 ),
-            ),
-        );
+            ));
     },
 }

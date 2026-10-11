@@ -295,10 +295,7 @@ pyre_interpreter::py_module! {
         // `oldcrc` is optional, so the argument count is not fixed: the
         // signature is `HOPELESS` and the positional path routes through the
         // binder rather than the fixed-arity fast entry.
-        pyre_interpreter::runtime_ops::module_ns_store(
-            ns,
-            "crc32",
-            pyre_interpreter::gateway::with_module(
+        pyre_interpreter::__pyre_store!(ns, "crc32", pyre_interpreter::gateway::with_module(
                 "binascii",
                 pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                     "crc32",
@@ -306,15 +303,11 @@ pyre_interpreter::py_module! {
                     pyre_interpreter::HOPELESS,
                     Some(sig_all_posonly("crc32", &["data", "crc"])),
                 ),
-            ),
-        );
+            ));
         // `HOPELESS` as well: a fixed arity would take the positional fast
         // entry, which skips the binder and would let a surplus positional
         // reach the body unchecked (`finish_builtin_code_positional`).
-        pyre_interpreter::runtime_ops::module_ns_store(
-            ns,
-            "crc_hqx",
-            pyre_interpreter::gateway::with_module(
+        pyre_interpreter::__pyre_store!(ns, "crc_hqx", pyre_interpreter::gateway::with_module(
                 "binascii",
                 pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                     "crc_hqx",
@@ -322,8 +315,7 @@ pyre_interpreter::py_module! {
                     pyre_interpreter::HOPELESS,
                     Some(sig_all_posonly("crc_hqx", &["data", "crc"])),
                 ),
-            ),
-        );
+            ));
     },
 }
 

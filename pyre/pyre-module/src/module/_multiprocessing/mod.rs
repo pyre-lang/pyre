@@ -1135,8 +1135,8 @@ pyre_interpreter::py_module! {
     extra_init: |ns| {
         #[cfg(all(any(unix, windows), feature = "host_env"))]
         {
-            let semlock_type = type_object();
-            pyre_interpreter::module_ns_store(ns, "SemLock", semlock_type);
+            let mut semlock_type = pyre_object::with_roots!(ns => type_object());
+            pyre_interpreter::__pyre_store!(ns, "SemLock", semlock_type);
             // interp_semaphore.py W_SemLock.typedef publishes this
             // constant on the class (the module also exports its own copy).
             // `SEM_VALUE_MAX` is what the platform will count to: the
@@ -1153,17 +1153,28 @@ pyre_interpreter::py_module! {
             };
             #[cfg(windows)]
             let value_max = i64::from(i32::MAX);
-            let sem_value_max = w_int_new(value_max);
-            let semlock_ns =
-                unsafe { pyre_object::w_type_get_dict_ptr(semlock_type) } as PyObjectRef;
+            let _roots = pyre_object::gc_roots::push_roots();
+            // Both words already exist. Sequential `pin_root` would query
+            // after the first write and leave the other word invisible
+            // (`RootScope::pin_roots`).
+            let ns_slot = pyre_object::gc_roots::pin_roots(&[ns, semlock_type]);
+            let semlock_slot = ns_slot + 1;
+            let vmax_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(value_max));
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(unsafe {
+                pyre_object::w_type_get_dict_ptr(pyre_object::gc_roots::shadow_stack_get(
+                    semlock_slot,
+                )) as PyObjectRef
+            });
             unsafe {
                 pyre_object::w_dict_setitem_str_no_proxy(
-                    semlock_ns,
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
                     "SEM_VALUE_MAX",
-                    sem_value_max,
+                    pyre_object::gc_roots::shadow_stack_get(vmax_slot),
                 );
-                pyre_object::w_dict_setitem_str_no_proxy(
-                    semlock_ns,
+                pyre_interpreter::__pyre_put_new!(
+                    dict_slot,
                     "__new__",
                     // interp_semaphore.py:572-573 declares the parameters
                     // through `@unwrap_spec(kind=int, value=int, maxvalue=int,
@@ -1183,51 +1194,42 @@ pyre_interpreter::py_module! {
                             0,
                             1,
                         ),
-                    ),
+                    )
                 );
                 // interp_semaphore.py `as_classmethod=True` — `_rebuild`
                 // allocates on the class it is called through.
-                pyre_object::w_dict_setitem_str_no_proxy(
-                    semlock_ns,
+                let rebuild_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_interpreter::make_builtin_function(
                     "_rebuild",
-                    pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
-                        "_rebuild",
-                        semlock_rebuild,
-                    )),
+                    semlock_rebuild,
+                ));
+                pyre_interpreter::__pyre_put_new!(
+                    dict_slot,
+                    "_rebuild",
+                    pyre_object::function::w_classmethod_new(
+                        pyre_object::gc_roots::shadow_stack_get(rebuild_slot)
+                    )
                 );
                 // PyPy `W_SemLock.typedef` owns `descr_new` in its rawdict,
                 // so `TypeDef.acceptable_as_base_class` is true.  This manual
                 // type installs the same descriptor after construction;
                 // reflect that rawdict result on its own TypeDef now.
-                pyre_object::w_type_set_acceptable_as_base_class(semlock_type, true);
+                pyre_object::w_type_set_acceptable_as_base_class(
+                    pyre_object::gc_roots::shadow_stack_get(semlock_slot),
+                    true,
+                );
             }
-
-            pyre_interpreter::module_ns_store(
-                ns,
-                "sem_unlink",
-                pyre_interpreter::make_builtin_function_with_arity("sem_unlink", sem_unlink, 1),
-            );
+            ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+            pyre_interpreter::__pyre_store!(ns, "sem_unlink", pyre_interpreter::make_builtin_function_with_arity("sem_unlink", sem_unlink, 1));
         }
         #[cfg(all(windows, feature = "host_env"))]
         {
-            pyre_interpreter::module_ns_store(
-                ns,
-                "closesocket",
-                pyre_interpreter::make_builtin_function_with_arity("closesocket", closesocket, 1),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "recv",
-                pyre_interpreter::make_builtin_function_with_arity("recv", recv, 2),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "send",
-                pyre_interpreter::make_builtin_function_with_arity("send", send, 2),
-            );
+            pyre_interpreter::__pyre_store!(ns, "closesocket", pyre_interpreter::make_builtin_function_with_arity("closesocket", closesocket, 1));
+            pyre_interpreter::__pyre_store!(ns, "recv", pyre_interpreter::make_builtin_function_with_arity("recv", recv, 2));
+            pyre_interpreter::__pyre_store!(ns, "send", pyre_interpreter::make_builtin_function_with_arity("send", send, 2));
             // `flags` reports the build-time semaphore capabilities the
             // POSIX build is configured with; this one has none to report.
-            pyre_interpreter::module_ns_store(ns, "flags", pyre_object::w_dict_new());
+            pyre_interpreter::__pyre_store!(ns, "flags", pyre_object::w_dict_new());
         }
     }
 }

@@ -700,16 +700,20 @@ pub fn cdata_type() -> PyObjectRef {
 const CDATA_DOC: &str = "The internal base type for CData objects.  Use FFI.CData to access it.  Always check with isinstance(): subtypes are sometimes returned on CPython, for performance reasons.";
 
 fn init_cdata_type(ns: PyObjectRef) {
-    let store = |name: &str, value: PyObjectRef| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
-    };
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    let store =
+        |name: &str, value: PyObjectRef| pyre_interpreter::__pyre_put_new!(ns_slot, name, value);
     store("__doc__", pyre_object::w_str_new(CDATA_DOC));
     // Both are typedef entries in PyPy, so they answer on an instance too.
     store("__module__", pyre_object::w_str_new("_cffi_backend"));
     store("__name__", pyre_object::w_str_new("<cdata>"));
     store(
         "__weakref__",
-        pyre_interpreter::typedef::make_weakref_descr(ns),
+        pyre_interpreter::typedef::make_weakref_descr(pyre_object::gc_roots::shadow_stack_get(
+            ns_slot,
+        )),
     );
     for (name, f, arity) in [
         (

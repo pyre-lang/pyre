@@ -446,6 +446,9 @@ fn dir1(w_lib: PyObjectRef, ignore_global_vars: bool) -> Result<PyObjectRef, PyE
             continue;
         }
         let name = unsafe { CStr::from_ptr(g.name) }.to_string_lossy();
+        // The name pin lives across this one append. The result list stays
+        // on `roots`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
         unsafe {
@@ -468,6 +471,9 @@ fn full_dict_copy(w_lib: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let name = unsafe { CStr::from_ptr(g.name) }
             .to_string_lossy()
             .into_owned();
+        // The value pin lives across this one setitem. The result dict stays
+        // on `roots`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
         let value = get_attr(
             roots.get(lib_slot),
             pyre_object::w_str_new_managed(&name),
@@ -613,9 +619,11 @@ pub fn lib_type() -> PyObjectRef {
 }
 
 fn init_lib_type(ns: PyObjectRef) {
-    let store = |name: &str, value: PyObjectRef| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
-    };
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    let store =
+        |name: &str, value: PyObjectRef| pyre_interpreter::__pyre_put_new!(ns_slot, name, value);
     for (name, function, arity) in [
         (
             "__repr__",

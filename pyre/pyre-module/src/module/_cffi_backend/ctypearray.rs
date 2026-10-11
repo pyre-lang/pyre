@@ -64,6 +64,9 @@ pub fn cdata_iter_type() -> PyObjectRef {
 }
 
 fn init_cdata_iter_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     for (name, f) in [
         (
             "__iter__",
@@ -71,13 +74,11 @@ fn init_cdata_iter_type(ns: PyObjectRef) {
         ),
         ("__next__", next_w),
     ] {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                pyre_interpreter::make_builtin_function_with_arity(name, f, 1),
-            );
-        }
+        pyre_interpreter::__pyre_put_new!(
+            ns_slot,
+            name,
+            pyre_interpreter::make_builtin_function_with_arity(name, f, 1)
+        )
     }
 }
 

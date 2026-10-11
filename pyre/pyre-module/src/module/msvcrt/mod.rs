@@ -106,7 +106,7 @@ pyre_interpreter::py_module! {
         // The C runtime assembly version the build's own toolset named; the
         // build script leaves it unset when no toolset header answered.
         if let Some(version) = option_env!("PYRE_CRT_ASSEMBLY_VERSION") {
-            pyre_interpreter::module_ns_store(ns, "CRT_ASSEMBLY_VERSION", pyre_object::w_str_new(version));
+            pyre_interpreter::__pyre_store!(ns, "CRT_ASSEMBLY_VERSION", pyre_object::w_str_new(version));
         }
     }
 }

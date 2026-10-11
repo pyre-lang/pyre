@@ -218,27 +218,67 @@ fn insort_right(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
 }
 
 pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     let left = pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function("bisect_left", bisect_left),
     );
+    // Each function is pinned before the next allocation. The stores below
+    // reload those original slots: a second `pin_root` of the Rust local
+    // would publish the pre-forward word (`RootScope::pin_roots`).
+    let left_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(left);
     let right = pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function("bisect_right", bisect_right),
     );
+    let right_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(right);
     let insert_left = pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function("insort_left", insort_left),
     );
+    let insert_left_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(insert_left);
     let insert_right = pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function("insort_right", insort_right),
     );
-    pyre_interpreter::module_ns_store(ns, "bisect_left", left);
-    pyre_interpreter::module_ns_store(ns, "bisect_right", right);
-    pyre_interpreter::module_ns_store(ns, "bisect", right);
-    pyre_interpreter::module_ns_store(ns, "insort_left", insert_left);
-    pyre_interpreter::module_ns_store(ns, "insort_right", insert_right);
-    pyre_interpreter::module_ns_store(ns, "insort", insert_right);
+    let insert_right_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(insert_right);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "bisect_left",
+            pyre_object::gc_roots::shadow_stack_get(left_slot),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "bisect_right",
+            pyre_object::gc_roots::shadow_stack_get(right_slot),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "bisect",
+            pyre_object::gc_roots::shadow_stack_get(right_slot),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "insort_left",
+            pyre_object::gc_roots::shadow_stack_get(insert_left_slot),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "insort_right",
+            pyre_object::gc_roots::shadow_stack_get(insert_right_slot),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "insort",
+            pyre_object::gc_roots::shadow_stack_get(insert_right_slot),
+        );
+    }
     Ok(())
 }

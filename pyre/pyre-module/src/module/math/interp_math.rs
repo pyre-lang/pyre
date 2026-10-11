@@ -2018,7 +2018,7 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
             && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
                 .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
     };
-    let (positional, start) = if is_kwargs {
+    let (iterable, start) = if is_kwargs {
         let kwargs = *args.last().unwrap();
         // `prod(iterable, /, *, start=1)` — `start` is the only accepted
         // keyword; any other is an unexpected-keyword TypeError.
@@ -2033,24 +2033,47 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
                 }
             }
         }
+        if args.len() < 2 {
+            return Err(pyre_interpreter::PyError::type_error(
+                "prod() takes at least 1 argument",
+            ));
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        // `args` already holds the iterable and the kwargs dict. One
+        // `pin_roots` publishes that set. Pinning kwargs first would
+        // normalize while the iterable is still unpublished
+        // (`ShadowStackFrameworkGCTransformer.push_roots`).
+        let args_base = pyre_object::gc_roots::pin_roots(args);
         let start_key = pyre_object::unicodeobject::intern_str_value("start");
-        let start =
-            unsafe { pyre_object::w_dict_lookup(kwargs, start_key) }.unwrap_or(w_int_new(1));
-        (&args[..args.len() - 1], start)
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(start_key);
+        let looked_up = unsafe {
+            pyre_object::w_dict_lookup(
+                pyre_object::gc_roots::shadow_stack_get(args_base + args.len() - 1),
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+            )
+        };
+        let start = match looked_up {
+            Some(start) => start,
+            None => w_int_new(1),
+        };
+        let start_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(start);
+        // Reload before this scope drops. The later `pin_roots` must publish
+        // the forwarded iterable, not the original slice word
+        // (`ShadowStackFrameworkGCTransformer.pop_roots`).
+        let iterable = pyre_object::gc_roots::shadow_stack_get(args_base);
+        let start = pyre_object::gc_roots::shadow_stack_get(start_slot);
+        (iterable, start)
     } else if args.len() >= 2 {
         return Err(pyre_interpreter::PyError::type_error(
             "prod() takes only one positional argument (the iterable)",
         ));
     } else {
-        (&args[..1], w_int_new(1))
+        (args[0], w_int_new(1))
     };
-    if positional.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
-            "prod() takes at least 1 argument",
-        ));
-    }
     let _roots = pyre_object::gc_roots::push_roots();
-    let acc_slot = pyre_object::gc_roots::pin_roots(&[start, positional[0]]);
+    let acc_slot = pyre_object::gc_roots::pin_roots(&[start, iterable]);
     let items = pyre_interpreter::builtins::collect_iterable(
         pyre_object::gc_roots::shadow_stack_get(acc_slot + 1),
     )?;

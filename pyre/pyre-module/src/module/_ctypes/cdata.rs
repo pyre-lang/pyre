@@ -12,7 +12,6 @@
 //! transparently handles user subclasses (`class MyInt(c_int)`).
 
 use super::stginfo::ParamFunc;
-use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
 
@@ -151,6 +150,8 @@ pub(super) fn cdata_type() -> PyObjectRef {
 }
 
 fn init_cdata_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
     for (name, f) in [
         (
             "from_address",
@@ -160,12 +161,12 @@ fn init_cdata_type(ns: PyObjectRef) {
         ("from_buffer_copy", cdata_from_buffer_copy),
         ("in_dll", cdata_in_dll),
     ] {
-        type_ns_store(
+        pyre_interpreter::__pyre_store!(
             ns,
             name,
             pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
                 name, f,
-            )),
+            ))
         );
     }
     for (name, f) in [
@@ -176,7 +177,7 @@ fn init_cdata_type(ns: PyObjectRef) {
         ("_b_base_", cdata_base_get),
         ("_b_needsfree_", cdata_needsfree_get),
     ] {
-        type_ns_store(
+        pyre_interpreter::__pyre_store!(
             ns,
             name,
             pyre_interpreter::typedef::make_getset_property_named(
@@ -184,25 +185,25 @@ fn init_cdata_type(ns: PyObjectRef) {
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
                 name,
-            ),
+            )
         );
     }
     // What an `out` parameter hands back once the callee has written it.
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__ctypes_from_outparam__",
-        pyre_interpreter::make_builtin_function("__ctypes_from_outparam__", |args| Ok(args[0])),
+        pyre_interpreter::make_builtin_function("__ctypes_from_outparam__", |args| Ok(args[0]))
     );
     // The pickling pair, alongside it in `PyCData_methods`.
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__reduce__",
-        pyre_interpreter::make_builtin_function_with_arity("__reduce__", cdata_reduce, 1),
+        pyre_interpreter::make_builtin_function_with_arity("__reduce__", cdata_reduce, 1)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__setstate__",
-        pyre_interpreter::make_builtin_function_with_arity("__setstate__", cdata_setstate, 3),
+        pyre_interpreter::make_builtin_function_with_arity("__setstate__", cdata_setstate, 3)
     );
 }
 
@@ -603,20 +604,23 @@ pub(super) fn simplecdata_type() -> PyObjectRef {
 }
 
 fn init_simplecdata_type(ns: PyObjectRef) {
-    type_ns_store(
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(
         ns,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(simplecdata_new),
+        pyre_interpreter::typedef::make_new_descr(simplecdata_new)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__init__",
-        pyre_interpreter::make_builtin_function("__init__", simplecdata_init),
+        pyre_interpreter::make_builtin_function("__init__", simplecdata_init)
     );
     // A scalar `out` parameter hands back the value rather than the box; one
     // whose type is a user subclass hands back the instance, because the
     // subclass is the thing the caller asked for.
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__ctypes_from_outparam__",
         pyre_interpreter::make_builtin_function("__ctypes_from_outparam__", |args| {
@@ -626,45 +630,55 @@ fn init_simplecdata_type(ns: PyObjectRef) {
                 return Ok(obj);
             }
             value_getter(&[pyre_object::PY_NULL, obj])
-        }),
+        })
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__repr__",
-        pyre_interpreter::make_builtin_function("__repr__", simplecdata_repr),
+        pyre_interpreter::make_builtin_function("__repr__", simplecdata_repr)
     );
     // `value` — data descriptor: getter decodes the buffer, setter encodes.
     let value_getter = pyre_interpreter::make_builtin_function_with_arity("value", value_getter, 2);
+    let value_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value_getter);
     let value_setter = pyre_interpreter::make_builtin_function_with_arity("value", value_setter, 3);
-    type_ns_store(
+    let value_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value_setter);
+    let value_deleter = pyre_interpreter::make_builtin_function_with_arity(
+        "value",
+        |_args| {
+            Err(pyre_interpreter::PyError::type_error(
+                "can't delete attribute",
+            ))
+        },
+        2,
+    );
+    let value_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value_deleter);
+    // Later pins forward the earlier functions. The descriptor reads the
+    // slots (`ShadowStackFrameworkGCTransformer.pop_roots`).
+    ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+    pyre_interpreter::__pyre_store!(
         ns,
         "value",
         pyre_interpreter::typedef::make_getset_property_named(
-            value_getter,
-            value_setter,
-            pyre_interpreter::make_builtin_function_with_arity(
-                "value",
-                |_args| {
-                    Err(pyre_interpreter::PyError::type_error(
-                        "can't delete attribute",
-                    ))
-                },
-                2,
-            ),
+            pyre_object::gc_roots::shadow_stack_get(value_getter_slot),
+            pyre_object::gc_roots::shadow_stack_get(value_setter_slot),
+            pyre_object::gc_roots::shadow_stack_get(value_deleter_slot),
             "value",
-        ),
+        )
     );
     // `from_param` — a classmethod the metaclass provides in CPython; the
     // package's `_reset_cache` reads `c_wchar_p.from_param` at import.  The
     // slice marshals arguments directly (§5.2) rather than via `from_param`,
     // so this is an identity stub that only has to exist and be gettable.
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "from_param",
         pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
             "from_param",
             simplecdata_from_param,
-        )),
+        ))
     );
 }
 
