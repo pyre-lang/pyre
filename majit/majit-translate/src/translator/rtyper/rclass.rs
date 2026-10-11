@@ -454,7 +454,8 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::InheritanceId { .. }
         | ConstValue::SpecTag(_)
         | ConstValue::HostObject(_)
-        | ConstValue::Opaque(_) => true,
+        | ConstValue::Opaque(_)
+        | ConstValue::Repr(_) => true,
     }
 }
 

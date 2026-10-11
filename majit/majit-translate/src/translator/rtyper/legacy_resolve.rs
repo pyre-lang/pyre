@@ -417,7 +417,8 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_)
-        | ConstValue::Opaque(_) => ConcreteType::GcRef,
+        | ConstValue::Opaque(_)
+        | ConstValue::Repr(_) => ConcreteType::GcRef,
     }
 }
 

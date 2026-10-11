@@ -904,6 +904,7 @@ pub fn builtin_bool(
             // default `True`.
             ConstValue::HostObject(_)
             | ConstValue::Opaque(_)
+            | ConstValue::Repr(_)
             | ConstValue::Function(_)
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)

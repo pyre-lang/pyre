@@ -2003,13 +2003,107 @@ pub fn rtype_WindowsError__init__(
     Err(rbuiltin_deferred("rtype_WindowsError__init__"))
 }
 
+/// Pack a live `Repr` into `ConstValue::Repr`. The box is leaked so the
+/// pointer stays valid for the process and `ConstValue` stays `Send`.
+pub(crate) fn repr_const(
+    repr: Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+) -> crate::flowspace::model::ConstValue {
+    crate::flowspace::model::ConstValue::Repr(Box::into_raw(Box::new(repr)) as usize)
+}
+
+/// Inverse of [`repr_const`]. Clones the `Arc`; the leaked box stays.
+pub(crate) fn repr_from_const(
+    value: &crate::flowspace::model::ConstValue,
+) -> Option<Arc<dyn crate::translator::rtyper::rmodel::Repr>> {
+    let crate::flowspace::model::ConstValue::Repr(ptr) = value else {
+        return None;
+    };
+    if *ptr == 0 {
+        return None;
+    }
+    // SAFETY: `ptr` was produced by `repr_const` and never freed.
+    Some(unsafe { Arc::clone(&*(*ptr as *const Arc<dyn crate::translator::rtyper::rmodel::Repr>)) })
+}
+
 /// RPython `def rtype_hlinvoke(hop)` (rbuiltin.py).
-///
-/// This is the high-level callable dispatch path for PBC callables. It
-/// depends on the `rpbc` callable repr call protocol, so expose the exact
-/// upstream hook name while the call path is still deferred.
-pub fn rtype_hlinvoke(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_hlinvoke"))
+pub fn rtype_hlinvoke(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeValue;
+    use crate::flowspace::argument::CallShape;
+
+    let (_repr, s_repr) = hop.r_s_popfirstarg();
+    let Some(const_value) = s_repr.const_() else {
+        return Err(TyperError::message(
+            "hlinvoke expects a constant repr as first argument",
+        ));
+    };
+    let r_callable = repr_from_const(const_value)
+        .ok_or_else(|| TyperError::message("hlinvoke expects a constant repr as first argument"))?;
+    // `Repr.get_r_implfunc` returns the implementation function and how
+    // many implicit arguments its signature carries. A method repr returns
+    // a different function repr; a function repr returns itself.
+    let (r_func, nimplicitarg) = r_callable.get_r_implfunc()?;
+    let s_callable = r_callable
+        .get_s_callable()
+        .ok_or_else(|| TyperError::message("hlinvoke callable has no s_callable"))?;
+    let nargs = hop.args_s.borrow().len();
+    if nargs == 0 {
+        return Err(TyperError::message("hlinvoke: missing callable argument"));
+    }
+    let nbargs = nargs - 1 + nimplicitarg;
+    let shape = CallShape {
+        shape_cnt: nbargs,
+        shape_keys: Vec::new(),
+        shape_star: false,
+    };
+    let s_sigs = r_func.get_s_signatures(&shape)?;
+    if s_sigs.len() != 1 {
+        return Err(TyperError::message(format!(
+            "cannot hlinvoke callable {} with not uniform annotations: {s_sigs:?}",
+            r_callable.repr_string()
+        )));
+    }
+    let (sig_args, s_ret) = s_sigs[0].clone();
+    let mut rinputs = Vec::with_capacity(sig_args.len());
+    for s_obj in &sig_args {
+        rinputs.push(hop.rtyper.getrepr(s_obj)?);
+    }
+    let rresult = hop.rtyper.getrepr(&s_ret)?;
+    let sig_args = sig_args[nimplicitarg..].to_vec();
+    let rinputs = rinputs.split_off(nimplicitarg);
+    let mut new_args_r = vec![Some(Arc::clone(&r_callable))];
+    for r_input in rinputs {
+        new_args_r.push(Some(r_input));
+    }
+    {
+        let hop_args_r = hop.args_r.borrow();
+        for (i, r_new) in new_args_r.iter().enumerate() {
+            let left = hop_args_r
+                .get(i)
+                .and_then(|r| r.as_ref())
+                .map(|r| r.lowleveltype().clone());
+            let right = r_new.as_ref().map(|r| r.lowleveltype().clone());
+            assert!(
+                left == right,
+                "hlinvoke arg {i} lowleveltype {left:?} != {right:?}"
+            );
+        }
+    }
+    *hop.args_r.borrow_mut() = new_args_r;
+    let mut new_args_s = vec![SomeValue::PBC(s_callable.clone())];
+    new_args_s.extend(sig_args);
+    *hop.args_s.borrow_mut() = new_args_s;
+    *hop.s_result.borrow_mut() = Some(s_ret.clone());
+    {
+        let current = hop.r_result.borrow();
+        let current_ll = current.as_ref().map(|r| r.lowleveltype().clone());
+        assert!(
+            current_ll.as_ref() == Some(rresult.lowleveltype()),
+            "hlinvoke r_result lowleveltype {current_ll:?} != {:?}",
+            rresult.lowleveltype()
+        );
+    }
+    *hop.r_result.borrow_mut() = Some(rresult);
+    hop.dispatch()
 }
 
 /// RPython `@typer_for(llmemory.offsetof) def rtype_offsetof(hop)`
@@ -5659,7 +5753,6 @@ mod tests {
                 rtype_EnvironmentError__init__,
             ),
             ("rtype_WindowsError__init__", rtype_WindowsError__init__),
-            ("rtype_hlinvoke", rtype_hlinvoke),
             ("rtype_dict_constructor", rtype_dict_constructor),
         ];
 
@@ -5854,6 +5947,170 @@ mod tests {
         assert!(
             err.to_string().contains("must be PtrRepr"),
             "rtype_direct_ptradd asserts PtrRepr, got {err}"
+        );
+    }
+
+    fn dict_constructor_hop() -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        HighLevelOp,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "simple_call",
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        (ann, hop)
+    }
+
+    fn hlinvoke_function(
+        ann: &std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        rtyper: &std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        with_signature: bool,
+    ) -> std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> {
+        use crate::annotator::description::{CallTableRow, DescEntry, FunctionDesc};
+        use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::{Block, ConstValue, Constant, FunctionGraph, GraphFunc};
+        use crate::flowspace::pygraph::PyGraph;
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rpbc::FunctionRepr;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "f",
+            Signature::new(Vec::new(), None, None),
+            None,
+            None,
+        )));
+        if with_signature {
+            let family = fd.borrow().base.getcallfamily().expect("callfamily");
+            let func = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
+            let graph = FunctionGraph::new("f", Block::shared(Vec::new()));
+            {
+                let block = graph.returnblock.borrow();
+                let crate::flowspace::model::Hlvalue::Variable(ret) = &block.inputargs[0] else {
+                    panic!("return var");
+                };
+                *ret.annotation.borrow_mut() =
+                    Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::default())));
+            }
+            let py = Rc::new(PyGraph {
+                graph: Rc::new(RefCell::new(graph)),
+                func,
+                signature: RefCell::new(Signature::new(Vec::new(), None, None)),
+                defaults: RefCell::new(None),
+                access_directly: Cell::new(false),
+            });
+            let mut row = CallTableRow::new();
+            row.insert(fd.borrow().base.identity, Rc::clone(&py));
+            fd.borrow().cache.borrow_mut().insert(
+                crate::annotator::description::GraphCacheKey::None,
+                py.clone(),
+            );
+            family.borrow_mut().calltables.insert(
+                crate::flowspace::argument::CallShape {
+                    shape_cnt: 0,
+                    shape_keys: Vec::new(),
+                    shape_star: false,
+                },
+                vec![row],
+            );
+        }
+        let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
+        FunctionRepr::new(rtyper, s_pbc).expect("function repr") as std::sync::Arc<dyn Repr>
+    }
+
+    #[test]
+    fn rtype_hlinvoke_rejects_non_uniform_signatures() {
+        use crate::annotator::model::{KnownType, SomeObject, SomeValue};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+
+        let (ann, hop) = dict_constructor_hop();
+        let r_fn = hlinvoke_function(&ann, &hop.rtyper, false);
+        let mut s_repr = SomeObject::new(KnownType::Object, true);
+        s_repr.const_box = Some(Constant::new(repr_const(std::sync::Arc::clone(&r_fn))));
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Object(s_repr), SomeValue::Impossible]);
+        hop.args_r.borrow_mut().extend([None, Some(r_fn)]);
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Constant(Constant::new(ConstValue::None)),
+            Hlvalue::Constant(Constant::new(ConstValue::None)),
+        ]);
+
+        let err = rtype_hlinvoke(&hop, &HashMap::new()).expect_err("non-uniform");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot hlinvoke"),
+            "non-uniform signatures must fail like rbuiltin.py, got {msg}"
+        );
+    }
+
+    #[test]
+    fn rtype_hlinvoke_dispatches_the_callable_repr() {
+        use crate::annotator::model::{KnownType, SomeInteger, SomeObject, SomeValue};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+
+        let (ann, hop) = dict_constructor_hop();
+        let r_fn = hlinvoke_function(&ann, &hop.rtyper, true);
+        let mut s_repr = SomeObject::new(KnownType::Object, true);
+        s_repr.const_box = Some(Constant::new(repr_const(std::sync::Arc::clone(&r_fn))));
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Object(s_repr), SomeValue::Impossible]);
+        hop.args_r
+            .borrow_mut()
+            .extend([None, Some(std::sync::Arc::clone(&r_fn))]);
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Constant(Constant::new(ConstValue::None)),
+            Hlvalue::Constant(Constant::new(ConstValue::None)),
+        ]);
+        let r_int = hop
+            .rtyper
+            .getrepr(&SomeValue::Integer(SomeInteger::default()))
+            .expect("int repr");
+        *hop.r_result.borrow_mut() = Some(r_int);
+
+        rtype_hlinvoke(&hop, &HashMap::new()).expect("hlinvoke dispatch");
+        assert!(
+            matches!(hop.args_s.borrow().first(), Some(SomeValue::PBC(_))),
+            "hlinvoke rewrites args_s[0] to the callable PBC before dispatch"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                hop.args_r.borrow()[0].as_ref().expect("callable repr"),
+                &r_fn
+            ),
+            "hlinvoke installs s_repr.const as args_r[0]"
+        );
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "direct_call"),
+            "dispatch of a constant function emits direct_call, ops={:?}",
+            ops.ops
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>()
         );
     }
 }

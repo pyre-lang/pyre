@@ -4753,6 +4753,17 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Address(s))
             }
+            ConstValue::Repr(_) => {
+                // `Repr._freeze_` returns true, so this is the `_freeze_`
+                // arm: `SomePBC([getdesc(x)])`. A Repr is not a HostObject,
+                // so the frozen description is built for this bookkeeper
+                // without a host key.
+                let entry =
+                    DescEntry::Frozen(Rc::new(RefCell::new(FrozenDesc::prebuilt(self.clone()))));
+                let mut pbc = SomePBC::new(vec![entry], false);
+                pbc.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::PBC(pbc))
+            }
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
             | ConstValue::LowLevelType(_)

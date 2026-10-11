@@ -1453,18 +1453,27 @@ pub struct FunctionRepr {
     base: FunctionReprBase,
     state: ReprState,
     lltype: LowLevelType,
+    /// Upgrades to the `Arc` `new` returned, so `get_r_implfunc` can
+    /// hand back `(self, 0)` as `Arc<dyn Repr>`.
+    self_weak: std::sync::Weak<FunctionRepr>,
 }
 
 impl FunctionRepr {
     /// RPython `FunctionRepr(rtyper, s_pbc)` — inherits `__init__` from
     /// `FunctionReprBase` and sets `lowleveltype = Void` as a
     /// class-level attribute (rpbc.py).
-    pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
-        Ok(FunctionRepr {
-            base: FunctionReprBase::new(rtyper, s_pbc)?,
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
+    pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Arc<Self>, TyperError> {
+        let base = FunctionReprBase::new(rtyper, s_pbc)?;
+        Ok(Arc::new_cyclic(|weak| FunctionRepr {
+            base,
             state: ReprState::new(),
             lltype: LowLevelType::Void,
-        })
+            self_weak: weak.clone(),
+        }))
     }
 
     /// Access to the embedded [`FunctionReprBase`] state.
@@ -1990,8 +1999,11 @@ impl Repr for FunctionRepr {
     /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py) —
     /// upstream `return self, 0`. Inherited by `FunctionRepr` via the
     /// `FunctionReprBase` base class.
-    fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
-        Ok((self, 0))
+    fn get_r_implfunc(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
+        let arc = self.self_weak.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionRepr.get_r_implfunc: repr Arc was dropped")
+        })?;
+        Ok((arc, 0))
     }
 
     /// RPython `FunctionReprBase.s_pbc` (rpbc.py) — exposed via the
@@ -1999,6 +2011,19 @@ impl Repr for FunctionRepr {
     /// supply `subset_of=r_func.s_pbc` when narrowing per-call SomePBC.
     fn pbc_s_pbc(&self) -> Option<&SomePBC> {
         Some(&self.base.s_pbc)
+    }
+
+    fn get_s_signatures(
+        &self,
+        shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        self.base.get_s_signatures(shape)
     }
 
     /// RPython `FunctionRepr.convert_desc(self, funcdesc)`
@@ -2100,11 +2125,18 @@ pub struct FunctionsPBCRepr {
     /// upstream `self.funccache[funcdesc]` lookup.
     pub funccache: RefCell<HashMap<DescKey, Constant>>,
     state: ReprState,
+    /// Upgrades to the `Arc` `new` returned, so `get_r_implfunc` can
+    /// hand back `(self, 0)` as `Arc<dyn Repr>`.
+    self_weak: std::sync::Weak<FunctionsPBCRepr>,
 }
 
 impl FunctionsPBCRepr {
     /// RPython `FunctionsPBCRepr(rtyper, s_pbc)` (rpbc.py).
-    pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
+    pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Arc<Self>, TyperError> {
         let base = FunctionReprBase::new(rtyper, s_pbc)?;
         let callfamily = base.callfamily.clone().ok_or_else(|| {
             TyperError::message("FunctionsPBCRepr: sample FunctionDesc has no callfamily")
@@ -2126,14 +2158,15 @@ impl FunctionsPBCRepr {
         } else {
             Self::setup_specfunc(&llct.uniquerows)?
         };
-        Ok(FunctionsPBCRepr {
+        Ok(Arc::new_cyclic(|weak| FunctionsPBCRepr {
             base,
             concretetable: llct.table,
             uniquerows: llct.uniquerows,
             lltype,
             funccache: RefCell::new(HashMap::new()),
             state: ReprState::new(),
-        })
+            self_weak: weak.clone(),
+        }))
     }
 
     /// RPython `FunctionsPBCRepr.setup_specfunc(self)` (rpbc.py):
@@ -2316,8 +2349,11 @@ impl Repr for FunctionsPBCRepr {
     /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py) —
     /// upstream `return self, 0`. Inherited by `FunctionsPBCRepr` via the
     /// `FunctionReprBase` base class.
-    fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
-        Ok((self, 0))
+    fn get_r_implfunc(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
+        let arc = self.self_weak.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionsPBCRepr.get_r_implfunc: repr Arc was dropped")
+        })?;
+        Ok((arc, 0))
     }
 
     /// RPython `FunctionReprBase.s_pbc` (rpbc.py) — exposed via the
@@ -2325,6 +2361,19 @@ impl Repr for FunctionsPBCRepr {
     /// supply `subset_of=r_func.s_pbc` when narrowing per-call SomePBC.
     fn pbc_s_pbc(&self) -> Option<&SomePBC> {
         Some(&self.base.s_pbc)
+    }
+
+    fn get_s_signatures(
+        &self,
+        shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        self.base.get_s_signatures(shape)
     }
 
     /// RPython `FunctionsPBCRepr.convert_desc(self, funcdesc)`
@@ -2685,6 +2734,9 @@ pub struct SmallFunctionSetPBCRepr {
     /// explicitly because `Repr::lowleveltype` returns `&LowLevelType`.
     lltype: LowLevelType,
     state: ReprState,
+    /// Upgrades to the `Arc` `new` returned, so `get_r_implfunc` can
+    /// hand back `(self, 0)` as `Arc<dyn Repr>`.
+    self_weak: std::sync::Weak<SmallFunctionSetPBCRepr>,
 }
 
 impl SmallFunctionSetPBCRepr {
@@ -2694,7 +2746,7 @@ impl SmallFunctionSetPBCRepr {
         clippy::arc_with_non_send_sync,
         reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
     )]
-    pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
+    pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Arc<Self>, TyperError> {
         // upstream rpbc.py — `FunctionReprBase.__init__(...)`.
         let base = FunctionReprBase::new(rtyper, s_pbc.clone())?;
         // upstream rpbc.py:396-397 —
@@ -2716,8 +2768,8 @@ impl SmallFunctionSetPBCRepr {
         }
         // upstream rpbc.py:399 — `self.pointer_repr =
         //                           FunctionsPBCRepr(rtyper, s_pbc)`.
-        let pointer_repr = Arc::new(FunctionsPBCRepr::new(rtyper, s_pbc)?);
-        Ok(SmallFunctionSetPBCRepr {
+        let pointer_repr = FunctionsPBCRepr::new(rtyper, s_pbc)?;
+        Ok(Arc::new_cyclic(|weak| SmallFunctionSetPBCRepr {
             base,
             pointer_repr,
             descriptions: RefCell::new(Vec::new()),
@@ -2731,7 +2783,8 @@ impl SmallFunctionSetPBCRepr {
             // upstream rpbc.py — `self.lowleveltype = Char`.
             lltype: LowLevelType::Char,
             state: ReprState::new(),
-        })
+            self_weak: weak.clone(),
+        }))
     }
 
     /// RPython `SmallFunctionSetPBCRepr._invent_dispatcher_name(self, row)`
@@ -3576,6 +3629,19 @@ impl Repr for SmallFunctionSetPBCRepr {
         Some(&self.base.s_pbc)
     }
 
+    fn get_s_signatures(
+        &self,
+        shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        self.base.get_s_signatures(shape)
+    }
+
     /// RPython `SmallFunctionSetPBCRepr._setup_repr(self)`
     /// (rpbc.py):
     ///
@@ -3855,8 +3921,11 @@ impl Repr for SmallFunctionSetPBCRepr {
     /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py) —
     /// inherited via `class SmallFunctionSetPBCRepr(FunctionReprBase)`:
     /// `return self, 0`.
-    fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
-        Ok((self, 0))
+    fn get_r_implfunc(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
+        let arc = self.self_weak.upgrade().ok_or_else(|| {
+            TyperError::message("SmallFunctionSetPBCRepr.get_r_implfunc: repr Arc was dropped")
+        })?;
+        Ok((arc, 0))
     }
 
     /// RPython `SmallFunctionSetPBCRepr.rtype_simple_call(self, hop)`
@@ -5905,21 +5974,6 @@ impl Repr for MethodOfFrozenPBCRepr {
     }
 
     /// RPython `MethodOfFrozenPBCRepr.get_r_implfunc(self)`
-    /// (rpbc.py).
-    ///
-    /// Returns `MissingRTypeOperation` — the upstream return value
-    /// `r_func = self.rtyper.getrepr(self.get_s_callable())` is a
-    /// freshly-built Repr, so callers must take ownership rather than
-    /// borrow. Use [`get_r_implfunc_arc`] instead.
-    fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
-        Err(TyperError::missing_rtype_operation(
-            "MethodOfFrozenPBCRepr.get_r_implfunc: use get_r_implfunc_arc \
-             (rpbc.py:874-876 returns a freshly-built Repr; callers must take \
-             ownership)",
-        ))
-    }
-
-    /// RPython `MethodOfFrozenPBCRepr.get_r_implfunc(self)`
     /// (rpbc.py):
     ///
     /// ```python
@@ -5927,15 +5981,10 @@ impl Repr for MethodOfFrozenPBCRepr {
     ///     r_func = self.rtyper.getrepr(self.get_s_callable())
     ///     return r_func, 1
     /// ```
-    ///
-    /// Pyre exposes this through the trait's owned-Arc form because the
-    /// `getrepr` result is a freshly-built (or cached) `Arc<dyn Repr>`
-    /// that cannot be returned by reference from a method that does
-    /// not own a stable backing handle.
-    fn get_r_implfunc_arc(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
+    fn get_r_implfunc(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
         // upstream: `r_func = self.rtyper.getrepr(self.get_s_callable())`.
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
-            TyperError::message("MethodOfFrozenPBCRepr.get_r_implfunc_arc: rtyper weak ref dropped")
+            TyperError::message("MethodOfFrozenPBCRepr.get_r_implfunc: rtyper weak ref dropped")
         })?;
         // upstream `get_s_callable` is `FunctionReprBase.get_s_callable`
         // (rpbc.py) — `return self.s_pbc`. For
@@ -5946,6 +5995,16 @@ impl Repr for MethodOfFrozenPBCRepr {
         // upstream: `return r_func, 1` — the `1` is the arg-position
         // offset (skip the bound `self`).
         Ok((r_func, 1))
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.get_s_callable(self)` (rpbc.py):
+    /// `return SomePBC([self.funcdesc])`. This is the underlying
+    /// function, not the bound-method PBC.
+    fn get_s_callable(&self) -> Option<SomePBC> {
+        Some(SomePBC::new(
+            vec![DescEntry::Func(self.funcdesc.clone())],
+            false,
+        ))
     }
 
     /// RPython `MethodOfFrozenPBCRepr.convert_desc` (rpbc.py) —
@@ -7317,7 +7376,7 @@ impl MethodsPBCRepr {
             let rtyper = self.rtyper.upgrade().ok_or_else(|| {
                 TyperError::message("MethodsPBCRepr.redispatch_call: rtyper weak ref dropped")
             })?;
-            let new_repr: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_func_pbc)?);
+            let new_repr: Arc<dyn Repr> = FunctionsPBCRepr::new(&rtyper, s_func_pbc)?;
             hop2.args_r.borrow_mut()[0] = Some(new_repr);
         } else {
             // upstream `else` arm: re-`convertvar` the freshly-inserted
@@ -7344,12 +7403,11 @@ impl MethodsPBCRepr {
     ///     return r_func, 1
     /// ```
     ///
-    /// Pyre exposes this through the trait's `get_r_implfunc_arc`
-    /// sibling (rmodel.rs) — the upstream Python `r_func` reference
-    /// outlives the call, but Rust's `&dyn Repr` cannot escape the
-    /// short-lived `RefCell::borrow()` guard on `clsfields`. Returning
-    /// the `Arc<dyn Repr>` clone preserves the same identity (the Arc
-    /// is shared with the cache).
+    /// The trait method `get_r_implfunc` calls this. The upstream
+    /// Python `r_func` reference outlives the call, but Rust's
+    /// `&dyn Repr` cannot escape the short-lived `RefCell::borrow()`
+    /// guard on `clsfields`. Returning the `Arc<dyn Repr>` clone
+    /// preserves the same identity (the Arc is shared with the cache).
     pub fn get_r_implfunc_arc_impl(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
         use crate::translator::rtyper::rclass::ClassReprArc;
 
@@ -7425,11 +7483,15 @@ impl Repr for MethodsPBCRepr {
     }
 
     /// RPython `MethodsPBCRepr.get_r_implfunc(self)` (rpbc.py).
-    /// The owned-Arc form lives on `get_r_implfunc_arc` because the
-    /// returned `r_func` is a clsfields-cache borrow that outlives the
-    /// short-lived `RefCell::borrow()` guard via Arc cloning.
-    fn get_r_implfunc_arc(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
+    /// The returned `r_func` is the clsfields entry, a different repr.
+    fn get_r_implfunc(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
         self.get_r_implfunc_arc_impl()
+    }
+
+    /// RPython `MethodsPBCRepr.get_s_callable(self)` (rpbc.py):
+    /// `return self.s_pbc`.
+    fn get_s_callable(&self) -> Option<SomePBC> {
+        Some(self.s_pbc.clone())
     }
 
     /// RPython `MethodsPBCRepr.convert_const(self, method)`
@@ -7541,10 +7603,7 @@ pub fn somepbc_rtyper_makerepr(
         // (its `as_function()` yields the wrapped base).
         DescKind::Function | DescKind::Memo => {
             if s_pbc.descriptions.len() == 1 && !s_pbc.can_be_none {
-                Ok(
-                    std::sync::Arc::new(FunctionRepr::new(rtyper, s_pbc.clone())?)
-                        as std::sync::Arc<dyn Repr>,
-                )
+                Ok(FunctionRepr::new(rtyper, s_pbc.clone())? as std::sync::Arc<dyn Repr>)
             } else {
                 // rpbc.py:42-49 — sample = self.any_description();
                 // callfamily = sample.querycallfamily(); if callfamily
@@ -7574,17 +7633,11 @@ pub fn somepbc_rtyper_makerepr(
                 if callable {
                     if small_cand(rtyper, s_pbc)? {
                         // rpbc.py — `getRepr = SmallFunctionSetPBCRepr`.
-                        Ok(
-                            std::sync::Arc::new(SmallFunctionSetPBCRepr::new(
-                                rtyper,
-                                s_pbc.clone(),
-                            )?) as std::sync::Arc<dyn Repr>,
-                        )
+                        Ok(SmallFunctionSetPBCRepr::new(rtyper, s_pbc.clone())?
+                            as std::sync::Arc<dyn Repr>)
                     } else {
-                        Ok(
-                            std::sync::Arc::new(FunctionsPBCRepr::new(rtyper, s_pbc.clone())?)
-                                as std::sync::Arc<dyn Repr>,
-                        )
+                        Ok(FunctionsPBCRepr::new(rtyper, s_pbc.clone())?
+                            as std::sync::Arc<dyn Repr>)
                     }
                 } else {
                     // rpbc.py:49 — uncallable Function-kind PBCs route
@@ -7787,9 +7840,10 @@ mod pbc_repr_tests {
     /// `convert_desc` / `convert_to_concrete_llfn` tests. The `rtyper`
     /// is returned alongside so the caller keeps the strong `Rc` alive
     /// — the repr only holds a `Weak<RPythonTyper>` and would deny
-    /// upgrade once the helper's local Rc drops.
+    /// upgrade once the helper's local Rc drops. The repr is the `Arc`
+    /// `FunctionsPBCRepr::new` built, so `get_r_implfunc` can upgrade it.
     fn build_multi_row_functions_pbc_repr() -> (
-        FunctionsPBCRepr,
+        Arc<FunctionsPBCRepr>,
         Rc<StdRefCell<crate::annotator::description::FunctionDesc>>,
         Rc<StdRefCell<crate::annotator::description::FunctionDesc>>,
         Rc<RPythonTyper>,
@@ -8137,6 +8191,29 @@ mod pbc_repr_tests {
         // The shared funcdesc on the repr is the same Rc as the
         // one bound on the MethodOfFrozenDesc.
         assert!(Rc::ptr_eq(&r.funcdesc.func(), &fd));
+        let s_callable = r.get_s_callable().expect("underlying function");
+        assert_eq!(s_callable.descriptions.len(), 1);
+        assert!(
+            s_callable
+                .descriptions
+                .values()
+                .next()
+                .unwrap()
+                .as_function()
+                .is_some()
+        );
+        let (r_func, nimplicit) = r.get_r_implfunc().expect("owned impl func");
+        assert_eq!(nimplicit, 1);
+        assert!(
+            r_func
+                .get_s_signatures(&crate::flowspace::argument::CallShape {
+                    shape_cnt: 1,
+                    shape_keys: Vec::new(),
+                    shape_star: false,
+                })
+                .is_ok()
+                || r_func.pbc_s_pbc().is_some()
+        );
     }
 
     // The "mixed funcdescs" rejection branch (rpbc.py:851-853 `assert
@@ -9779,8 +9856,7 @@ mod pbc_repr_tests {
         let (ann, rtyper) = make_rtyper();
         let (fd, _shape, _pygraph) = single_funcdesc_with_callfamily(&ann, "f");
         let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
-        let r: std::sync::Arc<FunctionRepr> =
-            std::sync::Arc::new(FunctionRepr::new(&rtyper, s_pbc.clone()).unwrap());
+        let r: std::sync::Arc<FunctionRepr> = FunctionRepr::new(&rtyper, s_pbc.clone()).unwrap();
         let r_dyn: std::sync::Arc<dyn Repr> = r.clone();
 
         // SpaceOperation: result_var = simple_call(receiver, c_int)
@@ -9859,7 +9935,7 @@ mod pbc_repr_tests {
         let (fd, _shape, _pygraph) = single_funcdesc_with_callfamily(&ann, "f");
         let s_pbc = SomePBC::new(vec![DescEntry::function(fd)], false);
         let r: std::sync::Arc<FunctionsPBCRepr> =
-            std::sync::Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc.clone()).unwrap());
+            FunctionsPBCRepr::new(&rtyper, s_pbc.clone()).unwrap();
         let r_dyn: std::sync::Arc<dyn Repr> = r.clone();
         let funcptr_lltype = r.lowleveltype().clone();
 
@@ -10352,8 +10428,7 @@ mod pbc_repr_tests {
             vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
-        let r: std::sync::Arc<dyn Repr> =
-            std::sync::Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap());
+        let r: std::sync::Arc<dyn Repr> = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
 
         // Input arg: a Ptr-typed Variable (matches FunctionsPBCRepr lowleveltype).
         let arg_var = Variable::new();
@@ -10456,10 +10531,7 @@ mod pbc_repr_tests {
         let r = FunctionRepr::new(&rtyper, s_pbc).unwrap();
         let (r_impl, nimplicit) = r.get_r_implfunc().unwrap();
         assert_eq!(nimplicit, 0);
-        assert!(std::ptr::eq(
-            r_impl as *const dyn Repr as *const (),
-            &r as *const FunctionRepr as *const (),
-        ));
+        assert!(Arc::ptr_eq(&r_impl, &(Arc::clone(&r) as Arc<dyn Repr>)));
     }
 
     #[test]

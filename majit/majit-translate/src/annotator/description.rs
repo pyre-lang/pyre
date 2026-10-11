@@ -3085,6 +3085,19 @@ impl FrozenDesc {
         })
     }
 
+    /// A frozen description with no host object. `Repr._freeze_` is true
+    /// and has no attributes; attribute reads miss.
+    pub fn prebuilt(bookkeeper: Rc<Bookkeeper>) -> Self {
+        FrozenDesc {
+            base: Desc::new(bookkeeper, None),
+            attrcache: RefCell::new(HashMap::new()),
+            knowntype: None,
+            _read_attribute: Box::new(|_attr: &str| {
+                Err(crate::flowspace::model::HostGetAttrError::Missing)
+            }),
+        }
+    }
+
     /// Default `read_attribute` closure — Rust equivalent of upstream
     /// `lambda attr: getattr(pyobj, attr)` (description.py).
     ///

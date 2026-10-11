@@ -1946,20 +1946,16 @@ mod tests {
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
 
-        let r_from: Arc<dyn Repr> = Arc::new(
-            FunctionRepr::new(
-                &rtyper,
-                SomePBC::new(vec![f_entry(&ann.bookkeeper, "f")], false),
-            )
-            .unwrap(),
-        );
-        let r_to: Arc<dyn Repr> = Arc::new(
-            FunctionRepr::new(
-                &rtyper,
-                SomePBC::new(vec![f_entry(&ann.bookkeeper, "g")], false),
-            )
-            .unwrap(),
-        );
+        let r_from: Arc<dyn Repr> = FunctionRepr::new(
+            &rtyper,
+            SomePBC::new(vec![f_entry(&ann.bookkeeper, "f")], false),
+        )
+        .unwrap();
+        let r_to: Arc<dyn Repr> = FunctionRepr::new(
+            &rtyper,
+            SomePBC::new(vec![f_entry(&ann.bookkeeper, "g")], false),
+        )
+        .unwrap();
 
         let input_var = Variable::new();
         input_var.set_concretetype(Some(
@@ -2032,14 +2028,12 @@ mod tests {
             vec![DescEntry::function(fd_f), DescEntry::function(fd_g.clone())],
             false,
         );
-        let r_from: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_from).unwrap());
-        let r_to: Arc<dyn Repr> = Arc::new(
-            FunctionRepr::new(
-                &rtyper,
-                SomePBC::new(vec![DescEntry::function(fd_g)], false),
-            )
-            .unwrap(),
-        );
+        let r_from: Arc<dyn Repr> = FunctionsPBCRepr::new(&rtyper, s_from).unwrap();
+        let r_to: Arc<dyn Repr> = FunctionRepr::new(
+            &rtyper,
+            SomePBC::new(vec![DescEntry::function(fd_g)], false),
+        )
+        .unwrap();
 
         let input_var = Variable::new();
         input_var.set_concretetype(Some(LowLevelType::Void));
@@ -2111,7 +2105,7 @@ mod tests {
             vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
-        let r: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap());
+        let r: Arc<dyn Repr> = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
 
         let input_var = Variable::new();
         input_var.set_concretetype(Some(r.lowleveltype().clone()));

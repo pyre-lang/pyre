@@ -2750,6 +2750,13 @@ pub enum ConstValue {
     /// (`rclass.FieldListAccessor` in `VTYPE._hints['virtualizable_accessor']`).
     /// Identity is the `Arc` pointer, matching Python `is`.
     Opaque(OpaqueConst),
+    /// RPython `s_repr.const` when that constant is an `rmodel.Repr`
+    /// (`hlinvoke`'s first argument). The `usize` is
+    /// `Box::into_raw(Box<Arc<dyn Repr>>)` leaked for the process.
+    /// A fat `Arc<dyn Repr>` cannot sit in this enum: `Repr` is not
+    /// `Send`, and `HostEnv` requires `ConstValue: Send`. This is the
+    /// object itself, not a side table.
+    Repr(usize),
 }
 
 /// Identity-bearing rtyper object stored on `Constant.value`.
@@ -2794,6 +2801,33 @@ impl Hash for OpaqueConst {
     }
 }
 
+/// `ConstValue::Repr` carries a leaked `Box<Arc<dyn Repr>>`. Equality is
+/// the inner `Arc` allocation, the same identity `OpaqueConst` uses.
+/// A null carrier is not a live box.
+fn repr_carriers_eq(a: usize, b: usize) -> bool {
+    if a == 0 || b == 0 {
+        return a == b;
+    }
+    // SAFETY: both addresses are leaked boxes from `repr_const`, which
+    // stores `Box<Arc<dyn Repr>>` and never frees it.
+    let arc_a =
+        unsafe { &*(a as *const std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>) };
+    let arc_b =
+        unsafe { &*(b as *const std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>) };
+    std::sync::Arc::ptr_eq(arc_a, arc_b)
+}
+
+fn hash_repr_carrier<H: Hasher>(ptr: usize, state: &mut H) {
+    if ptr == 0 {
+        0usize.hash(state);
+        return;
+    }
+    // SAFETY: `ptr` is a leaked box from `repr_const` and is never freed.
+    let arc =
+        unsafe { &*(ptr as *const std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>) };
+    std::sync::Arc::as_ptr(arc).hash(state);
+}
+
 impl PartialEq for ConstValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -2824,6 +2858,7 @@ impl PartialEq for ConstValue {
             (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => a == b,
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::Opaque(a), ConstValue::Opaque(b)) => a == b,
+            (ConstValue::Repr(a), ConstValue::Repr(b)) => repr_carriers_eq(*a, *b),
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             (ConstValue::AddressOffset(a), ConstValue::AddressOffset(b)) => a == b,
             (
@@ -2864,6 +2899,7 @@ impl std::fmt::Display for ConstValue {
             ConstValue::SpecTag(id) => write!(f, "<spec-tag {id}>"),
             ConstValue::HostObject(obj) => write!(f, "{}", obj.qualname()),
             ConstValue::Opaque(_) => f.write_str("<opaque>"),
+            ConstValue::Repr(ptr) => write!(f, "<repr {ptr:#x}>"),
             ConstValue::Dict(_)
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
@@ -2931,6 +2967,7 @@ impl Hash for ConstValue {
             },
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::Opaque(opaque) => opaque.hash(state),
+            ConstValue::Repr(ptr) => hash_repr_carrier(*ptr, state),
             ConstValue::SpecTag(id) => id.hash(state),
             ConstValue::AddressOffset(offset) => offset.hash(state),
             ConstValue::InheritanceId {
@@ -3541,6 +3578,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::SpecTag(_) => "SpecTag",
         ConstValue::InheritanceId { .. } => "InheritanceId",
         ConstValue::Opaque(_) => "Opaque",
+        ConstValue::Repr(_) => "Repr",
     }
 }
 
@@ -3691,7 +3729,7 @@ impl ConstValue {
             ConstValue::SpecTag(_) => Some(true),
             ConstValue::AddressOffset(_) => Some(true),
             ConstValue::InheritanceId { .. } => Some(true),
-            ConstValue::Opaque(_) => Some(true),
+            ConstValue::Opaque(_) | ConstValue::Repr(_) => Some(true),
         }
     }
 
@@ -3782,7 +3820,8 @@ impl ConstValue {
             | ConstValue::AddressOffset(_)
             | ConstValue::InheritanceId { .. }
             | ConstValue::SpecTag(_)
-            | ConstValue::Opaque(_) => None,
+            | ConstValue::Opaque(_)
+            | ConstValue::Repr(_) => None,
         }
     }
 

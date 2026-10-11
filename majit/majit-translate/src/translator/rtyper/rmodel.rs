@@ -634,49 +634,12 @@ pub trait Repr: Debug + std::any::Any {
     /// `rbuiltin.rtype_hlinvoke` (`rbuiltin.py`) to walk from an
     /// opaque callable repr to the underlying `FunctionReprBase` that
     /// exposes `get_s_signatures`. The base trait raises; concrete
-    /// reprs (FunctionRepr / FunctionsPBCRepr / MethodOfFrozenPBCRepr /
-    /// MethodsPBCRepr) override to return themselves or a `getrepr`-
-    /// resolved sibling alongside the implicit-arg count.
-    fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
+    /// reprs override. `FunctionReprBase` returns `(self, 0)`.
+    /// `MethodsPBCRepr` returns `(r_class.clsfields[methodname], 1)`.
+    /// `MethodOfFrozenPBCRepr` returns `(getrepr(get_s_callable()), 1)`.
+    fn get_r_implfunc(&self) -> Result<(std::sync::Arc<dyn Repr>, usize), TyperError> {
         Err(TyperError::message(format!(
             "{} has no corresponding implementation function representation",
-            self.repr_string()
-        )))
-    }
-
-    /// RPython `Repr.get_r_implfunc(self)` (rpbc.py) —
-    /// owned-`Arc<dyn Repr>` variant.
-    ///
-    /// `MethodsPBCRepr.get_r_implfunc` (rpbc.py) returns a
-    /// `r_func` borrowed from `r_class.clsfields[methodname]`. The
-    /// upstream borrow is a Python attribute lookup whose result
-    /// outlives the call; Rust's `&dyn Repr` cannot escape the
-    /// short-lived `RefCell::borrow()` guard, so this sibling method
-    /// returns the `Arc<dyn Repr>` instead. Default delegates to the
-    /// `&dyn Repr` variant for impls (FunctionRepr, FunctionsPBCRepr,
-    /// SmallFunctionSetPBCRepr) that return `(self, 0)` — those want
-    /// `Arc::new` of `self`, which is impossible from `&self` alone, so
-    /// callers that need the Arc must invoke the impl-specific helper
-    /// directly.
-    ///
-    /// **Convergence path** (TODO):
-    /// the dual-method shape collapses once `rbuiltin.rtype_hlinvoke`
-    /// (rpbc.py-side: rbuiltin.py) lands and reveals the production
-    /// call site shape. Two unification options at that point:
-    ///   (a) trait method takes `Arc<Self>` receiver — Rust trait
-    ///   methods cannot do this directly; would require a free function
-    ///   `pub fn get_r_implfunc(this: &Arc<dyn Repr>) -> Result<(Arc<dyn Repr>, usize)>`
-    ///   that downcasts on `repr_class_id()` to dispatch.
-    ///   (b) drop the `&dyn Repr` form entirely; impls that returned
-    ///   `(self, 0)` route through the rtyper's repr cache (similar to
-    ///   `getinstancerepr`) to recover their own `Arc<dyn Repr>`.
-    /// Either option requires updating all `get_r_implfunc` callers in
-    /// one pass — currently the only call site is the FunctionRepr
-    /// unit test, so the audit is small once `rtype_hlinvoke` exists.
-    fn get_r_implfunc_arc(&self) -> Result<(std::sync::Arc<dyn Repr>, usize), TyperError> {
-        Err(TyperError::message(format!(
-            "{} has no corresponding implementation function representation \
-             (Arc form)",
             self.repr_string()
         )))
     }
@@ -699,6 +662,36 @@ pub trait Repr: Debug + std::any::Any {
     /// FunctionReprBase impls override to return `Some(&self.base.s_pbc)`.
     fn pbc_s_pbc(&self) -> Option<&crate::annotator::model::SomePBC> {
         None
+    }
+
+    /// RPython `Repr.get_s_callable(self)` (`rmodel.py` / `rpbc.py`).
+    ///
+    /// `rtype_hlinvoke` reads this, not `s_pbc`. Function reprs return
+    /// their `s_pbc`. `MethodOfFrozenPBCRepr` returns the underlying
+    /// function, and `MethodsPBCRepr` returns the method PBC.
+    fn get_s_callable(&self) -> Option<crate::annotator::model::SomePBC> {
+        self.pbc_s_pbc().cloned()
+    }
+
+    /// RPython `FunctionReprBase.get_s_signatures(self, shape)` (rpbc.py).
+    ///
+    /// `rtype_hlinvoke` calls this on the `Repr` returned by
+    /// `get_r_implfunc`. The default is the missing-method failure;
+    /// `FunctionRepr` forwards to `FunctionReprBase`.
+    fn get_s_signatures(
+        &self,
+        _shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        Err(TyperError::message(format!(
+            "{} has no get_s_signatures",
+            self.repr_string()
+        )))
     }
 
     /// RPython `Repr.convert_const(self, value)` (`rmodel.py`).
