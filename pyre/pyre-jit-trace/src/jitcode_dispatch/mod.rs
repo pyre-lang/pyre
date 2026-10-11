@@ -15974,7 +15974,15 @@ fn handle<Sym: WalkSym>(
             let back_edge_jit_pc = ctx.trace_ctx.seen_loop_header_jit_pc.take();
 
             // pyjitpl.py self.heapcache.reset()
+            // The walker's cached sys_exc_value box is a heap-field cache too
+            // and is dropped with it.
             ctx.trace_ctx.heap_cache_mut().reset();
+            {
+                let mut state = ctx.frame_state.borrow_mut();
+                state.current_exception_seed = None;
+                state.current_exception_seed_concrete = pyre_object::PY_NULL;
+            }
+            ctx.fbw_mode.current_exception_seed_from_walk_store = false;
 
             // `close_loop_args_at` (trace_opcode.rs) runs the merge-point
             // vable `last_instr` sync BEFORE building the jump args: the
