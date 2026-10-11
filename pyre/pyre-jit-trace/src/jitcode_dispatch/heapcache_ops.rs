@@ -689,14 +689,16 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
             return;
         }
     };
+    // Old→young barrier: the materialization block may have been promoted to
+    // old-gen while `elem` is still young (the construction-barrier gap). A
+    // nursery block carries no TRACK_YOUNG_PTRS so the barrier is a no-op.
+    // `transform_generic_set` (framework.py): the barrier comes before the
+    // bare store.
+    pyre_object::gc_hook::try_gc_write_barrier(block as pyre_object::gc_hook::GCREF);
     unsafe {
         let base = pyre_object::object_array::items_block_items_base(block);
         *base.add(idx) = elem;
     }
-    // Old→young barrier: the materialization block may have been promoted to
-    // old-gen while `elem` is still young (the construction-barrier gap). A
-    // nursery block carries no TRACK_YOUNG_PTRS so the barrier is a no-op.
-    pyre_object::gc_hook::try_gc_write_barrier(block as pyre_object::gc_hook::GCREF);
 }
 
 /// Traced-iteration fill of a cleared `GcArray(Signed)` block from
