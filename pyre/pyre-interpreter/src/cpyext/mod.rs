@@ -78,6 +78,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::c_int;
 use std::hash::BuildHasherDefault;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
@@ -461,9 +462,10 @@ fn extension_import_error(message: String, name: &str, path: &Path) -> crate::Py
 /// address 0. `rdynload.dlsym` rejects that, and it must be rejected here too:
 /// address 0 transmuted to the init signature is a call through a null pointer.
 fn lookup_init_address(handle: usize, symbol: &str) -> Option<usize> {
-    match rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol.as_bytes()) {
-        Ok(0) | Err(_) => None,
-        Ok(address) => Some(address),
+    match majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, symbol.as_bytes())
+    {
+        Ok(address) => Some(address as usize),
+        Err(_) => None,
     }
 }
 
@@ -476,10 +478,10 @@ pub fn load_extension_module(
     let _load_guard = extension_load_lock();
     ensure_linked();
     initialize();
-    // `host_env::ctypes` deduplicates libraries by the native handle without
-    // maintaining an open count. A second open followed by drop would unload
-    // the one library owned by `EXTENSIONS`, so resolve PyPy's cache before
-    // opening on this host abstraction.
+    // `c_dlopen` / `c_dlsym` release the GIL. `spec` is used after those calls.
+    let spec_roots = pyre_object::gc_roots::push_roots();
+    let spec = spec_roots.pin_root(spec);
+    // Resolve PyPy's path cache before a second `dlopen` of the same file.
     if let Some(handle) = cached_extension_handle(path) {
         // `create_extension_module` takes the CFFI branch before it reaches the
         // extension cache, so a generated module is rebuilt on every import.
@@ -508,17 +510,13 @@ pub fn load_extension_module(
         mode |= libc::RTLD_NOW;
     }
     let handle =
-        rustpython_host_env::ctypes::open_library_with_mode(path, mode).map_err(|error| {
+        majit_rlib::rdynload::dlopen(Some(path.as_os_str().as_bytes()), mode).map_err(|error| {
             extension_import_error(
-                format!(
-                    "cannot load extension '{}': {}",
-                    path.display(),
-                    crate::with_causes(&error)
-                ),
+                format!("cannot load extension '{}': {}", path.display(), error.msg),
                 name,
                 path,
             )
-        })?;
+        })? as usize;
 
     // Every path from here leaves the library loaded, however it fails.  The
     // handle cache keeps one `dlopen` count per library and hands the same

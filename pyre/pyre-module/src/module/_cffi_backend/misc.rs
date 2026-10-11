@@ -580,6 +580,10 @@ pub fn dlopen_w(mut w_filename: PyObjectRef, flags: i64) -> Result<(String, usiz
     use super::cdataobj::W_CData;
     use super::ctypeobj;
 
+    // `rdynload.dlopen` releases the GIL.
+    let roots = pyre_object::gc_roots::push_roots();
+    w_filename = roots.pin_root(w_filename);
+
     if let Some(cdata) = W_CData::from_obj(w_filename) {
         // 'flags' is ignored in this case.
         let ct = ctypeobj::ctype_at(cdata.ctype)
@@ -623,19 +627,15 @@ fn filename_of(w_filename: PyObjectRef) -> Result<std::ffi::OsString, PyError> {
     ))
 }
 
-/// `rffi.cast(DLLHANDLE, handle)` — the raw address becomes the key the rest
-/// of this module looks symbols up under, which here means entering it in the
-/// loader's own table.
-#[cfg(all(feature = "host_env", unix))]
+/// `rffi.cast(DLLHANDLE, handle)` — the raw address is the handle.
+#[cfg(unix)]
 fn adopt_raw_handle(handle: *mut u8) -> Result<usize, PyError> {
-    Ok(rustpython_host_env::ctypes::insert_raw_library_handle(
-        handle.cast::<std::ffi::c_void>(),
-    ))
+    Ok(handle as usize)
 }
 
-/// A build without that table has no key to hand back, and answering `0` would
-/// name a library whose every symbol is missing.
-#[cfg(not(all(feature = "host_env", unix)))]
+/// A build without a loader has no handle to hand back, and answering `0`
+/// would name a library whose every symbol is missing.
+#[cfg(not(unix))]
 fn adopt_raw_handle(_handle: *mut u8) -> Result<usize, PyError> {
     Err(PyError::os_error(
         "dlopen() cannot adopt a raw 'void *' handle in this build",
@@ -643,29 +643,24 @@ fn adopt_raw_handle(_handle: *mut u8) -> Result<usize, PyError> {
 }
 
 /// `rdynload.dlopen`, whose mode defaults to resolving everything now.
-#[cfg(all(feature = "host_env", unix))]
+#[cfg(unix)]
 fn open_library(
     w_filename: PyObjectRef,
     is_none: bool,
     flags: i64,
     fname: &str,
 ) -> Result<usize, PyError> {
-    let mut mode = flags as libc::c_int;
-    if mode & (libc::RTLD_LAZY | libc::RTLD_NOW) == 0 {
-        mode |= libc::RTLD_NOW;
-    }
-    if is_none {
-        let ptr = rustpython_host_env::ctypes::dlopen_self(mode)
-            .map_err(|e| PyError::os_error(format!("cannot load library {fname}: {e}")))?;
-        return Ok(rustpython_host_env::ctypes::insert_raw_library_handle(ptr));
-    }
-    let name = filename_of(w_filename)?;
-    rustpython_host_env::ctypes::open_library_with_mode(&name, mode).map_err(|e| {
-        PyError::os_error(format!(
-            "cannot load library {fname}: {}",
-            pyre_interpreter::with_causes(&e)
-        ))
-    })
+    let name = if is_none {
+        None
+    } else {
+        Some(filename_of(w_filename)?)
+    };
+    let bytes = name
+        .as_ref()
+        .map(|n| std::os::unix::ffi::OsStrExt::as_bytes(n.as_os_str()));
+    majit_rlib::rdynload::dlopen(bytes, flags as majit_rlib::rdynload::INT)
+        .map(|handle| handle as usize)
+        .map_err(|e| PyError::os_error(format!("cannot load library {fname}: {}", e.msg)))
 }
 
 #[cfg(all(feature = "host_env", windows))]
@@ -687,7 +682,7 @@ fn open_library(
     })
 }
 
-#[cfg(not(all(feature = "host_env", any(unix, windows))))]
+#[cfg(not(any(unix, all(feature = "host_env", windows))))]
 fn open_library(
     _w_filename: PyObjectRef,
     _is_none: bool,

@@ -24,6 +24,8 @@ pub mod lltypesystem;
 pub mod nonconst;
 pub mod rarithmetic;
 pub mod rbigint;
+#[cfg(unix)]
+pub mod rdynload;
 pub mod rffi;
 pub mod rlocale;
 #[cfg(unix)]
