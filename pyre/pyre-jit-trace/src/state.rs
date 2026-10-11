@@ -10429,6 +10429,22 @@ fn seed_bridge_standing_exception_from_current(
     if !ctx.bridge_source_is_exception_guard() {
         return;
     }
+    // `pyjitpl.py prepare_resume_from_failure`: `exception_obj` is
+    // `cpu.grab_exc_value(deadframe)`, and a null one is `clear_exception()`
+    // followed by GUARD_NO_EXCEPTION. `GUARD_EXC_VALUE` is that grab. A
+    // GUARD_EXCEPTION whose call did not raise fails with it null; the sym
+    // persists across walks and `sys_exc_value` is the exception an enclosing
+    // `except` block is handling, so neither may stand in for it — the
+    // carrier walk would enter the handler under that GUARD_NO_EXCEPTION with
+    // the null SAVE_EXCEPTION result as its exception.
+    if majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get()) == 0 {
+        sym.current_exc_value.set(std::ptr::null_mut());
+        sym.current_exc_box = OpRef::NONE;
+        sym.last_exc_value.set(std::ptr::null_mut());
+        sym.last_exc_box = OpRef::NONE;
+        sym.class_of_last_exc_is_const = false;
+        return;
+    }
     if !sym.last_exc_box.is_none() {
         return;
     }

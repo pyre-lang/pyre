@@ -3963,20 +3963,31 @@ pub fn trace_and_compile_from_bridge(
     // blackhole resume with `guard_exc == 0` runs the no-exception
     // continuation, identical to the prior panic-then-fallback path), so
     // this never changes a result — only whether a bridge is attached.
-    let pending_exc = guard_exc != 0 || {
-        #[cfg(feature = "cranelift")]
-        {
-            majit_backend_cranelift::jit_exc_class_raw() != 0
-        }
-        #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-        {
-            majit_backend_dynasm::jit_exc_class_raw() != 0
-        }
-        #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
-        {
-            false
-        }
-    };
+    //
+    // An exception guard is the other way round: its failure stub moved
+    // `pos_exc_value` into `jf_guard_exc`, so `guard_exc` is the whole
+    // answer (`pyjitpl.py prepare_resume_from_failure` branches on
+    // `exception_obj` from `cpu.grab_exc_value(deadframe)` alone, and
+    // records GUARD_NO_EXCEPTION when it is null). A GUARD_EXCEPTION that
+    // failed because the call did not raise has `guard_exc == 0`; reading
+    // the backend cell there would let a stale class route the walk onto
+    // the `except` handler under that GUARD_NO_EXCEPTION, with the
+    // SAVE_EXCEPTION result — null at run time — as the handler's exception.
+    let pending_exc = guard_exc != 0
+        || !last_bridge_is_exception_guard && {
+            #[cfg(feature = "cranelift")]
+            {
+                majit_backend_cranelift::jit_exc_class_raw() != 0
+            }
+            #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+            {
+                majit_backend_dynasm::jit_exc_class_raw() != 0
+            }
+            #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
+            {
+                false
+            }
+        };
     // A pending exception at an EXCEPTION guard (GUARD_NO_EXCEPTION /
     // GUARD_EXCEPTION) whose raising op sits inside an in-frame try is the
     // bridge-side analogue of the same fallthrough-not-catch resume gap.
