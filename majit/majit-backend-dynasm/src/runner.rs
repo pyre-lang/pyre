@@ -3365,6 +3365,10 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_headerless = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_headerless(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_varsize = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_varsize(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
         // `setup_once`: `propagate_exception_path`, `_frame_realloc_slowpath`,
@@ -3400,6 +3404,8 @@ impl Backend for DynasmBackend {
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_varsize,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
@@ -3661,6 +3667,10 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_headerless = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_headerless(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_varsize = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_varsize(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
         // Same once-per-CPU helpers as `compile_loop`.
@@ -3693,6 +3703,8 @@ impl Backend for DynasmBackend {
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_varsize,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]

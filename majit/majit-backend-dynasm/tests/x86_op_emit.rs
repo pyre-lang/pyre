@@ -3,7 +3,8 @@
 //! `genop_float_abs`, `_cmp_guard_gc_type`, `genop_guard_guard_is_object`,
 //! `genop_guard_guard_subclass`, `_binaryop`, `_cmpop_float`,
 //! `_store_force_index`, `store_force_descr`, `genop_guard_guard_no_exception`,
-//! `cond_call` / `CondCallSlowPath`.
+//! `cond_call` / `CondCallSlowPath`, `malloc_cond`,
+//! `malloc_cond_varsize_frame`, `malloc_cond_varsize`.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -2390,4 +2391,221 @@ fn stack_check_slowpath_once_per_process() {
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 7);
     assert_eq!(STACK_CALLS.with(|calls| calls.get()), 0);
+}
+
+fn nursery_backend(nursery_size: usize, threshold: usize) -> DynasmBackend {
+    let gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size,
+        large_object_threshold: threshold,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    wb_backend(gc)
+}
+
+fn finish_ref(obj: OpRef, pos: u32) -> Op {
+    // `genop_finish` publishes one result at `jf_frame[0]`.
+    let op = Op::new(OpCode::Finish, &[rb(obj)]);
+    op.pos().set(OpRef::void_op(pos));
+    op.set_fail_arg_types(vec![Type::Ref]);
+    op.setfailargs(vec![rb(obj)].into());
+    op
+}
+
+fn compile_ops(
+    backend: &mut DynasmBackend,
+    inputargs: &[InputArgRc],
+    ops: Vec<Op>,
+) -> JitCellToken {
+    let token = JitCellToken::new(next_token_id());
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile malloc nursery: {err:?}"));
+    token
+}
+
+fn finished_ref(backend: &DynasmBackend, frame: &majit_backend::DeadFrame) -> majit_ir::GcRef {
+    assert!(
+        backend.get_latest_descr(frame).is_finish(),
+        "malloc nursery trace must finish"
+    );
+    backend.get_ref_value(frame, 0)
+}
+
+fn store_sum(obj: OpRef, sum: OpRef, pos: u32) -> Op {
+    op_at(
+        OpCode::GcStore,
+        &[obj, OpRef::const_int(0), sum, OpRef::const_int(8)],
+        OpRef::void_op(pos),
+    )
+}
+
+/// `malloc_cond` when the bump fits. The live sum is stored into the object
+/// after the bump, so it has to survive the allocation.
+#[test]
+fn call_malloc_nursery_fits_and_keeps_live_int() {
+    let mut backend = nursery_backend(1 << 20, 1 << 20);
+    let a = OpRef::input_arg_int(0);
+    let b = OpRef::input_arg_int(1);
+    let sum = OpRef::int_op(2);
+    let obj = OpRef::ref_op(3);
+    let ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(64)], obj),
+        store_sum(obj, sum, 4),
+        finish_ref(obj, 5),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(
+        majit_gc::can_move(ptr),
+        "a 64-byte bump stays in the nursery"
+    );
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
+}
+
+/// `malloc_cond` when the bump passes `nursery_top`. The slow path calls
+/// `malloc_slowpath_fixed`; the live sum is stored afterwards.
+#[test]
+fn call_malloc_nursery_overflow_keeps_live_int() {
+    let mut backend = nursery_backend(4096, 1 << 20);
+    let a = OpRef::input_arg_int(0);
+    let b = OpRef::input_arg_int(1);
+    let sum = OpRef::int_op(2);
+    let obj = OpRef::ref_op(3);
+    let ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(8192)], obj),
+        store_sum(obj, sum, 4),
+        finish_ref(obj, 5),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(
+        !majit_gc::can_move(ptr),
+        "8192 bytes do not fit a 4096-byte nursery"
+    );
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
+}
+
+/// `malloc_cond_varsize`: a short array takes the bump; a length past
+/// `maxlength` calls `malloc_slowpath_varsize`. The live sum is stored at
+/// the first item.
+#[test]
+fn call_malloc_nursery_varsize_small_and_large() {
+    let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size: 1 << 20,
+        large_object_threshold: 4096,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    let array_tid = gc.register_type(majit_gc::TypeInfo::varsize(8, 8, 0, false, Vec::new()));
+    let mut backend = wb_backend(gc);
+    let a = OpRef::input_arg_int(0);
+    let b = OpRef::input_arg_int(1);
+    let len = OpRef::input_arg_int(2);
+    let sum = OpRef::int_op(3);
+    let obj = OpRef::ref_op(4);
+    let alloc = op_at(
+        OpCode::CallMallocNurseryVarsize,
+        &[OpRef::const_int(0), OpRef::const_int(8), len],
+        obj,
+    );
+    alloc.setdescr(Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        8,
+        8,
+        array_tid,
+        Type::Int,
+    )));
+    let ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        alloc,
+        op_at(
+            OpCode::GcStore,
+            &[obj, OpRef::const_int(0), len, OpRef::const_int(8)],
+            OpRef::void_op(5),
+        ),
+        op_at(
+            OpCode::GcStore,
+            &[obj, OpRef::const_int(8), sum, OpRef::const_int(8)],
+            OpRef::void_op(6),
+        ),
+        finish_ref(obj, 7),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+
+    let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22), Value::Int(3)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 3);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+    drop(frame);
+
+    let large = 140_000;
+    let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(22), Value::Int(large)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(!majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, large);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+}
+
+fn run_varsize_frame(nursery_size: usize, alloc_size: i64) -> majit_ir::GcRef {
+    let mut backend = nursery_backend(nursery_size, 1 << 20);
+    let size = OpRef::input_arg_int(0);
+    let a = OpRef::input_arg_int(1);
+    let b = OpRef::input_arg_int(2);
+    let sum = OpRef::int_op(3);
+    let obj = OpRef::ref_op(4);
+    let ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        op_at(OpCode::CallMallocNurseryVarsizeFrame, &[size], obj),
+        store_sum(obj, sum, 5),
+        finish_ref(obj, 6),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(alloc_size), Value::Int(20), Value::Int(22)],
+    );
+    finished_ref(&backend, &frame)
+}
+
+/// `malloc_cond_varsize_frame` bump, and the same op when the size does not fit.
+#[test]
+fn call_malloc_nursery_varsize_frame_fit_and_overflow() {
+    let ptr = run_varsize_frame(1 << 20, 32);
+    assert!(!ptr.is_null());
+    assert!(majit_gc::can_move(ptr));
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
+
+    let ptr = run_varsize_frame(4096, 8192);
+    assert!(!ptr.is_null());
+    assert!(!majit_gc::can_move(ptr));
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
 }

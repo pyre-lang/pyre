@@ -1115,6 +1115,7 @@ pub(crate) fn build_cond_call_slowpaths(
         Arc::new(crate::guard::CpuDescrCell::default()),
         0,
         0,
+        0,
         wb_slowpath,
         0,
         0,
@@ -1318,7 +1319,12 @@ pub(crate) fn build_malloc_slowpath_fixed(
     dynasm!(asm ; .arch x64 ; sub rdx, rcx);
 
     let slowpath_fn = crate::runner::dynasm_nursery_slowpath as *const () as i64;
-    build_malloc_slowpath_body(&mut asm, slowpath_fn, propagate_path);
+    build_malloc_slowpath_body(
+        &mut asm,
+        slowpath_fn,
+        propagate_path,
+        MallocSlowpathKind::Fixed,
+    );
 
     let buffer = codebuf::finalize_executable(asm, arena).expect("malloc_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
@@ -1336,7 +1342,12 @@ pub(crate) fn build_malloc_slowpath_headerless(
     dynasm!(asm ; .arch x64 ; sub rdx, rcx);
 
     let slowpath_fn = crate::runner::dynasm_nursery_slowpath_headerless as *const () as i64;
-    build_malloc_slowpath_body(&mut asm, slowpath_fn, propagate_path);
+    build_malloc_slowpath_body(
+        &mut asm,
+        slowpath_fn,
+        propagate_path,
+        MallocSlowpathKind::Fixed,
+    );
 
     let buffer =
         codebuf::finalize_executable(asm, arena).expect("malloc_slowpath_headerless: finalize");
@@ -1344,21 +1355,63 @@ pub(crate) fn build_malloc_slowpath_headerless(
     (buffer, ptr)
 }
 
-/// Body of the single PyPy `malloc_slowpath` trampoline used by both
-/// `CallMallocNursery` (fixed-size object alloc) and
-/// `CallMallocNurseryVarsizeFrame` (JITFRAME alloc).  Emits the
-/// `_push_all_regs_to_frame([ecx, edx])` → CALL helper → reload_frame
-/// → inline WB → OOM check → `MOV ecx, eax` → `_pop_all_regs_from_frame`
-/// → RET sequence.  The caller emits the `SUB rdx, rcx` size recovery
-/// just above this helper (the only line that differs between fixed
-/// and varsize_frame in the trampoline header, and PyPy emits it for
-/// both kinds via the same `_build_malloc_slowpath('fixed')` arm —
-/// PyPy line 264).
+/// `_build_malloc_slowpath(kind='var')`. Entry is `malloc_cond_varsize`'s
+/// contract: length in `edx`, tid in `ecx`, itemsize at `[rsp+WORD]` and
+/// `base_size` at `[rsp+2*WORD]` after the callsite's `sub rsp, 16`
+/// (`MallocCondVarsizeSlowPath` stores those two words in the slot it
+/// reserved; `_call_header` keeps a callee-save at `[rsp+WORD]`, so the
+/// store is not a bare `MOV_si(WORD, itemsize)`). The helper is
+/// `dynasm_nursery_slowpath_varsize(base_size, item_size, length, tid)`.
+/// OOM adds the reserved 16 bytes back before `propagate_exception_path`,
+/// because this trampoline does not return to the callsite's `add rsp, 16`.
+pub(crate) fn build_malloc_slowpath_varsize(
+    cpu_handle: &crate::guard::CpuDescrHandle,
+    propagate_path: usize,
+    arena: &Arc<AsmMemoryManager>,
+) -> (codebuf::ArenaExecutableBuffer, usize) {
+    let _ = cpu_handle;
+    let mut asm = Assembler::new(0);
+    let slowpath_fn = crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64;
+    build_malloc_slowpath_body(
+        &mut asm,
+        slowpath_fn,
+        propagate_path,
+        MallocSlowpathKind::Varsize,
+    );
+    let buffer =
+        codebuf::finalize_executable(asm, arena).expect("malloc_slowpath_varsize: finalize");
+    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+    (buffer, ptr)
+}
+
+/// How `_build_malloc_slowpath` turns the entry registers into the
+/// helper arguments. `Fixed` is `kind='fixed'` (size already in `edx`
+/// via the caller's `SUB rdx, rcx`). `Varsize` is `kind='var'`:
+/// length in `edx`, tid in `ecx`, and the caller's two stack words.
+enum MallocSlowpathKind {
+    Fixed,
+    Varsize,
+}
+
+/// Body of `_build_malloc_slowpath` for `kind='fixed'` and `kind='var'`.
+/// `CallMallocNursery` and `CallMallocNurseryVarsizeFrame` share the
+/// fixed trampoline (`SUB rdx, rcx` is emitted by their builders).
+/// `kind='var'` leaves `edx` as the length.
 ///
+/// Emits `_push_all_regs_to_frame([ecx, edx])` → CALL helper →
+/// reload_frame → inline WB → OOM check → `MOV ecx, eax` →
+/// `_pop_all_regs_from_frame` → RET.
+
 /// `slowpath_fn` is the absolute address of the GC helper called by
-/// `MOV rax, imm64; CALL rax`.  ABI: size in ARG0 (RCX on Win64, RDI
-/// on SysV).  Result in RAX.
-fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_path: usize) {
+/// `MOV rax, imm64; CALL rax`.  `Fixed` passes the size in ARG0
+/// (RCX on Win64, RDI on SysV).  `Varsize` passes
+/// `(base_size, item_size, length, tid)`.  Result in RAX.
+fn build_malloc_slowpath_body(
+    asm: &mut Assembler,
+    slowpath_fn: i64,
+    propagate_path: usize,
+    kind: MallocSlowpathKind,
+) {
     let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
     // assembler.py `_push_all_regs_to_frame(mc, [ecx, edx], floats)`.
@@ -1380,16 +1433,46 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     #[cfg(not(target_os = "windows"))]
     let align: i32 = 8;
 
-    // assembler.py:270 `MOV_rr(ARG0, edx)` — size argument.
-    #[cfg(target_os = "windows")]
-    let arg0_reg: u8 = 1; // rcx
-    #[cfg(not(target_os = "windows"))]
-    let arg0_reg: u8 = 7; // rdi
-
     if align != 0 {
         rx86::sub_ri(asm, rx86::ESP, align);
     }
-    dynasm!(asm ; .arch x64 ; mov Rq(arg0_reg), rdx);
+    // `_build_malloc_slowpath`: `kind='fixed'` passes the size
+    // (`MOV ARG0, edx` after the caller's `SUB rdx, rcx`).
+    // `kind='var'` passes `(base_size, item_size, length, tid)` to
+    // `dynasm_nursery_slowpath_varsize`. After this `SUB`, the callsite's
+    // two words sit above the return address: itemsize at
+    // `[rsp+align+WORD]`, base_size at `[rsp+align+2*WORD]`
+    // (`MallocCondVarsizeSlowPath`).
+    match kind {
+        MallocSlowpathKind::Fixed => {
+            #[cfg(target_os = "windows")]
+            let arg0_reg: u8 = 1; // rcx
+            #[cfg(not(target_os = "windows"))]
+            let arg0_reg: u8 = 7; // rdi
+            dynasm!(asm ; .arch x64 ; mov Rq(arg0_reg), rdx);
+        }
+        MallocSlowpathKind::Varsize => {
+            let item_ofs = align + WORD as i32;
+            let base_ofs = align + (WORD as i32) * 2;
+            #[cfg(target_os = "windows")]
+            {
+                // ARG0 is ecx and ARG1 is edx, which still hold tid and
+                // length. Move those into ARG3/ARG2 before the loads.
+                dynasm!(asm ; .arch x64
+                    ; mov r9, rcx
+                    ; mov r8, rdx
+                );
+                rx86::mov_rs(asm, rx86::EDX, item_ofs);
+                rx86::mov_rs(asm, rx86::ECX, base_ofs);
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // ARG2 is edx (length) and ARG3 is ecx (tid) already.
+                rx86::mov_rs(asm, rx86::EDI, base_ofs);
+                rx86::mov_rs(asm, rx86::ESI, item_ofs);
+            }
+        }
+    }
     rx86::mov_ri(asm, rx86::EAX, slowpath_fn);
     dynasm!(asm ; .arch x64 ; call rax);
     if align != 0 {
@@ -1497,14 +1580,17 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     // `ImpossibleRelocation` and trip the caller's `expect("malloc_slowpath:
     // finalize")` on affected layouts.
     let propagate_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-    dynasm!(asm ; .arch x64
-        ; =>oom_tail
-        // assembler.py:321 `ADD esp, WORD` — pop the trampoline's own
-        // CALL return address so `_call_footer` in the propagate
-        // trampoline sees rsp at the trace's body alignment (the same
-        // value the trace's `_call_header` left after its SUB).
-        ; add rsp, 8
-    );
+    // `ADD esp, WORD` pops the trampoline return address so
+    // `_call_footer` in `propagate_exception_path` sees the trace body
+    // alignment `_call_header` left. `kind='var'` also pops the 16 bytes
+    // `MallocCondVarsizeSlowPath` reserved: this tail does not return to
+    // the callsite's `add rsp, 16`.
+    let oom_pop: i32 = match kind {
+        MallocSlowpathKind::Fixed => WORD as i32,
+        MallocSlowpathKind::Varsize => (WORD as i32) * 3,
+    };
+    dynasm!(asm ; .arch x64 ; =>oom_tail);
+    rx86::add_ri(asm, rx86::ESP, oom_pop);
     rx86::mov_ri(asm, propagate_scratch, propagate_path as i64);
     dynasm!(asm ; .arch x64 ; jmp Rq(propagate_scratch));
 }
@@ -1765,6 +1851,25 @@ enum SlowPathKind {
         guard_token_no_exception: Option<GuardToken>,
         expects_guard_no_exception: bool,
     },
+    /// `MallocCondSlowPath`. `gcmap == 0` stores a null map.
+    /// `synthesize` is the `nf_addr == 0` arm of `malloc_cond_varsize_frame`:
+    /// `(sizeloc, GcHeader::SIZE)` so `sub rdx, rcx` still yields the
+    /// byte count `_build_malloc_slowpath` passes on.
+    MallocCond {
+        gcmap: usize,
+        result_reg: u8,
+        synthesize: Option<(u8, i32)>,
+    },
+    /// `MallocCondVarsizeSlowPath` for `FLAG_ARRAY`. `lengthloc` is the
+    /// length operand captured before the fast path rewrites `edx`.
+    MallocCondVarsize {
+        gcmap: usize,
+        result_reg: u8,
+        itemsize: i64,
+        base_size: i64,
+        type_id: i64,
+        lengthloc: Loc,
+    },
 }
 
 /// `cond_call`: `variant_num = floats * 2 + callee_only`.
@@ -1943,6 +2048,8 @@ pub struct Assembler386<'a> {
     malloc_slowpath_fixed: usize,
     /// Headerless fixed-size nursery malloc slowpath trampoline.
     malloc_slowpath_headerless: usize,
+    /// `_build_malloc_slowpath(kind='var')`. `malloc_cond_varsize` calls it.
+    malloc_slowpath_varsize: usize,
     /// `assembler.py self.wb_slowpath`, resolved by
     /// `X86CpuExt::ensure_wb_slowpath`.
     wb_slowpath: [usize; 5],
@@ -2148,6 +2255,7 @@ impl<'a> Assembler386<'a> {
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
         malloc_slowpath_headerless: usize,
+        malloc_slowpath_varsize: usize,
         wb_slowpath: [usize; 5],
         propagate_exception_path: usize,
         frame_realloc_slowpath: usize,
@@ -2205,6 +2313,7 @@ impl<'a> Assembler386<'a> {
             jump_target_frame_depth: 0,
             malloc_slowpath_fixed,
             malloc_slowpath_headerless,
+            malloc_slowpath_varsize,
             wb_slowpath,
             propagate_exception_path,
             frame_realloc_slowpath,
@@ -5728,421 +5837,15 @@ impl<'a> Assembler386<'a> {
             OpCode::CallMallocNurseryHeaderless => {
                 self.genop_call_malloc_nursery_headerless(op, result_loc);
             }
-            // assembler.py:2567 malloc_cond_varsize_frame parity.
-            // The varsize_frame call site shares the entire slowpath
-            // structure with the fixed-size variant: PyPy's
-            // `MallocCondSlowPath` (line 2551) does `CALL malloc_slowpath`
-            // regardless of which caller pushed it, and the slowpath
-            // recovers `total_size = edx - ecx` either way.  Pyre
-            // mirrors that — both arms emit the ECX/EDX bump-allocator
-            // probe and `JA` into the same `malloc_slowpath_fixed`
-            // trampoline.  The trampoline's gcmap-aware save/restore
-            // preserves every regalloc-resident Ref across a minor
-            // collection fired by the slowpath (fib_recursive on x86
-            // exercised this path).
+            // `malloc_cond_varsize_frame` / `malloc_cond_varsize`.
             OpCode::CallMallocNurseryVarsizeFrame => {
-                let sizeloc = match arglocs.first() {
-                    Some(Loc::Reg(r)) => *r,
-                    other => panic!(
-                        "CallMallocNurseryVarsizeFrame size arg must be Loc::Reg, got {other:?}",
-                    ),
-                };
-                let result_reg = match result_loc {
-                    Some(Loc::Reg(r)) => *r,
-                    other => panic!(
-                        "CallMallocNurseryVarsizeFrame result_loc must be Loc::Reg, got {other:?}",
-                    ),
-                };
-                let mut sv = sizeloc.value;
-                let rv = result_reg.value;
-                // assembler.py malloc_cond_varsize_frame opens with
-                // `if sizeloc is ecx: MOV(edx, sizeloc); sizeloc = edx`,
-                // because ECX is about to take nursery_free (and is
-                // zeroed outright on the descriptor-less path below).
-                // The size really can arrive in ECX even though
-                // `MALLOC_NURSERY_CLOBBER` names it: llsupport/regalloc.py
-                // `spill_or_move_registers_before_call` drops a variable
-                // whose last use is the current operation out of the
-                // binding and frees its register *without moving the
-                // value*, and this operation is the size box's last use.
-                // A size already in EDX needs no move, since the `LEA`
-                // below reads EDX as its index before writing it — which
-                // is why upstream's EDX arm is a plain `ADD_rr`.
-                // R11 (X86_64_SCRATCH_REG) loads the absolute
-                // nursery_free/nursery_top addresses.
-                if sv == rx86::ECX {
-                    dynasm!(self.mc ; .arch x64 ; mov rdx, rcx);
-                    sv = rx86::EDX;
-                }
-                let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
-                let slow_path = self.mc.new_dynamic_label();
-                let done = self.mc.new_dynamic_label();
-                let gc_header_size = majit_gc::header::GcHeader::SIZE as i32;
-                if nf_addr == 0 || nt_addr == 0 {
-                    dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
-                    self.forget_after_call_or_jmp();
-                } else {
-                    // assembler.py:2572-2581 line-by-line — `MOV ecx,
-                    // [nf]; LEA edx, [ecx + sizeloc + gc_hdr]; CMP edx,
-                    // [nt]; JA slow; MOV [nf], edx`.  PyPy's LEA omits
-                    // `gc_hdr` because its allocator accounts for the
-                    // header inside the helper; pyre adds it here so
-                    // the trampoline's `SUB rdx, rcx` recovers the
-                    // exact byte count `dynasm_nursery_slowpath`
-                    // expects (total bytes including header).
-                    let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-                    rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
-                    rx86::lea_ra(
-                        &mut self.mc,
-                        rx86::EDX,
-                        (i16::from(rx86::ECX), sv, 0, gc_header_size),
-                    );
-                    let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
-                    rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
-                    dynasm!(self.mc ; .arch x64
-                                            ; ja =>slow_path
-                    );
-                    let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-                    rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
-                    dynasm!(self.mc ; .arch x64
-                                            ; mov QWORD [rcx], 0
-                    );
-                    self.forget_if_scratch_written(rv);
-                    rx86::lea_rm(&mut self.mc, rv, (rx86::ECX, gc_header_size));
-                    dynasm!(self.mc ; .arch x64
-                                            ; jmp =>done
-
-                    );
-                    self.forget_after_call_or_jmp();
-                }
-                self.forget_scratch_register();
-                dynasm!(self.mc ; .arch x64 ; =>slow_path);
-                // Trampoline entry contract (assembler.py:264
-                // `SUB_rr(edx, ecx)` → total size): caller must hand
-                // off `rcx = old_nf` and `rdx = old_nf + total`, just
-                // like `malloc_cond` does.  The `nf_addr == 0` guard
-                // path above skipped the probe, so re-stage the
-                // operands here.  `gc_header_size` is added so the
-                // slowpath's `dynasm_nursery_slowpath(total)` sees the
-                // same byte count the fast path proposed.  With no
-                // active GC descriptor the previous code dereferenced
-                // `[nf_addr]` where `nf_addr == 0` (crash before the
-                // helper-only fallback ever ran), so synthesize
-                // `(rcx=0, rdx=total)` directly — `sub edx, ecx`
-                // recovers `total` for the trampoline either way.
-                if nf_addr == 0 || nt_addr == 0 {
-                    dynasm!(self.mc ; .arch x64
-                    ; xor rcx, rcx
-                    );
-                    rx86::lea_ra(
-                        &mut self.mc,
-                        rx86::EDX,
-                        (rx86::NO_BASE_REGISTER, sv, 0, gc_header_size),
-                    );
-                }
-                if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
-                    self.push_gcmap(gcmap as *mut usize);
-                } else {
-                    let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
-                    rx86::mov_bi(&mut self.mc, gcmap_ofs, 0);
-                }
-                // Stage the trampoline address through R11 so RAX
-                // stays caller-live across the call (the trampoline
-                // saves+restores it via the `[ECX, EDX]`-ignored
-                // push_all_regs).
-                let helper_addr = self.malloc_slowpath_fixed as i64;
-                let call_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                self.forget_if_scratch_written(call_scratch);
-                rx86::mov_ri(&mut self.mc, call_scratch, helper_addr);
-                dynasm!(self.mc ; .arch x64
-                                    ; call Rq(call_scratch)
-
-                );
-                self.forget_after_call_or_jmp();
-                // assembler.py:304 — helper returns the payload in
-                // ECX (`MOV_rr(ecx, eax)` inside the trampoline).
-                // regalloc forces `result_reg = MALLOC_NURSERY_RESULT
-                // = ECX`, so the MOV is elided in the common case.
-                if result_reg.value != crate::regloc::ECX.value {
-                    self.forget_if_scratch_written(rv);
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
-                }
-                self.forget_scratch_register();
-                dynasm!(self.mc ; .arch x64 ; =>done);
-                // The payload already sits in `result_reg` on both paths, and
-                // that register is the delivery contract (see
-                // `genop_call_malloc_nursery`); an extra store grew
-                // `frame_depth` by one slot per allocation.
+                self.malloc_cond_varsize_frame(arglocs, result_loc);
             }
-            // x86/assembler.py malloc_cond_varsize parity
-            // arglocs = [lengthloc, imm(itemsize), imm(kind)]
-            OpCode::CallMallocNurseryVarsize | OpCode::CallMallocNurseryVarsizeHeaderless => {
-                // Headerless allocators have no `GcHeader` and do not collect
-                // on overflow. Cranelift and wasm do not install one.
-                let headerless = op.opcode == OpCode::CallMallocNurseryVarsizeHeaderless;
-                let (base_size, type_id) = op
-                    .with_array_descr(|ad| (ad.base_size(), ad.type_id()))
-                    .expect("CallMallocNurseryVarsize requires an ArrayDescr");
-                let base_size = base_size as i64;
-                let type_id = type_id as i64;
-                let itemsize = match arglocs.get(1) {
-                    Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
-                    _ => 8,
-                };
-                // x86/assembler.py `malloc_cond_varsize`: keep the common
-                // short-array allocation in generated code.  The unsigned
-                // length precheck sends negative and implausibly large values
-                // to the checked helper before `itemsize * length`; the second
-                // check sends a merely-full nursery there.  ECX/EDX are the
-                // exact result/temp pair reserved by
-                // `consider_call_malloc_nursery_varsize`, so the original
-                // length location remains intact for the slow arm.
-                let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
-                let max_young = crate::runner::dynasm_max_size_of_young_obj();
-                let slow_path = self.mc.new_dynamic_label();
-                let done = self.mc.new_dynamic_label();
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                let header_size = if headerless {
-                    0
-                } else {
-                    majit_gc::header::GcHeader::SIZE as i64
-                };
-                let word = std::mem::size_of::<usize>();
-                // `consider_call_malloc_nursery_varsize` passes this value
-                // directly as `maxlength`; the following nursery-top check
-                // rejects a scaled size that is still too large.
-                let max_length = if headerless {
-                    max_young.saturating_sub(base_size as usize)
-                } else {
-                    max_young.saturating_sub(2 * word)
-                };
-                debug_assert!(itemsize > 0);
-                debug_assert!(
-                    headerless
-                        || base_size as usize + majit_gc::header::GcHeader::SIZE
-                            >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
-                );
-                if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
-                    dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
-                    self.forget_after_call_or_jmp();
-                } else {
-                    match arglocs.first() {
-                        Some(Loc::Reg(len_r)) => {
-                            debug_assert_ne!(len_r.value, crate::regloc::ECX.value);
-                            debug_assert_ne!(len_r.value, crate::regloc::EDX.value);
-                            dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(len_r.value));
-                        }
-                        Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
-                            rx86::mov_ri(&mut self.mc, rx86::EDX, len_i.value);
-                        }
-                        Some(Loc::Frame(len_f)) => {
-                            rx86::mov_rb(&mut self.mc, rx86::EDX, len_f.ebp_loc.value);
-                        }
-                        Some(Loc::Ebp(len_e)) => {
-                            rx86::mov_rb(&mut self.mc, rx86::EDX, len_e.value);
-                        }
-                        other => {
-                            panic!("CallMallocNurseryVarsize length is not a value: {other:?}")
-                        }
-                    }
-                    self.load_scratch(max_length as i64);
-                    dynasm!(self.mc ; .arch x64
-                    ; cmp rdx, Rq(scratch)
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; ja =>slow_path
-                    );
-                    let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-                    rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
-                    rx86::imul_ri(&mut self.mc, rx86::EDX, itemsize as i32);
-                    rx86::add_ri(
-                        &mut self.mc,
-                        rx86::EDX,
-                        (base_size + header_size + 7) as i32,
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; and rdx, -8
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; add rdx, rcx
-                    );
-                    let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
-                    rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
-                    dynasm!(self.mc ; .arch x64
-                                            ; ja =>slow_path
-                    );
-                    let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-                    rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
-                    if !headerless {
-                        self.load_scratch(type_id);
-                        dynasm!(self.mc ; .arch x64
-                                                ; mov [rcx], Rq(scratch)
-                        );
-                        rx86::add_ri(&mut self.mc, rx86::ECX, header_size as i32);
-                    }
-                    dynasm!(self.mc ; .arch x64
-                                            ; jmp =>done
-
-                    );
-                    self.forget_after_call_or_jmp();
-                }
-                self.forget_scratch_register();
-                dynasm!(self.mc ; .arch x64 ; =>slow_path);
-                if headerless {
-                    // Length, itemsize, and base size go to the helper.
-                    // `malloc_cond_varsize` `ovfcheck`s there; wrapping
-                    // `length * itemsize + base_size + 7` here would hide it.
-                    // The regalloc reserves only ECX/EDX; the ABI call below
-                    // clobbers the argument and volatile registers, so every
-                    // register goes to the jitframe first
-                    // (`_push_all_regs_to_jitframe`).
-                    self.push_all_regs_to_jitframe(&[], true);
-                    match arglocs.first() {
-                        Some(Loc::Reg(len_r)) => {
-                            self.emit_abi_int_arg_from_reg(0, len_r.value as u8);
-                        }
-                        Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
-                            self.emit_abi_int_arg_from_imm(0, len_i.value);
-                        }
-                        Some(Loc::Frame(len_f)) => {
-                            self.emit_abi_int_arg_from_mem(0, len_f.ebp_loc.value);
-                        }
-                        Some(Loc::Ebp(len_e)) => {
-                            self.emit_abi_int_arg_from_mem(0, len_e.value);
-                        }
-                        other => panic!(
-                            "CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}"
-                        ),
-                    }
-                    self.emit_abi_int_arg_from_imm(1, itemsize);
-                    self.emit_abi_int_arg_from_imm(2, base_size);
-                    rx86::mov_ri(
-                        &mut self.mc,
-                        rx86::EAX,
-                        crate::runner::dynasm_nursery_slowpath_headerless_varsize as *const ()
-                            as i64,
-                    );
-                    self.emit_abi_call_rax();
-                    self.reload_frame_if_necessary();
-                    // EAX carries the allocation result.
-                    self.pop_all_regs_from_jitframe(&[crate::regloc::EAX], true);
-                    self.emit_propagate_exception_if_zero(0);
-                    let Some(Loc::Reg(r)) = result_loc else {
-                        panic!(
-                            "CallMallocNurseryVarsizeHeaderless result_loc must be a register; got {result_loc:?}"
-                        );
-                    };
-                    if r.value != crate::regloc::EAX.value {
-                        let rv = r.value;
-                        self.forget_if_scratch_written(rv);
-                        dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
-                    }
-                    dynasm!(self.mc ; .arch x64 ; jmp =>done);
-                    self.forget_after_call_or_jmp();
-                }
-                // x86/assembler.py:254 `_push_all_regs_to_jitframe` — the
-                // helper below can collect, and unlike the fixed-size path it
-                // is called directly rather than through the trampoline that
-                // spills for it, so nothing else puts the live references
-                // where the gcmap can name them.  Must precede the argument
-                // setup, which clobbers the ABI argument registers.
-                self.push_all_regs_to_jitframe(&[], true);
-                // arg3 is the descr's tid: a varsize object allocated as
-                // type 0 is traced with the layout of whatever registered
-                // first, so its items are never walked.
-                // Copy the only non-immediate argument first.  Any ABI
-                // argument register can also be `len_r`; writing base/item/tid
-                // first would destroy that value before it reaches arg2.
-                //
-                // assembler.py:2617-2621 `malloc_cond_varsize`:
-                //
-                //     if isinstance(lengthloc, RegLoc):
-                //         varsizeloc = lengthloc
-                //     else:
-                //         self.mc.MOV(edx, lengthloc)
-                //
-                // The stack arm is not the rare one.  `prepare_op_call_malloc_
-                // nursery_varsize` reads `lengthloc` *after*
-                // `spill_or_move_registers_before_call(SAVE_ALL_REGS)` has
-                // popped every register binding, so a live length is in its
-                // frame slot by the time this asks — which is why upstream
-                // spells the register arm as the special case and aarch64
-                // asserts `lengthloc.is_stack()` outright. Substituting an
-                // immediate 0 here sizes the block for no items at all, and
-                // the `gen_initialize_len` store that follows stamps the true
-                // length into it.
-                match arglocs.first() {
-                    Some(Loc::Reg(len_r)) => {
-                        self.emit_abi_int_arg_from_reg(2, len_r.value as u8);
-                    }
-                    Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
-                        self.emit_abi_int_arg_from_imm(2, len_i.value);
-                    }
-                    Some(Loc::Frame(len_f)) => {
-                        self.emit_abi_int_arg_from_mem(2, len_f.ebp_loc.value);
-                    }
-                    Some(Loc::Ebp(len_e)) => {
-                        self.emit_abi_int_arg_from_mem(2, len_e.value);
-                    }
-                    other => panic!("CallMallocNurseryVarsize length is not a value: {other:?}"),
-                }
-                self.emit_abi_int_arg_from_imm(0, base_size);
-                self.emit_abi_int_arg_from_imm(1, itemsize);
-                self.emit_abi_int_arg_from_imm(3, type_id);
-                // assembler.py:649-650 push_gcmap — a null gcmap tells the
-                // collector this frame holds no references, so every pointer
-                // spilled above would survive the collection unforwarded.
-                // `push_gcmap` marshals through the scratch register, which
-                // is not an ABI argument register.
-                let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
-                if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
-                    self.push_gcmap(gcmap as *mut usize);
-                } else {
-                    rx86::mov_bi(&mut self.mc, gcmap_ofs, 0);
-                }
-                rx86::mov_ri(
-                    &mut self.mc,
-                    rx86::EAX,
-                    crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64,
-                );
-                self.emit_abi_call_rax();
-                // _build_malloc_slowpath parity (assembler.py:295-308):
-                // reload the (possibly moved) jitframe before clearing the
-                // gcmap, otherwise the clear would target the freed
-                // nursery copy.
-                self.reload_frame_if_necessary();
-                // assembler.py:283 `_pop_all_regs_from_jitframe` — the
-                // jitframe slots are what the collector rewrote, so reload
-                // from them rather than trusting the callee-save/volatile
-                // state around the call.  EAX is excluded because it carries
-                // the allocation result the null check and result store read.
-                self.pop_all_regs_from_jitframe(&[crate::regloc::EAX], true);
-                // assembler.py:300-322 OOM propagate parity — the
-                // varsize helper now returns NULL on `libc::calloc`
-                // / `gc.alloc_varsize` failure; route that through
-                // `propagate_exception_descr` rather than letting the
-                // caller store a near-zero garbage pointer into the
-                // result slot.
-                self.emit_propagate_exception_if_zero(0);
-                rx86::mov_bi(&mut self.mc, gcmap_ofs, 0);
-                // Unlike the other three nursery paths, this one leaves the
-                // helper's return in RAX rather than in the regalloc result
-                // register, so the move is emitted here instead of the store
-                // that used to grow `frame_depth` by a slot per allocation.
-                // `consider_call_malloc_nursery_varsize` forces the result to
-                // `MALLOC_NURSERY_RESULT`, so this is never a no-op.
-                let Some(Loc::Reg(r)) = result_loc else {
-                    panic!(
-                        "CallMallocNurseryVarsize result_loc must be a register; got {result_loc:?}"
-                    );
-                };
-                if r.value != crate::regloc::EAX.value {
-                    let rv = r.value;
-                    self.forget_if_scratch_written(rv);
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
-                }
-                self.forget_scratch_register();
-                dynasm!(self.mc ; .arch x64 ; =>done);
+            OpCode::CallMallocNurseryVarsize => {
+                self.malloc_cond_varsize(op, arglocs, result_loc);
+            }
+            OpCode::CallMallocNurseryVarsizeHeaderless => {
+                self.genop_call_malloc_nursery_varsize_headerless(op, arglocs, result_loc);
             }
             // `genop_discard_check_memory_error`: `TEST` plus a
             // not-taken `jz` to the in-buffer trampoline
@@ -7432,6 +7135,29 @@ impl<'a> Assembler386<'a> {
         }
     }
 
+    /// `malloc_cond` / `malloc_cond_varsize`: `Some(cc)` is `SlowPath.__init__`
+    /// (`J_il`, conditional jumps do not forget). `None` is an unconditional
+    /// `jmp` into the same body when the nursery addresses are absent;
+    /// the `jmp` forgets before `saved_scratch_value_1` is recorded.
+    fn begin_slow_path(&mut self, cc: Option<u8>, kind: SlowPathKind) -> SlowPath {
+        let slow_label = self.mc.new_dynamic_label();
+        let continue_label = self.mc.new_dynamic_label();
+        match cc {
+            Some(cc) => self.emit_jcc_to_label(cc, slow_label),
+            None => {
+                dynasm!(self.mc ; .arch x64 ; jmp =>slow_label);
+                self.forget_after_call_or_jmp();
+            }
+        }
+        SlowPath {
+            slow_label,
+            continue_label,
+            saved_scratch_value_1: self.scratch_register_value,
+            saved_scratch_value_2: -1,
+            kind,
+        }
+    }
+
     /// `SlowPath.set_continue_addr`. Binds the fast-path continue point
     /// without `forget_scratch_register`: `get_relative_pos` is asked not
     /// to break the block, so the not-taken edge keeps the r11 cache.
@@ -7582,6 +7308,57 @@ impl<'a> Assembler386<'a> {
                     guard_token_no_exception,
                     expects_guard_no_exception,
                 );
+            }
+            SlowPathKind::MallocCond {
+                gcmap,
+                result_reg,
+                synthesize,
+            } => {
+                if let Some((sizeloc, header)) = synthesize {
+                    dynasm!(self.mc ; .arch x64 ; xor rcx, rcx);
+                    rx86::lea_ra(
+                        &mut self.mc,
+                        rx86::EDX,
+                        (rx86::NO_BASE_REGISTER, sizeloc, 0, header),
+                    );
+                }
+                self.publish_malloc_gcmap(gcmap);
+                self.call_malloc_helper(self.malloc_slowpath_fixed);
+                self.move_malloc_result(result_reg);
+            }
+            SlowPathKind::MallocCondVarsize {
+                gcmap,
+                result_reg,
+                itemsize,
+                base_size,
+                type_id,
+                lengthloc,
+            } => {
+                // The maxlength `ja` lands on the nursery `ja`. That edge
+                // skipped `addr_as_reg_offset`, so `saved_scratch_value_1`
+                // does not describe r11 here. Drop the cache before
+                // `load_scratch` (`MallocCondVarsizeSlowPath`).
+                self.forget_scratch_register();
+                // `MallocCondVarsizeSlowPath` stores itemsize with
+                // `MOV_si(WORD, itemsize)`. `_call_header` keeps a
+                // callee-save at `[rsp+WORD]`, so the callsite reserves
+                // 16 bytes: itemsize at `[rsp]`, base_size at `[rsp+WORD]`.
+                // The varsize trampoline reads them above its return address.
+                // OOM pops those 16 bytes inside the trampoline because it
+                // does not return to this `add rsp, 16`.
+                rx86::sub_ri(&mut self.mc, rx86::ESP, 16);
+                self.store_rsp_i64(0, itemsize);
+                self.store_rsp_i64(WORD as i32, base_size);
+                self.publish_malloc_gcmap(gcmap);
+                rx86::mov_ri(&mut self.mc, rx86::ECX, type_id);
+                debug_assert!(
+                    !matches!(lengthloc, Loc::Reg(r) if r.value == rx86::ECX || r.value == rx86::EDX),
+                    "malloc_cond_varsize lengthloc must not be ecx or edx"
+                );
+                self.mov_gpr_from_loc(rx86::EDX, lengthloc);
+                self.call_malloc_helper(self.malloc_slowpath_varsize);
+                rx86::add_ri(&mut self.mc, rx86::ESP, 16);
+                self.move_malloc_result(result_reg);
             }
         }
     }
@@ -10020,130 +9797,465 @@ impl<'a> Assembler386<'a> {
         self.pending_slowpaths.push(sp);
     }
 
-    /// x86/assembler.py malloc_cond parity.
+    fn mov_gpr_from_loc(&mut self, dst: u8, loc: Loc) {
+        match loc {
+            Loc::Reg(r) => {
+                if r.value != dst {
+                    self.forget_if_scratch_written(dst);
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(dst), Rq(r.value));
+                }
+            }
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                self.forget_if_scratch_written(dst);
+                rx86::mov_ri(&mut self.mc, dst, i.value);
+            }
+            Loc::Frame(f) => {
+                self.forget_if_scratch_written(dst);
+                rx86::mov_rb(&mut self.mc, dst, f.ebp_loc.value);
+            }
+            Loc::Ebp(e) => {
+                self.forget_if_scratch_written(dst);
+                rx86::mov_rb(&mut self.mc, dst, e.value);
+            }
+            other => panic!("malloc operand is not a GPR value: {other:?}"),
+        }
+    }
+
+    /// `CMP reg, imm`. A value outside imm32 is staged through r11.
+    fn cmp_reg_i64(&mut self, reg: u8, value: i64) {
+        if rx86::fits_in_32bits(value) {
+            rx86::cmp_ri(&mut self.mc, reg, value as i32);
+        } else {
+            self.load_scratch(value);
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            dynasm!(self.mc ; .arch x64 ; cmp Rq(reg), Rq(scratch));
+        }
+    }
+
+    /// `MOV_si` when `value` fits imm32, otherwise `MOV_sr` from r11.
+    fn store_rsp_i64(&mut self, offset: i32, value: i64) {
+        if rx86::fits_in_32bits(value) {
+            rx86::mov_si(&mut self.mc, offset, value as i32);
+        } else {
+            self.load_scratch(value);
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            rx86::mov_sr(&mut self.mc, offset, scratch);
+        }
+    }
+
+    /// `_imul_const_scaled`. Returns the residual scale (0..3) the outer
+    /// `LEA_ra` applies. `target = source * itemsize` once that scale is
+    /// shifted back in.
+    fn imul_const_scaled(&mut self, targetreg: u8, sourcereg: u8, itemsize: i64) -> u8 {
+        debug_assert!(itemsize > 0);
+        let mut reduced = itemsize as usize;
+        let shift = if reduced & 7 == 0 {
+            3
+        } else if reduced & 3 == 0 {
+            2
+        } else if reduced & 1 == 0 {
+            1
+        } else {
+            0
+        };
+        reduced >>= shift;
+        if crate::regalloc::valid_addressing_size(reduced.wrapping_sub(1)) {
+            let scale = crate::regalloc::get_scale(reduced - 1);
+            rx86::lea_ra(
+                &mut self.mc,
+                targetreg,
+                (i16::from(sourcereg), sourcereg, scale, 0),
+            );
+        } else if crate::regalloc::valid_addressing_size(reduced) {
+            let scale = crate::regalloc::get_scale(reduced);
+            rx86::lea_ra(
+                &mut self.mc,
+                targetreg,
+                (rx86::NO_BASE_REGISTER, sourcereg, scale, 0),
+            );
+        } else {
+            assert!(
+                rx86::fits_in_32bits(reduced as i64),
+                "_imul_const_scaled immediate {reduced} does not fit"
+            );
+            rx86::imul_rri(&mut self.mc, targetreg, sourcereg, reduced as i32);
+        }
+        shift as u8
+    }
+
+    /// `push_gcmap(..., store=True)`. `gcmap == 0` writes a null map.
+    fn publish_malloc_gcmap(&mut self, gcmap: usize) {
+        if gcmap != 0 {
+            self.push_gcmap(gcmap as *mut usize);
+        } else {
+            rx86::mov_bi(&mut self.mc, crate::jitframe::JF_GCMAP_OFS, 0);
+        }
+    }
+
+    /// `CALL(imm(malloc_slowpath*))` via r11, so the trampoline's
+    /// `_push_all_regs_to_frame` saves the caller's rax.
+    fn call_malloc_helper(&mut self, addr: usize) {
+        assert!(
+            addr != 0,
+            "malloc slowpath trampoline was not built (_build_malloc_slowpath)"
+        );
+        self.load_scratch(addr as i64);
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
+        self.forget_after_call_or_jmp();
+    }
+
+    /// The trampoline returns the payload in ecx (`MOV ecx, eax`).
+    fn move_malloc_result(&mut self, result_reg: u8) {
+        if result_reg != rx86::ECX {
+            self.forget_if_scratch_written(result_reg);
+            dynasm!(self.mc ; .arch x64 ; mov Rq(result_reg), rcx);
+        }
+    }
+
+    /// `malloc_cond`: nursery bump, `CMP`, not-taken `J_il(A)` into
+    /// `MallocCondSlowPath`, then fall-through `MOV [nursery_free], edx`.
+    ///
+    /// The payload `LEA` by `GcHeader::SIZE` stays on that fall-through,
+    /// before `set_continue_addr`. The fixed trampoline returns the object
+    /// in ecx and leaves edx clobbered, so the store of `nursery_free`
+    /// runs only when the `ja` is not taken.
     fn genop_call_malloc_nursery(&mut self, op: &Op, result_loc: Option<&Loc>) {
         let size_ref = op.arg(0).to_opref();
-        // history.py ConstInt.value carried inline — prefer the inline
-        // payload before falling through to the legacy pool / raw u32.
         let total_size = size_ref.inline_const_bits().unwrap_or_else(|| {
             self.constants
                 .get(&size_ref.raw())
                 .map(|c| c.as_raw_i64())
                 .unwrap_or(size_ref.raw() as i64)
         });
-        let gc_header_size = majit_gc::header::GcHeader::SIZE as i64;
-        // gc.py:525-531 — read nursery slot addresses from the active GC
-        // descriptor (cpu.gc_ll_descr.get_nursery_free_addr() parity), not
-        // from a process-global singleton.
+        debug_assert!(
+            total_size & (WORD as i64 - 1) == 0,
+            "malloc_cond size must be word-aligned"
+        );
+        let result_reg = match result_loc {
+            Some(Loc::Reg(r)) => r.value,
+            _ => rx86::ECX,
+        };
+        let gcmap = self.pending_malloc_nursery_gcmap.unwrap_or(0);
         let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
-
-        let nf = nf_addr as i64;
-        let nt = nt_addr as i64;
-        // assembler.py:2556 `malloc_cond` clobbers only ECX/EDX (the pair
-        // regalloc spilled via MALLOC_NURSERY_CLOBBER) because PyPy's
-        // encoder supports `MOV [imm64], reg` directly.  dynasm-rs has no
-        // such encoding so we need a third register to stage the absolute
-        // nursery slot addresses; use R11 (X86_64_SCRATCH_REG, outside
-        // ALL_CORE_REGS) instead of RAX — RAX is in the regalloc pool and
-        // clobbering it would silently destroy any live Box the regalloc
-        // bound to it.  The slow path preserves RAX via push_all_regs.
-
-        // ecx = nursery_free, edx = new nursery_free
-        let (sr, so) = self.addr_as_reg_offset(nf);
+        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
         rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
         rx86::lea_rm(&mut self.mc, rx86::EDX, (rx86::ECX, total_size as i32));
-        let (sr, so) = self.addr_as_reg_offset(nt);
+        let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
         rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
-
-        let slow_path = self.mc.new_dynamic_label();
-        let done = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
-
-        // Fast path: update nursery_free, compute obj ptr.
-        // `gen_initialize_tid` writes the whole header word.
-        // Stage the `*nf = new_free` store through R11; materialise the
-        // payload pointer directly into `result_reg` (regalloc forces it
-        // to ECX, MALLOC_NURSERY_RESULT) so both paths converge with the
-        // payload in the same register.
-        let (sr, so) = self.addr_as_reg_offset(nf);
+        let mut sp = self.begin_slow_path(
+            Some(CC_A),
+            SlowPathKind::MallocCond {
+                gcmap,
+                result_reg,
+                synthesize: None,
+            },
+        );
+        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
         rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
-        let result_reg_for_payload = match result_loc {
-            Some(Loc::Reg(r)) => r.value,
-            _ => crate::regloc::ECX.value,
-        };
-        self.forget_if_scratch_written(result_reg_for_payload);
+        self.forget_if_scratch_written(result_reg);
         rx86::lea_rm(
             &mut self.mc,
-            result_reg_for_payload,
-            (rx86::ECX, gc_header_size as i32),
+            result_reg,
+            (rx86::ECX, majit_gc::header::GcHeader::SIZE as i32),
         );
-        dynasm!(self.mc ; .arch x64 ; jmp =>done);
-        self.forget_after_call_or_jmp();
+        self.set_continue_here(&mut sp);
+        self.pending_slowpaths.push(sp);
+    }
 
-        // Slow path: helper extraction (PyPy assembler.py:295 `mc.CALL`).
+    /// `malloc_cond_varsize_frame`. When `sizeloc` is ecx it is staged in
+    /// edx first. The `LEA` displacement is `GcHeader::SIZE` so
+    /// `_build_malloc_slowpath`'s `sub rdx, rcx` recovers the byte count
+    /// `dynasm_nursery_slowpath` allocates. `malloc_cond_varsize_frame`
+    /// adds with displacement 0; this addend is the excluded header bias,
+    /// including when `sizeloc` is edx.
+    fn malloc_cond_varsize_frame(&mut self, arglocs: &[Loc], result_loc: Option<&Loc>) {
+        let sizeloc = match arglocs.first() {
+            Some(Loc::Reg(r)) => r.value,
+            other => {
+                panic!("CallMallocNurseryVarsizeFrame size arg must be Loc::Reg, got {other:?}")
+            }
+        };
+        let result_reg = match result_loc {
+            Some(Loc::Reg(r)) => r.value,
+            other => {
+                panic!("CallMallocNurseryVarsizeFrame result_loc must be Loc::Reg, got {other:?}")
+            }
+        };
+        let mut sv = sizeloc;
+        if sv == rx86::ECX {
+            dynasm!(self.mc ; .arch x64 ; mov rdx, rcx);
+            sv = rx86::EDX;
+        }
+        let gc_header_size = majit_gc::header::GcHeader::SIZE as i32;
+        let gcmap = self.pending_malloc_nursery_gcmap.unwrap_or(0);
+        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        if nf_addr == 0 || nt_addr == 0 {
+            let mut sp = self.begin_slow_path(
+                None,
+                SlowPathKind::MallocCond {
+                    gcmap,
+                    result_reg,
+                    synthesize: Some((sv, gc_header_size)),
+                },
+            );
+            self.set_continue_here(&mut sp);
+            self.pending_slowpaths.push(sp);
+            return;
+        }
+        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+        rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
+        rx86::lea_ra(
+            &mut self.mc,
+            rx86::EDX,
+            (i16::from(rx86::ECX), sv, 0, gc_header_size),
+        );
+        let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
+        rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
+        let mut sp = self.begin_slow_path(
+            Some(CC_A),
+            SlowPathKind::MallocCond {
+                gcmap,
+                result_reg,
+                synthesize: None,
+            },
+        );
+        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
+        self.forget_if_scratch_written(result_reg);
+        rx86::lea_rm(&mut self.mc, result_reg, (rx86::ECX, gc_header_size));
+        self.set_continue_here(&mut sp);
+        self.pending_slowpaths.push(sp);
+    }
+
+    /// `malloc_cond_varsize` for `FLAG_ARRAY`. The maxlength `ja` lands on
+    /// the nursery-overflow `ja` (`emit_forward_jump` / `patch_forward_jump`),
+    /// so both failures share one not-taken `J_il(A)`.
+    fn malloc_cond_varsize(&mut self, op: &Op, arglocs: &[Loc], result_loc: Option<&Loc>) {
+        let (base_size, type_id) = op
+            .with_array_descr(|ad| (ad.base_size() as i64, ad.type_id() as i64))
+            .expect("CallMallocNurseryVarsize requires an ArrayDescr");
+        let itemsize = match arglocs.get(1) {
+            Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
+            _ => panic!("malloc_cond_varsize itemsize must be an immediate, got {arglocs:?}"),
+        };
+        let lengthloc = match arglocs.first() {
+            Some(loc) => *loc,
+            None => panic!("malloc_cond_varsize requires a length loc"),
+        };
+        debug_assert!(itemsize > 0);
+        debug_assert!(
+            base_size as usize + majit_gc::header::GcHeader::SIZE
+                >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
+        );
+        let result_reg = match result_loc {
+            Some(Loc::Reg(r)) => r.value,
+            other => {
+                panic!("CallMallocNurseryVarsize result_loc must be a register; got {other:?}")
+            }
+        };
+        let gcmap = self.pending_malloc_nursery_gcmap.unwrap_or(0);
+        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        let max_young = crate::runner::dynasm_max_size_of_young_obj();
+        let max_length = max_young.saturating_sub(2 * WORD);
+        let kind = || SlowPathKind::MallocCondVarsize {
+            gcmap,
+            result_reg,
+            itemsize,
+            base_size,
+            type_id,
+            lengthloc,
+        };
+        if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
+            let mut sp = self.begin_slow_path(None, kind());
+            self.set_continue_here(&mut sp);
+            self.pending_slowpaths.push(sp);
+            return;
+        }
+        let mut varsizeloc = match lengthloc {
+            Loc::Reg(r) => {
+                debug_assert_ne!(r.value, rx86::ECX);
+                debug_assert_ne!(r.value, rx86::EDX);
+                r.value
+            }
+            other => {
+                self.mov_gpr_from_loc(rx86::EDX, other);
+                rx86::EDX
+            }
+        };
+        self.cmp_reg_i64(varsizeloc, max_length as i64);
+        let nursery_ja = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch x64 ; ja =>nursery_ja);
+        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+        rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
+        let shift = if crate::regalloc::valid_addressing_size(itemsize as usize) {
+            crate::regalloc::get_scale(itemsize as usize)
+        } else {
+            let shift = self.imul_const_scaled(rx86::EDX, varsizeloc, itemsize);
+            varsizeloc = rx86::EDX;
+            shift
+        };
+        let mut constsize = base_size + majit_gc::header::GcHeader::SIZE as i64;
+        let force_realignment = (itemsize as usize) % WORD != 0;
+        if force_realignment {
+            constsize += WORD as i64 - 1;
+        }
+        assert!(
+            rx86::fits_in_32bits(constsize),
+            "malloc_cond_varsize constsize {constsize} does not fit a displacement"
+        );
+        rx86::lea_ra(
+            &mut self.mc,
+            rx86::EDX,
+            (i16::from(rx86::ECX), varsizeloc, shift, constsize as i32),
+        );
+        if force_realignment {
+            rx86::and_ri(&mut self.mc, rx86::EDX, !(WORD as i32 - 1));
+        }
+        let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
+        rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
+        dynasm!(self.mc ; .arch x64 ; =>nursery_ja);
+        let mut sp = self.begin_slow_path(Some(CC_A), kind());
+        if rx86::fits_in_32bits(type_id) {
+            rx86::mov_mi(&mut self.mc, (rx86::ECX, 0), type_id as i32);
+        } else {
+            self.load_scratch(type_id);
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            dynasm!(self.mc ; .arch x64 ; mov [rcx], Rq(scratch));
+        }
+        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
+        self.forget_if_scratch_written(result_reg);
+        rx86::lea_rm(
+            &mut self.mc,
+            result_reg,
+            (rx86::ECX, majit_gc::header::GcHeader::SIZE as i32),
+        );
+        self.set_continue_here(&mut sp);
+        self.pending_slowpaths.push(sp);
+    }
+
+    /// Headerless varsize nursery allocation. The fast path keeps the
+    /// `imul` / `and` / taken `jmp` sequence; overflow calls
+    /// `dynasm_nursery_slowpath_headerless_varsize` through `push_all_regs`
+    /// and an ABI call. This is not `malloc_cond_varsize`.
+    fn genop_call_malloc_nursery_varsize_headerless(
+        &mut self,
+        op: &Op,
+        arglocs: &[Loc],
+        result_loc: Option<&Loc>,
+    ) {
+        let base_size = op
+            .with_array_descr(|ad| ad.base_size())
+            .expect("CallMallocNurseryVarsizeHeaderless requires an ArrayDescr")
+            as i64;
+        let itemsize = match arglocs.get(1) {
+            Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
+            _ => 8,
+        };
+        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        let max_young = crate::runner::dynasm_max_size_of_young_obj();
+        let slow_path = self.mc.new_dynamic_label();
+        let done = self.mc.new_dynamic_label();
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let max_length = max_young.saturating_sub(base_size as usize);
+        debug_assert!(itemsize > 0);
+        if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
+            dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
+            self.forget_after_call_or_jmp();
+        } else {
+            match arglocs.first() {
+                Some(Loc::Reg(len_r)) => {
+                    debug_assert_ne!(len_r.value, crate::regloc::ECX.value);
+                    debug_assert_ne!(len_r.value, crate::regloc::EDX.value);
+                    dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(len_r.value));
+                }
+                Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
+                    rx86::mov_ri(&mut self.mc, rx86::EDX, len_i.value);
+                }
+                Some(Loc::Frame(len_f)) => {
+                    rx86::mov_rb(&mut self.mc, rx86::EDX, len_f.ebp_loc.value);
+                }
+                Some(Loc::Ebp(len_e)) => {
+                    rx86::mov_rb(&mut self.mc, rx86::EDX, len_e.value);
+                }
+                other => {
+                    panic!("CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}")
+                }
+            }
+            self.load_scratch(max_length as i64);
+            dynasm!(self.mc ; .arch x64
+            ; cmp rdx, Rq(scratch)
+            );
+            dynasm!(self.mc ; .arch x64
+                                    ; ja =>slow_path
+            );
+            let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+            rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
+            rx86::imul_ri(&mut self.mc, rx86::EDX, itemsize as i32);
+            rx86::add_ri(&mut self.mc, rx86::EDX, (base_size + 7) as i32);
+            dynasm!(self.mc ; .arch x64
+            ; and rdx, -8
+            );
+            dynasm!(self.mc ; .arch x64
+                                    ; add rdx, rcx
+            );
+            let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
+            rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
+            dynasm!(self.mc ; .arch x64
+                                    ; ja =>slow_path
+            );
+            let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+            rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
+            dynasm!(self.mc ; .arch x64
+                                    ; jmp =>done
+
+            );
+            self.forget_after_call_or_jmp();
+        }
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
-        let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
-        if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
-            self.push_gcmap(gcmap as *mut usize);
-        } else {
-            rx86::mov_bi(&mut self.mc, gcmap_ofs, 0);
-        }
-        // Stage the trampoline address through R11 so RAX still holds
-        // the caller's pre-call value at the trampoline entry — its
-        // `push_all_regs_to_frame([ECX, EDX])` then saves the real RAX,
-        // and the matching pop restores it after the helper call.
-        // Loading `helper_addr` into RAX here (the previous shape) would
-        // clobber the caller's RAX, and the trampoline would save+restore
-        // that already-clobbered value, silently dropping any live Box
-        // the regalloc kept in RAX across this op.
-        let helper_addr = self.malloc_slowpath_fixed as i64;
-        let call_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.forget_if_scratch_written(call_scratch);
-        rx86::mov_ri(&mut self.mc, call_scratch, helper_addr);
-        dynasm!(self.mc ; .arch x64
-                    ; call Rq(call_scratch)
-
-        );
-        self.forget_after_call_or_jmp();
-        // assembler.py:304 — helper returns the payload in ECX
-        // (`MOV_rr(ecx, eax)` inside the trampoline) so the value
-        // survives the trampoline's `pop_all_regs([ECX, EDX])`.  The
-        // regalloc forces `result_reg = MALLOC_NURSERY_RESULT = ECX`
-        // (regalloc.rs), so the value already lives in the right
-        // register and no caller-side copy is needed.  If a future
-        // regalloc change picks a different `result_reg`, copy it
-        // from RCX (not RAX, which is now the caller's preserved
-        // pre-call value, not the helper return).
-        //
-        // OOM propagation: assembler.py:300-322 emits the `TEST/JZ
-        // propagate_exception_path` *inside* the slowpath itself, and
-        // pyre's `build_malloc_slowpath_fixed` now mirrors that —
-        // when the underlying `dynasm_nursery_slowpath` returns NULL
-        // the trampoline does the `_store_and_reset_exception`,
-        // writes `jf_descr = propagate_exception_descr` and runs
-        // `_call_footer` to exit the trace.  No call-site OOM check is
-        // needed; if the trampoline ever returns here it succeeded.
-        if let Some(Loc::Reg(r)) = result_loc {
-            if r.value != crate::regloc::ECX.value {
-                let rv = r.value;
-                self.forget_if_scratch_written(rv);
-                dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
+        self.push_all_regs_to_jitframe(&[], true);
+        match arglocs.first() {
+            Some(Loc::Reg(len_r)) => {
+                self.emit_abi_int_arg_from_reg(0, len_r.value as u8);
             }
+            Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
+                self.emit_abi_int_arg_from_imm(0, len_i.value);
+            }
+            Some(Loc::Frame(len_f)) => {
+                self.emit_abi_int_arg_from_mem(0, len_f.ebp_loc.value);
+            }
+            Some(Loc::Ebp(len_e)) => {
+                self.emit_abi_int_arg_from_mem(0, len_e.value);
+            }
+            other => panic!("CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}"),
         }
-        // gcmap was cleared by `pop_gcmap(mc)` inside the trampoline
-        // before RET (PyPy assembler.py:308); no caller-side clear is
-        // needed here.  Matches the PyPy contract where the trampoline
-        // owns the `JF_GCMAP_OFS` reset.
-        let _ = gcmap_ofs;
-
+        self.emit_abi_int_arg_from_imm(1, itemsize);
+        self.emit_abi_int_arg_from_imm(2, base_size);
+        rx86::mov_ri(
+            &mut self.mc,
+            rx86::EAX,
+            crate::runner::dynasm_nursery_slowpath_headerless_varsize as *const () as i64,
+        );
+        self.emit_abi_call_rax();
+        self.reload_frame_if_necessary();
+        self.pop_all_regs_from_jitframe(&[crate::regloc::EAX], true);
+        self.emit_propagate_exception_if_zero(0);
+        let Some(Loc::Reg(r)) = result_loc else {
+            panic!(
+                "CallMallocNurseryVarsizeHeaderless result_loc must be a register; got {result_loc:?}"
+            );
+        };
+        if r.value != crate::regloc::EAX.value {
+            let rv = r.value;
+            self.forget_if_scratch_written(rv);
+            dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
+        }
+        dynasm!(self.mc ; .arch x64 ; jmp =>done);
+        self.forget_after_call_or_jmp();
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>done);
-        // x86/regalloc.py `consider_call_malloc_nursery` binds the result with
-        // `force_allocate_reg(op, selected_reg=ecx)`, so the register IS the
-        // delivery contract; FrameManager emits a spill only where a later
-        // lifetime boundary needs one.  Storing it here as well grew
-        // `frame_depth` by one slot for every allocation.
     }
 
     /// Headerless fixed-size nursery allocation.  `size` excludes any GC

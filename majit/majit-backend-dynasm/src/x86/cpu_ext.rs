@@ -40,6 +40,10 @@ pub(crate) struct X86CpuExt {
     _malloc_slowpath_fixed_buffer: Option<ArenaExecutableBuffer>,
     malloc_slowpath_headerless: Option<usize>,
     _malloc_slowpath_headerless_buffer: Option<ArenaExecutableBuffer>,
+    /// `_build_malloc_slowpath(kind='var')`. `malloc_cond_varsize` calls
+    /// this address. Built once per CPU, same as `malloc_slowpath_fixed`.
+    malloc_slowpath_varsize: Option<usize>,
+    _malloc_slowpath_varsize_buffer: Option<ArenaExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.
     /// Standalone trampoline that the malloc slowpath JMPs to on OOM.
     /// The stack-check helper does not: its overflow footer runs before
@@ -77,6 +81,8 @@ impl X86CpuExt {
             _malloc_slowpath_fixed_buffer: None,
             malloc_slowpath_headerless: None,
             _malloc_slowpath_headerless_buffer: None,
+            malloc_slowpath_varsize: None,
+            _malloc_slowpath_varsize_buffer: None,
             propagate_exception_path: None,
             _propagate_exception_path_buffer: None,
             frame_realloc_slowpath: None,
@@ -271,6 +277,28 @@ impl X86CpuExt {
             .expect("malloc_slowpath_headerless was just ensured")
     }
 
+    /// `_build_malloc_slowpath(kind='var')`: one trampoline per CPU.
+    /// `ensure_propagate_exception_path` runs first; the OOM tail JMPs there.
+    pub(crate) fn ensure_malloc_slowpath_varsize(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
+        if self.malloc_slowpath_varsize.is_none() {
+            let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
+            let (buffer, addr) = super::assembler::build_malloc_slowpath_varsize(
+                cpu_handle,
+                propagate_path,
+                &self.asm_memory_manager,
+            );
+            debug_assert!(
+                addr != 0,
+                "build_malloc_slowpath_varsize returned NULL entry address — \
+                 dynasm finalize is expected to yield a non-zero buffer_ptr"
+            );
+            self._malloc_slowpath_varsize_buffer = Some(buffer);
+            self.malloc_slowpath_varsize = Some(addr);
+        }
+        self.malloc_slowpath_varsize
+            .expect("malloc_slowpath_varsize was just ensured")
+    }
+
     /// Whether either trampoline that bakes `propagate_exception_descr`
     /// as an immediate has already been materialised.  Used by
     /// `DynasmBackend::set_propagate_exception_descr` to refuse a
@@ -286,6 +314,7 @@ impl X86CpuExt {
     pub(crate) fn has_propagate_dependent_caches(&self) -> bool {
         self.malloc_slowpath_fixed.is_some()
             || self.malloc_slowpath_headerless.is_some()
+            || self.malloc_slowpath_varsize.is_some()
             || self.propagate_exception_path.is_some()
             || self.stack_check_slowpath.is_some()
     }
