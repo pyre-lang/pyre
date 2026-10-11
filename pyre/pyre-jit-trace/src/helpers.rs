@@ -27,6 +27,11 @@ pub use pyre_interpreter::{
     known_function_call_helper, register_jit_function_caller,
 };
 
+/// Residual CALL targets go through [`pyre_interpreter::residual_word_addr!`]:
+/// a path-based publisher matching `cpu_word!` / `word_fn_addr!`, so the
+/// wasm32 closure is a fn item (`word_publish` `zeroed()`). Native keeps the
+/// raw address.
+
 pub fn emit_trace_call_int_typed(
     ctx: &mut TraceCtx,
     helper: *const (),
@@ -256,7 +261,7 @@ pub(crate) fn emit_current_execution_context(ctx: &mut TraceCtx, site: &'static 
     crate::jitcode_dispatch::census_record(site);
     ctx.call_typed_with_effect(
         OpCode::CallR,
-        jit_getexecutioncontext as *const (),
+        pyre_interpreter::residual_word_addr!(0, jit_getexecutioncontext),
         &[],
         &[],
         Type::Ref,
@@ -631,7 +636,7 @@ pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate
     // back the prebuilt singleton as a constant, and no box op exists at all.
     // Only a walk with no snapshot to resume into reaches this call.
     ctx.call_ref_typed_with_effect(
-        jit_bool_value_from_truth as *const (),
+        pyre_interpreter::residual_word_addr!(1, jit_bool_value_from_truth),
         &[truth],
         &[Type::Int],
         EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),

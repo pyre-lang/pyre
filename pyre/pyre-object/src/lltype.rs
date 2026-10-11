@@ -237,6 +237,14 @@ pub fn for_each_class_descriptor(mut visit: impl FnMut(&'static PyreClassDescrip
     }
 }
 
+/// Native accessor. wasm32 publishes `extern "C" fn() -> i64` instead: a raw
+/// `PyObjectRef` return is `i32` there, and `descr.py` `CallDescr.create_call_stub`
+/// calls the descr FUNC, whose word is `i64`.
+#[cfg(not(target_arch = "wasm32"))]
+pub type TypeObjectFnAddr = fn() -> crate::PyObjectRef;
+#[cfg(target_arch = "wasm32")]
+pub type TypeObjectFnAddr = extern "C" fn() -> i64;
+
 /// Link-time descriptor for a `#[pyre_methods]`-generated `type_object()`
 /// accessor.  The accessor's body is the `OnceLock<usize>` type-object cache;
 /// its `CELL` read is unliftable, so the JIT stamps the accessor
@@ -248,9 +256,8 @@ pub struct TypeObjectFnDescriptor {
     /// `concat!(module_path!(), "::type_object")` — the `FunctionPath` the
     /// residual call names, matched against `jit_trace_fnaddrs`.
     pub path: &'static str,
-    /// The accessor.  `fn() -> PyObjectRef` is a single-word ref return with
-    /// no arguments — the plainest residual-call ABI the codewriter emits.
-    pub func: fn() -> crate::PyObjectRef,
+    /// The accessor. Native: `fn() -> PyObjectRef`. wasm32: the word shim.
+    pub func: TypeObjectFnAddr,
 }
 
 // Safety: `path` is `'static` and `func` is a plain `fn` pointer to
@@ -287,7 +294,7 @@ pub static WASM_TYPE_OBJECT_FNADDRS: std::sync::Mutex<Vec<TypeObjectFnDescriptor
 /// An entry appended after `jit_trace_fnaddrs` has been read is not published,
 /// and the residual call keeps the address its build-time snapshot carried.
 #[cfg(target_arch = "wasm32")]
-pub fn register_type_object_fnaddr(path: &'static str, func: fn() -> crate::PyObjectRef) {
+pub fn register_type_object_fnaddr(path: &'static str, func: TypeObjectFnAddr) {
     WASM_TYPE_OBJECT_FNADDRS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -300,9 +307,7 @@ pub fn register_type_object_fnaddr(path: &'static str, func: fn() -> crate::PyOb
 /// The JIT stamps the accessor `dont_look_inside` on every target, so a target
 /// that visited none would leave those residual calls bound to the addresses
 /// the build-script process recorded, which name nothing in the runtime one.
-pub fn for_each_type_object_fnaddr(
-    mut visit: impl FnMut(&'static str, fn() -> crate::PyObjectRef),
-) {
+pub fn for_each_type_object_fnaddr(mut visit: impl FnMut(&'static str, TypeObjectFnAddr)) {
     #[cfg(not(target_arch = "wasm32"))]
     for desc in PYRE_TYPE_OBJECT_FNADDRS {
         visit(desc.path, desc.func);
@@ -340,9 +345,12 @@ macro_rules! register_type_object_fnaddr {
         #[cfg(target_arch = "wasm32")]
         #[::ctor::ctor(unsafe)]
         fn __pyre_register_type_object_fnaddr() {
+            extern "C" fn __type_object_word() -> i64 {
+                type_object() as usize as i64
+            }
             $crate::lltype::register_type_object_fnaddr(
                 ::core::concat!(::core::module_path!(), "::type_object"),
-                type_object,
+                __type_object_word,
             );
         }
     };

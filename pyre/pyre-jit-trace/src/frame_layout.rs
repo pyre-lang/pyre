@@ -164,7 +164,8 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
         // and rebuilds descriptors inside `Arc::new_cyclic`, so any fields
         // set here survive into the returned Arc. After the Arc is formed
         // the vinfo is immutable through the shared handle.
-        info.clear_vable_ptr = Some(pyre_clear_vable_token as *const () as usize);
+        info.clear_vable_ptr =
+            Some(pyre_interpreter::residual_word_addr!(unsafe 1, pyre_clear_vable_token) as usize);
         info.clear_vable_descr = Some(VirtualizableInfo::make_clear_vable_descr());
         let info = info.finalize_arc(crate::state::pyframe_size_descr());
         info.finish();

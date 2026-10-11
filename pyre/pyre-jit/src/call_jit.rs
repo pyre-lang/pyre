@@ -5399,11 +5399,26 @@ pub extern "C" fn jit_create_callee_frame_4(
 
 pub fn callee_frame_helper(nargs: usize) -> Option<*const ()> {
     match nargs {
-        0 => Some(jit_create_callee_frame_0 as *const ()),
-        1 => Some(jit_create_callee_frame_1 as *const ()),
-        2 => Some(jit_create_callee_frame_2 as *const ()),
-        3 => Some(jit_create_callee_frame_3 as *const ()),
-        4 => Some(jit_create_callee_frame_4 as *const ()),
+        0 => Some(pyre_interpreter::residual_word_addr!(
+            2,
+            jit_create_callee_frame_0,
+        )),
+        1 => Some(pyre_interpreter::residual_word_addr!(
+            3,
+            jit_create_callee_frame_1,
+        )),
+        2 => Some(pyre_interpreter::residual_word_addr!(
+            4,
+            jit_create_callee_frame_2,
+        )),
+        3 => Some(pyre_interpreter::residual_word_addr!(
+            5,
+            jit_create_callee_frame_3,
+        )),
+        4 => Some(pyre_interpreter::residual_word_addr!(
+            6,
+            jit_create_callee_frame_4,
+        )),
         _ => None,
     }
 }

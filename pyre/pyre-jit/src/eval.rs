@@ -6102,7 +6102,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
         d.meta_interp_mut().ensure_oopspec_callinfo(
             majit_ir::OopSpecIndex::StrConcat,
             descr,
-            pyre_object::lowlevel_string::jit_ll_strconcat as *const () as u64,
+            pyre_interpreter::residual_word_addr!(2, pyre_object::lowlevel_string::jit_ll_strconcat,) as u64,
             "jit_ll_strconcat",
         );
     }
@@ -6117,43 +6117,43 @@ fn build_jit_driver_pair() -> JitDriverPair {
             (
                 Os::StreqSliceChecknull,
                 &[Ref, Int, Int, Ref],
-                ll::jit_ll_str_eq_slice_checknull as *const () as u64,
+                pyre_interpreter::residual_word_addr!(4, ll::jit_ll_str_eq_slice_checknull) as u64,
                 "_ll_4_str_eq_slice_checknull",
             ),
             (
                 Os::StreqSliceNonnull,
                 &[Ref, Int, Int, Ref],
-                ll::jit_ll_str_eq_slice_nonnull as *const () as u64,
+                pyre_interpreter::residual_word_addr!(4, ll::jit_ll_str_eq_slice_nonnull) as u64,
                 "_ll_4_str_eq_slice_nonnull",
             ),
             (
                 Os::StreqSliceChar,
                 &[Ref, Int, Int, Int],
-                ll::jit_ll_str_eq_slice_char as *const () as u64,
+                pyre_interpreter::residual_word_addr!(4, ll::jit_ll_str_eq_slice_char) as u64,
                 "_ll_4_str_eq_slice_char",
             ),
             (
                 Os::StreqNonnull,
                 &[Ref, Ref],
-                ll::jit_ll_str_eq_nonnull as *const () as u64,
+                pyre_interpreter::residual_word_addr!(2, ll::jit_ll_str_eq_nonnull) as u64,
                 "_ll_2_str_eq_nonnull",
             ),
             (
                 Os::StreqNonnullChar,
                 &[Ref, Int],
-                ll::jit_ll_str_eq_nonnull_char as *const () as u64,
+                pyre_interpreter::residual_word_addr!(2, ll::jit_ll_str_eq_nonnull_char) as u64,
                 "_ll_2_str_eq_nonnull_char",
             ),
             (
                 Os::StreqChecknullChar,
                 &[Ref, Int],
-                ll::jit_ll_str_eq_checknull_char as *const () as u64,
+                pyre_interpreter::residual_word_addr!(2, ll::jit_ll_str_eq_checknull_char) as u64,
                 "_ll_2_str_eq_checknull_char",
             ),
             (
                 Os::StreqLengthok,
                 &[Ref, Ref],
-                ll::jit_ll_str_eq_lengthok as *const () as u64,
+                pyre_interpreter::residual_word_addr!(2, ll::jit_ll_str_eq_lengthok) as u64,
                 "_ll_2_str_eq_lengthok",
             ),
         ];
@@ -7512,20 +7512,42 @@ fn init_callbacks() {
         let cb = Box::leak(Box::new(CallJitCallbacks {
             callee_frame_helper: crate::call_jit::callee_frame_helper,
             recursive_force_cache_safe: crate::call_jit::recursive_force_cache_safe,
-            jit_drop_callee_frame: crate::call_jit::jit_drop_callee_frame as *const (),
-            jit_force_callee_frame: crate::call_jit::jit_force_callee_frame as *const (),
-            jit_force_recursive_call_1: crate::call_jit::jit_force_recursive_call_1 as *const (),
-            jit_force_recursive_call_argraw_boxed_1:
-                crate::call_jit::jit_force_recursive_call_argraw_boxed_1 as *const (),
-            jit_force_self_recursive_call_argraw_boxed_1:
-                crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1 as *const (),
-            jit_create_callee_frame_1: crate::call_jit::jit_create_callee_frame_1 as *const (),
-            jit_create_callee_frame_1_raw_int: crate::call_jit::jit_create_callee_frame_1_raw_int
-                as *const (),
-            jit_create_self_recursive_callee_frame_1:
-                crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
-            jit_create_self_recursive_callee_frame_1_raw_int:
-                crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
+            jit_drop_callee_frame: pyre_interpreter::residual_word_addr!(
+                1,
+                crate::call_jit::jit_drop_callee_frame,
+            ),
+            jit_force_callee_frame: pyre_interpreter::residual_word_addr!(
+                1,
+                crate::call_jit::jit_force_callee_frame,
+            ),
+            jit_force_recursive_call_1: pyre_interpreter::residual_word_addr!(
+                3,
+                crate::call_jit::jit_force_recursive_call_1,
+            ),
+            jit_force_recursive_call_argraw_boxed_1: pyre_interpreter::residual_word_addr!(
+                3,
+                crate::call_jit::jit_force_recursive_call_argraw_boxed_1,
+            ),
+            jit_force_self_recursive_call_argraw_boxed_1: pyre_interpreter::residual_word_addr!(
+                2,
+                crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1,
+            ),
+            jit_create_callee_frame_1: pyre_interpreter::residual_word_addr!(
+                3,
+                crate::call_jit::jit_create_callee_frame_1,
+            ),
+            jit_create_callee_frame_1_raw_int: pyre_interpreter::residual_word_addr!(
+                3,
+                crate::call_jit::jit_create_callee_frame_1_raw_int,
+            ),
+            jit_create_self_recursive_callee_frame_1: pyre_interpreter::residual_word_addr!(
+                2,
+                crate::call_jit::jit_create_self_recursive_callee_frame_1,
+            ),
+            jit_create_self_recursive_callee_frame_1_raw_int: pyre_interpreter::residual_word_addr!(
+                2,
+                crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int,
+            ),
             driver_pair: || driver_pair() as *mut JitDriverPair as *mut u8,
             ensure_majit_jitcode: |code, w_code| {
                 if !code.is_null() {

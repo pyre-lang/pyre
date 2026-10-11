@@ -2204,10 +2204,15 @@ unsafe fn w_set_lock(obj: PyObjectRef) -> SetGuard {
     }
 }
 
-/// [`w_set_lock`] for the residual-call ABI: the guard's lock word. The
-/// jitcode's drop of the guard releases it through [`w_set_lock_release`].
-pub extern "C" fn w_set_lock_jit_abi(obj: PyObjectRef) -> usize {
-    std::mem::ManuallyDrop::new(unsafe { w_set_lock(obj) }).lock
+/// [`w_set_lock`] for the residual-call ABI: the guard's lock word.
+/// Arguments and the result are descr words (`'r'`/`'i'` → i64;
+/// `descr.py` `CallDescr.create_call_stub`, `callbuilder.py` `emit_raw_call`).
+/// Conversion matches `helper_arg_from_i64` / `helper_return_to_i64` on the
+/// macro trampoline (`emit_helper_fnaddr_registration`). The jitcode's drop
+/// of the guard releases it through [`w_set_lock_release`].
+pub extern "C" fn w_set_lock_jit_abi(obj: i64) -> i64 {
+    let obj = obj as usize as PyObjectRef;
+    std::mem::ManuallyDrop::new(unsafe { w_set_lock(obj) }).lock as i64
 }
 
 // The traced call names `w_set_lock`. Publish the word-returning entry under

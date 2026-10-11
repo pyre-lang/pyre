@@ -58,9 +58,9 @@ rustpython-wtf8 = { workspace = true }
 pyre-jit = { path = "../pyre-jit", version = "0.0.2", default-features = false, features = ["prepass", "pyre-module"] }
 wasm-bindgen = { workspace = true, optional = true }
 getrandom = { workspace = true }
-# Only the `wasm-host` (native-host) build installs the residual-call host
-# trampoline (`call_stub::set_residual_host_call`); the `web` build keeps
-# the in-module transmute path until the JS glue grows the matching import.
+# Only the `wasm-host` build installs `install_residual_host_call`, the host
+# fallback for a callee with no single wasm function type or a host import
+# outside the guest table. The `web` build does not install that hook.
 majit-backend = { workspace = true, optional = true }
 # Diagnostic-only: lets the `pyre_jit_bridge_diag` export read the wasm
 # backend's `compile_bridge` outcome tallies (a static counter, not a host

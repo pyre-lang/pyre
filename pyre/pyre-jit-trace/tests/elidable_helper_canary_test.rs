@@ -68,7 +68,8 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
     // target is unsafe.  Only the macro wrapper covers the bool→i64
     // conversion (1/0) in `majit-macros`'s `helper_return_to_i64`.
     let trace_fn = __majit_call_target_jit_int_in_small_cache_range;
-    let func_ptr = trace_fn as *const ();
+    let func_ptr =
+        pyre_interpreter::residual_word_addr!(1, __majit_call_target_jit_int_in_small_cache_range);
     let concrete_result = trace_fn(live_x);
     let effect = majit_ir::EffectInfo::new(
         majit_ir::ExtraEffect::ElidableCannotRaise,
@@ -120,7 +121,8 @@ fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {
 
     let live_arg = OpRef::input_arg_int(0);
     let trace_fn = __majit_call_target_jit_int_in_small_cache_range;
-    let func_ptr = trace_fn as *const ();
+    let func_ptr =
+        pyre_interpreter::residual_word_addr!(1, __majit_call_target_jit_int_in_small_cache_range);
     let concrete_result = trace_fn(live_x);
 
     let resbox = {
@@ -172,7 +174,7 @@ fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_p
 
     let live_arg = OpRef::input_arg_int(0);
     let trace_fn = __majit_call_target_int_bit_count;
-    let func_ptr = trace_fn as *const ();
+    let func_ptr = pyre_interpreter::residual_word_addr!(1, __majit_call_target_int_bit_count);
     let concrete_result = trace_fn(live_x);
     let effect = majit_ir::EffectInfo::new(
         majit_ir::ExtraEffect::ElidableCannotRaise,
@@ -213,7 +215,8 @@ fn elidable_helper_all_const_args_fold_to_const_and_cut_call() {
 
     let const_x: i64 = 3;
     let trace_fn = __majit_call_target_jit_int_in_small_cache_range;
-    let func_ptr = trace_fn as *const ();
+    let func_ptr =
+        pyre_interpreter::residual_word_addr!(1, __majit_call_target_jit_int_in_small_cache_range);
     let concrete_result = trace_fn(const_x);
     let effect = majit_ir::EffectInfo::new(
         majit_ir::ExtraEffect::ElidableCannotRaise,
@@ -287,7 +290,7 @@ fn emit_ref_lookup_shape_routes_to_call_pure_r_when_type_not_const() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_type))]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    let func_ptr = lookup_where_shape_canary as *const ();
+    let func_ptr = pyre_interpreter::residual_word_addr!(3, lookup_where_shape_canary);
     let w_name: usize = 0x4A3E_0000;
     let version_tag: i64 = 0x5234;
     let concrete_result = lookup_where_shape_canary(live_type as i64, w_name as i64, version_tag);
@@ -348,7 +351,7 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    let func_ptr = lookup_where_shape_canary as *const ();
+    let func_ptr = pyre_interpreter::residual_word_addr!(3, lookup_where_shape_canary);
     let w_type: usize = 0x710E_1111;
     let w_name: usize = 0x4A3E_1111;
     let version_tag: i64 = 0x5235;
@@ -431,7 +434,7 @@ fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_type))]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    let func_ptr = jit_lookup_where_with_method_cache as *const ();
+    let func_ptr = pyre_interpreter::residual_word_addr!(3, jit_lookup_where_with_method_cache);
     let w_name: usize = 0x4A3E_2222;
     let version_tag: i64 = 0x5236;
     // Synthetic descriptor pointer; the wrapper is NOT invoked here.
@@ -488,7 +491,7 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    let func_ptr = jit_lookup_where_with_method_cache as *const ();
+    let func_ptr = pyre_interpreter::residual_word_addr!(3, jit_lookup_where_with_method_cache);
     let w_type: usize = 0x710E_3333;
     let w_name: usize = 0x4A3E_3333;
     let version_tag: i64 = 0x5237;
@@ -576,7 +579,7 @@ fn instance_getdictvalue_records_residual_call_r_not_pure() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    let func_ptr = jit_instance_getdictvalue as *const ();
+    let func_ptr = pyre_interpreter::residual_word_addr!(2, jit_instance_getdictvalue);
     let w_obj: usize = 0x1457_5555;
     let w_name: usize = 0x4A3E_5555;
 

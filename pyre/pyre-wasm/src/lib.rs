@@ -140,92 +140,6 @@ mod heap_prof {
 #[global_allocator]
 static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 
-// One `extern "C"` trampoline per published table type. An i32 argument is
-// truncated, an i32 result is zero-extended, an f64 argument is
-// `f64::from_bits`, and an f64 result comes back as bits. `build.rs` writes
-// the bodies. Integer mixes go through arity 8. A signature that contains
-// an f32 or f64 goes through arity 5. f32 travels as `f32::from_bits` /
-// `to_bits`. i32/i64 mixes go through arity 8.
-#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-#[allow(unused_variables, clippy::missing_safety_doc)]
-mod residual_sig_call {
-    include!(concat!(env!("OUT_DIR"), "/residual_sig_call.rs"));
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-fn direct_sig_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
-    use majit_backend_wasm::{FuncSigVal, residual_target_sig};
-    if func_ptr == 0 || args.len() > 8 {
-        return None;
-    }
-    let sig = residual_target_sig(func_ptr as i64)?;
-    if sig.params.len() != args.len() {
-        return None;
-    }
-    if !sig.params.is_empty() && sig.params.iter().all(|p| *p == FuncSigVal::F64) {
-        if let Some(value) = residual_sig_call::call_uniform_f64(func_ptr, args, sig.result) {
-            return Some(value);
-        }
-    }
-    if sig
-        .params
-        .iter()
-        .any(|p| matches!(p, FuncSigVal::F64 | FuncSigVal::F32))
-    {
-        if args.is_empty() || args.len() > 5 {
-            return None;
-        }
-        let mut code = 0u32;
-        for (i, param) in sig.params.iter().enumerate() {
-            let digit = match param {
-                FuncSigVal::I32 => 0,
-                FuncSigVal::I64 => 1,
-                FuncSigVal::F32 => 2,
-                FuncSigVal::F64 => 3,
-            };
-            code |= digit << (2 * i);
-        }
-        return residual_sig_call::call_mixed_sig(func_ptr, args, code, sig.result);
-    }
-    let mut mask = 0u32;
-    for (i, param) in sig.params.iter().enumerate() {
-        match param {
-            FuncSigVal::I32 => mask |= 1u32 << i,
-            FuncSigVal::I64 => {}
-            FuncSigVal::F64 | FuncSigVal::F32 => return None,
-        }
-    }
-    residual_sig_call::call_int_sig(func_ptr, args, mask, sig.result)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-fn blackhole_residual_call(
-    func_ptr: usize,
-    args: &[i64],
-    classes: &[majit_backend::call_stub::ArgClass],
-    result: char,
-    result_signed: bool,
-    result_size: usize,
-) -> Option<i64> {
-    if let Some(value) = direct_sig_call(func_ptr, args) {
-        return Some(majit_backend_wasm::widen_reflected_result(
-            func_ptr,
-            value,
-            result,
-            result_signed,
-            result_size,
-        ));
-    }
-    majit_backend_wasm::residual_host_call(
-        func_ptr,
-        args,
-        classes,
-        result,
-        result_signed,
-        result_size,
-    )
-}
-
 // Host clock for the native-host (`wasm-host`) build.
 //
 // wasm32 has neither a `SystemTime` nor an `Instant`: both panic rather than
@@ -901,10 +815,11 @@ fn install_wasm_print_hook() {
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 fn run_python_impl(source: &str) -> String {
     install_panic_hook();
-    // A published table type is `call_indirect` inside the guest. Anything else
-    // uses the word stub or `jit_call_host`.
+    // Published targets match the descr FUNC and take the word stub. The host
+    // hook remains for a callee with no single wasm function type, or a host
+    // import outside the guest table.
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-    majit_backend::call_stub::set_residual_host_call(Some(blackhole_residual_call));
+    majit_backend_wasm::install_residual_host_call();
     // Optional-module rclass aliases must be installed before the collector
     // is built: `init_jit_hooks` / `build_gc` snapshots the alias census.
     pyre_module::register();
