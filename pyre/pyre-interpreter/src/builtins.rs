@@ -24888,15 +24888,19 @@ fn fileio_close_owned_fd(fd: i32) {
     let _ = fd;
 }
 
-/// PyPy `_open_inhcache.set_non_inheritable(fd)` / `rposix.set_inheritable`.
+/// `interp_fileio._open_inhcache.set_non_inheritable(fd)`. The cache probes
+/// the first descriptor once; where `O_CLOEXEC` already made it
+/// non-inheritable no later open issues a call.
 /// A caller-supplied integer descriptor is deliberately excluded: FileIO must
 /// preserve that descriptor's existing inheritance flag.
 #[cfg(all(unix, not(feature = "sandbox")))]
 fn fileio_set_non_inheritable(fd: i32, mut w_name: PyObjectRef) -> Result<(), crate::PyError> {
-    // `rposix._c_set_inheritable` releases the GIL and saves errno.
-    let ret = pyre_object::with_roots!(w_name => unsafe {
-        majit_rlib::rposix::_c_set_inheritable(fd, 0)
-    });
+    /// `interp_fileio._open_inhcache`.
+    static OPEN_INHCACHE: majit_rlib::rposix::SetNonInheritableCache =
+        majit_rlib::rposix::SetNonInheritableCache::new();
+    // `_c_get_inheritable` / `_c_set_inheritable` release the GIL and save
+    // errno.
+    let ret = pyre_object::with_roots!(w_name => OPEN_INHCACHE.set_non_inheritable(fd));
     if ret < 0 {
         return Err(crate::PyError::os_error_syscall(
             majit_rlib::rposix::get_saved_errno(),
