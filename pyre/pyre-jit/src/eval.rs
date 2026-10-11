@@ -974,17 +974,14 @@ unsafe fn identity_set_storage_custom_trace(
     storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
-/// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
-/// box (`Vec<u8>`, no inner refs, off-GC storage). Forward the field
-/// slot so a major GC greys the box; the box tid's own drop glue reclaims the
-/// buffer on sweep. A no-GC-hook fallback allocation is not collector-owned, so
-/// the guard skips it.
+/// Custom trace for `W_BytesObject`. `data` is the `rstr.STR` `chars` array
+/// (`BytesBlock`): a managed varsize leaf, or an immortal leaf stamped
+/// `init_gc_object_immortal` on the no-hook fallback. Grey it
+/// unconditionally; `visit` skips an immortal leaf via `NO_HEAP_PTRS`.
 unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let bytes = unsafe { &mut *(obj_addr as *mut pyre_object::bytesobject::W_BytesObject) };
     f(&mut bytes.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    if !bytes.data.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(bytes.data as pyre_object::gc_hook::GCREF)
-    {
+    if !bytes.data.is_null() {
         let data_slot = std::ptr::addr_of_mut!(bytes.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
@@ -1332,15 +1329,15 @@ unsafe fn tuple_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 unsafe fn unicode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let unicode = unsafe { &mut *(obj_addr as *mut pyre_object::unicodeobject::W_UnicodeObject) };
     f(&mut unicode.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    // Same `try_gc_owns_object` gate as `bytes_object_custom_trace`: an
-    // exact immortal `str` keeps a `malloc_raw` `Wtf8Buf` the collector
-    // must not treat as a box, while a managed value box has to be greyed
-    // or a later `hash()` reads a swept `Vec` length (`capacity overflow`).
-    if !unicode.value.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(unicode.value as pyre_object::gc_hook::GCREF)
-    {
+    // `unicodeobject.py W_UnicodeObject._utf8` is traced unconditionally.
+    // Off-heap payloads are immortal `rstr.STR` leaves
+    // (`alloc_raw_utf8_payload` / `init_gc_object_immortal`); managed
+    // payloads are nursery STR.
+    if !unicode.value.is_null() {
         f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
     }
+    // `index_storage` on an immortal holder is `malloc_raw` (tid 0), not a
+    // header-bearing STR payload.
     if !unicode.index_storage.is_null()
         && pyre_object::gc_hook::try_gc_owns_object(
             unicode.index_storage as pyre_object::gc_hook::GCREF,
@@ -2452,7 +2449,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     // Function carries inline `PyObjectRef` fields (code / closure /
     // defs_w / w_kw_defs / w_module / cached metadata) plus its `name`
-    // GC-managed storage box that the collector must walk —
+    // rstr `STR` that the collector must walk —
     // `object_subclass_with_gc_ptrs` records the offsets (including
     // `FUNCTION_NAME_OFFSET`) so mark traversal reaches them.
     // `BUILTIN_FUNCTION_TYPE` is a separate static `PyType` for module-level
@@ -2460,9 +2457,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // instances are the same Rust struct, so the vtable map sends
     // both PyTypes to `function_tid`. The destructor reclaims only the inline
     // `mutate_<name>` slots (`function.py:34-42 _immutable_fields_`), which the
-    // function owns outright: a managed function's `name` box is reclaimed by
-    // its own tid's drop glue, and reaching it from here would double-free a
-    // box swept before its owner.
+    // function owns outright: a managed function's `name` `STR` is reclaimed
+    // as a varsize leaf, and reaching it from here would double-free a
+    // payload swept before its owner.
     let function_tid = gc.register_type(
         TypeInfo::object_subclass_with_gc_ptrs(
             std::mem::size_of::<pyre_interpreter::function::Function>(),
@@ -5014,12 +5011,12 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::rutf8::Utf8IndexStorage>,
         pyre_object::unicodeobject::set_utf8_index_gc_type_id,
     );
-    // Mortal `name` string storage box shared by heap `W_TypeObject` and user
-    // `Function` (off-GC storage). A leaf `String` (no inner refs); the
-    // type's `type_object_custom_trace` name-slot greying and the function's
-    // `FUNCTION_NAME_OFFSET` gc-pointer edge grey it, and the box tid's drop glue
-    // reclaims the buffer on sweep. Only mortal holders box their name; immortal
-    // builtin types/functions keep a `malloc_raw` name. Keep this id at the
+    // Mortal `name` string storage box for heap `W_TypeObject` (off-GC
+    // storage). A leaf `String` (no inner refs); the type's
+    // `type_object_custom_trace` name-slot greying reaches it, and the box
+    // tid's drop glue reclaims the buffer on sweep. Only mortal types box
+    // their name; immortal builtin types keep a `malloc_raw` name. Function
+    // names are rstr `STR` payloads, not this box. Keep this id at the
     // absolute registration tail.
     register_leaf_storage_box::<pyre_object::typeobject::NameStorage>(
         &mut gc,
@@ -5149,9 +5146,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // insertion anywhere earlier renumbers every registration below it while the
     // `debug_assert_eq!`s that pair each literal with its registration are
     // compiled out of a release build. Allocations made before this line read a
-    // zero tid and take `alloc_bytes_block`'s plain-allocation arm; the trace
-    // skips those blocks on `try_gc_owns_object`, as it did for the storage box
-    // from its own later registration point.
+    // zero tid and take `alloc_bytes_block`'s immortal-leaf arm
+    // (`init_gc_object_immortal`); `visit` skips those via `NO_HEAP_PTRS`.
     let bytes_block_token = &pyre_object::bytesobject::BYTES_BLOCK_TOKEN;
     let bytes_block_tid = gc.register_type(TypeInfo::varsize(
         bytes_block_token.base_size,

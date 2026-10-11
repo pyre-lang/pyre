@@ -314,13 +314,15 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
 /// on every later store. Neither condition holds for a box allocated here in
 /// general, so a payload may use this only if it is a leaf and stays one (the
 /// `None` / `True` / `False` / `NotImplemented` / `Ellipsis` singletons, whose
-/// whole body is a `PyObject` header with a null `w_class`), or if its
-/// constructor barriers the whole box before anything can collect and every
-/// later reference store is barriered too. An ordinary `#[pyre_class]` box does
-/// NOT qualify — its reference fields are written at construction with no write
-/// barrier, so once the first barrier on any other field opens the object, a
-/// major would follow those never-updated slots into freed memory. See
-/// [`alloc_with_gc_header`] for the measured failure that rule comes from.
+/// whole body is a `PyObject` header with a null `w_class`), an interned
+/// exact-str wrapper (`w_str_from_wtf8_immortal`: off-heap `w_class`, raw
+/// `value` / `index_storage`), or if its constructor barriers the whole box
+/// before anything can collect and every later reference store is barriered
+/// too. An ordinary `#[pyre_class]` box does NOT qualify — its reference
+/// fields are written at construction with no write barrier, so once the first
+/// barrier on any other field opens the object, a major would follow those
+/// never-updated slots into freed memory. See [`alloc_with_gc_header`] for the
+/// measured failure that rule comes from.
 pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
     alloc_with_gc_header_flags(
         value,
@@ -329,6 +331,66 @@ pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
             crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
         ),
     )
+}
+
+/// Varsize analogue of [`alloc_with_gc_header_immortal`].
+///
+/// `rstr.STR` is a `GcStruct` (`rstr.py`); a prebuilt `rpy_string` carries a
+/// header stamped by `init_gc_object_immortal` (`gc/base.py` /
+/// `incminimark.py`). The returned pointer is the address after the header, so
+/// `{hash, len, chars}` readers stay unchanged. A payload holds no GC pointer,
+/// so it is a true leaf (`GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`).
+/// Returns null on overflow or allocation failure.
+pub fn alloc_varsize_with_gc_header_immortal(payload_size: usize, type_id: u32) -> *mut u8 {
+    alloc_varsize_with_gc_header_immortal_zeroed_flag(payload_size, type_id, false)
+}
+
+/// [`alloc_varsize_with_gc_header_immortal`] with the payload bytes cleared.
+pub fn alloc_varsize_with_gc_header_immortal_zeroed(payload_size: usize, type_id: u32) -> *mut u8 {
+    alloc_varsize_with_gc_header_immortal_zeroed_flag(payload_size, type_id, true)
+}
+
+fn varsize_immortal_layout(payload_size: usize) -> Option<std::alloc::Layout> {
+    let total = GcHeader::SIZE.checked_add(payload_size)?;
+    std::alloc::Layout::from_size_align(total, GcHeader::SIZE).ok()
+}
+
+fn alloc_varsize_with_gc_header_immortal_zeroed_flag(
+    payload_size: usize,
+    type_id: u32,
+    zeroed: bool,
+) -> *mut u8 {
+    let Some(layout) = varsize_immortal_layout(payload_size) else {
+        return std::ptr::null_mut();
+    };
+    unsafe {
+        let raw = if zeroed {
+            std::alloc::alloc_zeroed(layout)
+        } else {
+            std::alloc::alloc(layout)
+        };
+        if raw.is_null() {
+            return std::ptr::null_mut();
+        }
+        (raw as *mut GcHeader).write(GcHeader::with_flags(
+            type_id,
+            crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
+        ));
+        raw.add(GcHeader::SIZE)
+    }
+}
+
+/// Free a payload returned by [`alloc_varsize_with_gc_header_immortal`].
+///
+/// # Safety
+/// `payload` must be a live pointer from that allocator, and `payload_size`
+/// must be the size passed at allocation.
+pub unsafe fn dealloc_varsize_with_gc_header(payload: *mut u8, payload_size: usize) {
+    if payload.is_null() {
+        return;
+    }
+    let layout = varsize_immortal_layout(payload_size).expect("dealloc_varsize_with_gc_header");
+    unsafe { std::alloc::dealloc(payload.sub(GcHeader::SIZE), layout) };
 }
 
 fn alloc_with_gc_header_flags<T>(value: T, header: GcHeader) -> *mut T {
@@ -464,6 +526,21 @@ mod tests {
             assert_eq!((*hdr).flags(), GcFlags::empty());
             assert!(!(*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert!(!(*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
+        }
+    }
+
+    #[test]
+    fn alloc_varsize_with_gc_header_immortal_stamps_init_gc_object_immortal() {
+        let p = alloc_varsize_with_gc_header_immortal(16, 0x2468);
+        assert!(!p.is_null());
+        unsafe {
+            (p as *mut u64).write(0x1111_2222_3333_4444);
+            let hdr = header_of(p as usize);
+            assert_eq!((*hdr).type_id(), 0x2468);
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+            assert_eq!(*(p as *const u64), 0x1111_2222_3333_4444);
+            dealloc_varsize_with_gc_header(p, 16);
         }
     }
 

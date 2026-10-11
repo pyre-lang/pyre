@@ -26,8 +26,8 @@ use crate::pyobject::*;
 ///
 /// Layout matches [`crate::lowlevel_string`]: hash @0, len @8, chars @16.
 /// Mortal strings allocate through the registered low-level STR GC tid;
-/// immortal holders keep a raw `STR` so an immortal header never greys a
-/// young box.
+/// immortal holders keep an off-heap `STR` stamped `init_gc_object_immortal`
+/// (`rstr.py` `GcStruct('rpy_string')`).
 #[repr(C)]
 pub struct Utf8Str {
     pub hash: isize,
@@ -72,11 +72,11 @@ fn alloc_raw_utf8_payload(len: usize) -> i64 {
     let Some(total) = LOWLEVEL_STR_BASE_SIZE.checked_add(len) else {
         return 0;
     };
-    let layout = std::alloc::Layout::from_size_align(total, std::mem::align_of::<usize>())
-        .expect("utf8 payload layout");
-    // Same contract as `bh_alloc_str_nofill`: hash 0, length, trailing NUL.
-    // `chars` is filled by the caller.
-    let ptr = unsafe { std::alloc::alloc(layout) };
+    // `rstr.STR` is a `GcStruct`; a prebuilt `rpy_string` carries
+    // `init_gc_object_immortal`. The pointer handed out is the address after
+    // the header, so `{hash, len, chars}` readers stay unchanged.
+    let ptr =
+        majit_gc::header::alloc_varsize_with_gc_header_immortal(total, lowlevel_str_gc_type_id());
     if ptr.is_null() {
         return 0;
     }
@@ -151,9 +151,11 @@ pub struct W_UnicodeObject {
     /// rebuild.
     ///
     /// A managed holder boxes it (`utf8_index_gc_type_id`) and is greyed
-    /// through this slot; an immortal holder keeps a `malloc_raw` table the
-    /// walker's `is_managed_heap_object` edge guard skips, the same split its
-    /// `value` buffer already makes.
+    /// through this slot; an immortal holder keeps a `malloc_raw` table
+    /// (`w_str_compute_index_storage` tid 0), the same split its `value`
+    /// buffer already makes. That store already runs `try_gc_write_barrier`,
+    /// so `remember_young_pointer` / `_remember_young_pointer_inlined` would
+    /// clear `NO_HEAP_PTRS` if a heap pointer were ever written here.
     pub index_storage: *mut crate::rutf8::Utf8IndexStorage,
     /// Memoized digest, `rstr.py LLHelpers.ll_strhash`.  RPython
     /// keeps the hash in the string itself and recomputes only while the
@@ -673,13 +675,17 @@ pub unsafe fn w_str_cut(recv: PyObjectRef, piece: &Wtf8) -> PyObjectRef {
     w_str_from_wtf8_managed(piece.to_wtf8_buf())
 }
 
-/// Immortal `w_str_from_wtf8`: always allocates through `malloc_typed`,
-/// bypassing the `gc_interp` gate so the result is never collected.
+/// Immortal `w_str_from_wtf8`: `malloc_typed_immortal` /
+/// `init_gc_object_immortal` (`GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`).
 ///
-/// `box_str_constant` stores its result as a bare `usize` in the thread-local
-/// `STRING_CONSTANT_CACHE`, which is not a GC root; a collectable interned
-/// constant would be swept out from under the cache (use-after-free).  Interned
-/// constants are bounded, so keeping them immortal is the intended split.
+/// An off-heap exact-str wrapper is a prebuilt leaf: `w_class` is the
+/// builtin `STR_TYPE` instantiate (itself off-heap), `value` is
+/// `alloc_raw_utf8_payload` (an immortal `rstr.STR` leaf), and
+/// `index_storage` is either null or `gc_alloc_storage_box` with tid 0
+/// (`malloc_raw`). None of those slots can name a heap object, so `visit`
+/// may skip the wrapper while `NO_HEAP_PTRS` holds. `intern_wtf8_value`'s
+/// immortal arm, `box_str_constant`, and `intern_publish_const` all allocate
+/// through here.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
@@ -691,7 +697,7 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
         char_len += 1;
     }
     let value = alloc_utf8_payload(value.as_bytes(), false);
-    crate::lltype::malloc_typed(W_UnicodeObject {
+    crate::lltype::malloc_typed_immortal(W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
             w_class: get_instantiate(&STR_TYPE),
@@ -911,11 +917,15 @@ pub fn init_interned_strings() {
 
 /// Extra-root the `WEAKDICT` object (`baseobjspace.py` `interned_strings`).
 /// Its `entries` field is an ordinary GC pointer, traced with the object.
-/// The interned strings themselves are not roots. A minor's extra-root walk
-/// forwards this pointer and does not scan `entries` unless the object write
-/// barrier remembered it. `ll_set_nonnull` write-barriers the entries array
+/// The interned strings themselves are not roots: immortal wrappers from
+/// `w_str_from_wtf8_immortal` carry `init_gc_object_immortal` flags, and
+/// `visit` skips a prebuilt object that is not in `prebuilt_root_objects`.
+/// A managed `sys.intern` value lives as a weak value in this dict, so the
+/// `WEAKDICT` object stays a root. A minor's extra-root walk forwards this
+/// pointer and does not scan `entries` unless the object write barrier
+/// remembered it. `ll_set_nonnull` write-barriers the entries array
 /// (`setarrayitem_gc`) so `collect_oldrefs_to_nursery` traces a young WEAKREF
-/// and `invalidate_young_weakrefs` rewrites `weakptr` (`incminimark.py`).
+/// and `invalidate_young_weakrefs` rewrites `weakptr`.
 pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut table = lock_intern();
     if table.0.is_null() || !crate::gc_hook::try_gc_owns_object(table.0 as crate::gc_hook::GCREF) {
@@ -2396,6 +2406,50 @@ mod tests {
 
     fn managed_alloc_is_owned(addr: usize) -> bool {
         MANAGED_ALLOCS.with(|slots| slots.borrow().contains(&addr))
+    }
+
+    /// `w_str_from_wtf8_immortal` (and the intern / constant publishers that
+    /// allocate through it) stamps `init_gc_object_immortal`.
+    #[test]
+    fn w_str_from_wtf8_immortal_stamps_init_gc_object_immortal_flags() {
+        let obj = w_str_from_wtf8_immortal(Wtf8Buf::from("__pyre_immortal_str_leaf_s2__"));
+        unsafe {
+            let hdr = majit_gc::header::header_of(obj as usize);
+            assert_eq!((*hdr).type_id(), W_UNICODE_GC_TYPE_ID);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+        let interned = intern_wtf8_value(Wtf8::new("__pyre_immortal_intern_leaf_s2__"));
+        unsafe {
+            let hdr = majit_gc::header::header_of(interned as usize);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+        let boxed = box_str_constant(Wtf8::new("__pyre_immortal_const_leaf_s2__"));
+        unsafe {
+            let hdr = majit_gc::header::header_of(boxed as usize);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+    }
+
+    /// Off-heap `rstr.STR` payloads stamp `init_gc_object_immortal` in front
+    /// of `{hash, len, chars}`; the pointer handed out is the payload.
+    #[test]
+    fn alloc_raw_utf8_payload_stamps_init_gc_object_immortal_flags() {
+        let p = alloc_utf8_payload(b"leaf", false);
+        assert!(!p.is_null());
+        unsafe {
+            let hdr = majit_gc::header::header_of(p as usize);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+            assert_eq!(utf8_payload_bytes(p), b"leaf");
+        }
+        crate::lowlevel_string::bh_free_lowlevel_string(
+            p as i64,
+            crate::lowlevel_string::LOWLEVEL_STR_BASE_SIZE,
+            1,
+        );
     }
 
     /// A miss through `intern_wtf8_value` is immortal even when the
