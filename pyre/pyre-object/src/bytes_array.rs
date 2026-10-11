@@ -57,6 +57,7 @@ impl BytesArray {
         unsafe { items_block_items_base(self.block) }
     }
 
+    #[inline]
     pub fn empty() -> Self {
         Self {
             block: std::ptr::null_mut(),

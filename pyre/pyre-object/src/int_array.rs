@@ -87,6 +87,7 @@ impl IntArray {
     /// The block helpers already read null as capacity zero, `grow` and
     /// `dealloc` already special-case it, and `list_object_custom_trace`
     /// forwards the owning slot only when the collector owns what it holds.
+    #[inline]
     pub fn empty() -> Self {
         Self {
             block: std::ptr::null_mut(),
@@ -166,6 +167,7 @@ impl IntArray {
     /// Adopt an already-allocated Signed items block. The block is the
     /// `ll_newlist` result; `ll_arraycopy` fills it before the list header
     /// takes the edge.
+    #[inline]
     pub fn from_block(block: *mut TypedItemsBlock, len: usize) -> Self {
         Self {
             block,

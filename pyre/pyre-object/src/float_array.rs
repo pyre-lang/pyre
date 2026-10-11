@@ -69,6 +69,7 @@ impl FloatArray {
     /// Storage for a list whose strategy does not read this array. The
     /// [`crate::int_array::IntArray::empty`] twin — see it for why
     /// `from_vec(Vec::new())` is not the same thing.
+    #[inline]
     pub fn empty() -> Self {
         Self {
             block: std::ptr::null_mut(),

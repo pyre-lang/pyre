@@ -6081,7 +6081,8 @@ fn simplify_lowered_graph_expanding(
     // native `NewWithVtable` + payload stores before the dead-aggregate sweep,
     // which then reclaims the orphaned construct-on-stack ctor and header
     // field writes.
-    dirty |= crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
+    dirty |=
+        crate::model::fuse_boxing_alloc_with(graph, struct_field_attrs, expand_inline_struct) > 0;
     // After boxing fusion has read the header store, a leftover by-value
     // write of an inlined struct is one setfield per inner leaf.
     dirty |= crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)

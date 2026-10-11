@@ -4560,6 +4560,14 @@ pub fn fuse_boxing_alloc(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> usize {
+    fuse_boxing_alloc_with(graph, struct_field_attrs, &|_, _| None)
+}
+
+pub(crate) fn fuse_boxing_alloc_with(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+) -> usize {
     use crate::flowspace::model::Variable;
     // Gate names come from `crate::decline::gate` rather than being
     // spelled here: a name defined at its call site can be referenced
@@ -5487,6 +5495,17 @@ pub fn fuse_boxing_alloc(
             let mut payloads = Vec::with_capacity(fields.len());
             let mut complete = true;
             for (field_name, payload_ty) in &fields {
+                // Inlined nested structs (`W_ListObject.int_items: IntArray`)
+                // are not payload setfields of the boxing cluster.
+                // `NewWithVtable` zero-fills them (`clear_gc_fields`); the
+                // owner then stores dotted leaves (`int_items.block`)
+                // through `list.int_set_items` / `heaptracker.py
+                // all_fielddescrs`. A by-value store of the nested struct
+                // would apply the inner offsets to the outer object and
+                // overlay `ob_header`.
+                if expand_inline_struct(&owner, field_name).is_some() {
+                    continue;
+                }
                 let found = unique_store(graph, agg, field_name.as_str()).and_then(|store| {
                     store
                         .locations
@@ -13516,6 +13535,187 @@ mod tests {
                     if segments.last().map(String::as_str) == Some("malloc_typed")
             )),
             "no malloc_typed call may survive the fusion"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_skips_inlined_nested_struct_payload() {
+        // `w_list_adopt_int_items` builds `W_ListObject` with a by-value
+        // `int_items: IntArray` store. Copying that store onto the fused
+        // `NewWithVtable` result would apply `IntArray.block`'s offset 0
+        // to the list and overlay `ob_header`. Production
+        // `simplify_lowered_graph_expanding` skips those fields; this
+        // fixture is that skip.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("IntArray"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some(vec![(
+                FieldDescriptor {
+                    name: "int_items.block".into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                ValueType::Ref(None),
+            )])
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(fused, 1, "the list boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        let mut got: Vec<String> = Vec::new();
+        for op in ops.iter().skip(nwv_pos + 1) {
+            match &op.kind {
+                OpKind::FieldWrite { base, field, .. } if base == &ret => {
+                    got.push(field.name.clone());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                "allocated".to_string(),
+                "items".to_string(),
+                "strategy".to_string(),
+            ],
+            "inlined nested int_items must not become a payload store on the fused result"
         );
     }
 

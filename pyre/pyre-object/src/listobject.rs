@@ -353,6 +353,14 @@ pub const W_LIST_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObject>();
 pub const W_LIST_USER_GC_TYPE_ID: u32 = 165;
 pub const W_LIST_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObjectUser>();
 
+impl crate::lltype::GcType for W_ListObject {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_LIST_GC_TYPE_ID
+    }
+    const SIZE: usize = W_LIST_OBJECT_SIZE;
+}
+
 impl crate::lltype::GcType for W_ListObjectUser {
     #[inline(always)]
     fn type_id() -> u32 {
@@ -3135,6 +3143,11 @@ pub fn ll_list_int_capacity(l: &W_ListObject) -> usize {
 /// Store the Integer-strategy live length (`_ll_list_resize_ge`'s
 /// `l.length = newsize`, rlist.py:293). The caller has already ensured
 /// the block has room, so this only bumps the length field.
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `setfield_gc_i(int_items.len)`. rustc otherwise
+/// inlines the store as `FieldWrite(len)` on the nested `IntArray`.
+#[inline(never)]
 #[majit_macros::oopspec("list.int_set_len(l, n)")]
 pub fn ll_list_int_set_len(l: &mut W_ListObject, n: usize) {
     l.int_items.set_len(n);
@@ -3867,61 +3880,41 @@ unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
 /// `wraptuple` adopts `tuple_ll_newlist`'s array. Typed strategies keep
 /// `length == 0` and a null object `items` block.
 ///
-/// Native path opens a RootScope so the block and class pins pop on
-/// return (`gct_fv_gc_malloc` would have inserted that bracket).
-///
-/// Residual (`dont_look_inside`), same collector-heap allocation boundary
-/// as `w_int_gc_alloc` / `w_tuple_adopt_fixed_items`. Upstream
-/// `from_storage_and_strategy` is `instantiate` plus field stores, which
-/// records `new_with_vtable` + `setfield_gc`. The write-into-block
-/// `try_gc_alloc_nursery_raw` is not the `malloc_typed(%agg)` cluster
-/// `fuse_boxing_alloc` rewrites; a `malloc_typed` header would sit off
-/// the collector heap while `int_items.block` is a nursery array.
-/// The boundary goes when the write-into-block shape lowers. Allocation
-/// failure aborts rather than raising, so the residual carries no
-/// `guard_no_exception` — matching `new_with_vtable` upstream.
+/// Look-inside: `from_storage_and_strategy` is `instantiate` plus field
+/// stores (`listobject.py`), which records `new_with_vtable` +
+/// `setfield_gc`. `malloc_typed_managed` is the boxing primitive
+/// `w_str_from_storage_and_length` / specialised-tuple constructors
+/// expose so `fuse_boxing_alloc` emits that cluster. Nested typed
+/// storage is not a by-value `IntArray` store: rustc would write that
+/// with the inner struct's offsets on the list, overlaying `ob_header`.
+/// `list.int_set_items` / `list.int_set_len` keep the oopspec call so
+/// jtransform emits `setfield_gc` of `int_items.block` / `int_items.len`.
+/// `NewWithVtable` zero-fills the unused typed arrays. It does not
+/// collect, so the nursery items block the caller allocated stays the
+/// address passed in. A list born old by the allocator's fallback leaves
+/// `malloc_typed_managed` already on `old_objects_pointing_to_young`
+/// (`remember_young_pointer` clears `GCFLAG_TRACK_YOUNG_PTRS` once per
+/// object, not per store), and neither store below can collect, so the
+/// next minor traces `int_items.block` from that entry.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObjectRef {
-    let _roots = crate::gc_roots::push_roots();
-    let block_slot = crate::gc_roots::shadow_stack_len();
-    if !block.is_null() {
-        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
-    }
-    let w_class = get_instantiate(&LIST_TYPE);
-    let class_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(w_class);
-    let header = || PyObject {
-        ob_type: &LIST_TYPE as *const PyType,
-        w_class: crate::gc_roots::shadow_stack_get(class_slot),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE);
-    let block_now = if block.is_null() {
-        std::ptr::null_mut()
-    } else {
-        crate::gc_roots::shadow_stack_get(block_slot) as *mut TypedItemsBlock
-    };
-    let int_items = IntArray::from_block(block_now, n);
-    let built = W_ListObject {
-        ob_header: header(),
+    let list = crate::lltype::malloc_typed_managed(W_ListObject {
+        ob_header: PyObject {
+            ob_type: &LIST_TYPE as *const PyType,
+            w_class: get_instantiate(&LIST_TYPE),
+        },
         allocated: n as isize,
         length: AtomicUsize::new(0),
         items: std::ptr::null_mut(),
         strategy: ListStrategy::Integer,
-        int_items,
+        int_items: IntArray::empty(),
         float_items: FloatArray::empty(),
         bytes_items: BytesArray::empty(),
         ascii_items: UnicodeArray::empty(),
-    };
-    // One return so the RootScope Drop is a regular close, not an
-    // unwind-edge cleanup `stack_sensitivity` does not follow.
-    if !raw.is_null() {
-        std::ptr::write(raw as *mut W_ListObject, built);
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        raw as PyObjectRef
-    } else {
-        Box::into_raw(Box::new(built)) as PyObjectRef
-    }
+    });
+    ll_list_int_set_items(&mut *list, block);
+    ll_list_int_set_len(&mut *list, n);
+    list as PyObjectRef
 }
 
 /// `rlist.py ll_listslice_startstop`: `ll_newlist` plus `ll_arraycopy`.

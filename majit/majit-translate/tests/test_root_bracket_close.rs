@@ -38,22 +38,48 @@ use common::{
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured};
 use majit_translate::CallPath;
+use majit_translate::HostStaticAddrs;
 use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
-use majit_translate::front::mir::{LowerContext, erased_root_bracket_guards, lower_fun_decl};
+use majit_translate::front::mir::{
+    LowerContext, erased_root_bracket_guards, lower_fun_decl, lower_fun_decl_with_static_addrs,
+};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 
-fn lower_fun(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGraph {
+fn fun_decl_named<'a>(llbc: &'a Llbc, leaf: &str) -> &'a majit_charon_reader::FunDecl {
     let suffix = format!("::{leaf}");
-    let fd = llbc
-        .iter_local_fns()
+    llbc.iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
-        .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
-    lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
+        .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"))
+}
+
+fn lower_fun(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGraph {
+    lower_fun_decl(context, fun_decl_named(llbc, leaf))
+        .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
 }
 
 fn lower_named(llbc: &'static Llbc, leaf: &str) -> FunctionGraph {
     lower_fun(llbc, lower_context_for(llbc), leaf)
+}
+
+/// Same class-static bucket the production driver stamps
+/// (`jit_fnaddr.rs jit_static_pytype_addrs`). `fuse_boxing_alloc` needs
+/// a constant `ob_type` address to emit `NewWithVtable`; an empty
+/// `HostStaticAddrs.pytypes` leaves `&LIST_TYPE` as a residual call.
+fn lower_named_with_pytypes(
+    llbc: &'static Llbc,
+    leaf: &str,
+    pytypes: &[(&str, i64)],
+) -> FunctionGraph {
+    lower_fun_decl_with_static_addrs(
+        lower_context_for(llbc),
+        fun_decl_named(llbc, leaf),
+        HostStaticAddrs {
+            pytypes,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
 }
 
 /// Count calls whose path ends with `leaf`, over every block of the graph.
@@ -740,6 +766,59 @@ fn ll_listslice_new_int_list_newlist_becomes_new_array() {
         calls_to(&out.graph, "int_ll_newlist"),
         0,
         "int_ll_newlist must not remain a residual call after newlist(length) rewrite"
+    );
+}
+
+/// `from_storage_and_strategy` is `instantiate` plus field stores.
+/// `w_list_adopt_int_items` is that cluster: `malloc_typed_managed` fuses
+/// to `NewWithVtable`, and the live Integer storage is the oopspec
+/// `list.int_set_items` / `list.int_set_len` pair. The class address is
+/// the production `pyobject::LIST_TYPE` row (`jit_static_pytype_addrs`).
+#[test]
+fn w_list_adopt_int_items_fuses_to_new_with_vtable() {
+    let Some(llbc) = object_llbc() else { return };
+    const LIST_TYPE_ADDR: i64 = 0x00C0_FFEE;
+    let graph = lower_named_with_pytypes(
+        llbc,
+        "w_list_adopt_int_items",
+        &[("pyobject::LIST_TYPE", LIST_TYPE_ADDR)],
+    );
+    let kinds: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .map(|op| match &op.kind {
+            OpKind::NewWithVtable { owner, .. } => format!("NewWithVtable:{owner}"),
+            OpKind::New { owner } => format!("New:{owner}"),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => format!("Call:{}", segments.last().cloned().unwrap_or_default()),
+            OpKind::FieldWrite { field, .. } => format!("FieldWrite:{}", field.name),
+            other => format!("{other:?}")
+                .split('(')
+                .next()
+                .unwrap_or("op")
+                .to_string(),
+        })
+        .collect();
+    let nwv = kinds
+        .iter()
+        .filter(|k| k.starts_with("NewWithVtable:") && k.contains("W_ListObject"))
+        .count();
+    assert_eq!(
+        nwv, 1,
+        "adopt must record new_with_vtable of W_ListObject, ops={kinds:?}"
+    );
+    assert_eq!(
+        calls_to(&graph, "malloc_typed_managed"),
+        0,
+        "malloc_typed_managed must fuse rather than stay residual"
+    );
+    assert_eq!(
+        calls_to(&graph, "ll_list_int_set_items") + calls_to(&graph, "ll_list_int_set_len"),
+        2,
+        "live Integer storage is the oopspec set_items / set_len pair"
     );
 }
 

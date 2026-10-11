@@ -4801,6 +4801,32 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py `deal_with_young_objects_with_finalizers` drops a
+    /// `GCFLAG_IGNORE_FINALIZER` member from the young deque (`continue`), so
+    /// nothing keeps it alive and `free_young_rawmalloced_objects` may release
+    /// its block. A non-moving major runs without that minor:
+    /// [`Self::nonmoving_major_trace_young_finalizers`] leaves such a member
+    /// unmarked, and this cycle then releases the block with the entry still
+    /// on the deque. The next minor would read whatever was born at that
+    /// address and file it as a finalizer object. Drop the young raw-malloced
+    /// entries the minor would have dropped, before the blocks go.
+    fn drop_ignored_young_rawmalloc_finalizers_nonmoving(&mut self) {
+        debug_assert!(self.oldgen_nonmoving_active);
+        if self.probably_young_objects_with_finalizers.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.probably_young_objects_with_finalizers);
+        for (obj_addr, fq_index) in queued {
+            if self.is_young_rawmalloced(obj_addr)
+                && unsafe { (*header_of(obj_addr)).has_flag(GcFlags::GCFLAG_IGNORE_FINALIZER) }
+            {
+                continue;
+            }
+            self.probably_young_objects_with_finalizers
+                .push_back((obj_addr, fq_index));
+        }
+    }
+
     /// Young rawmallocs a non-moving major did not mark, before their blocks
     /// are released.
     ///
@@ -8345,6 +8371,7 @@ impl MiniMarkGC {
         // owes the minor's young-rawmalloc destructor pass: that minor did
         // not run, and the blocks are released after this seam.
         if self.oldgen_nonmoving_active {
+            self.drop_ignored_young_rawmalloc_finalizers_nonmoving();
             self.deal_with_young_rawmalloc_destructors_nonmoving();
         }
         if !self.old_objects_with_destructors.is_empty() {
@@ -18130,6 +18157,42 @@ cache size\t: 8192 kB\n";
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(TRIGGERS.load(Ordering::Relaxed), 0);
         assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
+    }
+
+    /// A non-moving major releases an unreachable young raw-malloced object
+    /// whose finalizer is ignored. Its entry has to leave the young deque with
+    /// it: the next minor would otherwise file whatever is born at that
+    /// address as a finalizer object.
+    #[test]
+    fn nonmoving_major_drops_an_ignored_young_rawmalloc_finalizer_entry() {
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        gc.next_major_collection_threshold = 1_000_000_000.0;
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let large = gc.config.large_object_threshold + 64;
+
+        let dead = gc.alloc_with_type(tid, large);
+        let mut kept = gc.alloc_with_type(tid, large);
+        unsafe { gc.roots.add(&mut kept) };
+        assert!(gc.is_young_rawmalloced(dead.0));
+        assert!(gc.is_young_rawmalloced(kept.0));
+        GcAllocator::register_finalizer(&mut gc, 0, dead, trigger);
+        GcAllocator::register_finalizer(&mut gc, 0, kept, trigger);
+        assert_eq!(gc.probably_young_objects_with_finalizers.len(), 2);
+        GcAllocator::ignore_finalizer(&mut gc, dead);
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert!(!gc.is_young_rawmalloced(dead.0));
+        let queued: Vec<usize> = gc
+            .probably_young_objects_with_finalizers
+            .iter()
+            .map(|&(addr, _)| addr)
+            .collect();
+        assert_eq!(queued, vec![kept.0]);
+        assert!(gc.old_objects_with_finalizers.is_empty());
+        gc.roots.clear();
     }
 
     /// An address the collector does not own has no header to stamp, so the
