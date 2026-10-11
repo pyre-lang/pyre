@@ -10022,6 +10022,13 @@ impl<'a> Assembler386<'a> {
         );
         let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
         rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
+        // `gen_initialize_tid_keep_flags` stores only the type-id half.
+        // Clear the whole header word on this fast path so a recycled
+        // nursery slot cannot keep `GCFLAG_HAS_SHADOW`, `GCFLAG_PINNED`,
+        // or the high half of `FORWARDED_MARKER`. The slow path does not
+        // clear: a young raw-malloced frame carries `YOUNG_RAWMALLOC`,
+        // and `set_continue_here` is after this store.
+        rx86::mov_mi(&mut self.mc, (rx86::ECX, 0), 0);
         self.forget_if_scratch_written(result_reg);
         rx86::lea_rm(&mut self.mc, result_reg, (rx86::ECX, gc_header_size));
         self.set_continue_here(&mut sp);

@@ -654,7 +654,9 @@ fn may_force_guard_not_forced_reads_failarg() {
     // alone. A helper that does not force falls through `GUARD_NOT_FORCED`
     // (`CMP [jf_descr], 0`). A helper that forces copies that descr into
     // `jf_descr`, so the guard fails and the live fail arg is readable both
-    // during `force` and on the side exit.
+    // during `force` and on the side exit. That failure stub loads and
+    // clears the process-wide exception cells.
+    let _lock = lock_exception_cells();
     let (finished, after, during) = run_may_force(force_nop);
     assert!(during.is_none(), "nop helper must not force");
     assert!(finished, "GUARD_NOT_FORCED must pass when nothing forces");
@@ -711,7 +713,18 @@ fn guard_not_forced_2_constant_failarg_is_hole() {
     assert_eq!(backend.get_int_value(&forced, 1), 0);
 }
 
-static COND_CALL_EXC_LOCK: Mutex<()> = Mutex::new(());
+/// `JIT_EXC_VALUE` / `JIT_EXC_TYPE` (`pos_exc_value` / `pos_exception`).
+/// The cells are process-wide and the JIT clears them with plain stores,
+/// so every test that pre-raises or whose executed code reaches them
+/// shares this lock.
+static EXCEPTION_CELLS_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_exception_cells() -> std::sync::MutexGuard<'static, ()> {
+    EXCEPTION_CELLS_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
 static EXC_OBJ: [i64; 2] = [0x5151_0D11, 0];
 
 struct ClearExc;
@@ -765,9 +778,7 @@ fn cond_call_guard_no_exception_checks_the_call_path() {
     // pre-raised exception is still pending at `FINISH`. The call path runs
     // `CMP [pos_exception], 0` and, on failure, `grab_exc_value` reads the
     // value the recovery stub stashed.
-    let _lock = COND_CALL_EXC_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_exception_cells();
     let _clear = ClearExc;
     majit_backend_dynasm::jit_exc_clear();
 
@@ -1863,9 +1874,7 @@ fn check_memory_error_nonzero_falls_through() {
 fn check_memory_error_null_propagates() {
     let (backend, token) = compile_check_memory_error();
     // `generate_propagate_error_64` clears the process-wide exception cells.
-    let _lock = COND_CALL_EXC_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_exception_cells();
     let top = shadow_top();
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
     assert_propagate(&backend, &frame);
@@ -2239,7 +2248,9 @@ fn bridge_frame_depth_reallocates_when_short() {
     );
     // `execute_token` sizes from `jfi_frame_depth`. Put the loop's depth
     // back so the bridge's `jl` is taken and `realloc_frame` runs.
+    // `build_frame_realloc_slowpath` clears both exception cells for that call.
     store_frame_info(&token, loop_depth, loop_size);
+    let _lock = lock_exception_cells();
     let (seen, tip) = run_bridged(&mut backend, &token);
     assert_ne!(seen, tip, "realloc_frame forwards the jitframe");
     store_frame_info(&token, loop_depth, loop_size);
@@ -2346,9 +2357,7 @@ fn stack_check_slowpath_once_per_process() {
     let token = compile_input_finish(&mut backend);
     assert_stack_probe(compiled_bytes(&token));
 
-    let _lock = COND_CALL_EXC_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+    let _lock = lock_exception_cells();
     let _clear = ClearExc;
     STACK_END.store(0, Ordering::Release);
     STACK_LENGTH.store(0, Ordering::Release);
@@ -2608,4 +2617,175 @@ fn call_malloc_nursery_varsize_frame_fit_and_overflow() {
     assert!(!ptr.is_null());
     assert!(!majit_gc::can_move(ptr));
     assert_eq!(unsafe { *(ptr.0 as *const i64) }, 42);
+}
+
+fn finish_int(value: OpRef, pos: u32) -> Op {
+    let op = Op::new(OpCode::Finish, &[rb(value)]);
+    op.pos().set(OpRef::void_op(pos));
+    op.set_fail_arg_types(vec![Type::Int]);
+    op.setfailargs(vec![rb(value)].into());
+    op
+}
+
+/// `TypeInfo::simple` is registered before the jitframe type so a zero
+/// header is not traced as a frame. `tid` is that simple type.
+fn nursery_backend_with_simple(
+    nursery_size: usize,
+    threshold: usize,
+    payload: usize,
+) -> (DynasmBackend, u32) {
+    let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size,
+        large_object_threshold: threshold,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    let tid = gc.register_type(majit_gc::TypeInfo::simple(payload));
+    (wb_backend(gc), tid)
+}
+
+fn gc_store(base: OpRef, ofs: i64, value: OpRef, size: i64, pos: u32) -> Op {
+    op_at(
+        OpCode::GcStore,
+        &[base, OpRef::const_int(ofs), value, OpRef::const_int(size)],
+        OpRef::void_op(pos),
+    )
+}
+
+/// `malloc_cond` overflow. The young object stays live across
+/// `MallocCondSlowPath`. The collection promotes it and the register
+/// must hold the updated pointer, with the marker still in the first word.
+#[test]
+fn call_malloc_nursery_slowpath_updates_live_ref() {
+    let (mut backend, tid) = nursery_backend_with_simple(4096, 1 << 20, 64);
+    let young = OpRef::ref_op(1);
+    let ops = vec![
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(2048)], young),
+        gc_store(
+            young,
+            -(GcHeader::SIZE as i64),
+            OpRef::const_int(i64::from(tid)),
+            8,
+            3,
+        ),
+        gc_store(young, 0, OpRef::const_int(0x5A5A), 8, 4),
+        op_at(
+            OpCode::CallMallocNursery,
+            &[OpRef::const_int(3000)],
+            OpRef::ref_op(5),
+        ),
+        finish_ref(young, 6),
+    ];
+    let token = compile_ops(&mut backend, &[], ops);
+    let frame = backend.execute_token(&token, &[]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(
+        !majit_gc::can_move(ptr),
+        "live ref {:#x} was not updated out of the nursery",
+        ptr.0
+    );
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 0x5A5A);
+    assert!(
+        !unsafe { (*header_of(ptr.0)).has_flag(GcFlags::GCFLAG_HAS_SHADOW) },
+        "promoted object kept HAS_SHADOW"
+    );
+}
+
+/// Header word after the fast path and a 4-byte type-id store.
+/// `FORWARDED_MARKER` was planted at that slot. The high half stays set
+/// until `malloc_cond_varsize_frame` clears the word.
+#[test]
+fn call_malloc_nursery_varsize_frame_fast_path_header_word() {
+    let (mut backend, tid) = nursery_backend_with_simple(1 << 20, 1 << 20, 64);
+    let size = OpRef::input_arg_int(0);
+    let pad = OpRef::ref_op(1);
+    let young = OpRef::ref_op(2);
+    let hdr = OpRef::int_op(3);
+    let ops = vec![
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(64)], pad),
+        gc_store(
+            pad,
+            56,
+            OpRef::const_int(majit_gc::header::FORWARDED_MARKER as i64),
+            8,
+            4,
+        ),
+        op_at(OpCode::CallMallocNurseryVarsizeFrame, &[size], young),
+        gc_store(
+            young,
+            -(GcHeader::SIZE as i64),
+            OpRef::const_int(i64::from(tid)),
+            (majit_gc::header::TYPE_ID_BITS / 8) as i64,
+            5,
+        ),
+        op_at(
+            OpCode::GcLoadI,
+            &[
+                young,
+                OpRef::const_int(-(GcHeader::SIZE as i64)),
+                OpRef::const_int(8),
+            ],
+            hdr,
+        ),
+        finish_int(hdr, 6),
+    ];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(64)]);
+    let word = backend.get_int_value(&frame, 0) as u64;
+    assert_eq!(
+        word >> 32,
+        0,
+        "recycled header flags survived the fast path: {word:#x}"
+    );
+    assert_eq!(word as u32, tid);
+}
+
+/// `malloc_cond_varsize_frame` fast path, then a 4-byte type-id store
+/// (`gen_initialize_tid_keep_flags`). The slot is planted with
+/// `FORWARDED_MARKER`. That word's flag half includes `GCFLAG_PINNED`
+/// and `GCFLAG_HAS_SHADOW`, so a nursery-overflowing `malloc_cond`
+/// leaves the live register pointing at the nursery slot. Clearing the
+/// header word lets the collection promote the object and rewrite it.
+#[test]
+fn call_malloc_nursery_varsize_frame_live_ref_across_recycled_header() {
+    let (mut backend, tid) = nursery_backend_with_simple(4096, 1 << 20, 64);
+    let size = OpRef::input_arg_int(0);
+    let pad = OpRef::ref_op(1);
+    let young = OpRef::ref_op(2);
+    let header_plant = majit_gc::header::FORWARDED_MARKER as i64;
+    let ops = vec![
+        op_at(OpCode::CallMallocNursery, &[OpRef::const_int(64)], pad),
+        gc_store(pad, 56, OpRef::const_int(header_plant), 8, 4),
+        op_at(OpCode::CallMallocNurseryVarsizeFrame, &[size], young),
+        gc_store(
+            young,
+            -(GcHeader::SIZE as i64),
+            OpRef::const_int(i64::from(tid)),
+            (majit_gc::header::TYPE_ID_BITS / 8) as i64,
+            5,
+        ),
+        gc_store(young, 0, OpRef::const_int(0x5A5A), 8, 6),
+        op_at(
+            OpCode::CallMallocNursery,
+            &[OpRef::const_int(4000)],
+            OpRef::ref_op(7),
+        ),
+        finish_ref(young, 8),
+    ];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(64)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(
+        !majit_gc::can_move(ptr),
+        "live ref {:#x} was not updated out of the nursery",
+        ptr.0
+    );
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, 0x5A5A);
+    let hdr = unsafe { *header_of(ptr.0) };
+    assert!(
+        !hdr.has_flag(GcFlags::GCFLAG_HAS_SHADOW),
+        "recycled header kept HAS_SHADOW: {:#x}",
+        hdr.tid_and_flags
+    );
 }
