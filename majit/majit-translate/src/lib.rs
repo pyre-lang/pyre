@@ -795,6 +795,9 @@ fn register_function_graph_alias(
 /// entry, so this runs after that pass. The seed lookup in
 /// `CallControl::find_all_graphs_bfs` and the route-(a) `function_path`
 /// are that one segment; nothing looks up `crate::name` for these helpers.
+/// Residual fnaddr lookup of the seed name follows the shared `GraphKey`
+/// (`CallControl::lookup_function_fnaddr`); the host publishes the source
+/// path once (`support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`).
 fn pin_builtin_graphs(
     graphs: &std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
     bindings: &[(String, crate::parse::CallPath)],

@@ -4914,9 +4914,16 @@ fn catch_and_rewrap(
         let payload_dead = err_payload_is_dead(graph, &orig, r);
         if payload_dead {
             // Nothing reads a dead payload, so the shell is the discriminant
-            // ctor alone and the collapse below does not run.
+            // ctor alone — the same shape `Ok(())` already collapses. A
+            // match consumer (`Err(_)` / `except ValueError:` without
+            // `as e`, `interp_math.py math1`) still has to drop that
+            // switch (`flowcontext.py` `FlowContext.guessexception`).
+            // `let _ = f()` has no match; leave the ctor and skip collapse.
             let shell = push_shell_ctor(graph, e_id, "Err", suffix);
-            (Some(shell), None)
+            let dummy = match_discriminant(graph, orig.target.0)
+                .ok()
+                .map(|_| e_exc_value_in.clone());
+            (Some(shell), dummy)
         } else {
             let v_err = e_exc_value_in;
             let shell = build_shell(
@@ -5167,7 +5174,7 @@ fn arm_shell_vars_from_args(
 /// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
 /// match they feed only reads `__pos_0` and forwards that payload.
 /// An arm that does not receive the shell is a discarded payload
-/// (`Ok(_)`); there is no `__pos_0` to collapse on that edge.
+/// (`Ok(_)` / `Err(_)`); there is no `__pos_0` to collapse on that edge.
 ///
 /// `getindex_w` is `try: int_w(...) except OperationError`. The rebuilt
 /// shell plus the discriminant switch is that `try` spelled as a `Result`.
@@ -5336,7 +5343,16 @@ fn collapse_rebuilt_shell_match(
     let ok_payload_is_void = ok_payload.concretetype()
         == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void);
     let ok_build = shell_build_ops(graph, normal, ok_shell, ok_payload_is_void)?;
-    let err_build = shell_build_ops(graph, handler, err_shell, false)?;
+    // `Err(_)` rebuilds the discriminant ctor and stores nothing, matching
+    // a Void payload (`shell_build_ops` `payload_is_void`).
+    let err_payload_is_void = !graph.blocks[handler].operations.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { base, field, .. }
+                if base == err_shell && field.name == "__pos_0"
+        )
+    });
+    let err_build = shell_build_ops(graph, handler, err_shell, err_payload_is_void)?;
     // Every check has run. The edits below do not fail.
     apply_remove_identical_inputargs(graph, m, &merge);
     let n_exit = single_exit(graph, normal).expect("normal still has one exit");
@@ -11757,6 +11773,35 @@ mod rebuilt_shell_collapse_tests {
         assert!(
             matches!(&exit.args[0], LinkArg::Value(v) if *v == fix.ok_payload),
             "the normal edge carries the unwrapped payload"
+        );
+    }
+
+    /// `Err(_)` / `except ValueError:` without `as e`: the handler rebuilds
+    /// the discriminant ctor and stores nothing. Collapse still splices
+    /// the match onto the exception link.
+    #[test]
+    fn discarded_err_arm_drops_the_rebuilt_shells() {
+        let mut fix = fixture();
+        fix.graph.blocks[fix.handler].operations.retain(
+            |op| !matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "__pos_0"),
+        );
+        let err_arm = fix.err_arm;
+        fix.graph.blocks[err_arm].operations.clear();
+        fix.graph.blocks[err_arm].inputargs.clear();
+        fix.graph.set_return(BlockId(err_arm), None);
+        let match_id = fix.graph.blocks[fix.normal].exits[0].target.0;
+        for exit in &mut fix.graph.blocks[match_id].exits {
+            if exit.target.0 == err_arm {
+                exit.args.clear();
+            }
+        }
+        collapse(&mut fix).expect("Err(_) match collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let exit = &fix.graph.blocks[fix.normal].exits[0];
+        assert_eq!(exit.target.0, fix.ok_arm);
+        assert_eq!(
+            fix.graph.blocks[fix.handler].exits[0].target.0, fix.err_arm,
+            "the exception edge is the handler as written"
         );
     }
 

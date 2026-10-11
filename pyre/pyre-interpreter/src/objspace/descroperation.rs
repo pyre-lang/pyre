@@ -3750,7 +3750,6 @@ pub(crate) unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
 }
 
 pub const FLOAT_MATH1_ABS: i64 = 0;
-pub const FLOAT_MATH1_SQRT: i64 = 1;
 pub const FLOAT_MATH1_SIN: i64 = 2;
 pub const FLOAT_MATH1_COS: i64 = 3;
 pub const FLOAT_MATH1_TAN: i64 = 4;
@@ -3785,12 +3784,11 @@ pub const FLOAT_MATH1_LDEXP: i64 = 31;
 pub const FLOAT_MATH1_ISQRT: i64 = 32;
 pub const FLOAT_MATH1_ISCLOSE: i64 = 33;
 
-/// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
+/// Hub so `_float_{sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
 /// `inline(never)` keeps every arm in the graph when a caller passes a constant.
 #[inline(never)]
 pub fn _float_math1(x: f64, kind: i64) -> PyResult {
     match kind {
-        FLOAT_MATH1_SQRT => _float_sqrt(x),
         FLOAT_MATH1_SIN => _float_sin(x),
         FLOAT_MATH1_COS => _float_cos(x),
         FLOAT_MATH1_TAN => _float_tan(x),
@@ -7748,19 +7746,6 @@ pub fn ll_math_sqrt(x: f64) -> Result<f64, PyError> {
         return Ok(sqrt_nonneg(x));
     }
     Ok(x)
-}
-
-/// ll_math.py `ll_math_sqrt` after the domain pin: `W_FloatObject(sqrt_nonneg(x))`.
-#[inline(never)]
-pub fn _float_sqrt(x: f64) -> PyResult {
-    let floatval = sqrt_nonneg(x);
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
-        },
-        floatval,
-    }) as PyObjectRef)
 }
 
 /// ll_math.py `ll_math_sin` after the finite pin: `W_FloatObject(sin(x))`.

@@ -1231,10 +1231,6 @@ fn ll_math_sqrt_and_math1_match_lower_to_exception_links() {
         wrap_dump.contains("sqrt_from_double"),
         "{wrap_dump}: wrap must call sqrt_from_double, not re-spell ll_math_sqrt"
     );
-    assert!(
-        !wrap_dump.contains("_float_sqrt"),
-        "{wrap_dump}: wrap must not call the hand-pinned _float_sqrt leaf"
-    );
     for (name, dump, graph) in [
         (helper_name, helper_dump.as_str(), &helper),
         (wrap_name, wrap_dump.as_str(), &wrap),

@@ -5089,15 +5089,10 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         crate::objspace::descroperation::_ll_2_int_mod,
     );
     // `ll_math.py ll_math_sqrt` raises; the residual ABI is the Ok `f64`
-    // with `PyError` published out of band (`ResidualError`). The
-    // canonical seed name and the source path share this trampoline —
-    // `support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`.
-    cpa1(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::_ll_1_ll_math_ll_math_sqrt",
-        "_ll_1_ll_math_ll_math_sqrt",
-        _ll_1_ll_math_ll_math_sqrt_word,
-    );
+    // with `PyError` published out of band (`ResidualError`). One function
+    // object (`support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`);
+    // the host publishes the source path and `pin_builtin_graphs` aliases
+    // the canonical seed name onto the same GraphKey.
     cpa1(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::ll_math_sqrt",

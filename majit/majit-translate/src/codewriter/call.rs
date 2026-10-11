@@ -6828,10 +6828,13 @@ impl CallControl {
             // registers the floordiv/mod graphs under the bare canonical
             // path, and sqrt under `_ll_1_ll_math_ll_math_sqrt` pointing at
             // `ll_math_sqrt` (`support.py` `_ll_1_ll_math_ll_math_sqrt =
-            // ll_math.ll_math_sqrt`, one function object). abs registers
-            // under that path via `free_function_alias_paths` because the
-            // Rust function is named `_ll_1_int_abs`.  The seed arm below
-            // pushes each and route (a) classifies the call `regular`.
+            // ll_math.ll_math_sqrt`, one function object). The host
+            // publishes that one source path; residual lookup of the
+            // canonical seed name follows the shared GraphKey. abs
+            // registers under that path via `free_function_alias_paths`
+            // because the Rust function is named `_ll_1_int_abs`.  The
+            // seed arm below pushes each and route (a) classifies the
+            // call `regular`.
             // Inside floordiv/mod, `x // y` / `x % y` are `ll_int_py_div`
             // / `ll_int_py_mod`; this BFS skips those oopspec callees
             // (`callee-oopspec-builtin`).
@@ -7034,15 +7037,19 @@ impl CallControl {
         // symbolic the C backend's linker resolves by name. Record the
         // same `{ path, symbolic }` pair `fnaddr_binding_for_target`
         // writes onto a `constants_i` FnAddr descriptor.
+        let (resolved_path, fnaddr, symbolic) = match self.resolved_function_fnaddr(fnaddr_path) {
+            Some((resolved, addr)) => (resolved, addr, false),
+            None => (
+                fnaddr_path.clone(),
+                symbolic_fnaddr_for_path(fnaddr_path),
+                true,
+            ),
+        };
         let reloc_path = self
             .fnaddr_registry_keys
-            .get(fnaddr_path)
+            .get(&resolved_path)
             .cloned()
-            .unwrap_or_else(|| fnaddr_path.canonical_key());
-        let (fnaddr, symbolic) = match self.function_fnaddrs.get(fnaddr_path).copied() {
-            Some(addr) => (addr, false),
-            None => (symbolic_fnaddr_for_path(fnaddr_path), true),
-        };
+            .unwrap_or_else(|| resolved_path.canonical_key());
         shell.fnaddr = fnaddr;
         shell.fnaddr_reloc = Some(crate::jitcode::ConstIRelocKind::FnAddr {
             path: reloc_path,
@@ -7697,7 +7704,7 @@ impl CallControl {
                 // the symbolic-fallback address is not callable, so the call must
                 // stay regular (executing the generated jitcode). This is the
                 // codewriter half; the runtime half registers the fnaddr.
-                if is_dont_look_inside_residual_helper(p) && self.function_fnaddrs.contains_key(p) {
+                if is_dont_look_inside_residual_helper(p) && self.has_function_fnaddr(p) {
                     return CallKind::Residual;
                 }
             }
@@ -7947,8 +7954,8 @@ impl CallControl {
             addr,
             symbolic,
         };
-        let from_table = |path: CallPath| match self.function_fnaddrs.get(&path).copied() {
-            Some(addr) => binding(path, addr, false),
+        let from_table = |path: CallPath| match self.resolved_function_fnaddr(&path) {
+            Some((resolved, addr)) => binding(resolved, addr, false),
             None => {
                 let addr = symbolic_fnaddr_for_path(&path);
                 binding(path, addr, true)
@@ -8055,7 +8062,29 @@ impl CallControl {
     /// (callers can then either skip or fall back to the symbolic
     /// placeholder explicitly).
     pub fn lookup_function_fnaddr(&self, path: &CallPath) -> Option<i64> {
-        self.function_fnaddrs.get(path).copied()
+        self.resolved_function_fnaddr(path).map(|(_, addr)| addr)
+    }
+
+    /// Address bound to `path`, or to another spelling of the same funcobj.
+    ///
+    /// `support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt` is
+    /// one function object: the host publishes the source path and
+    /// `pin_builtin_graphs` shares the `GraphKey`. Residual lookup of the
+    /// canonical seed name follows that key rather than a second runtime
+    /// table entry.
+    fn resolved_function_fnaddr(&self, path: &CallPath) -> Option<(CallPath, i64)> {
+        if let Some(addr) = self.function_fnaddrs.get(path).copied() {
+            return Some((path.clone(), addr));
+        }
+        for alias in self.function_graphs.alias_paths(path) {
+            if alias == *path {
+                continue;
+            }
+            if let Some(addr) = self.function_fnaddrs.get(&alias).copied() {
+                return Some((alias, addr));
+            }
+        }
+        None
     }
 
     /// `support.py:771-774` cache read.
@@ -8410,7 +8439,7 @@ impl CallControl {
     /// path. Such a path is a real callable surface and must not be treated
     /// as a transparent Rust enum constructor by jtransform.
     pub fn has_function_fnaddr(&self, path: &CallPath) -> bool {
-        self.function_fnaddrs.contains_key(path)
+        self.resolved_function_fnaddr(path).is_some()
     }
 
     /// Access the `{CallPath → Arc<JitCode>}` map.
@@ -8800,7 +8829,7 @@ impl CallControl {
             return None;
         }
         let exact = CallPath::from_segments(segments.iter().copied());
-        if let Some(&addr) = self.function_fnaddrs.get(&exact) {
+        if let Some((_, addr)) = self.resolved_function_fnaddr(&exact) {
             return Some(addr);
         }
         if segments.len() > 1 {
@@ -15142,6 +15171,28 @@ mod tests {
             cc.function_graphs().key_for(&alias),
             "canonical seed name must name the same funcobj as ll_math_sqrt"
         );
+    }
+
+    /// The host publishes the source path; residual lookup of the
+    /// canonical seed name follows the shared GraphKey.
+    #[test]
+    fn sqrt_canonical_seed_name_resolves_source_fnaddr() {
+        let mut cc = CallControl::new();
+        let source = CallPath::from_segments([
+            "pyre_interpreter",
+            "objspace",
+            "descroperation",
+            "ll_math_sqrt",
+        ]);
+        let alias = CallPath::from_segments(["_ll_1_ll_math_ll_math_sqrt"]);
+        let mut graph = FunctionGraph::new("ll_math_sqrt");
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(source.clone(), graph.clone());
+        cc.register_function_graph(alias.clone(), graph);
+        cc.register_function_fnaddr(source.clone(), 0x22);
+        assert_eq!(cc.lookup_function_fnaddr(&source), Some(0x22));
+        assert_eq!(cc.lookup_function_fnaddr(&alias), Some(0x22));
+        assert!(cc.has_function_fnaddr(&alias));
     }
 
     #[test]
