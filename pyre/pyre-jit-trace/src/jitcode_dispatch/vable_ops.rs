@@ -268,7 +268,6 @@ mod frame_replacement_tests {
             let mut ctx = WalkContext {
                 frame_state: state,
                 inline_callee_consts: None,
-                inline_poison_pcs: None,
                 fbw_mode: FbwWalkMode::<crate::state::PyreSym>::default(),
                 session: &session,
                 registers_r: &regs,
@@ -1631,16 +1630,18 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
         }
         crate::state::store_live_frame_array_slot(frame, index_value as usize, concrete);
-    }
-    // Keep the inline concrete-locals shadow current so a later read of this
-    // slot (after a may-force op clears the heapcache) recovers the concrete.
-    // Seed BOTH maps: the read fallback prefers re-resolving the slot's OpRef
-    // through the (GC-forwarded) op-table over the raw `concrete` copy, so the
-    // OpRef must track the stored value on every write — otherwise a re-stored
-    // slot would re-resolve a stale OpRef while `concrete` held the fresh value.
-    if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
-        shadow.set_opref(index_value, value);
-        shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
+        // Keep the inline concrete-locals shadow current so a later read of this
+        // slot (after a may-force op clears the heapcache) recovers the concrete.
+        // Seed BOTH maps: the read fallback prefers re-resolving the slot's OpRef
+        // through the (GC-forwarded) op-table over the raw `concrete` copy, so the
+        // OpRef must track the stored value on every write — otherwise a re-stored
+        // slot would re-resolve a stale OpRef while `concrete` held the fresh value.
+        // Only this level's own frame: a store to a foreign vable must not bind
+        // in `locals()` through this shadow.
+        if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
+            shadow.set_opref(index_value, value);
+            shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
+        }
     }
     let _ = _write;
     // A Ref stored to the operand-stack region of the vable array is an

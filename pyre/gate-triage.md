@@ -219,7 +219,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 | PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS | reading back the fastlocals a residual wrote to the frame, whether or not it forced, as a recorded `GETARRAYITEM_GC_R` off `locals_cells_stack_w` (`residual_call.rs adopt_residual_locals_writes`); setting it restores the walk that keeps the box it held before the call and so loses the write | when the walk reads a local through a channel a residual cannot leave stale; until then this is the one-binary control that keeps the defect demonstrable, and the parity fixture's two arms (a forcing call, and an inlined callee whose store forces nothing) are only separable with it |
 
-### §6a2 — Default-OFF experiments (4)
+### §6a2 — Default-OFF experiments (3)
 
 Kept as the switched-off arm of a one-binary comparison, not as latent
 defaults.
@@ -229,21 +229,10 @@ occupies `tracing` is still refused. Compiled-loop entry for another
 driver is no longer suppressed: `maybe_compile_and_run` reads
 `cell.flags & JC_TRACING` for that green key.
 
-`PYRE_FBW_INLINE_POISON` is off because its ON arm is known wrong, not merely
-unproven: the replay scan reports the pcs it objects to instead of collapsing
-them to one verdict, and the walk refuses on arriving at one, but that refusal
-denies the callee for the rest of the thread's tracing and lands wherever the
-walk happens to be. On the synthetic corpus it reaches a poisoned pc on 47 of
-451 benches, and two of those answer wrong because the refusal follows an
-executed effect. The scan and the enforcement stay wired so the arm that the
-fix has to make sound can be measured against the collapsed verdict from one
-build.
-
 | gate | what turning it ON does | retire when |
 |---|---|---|
 | PYRE_GUARD_RESUME_PC | prints the coordinate every walker-emitted guard resumes at (`resume_snapshot.rs guard_resume_pc_probe_enabled`); a guard whose `py_pc` is not the opcode it was emitted under re-executes the wrong bytecode on deopt, which reads as a livelock or a corrupted local rather than as a crash | the resume coordinate is covered by an ordinary test |
 | PYRE_WASM_COMPILE_CENSUS | reports every cranelift compile of a trace module separately (`main.rs jit_compile_trace`) — the bytes handed over, the wall time it took, and whether the request was a first compile or the re-emission of an owner that took a merge.  The stats line carries only the run's totals, which cannot separate a re-emission's cost from a first compile's nor say whether the per-module cost is linear in the bytes | trace compilation stops being on the critical path, or the two questions are answered and the answers stop moving |
-| PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
 
 ### §6b — VALUE knobs (16): config, not gates
@@ -286,7 +275,7 @@ effect unless the probe in §6c is enabled. The former
 `PYRE_PORTAL_METATRACE_ENTRY` knob is retired: the probe requires a split
 portal and enters at pc 0 through `initialize_state_from_start`.
 
-### §6c — Default-OFF diagnostics, censuses and probes (75): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (74): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead
@@ -301,7 +290,7 @@ configuration.
 `MAJIT_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
 `PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
-`PYRE_FBW_MF_DIAG`, `PYRE_FBW_REPLAY_DIRTY_BODY`, `PYRE_FBW_SPEC_CENSUS`,
+`PYRE_FBW_MF_DIAG`, `PYRE_FBW_SPEC_CENSUS`,
 `PYRE_FBW_STRICT_DIAG`,
 `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`,
@@ -355,12 +344,6 @@ example; it is unset by default. Its `AFTER`, `BUDGET`, `EVERY`, and `ROWS`
 value knobs bound the capture window, sampling rate, and report size. This is a
 diagnostic tool rather than a temporary runtime experiment, so it retires only
 if the example itself is removed.
-
-`PYRE_FBW_REPLAY_DIRTY_BODY` is a sub-knob of `PYRE_FBW_INLINE_DIAG` rather
-than a gate of its own: `replay_safety_dump_body` returns unless both are set,
-so setting it alone prints nothing. It lists each callee body as it is scanned,
-which is what lets the `pc` on a following `[replay-dirty]` line be matched to
-an op. It goes with the inline diagnostic it extends.
 
 `PYRE_VSTACK_NO_EXACT` and `PYRE_VSTACK_KEEP_REORDER` are A/B switches over the
 walk-level operand-stack mirror, each restoring the behaviour its default

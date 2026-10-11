@@ -8,6 +8,16 @@
 # frame with no vref at all, and every assertion below would pass without
 # testing anything.
 #
+# `leaf` is made a portal the way `_opimpl_recursive_call` does: a warmup
+# recurses past `max_unroll_recursion` (7), which stamps `dont_trace_here`
+# on its greenkey.  `can_inline_callable` then refuses it, so `driver`
+# residual-calls `leaf` and the function-threshold compiles the
+# `entry-bridge:leaf` this header declares.  Without that stamp
+# `perform_call` inlines `leaf` into `driver` (pypy3 compiles one loop
+# for the file) and `leave_compiled_frame_chain` never sees this frame.
+# The escape stays on the depth-0 body `mid_pass` calls, so `f_back` is
+# still `mid_pass`.
+#
 # `executioncontext.py ExecutionContext.leave` reaches the caller WITH the
 # force:
 #
@@ -49,11 +59,20 @@
 # diff against when the defect fires.
 import sys
 
+try:
+    import pypyjit
+except ImportError:
+    pypyjit = None
+
 WARM = 120000
 ESCAPE_AT = WARM - 5
+# One past `memory_manager.max_unroll_recursion` (default 7).
+UNROLL_PAST_BOUND = 8
 
 
-def leaf(i, n):
+def leaf(i, n, depth=0):
+    if depth > 0:
+        return leaf(i, n, depth - 1)
     if i == ESCAPE_AT:
         try:
             raise ValueError('escape')
@@ -78,8 +97,29 @@ def driver(n):
 HELD = []
 
 
+def warm_leaf_portal():
+    # `_opimpl_recursive_call` (`pyjitpl.py`) stamps `dont_trace_here`
+    # only while tracing. The default `function_threshold` is 1619, so one
+    # recursive call before `leaf` is warm never reaches that path, and a
+    # later depth-0 loop compiles an entry that never saw recursion.
+    # Lower the threshold first, then keep the recursive shape as the
+    # calls that cross it; depth-0 calls after that compile the
+    # `entry-bridge:leaf` header under the stamp.
+    if pypyjit is not None:
+        pypyjit.set_param('function_threshold=1')
+    k = 0
+    while k < 2000:
+        leaf(-1, 0, UNROLL_PAST_BOUND)
+        k += 1
+    k = 0
+    while k < 2000:
+        leaf(-1, 0)
+        k += 1
+
+
 def main():
     failures = []
+    warm_leaf_portal()
     driver(WARM)
     if len(HELD) != 1:
         print('FAIL the escape never fired: held %d frames' % len(HELD))

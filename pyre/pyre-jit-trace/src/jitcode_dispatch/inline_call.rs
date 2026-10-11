@@ -802,13 +802,8 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
 /// callee it resolved itself (rather than off a CALL) carries a differently
 /// shaped operand list, so it declines such a body up front.
 ///
-/// The CALL-entered `foriter_deferred_admit` route reaches no CALL_ASSEMBLER at
-/// all, so that reason does not apply to it — but a second, independent one
-/// does: a loop header is where a deferred `load_method_self`'s two
-/// operand-stack entries can be crossed by a failing guard.  See the admission
-/// itself, which pairs this predicate with
-/// [`fbw_callee_body_has_two_entry_method_push`] rather than declining
-/// every loop-bearing body.
+/// A loop header is also where a deferred `load_method_self`'s two
+/// operand-stack entries can be crossed by a failing guard.
 pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
 }
@@ -901,7 +896,7 @@ fn body_sample_safe_with(
     let mut flags_get: Option<(u8, u8)> = None;
     let mut finished_or: Option<(u8, u8)> = None;
     // First ref-slot accessor names the callee frame. A later `>r` that
-    // overwrites that register drops the identity, matching the replay scan.
+    // overwrites that register drops the identity.
     let mut vable_reg: Option<u8> = None;
     let mut pc = 0usize;
     while pc < body_code.len() {
@@ -3617,123 +3612,6 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     }))
 }
 
-/// #62 slice (3c): full-body-walk inline of a recognized user-function
-/// `call_fn`.
-///
-/// Returns:
-/// * `Ok(Some((outcome, next_pc)))` — the call was inlined; caller returns it.
-/// * `Ok(None)` — not eligible (not a pure-Python function, has a
-///   closure, or not an exact-positional call).  This branch emits NO IR, so
-///   the caller's residual-call fallback is clean.
-/// * `Err(..)` — a sub-walk step hit an unsupported op AFTER emitting IR;
-///   propagated as a trace abort (sound — aborts to the interpreter rather
-///   than mixing inlined + residual emission).
-///
-/// Arg layout: `r_args = [callable@0, null_or_self@1, positional@2..]`.
-/// `bh_call_fn_impl` prepends a non-null `null_or_self` as arg0, so the
-/// inlined callee's positional locals are either `positional` for plain calls
-/// or `[null_or_self, positional...]` for method-form calls.
-/// Only exact-positional callees whose frame can be materialized are inlined.
-/// Guards inside the callee use the callee's own resume coordinate and a
-/// paused caller frame; unsupported shapes remain residual calls.
-///
-/// That layout is a property of a subset of the CALL-family helpers, so the
-/// residual this reads from has to be one of them.  Every other entry the
-/// inline lever serves passes its own receiver-plus-metadata list, not an
-/// operand-stack image: `load_attr_fn(obj, code, name_idx)` is
-/// `r_args = [obj, code]` and `store_attr_fn` is `[obj, value, code]`, whose
-/// `code` operand is a code object the Python stack never held.  Publishing it
-/// as a stack slot resumes the interpreter with the code object where the
-/// receiver belongs — the `__getattr__`/`property` folds returned
-/// `AttributeError: 'code' object has no attribute <name>` for an attribute
-/// their own hook answers.  Decline for those instead; their operand image
-/// comes from the per-slot resume sources
-/// ([`crate::jitcode_dispatch::collect_call_stack_overrides`]).
-///
-/// `call_kw` is excluded for the same reason one step subtler: its list is a
-/// PERMUTATION of the stack rather than a different set of values.  The wire
-/// order is `(callable, null_or_self, kwnames, arg0..arg{n-1})`
-/// (`majit-ir effectinfo.rs` `RuntimeHelperKind::CallKw`), while `CALL_KW` pops
-/// `kwnames` FIRST (`eval.rs call_kw`), so the stack image is
-/// `[callable, null_or_self, arg0..arg{n-1}, kwnames]`.  A real `CALL_KW`
-/// always carries a non-empty kwnames tuple, so `n >= 1` on every reachable
-/// path and the two orders never coincide.  The flush's only structural check
-/// is a depth compare, which a permutation of the right length passes, and the
-/// re-executed `CALL_KW` would then pop `arg{n-1}` as its keyword-name tuple.
-pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
-    code: &[u8],
-    op: &DecodedOp,
-    ctx: &WalkContext<'_, '_, Sym>,
-    call_descr: &dyn majit_ir::descr::CallDescr,
-) -> Option<Vec<pyre_object::PyObjectRef>> {
-    if !matches!(
-        call_descr.get_extra_info().runtime_helper,
-        majit_ir::RuntimeHelperKind::CallFn | majit_ir::RuntimeHelperKind::CallFunctionEx
-    ) {
-        return None;
-    }
-    // The Ref list is NOT at a fixed offset: the method-form `CALL` helpers
-    // this leg latches for lower through the mixed `iIRd>r` shape, whose
-    // leading Int list shifts it (`dispatch_residual_call_iIRd_kind` reads it
-    // at `1 + i_width`).  Reading offset 1 there takes the Int list's register
-    // indices into the Ref bank — refs unrelated to the call, of a length that
-    // still passes the flush's depth check.
-    let ref_operand_offset = ref_var_list_operand_offset(code, op)?;
-    let fresh = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
-    if fresh.is_empty() {
-        return None;
-    }
-    // Validate the CALL operand slice itself, not the complete reconstructed
-    // stack.  A CALL inside WITH/FOR_ITER can retain non-null prefix operands;
-    // checking `stack.first()` after prepending them lets an unresolved NULL
-    // callable slip through and publishes an invalid frame at the CALL.
-    if !matches!(fresh.first(), Some(ConcreteValue::Ref(r)) if !r.is_null()) {
-        return None;
-    }
-    // The encoded residual args describe only the CALL operands.  Values can
-    // remain below them on the Python operand stack (notably the iterator of
-    // an enclosing FOR_ITER).  RPython resumes the complete MIFrame stack, so
-    // retain that prefix from the authoritative vstack mirror.
-    let prefix_len = if ctx.vstack_valid {
-        ctx.frame_state
-            .borrow()
-            .vstack_boxes
-            .len()
-            .checked_sub(fresh.len())?
-    } else {
-        0
-    };
-    let mut stack = Vec::with_capacity(prefix_len + fresh.len());
-    for &value in &ctx.frame_state.borrow().vstack_boxes[..prefix_len] {
-        match concrete_from_recorded_opref(ctx, value) {
-            ConcreteValue::Ref(r) if !r.is_null() => stack.push(r),
-            _ => return None,
-        }
-    }
-    // Only `null_or_self@1` may be null, and the layout above names it by
-    // index, so it is checked by position rather than by admitting a null
-    // anywhere.  Everything else here is a Python value the rewound `CALL`
-    // pops, and a null in one of those slots is an UNRESOLVED register, not a
-    // value: the concrete
-    // Ref bank holds `Ref(null)` for a box the walk never materialized, which
-    // is why `concrete_ref_for_color` tests for it and why the prefix loop
-    // above declines on it.  Publishing one lets the resumed interpreter pop a
-    // null where an object belongs.
-    for (index, c) in fresh.into_iter().enumerate() {
-        match c {
-            ConcreteValue::Ref(r) if index == NULL_OR_SELF_ARG_INDEX || !r.is_null() => {
-                stack.push(r)
-            }
-            _ => return None,
-        }
-    }
-    Some(stack)
-}
-
-/// `r_args` index of the `null_or_self` operand — the one slot of a residual
-/// call's Ref list whose correct value can be null.
-const NULL_OR_SELF_ARG_INDEX: usize = 1;
-
 /// Fold a keyword call's `kwnames`->parameter permutation at trace time so a
 /// `call_kw` reuses the positional inline path.  The constant `kwnames` tuple
 /// and the callee's static parameter names are both known at record time, so
@@ -4555,17 +4433,17 @@ unsafe fn fbw_bind_star_kwargs(
 /// Whether `w_code` commits nothing a discarded sub-walk would double.
 ///
 /// A route whose entry opcode is not a call boundary — `COMPARE_OP`,
-/// `BINARY_OP` — has no sound abort once the body has run.
-/// [`latch_abort_call_resume`] resumes *at* the call and so re-executes it,
-/// which is why it refuses as soon as `fbw_executed_effect_count()` has moved;
-/// and a bare `Err` leaves the walk driver replaying the loop from entry with
-/// the body's effects already applied.  Only a body that commits nothing can be
-/// thrown away either way, so admission is what has to carry the decision.
+/// `BINARY_OP` — has no CALL to convert past once the body has run.
+/// [`BinopRewindInlineGuard`] refuses the first commit before it runs, so a
+/// discarded body rewinds cleanly.  Admission is what has to carry that
+/// decision.
 ///
-/// `DeferredCall` is not enough here.  Its promise is that a residual the lever
-/// cannot inline aborts and rewinds to the enclosing CALL, and the FOR_ITER
-/// gate already records why that rewind does not reach a `BINARY_OP` /
-/// `COMPARE_OP` entry: the flush resumes one operand short.
+/// `DeferredCall` is not enough here.  A residual the lever cannot inline
+/// is executed and recorded, or converts in place through
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) when the callee already
+/// has a seeded `PyFrame`.  A `BINARY_OP` / `COMPARE_OP` entry is a
+/// separate rewind region: [`BinopRewindInlineGuard`] refuses the first
+/// commit so a discarded `NotImplemented` descent does not keep its prefix.
 /// Whether a dunder body at a `BINARY_OP` / `COMPARE_OP` entry is a shape
 /// worth attempting on the strength of the entry's rewind.
 ///
@@ -4692,31 +4570,6 @@ impl SubWalkRewind {
             && !self.unjournaled_before
             && !fbw_has_unjournaled_effect()
     }
-}
-
-fn callee_body_commits_nothing(w_code: *const ()) -> bool {
-    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
-        return false;
-    };
-    let Some((descr_refs, perfn_descrs, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
-    else {
-        return false;
-    };
-    matches!(
-        fbw_callee_body_replay_scan(
-            body.code,
-            &[],
-            body.num_regs_i,
-            body.constants_i,
-            body.num_regs_r,
-            body.constants_r,
-            &descr_refs,
-            RawDescrPool::PerFn(perfn_descrs),
-            false,
-        )
-        .verdict(),
-        CalleeReplaySafety::Clean
-    )
 }
 
 fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::InlineBodyFacts> {
@@ -5208,8 +5061,8 @@ fn record_activation_release(
 ///
 /// A guard rather than a pair of calls because the region between
 /// [`walker_ec_enter`] and [`walker_ec_leave`] has many ways out — a declined
-/// sub-walk, a poisoned pc, a rewind — and a width that leaks would price
-/// every later `CALL_ASSEMBLER` in the same trace too high.
+/// sub-walk, a rewind — and a width that leaks would price every later
+/// `CALL_ASSEMBLER` in the same trace too high.
 struct OpenInlineActivation<'a>(&'a std::cell::RefCell<WalkSession>);
 
 impl<'a> OpenInlineActivation<'a> {
@@ -6383,7 +6236,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // The odometer counts every journaled effect — a store, a list append/pop,
     // a cell store — where the store journal counts only the first.  The
     // rewind arm below reads it to decide whether this descent already applied
-    // something, the same question `latch_abort_call_resume` answers with it.
+    // something.
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let rewind = SubWalkRewind {
@@ -7017,119 +6870,6 @@ fn walker_guard_function_field<Sym: WalkSym>(
     Ok(())
 }
 
-/// Reconstruct the caller's complete operand stack at an entry opcode from
-/// the same per-frame sources used by multi-frame resume data.
-///
-/// Nothing here reads the entry opcode or a call descr: the inputs are the
-/// jitcode pc and the depth the forward analysis records at it, which is why
-/// this is the source a `BINARY_OP` / `COMPARE_OP` entry can use and
-/// `reconstructed_all_ref_call_stack` is not.  Retired with its only consumer
-/// in #1497 and revived for that entry.
-///
-/// `reconstructed_all_ref_call_stack` is the cheap residual-operand path, but
-/// a CALL under `with` can retain context-manager operands below it after the
-/// simple vstack mirror became unavailable.  RPython copies the complete
-/// caller MIFrame register bank.  `collect_call_stack_overrides` is pyre's
-/// existing equivalent: vstack first, then the CALL-PC color map, then this
-/// frame's virtualizable shadow.  Preserve typed `ConstPtr(NULL)` values and
-/// name an otherwise boxless null-or-self slot from the CALL layout.  Require
-/// a value for every stack slot before publishing the ordered image.
-fn reconstructed_call_stack_from_resume_sources<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    call_jitcode_pc: usize,
-) -> Option<Vec<pyre_object::PyObjectRef>> {
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return None;
-    }
-    let sym = unsafe { &*sym_ptr };
-    let jc = unsafe { sym.jitcode().as_ref()? };
-    let depth = jc.payload.depth_for_jitcode_pc_pred(call_jitcode_pc)? as usize;
-    let nlocals = sym.nlocals();
-    let Some(overrides) = collect_call_stack_overrides(sym, ctx, call_jitcode_pc) else {
-        if fbw_debug_abort_enabled() {
-            eprintln!(
-                "[fbw-abort-flush] resume stack source declined: call_jit_pc={call_jitcode_pc} \
-                 depth={depth} vstack_valid={} vstack_depth={} vstack_len={}",
-                ctx.vstack_valid,
-                ctx.vstack_depth,
-                ctx.frame_state.borrow().vstack_boxes.len(),
-            );
-        }
-        return None;
-    };
-    if fbw_debug_abort_enabled() {
-        eprintln!(
-            "[fbw-abort-flush] resume stack source: call_jit_pc={call_jitcode_pc} \
-             nlocals={nlocals} depth={depth} slots={:?} vstack_valid={} vstack_depth={} \
-             vstack_len={}",
-            overrides.iter().map(|&(slot, _)| slot).collect::<Vec<_>>(),
-            ctx.vstack_valid,
-            ctx.vstack_depth,
-            ctx.frame_state.borrow().vstack_boxes.len(),
-        );
-    }
-    let mut ordered = vec![None; depth];
-    for (slot, value) in overrides {
-        let rel = slot.checked_sub(nlocals)?;
-        if rel >= depth || ordered[rel].replace(value).is_some() {
-            return None;
-        }
-    }
-    ordered.into_iter().collect()
-}
-
-/// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
-/// resolve their callee from the CALL operand; builtin-dispatch specializers
-/// resolve an app-level descriptor first and enter here with that function as
-/// the callee while independently pinning the original builtin callable.
-#[allow(clippy::too_many_arguments)]
-/// Latch the outer CALL boundary as the forward-resume point for a discarded
-/// inline sub-walk, so the walk driver re-executes the whole call in the
-/// interpreter instead of rolling back and replaying the loop from entry.
-///
-/// Sound only when the attempt committed nothing observable: it must be the
-/// top-level inline, no unjournaled effect may predate it, and the callee must
-/// have executed no concrete effect.  Otherwise the re-execution would apply
-/// twice what the sub-walk already ran.  Every caller that discards a sub-walk
-/// result must go through this — returning the error without latching leaves
-/// the driver replaying the loop, which repeats the callee's effects.
-fn latch_abort_call_resume<Sym: WalkSym>(
-    code: &[u8],
-    op: &DecodedOp,
-    ctx: &WalkContext<'_, '_, Sym>,
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    is_top_inline: bool,
-    unjournaled_before_subwalk: bool,
-    executed_effects_before: usize,
-    abort_flush_call_jitcode_coord: Option<(u32, usize)>,
-) {
-    if !is_top_inline
-        || unjournaled_before_subwalk
-        || fbw_executed_effect_count() != executed_effects_before
-    {
-        return;
-    }
-    let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord else {
-        return;
-    };
-    // `reconstructed_all_ref_call_stack` declines at its first statement for
-    // any descr that is not `CallFn` / `CallFunctionEx`, because for every
-    // other entry the residual's operand list is a receiver-plus-metadata list
-    // rather than a stack image.  That refusal is right about the SOURCE and
-    // wrong as a verdict: it left a `BINARY_OP` / `COMPARE_OP` entry with no
-    // carrier at all, so its abort fell through to the legacy replay from loop
-    // entry.  Source the image the way the entry-agnostic path does instead --
-    // the frame's own resume sources, keyed on nothing but the jitcode pc,
-    // whose depth `depth_for_jitcode_pc_pred` supplies.  The CALL_ASSEMBLER
-    // leg below already chains the two this way.
-    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr)
-        .or_else(|| reconstructed_call_stack_from_resume_sources(ctx, call_jitcode_pc))
-    {
-        fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
-    }
-}
-
 fn immediate_inline_caller_py_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     call_jitcode_pc: usize,
@@ -7289,6 +7029,10 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
     Ok(())
 }
 
+/// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
+/// resolve their callee from the CALL operand; builtin-dispatch specializers
+/// resolve an app-level descriptor first and enter here with that function as
+/// the callee while independently pinning the original builtin callable.
 pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -7876,58 +7620,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     else {
         return resolved_inline_decline(op.pc, line!());
     };
-    // EXACT int/float only.  These feed `fbw_callee_body_replay_scan`, whose
-    // question is "will the walker specialize this body's BINARY_OP to a native
-    // op, leaving no residual to replay?".  The walker's specialization admits
-    // only exact builtin numbers (`is_exact_builtin_instance`), because a numeric subclass keeps the
-    // builtin layout while its Python-visible class lives in `w_class` and may
-    // define its own `__add__`.  `is_int` / `is_float` are `ob_type` checks
-    // that a subclass passes, so using them here claims a specialization that
-    // will not happen and admits a body whose real residual a replay would
-    // double.
-    //
-    // Preserve exactness per argument.  Method-form calls put a usually
-    // nonnumeric `self` in slot 0; folding all arguments into one boolean
-    // incorrectly made that erase the proof for an independent numeric `x`.
-    //
-    // The one argument a guard failure inside this callee rebuilds.  The rewind
-    // resumes at the caller's CALL, so it re-runs `type.__call__` from
-    // `__new__` — and only a constructor has its argument's ALLOCATION inside
-    // that region.  `try_walker_inline_type_call` passes the instance it just
-    // emitted as `callee_args[0]` and repeats it in `constructor_result`, so
-    // matching the two names that instance and nothing else; `is_unescaped`
-    // (`heapcache.py`) is the other half — nothing outside the walk has
-    // taken a reference between the allocation and this boundary.
-    let rewind_built_arg = constructor_result.and_then(|(instance, _)| {
-        (instance != OpRef::NONE
-            && callee_args.first() == Some(&instance)
-            && ctx.trace_ctx.heap_cache().is_unescaped(instance))
-        .then_some(0usize)
-    });
-    let arg_facts: Vec<CalleeArgFact> = callee_arg_concretes
-        .iter()
-        .enumerate()
-        .map(|(index, concrete)| {
-            let (plain_int, exact_float) = match concrete {
-                ConcreteValue::Int(_) => (true, false),
-                ConcreteValue::Float(_) => (false, true),
-                ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
-                    (
-                        pyre_object::is_plain_int1(*obj),
-                        pyre_object::is_plain_float_strict(*obj),
-                    )
-                },
-                ConcreteValue::Bool(_) | ConcreteValue::Ref(_) | ConcreteValue::Null => {
-                    (false, false)
-                }
-            };
-            CalleeArgFact {
-                numeric: plain_int || exact_float,
-                plain_int,
-                rewind_reallocates: rewind_built_arg == Some(index),
-            }
-        })
-        .collect();
     let args_all_builtin_integer = callee_arg_concretes.iter().all(|concrete| match concrete {
         ConcreteValue::Int(_) | ConcreteValue::Bool(_) => true,
         ConcreteValue::Ref(obj) if !obj.is_null() => unsafe { pyre_object::is_int_or_long(*obj) },
@@ -8130,8 +7822,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     );
     // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
-    // conversion, so neither replay safety nor an unseeded caller-boundary
-    // resume is part of that route's deopt discipline.
+    // conversion, so an unseeded caller-boundary resume is not part of that
+    // route's deopt discipline.
     // A zero-param `for` body's back-edge is a plain `goto`, so the
     // forward-branch scan would walk the loop and skip the portal activation
     // a residual call charges. That chain runs past the recursion limit.
@@ -8148,295 +7840,35 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             callee_frame_reg,
         );
     let instance_next_seeded_route = instance_next_foriter_green_key.is_some();
-    // The keyed route bypasses the legacy caller-replay classification, but it
-    // does not inherit that route's DeferredCall admission.
-    let mut foriter_deferred_admit = false;
-    let mut foriter_dirty_seeded_resume_admit = false;
-    // A handler-bearing `DeferredCall` body that `foriter_deferred_admit`
-    // refuses, but that a seeded frame can carry. See the assignment below.
-    let mut seeded_foriter_deferred = false;
-    // The pcs handed to this callee's sub-walk, set by whichever admission
-    // below admitted a body the scan could not prove clean everywhere.
-    let mut inline_poison_pcs: Option<std::sync::Arc<[usize]>> = None;
+    // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
+    // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) pushes an MIFrame.
+    // A seeded frame already exists here, and a walk abort converts through
+    // `convert_and_run_from_pyjitpl` (`blackhole.py`). The remaining terms
+    // are unported OTHER: `code_has_for_iter`, `code_is_self_recursive`,
+    // and the constant-callable screen. That screen pins `Function.code`
+    // (`guards_the_callee_function`) — the greenkey `can_inline_callable`
+    // unwraps — not function identity, so a fresh lambda with one code
+    // object is admitted the same way a closure is.
     if fbw_foriter_inflight_active() && !instance_next_seeded_route {
-        let scan = fbw_callee_body_replay_scan(
-            body.code,
-            &arg_facts,
-            body.num_regs_i,
-            body.constants_i,
-            body.num_regs_r,
-            body.constants_r,
-            callee_descr_refs,
-            RawDescrPool::PerFn(callee_perfn_descrs),
-            method_form,
-        );
-        let safety = scan.verdict();
-        let legacy_admit = match safety {
-            CalleeReplaySafety::Clean => true,
-            CalleeReplaySafety::DeferredCall => {
-                // The deferred promise rests on the abort REWINDING to the
-                // enclosing CALL and re-executing it from scratch, so the
-                // entry has to be a boundary the rewind can name.  What
-                // decides that is the entry opcode's stack effect rather than
-                // whether it is spelled CALL: one that merely peeks its
-                // operands re-executes from the stack it already had.  A
-                // `BINARY_OP` or `COMPARE_OP` entry is not: the flush resumes
-                // one operand short and the whole iteration's contribution is
-                // dropped, silently — the subscript inline observed its index
-                // operand replaced by an unrelated live Ref.  Each caller
-                // states this directly in `entry_is_call_boundary`; the older
-                // `arg_class_guard.is_none()` proxy stood for the same
-                // property and rotted, because the `obj[key]` inline enters
-                // from `BINARY_OP` while passing no `arg_class_guard`.  A
-                // `Clean` body is still admitted from there — it has nothing
-                // that can abort.
-                //
-                // The widened method-form surface — an unbound callee whose
-                // body reads `self.attr` — was admitted here only once the
-                // receiver was proven not to be a type object, because a type
-                // receiver's read went through `type.__getattribute__` and
-                // reached the deferred abort path.  `cls.__name__` on a class
-                // whose metaclass is `type` is traced through the metatype
-                // data descriptor, so that receiver leaves no residual to
-                // abort on.  Any other metaclass still aborts once and is
-                // denied.
-                //
-                // A callee with its own exception handler has protected-region
-                // state that must be restored at the callee's precise resume
-                // point.  If a deferred residual later aborts after a folded
-                // effect, caller-boundary replay can repeat the protected
-                // entry or skip the handler cleanup.  Keep handler-bearing
-                // bodies on the residual path unless this scan proves them
-                // clean.
-                //
-                // A body that owns a loop header puts failing guards between a
-                // deferred `load_method_self` and the `CALL` that consumes the
-                // two operand-stack entries it pushed, and a deopt landing in
-                // that window resumes a frame whose callable slot was never
-                // written — `names(traceback)` in
-                // `synth/exception_reentry_guard_finally_residual` SIGSEGVs in
-                // `classify_callable` on a null callable.  The test is a
-                // superset of the failing shape: `names` also needs an in-window
-                // guard that actually fails, which a plain `self.attr` read
-                // folds away.
-                //
-                // ⚠️This pair is what disqualifies a CALLEE, and that is the
-                // whole of its licence — it is NOT that a method-load is the
-                // only deferred result outliving the next op, which this clause
-                // used to claim.  Measured counterexample: in
-                // `parity_tests/exception_handler_method_load_resume.py` the
-                // CALLER's `out.append(...)` leaves its `LOAD_ATTR name +
-                // NULL|self` pair on the stack across four opcodes, and the
-                // deopt did resume over the unwritten slot — the same SIGSEGV,
-                // through a caller this gate never examines.  What prevents it
-                // is the producer of the flush's operand image refusing to
-                // publish an unresolved null (`collect_call_stack_overrides`),
-                // not any admission test here.
-                let loop_header_admitted = !body_facts.owns_loop_header
-                    || !fbw_callee_body_has_two_entry_method_push(body.code, callee_descr_refs);
-                foriter_deferred_admit = entry_is_call_boundary
-                    && loop_header_admitted
-                    && !pyre_interpreter::code_has_for_iter(callee_code)
-                    && !body_facts.has_exception_table;
-                // `perform_call` (`pyjitpl.py`) inlines this callee into the
-                // loop being traced and does not also publish it as its own
-                // portal. `foriter_deferred_admit` still refuses
-                // `has_exception_table`. A seeded frame (`try_multiframe` /
-                // `strict_seed`) is the resume coordinate `seeded_deferred`
-                // accepts below, so the same body must reach that admit:
-                // declining here residualizes the call, the callee crosses
-                // `increment_function_threshold` (`warmstate.py`), and
-                // `finish_and_compile` (`compile.py`) attaches a second entry
-                // bridge.
-                seeded_foriter_deferred = (try_multiframe || strict_seed)
-                    && entry_is_call_boundary
-                    && loop_header_admitted
-                    && !pyre_interpreter::code_has_for_iter(callee_code);
-                if !foriter_deferred_admit && fbw_inline_diag_enabled() {
-                    eprintln!(
-                        "[inline-foriter-deferred] pc={} boundary={entry_is_call_boundary} \
-                         header={loop_header_admitted} for_iter={} exc_table={}",
-                        op.pc,
-                        pyre_interpreter::code_has_for_iter(callee_code),
-                        body_facts.has_exception_table,
-                    );
-                }
-                foriter_deferred_admit
-            }
-            CalleeReplaySafety::Dirty => {
-                // The generated resume chain is sound once `try_multiframe` or
-                // `strict_seed` gives the callee a seeded frame.  That frame
-                // makes each in-callee guard carry the callee's own resume
-                // coordinate, so deopt does not replay the whole body from the
-                // caller's CALL boundary.  A stored bound method reaches the
-                // path on `bound_method` alone; one that also meets these terms
-                // takes the same screen exemption below.
-                //
-                // `callable_guard_op.is_constant()` is not part of that
-                // argument.  The operand is pinned by a `GuardValue` either
-                // way, so a varying callable is inlined soundly; what the term
-                // screens is whether that guard holds.  Dropping it admits
-                // `self.cb(...)` and a `__getitem__` reached through a closure
-                // cell (1088 ns to 191 on an attr-callee loop) and buys a guard
-                // failure per iteration wherever the operand really varies:
-                // 9 `bench/synth` fixtures per backend moved together,
-                // `guard_failures` 210 -> 1007, `bridges_compiled` 1 -> 5,
-                // `loops_aborted` 1 -> 2.  Narrowing it to `!contains_raise`
-                // reproduces those numbers unchanged -- the regressing callees
-                // do not raise -- so the term is not standing in for the
-                // raising-chain resume shape either.  Widening it wants a
-                // predicate for "this non-constant operand is monomorphic
-                // across the loop", which nothing here computes.
-                //
-                // The callee's own exception table is NOT a term here.  It was
-                // one because the route was written for handler-bearing bodies,
-                // not because the resume coordinate needs a handler: what the
-                // seeded frame answers is where a deopt lands, which is the same
-                // question for a body with no `try` at all.  Requiring it
-                // refused 17 sites in 14 `bench/synth` fixtures that met every
-                // other term — `entry_is_call_boundary`, a constant callable,
-                // depth 0, and `try_multiframe` — for having no handler, while
-                // the same body carrying one was admitted.  `pyjitpl.py`
-                // `perform_call` pushes a real `MIFrame` for every callee
-                // `can_inline_callable` admits and tests no exception table
-                // anywhere.  The screen exemption below is unaffected: it is
-                // reached only when `branchy_handler_scan` is `Some`, which
-                // itself requires `has_exception_table`.
-                // `try_multiframe` is `!strict_inlinable`, so asking for it
-                // alone refuses the SIMPLEST callee by construction: a
-                // straight-line leaf passes `callee_fast_path_inlinable`, is
-                // therefore strict, and is therefore never multiframe-eligible,
-                // while a branchier body with the same effects is admitted.
-                // What the term is standing in for is the warrant below — the
-                // callee owns a seeded frame, so an in-callee guard carries the
-                // callee's OWN resume coordinate rather than collapsing to the
-                // caller's CALL boundary — and `strict_seed` seeds one too.
-                // The two routes are an either/or, not a ladder.
-                //
-                // Neither carries a depth term of its own here, because each
-                // already declares the depth its resume machinery is proven to:
-                // `strict_seed` stops at `fbw_max_multiframe_depth`, and
-                // `try_multiframe` at `fbw_effective_multiframe_depth`, which
-                // reads the raising-chain and recursion cases separately.  The
-                // `inline_depth < 2` that stood here was `framestack.len() < 2`
-                // from the bare-reraise predicate this grew out of, where "one
-                // paused caller" bounded the re-raise chain specifically; it
-                // outlived that predicate the way `has_exception_table` did.
-                // Two is far under what both routes admit, so it was the whole
-                // bound in practice: a third Python frame residualized however
-                // straight-line it was, which is a two-deep helper called from
-                // any dunder at all.
-                // A closure's green key is `Function.code` (`function.py`
-                // `getcode`), not the function object.  `guards_the_callee_function`
-                // reads that field and threads the cells as red getfields, so a
-                // `def` inside the caller — a fresh function on every call, one
-                // code object — can inline.  The predicate is that flag, not
-                // `has_closure` alone: a guard operand that is not the callee
-                // still pins identity (`GuardValue`), and a fresh function
-                // fails that guard on every call.  A non-closure operand keeps
-                // the constant screen: dropping it inlined `self.cb(...)`
-                // wherever the callable really varied.
-                // A class-pinned `__call__` receiver selects one function for
-                // every instance the same way, with no identity guard on the
-                // operand.
-                let seeded_callee_resume = (try_multiframe || strict_seed)
-                    && (callable_guard_op.is_constant()
-                        || receiver_pinned_by_class
-                        || (has_closure && guards_the_callee_function));
-                // The handler exemption below was measured on a CALL entry
-                // (`blackhole_inlined_callee_local_after_escape_declined`).
-                // A seeded frame does not widen that exemption.
-                foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
-                // A seeded callee frame resumes inside the callee, so the
-                // caller's opcode is not re-executed and does not have to be
-                // a boundary the flush can name.  `perform_call`
-                // (`pyjitpl.py`) pushes that MIFrame for every callee
-                // `can_inline_callable` admits.  This is what lets a mutating
-                // `__format__` inline at FORMAT_WITH_SPEC: the opcode pops
-                // both operands, `entry_is_call_boundary` stays false so a
-                // non-str result still declines to the residual, and the
-                // `self.calls += 1` store is `Dirty`.  An unseeded bound
-                // method still needs the boundary, because its flush replays
-                // the entry opcode.
-                let foriter_dirty_bound = (seeded_callee_resume
-                    || (entry_is_call_boundary && bound_method.is_some()))
-                    && !pyre_interpreter::code_has_for_iter(callee_code)
-                    && !pyre_interpreter::code_is_self_recursive(callee_code);
-                if !foriter_dirty_bound && fbw_inline_diag_enabled() {
-                    eprintln!(
-                        "[inline-foriter-dirty] pc={} boundary={entry_is_call_boundary} \
-                         bound={} exc_table={} const_callable={} depth={inline_depth} \
-                         mf={try_multiframe} strict={strict_inlinable} for_iter={} selfrec={}",
-                        op.pc,
-                        bound_method.is_some(),
-                        body_facts.has_exception_table,
-                        callable_guard_op.is_constant(),
-                        pyre_interpreter::code_has_for_iter(callee_code),
-                        pyre_interpreter::code_is_self_recursive(callee_code),
-                    );
-                }
-                foriter_dirty_bound
-            }
-        };
-        if fbw_inline_diag_enabled() {
+        let seeded_callee_resume = (try_multiframe || strict_seed)
+            && (callable_guard_op.is_constant()
+                || receiver_pinned_by_class
+                || guards_the_callee_function);
+        let foriter_seeded_admit = seeded_callee_resume
+            && !pyre_interpreter::code_has_for_iter(callee_code)
+            && !pyre_interpreter::code_is_self_recursive(callee_code);
+        if !foriter_seeded_admit && fbw_inline_diag_enabled() {
             eprintln!(
-                "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} numeric_args={} \
-                 rewind_built_arg={rewind_built_arg:?} \
-                 safety={safety:?} deferred_admit={foriter_deferred_admit}",
+                "[inline-foriter-gate] pc={} seeded_admit={foriter_seeded_admit} \
+                 const_callable={} mf={try_multiframe} strict={strict_inlinable} \
+                 for_iter={} selfrec={} guards_fn={guards_the_callee_function}",
                 op.pc,
-                arg_facts.iter().filter(|arg| arg.numeric).count(),
+                callable_guard_op.is_constant(),
+                pyre_interpreter::code_has_for_iter(callee_code),
+                pyre_interpreter::code_is_self_recursive(callee_code),
             );
         }
-        // A body the verdict declined gets a second reading against the pcs the
-        // scan poisoned rather than the collapsed verdict.  Purely additive:
-        // `legacy_admit` above is unchanged, so nothing that inlined before
-        // stops, and only a body that would have residualized is reconsidered.
-        //
-        // `code_has_for_iter` is gone from this reading because the poison set
-        // subsumes it.  A `FOR_ITER` compiles to a `ForIterNext` residual and
-        // its mandatory `GET_ITER` to a `MayForce` one, neither of which the
-        // scan accepts, so both are poisoned pcs — and refusing AT them is the
-        // stronger test.  The `CodeObject` predicate asks whether a `for`
-        // appears anywhere in the callee; this asks whether the walk reached
-        // it.  `operator.itemgetter.__call__` is the difference: its
-        // multi-index arm builds a tuple with a comprehension that a
-        // single-index call never enters.
-        //
-        // `has_exception_table` goes the same way, and for the same reason.  It
-        // is not an op the walk arrives at but a REGION a guard can deopt
-        // inside, so what replaces it is not the poison set but
-        // `scan.protected` — the pcs the callee's own handlers cover.  Refusing
-        // on ENTERING one means no handler is ever in play on the walked path,
-        // which is the whole of what the `CodeObject` predicate was standing in
-        // for.
-        let poisoned = scan.poison_with_protected();
-        let poison_admit = fbw_inline_poison_enabled()
-            && !legacy_admit
-            && scan.enforceable()
-            && !poisoned.is_empty()
-            && match scan.safety {
-                CalleeReplaySafety::Clean => true,
-                CalleeReplaySafety::DeferredCall => {
-                    let loop_header_admitted = !body_facts.owns_loop_header
-                        || !fbw_callee_body_has_two_entry_method_push(body.code, callee_descr_refs);
-                    entry_is_call_boundary && loop_header_admitted
-                }
-                // The scan reports this only when it could not model the body,
-                // which `enforceable` already excluded.
-                CalleeReplaySafety::Dirty => false,
-            };
-        if fbw_inline_diag_enabled() && !poisoned.is_empty() {
-            eprintln!(
-                "[inline-poison] pc={} admit={poison_admit} safety={:?} poison={:?} protected={:?}",
-                op.pc, scan.safety, scan.poison, scan.protected,
-            );
-        }
-        if poison_admit {
-            inline_poison_pcs = Some(poisoned.into());
-        }
-        // A Dirty body is admitted only when the CALL boundary can seed its
-        // own MIFrame. Non-call specializer entries remain residual.
-        if !legacy_admit && !poison_admit && !seeded_foriter_deferred {
+        if !foriter_seeded_admit {
             return resolved_inline_decline(op.pc, line!());
         }
     }
@@ -8485,142 +7917,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `max_unroll_recursion`.  Carrier-resume frames participate in that same
     // count: `drive_bridge_frame_subwalk` reconstructs their `W_Code` green
     // identities before entering this path.
-    // Evaluated only behind the three cheaper terms, so the short-circuit order
-    // is the same one the single condition had.  Keeping the class lets the
-    // decline census say which admission would widen it.
-    let branchy_handler_scan =
-        if contains_raise && !strict_inlinable && body_facts.has_exception_table {
-            Some(fbw_callee_body_replay_scan(
-                body.code,
-                &arg_facts,
-                body.num_regs_i,
-                body.constants_i,
-                body.num_regs_r,
-                body.constants_r,
-                callee_descr_refs,
-                RawDescrPool::PerFn(callee_perfn_descrs),
-                false,
-            ))
-        } else {
-            None
-        };
-    let branchy_handler_safety = branchy_handler_scan.as_ref().map(|scan| scan.verdict());
-    // The same second reading this gate's sibling above performs, for the same
-    // reason and on the same terms: a body is kept out of the residual only
-    // because of ops the walk may never reach, so read the pcs instead of the
-    // collapsed verdict.  This is the gate the measurement named — bypassing it
-    // alone took a callee whose hot arm is branch-free from 2764.6 ns per call
-    // to 10.7, against 7.7 for the same body with the cold arm deleted.
-    //
-    // `DeferredCall` is admitted here, which `Clean`-only would not be, and
-    // what earns it is `scan.protected` rather than any new promise about
-    // residuals.  This gate's hazard is a structural abort landing after an
-    // effectful opcode WITH A HANDLER IN PLAY — that is why it conditions on
-    // `has_exception_table` at all, and why a terminal raising callee with no
-    // handler keeps its after-residual live anchor and is already admitted.
-    // Refusing on entry to every handler-covered pc removes the handler from
-    // the walked path, so the deferred residuals that remain are the ones the
-    // no-handler case already accepts.
-    let branchy_poisoned = branchy_handler_scan
-        .as_ref()
-        .map(|scan| scan.poison_with_protected())
-        .unwrap_or_default();
-    let branchy_poison_admit = fbw_inline_poison_enabled()
-        && branchy_handler_scan.as_ref().is_some_and(|scan| {
-            scan.enforceable()
-                && !branchy_poisoned.is_empty()
-                && scan.safety != CalleeReplaySafety::Dirty
-        });
-    if branchy_poison_admit {
-        inline_poison_pcs = Some(branchy_poisoned.into());
-    }
-    // `can_inline_callable` / `perform_call` test no exception table and push
-    // an MIFrame for every admitted callee.  The replay screen below is only
-    // for an unseeded sub-walk, whose guards resume at the caller's CALL
-    // boundary and would double a live-heap write.  A seeded frame
-    // (`try_multiframe` / `strict_seed`) carries the callee's own resume
-    // coordinate, which is enough for `DeferredCall` (`mutate_then_raise_caught`
-    // `step`).  A `Dirty` handler-bearing body still abort_trace's under that
-    // seed (`blackhole_inlined_callee_local_after_escape_declined` 0 → 5).
+    // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
+    // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) traces the taken
+    // path, including `except: raise` and `except E: return`. A seeded
+    // callee with an exception table is admitted; an abort inside converts
+    // through `convert_and_run_from_pyjitpl` (`blackhole.py`).
     let seeded_inline = try_multiframe || strict_seed;
-    let seeded_deferred =
-        seeded_inline && branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall);
-    // `perform_call` (`pyjitpl.py`) traces the taken path and pushes one
-    // MIFrame per admitted callee. `can_inline_callable` (`warmstate.py`)
-    // does not residualize that callee because an `except: raise` arm
-    // exists: the arm is a guard side exit. Refuse the walk only at
-    // `scan.poison`, which is that arm. The call inside the `try` stays
-    // on the traced path. An `except E as e: return` arm is the taken
-    // path when the `try` raises, so `handler_except_as_return_admit`
-    // walks those dirty ops instead of residualizing the callee.
-    //
-    // A `FOR_ITER` in that callee is the structural abort the branchy gate
-    // exists to keep behind the decline: the walk raises, then
-    // `LoopBearingCalleeInlineUnsupported` fires inside the handler and the
-    // outer CALL is re-executed. `code_has_for_iter` leaves that body
-    // residual. An `except: raise` arm with no `for` still inlines.
-    let handler_reraise_admit = seeded_inline
-        && !branchy_poison_admit
-        && !pyre_interpreter::code_has_for_iter(callee_code)
-        && branchy_handler_scan.as_ref().is_some_and(|scan| {
-            scan.enforceable()
-                && scan.safety != CalleeReplaySafety::Dirty
-                && poison_confined_to_reraise_handlers(body.code, &scan.poison)
-        });
-    if handler_reraise_admit {
-        if let Some(scan) = branchy_handler_scan.as_ref() {
-            inline_poison_pcs = Some(scan.poison.clone().into());
-        }
-    }
-    // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline`
-    // and `JC_DONT_TRACE_HERE`. `perform_call` (`pyjitpl.py`) traces the
-    // taken path, including `except UnicodeEncodeError as e: return`
-    // when `_check_surrogate` raises into classify. That arm is the
-    // recorded path on the reject site, so the walk must enter it —
-    // unlike `except: raise`, whose arm is a guard side exit and stays
-    // in `inline_poison_pcs`. `code_has_for_iter` still residualizes: a
-    // `LoopBearingCalleeInlineUnsupported` inside the handler re-executes
-    // the outer CALL.
-    //
-    // A Dirty happy path with an unrelated `except E: return` could abort
-    // after a mutation and re-execute the outer CALL, so Dirty is admitted
-    // only when poison is confined to returning handlers.
-    let handler_except_as_return_admit = seeded_inline
-        && !branchy_poison_admit
-        && !pyre_interpreter::code_has_for_iter(callee_code)
-        && branchy_handler_scan
-            .as_ref()
-            .is_some_and(|scan| handler_except_as_return_scan_admits(scan, body.code));
-    if fbw_inline_diag_enabled() {
-        if let Some(scan) = branchy_handler_scan.as_ref() {
-            eprintln!(
-                "[inline-reraise-admit] pc={} admit={handler_reraise_admit} \
-                 except_as={handler_except_as_return_admit} seeded={seeded_inline} \
-                 safety={:?} poison={:?} confined_return={} has_return={}",
-                op.pc,
-                scan.safety,
-                scan.poison,
-                poison_confined_to_returning_handlers(body.code, &scan.poison),
-                body_has_returning_handler(body.code),
-            );
-        }
-    }
-    if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
-        && !foriter_dirty_seeded_resume_admit
-        && !branchy_poison_admit
-        && !seeded_deferred
-        && !handler_reraise_admit
-        && !handler_except_as_return_admit
-    {
-        crate::jitcode_dispatch::census_record(
-            if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {
-                "InlineCallee::BranchyHandlerDeferredCall"
-            } else {
-                "InlineCallee::BranchyHandlerDirty"
-            },
-        );
-        return resolved_inline_decline(op.pc, line!());
-    }
     // Preflight the caller frame BEFORE the seed below records a virtual
     // PyFrame.  A CALL covered by a try/catch marker must remain residual so
     // its post-call catch resume routes an exception; returning after frame
@@ -9966,9 +9268,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     //
     // The odometer, not the store journal alone: a store, a list append/pop
     // and a cell store each bump it, and the store journal counts only the
-    // first.  `latch_abort_call_resume` — the sibling that decides the same
-    // "did this sub-walk already run an effect" question for the abort latch —
-    // reads it for that reason.
+    // first.  The abort path reads it for the same "did this sub-walk already
+    // run an effect" question.
     let prologue_effects_before = fbw_executed_effect_count();
     // Compute fresh outer_active_boxes for the inline sub-walk when the
     // parent FBW walk carries an empty set (`dispatch_via_miframe`
@@ -10160,9 +9461,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // Path-1: resolve scalar static-field reads off this callee's own
             // unseeded portal frame to its compile-time constants.
             inline_callee_consts: Some(inline_consts),
-            // The pcs an admission above accepted this body DESPITE.  Walking
-            // into one refuses the inline and rewinds to this CALL.
-            inline_poison_pcs: inline_poison_pcs.clone(),
             // Guards emitted inside the callee body — both the walker's own
             // and the `_nonstandard_virtualizable` PTR_EQ promote that
             // `vable_getfield_*` records internally — resume at this CALL
@@ -10527,27 +9825,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     );
                 }
             }
-            // Unlike the entry carrier, this leg resumes INSIDE the rebuilt
-            // callee, so a residual the callee recorded only symbolically
-            // before the abort pc lies BEHIND the resume point and the
-            // discarded trace was its only carrier.  `unjournaled_before_subwalk`
-            // is sampled before the sub-walk and cannot see such a mark; read
-            // the flags again, as the loop-header, abort-pc and branch-guard
-            // legs do.
+            // This leg resumes INSIDE the rebuilt callee, so a residual the
+            // callee recorded only symbolically before the abort pc lies
+            // BEHIND the resume point and the discarded trace was its only
+            // carrier.  `unjournaled_before_subwalk` is sampled before the
+            // sub-walk and cannot see such a mark; read the flags again, as
+            // the loop-header, abort-pc and branch-guard legs do.
             //
             // Attempted whether or not the callee executed anything.
             // `convert_and_run_from_pyjitpl` (`blackhole.py`) rebuilds
             // every framestack frame at its own pc unconditionally —
             // `run_blackhole_interp_to_cancel_tracing` ends `assert False`
             // (`pyjitpl.py`) — and the caller is resumed PAST its call
-            // (`blackhole.py`), never rewound to it.  The entry
-            // carrier's rewind-to-the-CALL has no upstream counterpart, so it
-            // is the fallback for a callee this one cannot rebuild, not the
-            // preferred leg; `fbw_set_abort_call_resume` keeps that ordering.
-            // This outer gate sits OUTSIDE the reason-producing closure below,
-            // so until it was instrumented its two narrowings were the only
-            // ones that could keep a callee off leg 4 without saying so — the
-            // census could not tell "never fired" from "not measured".
+            // (`blackhole.py`).  This outer gate sits OUTSIDE the
+            // reason-producing closure below, so until it was instrumented
+            // its two narrowings were the only ones that could keep a callee
+            // off leg 4 without saying so — the census could not tell
+            // "never fired" from "not measured".
             if fbw_debug_abort_enabled() && !(is_top_inline && !fbw_has_unjournaled_effect()) {
                 eprintln!(
                     "[fbw-abort-flush] gh#467 callee-rebuild NOT LATCHED ({})",
@@ -10560,8 +9854,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             if is_top_inline && !fbw_has_unjournaled_effect() {
                 // Each refusal names itself so the debug log can say WHICH
-                // narrowing keeps a callee off this leg — the entry carrier
-                // silently absorbs every one of them.
+                // narrowing keeps a callee off this leg.
                 let payload = (|| {
                     let (outer_jitcode_index, call_jitcode_pc) =
                         abort_flush_call_jitcode_coord.ok_or("no call jitcode coord")?;
@@ -10712,10 +10005,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         live_stack,
                         return_value: pyre_object::PY_NULL,
                         constructor_instance,
-                        // Attached later by `fbw_set_abort_call_resume`, which
-                        // runs in the Err arm below under the entry latch's own
-                        // zero-delta gate.
-                        entry_fallback: None,
                     })
                 })();
                 match payload {
@@ -10814,48 +10103,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             if fbw_inline_diag_enabled() {
                 eprintln!("[inline-abort] callee sub-walk err: {e:?}");
             }
-            // gh#467: a supported abort fired inside this top-level inline
-            // sub-walk.  If the callee executed NO concrete effect and no
-            // unjournaled effect existed before the attempt, latch the outer
-            // CALL boundary so the walk driver flushes the outer frame there
-            // and re-executes the call FORWARD — running the callee from scratch
-            // in the interpreter — instead of rolling back and replaying the
-            // loop from entry, which double-applies the non-journaled pre-CALL
-            // store.  Discarding a zero-executed-effect callee attempt and
-            // re-running its CALL is observationally identical to upstream
-            // never having inlined it: tracing aborts and `switch_to_blackhole`
-            // re-runs the call (`pyjitpl.py`; gh#467).  The operand
-            // stack the CALL opcode expects (`[callable, null_or_self,
-            // args...]`) is re-read from the (now GC-forwarded) outer registers,
-            // not the pre-sub-walk `arg_concretes`, so it is current after the
-            // sub-walk's allocations.  Any doubt keeps the legacy replay — the
-            // honest residual (the inner-frame rebuild is #126/#215).
-            //
-            // The kept-stack branch-guard aborts belong to the same class: they
-            // refuse to COMPILE a guard whose not-taken arm the blackhole could
-            // not reconstruct, which says nothing about the sub-walk having
-            // committed anything.  Without a carrier their only remaining leg
-            // rewinds to the OUTER frame's entry (`trace.rs`, "legacy drop
-            // kept"), re-running every effect the walk already executed —
-            // `threading.Thread.start` calling `_start_joinable_thread` twice.
-            if matches!(
-                e,
-                DispatchError::AbortPermanentMarkerReached { .. }
-                    | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
-                    | DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. }
-                    | DispatchError::BranchGuardKeptStackUnsupported { .. }
-            ) {
-                latch_abort_call_resume(
-                    code,
-                    op,
-                    ctx,
-                    call_descr,
-                    is_top_inline,
-                    unjournaled_before_subwalk,
-                    executed_effects_before,
-                    abort_flush_call_jitcode_coord,
-                );
-            }
+            // A seeded inline abort latches the live framestack in `walk`
+            // and converts through `convert_and_run_from_pyjitpl`
+            // (`blackhole.py`).  Returning the error is what lets that latch
+            // see the abort class.
             return Err(e);
         }
     };
@@ -10880,20 +10131,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         return resolved_inline_decline(op.pc, line!());
                     }
                     // descroperation.py checks the app-level result before
-                    // returning from `space.str` / `space.repr`. Re-run the
-                    // original builtin call at the caller boundary so the
-                    // interpreter raises its faithful TypeError; the inlined
-                    // body has no committed concrete effect at this point.
-                    latch_abort_call_resume(
-                        code,
-                        op,
-                        ctx,
-                        call_descr,
-                        is_top_inline,
-                        unjournaled_before_subwalk,
-                        executed_effects_before,
-                        abort_flush_call_jitcode_coord,
-                    );
+                    // returning from `space.str` / `space.repr`. Abort so
+                    // `convert_and_run_from_pyjitpl` (`blackhole.py`) raises
+                    // the faithful TypeError from the live framestack.
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 if require_exact_int_result
@@ -10914,6 +10154,37 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // and it keeps a legal program from killing the enclosing
                     // loop's trace, which `callee_inline_unsupported` would.
                     return resolved_inline_decline(op.pc, line!());
+                }
+                if operator_tail == Some(crate::operator_continuation::OperatorTail::Format)
+                    && fbw_executed_effect_count() == executed_effects_before
+                {
+                    // `descroperation.py format` checks `isinstance_w(w_res,
+                    // w_unicode)` after `__format__` returns. Pin the observed
+                    // str class before the destination write so a later
+                    // non-str deopts with the FORMAT_WITH_SPEC result slot
+                    // still pending; `OperatorTail::Format` is the resume
+                    // level that runs the same check when a guard inside the
+                    // inlined body fails (`crate::operator_continuation`).
+                    // This GuardClass itself resumes at `op.pc`, so a deopt
+                    // re-runs FORMAT_WITH_SPEC. Emit it only over a body that
+                    // committed nothing. An effectful body cannot decline
+                    // here: `cut_declined_subwalk` drops recorded ops and
+                    // does not undo the effect, so the FORMAT_WITH_SPEC
+                    // residual would run `__format__` again. Skip the pin
+                    // and keep the recorded prefix.
+                    let concrete = match concrete_for_shadow {
+                        ConcreteValue::Ref(obj) if !obj.is_null() => obj,
+                        _ => return resolved_inline_decline(op.pc, line!()),
+                    };
+                    let result_type = unsafe { (*concrete).ob_type } as i64;
+                    let result_type_const = ctx.trace_ctx.const_int(result_type);
+                    walker_emit_guard_with_snapshot(
+                        ctx,
+                        op.pc,
+                        OpCode::GuardClass,
+                        &[value, result_type_const],
+                    )?;
+                    ctx.trace_ctx.heap_cache_mut().class_now_known(value);
                 }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
                     // `len` runs `space.index` on what `__len__` returned,
@@ -10952,10 +10223,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // whole operator; aborting would ban the enclosing loop
                     // for a `__len__` that answers this way every iteration,
                     // which is worse than the residual this route was opened
-                    // to replace.  It also concedes nothing on the committed
-                    // body: that abort's own rewind has no CALL-forward
-                    // carrier here, so it replays the outer frame from entry
-                    // and re-runs the very effects the residual re-runs.
+                    // to replace.
                     if !len_value.is_some_and(|value| value >= 0)
                         || fbw_executed_effect_count() != executed_effects_before
                     {
@@ -10989,26 +10257,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // `descr_call` discards `__init__`'s result after checking it is
                 // None and returns the instance instead (`check_init_returned_none`).
                 // A non-None result is a TypeError the inlined body cannot raise, so
-                // give the callee back to the interpreter, which re-runs the call and
-                // raises the faithful message.  Latch the CALL boundary first, like
-                // the invalid-`str`/`repr`-result path above: the sub-walk already
-                // executed the constructor body, so a plain abort would have the
-                // interpreter replay it and repeat any effect it performed.
+                // abort and let `convert_and_run_from_pyjitpl` (`blackhole.py`)
+                // raise the faithful message from the live framestack.
                 let (value, concrete_for_shadow) = match constructor_result {
                     Some(instance) => {
                         if !matches!(concrete_for_shadow,
                         ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
                         {
-                            latch_abort_call_resume(
-                                code,
-                                op,
-                                ctx,
-                                call_descr,
-                                is_top_inline,
-                                unjournaled_before_subwalk,
-                                executed_effects_before,
-                                abort_flush_call_jitcode_coord,
-                            );
                             return Err(DispatchError::callee_inline_unsupported(op.pc));
                         }
                         instance
@@ -11042,21 +10297,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // did.  `FBW_EXECUTED_EFFECT_COUNT` is the odometer that
                     // answers whether that is survivable: "a nonzero count delta
                     // means the callee attempt cannot be discarded and re-executed
-                    // without risking a double".  Abort rather than decline —
-                    // `latch_abort_call_resume` deliberately declines to latch the
-                    // CALL when effects ran, so the interpreter resumes past it
-                    // instead of re-running the effects.
+                    // without risking a double".  Abort rather than decline so
+                    // `convert_and_run_from_pyjitpl` (`blackhole.py`) resumes
+                    // the live framestack past the call.
                     if fbw_executed_effect_count() != executed_effects_before {
-                        latch_abort_call_resume(
-                            code,
-                            op,
-                            ctx,
-                            call_descr,
-                            is_top_inline,
-                            unjournaled_before_subwalk,
-                            executed_effects_before,
-                            abort_flush_call_jitcode_coord,
-                        );
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     }
                     *result = Some((value, concrete_for_shadow));
@@ -13829,8 +13073,6 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         Some((arg, concrete_arg, w_type, version_tag, cell_guard)),
         None,
         // The entry is the `range(...)` CALL this `__index__` is nested in.
-        // `foriter_deferred_admit` rewinds a `DeferredCall` body to that CALL,
-        // which is what admits the body inside a `for`.
         // `index_inline_sample_safe` is what makes the re-run free.
         true,
         false,
@@ -13961,16 +13203,11 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag, cell_guard)),
         None,
-        // `entry_is_call_boundary`, for the reason the forward-dunder route
-        // gives: what decides it is whether the abort rewind can name this
-        // entry, not whether the entry is spelled CALL, and
-        // `latch_abort_call_resume` names a BINARY_OP one by sourcing the
-        // operand image from the frame's own resume sources.  Saying `false`
-        // here cost the whole route inside a `for`, where
-        // `foriter_dirty_bound` has it as a term and refused every subscript
-        // the loop walked.  There is no rewind arm to guard: `__getitem__`
-        // has no reflected half, so no body reached here can answer
-        // `NotImplemented` and demand its descent be taken back.
+        // `entry_is_call_boundary`. What decides it is whether the abort
+        // can name this entry as a resume coordinate, not whether the entry
+        // is spelled CALL. `__getitem__` has no reflected half, so no body
+        // reached here can answer `NotImplemented` and demand its descent
+        // be taken back.
         binop_rewind_enabled(),
         false,
         None,
@@ -14614,18 +13851,13 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         outcome => {
             // Rewinding the emission and falling through to the caller's
-            // residual re-runs the whole `__next__`.  The sibling decline that
-            // does the same states its precondition outright — "sound because
-            // the body is admitted only when re-running it observes and changes
-            // nothing" — and the legacy route can state it because
-            // `fbw_callee_body_replay_scan` proved the body `Clean` first.
-            // This keyed route deliberately bypasses that classification, so
-            // read the odometer instead: once the sub-walk has executed a
-            // concrete effect, `cut_trace_with_snapshots` cannot undo it (it
-            // truncates recorded ops and snapshots, nothing else) and the
-            // residual `next` compiles a loop that advances the iterator twice
-            // per iteration.  Surface the decline as an abort there, the same
-            // disposition every other caller of the inliner already takes.
+            // residual re-runs the whole `__next__`. Once the sub-walk has
+            // executed a concrete effect, `cut_trace_with_snapshots` cannot
+            // undo it (it truncates recorded ops and snapshots, nothing else)
+            // and the residual `next` compiles a loop that advances the
+            // iterator twice per iteration. Surface the decline as an abort
+            // there, the same disposition every other caller of the inliner
+            // already takes.
             if fbw_executed_effect_count() != executed_effects_before {
                 return Err(match outcome {
                     Err(e) => e,
@@ -15145,38 +14377,6 @@ pub(crate) struct GeneratorResumeCensus {
     yield_marker_offset: Option<usize>,
     /// `(ops, merge_points, residual_calls)` over the whole body.
     ops_to_yield: (usize, usize, usize),
-    /// What [`fbw_callee_body_replay_scan`] says about the body, or `None` if
-    /// the descr pool did not resolve.
-    replay: Option<GeneratorResumeReplay>,
-}
-
-/// The half of the census that prices a ROLLBACK-based resume.
-///
-/// A resume walk that declines mid-body leaves the generator's REAL frame
-/// written: the locals array through `store_live_frame_array_slot` and
-/// `last_instr` through `store_live_frame_static_int`, neither of which is a
-/// fresh frame the decline can simply discard.  The walk's non-commit epilogue
-/// can put both back (`fbw_locals_mirror_rollback`,
-/// `fbw_exit_last_instr_rollback`), but only for effects the journal covers,
-/// so what decides the resume is whether the body carries an op that commits
-/// outside it.  That is exactly the question the replay scan already answers
-/// for the FOR_ITER inline admissions.
-#[derive(Clone, Copy)]
-pub(crate) struct GeneratorResumeReplay {
-    /// The pc-set-aware verdict: what the body is once its poisoned ops are
-    /// excluded.
-    safety: CalleeReplaySafety,
-    /// [`CalleeReplayScan::verdict`] — what a caller that cannot carry a pc
-    /// set must read, so any poison at all reads `Dirty`.
-    verdict: CalleeReplaySafety,
-    /// Total poisoned offsets, and how many of them sit at or after the resume
-    /// marker.  A body poisoned only in its prologue is one the resume never
-    /// enters, so the whole-body verdict overstates its risk.
-    poison: (usize, usize),
-    /// Offsets inside one of the body's own protected regions.
-    protected: usize,
-    /// The scan could not model the body, so no pc set describes it.
-    unscannable: bool,
 }
 
 /// Decide whether a `FOR_ITER` over `iter_obj` names a generator resume the
@@ -15195,7 +14395,6 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
         tables: (0, 0),
         yield_marker_offset: None,
         ops_to_yield: (0, 0, 0),
-        replay: None,
     };
     macro_rules! decline {
         ($v:expr) => {{
@@ -15256,35 +14455,10 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
         .find(|&&(_, py)| py as usize == shape.last_instr as usize)
         .map(|&(off, _)| off as usize);
     census.marker_offset = generator_resume_marker_offset(&pjc, census.resume_py_pc);
-    let Some(marker) = census.marker_offset else {
+    if census.marker_offset.is_none() {
         decline!(V::NoResumeEntry)
-    };
-    census.ops_to_yield = generator_resume_op_scan(body.code);
-    if let Some((descr_refs, perfn_descrs, _)) =
-        crate::state::sub_jitcode_descr_pool_for_code(w_pycode)
-    {
-        let scan = fbw_callee_body_replay_scan(
-            body.code,
-            &[],
-            body.num_regs_i,
-            body.constants_i,
-            body.num_regs_r,
-            body.constants_r,
-            &descr_refs,
-            RawDescrPool::PerFn(perfn_descrs),
-            false,
-        );
-        census.replay = Some(GeneratorResumeReplay {
-            safety: scan.safety,
-            verdict: scan.verdict(),
-            poison: (
-                scan.poison.len(),
-                scan.poison.iter().filter(|&&off| off >= marker).count(),
-            ),
-            protected: scan.protected.len(),
-            unscannable: scan.unscannable,
-        });
     }
+    census.ops_to_yield = generator_resume_op_scan(body.code);
     census.verdict = V::Admissible;
     census
 }
@@ -15441,9 +14615,7 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
         let (ops, merge_points, residual_calls) = census.ops_to_yield;
         eprintln!(
             "[gen-census] pc={} {} resume_py={} n_py={} tables={:?} marker={:?} \
-             yield_marker={:?} loop_header={} ops={} mp={} residual={} \
-             safety={} verdict={} poison={} poison_after_marker={} protected={} \
-             unscannable={}",
+             yield_marker={:?} loop_header={} ops={} mp={} residual={}",
             op.pc,
             census.verdict.label(),
             census.resume_py_pc as isize,
@@ -15455,16 +14627,6 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
             ops,
             merge_points,
             residual_calls,
-            census
-                .replay
-                .map_or("-".into(), |r| format!("{:?}", r.safety)),
-            census
-                .replay
-                .map_or("-".into(), |r| format!("{:?}", r.verdict)),
-            census.replay.map_or(0, |r| r.poison.0),
-            census.replay.map_or(0, |r| r.poison.1),
-            census.replay.map_or(0, |r| r.protected),
-            census.replay.is_some_and(|r| r.unscannable),
         );
     }
     walk_generator_resume(ctx, op, funcptr, r_args[0], iter_obj, call_descr, dst)
@@ -15633,7 +14795,12 @@ fn descend_generatorentry<Sym: WalkSym>(
         &[iter_op, none_op],
         &[majit_ir::Type::Ref, majit_ir::Type::Ref],
     );
-    if concrete != 0 {
+    // `execute_and_record` (`pyjitpl.py`) stamps the executed result on the
+    // box before `opimpl_goto_if_not` reads `box.getint()`. `jit_next`
+    // answers exhaustion with a null return; that is still a concrete Ref,
+    // and leaving the CALL_ASSEMBLER unstamped makes the trailing
+    // `ptr_nonzero` / `goto_if_not` a missing-value abort.
+    if raised == 0 {
         ctx.trace_ctx.set_opref_concrete(
             ca_result,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
@@ -16485,45 +15652,16 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
             pyre_object::typeobject::w_type_get_name(w_class)
         }));
     }
-    // A `NotImplemented` result below has to be handed back to the full binary
-    // protocol, and the whole-body `Clean` verdict is what stood in for the
-    // walk being able to do that: with no rewind at this entry the result was
-    // discarded with a bare `Err`, which leaves the walk driver replaying the
-    // loop from entry with the body's effects already applied.
-    //
-    // What the bar has to prevent is a body that COMMITS and then answers
-    // `NotImplemented`, because there is no exit from that: the result has to
-    // go back to the protocol, and every route back re-runs the body.  That is
-    // a property of the path the body walks, and no reading of the code object
-    // has it -- `LoadAttr` and `BinaryOp` are deferred helpers, so the verdict
-    // is `DeferredCall` for `return self.v + o.v` over ints, which commits
-    // nothing, exactly as it is for `self.x + o` over a mutating dunder, which
-    // does.  So the verdict is not asked for the answer.  The descent runs
-    // under [`BinopRewindInlineGuard`], which refuses the first commit BEFORE
-    // it runs, leaving the cut legal for every path that reaches the arm
-    // below.
-    //
-    // That arm still reads the odometer.  The guard is what makes the reading
-    // come out all-clear; the reading is what proves it for the path walked,
-    // rather than assuming it.
-    let commits_nothing = callee_body_commits_nothing(w_code);
-    // Armed for exactly the bodies admitted on the rewind.  A `Clean` body
-    // commits nothing by the scan that named it, so it keeps the descent it
-    // already had rather than a stricter one.
-    let admitted_on_rewind = !commits_nothing;
-    let refusal = if commits_nothing {
-        None
-    } else if !binop_rewind_enabled() {
-        Some("commits a replayable effect")
-    } else if !dunder_body_admissible_on_rewind(w_code) {
-        Some("delegates through a nested call")
-    } else {
-        None
-    };
-    if let Some(why) = refusal {
-        decline!(format_args!("{}.{dunder} {why}", unsafe {
-            pyre_object::typeobject::w_type_get_name(w_class)
-        }));
+    // A `NotImplemented` result has to go back to the operator protocol.
+    // `perform_call` (`pyjitpl.py`) traces the dunder as an MIFrame; the
+    // walker admits the same way. [`BinopRewindInlineGuard`] refuses the
+    // first commit before the helper runs, so the cut is empty of effects
+    // when the result is handed back.
+    if !dunder_body_admissible_on_rewind(w_code) {
+        decline!(format_args!(
+            "{}.{dunder} delegates through a nested call",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
     }
 
     let arg_concretes = vec![
@@ -16555,8 +15693,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     // allocation would fail `obj.raw() >= from` and residualize the dunder.
     let region_from = ctx.trace_ctx.get_trace_position()._index;
     let session = ctx.session;
-    let rewind_guard =
-        admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session, region_from));
+    let rewind_guard = BinopRewindInlineGuard::enter(session, region_from);
     let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -16585,11 +15722,8 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         })),
         Some((other, concrete_other, w_typ_other)),
         // `entry_is_call_boundary`.  What decides it is whether the abort
-        // rewind can name this entry, not whether the entry is spelled CALL,
-        // and it can once `latch_abort_call_resume` sources the operand image
-        // from the frame's own resume sources instead of from a CALL
-        // residual's operand list -- the latter is what resumed one operand
-        // short here.
+        // can name this entry as a resume coordinate, not whether the entry
+        // is spelled CALL.  `binop_rewind_enabled` is that name.
         binop_rewind_enabled(),
         false,
         None,
@@ -16610,7 +15744,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         other => other,
     };
-    let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
+    let refused_a_commit = rewind_guard.refused();
     drop(rewind_guard);
     if refused_a_commit {
         fbw_effect_journal_rollback_since(journal_mark);
@@ -16779,33 +15913,12 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     if nparams < 2 || (nparams != 2 && !binop_defaulted_params_enabled()) {
         return Ok(None);
     }
-    // A `NotImplemented` result below has to be handed back to the full binary
-    // protocol, and the whole-body `Clean` verdict is what stood in for the
-    // walk being able to do that: with no rewind at this entry the result was
-    // discarded with a bare `Err`, which leaves the walk driver replaying the
-    // loop from entry with the body's effects already applied.
-    //
-    // What the bar has to prevent is a body that COMMITS and then answers
-    // `NotImplemented`, because there is no exit from that: the result has to
-    // go back to the protocol, and every route back re-runs the body.  That is
-    // a property of the path the body walks, and no reading of the code object
-    // has it -- `LoadAttr` and `BinaryOp` are deferred helpers, so the verdict
-    // is `DeferredCall` for `return self.v + o.v` over ints, which commits
-    // nothing, exactly as it is for `self.x + o` over a mutating dunder, which
-    // does.  So the verdict is not asked for the answer.  The descent runs
-    // under [`BinopRewindInlineGuard`], which refuses the first commit BEFORE
-    // it runs, leaving the cut legal for every path that reaches the arm
-    // below.
-    //
-    // That arm still reads the odometer.  The guard is what makes the reading
-    // come out all-clear; the reading is what proves it for the path walked,
-    // rather than assuming it.
-    let commits_nothing = callee_body_commits_nothing(w_code);
-    // Armed for exactly the bodies admitted on the rewind.  A `Clean` body
-    // commits nothing by the scan that named it, so it keeps the descent it
-    // already had rather than a stricter one.
-    let admitted_on_rewind = !commits_nothing;
-    if !commits_nothing && !(binop_rewind_enabled() && dunder_body_admissible_on_rewind(w_code)) {
+    // A `NotImplemented` result has to go back to the operator protocol.
+    // `perform_call` (`pyjitpl.py`) traces the dunder as an MIFrame; the
+    // walker admits the same way. [`BinopRewindInlineGuard`] refuses the
+    // first commit before the helper runs, so the cut is empty of effects
+    // when the result is handed back.
+    if !dunder_body_admissible_on_rewind(w_code) {
         return Ok(None);
     }
 
@@ -16837,8 +15950,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     // allocation would fail `obj.raw() >= from` and residualize the dunder.
     let region_from = ctx.trace_ctx.get_trace_position()._index;
     let session = ctx.session;
-    let rewind_guard =
-        admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session, region_from));
+    let rewind_guard = BinopRewindInlineGuard::enter(session, region_from);
     let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -16867,11 +15979,8 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         })),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         // `entry_is_call_boundary`.  What decides it is whether the abort
-        // rewind can name this entry, not whether the entry is spelled CALL,
-        // and it can once `latch_abort_call_resume` sources the operand image
-        // from the frame's own resume sources instead of from a CALL
-        // residual's operand list -- the latter is what resumed one operand
-        // short here.
+        // can name this entry as a resume coordinate, not whether the entry
+        // is spelled CALL.  `binop_rewind_enabled` is that name.
         binop_rewind_enabled(),
         false,
         None,
@@ -16892,7 +16001,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         other => other,
     };
-    let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
+    let refused_a_commit = rewind_guard.refused();
     drop(rewind_guard);
     if refused_a_commit {
         fbw_effect_journal_rollback_since(journal_mark);
@@ -17047,11 +16156,9 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
     }
 
     // If this straight-line body is safe to sample, refuse a bad result
-    // before the sub-walk emits anything.  The shared `require_str_result`
-    // fallback latches a Python CALL boundary; FORMAT_WITH_SPEC is not one,
-    // so replaying it from that latch skips the interpreter's TypeError check.
-    // This is the format sibling of the sample in
-    // `try_walker_inline_exception_string_override`.
+    // before the sub-walk emits anything.  `require_str_result` still
+    // declines a record-time non-str; this sample is the format sibling of
+    // the one in `try_walker_inline_exception_string_override`.
     if let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) {
         if body_facts.exc_override_sample_safe {
             let sampled = {
@@ -17076,7 +16183,8 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_value),
         ConcreteValue::Ref(concrete_spec),
     ];
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let inlined = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -17103,46 +16211,32 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
             inline_attr_cell_guard(w_class, "__format__", method)
         })),
         None,
-        // FORMAT_WITH_SPEC pops both operands, so this stays false: a
-        // non-str result has no CALL boundary to latch and declines to the
-        // residual, which raises `descroperation.py` `format`'s TypeError.
-        // A mutating body still inlines.  `foriter_dirty_bound` admits it
-        // once `strict_seed` gives the callee its own frame, and
-        // `perform_call` (`pyjitpl.py`) resumes inside that frame rather
-        // than re-executing this opcode.
+        // FORMAT_WITH_SPEC is not a Python CALL. A record-time non-str
+        // declines to the residual (`require_str_result`); a guard inside
+        // the inlined body resumes through `OperatorTail::Format`, which
+        // runs `DescrOperation.format`'s post-call str check.
         false,
-        // `__format__` returning a non-string is a TypeError the interpreter
-        // raises; the plumbing guards the inlined result is a string so that
-        // check keeps its meaning on the compiled path.
+        // `__format__` returning a non-string is a TypeError
+        // `call_format_dispatch_w` raises; `require_str_result` keeps that
+        // at record time, and `OperatorTail::Format` keeps it on deopt.
         true,
         None,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    if matches!(inlined.0, DispatchOutcome::Continue) {
-        // `space.format` checks `isinstance_w(result, str)` after the app-level
-        // call.  Pin the concrete string class observed by this trace: an
-        // exact str and each accepted str subclass get their own guarded
-        // version, while a later non-string result deopts to the residual that
-        // raises the faithful TypeError.
-        let result = ctx.registers_r.get(dst).expect("ref register in range");
-        let concrete_result = match concrete_from_recorded_opref(ctx, result) {
-            ConcreteValue::Ref(obj) => obj,
-            other => unreachable!("accepted __format__ result is not a Ref: {other:?}"),
-        };
-        debug_assert!(
-            !concrete_result.is_null() && unsafe { pyre_object::is_str(concrete_result) }
-        );
-        let result_type = unsafe { (*concrete_result).ob_type } as i64;
-        let result_type_const = ctx.trace_ctx.const_int(result_type);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[result, result_type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx.heap_cache_mut().class_now_known(result);
+        None,
+        false,
+        None,
+        None,
+        Some(crate::operator_continuation::OperatorTail::Format),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    // A refused result — `__format__` answering a non-str — declines from
+    // inside the call above after the body has been walked. Cut that
+    // emission back so the caller's residual runs the operator itself.
+    if inlined.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
-    Ok(Some(inlined))
+    Ok(inlined)
 }
 
 /// State taken before a protocol-dunder inline so a non-bool result can be
@@ -17220,9 +16314,8 @@ fn finish_inlined_bool<Sym: WalkSym>(
 ///
 /// No `NotImplemented` arm and no [`BinopRewindInlineGuard`].  The method
 /// returns a bool or raises, the same shape as [`try_walker_inline_format`].
-/// `entry_is_call_boundary` is [`binop_rewind_enabled`]: `latch_abort_call_resume`
-/// sources this opcode's operand image from the frame, which is what makes
-/// the entry a boundary a seeded callee can resume at.
+/// `entry_is_call_boundary` is [`binop_rewind_enabled`]: that flag names this
+/// opcode as a resume coordinate a seeded callee can convert at.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -18160,7 +17253,6 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     /// The active and paused adapters share the same frame-owned slots.
     frame_state: WalkFrameState,
     inline_callee_consts: Option<InlineCalleeConsts>,
-    inline_poison_pcs: Option<std::sync::Arc<[usize]>>,
     fbw_mode: FbwWalkMode<Sym>,
     session: &'a std::cell::RefCell<WalkSession>,
     descr_refs: &'a dyn DescrRefTable,
@@ -18212,7 +17304,6 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         let mut walk_ctx = WalkContext {
             frame_state: self.frame_state.clone(),
             inline_callee_consts: self.inline_callee_consts,
-            inline_poison_pcs: self.inline_poison_pcs.take(),
             fbw_mode: self.fbw_mode,
             session: self.session,
             registers_r: &self.registers_r,
@@ -18303,7 +17394,6 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         };
 
         self.inline_callee_consts = walk_ctx.inline_callee_consts;
-        self.inline_poison_pcs = walk_ctx.inline_poison_pcs.take();
         self.fbw_mode = walk_ctx.fbw_mode;
         self.entry_py_pc = walk_ctx.entry_py_pc;
         self.outer_resume_marker_jit_pc = walk_ctx.outer_resume_marker_jit_pc;
@@ -19039,7 +18129,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         concrete_registers_i: callee_concrete_i,
 
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         // `op_pc` belongs to the callee JitCode.  A canonical helper has no
         // Python blackhole entry of its own, so it stays transparent while its
         // actual MIFrame/register state lives in this heap-owned frame.

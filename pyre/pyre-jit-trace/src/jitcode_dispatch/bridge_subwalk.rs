@@ -414,7 +414,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 ..Default::default()
             }),
             inline_callee_consts: None,
-            inline_poison_pcs: None,
             fbw_mode: FbwWalkMode {
                 snapshot_sym: sym_ptr,
 
@@ -1727,11 +1726,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             }),
             inline_callee_consts: Some(consts),
             // A carrier resume starts at the failed guard and runs the callee
-            // forward; it does not replay an enclosing CALL, so there is no
-            // replay for a poisoned pc to double.  The same reason
+            // forward; it does not replay an enclosing CALL.
             // `fbw_abort_nested_unjournaled_residual` excludes
-            // `fbw_mode.carrier_resume` from its own decline.
-            inline_poison_pcs: None,
+            // `fbw_mode.carrier_resume` from its own decline for the same
+            // reason.
             fbw_mode: FbwWalkMode {
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,

@@ -67,36 +67,17 @@ pub(crate) fn fbw_inline_diag_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some())
 }
 
-/// `PYRE_FBW_INLINE_POISON`: admit a callee whose replay scan reported
-/// offending pcs and refuse at those pcs during the walk, instead of declining
-/// at the CALL on the scan's collapsed verdict.
-///
-/// Off by default.  Measured over the synthetic corpus on 2026-08-22, the arm
-/// reaches a poisoned pc on 47 of 451 benches; each refusal denies the callee
-/// for the rest of the thread's tracing, so `named_reraise_sibling_hot` goes
-/// from 4 compiled loops and 7 bridges to 1 and 0, and 154 backend/bench rows
-/// change counters.  Two of them answer wrong — `str_search_index_bounds` and
-/// `inline_subwalk_property_mutates` — because a refusal that lands after the
-/// callee has executed an effect has no resume leg that neither repeats it nor
-/// drops it.  The scan and the walk enforcement stay wired so both arms run
-/// from one binary.
-pub(crate) fn fbw_inline_poison_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_INLINE_POISON").is_some())
-}
-
 /// `PYRE_NO_BINOP_REWIND`: stop treating a `BINARY_OP` / `COMPARE_OP` dunder
-/// entry as a boundary the abort can rewind to, and go back to declining every
-/// body the whole-body scan collapses to `DeferredCall` there.
+/// entry as a boundary the abort can rewind to.
 ///
 /// On by default; the variable only turns it off, so a bisection can name this
 /// change in one command.  It stands on two rewinds a non-CALL entry did not
 /// have before.  The record-time one is the trace cut the caller takes on a
 /// `NotImplemented` result, under the same all-clear odometer reading the
-/// un-lowered-helper rollback uses.  The runtime one is the forward-flush
-/// carrier, which `latch_abort_call_resume` names from the frame's own resume
-/// sources; `caller_operand_slots` is where that entry's `[lhs, rhs]` operand
-/// image comes from, and reading the image off a CALL residual's operand list
+/// un-lowered-helper rollback uses.  The runtime one converts the live
+/// framestack through `convert_and_run_from_pyjitpl` (`blackhole.py`);
+/// `caller_operand_slots` is where that entry's `[lhs, rhs]` operand image
+/// comes from, and reading the image off a CALL residual's operand list
 /// instead is what resumed one operand short at a `BINARY_OP`.
 ///
 /// What it does NOT widen is the promise the entry makes about commits.  A

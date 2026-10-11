@@ -81,15 +81,20 @@ pub(crate) enum OperatorTail {
     /// `descroperation.py is_true` after `__bool__`: the bool object becomes
     /// the int `opcode_ops::truth_value` leaves in the Truth residual.
     Truth,
+    /// `descroperation.py format` after `__format__`: the returned box must
+    /// be a `str` (or subclass); anything else is a TypeError, and a str
+    /// subclass keeps its identity.
+    Format,
 }
 
 impl OperatorTail {
-    const ALL: [OperatorTail; 2] = [OperatorTail::Len, OperatorTail::Truth];
+    const ALL: [OperatorTail; 3] = [OperatorTail::Len, OperatorTail::Truth, OperatorTail::Format];
 
     fn slot(self) -> usize {
         match self {
             OperatorTail::Len => 0,
             OperatorTail::Truth => 1,
+            OperatorTail::Format => 2,
         }
     }
 
@@ -97,6 +102,7 @@ impl OperatorTail {
         match self {
             OperatorTail::Len => "len_tail",
             OperatorTail::Truth => "truth_bool_tail",
+            OperatorTail::Format => "format_tail",
         }
     }
 
@@ -106,6 +112,7 @@ impl OperatorTail {
         match self {
             OperatorTail::Len => (bh_len_tail as *const () as i64, 'r'),
             OperatorTail::Truth => (bh_truth_bool_tail as *const () as i64, 'i'),
+            OperatorTail::Format => (bh_format_tail as *const () as i64, 'r'),
         }
     }
 }
@@ -159,6 +166,25 @@ pub extern "C" fn bh_truth_bool_tail(w_res: pyre_object::PyObjectRef) -> i64 {
         return unsafe { pyre_object::w_bool_get_value(w_res) } as i64;
     }
     pyre_interpreter::bool_must_return_bool_jit_abi(w_res)
+}
+
+/// `descroperation.py format` after `get_and_call_function` of `__format__`.
+///
+/// `isinstance_w(w_res, w_unicode)` keeps a str subclass's identity; any
+/// other box is the TypeError `call_format_dispatch_w` builds. A guard
+/// inside the inlined `__format__` resumes here so that check, not the raw
+/// dunder return, is what the FORMAT_WITH_SPEC result register receives.
+pub extern "C" fn bh_format_tail(w_res: pyre_object::PyObjectRef) -> i64 {
+    if !w_res.is_null() && unsafe { pyre_object::is_str(w_res) } {
+        return w_res as i64;
+    }
+    let err = pyre_interpreter::PyError::type_error(format!(
+        "__format__ must return a str, not {}",
+        pyre_interpreter::type_methods::arg_type_name(w_res),
+    ));
+    use majit_ir::helper_fnaddr::ResidualError;
+    err.publish_residual();
+    0
 }
 
 thread_local! {
@@ -391,6 +417,30 @@ mod tests {
             cell.with(|c| c.get()),
             0,
             "a non-bool must publish the TypeError where the residual's \
+             exception guard reads it",
+        );
+        cell.with(|c| c.set(0));
+    }
+
+    /// `__format__` answering a str is that box. Anything else publishes the
+    /// TypeError the FORMAT_WITH_SPEC residual's exception guard reads.
+    #[test]
+    fn the_format_tail_requires_a_str() {
+        let cell = &majit_metainterp::blackhole::BH_LAST_EXC_VALUE;
+        cell.with(|c| c.set(0));
+        let answer = bh_format_tail(pyre_object::w_str_new("s"));
+        assert_eq!(cell.with(|c| c.get()), 0, "a str must not raise");
+        let answer = answer as pyre_object::PyObjectRef;
+        assert!(
+            unsafe { pyre_object::is_str(answer) },
+            "`format` hands the str box on, so a subclass keeps its type",
+        );
+
+        assert_eq!(bh_format_tail(pyre_object::w_int_new(42)), 0);
+        assert_ne!(
+            cell.with(|c| c.get()),
+            0,
+            "a non-str must publish the TypeError where the residual's \
              exception guard reads it",
         );
         cell.with(|c| c.set(0));

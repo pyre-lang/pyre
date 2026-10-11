@@ -16,7 +16,7 @@
 //! arms themselves stay in `handle` (mod.rs) and call into these.
 
 use super::symbolic_fold::try_fold_registered_symbolic_residual;
-use super::*;
+use super::{InlineParentBlackhole, InlineParentFrame, *};
 use pyre_interpreter::{locals_w, locals_w_mut};
 
 /// The published fnaddrs whose registered path matches `pred`, collected once.
@@ -661,6 +661,20 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
             .call_stack_overrides
             .iter()
             .find_map(|&(candidate, value)| (candidate == slot).then_some(value))
+            .or_else(|| {
+                // `_opimpl_setarrayitem_vable` (`pyjitpl.py`) writes each
+                // operand-stack slot through `setarrayitem_vable_via_metainterp`
+                // → `store_live_frame_array_slot` onto the inline callee's
+                // `callee_shadow.concrete_frame` before a nested sub-walk
+                // starts.  `paused_concrete_frame` is that shadow's frame
+                // (None on a root parent, whose live PyFrame is still parked
+                // at the loop header).  Fill a missing override from that
+                // array so a complete image can latch when the CALL-site
+                // capture was sparse.
+                parent
+                    .paused_concrete_frame()
+                    .and_then(|frame| crate::state::concrete_stack_value(frame, slot))
+            })
         else {
             latchdbg!(
                 "root-parent-stack: no call_stack_override for slot {slot} \
@@ -1311,6 +1325,314 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     true
 }
 
+/// Result-register of the CALL this paused parent sits on, if the op returns
+/// a value.  `_setup_return_value_*` writes that color when the callee
+/// finishes, so the captured image must leave it unset.
+fn parent_call_result_color(
+    pjc: &crate::pyjitcode::PyJitCode,
+    call_jit_pc: usize,
+) -> Option<(char, usize)> {
+    let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
+    let result_bank = call.argcodes.chars().last()?;
+    if result_bank == 'v' {
+        return None;
+    }
+    let color = pjc.jitcode.code.get(call.next_pc.checked_sub(1)?)?;
+    Some((result_bank, usize::from(*color)))
+}
+
+fn parent_resume_pc(
+    parent: &InlineParentFrame,
+    pjc: &crate::pyjitcode::PyJitCode,
+) -> Option<usize> {
+    if let Some(concrete) = parent.blackhole.as_ref() {
+        return Some(concrete.resume_pc);
+    }
+    if parent.call_jitcode_pc.is_none() {
+        return parent.resume_marker_jit_pc;
+    }
+    let call_jit_pc = parent.call_jitcode_pc?;
+    decode_op_at(&pjc.jitcode.code, call_jit_pc).map(|call| call.next_pc)
+}
+
+/// One paused caller as an `MIFrame`. Prefer the CALL-site blackhole capture;
+/// if that capture missed, reconstruct from the live banks `attach_live_caller`
+/// stored. Continuation tails (`descr_call`, operator) own no banks: they
+/// still become their own `MIFrame` at `resume_marker_jit_pc`, which is what
+/// `_setup_return_value_r` (`blackhole.py`) needs so the dunder return lands
+/// in the tail rather than the caller's result slot.
+fn build_parent_miframe<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent: &InlineParentFrame,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: no pyjitcode for parent \
+                 jitcode_index={}",
+                parent.jitcode_index
+            );
+        }
+        return None;
+    };
+    if let Some(concrete) = parent.blackhole.as_ref() {
+        return copy_captured_parent_blackhole(ctx, &pjc, concrete, origin, index);
+    }
+    if parent.call_jitcode_pc.is_none()
+        && parent.registers_i.is_none()
+        && parent.registers_r.is_none()
+        && parent.registers_f.is_none()
+    {
+        return build_codeless_continuation_parent(ctx, parent, &pjc, origin, index);
+    }
+    build_parent_miframe_from_live_banks(ctx, parent, &pjc, origin, index)
+}
+
+/// `descr_call` / operator tails: jitcode and resume pc only, no live banks.
+/// `ctor_continuation` keeps the instance in `INSTANCE_REG`; operator tails
+/// have nothing live (`get_list_of_active_boxes(in_a_call=True)`).
+fn build_codeless_continuation_parent<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent: &InlineParentFrame,
+    pjc: &crate::pyjitcode::PyJitCode,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let Some(resume_pc) = parent.resume_marker_jit_pc else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: continuation tail \
+                 has no resume_marker_jit_pc"
+            );
+        }
+        return None;
+    };
+    if !instruction_starts_at(&pjc.jitcode, resume_pc) {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: continuation \
+                 resume_pc={resume_pc} is not an instruction start"
+            );
+        }
+        return None;
+    }
+    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    if let Some(&instance) = parent.boxes.first() {
+        let color = crate::ctor_continuation::INSTANCE_REG as usize;
+        let Some(majit_ir::Value::Ref(gc)) = ctx.trace_ctx.concrete_of_opref(instance) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: continuation \
+                     instance box has no concrete Ref"
+                );
+            }
+            return None;
+        };
+        if color >= miframe.ref_regs.len() {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: continuation \
+                     INSTANCE_REG {color} out of range (len {})",
+                    miframe.ref_regs.len()
+                );
+            }
+            return None;
+        }
+        miframe.ref_regs[color] = Some(OpRef::const_ptr(gc));
+    }
+    Some(miframe)
+}
+
+fn copy_captured_parent_blackhole<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pjc: &crate::pyjitcode::PyJitCode,
+    concrete: &InlineParentBlackhole,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
+    for &(color, value) in &concrete.int_values {
+        let bank_len = miframe.int_regs.len();
+        let Some(slot) = miframe.int_regs.get_mut(color) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: int color {color} \
+                     out of range (len {bank_len})"
+                );
+            }
+            return None;
+        };
+        *slot = Some(OpRef::const_int(value));
+    }
+    for &(color, value) in &concrete.ref_values {
+        let bank_len = miframe.ref_regs.len();
+        let Some(slot) = miframe.ref_regs.get_mut(color) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: ref color {color} \
+                     out of range (len {bank_len})"
+                );
+            }
+            return None;
+        };
+        *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+    }
+    for &(color, opref) in &concrete.float_values {
+        let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: float opref {opref:?} \
+                     not a stamped Float"
+                );
+            }
+            return None;
+        };
+        let bank_len = miframe.float_regs.len();
+        let Some(slot) = miframe.float_regs.get_mut(color) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: float color {color} \
+                     out of range (len {bank_len})"
+                );
+            }
+            return None;
+        };
+        *slot = Some(OpRef::const_float(value));
+    }
+    Some(miframe)
+}
+
+fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent: &InlineParentFrame,
+    pjc: &crate::pyjitcode::PyJitCode,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let Some(resume_pc) = parent_resume_pc(parent, pjc) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: parent.blackhole None \
+                 and no CALL resume pc (continuation tail / capture missing)"
+            );
+        }
+        return None;
+    };
+    if !instruction_starts_at(&pjc.jitcode, resume_pc) {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: resume_pc={resume_pc} \
+                 is not an instruction start"
+            );
+        }
+        return None;
+    }
+    let (Some(registers_i), Some(registers_r), Some(registers_f), Some(frame_state)) = (
+        parent.registers_i.as_ref(),
+        parent.registers_r.as_ref(),
+        parent.registers_f.as_ref(),
+        parent.frame_state.as_ref(),
+    ) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: parent.blackhole None \
+                 and no live banks (descr_call / operator continuation)"
+            );
+        }
+        return None;
+    };
+    let result = parent
+        .call_jitcode_pc
+        .and_then(|pc| parent_call_result_color(pjc, pc));
+    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    for color in 0..miframe.int_regs.len() {
+        if result == Some(('i', color)) {
+            continue;
+        }
+        let Some(opref) = registers_i.get(color) else {
+            continue;
+        };
+        if opref == OpRef::NONE {
+            continue;
+        }
+        let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: live int color \
+                     {color} opref={opref:?} has no concrete"
+                );
+            }
+            return None;
+        };
+        miframe.int_regs[color] = Some(OpRef::const_int(value));
+    }
+    for color in 0..miframe.ref_regs.len() {
+        if result == Some(('r', color)) {
+            continue;
+        }
+        let Some(opref) = registers_r.get(color) else {
+            continue;
+        };
+        if opref.is_none() {
+            continue;
+        }
+        let from_shadow = {
+            let borrowed = frame_state.borrow();
+            borrowed
+                .concrete_registers_r
+                .get(color)
+                .copied()
+                .and_then(|value| match value {
+                    ConcreteValue::Ref(value) => Some(value as i64),
+                    _ => None,
+                })
+        };
+        let forwarded = match ctx
+            .trace_ctx
+            .lookup_opref_concrete(opref)
+            .or_else(|| ctx.trace_ctx.recover_ref_value(opref, 8))
+        {
+            Some(majit_ir::Value::Ref(gc)) => Some(gc.0 as i64),
+            _ => None,
+        };
+        if let Some(value) = forwarded.or(from_shadow) {
+            miframe.ref_regs[color] = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+        } else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: live ref color \
+                     {color} opref={opref:?} has no concrete"
+                );
+            }
+            return None;
+        }
+    }
+    for color in 0..miframe.float_regs.len() {
+        if result == Some(('f', color)) {
+            continue;
+        }
+        let Some(opref) = registers_f.get(color) else {
+            continue;
+        };
+        if opref == OpRef::NONE {
+            continue;
+        }
+        let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: live float color \
+                     {color} opref={opref:?} has no concrete"
+                );
+            }
+            return None;
+        };
+        miframe.float_regs[color] = Some(OpRef::const_float(value));
+    }
+    Some(miframe)
+}
+
 #[derive(Clone, Copy)]
 enum InnermostMiframeBuild {
     LiveMarker(Option<(char, usize, i64)>),
@@ -1357,58 +1679,9 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         .flat_map(|inline| inline.parents.iter())
         .enumerate()
     {
-        let Some(concrete) = parent.blackhole.as_ref() else {
-            // `descr_call`'s tail reaches here too, and captures no image
-            // because it owns no register banks. Declining is the same
-            // best-effort answer any uncaptured parent gets — never a chain
-            // with a level missing, which would deliver the callee's return
-            // into the wrong caller's slot.
-            s2dbg!("origin={origin} frame {index}: parent.blackhole None (capture missing)");
+        let Some(miframe) = build_parent_miframe(ctx, parent, origin, index) else {
             return None;
         };
-        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
-        else {
-            s2dbg!(
-                "origin={origin} frame {index}: no pyjitcode for parent jitcode_index={}",
-                parent.jitcode_index
-            );
-            return None;
-        };
-        let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
-        for &(color, value) in &concrete.int_values {
-            let bank_len = miframe.int_regs.len();
-            let Some(slot) = miframe.int_regs.get_mut(color) else {
-                s2dbg!(
-                    "origin={origin} frame {index}: int color {color} out of range (len {bank_len})"
-                );
-                return None;
-            };
-            *slot = Some(OpRef::const_int(value));
-        }
-        for &(color, value) in &concrete.ref_values {
-            let bank_len = miframe.ref_regs.len();
-            let Some(slot) = miframe.ref_regs.get_mut(color) else {
-                s2dbg!(
-                    "origin={origin} frame {index}: ref color {color} out of range (len {bank_len})"
-                );
-                return None;
-            };
-            *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
-        }
-        for &(color, opref) in &concrete.float_values {
-            let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
-                s2dbg!("origin={origin} frame {index}: float opref {opref:?} not a stamped Float");
-                return None;
-            };
-            let bank_len = miframe.float_regs.len();
-            let Some(slot) = miframe.float_regs.get_mut(color) else {
-                s2dbg!(
-                    "origin={origin} frame {index}: float color {color} out of range (len {bank_len})"
-                );
-                return None;
-            };
-            *slot = Some(OpRef::const_float(value));
-        }
         frames.push(miframe);
     }
 
@@ -4483,9 +4756,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // cannot mutate an object visible before the call.  Upstream records list
     // construction directly as `opimpl_newlist` (`pyjitpl.py`) and
     // allows residual calls at every `MIFrame` depth (`pyjitpl.py`);
-    // it has no nested-callee abort for these allocation helpers.  Keep this
-    // executor predicate aligned with `fbw_callee_body_replay_scan`, which
-    // already admits both helpers as replay-safe reads/fresh allocations.
+    // it has no nested-callee abort for these allocation helpers.
     //
     // Disjoint from the three observed-value classes above: those name `CallFn`
     // and `GetIter` over exact builtin scalars, this one names the two
@@ -4829,8 +5100,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let escape_frame = if is_may_force { live_frame } else { 0 };
         // Latch the operand-stack mirror for the escape flush: at force time
         // the walk-end flush needs the caller's mid-expression stack, which
-        // the vable shadow cannot provide (`reconstructed_all_ref_call_stack`
-        // resolves the same mirror for the inline-abort Entry carrier).
+        // the vable shadow cannot provide.
         //
         // A WRITING residual is latched too, but never to resume AT this
         // opcode: the withdrawal below cancels its commit and restores the
@@ -6203,340 +6473,6 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
     Some(decode_descr_index(body_code, d, descr_offset))
 }
 
-/// Which specialization table arm a body `BINARY_OP` residual was admitted
-/// under, hence what its result is proven to be.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SpecializedBinop {
-    /// `Add` / `Subtract` / `Multiply` (+ in-place): exact-numeric operands,
-    /// exact-numeric result.
-    Numeric,
-    /// `And` / `Or` / `Xor` (+ in-place): exact-plain-int operands,
-    /// exact-plain-int result.
-    PlainInt,
-    /// One of the six ordinary comparisons over exact numeric operands:
-    /// exact-bool result.
-    Compare,
-}
-
-/// A `BINARY_OP` has the generic residual shape in a per-function jitcode, but
-/// the walker replaces a statically tagged plain arithmetic op with a native
-/// one before the generic residual executor (and its nested-residual decline)
-/// is reached, when every incoming callee argument is an exact int or float.
-/// Non-numeric operands stay an impure residual, so admitting them here would
-/// trigger the nested-residual 6421 abort storm.
-///
-/// The accepted set is every tag the generated descent records without an
-/// unsafe replay residual.  In-place tags select the same concrete builtin
-/// arithmetic as their plain forms, so the two forms are admitted together:
-///
-/// - `Add` / `Subtract` / `Multiply` (+ in-place) — the generated
-///   `binary_value_from_tag` descent, including `FloatAdd` / `FloatSub` /
-///   `FloatMul` for float operands.
-/// - `And` / `Or` / `Xor` (+ in-place) — `IntAnd` / `IntOr` / `IntXor`,
-///   *int-only*.  Hence the separate
-///   [`SpecializedBinop::PlainInt`] arm, which additionally demands both
-///   operands be proven plain ints.
-/// - `FloorDivide` / `Remainder` (+ in-place) — exact-int-only generated
-///   descent.  Its success arm records the `int.py_div` / `int.py_mod`
-///   oopspec, and its zero-divisor arm propagates the materialised
-///   `W_BaseException` as `SubRaise`.  The `plain_int` proof rules out a user
-///   `__mod__`.
-///
-/// Every other tag is excluded because its lowering can still decline and
-/// leave a residual that is NOT replay-safe on its own:
-///
-/// - `TrueDivide` (+ in-place) — declines a zero divisor so the raising
-///   `descr_truediv` stays recorded.
-/// - shifts (+ in-place) — the generated descent handles exact-int sites, but
-///   this replay admission remains conservative around the count-dependent
-///   exception and large-count arms.
-/// - `Power` (+ in-place) — keeps a cold-path residual for
-///   nan/inf/negative-base operands.
-/// - `Subscr`, `MatrixMultiply` (+ in-place) — no arm.
-///
-/// The two provenance sets describe the actual operands of each binop.  This
-/// admits `def f(self, x): return x + 1` when only `x` is numeric, while still
-/// rejecting `self + x` and global numeric subclasses with user dunders.
-/// `None` for every op outside the accepted set.
-pub(crate) fn residual_call_specialized_plain_numeric_binop(
-    body_code: &[u8],
-    numeric_ref_regs: &[bool; u8::MAX as usize + 1],
-    plain_int_ref_regs: &[bool; u8::MAX as usize + 1],
-    d: &DecodedOp,
-    num_regs_i: usize,
-    constants_i: &[i64],
-    callee_descr_refs: &[DescrRef],
-) -> Option<SpecializedBinop> {
-    let helper = residual_call_helper_kind_in_body(body_code, d, callee_descr_refs);
-    if !matches!(
-        d.key,
-        "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
-    ) || !matches!(
-        helper,
-        Some(majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp)
-    ) {
-        return None;
-    }
-    // `iIR`: the R-list follows the I-list.  The specialization reads exactly
-    // `r_args[0]` (lhs) and `r_args[1]` (rhs) and declines any other arity,
-    // so demand the same shape here and require both operands to be proven.
-    let Some(&i_len) = body_code.get(d.pc + 2) else {
-        return None;
-    };
-    let r_len_pc = d.pc + 1 + 1 + 1 + i_len as usize;
-    if body_code.get(r_len_pc) != Some(&2) {
-        return None;
-    }
-    let (Some(&lhs_reg), Some(&rhs_reg)) =
-        (body_code.get(r_len_pc + 1), body_code.get(r_len_pc + 2))
-    else {
-        return None;
-    };
-    if !numeric_ref_regs[lhs_reg as usize] || !numeric_ref_regs[rhs_reg as usize] {
-        return None;
-    }
-    // The first I-list item is the BINARY_OP tag.  It must be in the callee's
-    // immutable constants window; a runtime tag could select an operation
-    // outside the accepted set.
-    if i_len == 0 {
-        return None;
-    }
-    let Some(&tag_reg) = body_code.get(d.pc + 3) else {
-        return None;
-    };
-    let Some(&tag) = (tag_reg as usize)
-        .checked_sub(num_regs_i)
-        .and_then(|constant_index| constants_i.get(constant_index))
-    else {
-        return None;
-    };
-    // All six `ComparisonOperator`s are admitted.  The hand int, long,
-    // mixed long/int and float compare folds are retired;
-    // `compare_op_descent` records the exact-builtin sites.
-    // `CHECK_EXC_MATCH` reuses the `CompareOp`
-    // shape with `ISINSTANCE_OP` (tag 10), which is not one of the six and so
-    // stays excluded.
-    if helper == Some(majit_ir::RuntimeHelperKind::CompareOp) {
-        return pyre_interpreter::runtime_ops::compare_op_from_tag(tag)
-            .is_some()
-            .then_some(SpecializedBinop::Compare);
-    }
-    use pyre_interpreter::bytecode::BinaryOperator;
-    match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {
-        Some(
-            BinaryOperator::Add
-            | BinaryOperator::Subtract
-            | BinaryOperator::Multiply
-            | BinaryOperator::InplaceAdd
-            | BinaryOperator::InplaceSubtract
-            | BinaryOperator::InplaceMultiply,
-        ) => Some(SpecializedBinop::Numeric),
-        Some(
-            BinaryOperator::And
-            | BinaryOperator::Or
-            | BinaryOperator::Xor
-            | BinaryOperator::InplaceAnd
-            | BinaryOperator::InplaceOr
-            | BinaryOperator::InplaceXor
-            | BinaryOperator::FloorDivide
-            | BinaryOperator::Remainder
-            | BinaryOperator::InplaceFloorDivide
-            | BinaryOperator::InplaceRemainder,
-        ) => (plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize])
-            .then_some(SpecializedBinop::PlainInt),
-        _ => None,
-    }
-}
-
-/// Flatten lowered `BINARY_OP` to `inline_call_ir_r/dIR>r` of
-/// `binary_value_from_tag` / named `add`.  The residual-call exemption
-/// above never sees that form, so a one-line `return a + i` body was
-/// `Dirty` (`UnprovableStoreOrCallForm`) and stayed a per-iteration
-/// residual (`inlined_helper_arith_hot`).
-pub(crate) fn inline_call_specialized_plain_numeric_binop(
-    body_code: &[u8],
-    numeric_ref_regs: &[bool; u8::MAX as usize + 1],
-    plain_int_ref_regs: &[bool; u8::MAX as usize + 1],
-    d: &DecodedOp,
-    num_regs_i: usize,
-    constants_i: &[i64],
-    callee_descr_refs: &[DescrRef],
-    callee_pool: super::RawDescrPool<'_>,
-) -> Option<SpecializedBinop> {
-    if !d.opname.starts_with("inline_call_ir_r") {
-        return None;
-    }
-    let descr_index = {
-        let lo = *body_code.get(d.pc + 1)? as usize;
-        let hi = *body_code.get(d.pc + 2)? as usize;
-        lo | (hi << 8)
-    };
-    let sub_index = callee_descr_refs
-        .get(descr_index)
-        .and_then(|descr| descr.as_jitcode_descr())
-        .map(|jc| jc.jitcode_index());
-    let &i_len = body_code.get(d.pc + 3)?;
-    let r_len_pc = d.pc + 3 + 1 + i_len as usize;
-    if body_code.get(r_len_pc) != Some(&2) {
-        return None;
-    }
-    let lhs_reg = *body_code.get(r_len_pc + 1)?;
-    let rhs_reg = *body_code.get(r_len_pc + 2)?;
-    if !numeric_ref_regs[lhs_reg as usize] || !numeric_ref_regs[rhs_reg as usize] {
-        return None;
-    }
-    let int_concretes: Vec<ConcreteValue> = if i_len == 0 {
-        Vec::new()
-    } else {
-        let tag_reg = *body_code.get(d.pc + 4)?;
-        (tag_reg as usize)
-            .checked_sub(num_regs_i)
-            .and_then(|index| constants_i.get(index).copied())
-            .map(|tag| vec![ConcreteValue::Int(tag)])
-            .unwrap_or_default()
-    };
-    // Prefer the I-list tag.  Flatten's per-fn descr index can name a
-    // different jitcode (`dict_write_barrier` at descr 109) while the
-    // I-list still carries BINARY_OP Add=0; the helper-name lookup then
-    // declines a body the walker will specialize.
-    let tag = match int_concretes.first() {
-        Some(ConcreteValue::Int(tag)) => *tag,
-        _ => super::specialize::binary_op_tag_for_helper_index(
-            callee_pool,
-            sub_index?,
-            &int_concretes,
-        )?,
-    };
-    use pyre_interpreter::bytecode::BinaryOperator;
-    match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {
-        Some(
-            BinaryOperator::Add
-            | BinaryOperator::Subtract
-            | BinaryOperator::Multiply
-            | BinaryOperator::InplaceAdd
-            | BinaryOperator::InplaceSubtract
-            | BinaryOperator::InplaceMultiply,
-        ) => Some(SpecializedBinop::Numeric),
-        Some(
-            BinaryOperator::And
-            | BinaryOperator::Or
-            | BinaryOperator::Xor
-            | BinaryOperator::InplaceAnd
-            | BinaryOperator::InplaceOr
-            | BinaryOperator::InplaceXor
-            | BinaryOperator::FloorDivide
-            | BinaryOperator::Remainder
-            | BinaryOperator::InplaceFloorDivide
-            | BinaryOperator::InplaceRemainder,
-        ) => (plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize])
-            .then_some(SpecializedBinop::PlainInt),
-        _ => None,
-    }
-}
-
-/// The register holding the receiver of a `STORE_ATTR` residual in a callee
-/// body, or `None` for any other op or an unexpected shape.
-///
-/// `lower_setattr_hlop_to_insn` builds the R-list as `[obj, value, code]`, and
-/// the executor above reads the receiver back as `r_args.first()`, so operand 0
-/// is the receiver at both ends.  The offsets are the same `iIR` walk
-/// [`residual_call_specialized_plain_numeric_binop`] does: the R-list follows
-/// the I-list, whose length is the byte at `pc + 2`.
-pub(crate) fn residual_call_store_attr_receiver_reg(
-    body_code: &[u8],
-    d: &DecodedOp,
-    callee_descr_refs: &[DescrRef],
-) -> Option<u8> {
-    if d.key != "residual_call_ir_v/iIRd"
-        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
-            != Some(majit_ir::RuntimeHelperKind::StoreAttr)
-    {
-        return None;
-    }
-    let &i_len = body_code.get(d.pc + 2)?;
-    let r_len_pc = d.pc + 1 + 1 + 1 + i_len as usize;
-    // Exactly the three the lowering emits; a different arity is not this shape.
-    if body_code.get(r_len_pc) != Some(&3) {
-        return None;
-    }
-    body_code.get(r_len_pc + 1).copied()
-}
-
-/// Is this body op the `CHECK_EXC_MATCH` residual — `compare_fn(exc,
-/// match_type, ISINSTANCE_OP)`?
-///
-/// Unlike the arithmetic tags, this one needs no operand proof.  The helper
-/// validates the match target and then walks the exception class MRO
-/// (`validate_check_exc_match_class` + `check_exc_match_against` →
-/// `exception_match`), reading `is_tuple` / `is_type` / the MRO array and
-/// nothing else: it reaches no user code for any operand, mutates nothing, and
-/// returns one of the two immortal `bool` singletons.  Its single failure mode
-/// — `TypeError` for a target that is not an exception class — allocates a
-/// fresh exception exactly the way the `CanRaise`-tagged members of the
-/// `replay_safe_read` set can, so a replay commits nothing new.
-///
-/// `iIRd>r`: the tag is the first I-list entry, and it must live in the
-/// callee's immutable constant window — a runtime tag could select one of the
-/// six ordinary comparisons, which do dispatch to user `__eq__`.
-pub(crate) fn residual_call_is_exception_match(
-    body_code: &[u8],
-    d: &DecodedOp,
-    num_regs_i: usize,
-    constants_i: &[i64],
-    callee_descr_refs: &[DescrRef],
-) -> bool {
-    if d.key != "residual_call_ir_r/iIRd>r"
-        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
-            != Some(majit_ir::RuntimeHelperKind::CompareOp)
-    {
-        return false;
-    }
-    if body_code.get(d.pc + 2).is_none_or(|i_len| *i_len == 0) {
-        return false;
-    }
-    let Some(&tag_reg) = body_code.get(d.pc + 3) else {
-        return false;
-    };
-    (tag_reg as usize)
-        .checked_sub(num_regs_i)
-        .and_then(|constant_index| constants_i.get(constant_index))
-        .is_some_and(|tag| *tag == pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG)
-}
-
-/// Is this body op a `TO_BOOL` / `POP_JUMP_IF_*` truth residual whose single
-/// Ref operand is a proven immutable builtin — an exact numeric, or the `bool`
-/// an accepted `COMPARE_OP` in the same body produced?
-///
-/// Such an operand's `__bool__` is `int`'s or `bool`'s, so the call reads a
-/// field and returns an int: it commits nothing a replay could double.  That is
-/// the same argument the `replay_safe_read` set is built on, and it holds
-/// whether or not the walk of `opcode_ops::truth_value` erases the residual.
-///
-/// `iRd>i`: the funcbox int operand, then the R-list (length byte, then one
-/// register per entry), then the descr.  Only the one-operand arity is the
-/// truth shape.
-pub(crate) fn residual_call_is_proven_truth(
-    body_code: &[u8],
-    numeric_ref_regs: &[bool; u8::MAX as usize + 1],
-    bool_ref_regs: &[bool; u8::MAX as usize + 1],
-    d: &DecodedOp,
-    callee_descr_refs: &[DescrRef],
-) -> bool {
-    if d.key != "residual_call_r_i/iRd>i"
-        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
-            != Some(majit_ir::RuntimeHelperKind::Truth)
-    {
-        return false;
-    }
-    if body_code.get(d.pc + 2) != Some(&1) {
-        return false;
-    }
-    let Some(&arg_reg) = body_code.get(d.pc + 3) else {
-        return false;
-    };
-    numeric_ref_regs[arg_reg as usize] || bool_ref_regs[arg_reg as usize]
-}
-
 /// Whether this residual is the binding store immediately following the live
 /// in-flight `FOR_ITER`.  Both effect accounting and namespace rollback must
 /// use this one predicate so their loop-variable classifications cannot drift.
@@ -6801,10 +6737,9 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
 ///
 /// A sub-walk inherits `FbwWalkMode::snapshot_sym` from its parent, so that
 /// field names the walk's outermost frame however deep the descent is. A
-/// helper holding a class statement is an ordinary inline candidate — the
-/// admission that declines one today is the generic replay-safety screen, not
-/// a rule about `__build_class__` — so reading the snapshot root would decide
-/// a callee's class statement by its caller's returns. `WalkSession::framestack`
+/// helper holding a class statement is an ordinary inline candidate, so
+/// reading the snapshot root would decide a callee's class statement by its
+/// caller's returns. `WalkSession::framestack`
 /// carries the callee levels, and its top is the frame executing the opcode;
 /// this is the same derivation `ActiveResumeFrame::current` performs, so the
 /// gate and the snapshot encoder name one consistent active frame.
@@ -9230,14 +9165,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // `while` body, and the fold below is what erases its
                 // residual.
                 //
-                // A body carrying `STORE_ATTR` scans `Dirty`, which the
-                // admission at `inline_call.rs` refuses before the descent
-                // executes anything.  What does reach here is the store an
-                // inlined `__init__` performs on the instance the region's own
-                // `type` call allocated -- `return Nested(self.n + o.n).n` --
-                // and the receiver is what tells the two apart, so it is
-                // passed rather than the region being asked about the write
-                // alone.
+                // The receiver tells the rewind guard whether this store is
+                // on an instance the region's own `type` call allocated
+                // (`return Nested(self.n + o.n).n`) or on an object that
+                // already existed, so it is passed rather than the region
+                // being asked about the write alone.
                 fbw_binop_rewind_refuse_commit(ctx, op.pc, Some(obj_opref))?;
                 if spec_gate(SpecFold::StoreAttrDirect, || {
                     try_walker_specialize_store_attr(

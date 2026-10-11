@@ -796,9 +796,8 @@ enum RuntimeInsn {
 /// (`int_sub/ci>i`, `goto_if_not_int_gt/icL`, ...) have no fixed `BC_*` byte
 /// and only appear once a graph uses them.  Those bytes must reach
 /// [`decode_op_at`] too: it resolves every opcode through the byte -> opname
-/// map, and an unknown byte makes the whole body undecodable, which the
-/// callers read as "assume the worst" (`replay_unscannable`, every frame slot
-/// written).
+/// map, and an unknown byte makes the whole body undecodable. Callers treat
+/// that as an unreadable instruction.
 ///
 /// **The numbering is per-`Assembler`, not global.** `record_insn_key` picks
 /// the lowest unreserved byte this assembler has not used, so first-appearance

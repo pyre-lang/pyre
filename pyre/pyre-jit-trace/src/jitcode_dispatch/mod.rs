@@ -2111,17 +2111,6 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// reads that alias the caller's frame. `None` when this is not an
     /// inlined-callee sub-walk.
     pub inline_callee_consts: Option<InlineCalleeConsts>,
-    /// Ascending jitcode offsets in THIS sub-walk's body that
-    /// [`fbw_state::fbw_callee_body_replay_scan`] could not prove replay-safe.
-    /// [`walk`] refuses the inline on reaching one.
-    ///
-    /// The admission that hands this over is what turns a whole-body verdict
-    /// into a path-sensitive one, so the set is per-sub-walk and never
-    /// inherited: it names offsets into one callee's jitcode and means nothing
-    /// in another's.  `None` for a top-level walk and for an admission that
-    /// found nothing to poison, which is the common case and the reason the
-    /// per-op test is one `Option` check.
-    pub inline_poison_pcs: Option<std::sync::Arc<[usize]>>,
     /// FBW walk modes inherited by nested sub-walk contexts.
     pub fbw_mode: FbwWalkMode<Sym>,
     /// Caller-owned state shared by every frame in this walk attempt.
@@ -3459,9 +3448,9 @@ impl DispatchError {
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
             Self::BranchGuardKeptSlotUnsourced { .. } => "BranchGuardKeptSlotUnsourced",
             Self::ForceQuasiImmutable { .. } => "ForceQuasiImmutable",
-            // Split on the discriminant: the two carry different recoveries —
-            // `false` routes to the CALL-forward carrier, `true` is owned by the
-            // general walk-abort leg — so one key cannot answer which fired.
+            // Split on the discriminant: `true` converts through WalkAbort
+            // when frames are materialized; `false` without a seeded frame
+            // is residual-not-abort.  One key cannot answer which fired.
             Self::LoopBearingCalleeInlineUnsupported {
                 blackhole_required: true,
                 ..
@@ -3567,10 +3556,10 @@ impl DispatchError {
     /// registers, descrs and concretes lazily against the live trace context,
     /// so a second family exists here that upstream has no analog for: the
     /// abort IS the report that a value is unavailable
-    /// (`RegisterReadUnbound`, `*NotConcrete`, `*ArgUnbound`, a malformed
-    /// descr).  Converting one of those to a blackhole resumes execution on
-    /// exactly the hole the walker refused to read, so those keep the legacy
-    /// entry replay.
+    /// (`RegisterReadUnbound`, `SwitchValueNotConcrete`, `*ArgUnbound`, a
+    /// malformed descr).  Converting one of those to a blackhole resumes
+    /// execution on exactly the hole the walker refused to read, so those
+    /// keep the legacy entry replay.
     ///
     /// An allow-list, not a deny-list: a class left out only forgoes the
     /// handoff, while a class wrongly let in resumes on missing data.
@@ -3596,6 +3585,49 @@ impl DispatchError {
                 // succeed. The missing guard snapshot affects compilation of
                 // the discarded trace, not the complete forward image.
                 | Self::SegmentTraceSnapshotUnavailable { .. }
+        )
+    }
+
+    /// Modeling-gap abort that still leaves a complete MIFrame image when the
+    /// inlined callee's `PyFrame` is already seeded.
+    ///
+    /// [`Self::leaves_complete_image`] is the allow-list the root walk uses:
+    /// a class left out only forgoes the handoff.  Inside a seeded inline the
+    /// frames exist (`InlineConcreteFrameGuard`), so the same stop-tracing
+    /// decision can convert through `convert_and_run_from_pyjitpl`
+    /// (`blackhole.py`) instead of falling to entry replay.  Missing-value
+    /// classes stay false — converting those resumes on the hole the walker
+    /// refused to read.
+    ///
+    /// `SubWalkClosedLoop`, `UnexpectedVoidSubReturn` and
+    /// `UnexpectedNonVoidSubReturn` fire in the caller's `inline_call`
+    /// handler after the callee residuals have already run. The latch
+    /// coordinate is that CALL, so converting would re-enter the body.
+    pub(crate) fn can_convert_seeded_inline(&self) -> bool {
+        if self.leaves_complete_image() {
+            return true;
+        }
+        matches!(
+            self,
+            Self::AbortMarkerReached { .. }
+                | Self::AbortPermanentMarkerReached { .. }
+                | Self::PortalFrameTracerArmed { .. }
+                | Self::NotInTraceRequiresConcreteExecution { .. }
+                | Self::KwonlyDefaultsMappingRacedRecord { .. }
+                | Self::ConcreteShadowAllocationFailed { .. }
+                | Self::BranchGuardKeptStackUnsupported { .. }
+                | Self::BranchGuardKeptSlotUnsourced { .. }
+                | Self::BranchGuardUnrestorableKeptStackPermanent { .. }
+                | Self::ExcEdgeNoInFrameCatch { .. }
+                // In-walk refuse of a loop-bearing callee (`fbw_decline_inline_callee`).
+                // With a seeded inline the frames are already an MIFrame stack, so
+                // the refuse converts in place (`run_blackhole_interp_to_cancel_tracing`)
+                // instead. Unseeded remains residual-not-abort: `carrier_owned` when
+                // `!frames_materialized`.
+                | Self::LoopBearingCalleeInlineUnsupported {
+                    blackhole_required: false,
+                    ..
+                }
         )
     }
 
@@ -4610,29 +4642,6 @@ pub fn walk<Sym: WalkSym>(
         // when this step's own sub-walk propagates.
         ctx.session.borrow_mut().crossed_inline_subwalk = false;
         let opcode_position = pc;
-        // The path-sensitive half of the inline admission.  The scan that
-        // admitted this callee left behind the pcs it could not prove
-        // replay-safe instead of declining the whole body for them, so the
-        // refusal happens HERE, where the walk has arrived at one, rather than
-        // at the CALL for an arm the walk may never take.
-        //
-        // Before `step`, so nothing of the offending op is recorded or
-        // executed: the op is the effect, and the decline promises the
-        // enclosing CALL can be re-entered from scratch.  Everything walked up
-        // to this point passed the scan, so it committed no live-heap effect
-        // for the rewind to have to undo.
-        if ctx
-            .inline_poison_pcs
-            .as_ref()
-            .is_some_and(|pcs| pcs.binary_search(&pc).is_ok())
-        {
-            if fbw_inline_diag_enabled() {
-                eprintln!("[inline-poison-refuse] pc={pc}");
-            }
-            census_record("InlineCallee::PoisonedPcReached");
-            let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
-            return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
-        }
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned
@@ -4664,11 +4673,8 @@ pub fn walk<Sym: WalkSym>(
                 // so an unlatched abort is never worse than before.
                 //
                 // Kept in lockstep with the epilogue's own exclusions
-                // (`run_perfn_walk`, `WalkEndCommitLeg::WalkAbort`): the two
-                // gh#467 CALL-forward classes have a more precise recovery that
-                // resumes the OUTER frame at its CALL, so staging an image no
-                // consumer will take would only retain it to the next walk's
-                // reset.  `VableEscapedDuringResidualCall` needs no exclusion —
+                // (`run_perfn_walk`, `WalkEndCommitLeg::WalkAbort`).
+                // `VableEscapedDuringResidualCall` needs no exclusion —
                 // it latches its narrower resume-marker image at force time,
                 // before the error unwinds here, so the guard below defers to it.
                 // Do not consume the session's one-shot coordinate claim for
@@ -4693,14 +4699,23 @@ pub fn walk<Sym: WalkSym>(
                         ctx.inline_callee_consts.map(|c| c.jitcode_index),
                     );
                 }
-                let carrier_owned = matches!(
-                    error,
-                    DispatchError::AbortPermanentMarkerReached { .. }
-                        | DispatchError::LoopBearingCalleeInlineUnsupported {
+                // `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`
+                // without a seeded callee is residual-not-abort: the enclosing
+                // CALL is not entered, so there is no MIFrame to convert.
+                // A seeded inline already has the callee `PyFrame` and converts
+                // in place (`run_blackhole_interp_to_cancel_tracing`).
+                // `AbortPermanentMarkerReached` at the root still owns the
+                // AbortPc flush.
+                let frames_materialized = ctx.fbw_mode.inline_subwalk
+                    && residual_call::current_inline_concrete_frame() != 0;
+                let carrier_owned = !frames_materialized
+                    && matches!(
+                        error,
+                        DispatchError::LoopBearingCalleeInlineUnsupported {
                             blackhole_required: false,
                             ..
-                        }
-                );
+                        } | DispatchError::AbortPermanentMarkerReached { .. }
+                    );
                 // Kept in lockstep with the epilogue's own gate: an abort that
                 // reports a MISSING value cannot be converted, because the
                 // image it would hand the blackhole is the one that just
@@ -4714,8 +4729,14 @@ pub fn walk<Sym: WalkSym>(
                 // blackhole resume loses per-frame identity.  This is the
                 // abort counterpart of the transparent-helper guard snapshot
                 // and trace-limit handling below.
+                //
+                // A seeded inline whose abort is a modeling gap rather than a
+                // missing value latches even when the root allow-list has not
+                // named the class: `run_blackhole_interp_to_cancel_tracing`
+                // (`pyjitpl.py`) converts whatever `framestack` is live.
                 if coordinate_belongs_to_this_frame
-                    && error.leaves_complete_image()
+                    && (error.leaves_complete_image()
+                        || (frames_materialized && error.can_convert_seeded_inline()))
                     && !carrier_owned
                     && !abort_blackhole_latched()
                 {
@@ -5495,153 +5516,6 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
     }
 }
 
-/// Whether every pc in `poison` sits on a `Reraise` handler and off both the
-/// happy path and every other handler.
-///
-/// `perform_call` (`pyjitpl.py`) traces the path the interpreter takes.
-/// `can_inline_callable` (`warmstate.py`) does not residualize a callee
-/// because an `except: raise` arm exists: that arm is the guard's side exit.
-/// The replay scan names the arm's ops in `poison`. This answers whether
-/// refusing the walk at exactly those pcs leaves the traced `try` body free
-/// of them. An empty set, a poison pc on the happy path, a poison pc a
-/// non-`Reraise` handler can reach, or a body this scan cannot decode all
-/// decline.
-pub(crate) fn poison_confined_to_reraise_handlers(code: &[u8], poison: &[usize]) -> bool {
-    poison_confined_to_handler_shape(code, poison, ExcHandlerShape::Reraise)
-}
-
-/// Whether every pc in `poison` sits on a `Returns` handler and off both the
-/// happy path and every other handler.
-///
-/// `can_inline_callable` (`warmstate.py`) does not residualize a callee
-/// because an `except E as e: return` arm exists. `perform_call`
-/// (`pyjitpl.py`) traces that arm when it is the taken path — classify's
-/// `_check_surrogate` reject is that shape. Unlike a reraise arm, the walk
-/// must enter these pcs, so the matching admit does not put them in
-/// `inline_poison_pcs`.
-pub(crate) fn poison_confined_to_returning_handlers(code: &[u8], poison: &[usize]) -> bool {
-    poison_confined_to_handler_shape(code, poison, ExcHandlerShape::Returns)
-}
-
-/// Whether a seeded except-as-return admit may keep this scan.
-///
-/// [`fbw_callee_body_replay_scan`] stores unsafe ops in `poison` and
-/// leaves `safety` as `Clean`/`DeferredCall`; [`CalleeReplayScan::verdict`]
-/// folds a non-empty poison set into `Dirty`. This admit does not install
-/// `inline_poison_pcs` (the walk must enter a taken `except E: return`
-/// arm), so it has to read `verdict()` — `safety != Dirty` is true for
-/// every enforceable scan and would admit a Dirty happy path as long as
-/// some returning handler exists. The reraise and branchy-poison siblings
-/// keep reading `safety` because they refuse the walk at `scan.poison`.
-pub(crate) fn handler_except_as_return_scan_admits(scan: &CalleeReplayScan, code: &[u8]) -> bool {
-    scan.enforceable()
-        && body_has_returning_handler(code)
-        && (scan.verdict() != CalleeReplaySafety::Dirty
-            || poison_confined_to_returning_handlers(code, &scan.poison))
-}
-
-/// Whether any `catch_exception` target is a returning handler.
-///
-/// `except E as e: return` compiles to `ExcHandlerShape::Returns` or
-/// `ExceptAsReturn` (CHECK_EXC_MATCH miss reraises). The try body may
-/// still carry happy-path poison (`BUILD_MAP` for `type(name, (), {})`),
-/// so the except-as admit asks this instead of
-/// [`poison_confined_to_returning_handlers`].
-pub(crate) fn body_has_returning_handler(code: &[u8]) -> bool {
-    let mut pc = 0usize;
-    while pc < code.len() {
-        let Some(op) = decode_op_at(code, pc) else {
-            return false;
-        };
-        if op.key == "catch_exception/L" {
-            let target = read_label(code, &op, 0);
-            if matches!(
-                exc_handler_shape(code, target),
-                ExcHandlerShape::Returns | ExcHandlerShape::ExceptAsReturn
-            ) {
-                return true;
-            }
-        }
-        pc = op.next_pc;
-    }
-    false
-}
-
-fn poison_confined_to_handler_shape(
-    code: &[u8],
-    poison: &[usize],
-    wanted: ExcHandlerShape,
-) -> bool {
-    if poison.is_empty() {
-        return false;
-    }
-    let Some(happy) = reachable_op_pcs(code, 0) else {
-        return false;
-    };
-    if poison.iter().any(|pc| happy.contains(pc)) {
-        return false;
-    }
-    let mut wanted_reach = std::collections::HashSet::new();
-    let mut other_reach = std::collections::HashSet::new();
-    let mut saw_wanted = false;
-    let mut pc = 0usize;
-    while pc < code.len() {
-        let Some(op) = decode_op_at(code, pc) else {
-            return false;
-        };
-        if op.key == "catch_exception/L" {
-            let target = read_label(code, &op, 0);
-            match exc_handler_shape(code, target) {
-                ExcHandlerShape::Unproven => return false,
-                shape if shape == wanted => {
-                    saw_wanted = true;
-                    let Some(reach) = reachable_op_pcs(code, target) else {
-                        return false;
-                    };
-                    wanted_reach.extend(reach);
-                }
-                _ => {
-                    let Some(reach) = reachable_op_pcs(code, target) else {
-                        return false;
-                    };
-                    other_reach.extend(reach);
-                }
-            }
-        }
-        pc = op.next_pc;
-    }
-    saw_wanted
-        && poison
-            .iter()
-            .all(|pc| wanted_reach.contains(pc) && !other_reach.contains(pc))
-}
-
-/// Ops reachable from `start` by ordinary control edges.
-///
-/// `None` when the region cannot be decoded: a `switch`, a label whose
-/// width this scan does not model, a budget overrun, or a byte that is not
-/// an opcode. Callers treat that as "do not admit". `catch_exception/L`
-/// contributes its fall-through only — the label is the handler, and
-/// blackhole jumps there. `goto/L` contributes its label only. Every other
-/// labeled op contributes both edges.
-fn reachable_op_pcs(code: &[u8], start: usize) -> Option<std::collections::HashSet<usize>> {
-    let mut visited = std::collections::HashSet::new();
-    let mut work = vec![start];
-    let mut budget = 4096usize;
-    while let Some(pc) = work.pop() {
-        if budget == 0 {
-            return None;
-        }
-        budget -= 1;
-        if !visited.insert(pc) {
-            continue;
-        }
-        let op = decode_op_at(code, pc)?;
-        work.extend(control_successors(code, &op)?);
-    }
-    Some(visited)
-}
-
 fn control_successors(code: &[u8], op: &DecodedOp) -> Option<Vec<usize>> {
     let key = op.key;
     if key.starts_with("raise")
@@ -6210,6 +6084,7 @@ fn concrete_from_recorded_opref<Sym: WalkSym>(
 /// decline.
 ///
 /// [`decode_op_at`]: crate::jitcode_runtime::decode_op_at
+#[cfg(test)]
 fn ref_var_list_operand_offset(code: &[u8], op: &DecodedOp) -> Option<usize> {
     let first_operand_pc = op.pc + 1;
     let mut cursor = first_operand_pc;
@@ -8295,20 +8170,6 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
     }
 }
 
-thread_local! {
-    /// Top-level caller CALL native JitCode coordinate and concrete
-    /// operand-stack slots stashed by
-    /// [`fbw_abort_nested_unjournaled_residual`] at the nested-inline decline,
-    /// read back by the trace loop after the walk unwinds
-    /// ([`fbw_abort_outer_resume_take`]) to drive the abort-point flush.
-    /// The trailing `usize` is the executed-effect odometer at that CALL, the
-    /// `WalkEndResume::Rewind` snapshot the flush re-checks before committing.
-    static FBW_ABORT_OUTER_RESUME: std::cell::Cell<Option<(u32, usize, usize)>> =
-        const { std::cell::Cell::new(None) };
-    static FBW_ABORT_OUTER_STACK_OVERRIDES: std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
 impl<'a> InlineFrameGuard<'a> {
     fn enter(
         session: &'a std::cell::RefCell<WalkSession>,
@@ -8707,15 +8568,13 @@ thread_local! {
     static FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS: std::cell::Cell<Option<(usize, usize)>> =
         const { std::cell::Cell::new(None) };
 
-    /// gh#467 inline-abort forward-flush carrier: latched by
+    /// Inline-abort MidBody carrier: latched by
     /// [`try_walker_inline_user_call`] when a supported abort fires inside a
-    /// TOP-level inline sub-walk whose callee executed no concrete effect.
-    /// Holds `(outer CALL python pc, [callable, null_or_self, args...])` — the
-    /// exact operand stack the interpreter's CALL opcode expects — so the walk
-    /// driver can flush the outer frame AT that CALL and resume the interpreter
-    /// forward (re-executing the callee from scratch) instead of rolling back
-    /// and replaying the loop body from entry.  The `PyObjectRef`s are rooted by
-    /// [`fbw_store_journal_root_walker`] across the abort unwind's allocations.
+    /// TOP-level inline sub-walk.  Holds the rebuilt-callee image so the walk
+    /// driver can resume inside the callee; the live framestack converts
+    /// through `convert_and_run_from_pyjitpl` (`blackhole.py`).  The
+    /// `PyObjectRef`s are rooted by [`fbw_store_journal_root_walker`] across
+    /// the abort unwind's allocations.
     static FBW_ABORT_CALL_RESUME: std::cell::RefCell<Option<InlineAbortCarrier>> =
         const { std::cell::RefCell::new(None) };
 
@@ -8780,19 +8639,6 @@ enum FbwListEffect {
 
 #[derive(Clone, Debug)]
 pub(crate) enum InlineAbortCarrier {
-    Entry {
-        /// The outer CALL's native coordinate, resolved at the interpreter
-        /// flush boundary.
-        outer_jitcode_index: u32,
-        call_jitcode_pc: usize,
-        call_stack: Vec<pyre_object::PyObjectRef>,
-        /// [`FBW_EXECUTED_EFFECT_COUNT`] at the CALL this carrier resumes at,
-        /// sampled when the latch was set.  The flush that consumes this
-        /// carrier re-executes that CALL, so it is
-        /// [`crate::trace::WalkEndResume::Rewind`] and must prove the odometer
-        /// has not moved since.
-        entry_executed_effects: usize,
-    },
     MidBody(MidBodyPayload),
 }
 
@@ -8835,22 +8681,6 @@ pub(crate) struct MidBodyPayload {
     /// itself off this field.  [`crate::ctor_continuation`] plays the same
     /// tail for the blackhole resume.
     pub constructor_instance: pyre_object::PyObjectRef,
-    /// What [`InlineAbortCarrier::Entry`] would have carried for the same
-    /// abort.  The rebuild is preferred, but it can still decline at the flush
-    /// (an unsourceable outer local, a handler-bearing body); dropping to the
-    /// legacy replay there would re-open the double-apply this carrier family
-    /// exists to close, so the entry rewind stands behind it.  An effectful
-    /// loop-header handoff may also attach this only to source caller operands
-    /// below an expression-position CALL; its pre-effect odometer deliberately
-    /// keeps the entry rewind disabled.
-    pub entry_fallback: Option<EntryFallback>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct EntryFallback {
-    pub call_stack: Vec<pyre_object::PyObjectRef>,
-    /// See [`InlineAbortCarrier::Entry::entry_executed_effects`].
-    pub entry_executed_effects: usize,
 }
 
 /// Eager in-place cell write the StoreName/StoreGlobal fold applied.
@@ -8908,7 +8738,6 @@ struct FbwStoreJournalRootArea {
     stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
     list_effects: *const std::cell::RefCell<Vec<FbwListEffect>>,
     append_promote: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
-    abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<FbwCellStore>>,
     namespace_stores: *const std::cell::RefCell<Vec<FbwNamespaceStore>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
@@ -8928,7 +8757,6 @@ thread_local! {
         stores: FBW_STORE_JOURNAL.with(|value| value as *const _),
         list_effects: FBW_LIST_EFFECT_JOURNAL.with(|value| value as *const _),
         append_promote: FBW_APPEND_PROMOTE_JOURNAL.with(|value| value as *const _),
-        abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
         namespace_stores: FBW_NAMESPACE_STORE_JOURNAL.with(|value| value as *const _),
         sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
@@ -9259,12 +9087,6 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     for list in append_promote.iter_mut() {
         visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
     }
-    // Nested-inline abort outer-frame stash: PyObjectRef slots kept across the
-    // rest of the walk; only the ref slot is a root.
-    let abort_overrides = unsafe { &mut *(*area.abort_overrides).as_ptr() };
-    for (_slot, value) in abort_overrides.iter_mut() {
-        visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
-    }
     // Cell-store journal: the cell is nursery-allocated and a mid-walk
     // rebind can drop the module dict's only reference.  Forwarding the
     // slot keeps the rollback's restore on the live object.
@@ -9439,18 +9261,13 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             }
         }
     }
-    // gh#467: the latched forward-flush operand stack (callable + args) is
-    // nursery-resident across the abort unwind — the flush boxes Int/Float
-    // locals, which can trigger a minor collection that moves these refs before
-    // they are written into the frame array — so forward every slot as a root.
+    // The latched MidBody carrier is nursery-resident across the abort unwind
+    // — the flush boxes Int/Float locals, which can trigger a minor collection
+    // that moves these refs before they are written into the frame array — so
+    // forward every slot as a root.
     let abort_resume = unsafe { &mut *(*area.abort_resume).as_ptr() };
     if let Some(carrier) = abort_resume.as_mut() {
         match carrier {
-            InlineAbortCarrier::Entry { call_stack, .. } => {
-                for slot in call_stack {
-                    visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-                }
-            }
             InlineAbortCarrier::MidBody(payload) => {
                 visitor(unsafe {
                     &mut *(&mut payload.w_code as *mut pyre_object::PyObjectRef).cast()
@@ -9477,11 +9294,6 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 for slot in &mut payload.live_stack {
                     if let ConcreteValue::Ref(value) = slot {
                         visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
-                    }
-                }
-                if let Some(fallback) = payload.entry_fallback.as_mut() {
-                    for slot in &mut fallback.call_stack {
-                        visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
                     }
                 }
             }
@@ -12909,7 +12721,13 @@ fn guarded_branch_core<Sym: WalkSym>(
                 // keeps only in an Int register, and replaying from the trace
                 // entry when it is absent double-applies prior residuals.
                 latch_taken_python_branch_abort_stack(ctx, gate_frame.as_ref(), guard_opcode);
-                ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+                // Stamp only at the root: a sub-walk raise must leave
+                // `abort_in_subwalk` clear so `claim_abort_coordinate` can
+                // own this pc. Overwrite a leftover true from a recovered
+                // nested walk when this is the portal.
+                if !ctx.fbw_mode.inline_subwalk {
+                    ctx.session.borrow_mut().abort_in_subwalk = false;
+                }
                 return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent { pc: op.pc });
             }
         }
@@ -14037,9 +13855,12 @@ fn handle<Sym: WalkSym>(
             // inside an inlined callee is a callee coordinate the outer
             // walk's py_pc→jitcode tables cannot resolve, so the abort-point
             // flush must
-            // decline. Latch the value at the marker because the sub-walk's
-            // context is gone when the top-level driver reads the out-channel.
-            ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+            // decline. A sub-walk raise leaves `abort_in_subwalk` for
+            // `claim_abort_coordinate`; the root overwrites a leftover true
+            // so the driver cannot inherit a nested walk's flag.
+            if !ctx.fbw_mode.inline_subwalk {
+                ctx.session.borrow_mut().abort_in_subwalk = false;
+            }
             Err(DispatchError::AbortPermanentMarkerReached { pc: op.pc })
         }
         // `pyjitpl.py opimpl_getfield_raw_i`: `execute_with_descr(

@@ -7332,12 +7332,9 @@ where
         _ => return None,
     };
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
-    // Tag the LOAD_SUPER_ATTR helper calldescr so the full-body walker's callee
-    // replay scan can classify the call.  Untagged it reads as
-    // `RuntimeHelperKind::None`, which the scan poisons as an unprovable
-    // live-heap write, and a poisoned pc declines the whole enclosing callee to
-    // a residual — so every method containing `super()` lost its inline.  The
-    // standing is `LoadAttr`'s (deferred, not clean): the proxy's
+    // Tag the LOAD_SUPER_ATTR helper so the walker fold can name it
+    // (`try_walker_specialize_load_super_attr`). Untagged it reads as
+    // `RuntimeHelperKind::None`. The standing is `LoadAttr`'s: the proxy's
     // `__getattribute__` binds a descriptor whose `__get__` may run Python, and
     // an unfolded residual still reaches the nested-residual backstop.
     effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadSuperAttr;

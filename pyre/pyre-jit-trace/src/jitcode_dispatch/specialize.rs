@@ -9554,7 +9554,14 @@ fn try_walker_fold_small_tuple_eq<Sym: WalkSym>(
                 return None;
             }
             unsafe {
-                if !pyre_object::is_exact_type(obj, &pyre_object::INT_TYPE)
+                // `_descr_eq` (`tupleobject.py`) calls `space.eq_w` per item.
+                // `W_IntObject` (`intobject.py`) is the machine-int class;
+                // `W_LongObject` is a sibling. `is_exact_type(..., INT_TYPE)`
+                // is Python `type is int` and is true for both, so a long
+                // would be unboxed through `W_IntObject.intval`.
+                if !pyre_object::is_int(obj)
+                    || pyre_object::is_bool(obj)
+                    || pyre_object::is_long(obj)
                     || !std::ptr::eq((*obj).w_class, int_typeobj)
                 {
                     return None;
@@ -12384,12 +12391,14 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// Returns `None` (fall through to the generic residual, SAFE — exactly the
 /// behaviour this arm replaced) for every other shape: a sub-walk whose guards
 /// would collapse to the caller's CALL boundary, a level with no shadow, an
-/// inactive strict fold or unseeded frame register, a top frame that is not
-/// this level's own, a shadow describing another code object, a non-OPTIMIZED
-/// frame, cellvars / freevars / `CO_FAST_HIDDEN` slots, a frame that already
-/// carries a locals mapping or an `f_extra_locals` dict, and a written slot
-/// the shadow cannot resolve back to a Ref.  `PYRE_FBW_DEBUG_ABORT` names
-/// which of them declined.
+/// unseeded frame box, a top frame that is not this level's own, a shadow
+/// describing another code object, a non-OPTIMIZED frame, cellvars / freevars
+/// / `CO_FAST_HIDDEN` slots, a frame that already carries a locals mapping or
+/// an `f_extra_locals` dict, and a written slot the shadow cannot resolve back
+/// to a Ref.  A multiframe level keeps the strict fold off
+/// (`fold_frame_reg == u16::MAX`) and still answers: its `frame_box` and
+/// per-slot `opref` map are the virtual `fast2locals` reads.  `PYRE_FBW_DEBUG_ABORT`
+/// names which of them declined.
 fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -12429,17 +12438,14 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     // shape yet, and widening the expansion until this line is unreachable is
     // the convergence path.
     //
-    // It is unreachable today.  Measured 2026-08-29 on release dynasm over the
-    // 507 `bench/synth` fixtures, all of which exit 0: not one `[decline-why]
-    // LOCALS-IN-CALLEE` line anywhere, so no shape in the corpus reaches this
-    // refusal.  Before the width gate came off, `locals_in_wide_inlined_callee`
-    // reported the single line `nslots-over-cap nslots=42 name=wide`; that was
-    // the only one the corpus produced, and no other gate has ever been
-    // observed to fire.  Each gate below now records why it does not: the
-    // non-OPTIMIZED refusal is the answer rather than a gap, its
-    // `CO_FAST_HIDDEN` half is a bit this compiler never sets, and the two
-    // frame-payload gates sit behind writers that need a reference to the
-    // level's own live frame.
+    // A multiframe-seeded level does not land here: the strict fold witness
+    // (`fold_frame_reg`) is off for a virtual callee frame on purpose, and
+    // the shadow still holds the SSA values `fast2locals` reads.  Each gate
+    // of the expansion records
+    // why it does not fire: the non-OPTIMIZED refusal is the answer rather
+    // than a gap, its `CO_FAST_HIDDEN` half is a bit this compiler never
+    // sets, and the two frame-payload gates sit behind writers that need a
+    // reference to the level's own live frame.
     if let Some(callee) = super::fbw_state::fbw_innermost_inline_callee_key(ctx) {
         return Err(super::fbw_state::fbw_decline_inline_callee(
             ctx,
@@ -12516,10 +12522,16 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         let Some(shadow) = state.callee_shadow.as_ref() else {
             decline!("no-callee-shadow");
         };
-        // `u16::MAX` is the strict fresh-frame fold switched off, and a
-        // `NONE` frame box is a frame register that was never seeded — in
-        // neither case is the shadow the authority for this level's slots.
-        if shadow.fold_frame_reg == u16::MAX || shadow.frame_box.is_none() {
+        // A `NONE` frame box is a frame register that was never seeded, so
+        // the shadow is not the authority for this level's slots.
+        // `u16::MAX` is only the strict fresh-frame fold switched off: a
+        // multiframe callee still seeds `frame_box` and the per-slot `opref`
+        // map, and `fast2locals` (`pyframe.py`, `@jit.unroll_safe`) reads
+        // those SSA values.  `rewrite_op_jit_force_virtualizable`
+        // (`jtransform.py`) erases the force inside a graph the tracer
+        // looks into, so refusing this shape would abort the enclosing
+        // walk instead of recording the look-inside.
+        if shadow.frame_box.is_none() {
             decline!("unseeded-frame-register");
         }
         (shadow.fold_frame_reg, shadow.code_ptr)
@@ -12648,10 +12660,17 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
                 (None, None) => slot_oprefs.push(None),
                 // Only an entry recorded through THIS level's frame register
                 // describes this frame — the same per-frame isolation the
-                // `getarrayitem_vable` read fallback applies.
-                (Some(opref), Some(concrete)) if concrete.frame_reg == fold_frame_reg => {
+                // `getarrayitem_vable` read fallback applies.  When the
+                // strict fold is off the shadow is still this level's, and
+                // `concrete.frame_reg` names the portal red rather than the
+                // fold witness; accept the opref and let `concrete_of_opref`
+                // resolve the value.
+                (Some(opref), Some(concrete))
+                    if fold_frame_reg == u16::MAX || concrete.frame_reg == fold_frame_reg =>
+                {
                     slot_oprefs.push(Some(opref))
                 }
+                (Some(opref), None) if fold_frame_reg == u16::MAX => slot_oprefs.push(Some(opref)),
                 // Written with no reconstructable concrete half, or through
                 // another frame's register: decline rather than guess.
                 _ => decline!("slot-not-this-frame"),
@@ -15290,6 +15309,10 @@ fn rollback_list_append_attempt<Sym: WalkSym>(
     if !promoted && unsafe { pyre_object::w_list_len(list) } > len_before {
         fbw_rewind_unjournaled_list_append(list, len_before, allocated_before);
     }
+    // A declined inlined callee may have latched a blackhole image. This
+    // recovery continues the walk, so that image must not answer for a
+    // later abort (`abort_blackhole_latched`).
+    reset_single_frame_blackhole();
 }
 
 /// `Ok(false)` rolls the attempt back to the residual.  A resume coordinate

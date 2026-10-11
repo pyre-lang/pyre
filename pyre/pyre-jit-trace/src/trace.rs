@@ -100,8 +100,7 @@ struct WalkEndRootArea {
 
 /// The flush legs that can commit a walk's end state, in the order they are
 /// tried in the epilogue.  Recorded per walk so the census can distinguish
-/// them: they resume the interpreter at different pcs, and the ones that
-/// resume at a CALL re-execute it.
+/// them: they resume the interpreter at different pcs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub(crate) enum WalkEndCommitLeg {
@@ -109,16 +108,10 @@ pub(crate) enum WalkEndCommitLeg {
     LoopHeader = 1,
     /// Force-time escape flush wrote the resume state into the live frame.
     VableEscape = 2,
-    /// gh#467 CALL-forward: resume the OUTER frame AT the CALL that entered
-    /// the aborting callee, re-executing the call from scratch.
-    EntryCarrierCall = 3,
     /// gh#467 callee-rebuild: resume inside the rebuilt callee frame.
     CalleeRebuild = 4,
     /// Resume at the abort pc itself.
     AbortPc = 5,
-    /// Nested-inline decline: resume the outer caller AT its CALL pc, taken
-    /// from the framestack root's parent.
-    NestedInlineOuterCall = 6,
     /// Kept-stack branch guard flush at the abort pc.
     BranchGuard = 7,
     /// Not a flush leg: the portal/CALL_ASSEMBLER `Terminate` no-replay
@@ -587,18 +580,6 @@ fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> boo
     })
 }
 
-fn resolve_entry_carrier_call_py_pc(
-    outer_jitcode_index: u32,
-    call_jitcode_pc: usize,
-) -> Option<usize> {
-    let outer = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32);
-    outer.filter(|payload| !payload.code_ptr.is_null())?;
-    Some(crate::py_coord::resume_py_pc_for_jitcode_word(
-        outer_jitcode_index as i32,
-        call_jitcode_pc as i32,
-    ) as usize)
-}
-
 #[derive(Clone, Copy)]
 struct MidBodyFlushWords {
     call_py_pc: usize,
@@ -678,82 +659,16 @@ fn exception_delivery_stack_is_sourceable(
     handler_depth as usize <= below_len && array_len >= stack_base + below_len + 1
 }
 
-/// Flush the OUTER frame at the CALL that entered the aborting callee and let
-/// the interpreter re-execute that whole call.  Returns the committed
-/// `call_py_pc`, or `None` when any step declined and the legacy replay stands.
-///
-/// This resume REWINDS to the CALL, which is sound only while nothing has been
-/// applied since it — the latch was set under that gate, and it is re-checked
-/// here before the flush mutates the live frame.  Reached either as the carrier
-/// in its own right or as the callee-rebuild leg's fallback.
-fn try_commit_entry_carrier_call(
-    ctx: &TraceCtx,
-    flush_committed: &std::cell::Cell<bool>,
-    cf_addr: usize,
-    abort_jit_pc: usize,
-    outer_jitcode_index: u32,
-    call_jitcode_pc: usize,
-    call_stack: &[pyre_object::PyObjectRef],
-    entry_executed_effects: usize,
-) -> Option<usize> {
-    let resume = WalkEndResume::Rewind {
-        effects_at_resume_point: entry_executed_effects,
-    };
-    if !walk_end_resume_provable(resume) {
-        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-            eprintln!(
-                "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                 abort_jit_pc={abort_jit_pc} (executed-effect delta since the \
-                 outer CALL) — legacy replay kept"
-            );
-        }
-        return None;
-    }
-    let Some(call_py_pc) = resolve_entry_carrier_call_py_pc(outer_jitcode_index, call_jitcode_pc)
-    else {
-        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-            eprintln!(
-                "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                 abort_jit_pc={abort_jit_pc} (unresolved outer \
-                 jitcode_index={outer_jitcode_index} or null code ptr) — legacy replay kept"
-            );
-        }
-        return None;
-    };
-    if !crate::state::flush_walk_end_state_at_outer_call(ctx, cf_addr, call_py_pc, call_stack) {
-        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-            eprintln!(
-                "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                 call_py_pc={call_py_pc} (depth mismatch / unresolved local) — \
-                 legacy replay kept"
-            );
-        }
-        return None;
-    }
-    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-        eprintln!(
-            "[fbw-abort-flush] gh#467 CALL-forward COMMIT abort_jit_pc={abort_jit_pc} \
-             call_py_pc={call_py_pc} stack_depth={}",
-            call_stack.len()
-        );
-    }
-    let committed = commit_walk_end(flush_committed, WalkEndCommitLeg::EntryCarrierCall, resume);
-    debug_assert!(committed, "provability re-checked after a pure flush");
-    Some(call_py_pc)
-}
-
 /// Why a callee rebuild did not commit — and whether the callee body had
 /// already executed when that was decided.
 ///
-/// The distinction is load-bearing, not diagnostic.  The caller's fallback is
-/// `EntryCarrierCall`, which rewinds the outer frame to its CALL; taking that
-/// after `frame.execute_frame` has run the callee runs the callee a SECOND
-/// time.  `walk_end_resume_provable` cannot catch it, because the odometer it
-/// samples (`FBW_EXECUTED_EFFECT_COUNT`) is walker-side and the plain
-/// interpretation inside `execute_frame` never bumps it.
+/// The distinction is load-bearing, not diagnostic.  After `frame.execute_frame`
+/// has run the callee, no rewinding leg may be selected: the callee's effects
+/// have no journal undo.  `walk_end_resume_provable` cannot catch it, because
+/// the odometer it samples (`FBW_EXECUTED_EFFECT_COUNT`) is walker-side and the
+/// plain interpretation inside `execute_frame` never bumps it.
 enum MidBodyDecline {
-    /// Refused before the callee ran; none of its effects are applied, so
-    /// rewinding the caller to its CALL is still sound.
+    /// Refused before the callee ran; none of its effects are applied.
     BeforeRun(&'static str),
     /// The callee body already ran.  Its effects are applied and there is no
     /// journal undo for them, so no rewinding leg may be selected.
@@ -768,8 +683,7 @@ impl MidBodyDecline {
     }
 }
 
-/// Wrapper that names which narrowing kept a rebuild off leg 4; the reason
-/// otherwise vanishes into the entry-carrier fallback.
+/// Wrapper that names which narrowing kept a rebuild off the CalleeRebuild leg.
 fn try_commit_midbody_abort(
     ctx: &TraceCtx,
     cf_addr: usize,
@@ -807,9 +721,9 @@ fn try_commit_midbody_abort_inner(
         (!ctor_instance.is_null()).then(|| ObjectSlotRoot::new(&mut ctor_instance));
     // An expression-position call sits on top of operands the payload does not
     // record — it counts only the call's own `[callable, null_or_self, args…]`.
-    // The entry fallback's `reconstructed_all_ref_call_stack` is the caller's
-    // WHOLE operand stack at that pc, slot-ordered from the stack base, so its
-    // prefix is exactly that residue.
+    // A non-zero residue below the CALL has no register image here, so the
+    // rebuild declines and WalkAbort / `convert_and_run_from_pyjitpl`
+    // (`blackhole.py`) continues the live framestack.
     let below = match crate::state::outer_call_operands_below(
         cf_addr,
         words.call_py_pc,
@@ -817,28 +731,10 @@ fn try_commit_midbody_abort_inner(
         payload.call_stack_len,
     ) {
         Some(0) => &[][..],
-        Some(n) => {
-            let Some(full) = payload
-                .entry_fallback
-                .as_ref()
-                .map(|fallback| fallback.call_stack.as_slice())
-                .filter(|full| full.len() == n + payload.call_stack_len)
-            else {
-                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-abort-flush] caller-stack mismatch: below={n} call={} carried={:?}",
-                        payload.call_stack_len,
-                        payload
-                            .entry_fallback
-                            .as_ref()
-                            .map(|fallback| fallback.call_stack.len()),
-                    );
-                }
-                return Err(MidBodyDecline::BeforeRun(
-                    "expression-position call with no reconstructed stack below it",
-                ));
-            };
-            &full[..n]
+        Some(_) => {
+            return Err(MidBodyDecline::BeforeRun(
+                "expression-position call with no reconstructed stack below it",
+            ));
         }
         None => {
             return Err(MidBodyDecline::BeforeRun(
@@ -4357,7 +4253,7 @@ fn blackhole_terminal_error(error: &crate::jitcode_dispatch::DispatchError) -> b
         error,
         crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
             | crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
-    ) || error.leaves_complete_image()
+    ) || error.can_convert_seeded_inline()
 }
 
 fn run_perfn_walk<Sym: WalkSym>(
@@ -5236,25 +5132,27 @@ fn run_perfn_walk<Sym: WalkSym>(
         // A complete abort image can continue the frames that the walk already
         // advanced, avoiding entry replay of their concrete residual effects.
         // Errors with missing live values are excluded by
-        // `leaves_complete_image`; the cases below have narrower recovery and
-        // must not be pre-empted here.  Root qmut uses its one-frame flush,
-        // while inline qmut belongs here because it captured the full stack.
+        // `leaves_complete_image`; a seeded inline also converts modeling-gap
+        // classes whose callee `PyFrame` is already materialized
+        // (`can_convert_seeded_inline`), but only once the multi-frame latch
+        // exists so a root `AbortPermanent` still owns its AbortPc flush.
+        // The cases below have narrower recovery and must not be pre-empted
+        // here.  Root qmut uses its one-frame flush, while inline qmut belongs
+        // here because it captured the full stack.
         let mut walk_abort_adopted = !trace_too_long_adopted
             && !segment_adopted
-            && matches!(&walk_result, Err(error) if error.leaves_complete_image()
+            && matches!(&walk_result, Err(error) if error.can_convert_seeded_inline()
             && !matches!(
                 error,
                 crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
                     | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
-                    | crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
-                        blackhole_required: false,
-                        ..
-                    }
             )
             && (!matches!(
                 error,
                 crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
-            ) || session.borrow().abort_in_subwalk))
+            ) || session.borrow().abort_in_subwalk)
+            && (error.leaves_complete_image()
+                || crate::jitcode_dispatch::multi_frame_blackhole_is_latched()))
             && walk_abort_leg_enabled()
             && try_adopt_blackhole(
                 flush_committed,
@@ -5420,11 +5318,11 @@ fn run_perfn_walk<Sym: WalkSym>(
         {
             crate::jitcode_dispatch::restore_escape_flush_undo();
         }
-        // The third field marks an abort that may only consume the `Entry`
-        // carrier: the `MidBody` carrier is latched exclusively by the first two
+        // The third field marks an abort that must not consume a `MidBody`
+        // carrier: that carrier is latched exclusively by the first two
         // variants (`inline_call.rs`), so a kept-stack abort matching a MidBody
         // payload would be reading another abort's rebuild plan.
-        let call_forward_abort = match &walk_result {
+        let midbody_or_abortpc = match &walk_result {
             Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
                 Some((*pc, true, false))
             }
@@ -5442,43 +5340,18 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
             _ => None,
         };
-        let mut committed_entry_carrier_call_py_pc = None;
         if !walk_abort_adopted
-            && let Some((abort_jit_pc, is_marker_abort, entry_carrier_only)) = call_forward_abort
+            && let Some((abort_jit_pc, is_marker_abort, entry_carrier_only)) = midbody_or_abortpc
         {
-            // gh#467: a supported abort fired inside a TOP-level inline
-            // sub-walk whose callee executed no concrete effect
-            // (`try_walker_inline_user_call` latched the carrier only under
-            // that gate).  The nested-unjournaled-decline class means the
-            // residual did not execute; its callee attempt can be discarded
-            // with any inside-only unjournaled mark.  Flush the OUTER frame
-            // at the CALL that entered the callee and resume the interpreter
-            // forward — re-executing the whole call from scratch — instead
-            // of the legacy replay from loop entry, which double-applies the
-            // non-journaled pre-CALL store.  The abort's `abort_jit_pc` is a
-            // CALLEE coordinate with no meaning in the outer py_pc tables,
-            // so the outer CALL py_pc and operand stack come from the latch.
-            // Convergence of `run_blackhole_interp_to_cancel_tracing`
-            // (`pyjitpl.py`), minus the inner-frame rebuild (#126/#215).
+            // A supported abort fired inside a TOP-level inline sub-walk.
+            // WalkAbort already converted the live framestack through
+            // `convert_and_run_from_pyjitpl` (`blackhole.py`) when the image
+            // was complete.  A MidBody carrier still rebuilds the callee at
+            // its abort pc; a marker abort without a carrier resumes at the
+            // abort pc itself.  Kept-stack aborts must not consume a MidBody
+            // payload latched for a different abort.
             let carrier = crate::jitcode_dispatch::fbw_abort_carrier_clone();
             match carrier.as_ref() {
-                Some(crate::jitcode_dispatch::InlineAbortCarrier::Entry {
-                    outer_jitcode_index,
-                    call_jitcode_pc,
-                    call_stack,
-                    entry_executed_effects,
-                }) => {
-                    committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
-                        ctx,
-                        flush_committed,
-                        cf_addr,
-                        abort_jit_pc,
-                        *outer_jitcode_index,
-                        *call_jitcode_pc,
-                        call_stack,
-                        *entry_executed_effects,
-                    );
-                }
                 Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
                     if !entry_carrier_only
                         && ((is_marker_abort
@@ -5527,45 +5400,14 @@ fn run_perfn_walk<Sym: WalkSym>(
                             );
                         }
                         Err(MidBodyDecline::BeforeRun(_)) => {
-                            if let Some(fallback) = payload.entry_fallback.as_ref() {
-                                // The rebuild declined before running anything
-                                // and the entry latch's gate had held, so
-                                // rewinding to the outer CALL is still open.
-                                // Falling through to the legacy replay instead
-                                // would re-apply the non-journaled pre-CALL
-                                // stores.
-                                committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
-                                    ctx,
-                                    flush_committed,
-                                    cf_addr,
-                                    abort_jit_pc,
-                                    payload.outer_jitcode_index,
-                                    payload.call_jitcode_pc,
-                                    &fallback.call_stack,
-                                    fallback.entry_executed_effects,
-                                );
-                            }
+                            // WalkAbort already ran; an incomplete rebuild
+                            // image keeps the unflushed abort.
                         }
                         Err(MidBodyDecline::AfterRun(_)) => {
-                            // The callee body already executed.  `EntryCarrierCall`
-                            // rewinds the outer frame to its CALL, which would run
-                            // that body a SECOND time — the gh#467 double-apply.
-                            // Its `walk_end_resume_provable` re-check does not stop
-                            // it: that samples `FBW_EXECUTED_EFFECT_COUNT`, which is
-                            // walker-side, and the plain interpretation inside
-                            // `execute_frame` never bumps it.  So take no leg.
-                            //
-                            // ⚠️This NARROWS the hazard, it does not close it: the
-                            // legacy replay this falls through to re-enters the
-                            // outer frame at its entry and re-runs the CALL too.
-                            // The callee's effects are user code and the store
-                            // journal does not cover them, so neither branch can
-                            // undo them.  Closing it means making the post-run path
-                            // infallible — every one of these declines already has a
-                            // pre-run counterpart (`can_flush_walk_end_state_after_
-                            // outer_call`, the propagate licence), so reaching here
-                            // means a pre-check was too weak, not that a new
-                            // fallback is needed.
+                            // The callee body already executed.  WalkAbort
+                            // already ran the live framestack through
+                            // `convert_and_run_from_pyjitpl` (`blackhole.py`);
+                            // taking another flush would re-enter that body.
                         }
                     }
                 }
@@ -5612,7 +5454,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 }
                 _ if crate::jitcode_dispatch::fbw_debug_abort_enabled() => {
                     eprintln!(
-                        "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                        "[fbw-abort-flush] gh#467 MidBody declined at \
                              abort_jit_pc={abort_jit_pc} (no carrier) — legacy replay kept"
                     );
                 }
@@ -5620,128 +5462,6 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
             if carrier.is_some() {
                 crate::jitcode_dispatch::fbw_abort_carrier_clear();
-            }
-        }
-        if let Err(crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
-            pc,
-            ..
-        }) = &walk_result
-        {
-            let abort_jit_pc = *pc;
-            // A walk commits at most ONE leg.  The carrier block above may
-            // already have taken `CalleeRebuild`, which resumes INSIDE the
-            // rebuilt callee, past what it applied; rewinding the caller to its
-            // CALL on top of that runs the whole callee a second time.  Nothing
-            // else keeps the two apart — this leg's own gates are inclusion
-            // tests on the residual odometer, and `walk_end_resume_provable`
-            // cannot see effects applied by the plain interpretation the
-            // rebuild resumed into (the `MidBodyDecline::AfterRun` argument,
-            // which the carrier block applies only to its own fallback).
-            if flush_committed.get() {
-                crate::jitcode_dispatch::fbw_abort_outer_resume_reset();
-                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                             (a carrier leg already committed this walk)"
-                    );
-                }
-            } else if !crate::jitcode_dispatch::fbw_executed_nonpure_residual() {
-                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                             (no executed non-pure residual) — legacy replay kept"
-                    );
-                }
-            } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
-                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                             (unjournaled effect) — legacy replay kept"
-                    );
-                }
-            } else if let Some((jitcode_index, call_jitcode_pc, effects_at_resume_point)) =
-                crate::jitcode_dispatch::fbw_abort_outer_resume_take()
-            {
-                // Like the entry carrier, this resume re-executes the outer
-                // CALL, so it needs the same zero-delta proof — the one the
-                // latch sampled at that CALL.
-                let resume = WalkEndResume::Rewind {
-                    effects_at_resume_point,
-                };
-                let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32);
-                if !walk_end_resume_provable(resume) {
-                    crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                                 (executed-effect delta since the outer CALL) — legacy replay kept"
-                        );
-                    }
-                } else if let Some(pjc) = pjc {
-                    let resume_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(
-                        &pjc.metadata,
-                        call_jitcode_pc,
-                    ) as usize;
-                    if committed_entry_carrier_call_py_pc == Some(resume_py_pc) {
-                        crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
-                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] skipped at resume_py_pc={resume_py_pc} \
-                                     (entry carrier already handled same resume)"
-                            );
-                        }
-                    } else {
-                        // Flush while the overrides stay rooted in
-                        // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
-                        // locals — an allocation that can move the nursery-resident
-                        // override refs; the area walker forwards them in place),
-                        // then clear the cell.
-                        let committed =
-                            crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
-                                |stack_overrides| {
-                                    crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
-                                        ctx,
-                                        cf_addr,
-                                        resume_py_pc,
-                                        stack_overrides,
-                                    )
-                                },
-                            );
-                        crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
-                        if committed {
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                         resume_py_pc={resume_py_pc} (nested inline decline)"
-                                );
-                            }
-                            let committed = commit_walk_end(
-                                flush_committed,
-                                WalkEndCommitLeg::NestedInlineOuterCall,
-                                resume,
-                            );
-                            debug_assert!(committed, "provability re-checked after a pure flush");
-                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                     (shadow slot without concrete / depth) — legacy replay kept"
-                            );
-                        }
-                    }
-                } else {
-                    crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                                 (unresolved outer jitcode_index={jitcode_index}) — legacy replay kept"
-                        );
-                    }
-                }
-            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                         (no outer caller resume pc) — legacy replay kept"
-                );
             }
         }
 
@@ -5855,10 +5575,9 @@ fn run_perfn_walk<Sym: WalkSym>(
         if let Some(pc) = kept_stack_abort_pc {
             let abort_jit_pc = pc;
             if flush_committed.get() {
-                // A walk commits at most ONE leg.  The gh#467 CALL-forward block
-                // above now also serves these aborts, and its flush already
-                // repositioned the frame; flushing again here would move it a
-                // second time.
+                // A walk commits at most ONE leg.  The MidBody / AbortPc
+                // block above already repositioned the frame; flushing
+                // again here would move it a second time.
                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-branch-flush] declined at abort_jit_pc={abort_jit_pc} \
@@ -6978,7 +6697,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
     crate::jitcode_dispatch::reset_single_frame_blackhole();
     crate::jitcode_dispatch::fbw_executed_nonpure_residual_reset();
     crate::jitcode_dispatch::fbw_executed_body_residual_reset();
-    crate::jitcode_dispatch::fbw_abort_outer_resume_reset();
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
     // A continuation keeps them instead: see [`WalkJournals`].

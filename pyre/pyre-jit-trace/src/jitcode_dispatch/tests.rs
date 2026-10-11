@@ -1052,7 +1052,6 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: mode,
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -1200,7 +1199,6 @@ fn portal_may_force_records_the_callee_execution_context() {
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData::default()),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -1615,435 +1613,6 @@ fn inline_caller_frame_declines_only_a_returning_handler() {
     );
 }
 
-#[test]
-fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let catch_exception = insns["catch_exception/L"];
-    let void_return = insns["void_return/"];
-    let reraise = insns["reraise/"];
-    let int_copy = insns["int_copy/i>i"];
-    // Happy path: copy then catch fall-through return. Handler at pc=7.
-    let returns_body = [
-        int_copy,
-        0,
-        1,
-        catch_exception,
-        7,
-        0,
-        void_return,
-        int_copy,
-        0,
-        1,
-        void_return,
-    ];
-    assert!(poison_confined_to_returning_handlers(&returns_body, &[7]));
-    assert!(!poison_confined_to_reraise_handlers(&returns_body, &[7]));
-    assert!(!poison_confined_to_returning_handlers(&returns_body, &[]));
-    assert!(!poison_confined_to_returning_handlers(&returns_body, &[0]));
-    assert!(body_has_returning_handler(&returns_body));
-
-    let reraise_body = [int_copy, 0, 1, catch_exception, 7, 0, void_return, reraise];
-    assert!(poison_confined_to_reraise_handlers(&reraise_body, &[7]));
-    assert!(!poison_confined_to_returning_handlers(&reraise_body, &[7]));
-    assert!(!body_has_returning_handler(&reraise_body));
-
-    // Mixed return/reraise: goto_if_not from the handler to void_return,
-    // fall-through reraise. `except E as e: return` is this shape —
-    // CHECK_EXC_MATCH miss reraises, match returns. `perform_call`
-    // traces the taken return; poison_confined stays off because the
-    // reraise arm is a guard side-exit, not a Returns-only region.
-    let goto_if_not = insns["goto_if_not/iL"];
-    let mixed_body = [
-        int_copy,
-        0,
-        1,
-        catch_exception,
-        7,
-        0,
-        void_return,
-        goto_if_not,
-        0,
-        12,
-        0,
-        reraise,
-        void_return,
-    ];
-    assert_eq!(
-        exc_handler_shape(&mixed_body, 7),
-        ExcHandlerShape::ExceptAsReturn
-    );
-    assert!(body_has_returning_handler(&mixed_body));
-    assert!(!poison_confined_to_returning_handlers(&mixed_body, &[7]));
-    assert!(!poison_confined_to_reraise_handlers(&mixed_body, &[7]));
-
-    // Matching arm returns, mismatch arm reraises. `opimpl_goto_if_exception_mismatch`
-    // (`pyjitpl.py`) jumps to the next exception target; treating the op as
-    // fall-through classifies the handler `Returns`.
-    let mismatch = insns["goto_if_exception_mismatch/iL"];
-    let mismatch_body = [
-        int_copy,
-        0,
-        1,
-        catch_exception,
-        7,
-        0,
-        void_return,
-        mismatch,
-        0,
-        12,
-        0,
-        void_return,
-        reraise,
-    ];
-    assert_eq!(
-        exc_handler_shape(&mismatch_body, 7),
-        ExcHandlerShape::ExceptAsReturn
-    );
-    assert!(body_has_returning_handler(&mismatch_body));
-
-    // except-as-return does not install `inline_poison_pcs`, so a Dirty
-    // happy path plus an unrelated returning handler must decline.
-    // `fbw_callee_body_replay_scan` keeps `safety` Clean and reports the
-    // ops in `poison`; `verdict()` is the value this admit must read.
-    let happy_poison = CalleeReplayScan {
-        safety: CalleeReplaySafety::Clean,
-        poison: vec![0],
-        protected: Vec::new(),
-        unscannable: false,
-    };
-    assert_eq!(happy_poison.safety, CalleeReplaySafety::Clean);
-    assert_eq!(happy_poison.verdict(), CalleeReplaySafety::Dirty);
-    assert!(!poison_confined_to_returning_handlers(
-        &returns_body,
-        &happy_poison.poison
-    ));
-    assert!(!handler_except_as_return_scan_admits(
-        &happy_poison,
-        &returns_body
-    ));
-    let confined = CalleeReplayScan {
-        safety: CalleeReplaySafety::Clean,
-        poison: vec![7],
-        protected: Vec::new(),
-        unscannable: false,
-    };
-    assert!(handler_except_as_return_scan_admits(
-        &confined,
-        &returns_body
-    ));
-}
-
-/// A synthetic callee whose body is `new_with_vtable` plus setfields on
-/// that fresh ref, then `ref_return` of it. The scan admits by effect
-/// (`FreshMallocs.is_fresh_malloc` / `analyze_direct_call`), not by the
-/// callee's name. BUILD_MAP 0's bound path is this shape; #2245 tagged
-/// the residual `NewEmptyDict` fallback and the bound call was still
-/// `UnprovableStoreOrCallForm`.
-fn synthetic_fresh_alloc_jitcode(
-    code: Vec<u8>,
-    num_regs_r: u8,
-    num_regs_i: u8,
-) -> std::sync::Arc<majit_metainterp::jitcode::JitCode> {
-    let jc = majit_metainterp::jitcode::JitCode::new("synthetic_fresh_alloc");
-    jc.set_body(majit_jitcode::jitcode::JitCodeBody {
-        code,
-        c_num_regs_r: num_regs_r,
-        c_num_regs_i: num_regs_i,
-        ..Default::default()
-    });
-    std::sync::Arc::new(jc)
-}
-
-#[test]
-fn except_as_return_scan_admits_fresh_alloc_inline_call() {
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let new_vt = insns["new_with_vtable/d>r"];
-    let setfield = insns["setfield_gc_i/rid"];
-    let ret = insns["ref_return/r"];
-    let callee =
-        synthetic_fresh_alloc_jitcode(vec![new_vt, 0, 0, 0, setfield, 0, 0, 1, 0, ret, 0], 1, 1);
-    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(
-        callee.clone(),
-    )];
-    let inline_call = insns["inline_call_r_r/dR>r"];
-    let catch_exception = insns["catch_exception/L"];
-    let void_return = insns["void_return/"];
-    // Happy path: 0-arg `inline_call_r_r` then catch fall-through return.
-    // Handler at pc=9 returns. `inline_call` is 5 bytes (descr + empty R + dst).
-    let body = [
-        inline_call,
-        0,
-        0,
-        0,
-        0,
-        catch_exception,
-        9,
-        0,
-        void_return,
-        void_return,
-    ];
-    let descrs = vec![crate::descr::make_jitcode_descr(0)];
-    let scan = fbw_callee_body_replay_scan(
-        &body,
-        &[],
-        0,
-        &[],
-        1,
-        &[],
-        &descrs,
-        RawDescrPool::PerFn(&perfn),
-        false,
-    );
-    assert!(
-        scan.poison.is_empty(),
-        "fresh-alloc inline_call must not poison, got {:?}",
-        scan.poison
-    );
-    assert_eq!(
-        callee.nested_replay_scan(),
-        Some((true, true)),
-        "GraphAnalyzer._analyzed_calls lives on the jitcode after the first scan"
-    );
-    assert!(body_has_returning_handler(&body));
-    assert!(handler_except_as_return_scan_admits(&scan, &body));
-
-    let other = fbw_callee_body_replay_scan(
-        &body,
-        &[],
-        0,
-        &[],
-        1,
-        &[],
-        &[make_fail_descr(0)],
-        RawDescrPool::PerFn(&perfn),
-        false,
-    );
-    assert_eq!(other.poison, vec![0]);
-    assert!(!handler_except_as_return_scan_admits(&other, &body));
-}
-
-#[test]
-fn replay_scan_poisons_inline_call_that_stores_to_arg() {
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let setfield = insns["setfield_gc_i/rid"];
-    let ret = insns["ref_return/r"];
-    let callee = synthetic_fresh_alloc_jitcode(vec![setfield, 0, 0, 0, 0, ret, 0], 1, 1);
-    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
-    let inline_call = insns["inline_call_r_r/dR>r"];
-    // 1-arg `inline_call_r_r`: descr 0, R=[r0], dst r1.
-    let body = [inline_call, 0, 0, 1, 0, 1];
-    let descrs = vec![crate::descr::make_jitcode_descr(0)];
-    let scan = fbw_callee_body_replay_scan(
-        &body,
-        &[],
-        0,
-        &[],
-        2,
-        &[],
-        &descrs,
-        RawDescrPool::PerFn(&perfn),
-        false,
-    );
-    assert_eq!(scan.poison, vec![0]);
-}
-
-#[test]
-fn except_as_return_scan_admits_boxer_shaped_inline_call_ir_r() {
-    // `w_int_new` / `newfloat` call-site shape: `inline_call_ir_r/dIR>r`
-    // with a one-int I list. `WriteAnalyzer.analyze_simple_operation`
-    // ignores a `setfield` whose target `FreshMallocs.is_fresh_malloc`
-    // regardless of argument count or kind.
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let new_vt = insns["new_with_vtable/d>r"];
-    let setfield = insns["setfield_gc_i/rid"];
-    let ret = insns["ref_return/r"];
-    let callee =
-        synthetic_fresh_alloc_jitcode(vec![new_vt, 0, 0, 0, setfield, 0, 0, 1, 0, ret, 0], 1, 1);
-    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
-    let inline_call = insns["inline_call_ir_r/dIR>r"];
-    let catch_exception = insns["catch_exception/L"];
-    let void_return = insns["void_return/"];
-    // descr 0, I=[i0], R=[], dst r0. `inline_call` is 7 bytes; handler at pc=11.
-    let body = [
-        inline_call,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        catch_exception,
-        11,
-        0,
-        void_return,
-        void_return,
-    ];
-    let descrs = vec![crate::descr::make_jitcode_descr(0)];
-    let scan = fbw_callee_body_replay_scan(
-        &body,
-        &[],
-        1,
-        &[],
-        1,
-        &[],
-        &descrs,
-        RawDescrPool::PerFn(&perfn),
-        false,
-    );
-    assert!(
-        scan.poison.is_empty(),
-        "boxer-shaped inline_call_ir_r must not poison, got {:?}",
-        scan.poison
-    );
-    assert!(body_has_returning_handler(&body));
-    assert!(handler_except_as_return_scan_admits(&scan, &body));
-}
-
-#[test]
-fn replay_scan_admits_empty_write_set_even_if_a_return_is_nonfresh() {
-    // One path mallocs; the other `ref_return`s an argument. Arguments
-    // start nonfresh (`FreshMallocs.__init__` `nonfresh = set(graph.getargs())`),
-    // so the caller's dst is not a fresh malloc. The write set is still
-    // empty (`analyze_simple_operation` ignores the setfield on the
-    // fresh path), so the call itself is replay-safe.
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let goto_if_not = insns["goto_if_not/iL"];
-    let new_vt = insns["new_with_vtable/d>r"];
-    let setfield = insns["setfield_gc_i/rid"];
-    let ret = insns["ref_return/r"];
-    // pc=0 goto_if_not i0 → 15; pc=4 new_with_vtable r1; pc=8 setfield;
-    // pc=13 ref_return r1; pc=15 ref_return r0.
-    let callee = synthetic_fresh_alloc_jitcode(
-        vec![
-            goto_if_not,
-            0,
-            15,
-            0,
-            new_vt,
-            0,
-            0,
-            1,
-            setfield,
-            1,
-            0,
-            0,
-            0,
-            ret,
-            1,
-            ret,
-            0,
-        ],
-        2,
-        1,
-    );
-    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
-    let inline_call = insns["inline_call_ir_r/dIR>r"];
-    let setarray = insns["setarrayitem_gc_r/rird"];
-    // descr 0, I=[i0], R=[r0], dst r1 (8 bytes). Then setarrayitem on r1.
-    let body = [inline_call, 0, 0, 1, 0, 1, 0, 1, setarray, 1, 0, 0, 0, 0];
-    let descrs = vec![crate::descr::make_jitcode_descr(0)];
-    let scan = fbw_callee_body_replay_scan(
-        &body,
-        &[],
-        1,
-        &[],
-        2,
-        &[],
-        &descrs,
-        RawDescrPool::PerFn(&perfn),
-        false,
-    );
-    assert!(
-        !scan.poison.contains(&0),
-        "empty write set must stay write-free, poison={:?}",
-        scan.poison
-    );
-    assert_eq!(scan.poison, vec![8]);
-}
-
-#[test]
-fn replay_scan_does_not_mark_fresh_alloc_call_result_fresh() {
-    // `WriteAnalyzer.analyze_simple_operation` ignores stores into a
-    // `FreshMallocs.is_fresh_malloc` of THAT graph; `FreshMallocs.__init__`
-    // adds a `direct_call` result to `nonfresh`. The call is write-free,
-    // the result in the caller is not a fresh malloc. A later
-    // `setarrayitem_gc` on dst must still poison — marking dst fresh
-    // skipped that store (and its write barrier) and SIGSEGV'd
-    // `match_sequence_of_class_patterns` once the nested scan itself
-    // stopped crashing.
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let new_vt = insns["new_with_vtable/d>r"];
-    let setfield = insns["setfield_gc_i/rid"];
-    let ret = insns["ref_return/r"];
-    let callee =
-        synthetic_fresh_alloc_jitcode(vec![new_vt, 0, 0, 0, setfield, 0, 0, 1, 0, ret, 0], 1, 1);
-    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
-    let inline_call = insns["inline_call_r_r/dR>r"];
-    let setarray = insns["setarrayitem_gc_r/rird"];
-    // pc=0: 0-arg inline_call dst r0 (5 bytes). pc=5: setarrayitem array=r0.
-    let body = [inline_call, 0, 0, 0, 0, setarray, 0, 0, 0, 0, 0];
-    let descrs = vec![crate::descr::make_jitcode_descr(0)];
-    let scan = fbw_callee_body_replay_scan(
-        &body,
-        &[],
-        1,
-        &[],
-        1,
-        &[],
-        &descrs,
-        RawDescrPool::PerFn(&perfn),
-        false,
-    );
-    assert!(
-        !scan.poison.contains(&0),
-        "fresh-alloc call must stay write-free, poison={:?}",
-        scan.poison
-    );
-    assert_eq!(scan.poison, vec![5]);
-}
-
-#[test]
-fn replay_scan_nested_callee_constants_r_are_not_live_python_objects() {
-    // Nested helper `constants_r` are GCREF slots. Classifying them with
-    // `is_plain_int1` SIGSEGV'd `fbw_callee_body_replay_scan_rec` at
-    // EXC_BAD_ACCESS 0x5941698a3b0 while scanning
-    // `_orig_w_module_dict_lookup_object_entries` for MATCH_CLASS.
-    // `FreshMallocs` does not read that pool.
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let new_vt = insns["new_with_vtable/d>r"];
-    let ret = insns["ref_return/r"];
-    let jc = majit_metainterp::jitcode::JitCode::new("synthetic_fresh_alloc");
-    jc.set_body(majit_jitcode::jitcode::JitCodeBody {
-        code: vec![new_vt, 0, 0, 0, ret, 0],
-        c_num_regs_r: 1,
-        constants_r: vec![majit_jitcode::codewriter::jitcode::ConstSlotR::new(
-            0x0594_1698_a3b0,
-        )],
-        ..Default::default()
-    });
-    let callee = std::sync::Arc::new(jc);
-    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
-    let inline_call = insns["inline_call_r_r/dR>r"];
-    let body = [inline_call, 0, 0, 0, 0];
-    let descrs = vec![crate::descr::make_jitcode_descr(0)];
-    let scan = fbw_callee_body_replay_scan(
-        &body,
-        &[],
-        0,
-        &[],
-        1,
-        &[],
-        &descrs,
-        RawDescrPool::PerFn(&perfn),
-        false,
-    );
-    assert!(
-        scan.poison.is_empty(),
-        "nested helper constants_r must not crash the scan, poison={:?}",
-        scan.poison
-    );
-}
-
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
 /// for all three residual-call shapes (iRd / iIRd / iIRFd); they all
 /// funnel through this helper, so one direct test covers the guard
@@ -2185,7 +1754,6 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -2496,7 +2064,6 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -2560,7 +2127,6 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -2642,7 +2208,6 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
                 ..Default::default()
             }),
             inline_callee_consts: None,
-            inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
             session: &session,
             registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -2746,7 +2311,6 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
                 ..Default::default()
             }),
             inline_callee_consts: None,
-            inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
             session: &session,
             registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -2886,7 +2450,6 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
                 ..Default::default()
             }),
             inline_callee_consts: None,
-            inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
             session: &session,
             registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -3165,7 +2728,6 @@ fn drive_int_add_jump_if_ovf(
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -3367,7 +2929,6 @@ fn drive_alloc_with_descr(
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -3636,7 +3197,6 @@ fn with_hint_walk_context<R>(
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -4484,7 +4044,6 @@ fn switch_id_jumps_to_target_or_falls_through() {
                 ..Default::default()
             }),
             inline_callee_consts: None,
-            inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
             session: &session,
             registers_r: &RegisterBank::default(),
@@ -4550,7 +4109,6 @@ fn switch_id_requires_concrete_int_value() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -4623,7 +4181,6 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -4688,7 +4245,6 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -4752,7 +4308,6 @@ fn goto_if_not_requires_concrete_int_value() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -5926,7 +5481,6 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -6054,7 +5608,6 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -6095,71 +5648,6 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
         "a child push must restore the parent's pre-CALL heap-cache knowledge"
     );
     assert_eq!(finish_payload_of(&outcome), Some((expected, Type::Ref)));
-}
-
-#[test]
-fn replay_scan_treats_callee_frame_bookkeeping_as_call_owned() {
-    let get_vable = *insns_opname_to_byte()
-        .get("getarrayitem_vable_r/ridd>r")
-        .unwrap();
-    let setfield = *insns_opname_to_byte().get("setfield_gc_i/rid").unwrap();
-    let ret = *insns_opname_to_byte().get("ref_return/r").unwrap();
-    // Reading a ref slot identifies r4 as this callee's virtualizable frame;
-    // the mutable SetfieldGc that follows is frame lifecycle bookkeeping.
-    let code = [get_vable, 4, 0, 0, 0, 1, 0, 5, setfield, 4, 0, 2, 0, ret, 5];
-    let descrs = vec![
-        make_fail_descr(0),
-        make_fail_descr(1),
-        field_descr_with_index(2),
-    ];
-    let scan = fbw_callee_body_replay_scan(
-        &code,
-        &[],
-        0,
-        &[0],
-        6,
-        &[],
-        &descrs,
-        RawDescrPool::Global,
-        false,
-    );
-    assert_eq!(scan.verdict(), CalleeReplaySafety::Clean);
-    assert!(scan.poison.is_empty());
-}
-
-#[test]
-fn replay_scan_does_not_transfer_frame_identity_across_register_overwrite() {
-    let get_vable = *insns_opname_to_byte()
-        .get("getarrayitem_vable_r/ridd>r")
-        .unwrap();
-    let copy = *insns_opname_to_byte().get("ref_copy/r>r").unwrap();
-    let setfield = *insns_opname_to_byte().get("setfield_gc_i/rid").unwrap();
-    let ret = *insns_opname_to_byte().get("ref_return/r").unwrap();
-    // r4 initially names the callee frame.  Loading a slot into r5 and then
-    // overwriting r4 with r5 must revoke that identity before the mutable
-    // store; the new value is an arbitrary non-fresh heap reference.
-    let code = [
-        get_vable, 4, 0, 0, 0, 1, 0, 5, copy, 5, 4, setfield, 4, 0, 2, 0, ret, 5,
-    ];
-    let descrs = vec![
-        make_fail_descr(0),
-        make_fail_descr(1),
-        field_descr_with_index(2),
-    ];
-
-    let scan = fbw_callee_body_replay_scan(
-        &code,
-        &[],
-        0,
-        &[0],
-        6,
-        &[],
-        &descrs,
-        RawDescrPool::Global,
-        false,
-    );
-
-    assert_eq!(scan.poison, vec![11]);
 }
 
 #[test]
@@ -6280,7 +5768,6 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -6406,7 +5893,6 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -6523,7 +6009,6 @@ fn compare_tag_inline_call_records_no_binary_exception_guard() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -6652,7 +6137,6 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -6761,7 +6245,6 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -6865,7 +6348,6 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -6950,7 +6432,6 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7015,7 +6496,6 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7076,7 +6556,6 @@ fn step_through_live_opcode_advances_by_offset_size() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7146,7 +6625,6 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs.iter().copied()),
@@ -7214,7 +6692,6 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7283,7 +6760,6 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(registers_r.iter().copied()),
@@ -7353,7 +6829,6 @@ fn step_through_int_return_records_finish_with_int_descr() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7440,7 +6915,6 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7515,7 +6989,6 @@ fn step_through_void_return_stashes_void_finish_payload() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7591,7 +7064,6 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7655,7 +7127,6 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7722,7 +7193,6 @@ fn step_through_goto_jumps_to_label_target() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7789,7 +7259,6 @@ fn step_through_goto_handles_high_byte_of_label() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -7910,7 +7379,6 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs.iter().copied()),
@@ -7972,7 +7440,6 @@ fn step_through_catch_exception_advances_past_label_operand() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -8048,7 +7515,6 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs.iter().copied()),
@@ -8134,7 +7600,6 @@ fn top_level_raise_settles_the_vable_token() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs.iter().copied()),
@@ -8263,7 +7728,6 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs.iter().copied()),
@@ -8377,7 +7841,6 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -8462,7 +7925,6 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -8524,7 +7986,6 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -8650,7 +8111,6 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -8777,7 +8237,6 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -8855,7 +8314,6 @@ fn step_through_int_copy_advances_past_operand_bytes() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -8929,7 +8387,6 @@ fn int_copy_writes_src_value_into_dst_register() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -8996,7 +8453,6 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -9060,7 +8516,6 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -9144,7 +8599,6 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -9216,7 +8670,6 @@ fn ref_copy_writes_src_value_into_dst_register() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -9292,7 +8745,6 @@ fn ref_copy_keeps_operand_stack_tos_candidate() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -9352,7 +8804,6 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -9414,7 +8865,6 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(), // empty — index 7 must surface OOR
@@ -9487,7 +8937,6 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -9655,7 +9104,6 @@ fn drive_int_between(
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -9800,7 +9248,6 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -9900,7 +9347,6 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -9988,7 +9434,6 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -10111,7 +9556,6 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -10292,7 +9736,6 @@ fn run_float_step(
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -10497,7 +9940,6 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -10560,7 +10002,6 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -10625,7 +10066,6 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -10707,7 +10147,6 @@ fn unsupported_opname_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -10767,7 +10206,6 @@ fn new_array_id_records_new_array() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -11179,7 +10617,6 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(registers_r.iter().copied()),
@@ -11261,7 +10698,6 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -11441,7 +10877,6 @@ fn abort_result_r_stops_the_walk() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -11516,7 +10951,6 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -11608,7 +11042,6 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -11701,7 +11134,6 @@ fn ref_guard_value_on_const_records_nothing() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -11807,7 +11239,6 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -11992,7 +11423,6 @@ fn run_symbolic_box_str_dispatch(
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: FbwWalkMode {
             inline_subwalk: true,
             ..test_fbw_mode()
@@ -12165,7 +11595,6 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -12256,7 +11685,6 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -12337,7 +11765,6 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -12404,7 +11831,6 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -12485,7 +11911,6 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -12597,7 +12022,6 @@ fn may_force_with_active_vable_executes_and_clears_token() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -12707,7 +12131,6 @@ fn may_force_vable_escape_surfaces_typed_abort() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -12813,7 +12236,6 @@ fn run_not_in_trace(
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -12950,7 +12372,6 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13015,7 +12436,6 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13092,7 +12512,6 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13178,7 +12597,6 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13267,7 +12685,6 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13355,7 +12772,6 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -13422,7 +12838,6 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -13527,7 +12942,6 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13631,7 +13045,6 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13743,7 +13156,6 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13887,7 +13299,6 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -13967,7 +13378,6 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -14033,7 +13443,6 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -14123,7 +13532,6 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -14243,7 +13651,6 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -14369,7 +13776,6 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
                 ..Default::default()
             }),
             inline_callee_consts: None,
-            inline_poison_pcs: None,
             fbw_mode: FbwWalkMode {
                 transparent_helper_subwalk,
                 ..test_fbw_mode()
@@ -14467,7 +13873,6 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -14579,7 +13984,6 @@ fn inline_call_r_v_accepts_void_returning_callee() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -14670,7 +14074,6 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -14762,7 +14165,6 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -14852,7 +14254,6 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -14947,7 +14348,6 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15040,7 +14440,6 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15122,7 +14521,6 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15225,7 +14623,6 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15306,7 +14703,6 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15375,7 +14771,6 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -15456,7 +14851,6 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15557,7 +14951,6 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15648,7 +15041,6 @@ fn setfield_gc_i_redundant_write_skips_recording() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15717,7 +15109,6 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15812,7 +15203,6 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -15890,7 +15280,6 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -16046,7 +15435,6 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -16137,7 +15525,6 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -16203,7 +15590,6 @@ fn getarrayitem_gc_headerless_const_index_stamps_the_byte() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -16271,7 +15657,6 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -16348,7 +15733,6 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -16750,7 +16134,6 @@ fn walk_undecodable_byte_surfaces_typed_error() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -16839,7 +16222,6 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -16962,7 +16344,6 @@ fn loop_header_stamps_seen_flag() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -17044,7 +16425,6 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -17127,7 +16507,6 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -17526,7 +16905,6 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),
@@ -17729,7 +17107,6 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -17856,7 +17233,6 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -17957,7 +17333,6 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
@@ -18275,7 +17650,6 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
             ..Default::default()
         }),
         inline_callee_consts: None,
-        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &RegisterBank::default(),

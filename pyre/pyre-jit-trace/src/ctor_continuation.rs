@@ -49,9 +49,7 @@
 //! executes, so a seeded `__init__` returns `Ref` and `_setup_return_value_r`
 //! (`blackhole.py`) writes its `None` into the caller's call-result register —
 //! the register that has to hold the instance.  That is why the constructor
-//! inline used to pin itself to the caller boundary instead.  (The callee-body
-//! replay-safety scan in `fbw_state.rs` stays: its other caller decides
-//! FOR_ITER-in-flight admission, which is a rewind question, not a deopt one.)
+//! inline used to pin itself to the caller boundary instead.
 //!
 //! The level is recorded the way upstream's is: as one of the paused levels
 //! on `__init__`'s framestack entry (`InlineFrame::parents`, outermost-first),

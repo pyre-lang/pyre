@@ -5667,23 +5667,6 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
     flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[], None, true)
 }
 
-pub(crate) fn flush_walk_end_state_to_frame_with_stack_overrides(
-    ctx: &TraceCtx,
-    frame: usize,
-    resume_py_pc: usize,
-    stack_overrides: &[(usize, PyObjectRef)],
-) -> bool {
-    flush_walk_end_state_to_frame_inner(
-        ctx,
-        frame,
-        resume_py_pc,
-        None,
-        stack_overrides,
-        None,
-        false,
-    )
-}
-
 /// `flush_walk_end_state_to_frame` with the COMPLETE operand stack supplied by
 /// the caller as a contiguous slice for absolute slots
 /// `nlocals..nlocals + stack.len()`.  The mid-expression escape flush resolves
@@ -6047,128 +6030,6 @@ fn store_boxed_frame_local(frame: usize, abs: usize, value: &Value) -> Option<us
     Some(frame_now)
 }
 
-/// gh#467 forward-flush AT an inlined-callee CALL boundary.  When an
-/// supported abort fires inside an inline sub-walk whose callee executed no
-/// concrete effect, the outer frame is flushed as of the CALL that
-/// entered the callee: the locals/cells region from the vable shadow (exactly
-/// like [`flush_walk_end_state_to_frame`]), the operand-stack region rebuilt
-/// from the concrete `call_stack` (any kept prefix followed by
-/// `[callable, null_or_self, args...]`), `valuestackdepth` set to cover both, and
-/// `last_instr = call_py_pc - 1` so `next_instr()` re-executes the CALL in the
-/// interpreter — running the callee from scratch.  Everything the walk applied
-/// BEFORE the CALL stands (the caller commits the store journals), so the
-/// non-journaled pre-CALL store applies exactly once.  This is the frame-level
-/// analogue of `run_blackhole_interp_to_cancel_tracing` (`pyjitpl.py`)
-/// continuing forward from the abort, without the inner-frame reconstruction
-/// (#126/#215): the outer frame re-runs the whole call.
-///
-/// Unlike the merge-point flush, the operand stack does NOT come from the vable
-/// shadow (whose stack region is only valid at a merge point — at a mid-
-/// statement CALL those slots read NULL); it is the caller-provided
-/// `call_stack`, whose height MUST match the forward analysis's `depth_at_py_pc`
-/// at `call_py_pc` (a mismatch means the reconstruction disagrees with the
-/// encoded stack shape → decline).  All-or-nothing: returns false (frame
-/// untouched) on any depth mismatch, an unresolved live local, a net block-chain
-/// change, or insufficient array capacity; the caller then keeps the legacy
-/// replay.
-pub(crate) fn flush_walk_end_state_at_outer_call(
-    ctx: &TraceCtx,
-    frame: usize,
-    call_py_pc: usize,
-    call_stack: &[PyObjectRef],
-) -> bool {
-    if frame == 0 {
-        return false;
-    }
-    let Some(nlocals) = concrete_nlocals(frame) else {
-        return false;
-    };
-    let Some(info) = ctx.virtualizable_info() else {
-        return false;
-    };
-    let frame_ptr = frame as *const u8;
-    let w_code =
-        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
-    if w_code.is_null() {
-        return false;
-    }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    // The analysis depth at the CALL pc is the live operand-stack height there
-    // (`callable + null_or_self + args`).  The reconstructed `call_stack` must
-    // match it exactly — a disagreement means the residual_call operand list
-    // does not model the interpreter's CALL stack for this call shape, so the
-    // resumed frame would be mis-sized.  Decline.
-    let Some(depth) = crate::liveness::liveness_for(raw_code)
-        .depth_at_py_pc()
-        .get(call_py_pc)
-        .copied()
-    else {
-        return false;
-    };
-    if depth as usize != call_stack.len() {
-        return false;
-    }
-    let end_vsd = nlocals + call_stack.len();
-    let base = info.num_static_extra_boxes;
-    // Validation pass first (allocates nothing): every LOCAL slot must resolve
-    // in the shadow.  The stack region is supplied by `call_stack`, not the
-    // shadow, so it is not validated here.
-    for abs in 0..nlocals {
-        if ctx.virtualizable_entry_at(base + abs).is_none() {
-            return false;
-        }
-    }
-    let arr_ptr = unsafe {
-        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *mut pyre_object::FixedObjectArray)
-    };
-    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < end_vsd {
-        return false;
-    }
-    // Commit the operand stack FIRST: `call_stack` holds live nursery-resident
-    // refs, and boxing an Int/Float local below can trigger a minor collection.
-    // The detached frame array is forwarded only while it is in the remembered
-    // set, so arm the barrier once the stack refs are landed and again after
-    // every local store (each minor consumes the remembered entry).
-    for (i, &value) in call_stack.iter().enumerate() {
-        unsafe {
-            (*arr_ptr).as_mut_slice()[nlocals + i] = value;
-        }
-    }
-    frame_array_write_barrier(frame as *mut u8, arr_ptr);
-    // Commit the locals from the shadow, re-reading per slot.
-    let clobbered = clobbered_locals_slots(ctx, arr_ptr, base, nlocals);
-    let mut frame = frame;
-    for abs in 0..nlocals {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-            return false;
-        };
-        let Some(frame_now) = store_boxed_frame_local(frame, abs, &value) else {
-            return false;
-        };
-        frame = frame_now;
-    }
-    let arr_ptr = unsafe {
-        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *mut pyre_object::FixedObjectArray)
-    };
-    unsafe {
-        let pf = &mut *(frame as *mut PyFrame);
-        pf.valuestackdepth = end_vsd;
-        pf.last_instr = call_py_pc as isize - 1;
-    }
-    frame_array_write_barrier(frame as *mut u8, arr_ptr);
-    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-        eprintln!(
-            "[fbw-outer-call-flush] locals-region written: nlocals={nlocals} clobbered={clobbered:?}"
-        );
-    }
-    true
-}
-
 /// How many operands the CALL at `call_py_pc` sits on top of: the caller's
 /// static stack height there minus the call's own `[callable, null_or_self,
 /// args...]`.  Zero for a statement-position call, positive for an
@@ -6214,8 +6075,8 @@ pub(crate) fn outer_call_operands_below(
 ///
 /// `below` is [`outer_call_operands_below`]'s slice of the caller's operand
 /// stack — empty for a statement-position call.  Leg 4's payload records only
-/// the call's own operand count, so an expression-position call sources the
-/// residue from the entry carrier's full-stack reconstruction.
+/// the call's own operand count, so an expression-position call declines
+/// and WalkAbort continues the live framestack.
 pub(crate) fn can_flush_walk_end_state_after_outer_call(
     ctx: &TraceCtx,
     frame: usize,
