@@ -267,6 +267,9 @@ fn field_is_fat_dyn(
     let mut hits = Vec::new();
     let mut fat = Vec::new();
     for decl in llbc.iter_type_decls() {
+        if decl.published_struct_copy {
+            continue;
+        }
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             continue;
         };

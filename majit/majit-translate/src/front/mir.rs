@@ -3220,6 +3220,12 @@ fn derive_program_metadata(
         if type_decl_is_builtin_adt(td) {
             continue;
         }
+        // A copied import is not a second registration of the defining
+        // crate's class. First-writer field rows and later exact layouts
+        // would otherwise overwrite that class.
+        if td.published_struct_copy {
+            continue;
+        }
         if matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
             note_raw_word_owner(&mut struct_fields, td, llbc, gc_struct_ids);
         }
@@ -3996,6 +4002,9 @@ fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
 /// inlines a container only as the first field). `Ref` and `RawPtr` stay
 /// in place here; only an `Adt` node yields an id.
 fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::StructId> {
+    if td.published_struct_copy {
+        return None;
+    }
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return None;
     };
@@ -4005,6 +4014,9 @@ fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::
         return None;
     }
     let inner = llbc.type_by_id(adt_node_def_id(node)?)?;
+    if inner.published_struct_copy {
+        return None;
+    }
     match &inner.kind {
         TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) => Some(struct_id_for_type_decl(inner)),
         _ => None,
@@ -4071,6 +4083,9 @@ pub(crate) fn declared_gckind_by_name(
     for llbc in llbcs {
         for td in llbc.iter_type_decls() {
             if type_decl_is_builtin_adt(td) {
+                continue;
+            }
+            if td.published_struct_copy {
                 continue;
             }
             if !matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
@@ -20588,6 +20603,11 @@ impl<'a> Lowering<'a> {
         let td = self
             .llbc
             .type_by_id(type_decl_ref_adt_id(head.as_object()?)?)?;
+        // Copied fields are for projection. Constructing the import still
+        // builds the opaque aggregate this crate lowered before the copy.
+        if td.published_struct_copy {
+            return None;
+        }
         // Charon names a tuple-variant constructor `<Enum>::<Variant>` and a
         // tuple-struct constructor `<Struct>`.
         let variant_idx = match &td.kind {
@@ -20633,6 +20653,9 @@ impl<'a> Lowering<'a> {
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
+        if td.published_struct_copy {
+            return None;
+        }
         let name_path = td.item_meta.name_path();
         let head_adt = head.as_object();
         let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
@@ -29981,7 +30004,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let td = self.llbc.type_by_id(adt_def_id)?;
-        if !matches!(td.kind, TypeDeclKind::Opaque) {
+        if !matches!(td.kind, TypeDeclKind::Opaque) && !td.published_struct_copy {
             return None;
         }
         // A fieldless enum is an int. Painting `self` as an instance
@@ -30055,7 +30078,7 @@ impl<'a> Lowering<'a> {
                 // call registry resolves to an opaque external
                 // (`register_foreign_opaque_method_externals`) and the
                 // codewriter emits as a residual fnaddr call.
-                if matches!(td.kind, TypeDeclKind::Opaque) {
+                if matches!(td.kind, TypeDeclKind::Opaque) || td.published_struct_copy {
                     return None;
                 }
                 // A raw struct or enum is an address, not a GC instance.
@@ -31327,6 +31350,9 @@ impl<'a> Lowering<'a> {
     fn move_plan(&self, ty: &TyRef) -> Option<MovePlan> {
         let id = self.tyref_adt_def_id(ty)?;
         let td = self.llbc.type_by_id(id)?;
+        if td.published_struct_copy {
+            return None;
+        }
         let target = std::env::var("TARGET").unwrap_or_default();
         let layout = td.layout_for_target(self.llbc, &target)?;
         let size = layout.size?;
@@ -34341,6 +34367,9 @@ impl<'a> Lowering<'a> {
         let ty = peeled.as_ref().unwrap_or(ty);
         let id = self.tyref_adt_def_id(ty)?;
         let td = self.llbc.type_by_id(id)?;
+        if td.published_struct_copy {
+            return None;
+        }
         let TypeDeclKind::Struct(fields) = &td.kind else {
             return None;
         };
@@ -36460,6 +36489,9 @@ impl<'a> Lowering<'a> {
     /// compiler-generated closure types consumed by `Result::map_err`.
     fn type_decl_is_trivially_dropless(&self, decl: &TypeDecl, depth: usize) -> bool {
         if depth > 16 || self.type_decl_has_explicit_drop(decl.def_id) {
+            return false;
+        }
+        if decl.published_struct_copy {
             return false;
         }
         match &decl.kind {
@@ -39294,6 +39326,9 @@ impl<'a> Lowering<'a> {
         let v = self.tyref_adt_body(ty)?;
         let def_id = inline_adt_def_id(v)?;
         let td = self.llbc.type_by_id(def_id)?;
+        if td.published_struct_copy {
+            return None;
+        }
         match &td.kind {
             TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&td.item_meta.name_path())),
             _ => None,
@@ -43591,6 +43626,9 @@ fn tyref_is_raw_ptr_value(ty: &TyRef, llbc: &Llbc) -> bool {
 fn struct_field_index_named(ty: &TyRef, llbc: &Llbc, name: &str) -> Option<usize> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    if decl.published_struct_copy {
+        return None;
+    }
     let TypeDeclKind::Struct(fields) = &decl.kind else {
         return None;
     };
@@ -43618,7 +43656,7 @@ fn struct_pointee_array_type_id(
 ) -> Option<String> {
     let pointee = tyref_peel_one_raw_ptr_node(base_ty, llbc)?;
     let decl = llbc.type_by_id(adt_node_def_id(pointee)?)?;
-    if !matches!(decl.kind, TypeDeclKind::Struct(_)) {
+    if decl.published_struct_copy || !matches!(decl.kind, TypeDeclKind::Struct(_)) {
         return None;
     }
     if tyref_transparent_nonzst_field(&TyRef::Other(pointee.clone()), llbc).is_some() {
@@ -44426,22 +44464,37 @@ impl<'a> RootStackAnalyzer<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        if let Some(&known) = self.state.scope_constructors.borrow().get(id) {
+        self.fn_returns_owned_scope(*id)
+    }
+
+    /// Whether `id`'s body opens a bracket and returns its guard inside the
+    /// result. A declaration with no body answers from the flag the link
+    /// step set on that `FunDecl` when its identity matched a defining crate.
+    fn fn_returns_owned_scope(&self, id: u64) -> bool {
+        if let Some(&known) = self.state.scope_constructors.borrow().get(&id) {
             return known;
         }
-        let answer = self
-            .llbc
-            .fn_by_id(*id)
-            .and_then(|fd| fd.unstructured())
-            .is_some_and(|body| {
-                body_returns_owned_scope(self.llbc, &body, &|reg| {
-                    regular_call_name_path(reg, self.llbc)
-                })
-            });
+        // A cycle does not return a scope through itself. A direct
+        // `push_roots` in this body is still seen below.
+        self.state.scope_constructors.borrow_mut().insert(id, false);
+        let answer = match self.llbc.fn_by_id(id) {
+            Some(fd) => match fd.unstructured() {
+                Some(body) => body_returns_owned_scope(
+                    self.llbc,
+                    &body,
+                    &|reg| regular_call_name_path(reg, self.llbc),
+                    &|reg| self.call_returns_owned_scope(reg),
+                ),
+                None => fd
+                    .returns_owned_scope
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+            None => false,
+        };
         self.state
             .scope_constructors
             .borrow_mut()
-            .insert(*id, answer);
+            .insert(id, answer);
         answer
     }
 
@@ -44885,6 +44938,7 @@ fn body_returns_owned_scope(
     llbc: &Llbc,
     body: &Unstructured,
     name_of: &impl Fn(&RegularCall) -> Option<String>,
+    returns_owned: &impl Fn(&RegularCall) -> bool,
 ) -> bool {
     let guards: bit_set::BitSet = body
         .body
@@ -44892,7 +44946,8 @@ fn body_returns_owned_scope(
         .filter_map(|bb| match bb.term(llbc) {
             Ok(TermKind::Call { call, .. }) => match (&call.func, &call.dest.kind) {
                 (CallFunc::Regular(reg), PlaceKind::Local(dest))
-                    if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path)) =>
+                    if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
+                        || returns_owned(reg) =>
                 {
                     Some(*dest as usize)
                 }
@@ -46752,6 +46807,716 @@ fn record_root_slot_getter_reads(
 /// crate from there is answered by its body instead of being assumed to
 /// touch the stack.  Paths that name several bodies (`<Impl>::new`) are
 /// listed if any of them touches.
+/// One struct body copied onto an importing crate's opaque `TypeDecl`.
+///
+/// `ty` is a type node whose ADT ids are `{"Path": "<name_path>"}` and
+/// whose dedup indirections have been expanded against the defining crate.
+/// [`apply_published_structs`] remaps those paths onto the destination's
+/// def ids and installs the fields as `TypeDeclKind::Struct`.
+#[derive(Clone)]
+pub struct PublishedStructBody {
+    pub path: String,
+    pub fields: Vec<PublishedStructField>,
+}
+
+/// One field of [`PublishedStructBody`].
+#[derive(Clone)]
+pub struct PublishedStructField {
+    pub name: Option<String>,
+    pub ty: serde_json::Value,
+}
+
+/// Struct bodies of this artefact, keyed by the full path and the
+/// crate-stripped path. An importing crate's `Opaque` view of the same
+/// type receives these fields so [`Lowering::resolve_adt_field`]'s struct
+/// arm names them.
+pub fn harvest_published_structs(llbc: &Llbc) -> Vec<PublishedStructBody> {
+    let mut rows = Vec::new();
+    for td in llbc.iter_type_decls() {
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
+        if fields.is_empty() {
+            continue;
+        }
+        let portable: Vec<PublishedStructField> = fields
+            .iter()
+            .map(|field| PublishedStructField {
+                name: field.name.clone(),
+                ty: expand_portable_tyref(llbc, &field.ty),
+            })
+            .collect();
+        let path = td.item_meta.name_path();
+        let canonical = strip_crate_prefix(&path);
+        rows.push(PublishedStructBody {
+            path: path.clone(),
+            fields: portable.clone(),
+        });
+        if canonical != path {
+            rows.push(PublishedStructBody {
+                path: canonical,
+                fields: portable,
+            });
+        }
+    }
+    rows
+}
+
+/// Copy `rows` onto every `Opaque` or `Unknown` type decl whose path is
+/// one of them. An existing `Struct` is left alone. A path that does not
+/// resolve to a destination decl stays a `{"Path": ...}` id.
+pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
+    if rows.is_empty() {
+        return;
+    }
+    let mut index: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for td in llbc.iter_type_decls() {
+        let path = td.item_meta.name_path();
+        let id = td.def_id;
+        index.entry(path.clone()).or_insert(id);
+        let stripped = strip_crate_prefix(&path);
+        if stripped != path {
+            index.entry(stripped).or_insert(id);
+        }
+    }
+    // First row for a path wins. The link loop sorts stably and dedups so
+    // that row is the earliest defining crate.
+    let mut by_path: std::collections::HashMap<&str, &PublishedStructBody> =
+        std::collections::HashMap::new();
+    for row in rows {
+        by_path.entry(row.path.as_str()).or_insert(row);
+    }
+    for td in llbc.file.translated.type_decls.iter_mut().flatten() {
+        if !matches!(td.kind, TypeDeclKind::Opaque | TypeDeclKind::Unknown) {
+            continue;
+        }
+        let path = td.item_meta.name_path();
+        let stripped = strip_crate_prefix(&path);
+        let row = by_path.get(path.as_str()).copied().or_else(|| {
+            (stripped != path)
+                .then(|| by_path.get(stripped.as_str()).copied())
+                .flatten()
+        });
+        let Some(row) = row else {
+            continue;
+        };
+        let fields = row
+            .fields
+            .iter()
+            .map(|field| {
+                let mut ty = field.ty.clone();
+                remap_portable_type_ids(&mut ty, &index);
+                majit_charon_reader::ullbc::FieldDecl {
+                    name: field.name.clone(),
+                    ty: TyRef::Other(ty),
+                    attr_info: None,
+                }
+            })
+            .collect();
+        td.published_struct_copy = true;
+        td.kind = TypeDeclKind::Struct(fields);
+    }
+}
+
+fn lookup_published_type_path(
+    index: &std::collections::HashMap<String, u64>,
+    path: &str,
+) -> Option<u64> {
+    if let Some(id) = index.get(path) {
+        return Some(*id);
+    }
+    let stripped = strip_crate_prefix(path);
+    if stripped != path {
+        return index.get(&stripped).copied();
+    }
+    None
+}
+
+/// Identities of local bodies that open a bracket and return its guard,
+/// keeping only an identity that this crate publishes once.
+///
+/// `<Impl>::new` is not a unique path. The rendered name substitutes the
+/// impl's `Self` ADT, and the signature, instantiation, and span separate
+/// two constructors that still share that ADT and leaf.
+pub fn harvest_scope_owning_identities(llbc: &Llbc) -> Vec<String> {
+    let root_state = RootStackState::new(llbc);
+    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
+    let mut identities: Vec<String> = llbc
+        .iter_local_fns()
+        .filter(|fd| fd.body.is_some() && analyzer.fn_returns_owned_scope(fd.def_id))
+        .map(|fd| scope_owner_identity(llbc, fd))
+        .collect();
+    identities.sort();
+    let mut unique = Vec::new();
+    let mut index = 0;
+    while index < identities.len() {
+        let mut next = index + 1;
+        while next < identities.len() && identities[next] == identities[index] {
+            next += 1;
+        }
+        if next == index + 1 {
+            unique.push(std::mem::take(&mut identities[index]));
+        }
+        index = next;
+    }
+    unique
+}
+
+/// Set [`FunDecl::returns_owned_scope`] on every body-less foreign
+/// declaration whose [`scope_owner_identity`] is in `identities`.
+/// `identities` is sorted. A defining-crate duplicate was already dropped,
+/// so every foreign copy of one published constructor is the guard.
+pub fn mark_foreign_scope_owners(llbc: &Llbc, identities: &[String]) {
+    if identities.is_empty() {
+        return;
+    }
+    for fd in llbc.iter_fun_decls() {
+        if fd.item_meta.is_local || fd.unstructured().is_some() {
+            continue;
+        }
+        let identity = scope_owner_identity(llbc, fd);
+        if identities.binary_search(&identity).is_ok() {
+            fd.returns_owned_scope
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// `{name}|{inputs}|{output}|{span}|{type args}|{const args}`.
+///
+/// Region ids and trait-ref ids are crate-local and are not part of the
+/// string. An inherent or trait impl's `Self` is that ADT's `name_path`.
+pub fn scope_owner_identity(llbc: &Llbc, fd: &FunDecl) -> String {
+    let name = scope_owner_rendered_name(llbc, fd);
+    let inputs = fd
+        .signature
+        .inputs
+        .iter()
+        .map(|ty| identity_ty(llbc, ty))
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = identity_ty(llbc, &fd.signature.output);
+    let span = identity_span(llbc, fd);
+    let (type_args, const_args) = identity_instantiation(llbc, fd.item_meta.instantiation());
+    format!("{name}|{inputs}|{output}|{span}|{type_args}|{const_args}")
+}
+
+fn scope_owner_rendered_name(llbc: &Llbc, fd: &FunDecl) -> String {
+    let owner = impl_owner_path(llbc, fd);
+    let mut out = String::new();
+    for seg in fd.item_meta.template_name() {
+        if !out.is_empty() {
+            out.push_str("::");
+        }
+        match seg {
+            NameSeg::Ident {
+                ident: (name, disambiguator),
+            } => {
+                out.push_str(name);
+                if name == "closure" && *disambiguator > 0 {
+                    out.push('#');
+                    out.push_str(&disambiguator.to_string());
+                }
+            }
+            NameSeg::Other(value) => {
+                if value.as_object().and_then(|map| map.get("Impl")).is_some() {
+                    match owner.as_deref() {
+                        Some(path) => out.push_str(path),
+                        None => out.push_str("<Impl>"),
+                    }
+                    continue;
+                }
+                if let Some(label) = majit_charon_reader::ullbc::builtin_path_label(value) {
+                    out.push_str(&label);
+                    continue;
+                }
+                let label = value
+                    .as_object()
+                    .and_then(|map| map.keys().next().cloned())
+                    .unwrap_or_else(|| "?".into());
+                out.push('<');
+                out.push_str(&label);
+                out.push('>');
+            }
+        }
+    }
+    out
+}
+
+fn identity_span(llbc: &Llbc, fd: &FunDecl) -> String {
+    let Some(data) = llbc.span_data(&fd.item_meta.span) else {
+        return "?:?:?".to_string();
+    };
+    let file = llbc.file_path(data.file_id).unwrap_or("?");
+    format!("{file}:{}:{}", data.beg.line, data.beg.col)
+}
+
+fn identity_instantiation(
+    llbc: &Llbc,
+    instantiation: Option<&serde_json::Value>,
+) -> (String, String) {
+    let Some(instantiation) = instantiation else {
+        return (String::new(), String::new());
+    };
+    let types = instantiation
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .map(|ty| identity_type_value(llbc, ty, 0))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let consts = instantiation
+        .get("const_generics")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .map(|value| identity_const(llbc, value))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    (types, consts)
+}
+
+fn identity_ty(llbc: &Llbc, ty: &TyRef) -> String {
+    match tyref_node(ty, llbc) {
+        Some(value) => identity_type_value(llbc, value, 0),
+        None => "?".to_string(),
+    }
+}
+
+fn identity_type_value(llbc: &Llbc, value: &serde_json::Value, depth: usize) -> String {
+    if depth > 32 {
+        return "?".to_string();
+    }
+    let Some(obj) = value.as_object() else {
+        return value.as_str().unwrap_or("?").to_string();
+    };
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return match llbc.dedup_body(id) {
+            Some(body) => identity_type_value(llbc, body, depth + 1),
+            None => "?".to_string(),
+        };
+    }
+    if let Some(pair) = obj.get("Value").and_then(serde_json::Value::as_array)
+        && pair.len() == 2
+    {
+        return identity_type_value(llbc, &pair[1], depth + 1);
+    }
+    if let Some(literal) = obj.get("Scalar") {
+        return charon_literal_to_ast_string(literal);
+    }
+    if let Some(reference) = obj.get("Ref").and_then(serde_json::Value::as_array)
+        && reference.len() >= 2
+    {
+        let inner = identity_type_value(llbc, &reference[1], depth + 1);
+        let mutable = reference
+            .get(2)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("Mut"));
+        return if mutable {
+            format!("&mut {inner}")
+        } else {
+            format!("&{inner}")
+        };
+    }
+    if let Some(pointer) = obj.get("RawPtr").and_then(serde_json::Value::as_array)
+        && !pointer.is_empty()
+    {
+        let inner = identity_type_value(llbc, &pointer[0], depth + 1);
+        let mutable = pointer
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("Mut"));
+        return if mutable {
+            format!("*mut {inner}")
+        } else {
+            format!("*const {inner}")
+        };
+    }
+    if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
+        return identity_adt(llbc, adt, depth);
+    }
+    if let Some(type_var) = obj.get("TypeVar") {
+        if let Some(index) = type_var.get("Free").and_then(serde_json::Value::as_u64) {
+            return format!("TypeVar#{index}");
+        }
+        if let Some(bound) = type_var.get("Bound").and_then(serde_json::Value::as_array) {
+            let index = bound
+                .get(1)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            return format!("TypeVar#{index}");
+        }
+        return "TypeVar".to_string();
+    }
+    if let Some(array) = obj.get("Array").and_then(serde_json::Value::as_array)
+        && !array.is_empty()
+    {
+        let elem = identity_type_value(llbc, &array[0], depth + 1);
+        let len = array
+            .get(1)
+            .map(|len| identity_const(llbc, len))
+            .unwrap_or_else(|| "?".to_string());
+        return format!("[{elem};{len}]");
+    }
+    if let Some(elem) = obj
+        .get("Slice")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|array| array.first())
+    {
+        return format!("[{}]", identity_type_value(llbc, elem, depth + 1));
+    }
+    obj.keys().next().cloned().unwrap_or_else(|| "?".into())
+}
+
+fn identity_adt(
+    llbc: &Llbc,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> String {
+    let name = if adt.get("builtin").and_then(serde_json::Value::as_str) == Some("Tuple") {
+        "Tuple".to_string()
+    } else if let Some(builtin) = adt.get("builtin").filter(|builtin| !builtin.is_null()) {
+        builtin
+            .as_str()
+            .or_else(|| {
+                builtin
+                    .as_object()
+                    .and_then(|map| map.keys().next().map(String::as_str))
+            })
+            .unwrap_or("?")
+            .to_string()
+    } else if let Some(id) = adt.get("id").and_then(serde_json::Value::as_u64) {
+        llbc.type_by_id(id)
+            .map(|td| td.item_meta.name_path())
+            .unwrap_or_else(|| "?".to_string())
+    } else if let Some(path) = adt
+        .get("id")
+        .and_then(|id| id.get("Path"))
+        .and_then(serde_json::Value::as_str)
+    {
+        path.to_string()
+    } else {
+        "?".to_string()
+    };
+    let args = adt
+        .get("generics")
+        .and_then(|generics| generics.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .map(|ty| identity_type_value(llbc, ty, depth + 1))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if args.is_empty() {
+        name
+    } else {
+        format!("{name}<{}>", args.join(","))
+    }
+}
+
+fn identity_const(llbc: &Llbc, value: &serde_json::Value) -> String {
+    if let Some(id) = value
+        .get("Deduplicated")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return match llbc.dedup_const_body(id) {
+            Some(body) => const_literal_text(body),
+            None => "?".to_string(),
+        };
+    }
+    if let Some(pair) = value.get("Value").and_then(serde_json::Value::as_array)
+        && pair.len() == 2
+    {
+        return const_literal_text(&pair[1]);
+    }
+    if value.as_array().is_some() {
+        return const_literal_text(value);
+    }
+    "?".to_string()
+}
+
+fn const_literal_text(body: &serde_json::Value) -> String {
+    let Some(literal) = body.as_array().and_then(|pair| pair.first()) else {
+        return "?".to_string();
+    };
+    if let Some(boolean) = literal.get("Bool").and_then(serde_json::Value::as_bool) {
+        return boolean.to_string();
+    }
+    literal
+        .get("Integer")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|int| int.values().next())
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.get(1))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?")
+        .to_string()
+}
+
+fn expand_portable_tyref(llbc: &Llbc, ty: &TyRef) -> serde_json::Value {
+    match ty {
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(body) => expand_portable_type(llbc, body, 0),
+            None => serde_json::json!({"Unresolved": true}),
+        },
+        TyRef::Inline { value: (_, value) } | TyRef::Other(value) => {
+            expand_portable_type(llbc, value, 0)
+        }
+    }
+}
+
+fn expand_portable_type(llbc: &Llbc, value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    if depth > 32 {
+        return serde_json::json!({"Unresolved": true});
+    }
+    let Some(obj) = value.as_object() else {
+        return value.clone();
+    };
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return match llbc.dedup_body(id) {
+            Some(body) => expand_portable_type(llbc, body, depth + 1),
+            None => serde_json::json!({"Unresolved": true}),
+        };
+    }
+    if let Some(pair) = obj.get("Value").and_then(serde_json::Value::as_array)
+        && pair.len() == 2
+    {
+        return expand_portable_type(llbc, &pair[1], depth + 1);
+    }
+    let mut out = value.clone();
+    let Some(map) = out.as_object_mut() else {
+        return out;
+    };
+    if map.contains_key("Adt") {
+        let adt = map.get_mut("Adt").expect("Adt");
+        expand_portable_adt(llbc, adt, depth);
+    }
+    if let Some(array) = map
+        .get_mut("Array")
+        .and_then(serde_json::Value::as_array_mut)
+        && array.len() >= 2
+    {
+        array[0] = expand_portable_type(llbc, &array[0], depth + 1);
+        array[1] = expand_portable_const(llbc, &array[1], depth + 1);
+        if array.len() >= 3 {
+            array[2] = serde_json::Value::Null;
+        }
+    }
+    if let Some(slice) = map
+        .get_mut("Slice")
+        .and_then(serde_json::Value::as_array_mut)
+        && !slice.is_empty()
+    {
+        slice[0] = expand_portable_type(llbc, &slice[0], depth + 1);
+        if slice.len() >= 2 {
+            slice[1] = serde_json::Value::Null;
+        }
+    }
+    if let Some(reference) = map.get_mut("Ref").and_then(serde_json::Value::as_array_mut)
+        && reference.len() >= 2
+    {
+        reference[0] = serde_json::json!({"Erased": true});
+        reference[1] = expand_portable_type(llbc, &reference[1], depth + 1);
+    }
+    if let Some(pointer) = map
+        .get_mut("RawPtr")
+        .and_then(serde_json::Value::as_array_mut)
+        && !pointer.is_empty()
+    {
+        pointer[0] = expand_portable_type(llbc, &pointer[0], depth + 1);
+    }
+    out
+}
+
+fn expand_portable_adt(llbc: &Llbc, adt: &mut serde_json::Value, depth: usize) {
+    let Some(obj) = adt.as_object_mut() else {
+        return;
+    };
+    let decl_types = obj
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|id| {
+            let td = llbc.type_by_id(id)?;
+            let path = td.item_meta.name_path();
+            let instantiation = td.item_meta.instantiation().cloned();
+            Some((path, instantiation))
+        });
+    if let Some(id) = obj.get("id").and_then(serde_json::Value::as_u64) {
+        match &decl_types {
+            Some((path, _)) => {
+                obj.insert("id".into(), serde_json::json!({"Path": path}));
+            }
+            None => {
+                let _ = id;
+                obj.insert("id".into(), serde_json::json!({"Unresolved": true}));
+            }
+        }
+    }
+    if let Some((_, instantiation)) = decl_types {
+        fill_adt_generics_from_instantiation(obj, instantiation.as_ref());
+    }
+    let Some(generics) = obj
+        .get_mut("generics")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if let Some(types) = generics
+        .get_mut("types")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for ty in types.iter_mut() {
+            *ty = expand_portable_type(llbc, ty, depth + 1);
+        }
+    }
+    if let Some(consts) = generics
+        .get_mut("const_generics")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for value in consts.iter_mut() {
+            *value = expand_portable_const(llbc, value, depth + 1);
+        }
+    }
+    if let Some(regions) = generics
+        .get_mut("regions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for region in regions.iter_mut() {
+            *region = serde_json::json!({"Erased": true});
+        }
+    }
+    if let Some(trait_refs) = generics
+        .get_mut("trait_refs")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for trait_ref in trait_refs.iter_mut() {
+            *trait_ref = serde_json::Value::Null;
+        }
+    }
+}
+
+fn fill_adt_generics_from_instantiation(
+    adt: &mut serde_json::Map<String, serde_json::Value>,
+    instantiation: Option<&serde_json::Value>,
+) {
+    let Some(instantiation) = instantiation else {
+        return;
+    };
+    let generics = adt
+        .entry("generics")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(generics) = generics.as_object_mut() else {
+        return;
+    };
+    let types_empty = generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|types| types.is_empty());
+    if types_empty
+        && let Some(types) = instantiation
+            .get("types")
+            .filter(|types| types.as_array().is_some_and(|types| !types.is_empty()))
+    {
+        generics.insert("types".into(), types.clone());
+    }
+    let consts_empty = generics
+        .get("const_generics")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|consts| consts.is_empty());
+    if consts_empty
+        && let Some(consts) = instantiation
+            .get("const_generics")
+            .filter(|consts| consts.as_array().is_some_and(|consts| !consts.is_empty()))
+    {
+        generics.insert("const_generics".into(), consts.clone());
+    }
+}
+
+fn expand_portable_const(
+    llbc: &Llbc,
+    value: &serde_json::Value,
+    depth: usize,
+) -> serde_json::Value {
+    if depth > 32 {
+        return serde_json::json!({"Unresolved": true});
+    }
+    if let Some(id) = value
+        .get("Deduplicated")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return match llbc.dedup_const_body(id) {
+            Some(body) => {
+                serde_json::json!({"Value": [0, expand_const_body(llbc, body, depth + 1)]})
+            }
+            None => serde_json::json!({"Unresolved": true}),
+        };
+    }
+    if let Some(pair) = value.get("Value").and_then(serde_json::Value::as_array)
+        && pair.len() == 2
+    {
+        return serde_json::json!({"Value": [0, expand_const_body(llbc, &pair[1], depth + 1)]});
+    }
+    if value.as_array().is_some_and(|pair| pair.len() == 2) {
+        return serde_json::json!({"Value": [0, expand_const_body(llbc, value, depth + 1)]});
+    }
+    value.clone()
+}
+
+fn expand_const_body(llbc: &Llbc, body: &serde_json::Value, depth: usize) -> serde_json::Value {
+    let Some(pair) = body.as_array().filter(|pair| pair.len() == 2) else {
+        return body.clone();
+    };
+    serde_json::json!([
+        pair[0].clone(),
+        expand_portable_type(llbc, &pair[1], depth + 1)
+    ])
+}
+
+fn remap_portable_type_ids(
+    value: &mut serde_json::Value,
+    index: &std::collections::HashMap<String, u64>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remap_portable_type_ids(item, index);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(adt) = map
+                .get_mut("Adt")
+                .and_then(serde_json::Value::as_object_mut)
+                && let Some(path) = adt
+                    .get("id")
+                    .and_then(|id| id.get("Path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                && let Some(def_id) = lookup_published_type_path(index, &path)
+            {
+                adt.insert("id".into(), serde_json::json!(def_id));
+            }
+            for child in map.values_mut() {
+                remap_portable_type_ids(child, index);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether the body at `id` returns a root-bracket guard, including a
+/// body-less declaration answered from [`FunDecl::returns_owned_scope`].
+pub fn fn_returns_owned_scope(llbc: &Llbc, id: u64) -> bool {
+    let root_state = RootStackState::new(llbc);
+    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
+    analyzer.fn_returns_owned_scope(id)
+}
+
 pub fn harvest_root_stack_touching_paths(llbc: &Llbc) -> Vec<String> {
     let root_state = RootStackState::new(llbc);
     let analyzer = RootStackAnalyzer::new(llbc, &root_state);
@@ -50361,6 +51126,9 @@ fn spill_address_payloads(
     if tyref_is_zero_sized(ty, llbc) {
         return SpillPayloads::Types(Vec::new());
     }
+    if decl.published_struct_copy {
+        return SpillPayloads::Unclassified;
+    }
     match &decl.kind {
         TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
             spill_substituted_fields(fields, node, llbc)
@@ -53726,9 +54494,12 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         };
         let self_receiver = first_input_is_adt_free(llbc, fd, owner_def_id);
         // Existing arm: method on a foreign opaque ADT with `self`
-        // (`<BigInt as Add>::add`).  Mirrors the gate `impl_method_owner`
+        // (`<BigInt as Add>::add`), including a published struct copy of
+        // that opaque import.  Mirrors the gate `impl_method_owner`
         // applies before declining the Method hint.
-        let opaque_self_method = matches!(owner_td.kind, TypeDeclKind::Opaque) && self_receiver;
+        let opaque_self_method = (matches!(owner_td.kind, TypeDeclKind::Opaque)
+            || owner_td.published_struct_copy)
+            && self_receiver;
         // Bodyless foreign associated fn (`GcAllocOutcome::from_hook`):
         // unextracted crate, so the FunDecl has no body while the owner
         // TypeDecl is a full Enum.  Not a `self` method — that keeps the
@@ -53835,6 +54606,7 @@ fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option
                 TypeDeclKind::Enum(_) if !type_decl_is_fieldless_enum(td, llbc) => {
                     root.map(|r| ValueType::Ref(Some(r)))
                 }
+                _ if td.published_struct_copy => Some(ValueType::Ref(None)),
                 _ => None,
             }
         }
@@ -57650,7 +58422,7 @@ fn tyref_atomic_is_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
 /// a borrow of the wrapper is the same word a fieldless-enum borrow is
 /// ([`tyref_is_borrowed_fieldless_enum`]). A raw pointer remains an address.
 fn transparent_nonzst_field(decl: &TypeDecl, llbc: &Llbc) -> Option<(usize, String)> {
-    if !decl.is_repr_transparent() {
+    if !decl.is_repr_transparent() || decl.published_struct_copy {
         return None;
     }
     let TypeDeclKind::Struct(fields) = &decl.kind else {
@@ -58004,7 +58776,10 @@ fn tyref_transparent_inner_value_type(
     // A foreign `Opaque` decl keeps `repr.transparent: false`: the defining
     // crate is outside the extraction set, so the layout does not record the
     // wrapper. The linked kind is that missing field.
-    if let TypeDeclKind::Opaque = &decl.kind
+    // `apply_published_structs` turns that import into a `Struct` and does
+    // not copy `repr`, so the same false flag remains. Reading the copied
+    // field would retype the word; the kind stays the scalar table.
+    if (matches!(&decl.kind, TypeDeclKind::Opaque) || decl.published_struct_copy)
         && let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path())
     {
         return Some(transparent_scalar_value_type(kind));
@@ -58013,7 +58788,7 @@ fn tyref_transparent_inner_value_type(
         return None;
     }
     match &decl.kind {
-        TypeDeclKind::Struct(fields) => {
+        TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
             let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
                 fields.get(index)?
             } else if let [only] = fields.as_slice() {
@@ -58241,7 +59016,7 @@ pub(crate) fn discover_transparent_scalar_kinds(
 ) -> Vec<(String, majit_charon_reader::TransparentScalarKind)> {
     let mut discovered = Vec::new();
     for decl in llbc.iter_type_decls() {
-        if !decl.is_repr_transparent() {
+        if !decl.is_repr_transparent() || decl.published_struct_copy {
             continue;
         }
         let TypeDeclKind::Struct(fields) = &decl.kind else {
@@ -59514,7 +60289,7 @@ fn gc_ref_pointer(
     let Some(decl) = llbc.type_by_id(id) else {
         return false;
     };
-    if !decl.is_repr_transparent() {
+    if !decl.is_repr_transparent() || decl.published_struct_copy {
         return false;
     }
     let TypeDeclKind::Struct(fields) = &decl.kind else {
@@ -60413,6 +61188,7 @@ fn tyref_to_field_layout_string(
         return tyref_to_ast_string(ty, llbc);
     }
     if let TypeDeclKind::Struct(fields) = &decl.kind
+        && !decl.published_struct_copy
         && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
         && let Some(field) = fields.get(index)
         && !matches!(
@@ -61727,6 +62503,15 @@ fn charon_adt_to_ast_string(
         let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
         if type_args.is_empty() {
             return leaf;
+        }
+        return format!("{leaf}<{}>", type_args.join(","));
+    }
+    // A field type copied from another crate names the ADT by path. The
+    // leaf is the same spelling the defining crate's numeric id rendered.
+    if let Some(path) = id.and_then(|i| i.get("Path")).and_then(|p| p.as_str()) {
+        let leaf = path.rsplit("::").next().unwrap_or(path);
+        if type_args.is_empty() {
+            return leaf.to_string();
         }
         return format!("{leaf}<{}>", type_args.join(","));
     }

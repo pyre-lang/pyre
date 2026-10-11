@@ -10,7 +10,12 @@
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
-use majit_translate::front::mir::{erased_root_bracket_guards, harvest_root_stack_touching_paths};
+use majit_translate::front::mir::{
+    apply_published_structs, erased_root_bracket_guards, fn_returns_owned_scope,
+    harvest_published_structs, harvest_root_stack_touching_paths, harvest_scope_owning_identities,
+    lower_function, mark_foreign_scope_owners, scope_owner_identity,
+};
+use majit_translate::model::OpKind;
 
 const OBJECT_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -19,6 +24,10 @@ const OBJECT_LLBC: &str = concat!(
 const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-interpreter.ullbc"
+);
+const MODULE_LLBC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/pyre-module.ullbc"
 );
 
 /// Bodies that open a bracket, sampled: every `erased_root_bracket_guards`
@@ -119,5 +128,122 @@ fn published_dependency_effects_let_an_importing_crate_erase_its_brackets() {
     assert!(
         after > before,
         "publishing pyre-object's effects must let more interpreter brackets go"
+    );
+}
+
+#[test]
+fn a_bodyless_rooted_items_new_returns_the_scope_its_defining_crate_published() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let owning = harvest_scope_owning_identities(&object);
+    assert!(
+        owning.iter().any(|p| p.contains("RootedItems")),
+        "RootedItems::new opens push_roots and returns that guard: {owning:?}"
+    );
+    assert!(
+        owning.iter().any(|p| p.contains("DictOperationGuard")),
+        "DictOperationGuard::new returns the bracket it opened: {owning:?}"
+    );
+    drop(object);
+
+    let mut interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let external_id = interpreter
+        .iter_fun_decls()
+        .find(|fd| {
+            !fd.item_meta.is_local
+                && fd.item_meta.name_path().ends_with("::new")
+                && scope_owner_identity(&interpreter, fd).contains("RootedItems")
+        })
+        .expect("interpreter names RootedItems::new")
+        .def_id;
+    for fd in interpreter.file.translated.fun_decls.iter_mut().flatten() {
+        if fd.def_id == external_id {
+            fd.body = None;
+        }
+    }
+    assert!(
+        interpreter
+            .fn_by_id(external_id)
+            .is_some_and(|fd| fd.body.is_none()),
+        "the declaration under test has no body"
+    );
+    assert!(
+        !fn_returns_owned_scope(&interpreter, external_id),
+        "without the published constructors the opaque new is not a guard"
+    );
+    mark_foreign_scope_owners(&interpreter, &owning);
+    assert!(
+        fn_returns_owned_scope(&interpreter, external_id),
+        "the published RootedItems::new is the guard its caller holds"
+    );
+}
+
+#[test]
+fn an_opaque_pyerror_object_field_reads_the_defining_crates_field() {
+    if !std::path::Path::new(INTERPRETER_LLBC).is_file()
+        || !std::path::Path::new(MODULE_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    // `PyError` is a one-field tuple over the raised value. The named
+    // fields live on `PyErrorObject`, which `Deref` exposes. `parse_filter_spec`
+    // reads `error.kind` as that struct's field.
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let fields = harvest_published_structs(&interpreter);
+    let pyerror_object = fields
+        .iter()
+        .find(|body| body.path.ends_with("::PyErrorObject"))
+        .expect("interpreter publishes PyErrorObject's fields");
+    assert!(
+        pyerror_object
+            .fields
+            .iter()
+            .any(|field| field.name.as_deref() == Some("kind")),
+        "PyErrorObject publishes a named kind field: {:?}",
+        pyerror_object
+            .fields
+            .iter()
+            .map(|field| field.name.as_deref())
+            .collect::<Vec<_>>()
+    );
+    drop(interpreter);
+
+    let mut module = Llbc::load(MODULE_LLBC).expect("load pyre-module");
+    let opaque = module.iter_type_decls().any(|td| {
+        td.item_meta.name_path().ends_with("::PyErrorObject")
+            && matches!(td.kind, majit_charon_reader::ullbc::TypeDeclKind::Opaque)
+    });
+    assert!(opaque, "pyre-module sees PyErrorObject as an opaque struct");
+    apply_published_structs(&mut module, &fields);
+    assert!(
+        module.iter_type_decls().any(|td| {
+            td.item_meta.name_path().ends_with("::PyErrorObject") && td.published_struct_copy
+        }),
+        "PyErrorObject's copied fields stay an import, not a second class"
+    );
+    let graph = lower_function(&module, "parse_filter_spec")
+        .expect("parse_filter_spec lowers once PyErrorObject.kind is a field");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "kind"
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|root| root.contains("PyErrorObject"))
+            )
+        })
+    });
+    assert!(
+        saw,
+        "error.kind must be a FieldRead of PyErrorObject.kind, not the error value"
     );
 }

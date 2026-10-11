@@ -64,6 +64,12 @@ pub struct FunDecl {
     /// declaration was not loaded through [`crate::Llbc::from_slice`].
     #[serde(skip)]
     promoted_inits: Option<Arc<Vec<Option<PromotedInit>>>>,
+    /// Set on a body-less foreign declaration whose signature, span, and
+    /// impl owner match one constructor a defining crate analysed as
+    /// returning an owned root-bracket guard. Read only when
+    /// [`FunDecl::unstructured`] is `None`.
+    #[serde(skip)]
+    pub returns_owned_scope: std::sync::atomic::AtomicBool,
 }
 
 impl FunDecl {
@@ -274,6 +280,12 @@ pub struct TypeDecl {
     /// unmodelled origin cannot fail the load.
     #[serde(default)]
     pub src: Option<Value>,
+    /// Set when a defining crate's struct fields were copied onto this
+    /// import. Field projection reads those fields. Call routing,
+    /// construction, spill, and metadata still treat the decl as the
+    /// opaque import: the copy is not a second definition of the class.
+    #[serde(skip)]
+    pub published_struct_copy: bool,
 }
 
 /// One `{key, value}` entry of [`TypeDecl::layout`].
