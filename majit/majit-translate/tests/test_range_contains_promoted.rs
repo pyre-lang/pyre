@@ -2,8 +2,8 @@
 //! rustc's `AnonConst` `RangeInclusive` so `front::range_contains` can
 //! fold it to `int_between`.
 //!
-//! Shares the production `pyre-module.ullbc` with the other module-LLBC
-//! integration tests; load is once per process.
+//! Shares the production `pyre-module.ullbc` / `pyre-object.ullbc` with
+//! the other LLBC integration tests; each load is once per process.
 
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::lower_function;
@@ -14,10 +14,19 @@ const MODULE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-module.ullbc",
 );
+const OBJECT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/pyre-object.ullbc",
+);
 
 fn module_llbc() -> &'static Llbc {
     static LLBC: OnceLock<Llbc> = OnceLock::new();
     LLBC.get_or_init(|| Llbc::load(MODULE).expect("load pyre-module.ullbc"))
+}
+
+fn object_llbc() -> &'static Llbc {
+    static LLBC: OnceLock<Llbc> = OnceLock::new();
+    LLBC.get_or_init(|| Llbc::load(OBJECT).expect("load pyre-object.ullbc"))
 }
 
 fn functionpath_calls_ending(
@@ -220,4 +229,57 @@ fn const_int_of_rejects_phi_of_distinct_constants() {
     graph.set_goto(left, join, vec![one]);
     graph.set_goto(right, join, vec![nine]);
     assert_eq!(const_int_of(&graph, &join_args[0]), None);
+}
+
+/// `w_small_int_const` uses live exclusive
+/// `(SMALL_INT_CONST_FROM..SMALL_INT_CONST_TO).contains(&value)`.
+/// The transparent `Range` ADT routes `contains` as `CallTarget::Method`.
+#[test]
+fn w_small_int_const_exclusive_range_folds() {
+    let graph = lower_function(object_llbc(), "pyre_object::intobject::w_small_int_const")
+        .expect("lower w_small_int_const");
+
+    let residual_contains = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                args,
+                ..
+            } if args.len() == 2 && name == "contains" => true,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if args.len() == 2
+                && segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "contains" || leaf.starts_with("contains")) =>
+            {
+                true
+            }
+            _ => false,
+        })
+        .count();
+    let int_between = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "int_between"
+            )
+        })
+        .count();
+    assert_eq!(
+        residual_contains, 0,
+        "Range::contains must be lowered; graph has leftover contains"
+    );
+    assert!(
+        int_between >= 1,
+        "exclusive int range emits int_between; got {int_between}"
+    );
 }

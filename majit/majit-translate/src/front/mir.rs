@@ -6117,13 +6117,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             );
         }
-        // The `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold
+        // The std `Range` / `RangeInclusive` `contains` fold
         // (`front::range_contains`) splices the residual `contains` call
-        // in place with `int_between` (two comparisons when the
-        // `int_between` contract cannot be proved) and removes the paired
-        // construction — residual `RangeInclusive::new`, or the exclusive
-        // `Range { start, end }` ctor + FieldWrites — in its predecessor
-        // block.  It threads the construction bounds into the `contains`
+        // in place with `int_between` / the two comparisons
+        // (`translate_op_contains` / `IntegerRepr.rtype_le` /
+        // `FloatRepr.rtype_le`) and removes the paired producer
+        // (`RangeInclusive::new`, or the exclusive `Range { start, end }`
+        // ctor + FieldWrites).  It threads the bounds into the `contains`
         // block via `ensure_variable_at_block` (touching predecessor link
         // args / inputargs only — no fresh blocks, no detached edges).
         // Removing the cross-block producer leaves its threaded range
@@ -6140,6 +6140,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::range_contains::rewire_range_contains_call_sites(
                 &mut lo.graph,
                 &lo.range_inclusive_new_sites,
+                &lo.range_exclusive_new_sites,
                 &lo.range_contains_sites,
             )
         };
@@ -9271,12 +9272,15 @@ struct Lowering<'a> {
     /// for the unsigned high-word clamp diamond `front::saturating_mul`
     /// synthesizes after body lowering.
     saturating_mul_sites: Vec<Variable>,
-    /// `RangeInclusive::new(lo, hi)` and exclusive int-`Range { start, end }`
-    /// construction sites recorded for the
-    /// `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold the
-    /// `front::range_contains` post-pass synthesizes (see
+    /// `RangeInclusive::new(lo, hi)` call sites recorded for the
+    /// `(a..=b).contains(&x)` fold the `front::range_contains` post-pass
+    /// synthesizes (see
     /// [`crate::front::range_contains::RangeInclusiveNewSite`]).
     range_inclusive_new_sites: Vec<crate::front::range_contains::RangeInclusiveNewSite>,
+    /// Exclusive `Range { start, end }` aggregates recorded for the same
+    /// `(a..b).contains(&x)` fold.  Distinct from `range_iter_new_sites`:
+    /// that divert is consumer-gated on `next()`, this one on `contains`.
+    range_exclusive_new_sites: Vec<crate::front::range_contains::RangeExclusiveNewSite>,
     /// Exclusive int-`Range { start, end }` aggregates (`for _ in a..b`)
     /// recorded for the `range()` + list-iter divert the
     /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
@@ -9295,9 +9299,9 @@ struct Lowering<'a> {
     /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
     /// `range_iter` candidate; both passes are consumer-gated.
     slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `RangeInclusive::contains` / `Range::contains` call sites paired
-    /// with the construction sites above by the `front::range_contains`
-    /// post-pass (see [`crate::front::range_contains::RangeContainsSite`]).
+    /// `Range` / `RangeInclusive` `contains(&self, &x)` call sites paired
+    /// with the producers above by the `front::range_contains` post-pass
+    /// (see [`crate::front::range_contains::RangeContainsSite`]).
     range_contains_sites: Vec<crate::front::range_contains::RangeContainsSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
@@ -10097,6 +10101,7 @@ impl<'a> Lowering<'a> {
             saturating_add_sites: Vec::new(),
             saturating_mul_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
+            range_exclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             slice_index_rangefrom_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
@@ -15385,24 +15390,28 @@ impl<'a> Lowering<'a> {
                                     end: arg_vars[1].clone(),
                                 },
                             );
-                            // Word-sized signed exclusive `(a..b).contains(&x)`
-                            // — the same I64/Isize gate as RangeInclusive.
-                            // Captured here because exclusive Range is a
-                            // struct aggregate, not a `new` call.  The
-                            // contains post-pass pairs this with
-                            // `Range::contains` and is consumer-gated, so
-                            // a for-loop / slice-index range stays the
-                            // ordinary ctor + FieldWrite path.
-                            if tyref_is_int_range(dest_ty, self.llbc) {
-                                self.range_inclusive_new_sites.push(
-                                    crate::front::range_contains::RangeInclusiveNewSite {
-                                        result_var: res.clone(),
-                                        lo: arg_vars[0].clone(),
-                                        hi: arg_vars[1].clone(),
-                                        exclusive: true,
-                                    },
-                                );
-                            }
+                        }
+                        // Capture exclusive `Range { start, end }` for
+                        // `(a..b).contains(&x)` (`front::range_contains`).
+                        // Signed-word and F64 elements; the post-pass is
+                        // consumer-gated on `contains`, so a for-loop /
+                        // slice-index range stays the ordinary ctor path.
+                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
+                            && ctor
+                                .ctor_name
+                                .split('<')
+                                .next()
+                                .unwrap_or(ctor.ctor_name.as_str())
+                                == "Range"
+                            && arg_vars.len() == 2
+                            && let Some(elem) = self.aggregate_head_range_contains_elem(&kind)
+                        {
+                            self.range_exclusive_new_sites.push(
+                                crate::front::range_contains::RangeExclusiveNewSite {
+                                    result_var: res.clone(),
+                                    elem,
+                                },
+                            );
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
                             && ctor
@@ -21165,6 +21174,12 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok(self.emit_promoted_int_range_inclusive(mir_bb, lo, hi, &place_ty));
                 }
+                if let Some((lo, hi)) = promoted_float_range_inclusive_bounds(self.llbc, id)
+                    && tyref_range_contains_elem(&place_ty, self.llbc, "RangeInclusive")
+                        == Some(crate::front::range_contains::RangeElemKind::Float)
+                {
+                    return Ok(self.emit_promoted_float_range_inclusive(mir_bb, lo, hi, &place_ty));
+                }
                 let segments = self.global_segments(mir_bb, id)?;
                 // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
                 // the `None` stored in PyPy's `locals_cells_stack_w` slots
@@ -21962,6 +21977,37 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// Element bank of an exclusive `Range { start, end }` aggregate the
+    /// `(a..b).contains(&x)` fold can lower: signed word (`int_between` /
+    /// `int_le`) or `F64` (`float_le`).  Other widths stay residual.
+    fn aggregate_head_range_contains_elem(
+        &self,
+        kind: &serde_json::Value,
+    ) -> Option<crate::front::range_contains::RangeElemKind> {
+        let head = kind
+            .as_object()
+            .and_then(|m| m.get("Adt"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())?;
+        let is_range = head
+            .as_object()
+            .and_then(type_decl_ref_adt_id)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| td.item_meta.name_path() == "core::ops::range::Range");
+        if !is_range {
+            return None;
+        }
+        let elem = head
+            .as_object()
+            .and_then(|head| type_decl_ref_generics(head, self.llbc))
+            .and_then(|g| g.as_object())
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+            .and_then(|n| strip_ty_wrappers(n, self.llbc))?;
+        range_contains_elem_from_scalar(elem)
+    }
+
     /// Close a root bracket at the guard's `Drop`, by calling the same rewind
     /// the destructor body calls. A non-guard drop is a no-op.
     ///
@@ -22328,13 +22374,60 @@ impl<'a> Lowering<'a> {
             result: Some(hi_v.clone()),
             kind: OpKind::ConstInt(hi),
         });
+        self.emit_promoted_range_inclusive_new(
+            bb_id,
+            lo_v,
+            hi_v,
+            place_ty,
+            crate::front::range_contains::RangeElemKind::SignedInt,
+        )
+    }
+
+    fn emit_promoted_float_range_inclusive(
+        &mut self,
+        mir_bb: usize,
+        lo: u64,
+        hi: u64,
+        place_ty: &TyRef,
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let lo_v = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Float);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(lo_v.clone()),
+            kind: OpKind::ConstFloat(lo),
+        });
+        let hi_v = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Float);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(hi_v.clone()),
+            kind: OpKind::ConstFloat(hi),
+        });
+        self.emit_promoted_range_inclusive_new(
+            bb_id,
+            lo_v,
+            hi_v,
+            place_ty,
+            crate::front::range_contains::RangeElemKind::Float,
+        )
+    }
+
+    /// Owner-qualified `RangeInclusive::new(lo, hi)` plus the fold site.
+    /// `unspecialized_fun_segments` emits `ops::range::RangeInclusive::new`;
+    /// the fold matches the `["range", "RangeInclusive", "new"]` tail.
+    fn emit_promoted_range_inclusive_new(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        lo_v: Variable,
+        hi_v: Variable,
+        place_ty: &TyRef,
+        elem: crate::front::range_contains::RangeElemKind,
+    ) -> Variable {
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        // Owner-qualified associated-function spelling
-        // `unspecialized_fun_segments` emits for `RangeInclusive::new`
-        // (`ops::range::RangeInclusive::new`). The fold matches the
-        // `["range", "RangeInclusive", "new"]` tail.
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::Call {
@@ -22353,7 +22446,7 @@ impl<'a> Lowering<'a> {
                 result_var: res.clone(),
                 lo: lo_v,
                 hi: hi_v,
-                exclusive: false,
+                elem,
             });
         res
     }
@@ -30787,15 +30880,16 @@ impl<'a> Lowering<'a> {
         // resolves to the opaque `RangeInclusive` ADT, so `lower_call`
         // emits it as a 2-arg FunctionPath whose segments end
         // `["range", "RangeInclusive", "new"]` (the owner-qualified
-        // spelling, like `bigint::BigInt::div_rem`).  The int element gate
+        // spelling, like `bigint::BigInt::div_rem`).  The element gate
         // reads the destination `RangeInclusive`'s type argument
         // (`call.dest.ty`), which is present even when the bounds are
         // literal constants — the common `(0..=255)` shape passes
         // `Operand::Const` bounds, so gating the operand types instead
-        // would miss them.  A float / narrower-width range never records a
-        // site and declines cleanly (both calls stay residual, census
-        // Skip).  The op is still emitted normally; the post-pass removes
-        // it once the paired `contains` folds.
+        // would miss them.  Signed-word and F64 elements record; a
+        // narrower-width range never records a site and declines cleanly
+        // (both calls stay residual, census Skip).  The op is still
+        // emitted normally; the post-pass removes it once the paired
+        // `contains` folds.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -30803,66 +30897,34 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && fmt_path_ends_with(segments, &["range", "RangeInclusive", "new"])
-            && tyref_is_int_range_inclusive(&call.dest.ty, self.llbc)
+            && let Some(elem) =
+                tyref_range_contains_elem(&call.dest.ty, self.llbc, "RangeInclusive")
         {
             self.range_inclusive_new_sites.push(
                 crate::front::range_contains::RangeInclusiveNewSite {
                     result_var: result_var.clone(),
                     lo: args[0].clone().into_variable(),
                     hi: args[1].clone().into_variable(),
-                    exclusive: false,
+                    elem,
                 },
             );
         }
-        // Capture `RangeInclusive::contains(&self, &x)` sites for the same
-        // fold.  Its `&RangeInclusive` receiver is an opaque foreign ADT
-        // whose impl-owner resolution routes it as a 2-arg FunctionPath
-        // (receiver `args[0]`, value `args[1]`) ending
-        // `["range", "RangeInclusive", "contains"]`, NOT a
-        // `CallTarget::Method`.  Gate on the receiver operand type
-        // (`first_arg_ty`) resolving to the opaque `RangeInclusive` ADT
-        // over an int element so a same-named `contains` on any other type
-        // — or a float range — is never recorded; the post-pass pairs each
-        // recorded site with its producing `new` and declines on any
-        // structural mismatch.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["range", "RangeInclusive", "contains"])
-            && first_arg_ty
-                .as_ref()
-                .is_some_and(|t| tyref_is_int_range_inclusive(t, self.llbc))
-        {
-            self.range_contains_sites
-                .push(crate::front::range_contains::RangeContainsSite {
-                    result_var: result_var.clone(),
-                });
-        }
-        // Capture `Range::contains(&self, &x)` for the exclusive
-        // `(a..b).contains(&x)` fold.  Exclusive Range is a struct ADT,
-        // so `first_is_self` routes the call as a 2-arg
-        // `CallTarget::Method { name: "contains" }` (receiver `args[0]`,
-        // value `args[1]`).  A FunctionPath spelling ending
-        // `["range", "Range", "contains"]` is recorded too.  Gate on the
-        // receiver resolving to `Range` over I64/Isize — the same
-        // element types as RangeInclusive — so a float range, a
-        // narrower-width range, and a same-named `contains` on any other
-        // type are never recorded.
+        // Capture `Range` / `RangeInclusive` `contains(&self, &x)` sites
+        // for the same fold.  Transparent `Range` is a 2-arg
+        // `CallTarget::Method` (`first_is_self`, `receiver_root == "Range"`);
+        // opaque `RangeInclusive` stays a FunctionPath whose leaf is
+        // `contains`.  Gate on the receiver operand type (`first_arg_ty`)
+        // resolving to that ADT over a signed-word / F64 element so a
+        // same-named `contains` on any other type is never recorded; the
+        // post-pass pairs each recorded site with its producer (`new` or
+        // the exclusive aggregate) and declines on any structural mismatch.
         if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
-            && match target {
-                CallTarget::Method { name, .. } => name == "contains",
-                CallTarget::FunctionPath { segments, .. } => {
-                    fmt_path_ends_with(segments, &["range", "Range", "contains"])
-                }
-                _ => false,
-            }
-            && first_arg_ty
-                .as_ref()
-                .is_some_and(|t| tyref_is_int_range(t, self.llbc))
+            && crate::front::range_contains::is_range_contains_call_target(target)
+            && first_arg_ty.as_ref().is_some_and(|t| {
+                tyref_range_contains_elem(t, self.llbc, "RangeInclusive").is_some()
+                    || tyref_range_contains_elem(t, self.llbc, "Range").is_some()
+            })
         {
             self.range_contains_sites
                 .push(crate::front::range_contains::RangeContainsSite {
@@ -35733,8 +35795,11 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the unary llop
-    /// `rewrite_op_cast_ptr_to_int` keeps, not a residual call.
+    /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the host
+    /// `simple_call` flowspace records (`lloperation.py` LLOp, rtyped
+    /// by `rbuiltin.py rtype_cast_*`). `rewrite_op_cast_ptr_to_int`
+    /// later keeps the unary llop; emitting it here would skip the
+    /// annotator (`normalize_unary_op_name` has no typed-cast arm).
     fn emit_host_cast_llop(
         &mut self,
         mir_bb: usize,
@@ -59959,71 +60024,63 @@ fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
-/// `adt_path` whose sole element type is a word-sized signed integer
-/// (`I64` / `Isize`).  `require_opaque` is the RangeInclusive extraction
-/// shape; exclusive `Range` is a struct ADT and must not require it.
-fn tyref_is_word_signed_range_adt(
+/// `core::ops::range::RangeInclusive` over a word-sized signed integer
+/// (`I64` / `Isize`).  The promoted-const un-promote path is int-only
+/// (`ConstInt` bounds); float `RangeInclusive` is recorded through
+/// [`tyref_range_contains_elem`].
+fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_range_contains_elem(ty, llbc, "RangeInclusive")
+        == Some(crate::front::range_contains::RangeElemKind::SignedInt)
+}
+
+/// Element bank of a `core::ops::range::{Range,RangeInclusive}` ADT the
+/// `contains` fold can lower.  `adt_leaf` is `"Range"` or
+/// `"RangeInclusive"`.  The element type is read from the ADT
+/// reference's `generics.types[0]`, so it is available even when the
+/// bounds are literal constants (whose operand types the front does not
+/// carry). Exclusive `Range` is a struct ADT; `RangeInclusive` is Opaque
+/// — match by path only.
+fn tyref_range_contains_elem(
     ty: &TyRef,
     llbc: &Llbc,
-    adt_path: &str,
-    require_opaque: bool,
-) -> bool {
-    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return false;
-    };
-    let Some(adt) = node
+    adt_leaf: &str,
+) -> Option<crate::front::range_contains::RangeElemKind> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let adt = node
         .as_object()
         .and_then(|m| m.get("Adt"))
-        .and_then(|v| v.as_object())
-    else {
-        return false;
-    };
-    let is_range = adt_node_def_id(node)
+        .and_then(|v| v.as_object())?;
+    let path = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            (!require_opaque || matches!(td.kind, TypeDeclKind::Opaque))
-                && td.item_meta.name_path() == adt_path
-        });
-    if !is_range {
-        return false;
+        .map(|td| td.item_meta.name_path())?;
+    if path != format!("core::ops::range::{adt_leaf}") {
+        return None;
     }
     let elem = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
         .and_then(|t| t.first())
-        .and_then(|n| strip_ty_wrappers(n, llbc));
-    matches!(
-        elem.and_then(|e| e.as_object())
-            .and_then(|m| m.get("Scalar"))
-            .and_then(|l| l.get("Integer"))
-            .and_then(|l| l.get("Signed"))
-            .and_then(serde_json::Value::as_str),
-        Some("I64" | "Isize")
-    )
+        .and_then(|n| strip_ty_wrappers(n, llbc))?;
+    range_contains_elem_from_scalar(elem)
 }
 
-/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
-/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
-/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
-/// both the `new` and the `contains` recording of the
-/// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
-/// type — and a float / narrower-width range — is never folded to
-/// integer compares.  The element type is read from the ADT reference's
-/// `generics.types[0]`, so it is available even when the `new` bounds are
-/// literal constants (whose operand types the front does not carry);
-/// float ranges decline cleanly (both calls stay residual, census Skip).
-fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::RangeInclusive", true)
-}
-
-/// True when `ty` resolves to exclusive `core::ops::range::Range` over
-/// `I64` / `Isize` — the same integer element gate as
-/// [`tyref_is_int_range_inclusive`].  Exclusive Range is a struct ADT
-/// (not Opaque).  Float exclusive ranges decline the same way inclusive
-/// float ranges do.
-fn tyref_is_int_range(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::Range", false)
+fn range_contains_elem_from_scalar(
+    elem: &serde_json::Value,
+) -> Option<crate::front::range_contains::RangeElemKind> {
+    let scalar = elem.as_object()?.get("Scalar")?.as_object()?;
+    if let Some(signed) = scalar
+        .get("Integer")
+        .and_then(|l| l.get("Signed"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return matches!(signed, "I64" | "Isize")
+            .then_some(crate::front::range_contains::RangeElemKind::SignedInt);
+    }
+    match scalar.get("Float").and_then(serde_json::Value::as_str) {
+        Some("F64") => Some(crate::front::range_contains::RangeElemKind::Float),
+        _ => None,
+    }
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
@@ -64166,7 +64223,11 @@ fn charon_dyn_trait_to_ast_string(dynt: &serde_json::Value, llbc: &Llbc) -> Stri
     fn find_trait_id(v: &serde_json::Value) -> Option<u64> {
         match v {
             serde_json::Value::Object(m) => {
-                if let Some(id) = m.get("trait_decl_id").and_then(serde_json::Value::as_u64) {
+                if let Some(id) = m
+                    .get("trait_decl_id")
+                    .or_else(|| m.get("id"))
+                    .and_then(serde_json::Value::as_u64)
+                {
                     return Some(id);
                 }
                 m.values().find_map(find_trait_id)
@@ -65973,7 +66034,7 @@ fn named_const_promoted_in_anon(llbc: &Llbc, def_id: u64) -> Option<u64> {
 /// Charon records the init as a 3-BB Call+Ref-return+Unwind, which
 /// `promoted_init_from_body` will not splice.  The bounds are the live
 /// host values RPython would already have at translation time.
-fn promoted_int_range_inclusive_bounds(llbc: &Llbc, def_id: u64) -> Option<(i64, i64)> {
+fn promoted_range_inclusive_new_args(llbc: &Llbc, def_id: u64) -> Option<(Operand, Operand)> {
     let g = llbc.global_by_id(def_id)?;
     if g.rest
         .get("global_kind")
@@ -65988,7 +66049,7 @@ fn promoted_int_range_inclusive_bounds(llbc: &Llbc, def_id: u64) -> Option<(i64,
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
     let u = llbc.fn_by_id(init_id)?.unstructured()?;
-    let mut bounds = None;
+    let mut args = None;
     for bb in &u.body {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
@@ -66016,14 +66077,47 @@ fn promoted_int_range_inclusive_bounds(llbc: &Llbc, def_id: u64) -> Option<(i64,
         if call.args.len() != 2 {
             return None;
         }
-        let lo = operand_as_signed_int(llbc, &call.args[0])?;
-        let hi = operand_as_signed_int(llbc, &call.args[1])?;
-        if bounds.is_some() {
+        if args.is_some() {
             return None;
         }
-        bounds = Some((lo, hi));
+        args = Some((call.args[0].clone(), call.args[1].clone()));
     }
-    bounds
+    args
+}
+
+fn promoted_int_range_inclusive_bounds(llbc: &Llbc, def_id: u64) -> Option<(i64, i64)> {
+    let (lo, hi) = promoted_range_inclusive_new_args(llbc, def_id)?;
+    Some((
+        operand_as_signed_int(llbc, &lo)?,
+        operand_as_signed_int(llbc, &hi)?,
+    ))
+}
+
+fn promoted_float_range_inclusive_bounds(llbc: &Llbc, def_id: u64) -> Option<(u64, u64)> {
+    let (lo, hi) = promoted_range_inclusive_new_args(llbc, def_id)?;
+    Some((
+        operand_as_float_bits(llbc, &lo)?,
+        operand_as_float_bits(llbc, &hi)?,
+    ))
+}
+
+/// F64 bit pattern carried by a `RangeInclusive::new` operand: a literal or a `NamedConst` global.
+fn operand_as_float_bits(llbc: &Llbc, op: &Operand) -> Option<u64> {
+    match op {
+        Operand::Const(value) => match decode_constant(llbc, value).ok()? {
+            DecodedConst::Float(bits) => Some(bits),
+            _ => None,
+        },
+        Operand::Copy(place) | Operand::Move(place) => {
+            let PlaceKind::Global { id, .. } = &place.kind else {
+                return None;
+            };
+            match fold_named_const_on_llbc(llbc, *id)? {
+                OpKind::ConstFloat(bits) => Some(bits),
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Integer constant carried by a `RangeInclusive::new` operand: a
@@ -78101,6 +78195,36 @@ mod tests {
         }
     }
 
+    /// `w_set_items` is `(*(obj as *const W_SetObject)).strategy.getkeys(obj)`.
+    /// Every FieldRead base must be a block inputarg or op result.
+    #[test]
+    fn w_set_items_fieldread_bases_are_defined() {
+        use crate::model::OpKind;
+        let graph = lower_object_fn("pyre_object::setobject::w_set_items");
+        assert_graph_operands_defined(&graph);
+        assert!(
+            !graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr")
+            ),
+            "cast_int_to_ptr must be simple_call at flowspace\n{}",
+            graph.dump()
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "strategy")
+            ),
+            "w_set_items must FieldRead strategy\n{}",
+            graph.dump()
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "imp")
+            ),
+            "w_set_items must FieldRead imp\n{}",
+            graph.dump()
+        );
+    }
+
     /// `w_type_set_w_doc` is `type_write_barrier(obj); t.w_doc = w_doc`.
     /// The barrier call is dropped and the `setfield` stays; the backend
     /// rewrite puts `COND_CALL_GC_WB` in front of it.
@@ -82198,13 +82322,11 @@ mod tests {
     }
 
     /// The float range in `complex_pow` (`descroperation.rs`,
-    /// `(-100.0..=100.0)`) is out of the int-only fold's scope: the
-    /// element gate rejects the `F64` type, so BOTH residual range calls
-    /// survive (the graph census-Skips as before — no regression, no
-    /// float→int miscompile).  Ignored by default (loads the real LLBC).
+    /// `(-100.0..=100.0)`) lowers to the compare pair, not `int_between`.
+    /// Ignored by default (loads the real LLBC).
     #[test]
     #[ignore]
-    fn range_contains_fold_real_declines_float_range() {
+    fn range_contains_fold_real_float_range_compares() {
         use crate::model::{CallTarget, OpKind};
 
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
@@ -82228,14 +82350,28 @@ mod tests {
                 })
                 .count()
         };
-        assert!(
-            range_call("new") >= 1,
-            "float range constructor stays residual (fold out of scope)"
-        );
-        assert!(
-            range_call("contains") >= 1,
-            "float range contains stays residual (fold out of scope)"
-        );
+        let int_between = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, args }
+                        if opname == "int_between" && args.len() == 3
+                )
+            })
+            .count();
+        let le = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "le"))
+            .count();
+        assert_eq!(range_call("new"), 0, "float RangeInclusive::new removed");
+        assert_eq!(range_call("contains"), 0, "float contains removed");
+        assert_eq!(int_between, 0, "float range must not become int_between");
+        assert!(le >= 1, "float range emits le/ge compares");
     }
 
     /// Exclusive `(1..EXACT_FLOAT_INT).contains(&n)` in
@@ -83312,8 +83448,10 @@ mod tests {
             .map(|(name, id)| (name.clone(), *id))
             .collect();
         let _registry = crate::test_support::register_struct_ids_serialized(rdict_ids.clone());
+        let pair_fields: std::collections::HashMap<String, Vec<(String, String)>> =
+            fields.fields.clone().into();
         let provider = crate::layout::HeuristicLayoutProvider::from_struct_fields(
-            &fields.fields,
+            &pair_fields,
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
         );
@@ -84434,6 +84572,313 @@ mod tests {
         assert!(
             !fat_lens.is_empty(),
             "the vtable word must be a FatMeta of slot\n{}",
+            graph.dump()
+        );
+    }
+
+    /// Nested `Deref+Field+Deref` through a RawPtr cast onto a GC struct,
+    /// then `SetStrategyRef::deref` (`self.imp`) and a Dynamic `getkeys`.
+    /// Every FieldRead base must be a block inputarg or op result —
+    /// `rclass.py InstanceRepr.getfield`'s `vinst`.
+    #[test]
+    fn nested_rawptr_strategy_deref_fieldread_bases_are_defined() {
+        use crate::model::{FieldDescriptor, OpKind};
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let empty_generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let set_adt =
+            serde_json::json!({"Adt": {"id": 0, "builtin": null, "generics": empty_generics}});
+        let holder_adt =
+            serde_json::json!({"Adt": {"id": 1, "builtin": null, "generics": empty_generics}});
+        let vtable_adt =
+            serde_json::json!({"Adt": {"id": 2, "builtin": null, "generics": empty_generics}});
+        let obj_ty = serde_json::json!({"Ref": [null, set_adt, "Shared"]});
+        let raw_ty = serde_json::json!({"RawPtr": [set_adt, "Const"]});
+        let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+        let fat_ty = serde_json::json!({"Ref": ["static", {"DynTrait": {}}, "Shared"]});
+        let vtable_ptr = serde_json::json!({"RawPtr": [vtable_adt, "Const"]});
+        let fn_ptr = serde_json::json!({"FnPtr": {"inputs": [fat_ty.clone(), obj_ty.clone()], "output": {"Tuple": []}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let raw_u8 =
+            serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let w_set = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "W_SetObject"]),
+            "kind": {"Struct": [
+                {"name": "ob_header", "ty": i64_ty, "attr_info": field_attr},
+                {"name": "sstorage", "ty": i64_ty, "attr_info": field_attr},
+                {"name": "strategy", "ty": holder_ref, "attr_info": field_attr}
+            ]}
+        });
+        let holder = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "SetStrategyRef"]),
+            "kind": {"Struct": [
+                {"name": "kind", "ty": i64_ty, "attr_info": field_attr},
+                {"name": "imp", "ty": fat_ty, "attr_info": field_attr},
+                {"name": "owner", "ty": raw_u8, "attr_info": field_attr}
+            ]}
+        });
+        let vtable = serde_json::json!({
+            "def_id": 2,
+            "item_meta": meta(&["fixture", "SetStrategy", "{vtable}"]),
+            "kind": {"Struct": [{
+                "name": "method_getkeys",
+                "ty": fn_ptr,
+                "attr_info": field_attr
+            }]}
+        });
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+        let obj_place = place(serde_json::json!({"Local": 1}), &obj_ty);
+        let raw_place = place(serde_json::json!({"Local": 6}), &raw_ty);
+        let strategy_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Projection": [
+                        raw_place.clone(),
+                        "Deref"
+                    ]}), &set_adt),
+                    {"Field": [null, 2]}
+                ]}), &holder_ref),
+                "Deref"
+            ]}),
+            &holder_adt,
+        );
+        let assign_raw = serde_json::json!({"span": span, "kind": {"Assign": [
+            raw_place,
+            {"UnaryOp": [
+                {"Cast": {"RawPtr": [obj_ty.clone(), raw_ty.clone()]}},
+                {"Copy": obj_place.clone()}
+            ]}
+        ]}});
+        let assign_ref = serde_json::json!({"span": span, "kind": {"Assign": [
+            place(serde_json::json!({"Local": 5}), &holder_ref),
+            {"Ref": {"place": strategy_place, "kind": "Shared", "ptr_metadata": null}}
+        ]}});
+        let lock = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "lock"]),
+            "signature": {"is_unsafe": false, "inputs": [obj_ty.clone()], "output": unit},
+            "body": "Opaque"
+        });
+        let deref_self = place(serde_json::json!({"Local": 1}), &holder_ref);
+        let deref_imp = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    deref_self.clone(),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 1]}
+            ]}),
+            &fat_ty,
+        );
+        let deref_fn = serde_json::json!({
+            "def_id": 2,
+            "item_meta": meta(&["fixture", "SetStrategyRef", "<Impl>", "deref"]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [holder_ref.clone()],
+                "output": fat_ty
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &fat_ty),
+                    local(1, &holder_ref)
+                ]},
+                "body": [{
+                    "statements": [{"span": span, "kind": {"Assign": [
+                        place(serde_json::json!({"Local": 0}), &fat_ty),
+                        {"Use": [{"Copy": deref_imp}, "No"]}
+                    ]}}],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let fat_local = place(serde_json::json!({"Local": 4}), &fat_ty);
+        let metadata_place = place(
+            serde_json::json!({"Projection": [
+                fat_local.clone(),
+                "PtrMetadata"
+            ]}),
+            &vtable_ptr,
+        );
+        let slot_field = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    metadata_place,
+                    "Deref"
+                ]}), &vtable_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fn_ptr,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "getkeys_via_strategy"]),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [obj_ty.clone()],
+                "output": unit
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &unit),
+                    local(1, &obj_ty),
+                    local(2, &unit),
+                    local(3, &obj_ty),
+                    local(4, &fat_ty),
+                    local(5, &holder_ref),
+                    local(6, &raw_ty),
+                    local(7, &fn_ptr)
+                ]},
+                "body": [
+                    {
+                        "statements": [{"span": span, "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 3}), &obj_ty),
+                            {"Use": [{"Copy": obj_place.clone()}, "No"]}
+                        ]}}],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 1},
+                                    "generics": empty_generics
+                                }},
+                                "args": [{"Move": place(serde_json::json!({"Local": 3}), &obj_ty)}],
+                                "dest": place(serde_json::json!({"Local": 2}), &unit)
+                            },
+                            "target": 1,
+                            "on_unwind": 4
+                        }}}
+                    },
+                    {
+                        "statements": [assign_raw, assign_ref],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 2},
+                                    "generics": empty_generics
+                                }},
+                                "args": [{"Move": place(serde_json::json!({"Local": 5}), &holder_ref)}],
+                                "dest": fat_local.clone()
+                            },
+                            "target": 2,
+                            "on_unwind": 4
+                        }}}
+                    },
+                    {
+                        "statements": [{"span": span, "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 7}), &fn_ptr),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [fn_ptr.clone(), fn_ptr.clone()]}},
+                                {"Copy": slot_field}
+                            ]}
+                        ]}}],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Copy": place(
+                                    serde_json::json!({"Local": 7}),
+                                    &fn_ptr
+                                )}},
+                                "args": [
+                                    {"Move": fat_local.clone()},
+                                    {"Move": obj_place.clone()}
+                                ],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 3,
+                            "on_unwind": 4
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [w_set, holder, vtable],
+                "fun_decls": [caller, lock, deref_fn],
+                "global_decls": [],
+                "trait_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(&["majit_gc", "header", "GcType"]),
+                        "methods": []
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(&["fixture", "SetStrategy"]),
+                        "methods": [{"skip_binder": {"name": "getkeys"}}]
+                    }
+                ],
+                "trait_impls": [gctype_impl_for_adt(0)]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph = super::lower_function(&llbc, "getkeys_via_strategy")
+            .expect("lower getkeys_via_strategy");
+        assert_graph_operands_defined(&graph);
+        assert!(
+            !graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr")
+            ),
+            "cast_int_to_ptr must be simple_call at flowspace\n{}",
+            graph.dump()
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "strategy")
+            ),
+            "must FieldRead strategy\n{}",
+            graph.dump()
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "imp")
+            ),
+            "must FieldRead imp\n{}",
+            graph.dump()
+        );
+        let method_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field: FieldDescriptor { name, .. }, .. }
+                        if name == "method_getkeys"
+                )
+            })
+            .count();
+        assert!(
+            method_reads > 0,
+            "must read method_getkeys\n{}",
             graph.dump()
         );
     }
@@ -87231,6 +87676,28 @@ mod tests {
             .iter()
             .flat_map(|block| block.operations.iter())
             .collect()
+    }
+
+    fn assert_graph_operands_defined(graph: &FunctionGraph) {
+        for block in &graph.blocks {
+            let mut defined: std::collections::HashSet<u64> =
+                block.inputargs.iter().map(|var| var.id()).collect();
+            for op in &block.operations {
+                for operand in crate::inline::op_variable_refs(&op.kind) {
+                    assert!(
+                        defined.contains(&operand.id()),
+                        "block {:?} uses undefined operand {:?} in {:?}\n{}",
+                        block.id,
+                        operand,
+                        op.kind,
+                        graph.dump()
+                    );
+                }
+                if let Some(result) = &op.result {
+                    defined.insert(result.id());
+                }
+            }
+        }
     }
 
     #[test]

@@ -451,7 +451,7 @@ fn graph_defines(graph: &FunctionGraph, var: &Variable) -> bool {
 /// captured `Range` shell.  A duplicate, missing, or non-variable field value
 /// declines: the consumer rewrite is valid only for the exact two-field Rust
 /// `Range { start, end }` construction shape.
-fn live_range_bounds(
+pub(crate) fn live_range_bounds(
     graph: &FunctionGraph,
     range_result: &Variable,
 ) -> Option<(Variable, Variable)> {

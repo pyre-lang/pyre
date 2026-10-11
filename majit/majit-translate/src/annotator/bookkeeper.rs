@@ -1096,9 +1096,15 @@ fn two_word_fat_struct(
     )))
 }
 
+/// Inner `dyn Trait` spelling of a fat dyn pointer field, after stripping
+/// `&` / `*mut` / `Box<>` / a leading `'lifetime`.
+fn is_dyn_trait_spelling(s: &str) -> bool {
+    s == "dyn" || s.starts_with("dyn ") || s.starts_with("(dyn ")
+}
+
 fn is_fat_pointee(inner: &str) -> bool {
     let inner = inner.trim();
-    if inner == "str" || inner.ends_with("::str") || inner.starts_with("dyn ") {
+    if inner == "str" || inner.ends_with("::str") || is_dyn_trait_spelling(inner) {
         return true;
     }
     inner
@@ -10870,6 +10876,68 @@ mod tests {
             2 * word,
             "later fields must keep the metadata word"
         );
+    }
+
+    #[test]
+    fn dyn_trait_field_projects_to_tuple_not_classdef_less_instance() {
+        let bk = bk();
+        for spelling in [
+            "&dyn SetStrategy",
+            "&'static dyn SetStrategy",
+            "dyn SetStrategy",
+            "Box<dyn SetStrategy>",
+            "*mut dyn SetStrategy",
+            // Charon `DynTrait { id }` with no resolved leaf renders `dyn`.
+            "&dyn",
+            "dyn",
+        ] {
+            let s = bk.project_struct_field_type(spelling);
+            let SomeValue::Tuple(t) = s else {
+                panic!("{spelling}: expected SomeTuple, got {s:?}");
+            };
+            assert_eq!(
+                t.items.len(),
+                2,
+                "{spelling}: two_word_fat_struct is the data/len pair (`rtuple.py` rtype_getitem)"
+            );
+        }
+        let list = bk.project_struct_field_type("&[PyObjectRef]");
+        assert!(
+            matches!(list, SomeValue::List(_)),
+            "slice spelling must stay SomeList, got {list:?}"
+        );
+    }
+
+    #[test]
+    fn interned_dyn_imp_field_is_tuple_not_force_shell() {
+        use crate::front::StructFieldRegistry;
+
+        // Production `tyref_to_field_layout_string` keeps the `&` of a
+        // `&'static dyn Trait` field. Charon `DynTrait { id }` without a
+        // resolved leaf is the fallback spelling `&dyn`.
+        for spelling in ["&dyn SetStrategy", "&dyn"] {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            reg.fields.insert(
+                "SetStrategyRef".to_string(),
+                vec![("imp".to_string(), spelling.to_string())],
+            );
+            bk.set_struct_fields(Rc::new(reg));
+            let cd = bk
+                .getuniqueclassdef_for_struct_root("SetStrategyRef")
+                .expect("SetStrategyRef registers");
+            let g = cd.borrow();
+            let imp = g.attrs.get("imp").expect("imp attr present");
+            let SomeValue::Tuple(t) = &imp.s_value else {
+                panic!("{spelling}: expected SomeTuple, got {:?}", imp.s_value);
+            };
+            assert_eq!(
+                t.items.len(),
+                2,
+                "{spelling}: interned dyn-fat field is two_word_fat_struct, got {:?}",
+                imp.s_value
+            );
+        }
     }
 
     #[test]

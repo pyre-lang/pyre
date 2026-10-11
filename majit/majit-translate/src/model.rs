@@ -5947,8 +5947,9 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
 /// into the use block.  This is the same condition `SSA_to_SSI` enforces while
 /// adding one inputarg to every block and one argument to every incoming link
 /// (`rpython/translator/backendopt/ssa.py`).  `SSA_to_SSI.record_used_var`
-/// walks `op.args`, `block.exitswitch`, and `link.args`; this pass matches
-/// that census so a loop-carried iterator named only on the back-edge
+/// walks every `op.args` (every op kind), `block.exitswitch`, and `link.args`;
+/// this pass matches that census via `op_variable_refs` so a loop-carried
+/// iterator named only on the back-edge
 /// (`range_iter` plants `iter()` in the preheader, the latch forwards it)
 /// is an inputarg of the latch, the way `ll_listnext` (`rlist.py`) keeps
 /// the iterator live across a body that does not mention it.
