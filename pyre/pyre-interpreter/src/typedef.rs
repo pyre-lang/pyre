@@ -37,6 +37,10 @@ mod typedef_identity_tests {
         super::init_typeobjects();
         let _roots = gc_roots::push_roots();
         for name in ["FirstOwner", "SecondOwner"] {
+            // The namespace and the stamped descriptor are live only for this
+            // iteration's asserts. `push_roots` / `pop_roots` drop them before
+            // the next name allocates.
+            let _pyre_store_roots = gc_roots::push_roots();
             let ns_slot = gc_roots::shadow_stack_len();
             let _ = gc_roots::pin_root(w_dict_new());
             let template = super::dict_descr();
@@ -105,6 +109,10 @@ mod typedef_identity_tests {
             (super::w_object(), vec!["field"]),
             (super::gettypefor(&INT_TYPE).unwrap().as_ptr(), vec![]),
         ] {
+            // Slot names, the namespace and the child type are read only
+            // inside this iteration. Close that bracket before the next base
+            // allocates.
+            let _pyre_store_roots = gc_roots::push_roots();
             let ns_slot = gc_roots::shadow_stack_len();
             let _ = gc_roots::pin_root(w_dict_new());
             let slots = slot_names
@@ -1848,33 +1856,43 @@ fn patch_object_class_descriptor() {
     {
         return;
     }
+    let _scope = pyre_object::gc_roots::push_roots();
+    let object_type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(object_type);
     let class_getter = make_builtin_function_with_arity(
         "__class__",
         |args| Ok(crate::typedef::r#type(args[1]).map_or(pyre_object::PY_NULL, |p| p.as_ptr())),
         2,
     );
+    let class_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(class_getter);
     let class_setter = make_builtin_function_with_arity(
         "__class__",
         |args| crate::baseobjspace::descr_set___class__(args[1], args[2]),
         3,
     );
+    let class_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(class_setter);
+    let class_deleter = make_builtin_function_with_arity(
+        "__class__",
+        |_args| {
+            Err(crate::PyError::type_error(
+                "can't delete __class__ attribute",
+            ))
+        },
+        2,
+    );
+    let class_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(class_deleter);
     crate::type_dict_store(
-        object_type,
+        pyre_object::gc_roots::shadow_stack_get(object_type_slot),
         "__class__",
         make_getset_property_full(
-            class_getter,
-            class_setter,
-            make_builtin_function_with_arity(
-                "__class__",
-                |_args| {
-                    Err(crate::PyError::type_error(
-                        "can't delete __class__ attribute",
-                    ))
-                },
-                2,
-            ),
+            pyre_object::gc_roots::shadow_stack_get(class_getter_slot),
+            pyre_object::gc_roots::shadow_stack_get(class_setter_slot),
+            pyre_object::gc_roots::shadow_stack_get(class_deleter_slot),
             pyre_object::PY_NULL,
-            object_type,
+            pyre_object::gc_roots::shadow_stack_get(object_type_slot),
             Some("__class__"),
         ),
     );
@@ -1923,6 +1941,9 @@ fn patch_complex_realimag_descriptors() {
     if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
         return;
     }
+    let _scope = pyre_object::gc_roots::push_roots();
+    let complex_type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(complex_type);
     for (name, doc, getter) in [
         (
             "real",
@@ -1935,15 +1956,30 @@ fn patch_complex_realimag_descriptors() {
             complex_imag_property_get,
         ),
     ] {
+        // Getter, setter, deleter and doc live across this one
+        // `type_dict_store`. The complex type stays on `_scope`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
+        let getter_w = make_builtin_function_with_arity(name, getter, 2);
+        let getter_w_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter_w);
+        let setter_w = make_builtin_function_with_arity(name, complex_lane_readonly, 3);
+        let setter_w_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(setter_w);
+        let deleter_w = make_builtin_function_with_arity(name, complex_lane_readonly, 2);
+        let deleter_w_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(deleter_w);
+        let doc_w = pyre_object::w_str_new(doc);
+        let doc_w_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(doc_w);
         crate::type_dict_store(
-            complex_type,
+            pyre_object::gc_roots::shadow_stack_get(complex_type_slot),
             name,
             make_getset_property_full(
-                make_builtin_function_with_arity(name, getter, 2),
-                make_builtin_function_with_arity(name, complex_lane_readonly, 3),
-                make_builtin_function_with_arity(name, complex_lane_readonly, 2),
-                pyre_object::w_str_new(doc),
-                complex_type,
+                pyre_object::gc_roots::shadow_stack_get(getter_w_slot),
+                pyre_object::gc_roots::shadow_stack_get(setter_w_slot),
+                pyre_object::gc_roots::shadow_stack_get(deleter_w_slot),
+                pyre_object::gc_roots::shadow_stack_get(doc_w_slot),
+                pyre_object::gc_roots::shadow_stack_get(complex_type_slot),
                 Some(name),
             ),
         );
@@ -1959,34 +1995,39 @@ fn patch_float_realimag_descriptors() {
     if float_type.is_null() || !crate::type_dict_has_storage(float_type) {
         return;
     }
-    for (name, getter) in [
+    let _scope = pyre_object::gc_roots::push_roots();
+    let float_type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(float_type);
+    for (name, getter_fn) in [
         (
             // `floatobject.py descr_get_real` returns `space.float(self)`,
             // so a subclass receiver is down-converted to a base `float`.
             "real",
-            make_builtin_function_with_arity(
-                "real",
-                |args| match args.get(1).copied() {
-                    Some(receiver) => crate::builtins::builtin_float_dunder(&[receiver]),
-                    None => Ok(pyre_object::w_float_new(0.0)),
-                },
-                2,
-            ),
+            (|args: &[PyObjectRef]| match args.get(1).copied() {
+                Some(receiver) => crate::builtins::builtin_float_dunder(&[receiver]),
+                None => Ok(pyre_object::w_float_new(0.0)),
+            }) as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
         ),
         (
             "imag",
-            make_builtin_function_with_arity("imag", |_| Ok(pyre_object::w_float_new(0.0)), 2),
+            (|_args: &[PyObjectRef]| Ok(pyre_object::w_float_new(0.0)))
+                as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
         ),
     ] {
+        // Pin each getter as it is built. The float type stays on `_scope`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
+        let getter = make_builtin_function_with_arity(name, getter_fn, 2);
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         crate::type_dict_store(
-            float_type,
+            pyre_object::gc_roots::shadow_stack_get(float_type_slot),
             name,
             make_getset_property_full(
-                getter,
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
-                float_type,
+                pyre_object::gc_roots::shadow_stack_get(float_type_slot),
                 Some(name),
             ),
         );
@@ -2701,18 +2742,21 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
         }
         let _entry_roots = pyre_object::gc_roots::push_roots();
         let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-        let descr = pyre_object::gc_roots::pin_root(descr);
+        let _ = pyre_object::gc_roots::pin_root(descr);
         let w_type = pyre_object::gc_roots::shadow_stack_get(ns_slot + 1);
-        let bound = copy_for_type(descr, w_type);
+        let bound = copy_for_type(pyre_object::gc_roots::shadow_stack_get(descr_slot), w_type);
         if std::ptr::eq(bound, pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
             continue;
         }
-        let bound = pyre_object::gc_roots::pin_root(bound);
-        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        let bound_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _bound = pyre_object::gc_roots::pin_root(bound);
         let key = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2);
         if let Some(text) = pyre_object::w_str_get_value_opt(key) {
             let text = text.to_owned();
-            pyre_object::w_dict_setitem_str_no_proxy(ns, &text, bound);
+            // `copy_for_type` may return a fresh descriptor. The pin above
+            // keeps it across this copy; setitem reads the live word.
+            let bound = pyre_object::gc_roots::shadow_stack_get(bound_slot);
+            crate::__pyre_put_new!(ns_slot, &text, bound);
         }
     }
 }
@@ -2775,14 +2819,19 @@ pub(crate) fn init_builtin_typeobject(
     ns: PyObjectRef,
     w_metatype: PyObjectRef,
 ) -> PyObjectRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let save_point = pyre_object::gc_roots::pin_roots(&[bases, ns, w_metatype]);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    // One livevar set: the already-built type identity plus the three
+    // `W_TypeObject.__init__` operands. Sequential `pin_root(ns)` would
+    // query before `bases` / `w_metatype` were visible
+    // (`ShadowStackFrameworkGCTransformer.push_roots`).
+    let save_point = pyre_object::gc_roots::pin_roots(&[type_obj, bases, ns, w_metatype]);
+    let ns_slot = save_point + 2;
     unsafe {
         pyre_object::w_type_init_builtin(
-            type_obj,
-            name,
             pyre_object::gc_roots::shadow_stack_get(save_point),
-            pyre_object::gc_roots::shadow_stack_get(save_point + 1) as pyre_object::gc_hook::GCREF,
+            name,
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+            pyre_object::gc_roots::shadow_stack_get(ns_slot) as pyre_object::gc_hook::GCREF,
         );
     }
     // `typeobject.py ensure_common_attributes` runs for every PyPy TypeDef,
@@ -2790,35 +2839,52 @@ pub(crate) fn init_builtin_typeobject(
     // the same common preparation at the single builtin construction point:
     // every type owns a `__doc__` entry, and `ensure_hash` prevents a type
     // defining equality from silently inheriting an unrelated hash.
-    let ns = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
     unsafe {
-        if pyre_object::w_dict_getitem_str(ns, "__doc__").is_none() {
+        if pyre_object::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "__doc__",
+        )
+        .is_none()
+        {
             // `ensure_common_attributes`: `dict_w.setdefault('__doc__', w_self.w_doc)`.
-            let w_doc = pyre_object::w_type_get_w_doc(type_obj);
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            let w_doc =
+                pyre_object::w_type_get_w_doc(pyre_object::gc_roots::shadow_stack_get(save_point));
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__doc__",
                 if w_doc.is_null() {
                     pyre_object::w_none()
                 } else {
                     w_doc
-                },
+                }
             );
         }
-        let ns = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
-        if pyre_object::w_dict_getitem_str(ns, "__eq__").is_some()
-            && pyre_object::w_dict_getitem_str(ns, "__hash__").is_none()
+        if pyre_object::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "__eq__",
+        )
+        .is_some()
+            && pyre_object::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                "__hash__",
+            )
+            .is_none()
         {
-            pyre_object::w_dict_setitem_str_no_proxy(ns, "__hash__", pyre_object::w_none());
+            crate::__pyre_put_new!(ns_slot, "__hash__", pyre_object::w_none());
         }
     }
-    let w_metatype = pyre_object::gc_roots::shadow_stack_get(save_point + 2);
+    let w_metatype = pyre_object::gc_roots::shadow_stack_get(save_point + 3);
     let w_metatype = match w_metatype.is_null() {
         true => w_type(),
         false => w_metatype,
     };
-    unsafe { store_subclass_tag(type_obj, w_metatype) };
-    type_obj
+    unsafe {
+        store_subclass_tag(
+            pyre_object::gc_roots::shadow_stack_get(save_point),
+            w_metatype,
+        )
+    };
+    pyre_object::gc_roots::shadow_stack_get(save_point)
 }
 
 /// Create the root `object` type. MRO = [object].
@@ -3308,10 +3374,11 @@ fn new_typeobject_with_metatype_and_layout(
     method_descriptor: bool,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
+    let param_base = pyre_object::gc_roots::pin_roots(&[base, w_metatype]);
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new_nonmoving();
-    let ns = pyre_object::gc_roots::pin_root(ns);
-    init(ns);
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    init(pyre_object::gc_roots::shadow_stack_get(ns_slot));
     // `type_ready_set_dict` — a type whose `tp_name` is qualified publishes the
     // leading component as a `__module__` entry, so
     // `array.array.__dict__["__module__"] == "array"`.  An unqualified name
@@ -3336,8 +3403,8 @@ fn new_typeobject_with_metatype_and_layout(
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(module));
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 "__module__",
                 pyre_object::gc_roots::shadow_stack_get(module_slot),
             )
@@ -3349,7 +3416,7 @@ fn new_typeobject_with_metatype_and_layout(
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         unsafe { stamp_method_owners(ns, owner) };
     }
-    let bases = w_tuple_new(vec![base]);
+    let bases = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(param_base)]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     // The type object it allocates is what the namespace has to survive: the
     // word handed over is stored in the new type, but this frame's copy is
@@ -3359,10 +3426,10 @@ fn new_typeobject_with_metatype_and_layout(
         bases,
         ns as pyre_object::gc_hook::GCREF,
         layout_pytype,
-        w_metatype,
+        pyre_object::gc_roots::shadow_stack_get(param_base + 1),
     );
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    let type_obj = pyre_object::gc_roots::pin_root(type_obj);
+    let _ = pyre_object::gc_roots::pin_root(type_obj);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     // typeobject.py setup_builtin_type:
@@ -3371,7 +3438,8 @@ fn new_typeobject_with_metatype_and_layout(
     //       return parent_layout      ← reuse
     //   return Layout(instancetypedef, 0, base_layout=parent_layout)
     unsafe {
-        let parent_layout = pyre_object::w_type_get_layout_ptr(base);
+        let parent_layout =
+            pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(param_base));
         let has_dict = pyre_object::w_dict_getitem_str(ns, "__dict__").is_some();
         let has_weakref = pyre_object::w_dict_getitem_str(ns, "__weakref__").is_some();
         let typedef = if overridetypedef.is_null() {
@@ -3403,7 +3471,9 @@ fn new_typeobject_with_metatype_and_layout(
             // base's layout plus that slot rather than an instance layout of
             // its own -- everything else is inherited, not re-derived from
             // the namespace.
-            match crate::type_methods::base_owes_dict_backing(base) {
+            match crate::type_methods::base_owes_dict_backing(
+                pyre_object::gc_roots::shadow_stack_get(param_base),
+            ) {
                 false => parent_layout,
                 true => pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
                     typedef: (*parent_layout).typedef,
@@ -3422,30 +3492,41 @@ fn new_typeobject_with_metatype_and_layout(
                 dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             })
         };
-        pyre_object::w_type_set_layout(type_obj, layout);
+        pyre_object::w_type_set_layout(pyre_object::gc_roots::shadow_stack_get(type_slot), layout);
         // typedef.py:39-41: inherit from bases
-        let base_hasdict = pyre_object::w_type_get_hasdict(base);
-        let base_weakrefable = pyre_object::w_type_get_weakrefable(base);
-        pyre_object::w_type_set_hasdict(type_obj, has_dict || base_hasdict);
-        pyre_object::w_type_set_weakrefable(type_obj, has_weakref || base_weakrefable);
+        let base_hasdict =
+            pyre_object::w_type_get_hasdict(pyre_object::gc_roots::shadow_stack_get(param_base));
+        let base_weakrefable = pyre_object::w_type_get_weakrefable(
+            pyre_object::gc_roots::shadow_stack_get(param_base),
+        );
+        pyre_object::w_type_set_hasdict(
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            has_dict || base_hasdict,
+        );
+        pyre_object::w_type_set_weakrefable(
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            has_weakref || base_weakrefable,
+        );
     }
 
     // MRO = [self] + base_mro
-    let base_mro = unsafe { w_type_get_mro(base) };
-    let mut mro = vec![type_obj];
+    let base_mro = unsafe { w_type_get_mro(pyre_object::gc_roots::shadow_stack_get(param_base)) };
+    let mut mro = vec![pyre_object::gc_roots::shadow_stack_get(type_slot)];
     if !base_mro.is_null() {
         mro.extend_from_slice(unsafe { (*base_mro).as_slice() });
     } else {
-        mro.push(base);
+        mro.push(pyre_object::gc_roots::shadow_stack_get(param_base));
     }
-    unsafe { w_type_set_mro(type_obj, mro) };
+    unsafe { w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(type_slot), mro) };
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    unsafe { stamp_new_descr_self(ns, type_obj) };
+    unsafe { stamp_new_descr_self(ns, pyre_object::gc_roots::shadow_stack_get(type_slot)) };
     // `typeobject.py TypeCache.ready(w_type)` runs `w_type.ready()`
     // for every builtin typedef the space cache builds, exactly as
     // `_type_new` (typeobject.py:970) does for a heap type — so a builtin
     // shows up in `base.__subclasses__()` too.
-    unsafe { pyre_object::typeobject::w_type_ready(type_obj) };
+    unsafe {
+        pyre_object::typeobject::w_type_ready(pyre_object::gc_roots::shadow_stack_get(type_slot))
+    };
     pyre_object::gc_roots::shadow_stack_get(type_slot)
 }
 
@@ -4398,28 +4479,27 @@ fn module_annotate_del(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `module.py Module.typedef` — wire `__new__` / `__init__` so
 /// `type(m)(name)` builds a real module.  `module` defines its own
 /// `tp_new`, so `module.__new__ is not object.__new__`.
-fn init_module_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr_with_doc(
-                module_descr_new,
-                "Create and return a new object.  See help(type) for accurate signature.",
-            ),
+fn init_module_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
+        ns,
+        "__new__",
+        make_new_descr_with_doc(
+            module_descr_new,
+            "Create and return a new object.  See help(type) for accurate signature.",
         )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    );
+    crate::__pyre_store!(
+        ns,
+        "__init__",
+        crate::gateway::make_builtin_function_with_doc(
             "__init__",
-            crate::gateway::make_builtin_function_with_doc(
-                "__init__",
-                module_descr_init,
-                "Initialize self.  See help(type(self)) for accurate signature.",
-            ),
+            module_descr_init,
+            "Initialize self.  See help(type(self)) for accurate signature.",
         )
-    };
+    );
     for (name, function, arity, doc) in [
         (
             "__repr__",
@@ -4440,61 +4520,67 @@ fn init_module_type(ns: PyObjectRef) {
             "__dir__() -> list\nspecialized dir() implementation",
         ),
     ] {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                crate::gateway::make_builtin_function_with_arity_and_doc(
-                    name, function, arity, doc,
-                ),
-            )
-        };
-    }
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+        crate::__pyre_store!(
             ns,
-            "__dict__",
-            pyre_object::w_member_new_direct(
-                pyre_object::MEMBER_MODULE_DICT,
-                "__dict__".to_owned(),
-                pyre_object::PY_NULL,
-            ),
+            name,
+            crate::gateway::make_builtin_function_with_arity_and_doc(name, function, arity, doc)
+        );
+    }
+    crate::__pyre_store!(
+        ns,
+        "__dict__",
+        pyre_object::w_member_new_direct(
+            pyre_object::MEMBER_MODULE_DICT,
+            "__dict__".to_owned(),
+            pyre_object::PY_NULL,
         )
-    };
+    );
     // `Module.typedef` places the public type doc after `__dict__` and
     // before the annotations descriptor. Keep that structural order while
     // using the 3.14 wording (which omits PyPy's signature preamble).
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__doc__",
-            pyre_object::w_str_new(
-                "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type.",
-            ),
+    crate::__pyre_store!(
+        ns,
+        "__doc__",
+        pyre_object::w_str_new(
+            "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type.",
         )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__annotations__",
-            make_getset_property(
-                make_builtin_function_with_arity("__annotations__", module_annotations_get, 2),
-                make_builtin_function_with_arity("__annotations__", module_annotations_set, 3),
-                make_builtin_function_with_arity("__annotations__", module_annotations_del, 2),
-            ),
+    );
+    let ann_get = make_builtin_function_with_arity("__annotations__", module_annotations_get, 2);
+    let ann_get_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ann_get);
+    let ann_set = make_builtin_function_with_arity("__annotations__", module_annotations_set, 3);
+    let ann_set_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ann_set);
+    let ann_del = make_builtin_function_with_arity("__annotations__", module_annotations_del, 2);
+    let ann_del_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ann_del);
+    crate::__pyre_store!(
+        ns,
+        "__annotations__",
+        make_getset_property(
+            pyre_object::gc_roots::shadow_stack_get(ann_get_slot),
+            pyre_object::gc_roots::shadow_stack_get(ann_set_slot),
+            pyre_object::gc_roots::shadow_stack_get(ann_del_slot)
         )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__annotate__",
-            make_getset_property(
-                make_builtin_function_with_arity("__annotate__", module_annotate_get, 2),
-                make_builtin_function_with_arity("__annotate__", module_annotate_set, 3),
-                make_builtin_function_with_arity("__annotate__", module_annotate_del, 2),
-            ),
+    );
+    let annotate_get = make_builtin_function_with_arity("__annotate__", module_annotate_get, 2);
+    let annotate_get_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_get);
+    let annotate_set = make_builtin_function_with_arity("__annotate__", module_annotate_set, 3);
+    let annotate_set_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_set);
+    let annotate_del = make_builtin_function_with_arity("__annotate__", module_annotate_del, 2);
+    let annotate_del_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_del);
+    crate::__pyre_store!(
+        ns,
+        "__annotate__",
+        make_getset_property(
+            pyre_object::gc_roots::shadow_stack_get(annotate_get_slot),
+            pyre_object::gc_roots::shadow_stack_get(annotate_set_slot),
+            pyre_object::gc_roots::shadow_stack_get(annotate_del_slot)
         )
-    };
+    );
     // PyPy `Module.typedef` supplies these Function carriers and their
     // registration order. [3.14-spec] Attach the measured Argument Clinic
     // signatures through the same Function.w_text_signature field.
@@ -4505,8 +4591,10 @@ fn init_module_type(ns: PyObjectRef) {
         ("__getattribute__", "($self, name, /)"),
         ("__dir__", "($self, /)"),
     ] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("module TypeDef callable was just installed");
+        let function = unsafe {
+            pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), name)
+        }
+        .expect("module TypeDef callable was just installed");
         let roots = pyre_object::gc_roots::push_roots();
         let function_slot = roots.base();
         let _ = roots.pin_root(function);
@@ -4579,23 +4667,26 @@ fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 /// PyPy `pypy/interpreter/typedef.py Ellipsis.typedef`.
 fn init_ellipsis_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // Preserve the real PyPy type-dict order (`__new__`, `__repr__`,
     // `__reduce__`, `__doc__`). [3.14-spec] The carrier docs and signatures
     // below are the public values measured on CPython 3.14.2; storage remains
     // PyPy `Function.w_text_signature` / `BuiltinCode.docstring`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__new__",
             make_new_descr_with_doc(
                 ellipsis_descr_new,
                 "Create and return a new object.  See help(type) for accurate signature.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__repr__",
@@ -4611,12 +4702,12 @@ fn init_ellipsis_type(ns: PyObjectRef) {
                 },
                 1,
                 "Return repr(self).",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__reduce__",
             crate::gateway::make_method_descriptor_with_arity(
                 "__reduce__",
@@ -4631,14 +4722,14 @@ fn init_ellipsis_type(ns: PyObjectRef) {
                     Ok(w_str_new("Ellipsis"))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
-            w_str_new("The type of the Ellipsis singleton."),
+            w_str_new("The type of the Ellipsis singleton.")
         )
     };
     for (name, text_signature) in [
@@ -4646,7 +4737,11 @@ fn init_ellipsis_type(ns: PyObjectRef) {
         ("__repr__", "($self, /)"),
         ("__reduce__", "($self, /)"),
     ] {
-        set_type_callable_text_signature(ns, name, text_signature);
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -4667,22 +4762,25 @@ fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// PyPy `pypy/interpreter/typedef.py NotImplemented.typedef`.
 fn init_notimplemented_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // Preserve real PyPy's shared order (`__new__`, `__repr__`, `__reduce__`,
     // `__bool__`, `__doc__`). [3.14-spec] Only the measured CPython 3.14.2
     // docs/signatures and the hard boolean-context TypeError differ.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__new__",
             make_new_descr_with_doc(
                 notimplemented_descr_new,
                 "Create and return a new object.  See help(type) for accurate signature.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__repr__",
@@ -4698,12 +4796,12 @@ fn init_notimplemented_type(ns: PyObjectRef) {
                 },
                 1,
                 "Return repr(self).",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__reduce__",
             crate::gateway::make_method_descriptor_with_arity(
                 "__reduce__",
@@ -4718,14 +4816,14 @@ fn init_notimplemented_type(ns: PyObjectRef) {
                     Ok(w_str_new("NotImplemented"))
                 },
                 1,
-            ),
+            )
         )
     };
     // Python 3.14 changed the older PyPy/3.11 deprecation warning into a hard
     // TypeError.  3.14 is pyre's language-version oracle.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__bool__",
             crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__bool__",
@@ -4743,14 +4841,14 @@ fn init_notimplemented_type(ns: PyObjectRef) {
                 },
                 1,
                 "True if self else False",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
-            w_str_new("The type of the NotImplemented singleton."),
+            w_str_new("The type of the NotImplemented singleton.")
         )
     };
     for (name, text_signature) in [
@@ -4759,7 +4857,11 @@ fn init_notimplemented_type(ns: PyObjectRef) {
         ("__reduce__", "($self, /)"),
         ("__bool__", "($self, /)"),
     ] {
-        set_type_callable_text_signature(ns, name, text_signature);
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -4801,6 +4903,9 @@ fn none_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn init_none_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // Preserve `W_NoneObject.typedef`'s shared order (`__new__`, `__bool__`,
     // `__repr__`, then `__doc__` after the 3.14-only rich-comparison slots).
     // [3.14-spec] The extra slots and their public docs/signatures are the
@@ -4889,7 +4994,7 @@ fn init_none_type(ns: PyObjectRef) {
         ),
     ];
     for (name, value) in entries {
-        unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
+        unsafe { crate::__pyre_put_new!(ns_slot, name, value) };
     }
     for (name, function, doc) in [
         ("__lt__", none_lt as DunderFn, "Return self<value."),
@@ -4899,17 +5004,17 @@ fn init_none_type(ns: PyObjectRef) {
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str(
-                ns,
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 name,
                 crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, 2, doc),
             )
         };
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
-            w_str_new("The type of the None singleton."),
+            w_str_new("The type of the None singleton.")
         )
     };
     for (name, text_signature) in [
@@ -4924,7 +5029,11 @@ fn init_none_type(ns: PyObjectRef) {
         ("__gt__", "($self, value, /)"),
         ("__ge__", "($self, value, /)"),
     ] {
-        set_type_callable_text_signature(ns, name, text_signature);
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -5756,9 +5865,12 @@ fn super_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// PyPy `descriptor.py W_Super.typedef`, with Python 3.14's zero-argument
 /// documentation and concrete type surface.
 fn init_super_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
         pyre_object::w_dict_setitem_str(
-            ns,
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
             "__doc__",
             w_str_new(
                 "super() -> same as super(__class__, <first argument>)\n\
@@ -5818,7 +5930,7 @@ fn init_super_type(ns: PyObjectRef) {
             ),
         ),
     ] {
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+        unsafe { crate::__pyre_put_new!(ns_slot, name, value) };
     }
     for (name, kind, doc) in [
         (
@@ -5838,15 +5950,15 @@ fn init_super_type(ns: PyObjectRef) {
         ),
     ] {
         unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
                 pyre_object::w_member_new_direct_with_doc(
                     kind,
                     name.to_owned(),
                     doc.to_owned(),
                     PY_NULL,
-                ),
+                )
             )
         };
     }
@@ -5947,9 +6059,12 @@ fn make_range_method(
 
 /// PyPy `functional.py W_Range.typedef`, kept in the same entry order.
 fn init_range_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
         pyre_object::w_dict_setitem_str(
-            ns,
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
             "__doc__",
             w_str_new(
                 "range(stop) -> range object\n\
@@ -6068,7 +6183,7 @@ fn init_range_type(ns: PyObjectRef) {
         ),
     ];
     for (name, value) in entries {
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+        unsafe { crate::__pyre_put_new!(ns_slot, name, value) };
     }
     for (name, kind) in [
         ("start", pyre_object::MEMBER_RANGE_START),
@@ -6076,17 +6191,13 @@ fn init_range_type(ns: PyObjectRef) {
         ("step", pyre_object::MEMBER_RANGE_STEP),
     ] {
         unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                pyre_object::w_member_new_direct(kind, name.to_owned(), PY_NULL),
+                pyre_object::w_member_new_direct(kind, name.to_owned(), PY_NULL)
             )
         };
     }
-}
-
-fn install_functional_entry(ns: PyObjectRef, name: &'static str, value: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
 }
 
 /// CPython 3.14's Argument Clinic signature shared by the functional iterator
@@ -6117,39 +6228,41 @@ fn make_functional_method(name: &'static str, function: DunderFn, arity: u16) ->
 }
 
 /// PyPy `functional.py W_Enumerate.typedef`.
-fn init_enumerate_type(ns: PyObjectRef) {
-    install_functional_entry(
+fn init_enumerate_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
         ns,
         "__doc__",
         w_str_new(
             "Return an enumerate object.\n\n  iterable\n    an object supporting iteration\n\nThe enumerate object yields pairs containing a count (from start, which\ndefaults to zero) and a value yielded by the iterable argument.\n\nenumerate is useful for obtaining an indexed list:\n    (0, seq[0]), (1, seq[1]), (2, seq[2]), ...",
-        ),
+        )
     );
-    install_functional_entry(
+    crate::__pyre_store!(
         ns,
         "__new__",
-        make_functional_new_descr(enumerate_descr_new),
+        make_functional_new_descr(enumerate_descr_new)
     );
-    install_functional_entry(
+    crate::__pyre_store!(
         ns,
         "__iter__",
-        make_functional_method("__iter__", crate::baseobjspace::enumerate_iter_method, 1),
+        make_functional_method("__iter__", crate::baseobjspace::enumerate_iter_method, 1)
     );
-    install_functional_entry(
+    crate::__pyre_store!(
         ns,
         "__next__",
-        make_functional_method("__next__", crate::baseobjspace::enumerate_next_method, 1),
+        make_functional_method("__next__", crate::baseobjspace::enumerate_next_method, 1)
     );
-    install_functional_entry(
+    crate::__pyre_store!(
         ns,
         "__reduce__",
         make_functional_method(
             "__reduce__",
             crate::baseobjspace::enumerate_reduce_method,
             1,
-        ),
+        )
     );
-    install_functional_entry(
+    crate::__pyre_store!(
         ns,
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(
@@ -6159,18 +6272,20 @@ fn init_enumerate_type(ns: PyObjectRef) {
                 2,
                 "($type, object, /)",
             ),
-        ),
+        )
     );
 }
 
 /// PyPy `functional.py W_ReversedIterator.typedef`.
-fn init_reversed_type(ns: PyObjectRef) {
-    install_functional_entry(
+fn init_reversed_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
         ns,
         "__doc__",
-        w_str_new("Return a reverse iterator over the values of the given sequence."),
+        w_str_new("Return a reverse iterator over the values of the given sequence.")
     );
-    install_functional_entry(ns, "__new__", make_functional_new_descr(reversed_descr_new));
+    crate::__pyre_store!(ns, "__new__", make_functional_new_descr(reversed_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -6190,20 +6305,22 @@ fn init_reversed_type(ns: PyObjectRef) {
             2,
         ),
     ] {
-        install_functional_entry(ns, name, make_functional_method(name, function, arity));
+        crate::__pyre_store!(ns, name, make_functional_method(name, function, arity));
     }
 }
 
 /// PyPy `functional.py W_Map.typedef`, plus Python 3.14's exposed state slot.
-fn init_map_type(ns: PyObjectRef) {
-    install_functional_entry(
+fn init_map_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
         ns,
         "__doc__",
         w_str_new(
             "map(func, *iterables) --> map object\n\nMake an iterator that computes the function using arguments from\neach of the iterables.  Stops when the shortest iterable is exhausted.",
-        ),
+        )
     );
-    install_functional_entry(ns, "__new__", make_functional_new_descr(map_descr_new));
+    crate::__pyre_store!(ns, "__new__", make_functional_new_descr(map_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -6214,20 +6331,22 @@ fn init_map_type(ns: PyObjectRef) {
         ("__reduce__", crate::baseobjspace::map_reduce_method, 1),
         ("__setstate__", crate::baseobjspace::map_setstate_method, 2),
     ] {
-        install_functional_entry(ns, name, make_functional_method(name, function, arity));
+        crate::__pyre_store!(ns, name, make_functional_method(name, function, arity));
     }
 }
 
 /// PyPy `functional.py W_Filter.typedef`.
-fn init_filter_type(ns: PyObjectRef) {
-    install_functional_entry(
+fn init_filter_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
         ns,
         "__doc__",
         w_str_new(
             "filter(function or None, iterable) --> filter object\n\nReturn an iterator yielding those items of iterable for which function(item)\nis true. If function is None, return the items that are true.",
-        ),
+        )
     );
-    install_functional_entry(ns, "__new__", make_functional_new_descr(filter_descr_new));
+    crate::__pyre_store!(ns, "__new__", make_functional_new_descr(filter_descr_new));
     for (name, function) in [
         (
             "__iter__",
@@ -6236,20 +6355,22 @@ fn init_filter_type(ns: PyObjectRef) {
         ("__next__", crate::baseobjspace::filter_next_method),
         ("__reduce__", crate::baseobjspace::filter_reduce_method),
     ] {
-        install_functional_entry(ns, name, make_functional_method(name, function, 1));
+        crate::__pyre_store!(ns, name, make_functional_method(name, function, 1));
     }
 }
 
 /// PyPy `functional.py W_Zip.typedef`.
-fn init_zip_type(ns: PyObjectRef) {
-    install_functional_entry(
+fn init_zip_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
         ns,
         "__doc__",
         w_str_new(
             "zip(*iterables) --> A zip object yielding tuples until an input is exhausted.\n\nThe zip object yields n-length tuples, where n is the number of iterables\npassed as positional arguments to zip().  The i-th element in every tuple\ncomes from the i-th iterable argument to zip().  This continues until the\nshortest argument is exhausted.",
-        ),
+        )
     );
-    install_functional_entry(ns, "__new__", make_functional_new_descr(zip_descr_new));
+    crate::__pyre_store!(ns, "__new__", make_functional_new_descr(zip_descr_new));
     for (name, function, arity) in [
         (
             "__iter__",
@@ -6260,7 +6381,7 @@ fn init_zip_type(ns: PyObjectRef) {
         ("__reduce__", crate::baseobjspace::zip_reduce_method, 1),
         ("__setstate__", crate::baseobjspace::zip_setstate_method, 2),
     ] {
-        install_functional_entry(ns, name, make_functional_method(name, function, arity));
+        crate::__pyre_store!(ns, name, make_functional_method(name, function, arity));
     }
 }
 
@@ -6931,40 +7052,43 @@ fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 fn init_list_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // listobject.py W_ListObject.typedef, kept in source order.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
             w_str_new(
                 "Built-in mutable sequence.\n\nIf no argument is given, the constructor creates a new empty list.\nThe argument must be an iterable if specified.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__new__",
             make_new_descr_with_doc(
                 __majit_wrap_list_descr_new,
                 "Create and return a new object.  See help(type) for accurate signature.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__init__",
             crate::gateway::make_builtin_function_with_doc(
                 "__init__",
                 __majit_wrap_list_descr_init,
                 "Initialize self.  See help(type(self)) for accurate signature.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -6975,27 +7099,27 @@ fn init_list_type(ns: PyObjectRef) {
                     }))
                 },
                 1,
-            ),
+            )
         )
     };
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none()) };
+    unsafe { crate::__pyre_put_new!(ns_slot, "__hash__", w_none()) };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__sizeof__",
             crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__sizeof__",
                 list_descr_sizeof,
                 1,
                 "($self, /)",
-            ),
+            )
         )
     };
     // listobject.py:2486 __class_getitem__ = interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__class_getitem__",
             pyre_object::function::w_classmethod_new(
                 crate::gateway::make_builtin_function_with_arity_and_text_signature(
@@ -7004,66 +7128,66 @@ fn init_list_type(ns: PyObjectRef) {
                     2,
                     "($type, object, /)",
                 ),
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "append",
             crate::gateway::make_method_descriptor_with_arity_and_doc(
                 "append",
                 __majit_wrap_list_descr_append,
                 2,
                 "Append object to the end of the list.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "extend",
-            make_builtin_function_with_arity("extend", __majit_wrap_list_descr_extend, 2),
+            make_builtin_function_with_arity("extend", __majit_wrap_list_descr_extend, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "copy",
-            make_builtin_function_with_arity("copy", crate::type_methods::descr_copy, 1),
+            make_builtin_function_with_arity("copy", crate::type_methods::descr_copy, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "insert",
-            make_builtin_function_with_arity("insert", crate::type_methods::descr_insert, 3),
+            make_builtin_function_with_arity("insert", crate::type_methods::descr_insert, 3)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "pop",
-            make_builtin_function("pop", __majit_wrap_list_descr_pop),
+            make_builtin_function("pop", __majit_wrap_list_descr_pop)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "clear",
-            make_builtin_function_with_arity("clear", crate::type_methods::descr_clear, 1),
+            make_builtin_function_with_arity("clear", crate::type_methods::descr_clear, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "reverse",
-            make_builtin_function_with_arity("reverse", crate::type_methods::descr_reverse, 1),
+            make_builtin_function_with_arity("reverse", crate::type_methods::descr_reverse, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "sort",
             crate::gateway::make_builtin_function_with_text_signature_and_sig(
                 "sort",
@@ -7076,28 +7200,28 @@ fn init_list_type(ns: PyObjectRef) {
                     2,
                     1,
                 )),
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "index",
-            make_builtin_function("index", crate::type_methods::list_method_index),
+            make_builtin_function("index", crate::type_methods::list_method_index)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "count",
-            make_builtin_function_with_arity("count", crate::type_methods::list_method_count, 2),
+            make_builtin_function_with_arity("count", crate::type_methods::list_method_count, 2,)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "remove",
-            make_builtin_function_with_arity("remove", crate::type_methods::descr_remove, 2),
+            make_builtin_function_with_arity("remove", crate::type_methods::descr_remove, 2)
         )
     };
     // Container slots exposed as callable dunders.  `__getitem__` binds the
@@ -7105,8 +7229,8 @@ fn init_list_type(ns: PyObjectRef) {
     // subclass override's `super().__getitem__` reaches the inherited builtin
     // subscript instead of re-entering override dispatch.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getitem__",
             make_builtin_function_with_arity(
                 "__getitem__",
@@ -7116,12 +7240,12 @@ fn init_list_type(ns: PyObjectRef) {
                     crate::baseobjspace::getitem_slot(args[0], args[1])
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__setitem__",
             make_builtin_function_with_arity(
                 "__setitem__",
@@ -7132,12 +7256,12 @@ fn init_list_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_none())
                 },
                 3,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__delitem__",
             make_builtin_function_with_arity(
                 "__delitem__",
@@ -7148,19 +7272,19 @@ fn init_list_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__len__",
-            make_builtin_function_with_arity("__len__", __majit_wrap_list_descr_len, 1),
+            make_builtin_function_with_arity("__len__", __majit_wrap_list_descr_len, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__contains__",
             make_builtin_function_with_arity(
                 "__contains__",
@@ -7171,12 +7295,12 @@ fn init_list_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_bool_from(found))
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__iter__",
             // Build the storage iterator directly rather than re-entering
             // `space.iter()` — a `list` subclass that calls `super().__iter__()`
@@ -7189,12 +7313,12 @@ fn init_list_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_list_iter_new(obj))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__reversed__",
             make_builtin_function_with_arity(
                 "__reversed__",
@@ -7214,7 +7338,7 @@ fn init_list_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_list_reverse_iter_new(obj, n - 1))
                 },
                 1,
-            ),
+            )
         )
     };
     // Arithmetic slots.  `listobject.py descr_add` returns NotImplemented
@@ -7222,8 +7346,8 @@ fn init_list_type(ns: PyObjectRef) {
     // a generic "unsupported operand type(s)" TypeError is raised);
     // `list_repeat` requires an integer count.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__add__",
             crate::make_slot_wrapper_with_arity(
                 "__add__",
@@ -7237,26 +7361,26 @@ fn init_list_type(ns: PyObjectRef) {
                     }
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__mul__",
-            make_builtin_function_with_arity("__mul__", list_descr_mul, 2),
+            make_builtin_function_with_arity("__mul__", list_descr_mul, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__rmul__",
-            make_builtin_function_with_arity("__rmul__", list_descr_rmul, 2),
+            make_builtin_function_with_arity("__rmul__", list_descr_rmul, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__iadd__",
             make_builtin_function_with_arity(
                 "__iadd__",
@@ -7286,12 +7410,12 @@ fn init_list_type(ns: PyObjectRef) {
                     Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__imul__",
             make_builtin_function_with_arity(
                 "__imul__",
@@ -7317,7 +7441,7 @@ fn init_list_type(ns: PyObjectRef) {
                     Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 2,
-            ),
+            )
         )
     };
     for (name, func) in [
@@ -7329,10 +7453,10 @@ fn init_list_type(ns: PyObjectRef) {
         ("__ge__", list_dunder_ge),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, func, 2),
+                make_builtin_function_with_arity(name, func, 2)
             )
         };
     }
@@ -7374,9 +7498,11 @@ fn init_list_type(ns: PyObjectRef) {
         ("reverse", "($self, /)"),
         ("sort", "($self, /, *, key=None, reverse=False)"),
     ] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("list TypeDef callable was just installed");
-        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -7451,9 +7577,12 @@ fn str_descr_rmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn init_str_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
             w_str_new(
                 "str(object='') -> str\n\
@@ -7465,22 +7594,16 @@ fn init_str_type(ns: PyObjectRef) {
                  or repr(object).\n\
                  encoding defaults to 'utf-8'.\n\
                  errors defaults to 'strict'.",
-            ),
+            )
         )
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(str_descr_new),
-        )
-    };
+    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr(str_descr_new)) };
     // unicodeobject.py descr_repr / descr_str.  descr_str returns an
     // exact base str for a subtype, which is required by enum.StrEnum's
     // inherited `str.__str__`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -7491,12 +7614,12 @@ fn init_str_type(ns: PyObjectRef) {
                     ))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__str__",
             make_builtin_function_with_arity(
                 "__str__",
@@ -7512,23 +7635,23 @@ fn init_str_type(ns: PyObjectRef) {
                     }
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
                 |args| Ok(w_int_new(crate::builtins::hash_value(args[0]))),
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__sizeof__",
             crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__sizeof__",
@@ -7568,443 +7691,443 @@ fn init_str_type(ns: PyObjectRef) {
                 },
                 1,
                 "($self, /)",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__format__",
             make_builtin_function_with_arity(
                 "__format__",
                 crate::type_methods::builtin_value_format,
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "join",
             crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "join",
                 crate::type_methods::str_method_join,
                 2,
                 "($self, iterable, /)",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "split",
-            make_builtin_function("split", crate::type_methods::str_method_split),
+            make_builtin_function("split", crate::type_methods::str_method_split)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "rsplit",
-            make_builtin_function("rsplit", crate::type_methods::str_method_rsplit),
+            make_builtin_function("rsplit", crate::type_methods::str_method_rsplit)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "splitlines",
-            make_builtin_function("splitlines", crate::type_methods::str_method_splitlines),
+            make_builtin_function("splitlines", crate::type_methods::str_method_splitlines)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "partition",
-            make_builtin_function("partition", crate::type_methods::descr_partition),
+            make_builtin_function("partition", crate::type_methods::descr_partition)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "rpartition",
-            make_builtin_function("rpartition", crate::type_methods::descr_rpartition),
+            make_builtin_function("rpartition", crate::type_methods::descr_rpartition)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "zfill",
-            make_builtin_function("zfill", crate::type_methods::str_method_zfill),
+            make_builtin_function("zfill", crate::type_methods::str_method_zfill)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "casefold",
-            make_builtin_function("casefold", crate::type_methods::str_method_casefold),
+            make_builtin_function("casefold", crate::type_methods::str_method_casefold)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "swapcase",
-            make_builtin_function("swapcase", crate::type_methods::descr_swapcase),
+            make_builtin_function("swapcase", crate::type_methods::descr_swapcase)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "expandtabs",
-            make_builtin_function("expandtabs", crate::type_methods::descr_expandtabs),
+            make_builtin_function("expandtabs", crate::type_methods::descr_expandtabs)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "format_map",
-            make_builtin_function("format_map", crate::type_methods::descr_format_map),
+            make_builtin_function("format_map", crate::type_methods::descr_format_map)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "strip",
-            make_builtin_function("strip", crate::type_methods::str_method_strip),
+            make_builtin_function("strip", crate::type_methods::str_method_strip)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "lstrip",
-            make_builtin_function("lstrip", crate::type_methods::str_method_lstrip),
+            make_builtin_function("lstrip", crate::type_methods::str_method_lstrip)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "rstrip",
-            make_builtin_function("rstrip", crate::type_methods::str_method_rstrip),
+            make_builtin_function("rstrip", crate::type_methods::str_method_rstrip)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "startswith",
             make_builtin_function(
                 "startswith",
                 crate::type_methods::__majit_wrap_str_descr_startswith,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "endswith",
             make_builtin_function(
                 "endswith",
                 crate::type_methods::__majit_wrap_str_descr_endswith,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "replace",
-            make_builtin_function("replace", crate::type_methods::str_method_replace),
+            make_builtin_function("replace", crate::type_methods::str_method_replace)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "find",
-            make_builtin_function("find", crate::type_methods::__majit_wrap_str_descr_find),
+            make_builtin_function("find", crate::type_methods::__majit_wrap_str_descr_find)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "rfind",
-            make_builtin_function("rfind", crate::type_methods::__majit_wrap_str_descr_rfind),
+            make_builtin_function("rfind", crate::type_methods::__majit_wrap_str_descr_rfind)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "rindex",
-            make_builtin_function("rindex", crate::type_methods::descr_rindex),
+            make_builtin_function("rindex", crate::type_methods::descr_rindex)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "upper",
             crate::make_method_descriptor_with_arity(
                 "upper",
                 crate::type_methods::str_method_upper,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "lower",
             crate::make_method_descriptor_with_arity(
                 "lower",
                 crate::type_methods::str_method_lower,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "format",
-            make_builtin_function("format", crate::type_methods::descr_format),
+            make_builtin_function("format", crate::type_methods::descr_format)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "encode",
-            make_builtin_function("encode", crate::type_methods::str_method_encode),
+            make_builtin_function("encode", crate::type_methods::str_method_encode)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isdigit",
-            make_builtin_function_with_arity("isdigit", crate::type_methods::str_method_isdigit, 1),
+            make_builtin_function_with_arity("isdigit", crate::type_methods::str_method_isdigit, 1,)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isdecimal",
             make_builtin_function_with_arity(
                 "isdecimal",
                 crate::type_methods::str_method_isdecimal,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isnumeric",
             make_builtin_function_with_arity(
                 "isnumeric",
                 crate::type_methods::str_method_isnumeric,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "istitle",
-            make_builtin_function_with_arity("istitle", crate::type_methods::str_method_istitle, 1),
+            make_builtin_function_with_arity("istitle", crate::type_methods::str_method_istitle, 1,)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isalpha",
-            make_builtin_function_with_arity("isalpha", crate::type_methods::str_method_isalpha, 1),
+            make_builtin_function_with_arity("isalpha", crate::type_methods::str_method_isalpha, 1,)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isidentifier",
             make_builtin_function_with_arity(
                 "isidentifier",
                 crate::type_methods::descr_isidentifier,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "zfill",
-            make_builtin_function_with_arity("zfill", crate::type_methods::str_method_zfill, 2),
+            make_builtin_function_with_arity("zfill", crate::type_methods::str_method_zfill, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "count",
-            make_builtin_function("count", crate::type_methods::__majit_wrap_str_descr_count),
+            make_builtin_function("count", crate::type_methods::__majit_wrap_str_descr_count)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "index",
-            make_builtin_function("index", crate::type_methods::str_method_index),
+            make_builtin_function("index", crate::type_methods::str_method_index)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "title",
-            make_builtin_function_with_arity("title", crate::type_methods::descr_title, 1),
+            make_builtin_function_with_arity("title", crate::type_methods::descr_title, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "capitalize",
             make_builtin_function_with_arity(
                 "capitalize",
                 crate::type_methods::descr_capitalize,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "swapcase",
-            make_builtin_function_with_arity("swapcase", crate::type_methods::descr_swapcase, 1),
+            make_builtin_function_with_arity("swapcase", crate::type_methods::descr_swapcase, 1,)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "center",
-            make_builtin_function("center", crate::type_methods::str_method_center),
+            make_builtin_function("center", crate::type_methods::str_method_center)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "ljust",
-            make_builtin_function("ljust", crate::type_methods::descr_ljust),
+            make_builtin_function("ljust", crate::type_methods::descr_ljust)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "rjust",
-            make_builtin_function("rjust", crate::type_methods::descr_rjust),
+            make_builtin_function("rjust", crate::type_methods::descr_rjust)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isspace",
-            make_builtin_function_with_arity("isspace", crate::type_methods::descr_isspace, 1),
+            make_builtin_function_with_arity("isspace", crate::type_methods::descr_isspace, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isprintable",
             make_builtin_function_with_arity(
                 "isprintable",
                 crate::type_methods::descr_isprintable,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isupper",
-            make_builtin_function_with_arity("isupper", crate::type_methods::descr_isupper, 1),
+            make_builtin_function_with_arity("isupper", crate::type_methods::descr_isupper, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "islower",
-            make_builtin_function_with_arity("islower", crate::type_methods::descr_islower, 1),
+            make_builtin_function_with_arity("islower", crate::type_methods::descr_islower, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isalnum",
-            make_builtin_function_with_arity("isalnum", crate::type_methods::descr_isalnum, 1),
+            make_builtin_function_with_arity("isalnum", crate::type_methods::descr_isalnum, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isascii",
-            make_builtin_function_with_arity("isascii", crate::type_methods::descr_isascii, 1),
+            make_builtin_function_with_arity("isascii", crate::type_methods::descr_isascii, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "partition",
-            make_builtin_function_with_arity("partition", crate::type_methods::descr_partition, 2),
+            make_builtin_function_with_arity("partition", crate::type_methods::descr_partition, 2,)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "rpartition",
             make_builtin_function_with_arity(
                 "rpartition",
                 crate::type_methods::descr_rpartition,
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "splitlines",
-            make_builtin_function("splitlines", crate::type_methods::str_method_splitlines),
+            make_builtin_function("splitlines", crate::type_methods::str_method_splitlines)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "removeprefix",
             make_builtin_function_with_arity(
                 "removeprefix",
                 crate::type_methods::descr_removeprefix,
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "removesuffix",
             make_builtin_function_with_arity(
                 "removesuffix",
                 crate::type_methods::descr_removesuffix,
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "expandtabs",
-            make_builtin_function("expandtabs", crate::type_methods::descr_expandtabs),
+            make_builtin_function("expandtabs", crate::type_methods::descr_expandtabs)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "translate",
             make_builtin_function_with_arity(
                 "translate",
                 crate::type_methods::str_method_translate,
                 2,
-            ),
+            )
         )
     };
     // str dunder methods
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__contains__",
             make_builtin_function_with_arity(
                 "__contains__",
@@ -8015,12 +8138,12 @@ fn init_str_type(ns: PyObjectRef) {
                     ))
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__len__",
             make_builtin_function_with_arity(
                 "__len__",
@@ -8032,12 +8155,12 @@ fn init_str_type(ns: PyObjectRef) {
                     crate::baseobjspace::len_slot(args[0])
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getitem__",
             make_builtin_function_with_arity(
                 "__getitem__",
@@ -8046,12 +8169,12 @@ fn init_str_type(ns: PyObjectRef) {
                     crate::baseobjspace::getitem_slot(args[0], args[1])
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__iter__",
             make_builtin_function_with_arity(
                 "__iter__",
@@ -8062,12 +8185,12 @@ fn init_str_type(ns: PyObjectRef) {
                     crate::baseobjspace::iter(args[0])
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__add__",
             make_builtin_function_with_arity(
                 "__add__",
@@ -8087,41 +8210,41 @@ fn init_str_type(ns: PyObjectRef) {
                     }
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__mul__",
-            make_builtin_function_with_arity("__mul__", str_descr_mul, 2),
+            make_builtin_function_with_arity("__mul__", str_descr_mul, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__rmul__",
-            make_builtin_function_with_arity("__rmul__", str_descr_mul, 2),
+            make_builtin_function_with_arity("__rmul__", str_descr_mul, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__mod__",
-            make_builtin_function_with_arity("__mod__", str_descr_mod, 2),
+            make_builtin_function_with_arity("__mod__", str_descr_mod, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__rmod__",
-            make_builtin_function_with_arity("__rmod__", str_descr_rmod, 2),
+            make_builtin_function_with_arity("__rmod__", str_descr_rmod, 2)
         )
     };
     // maketrans — PyPy: unicodeobject.py descr_maketrans
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "maketrans",
             make_maketrans_descr!(
                 "str",
@@ -8187,12 +8310,13 @@ fn init_str_type(ns: PyObjectRef) {
                             // never moves, so it is not read back.
                             let _pair = pyre_object::gc_roots::push_roots();
                             let key = pyre_object::w_int_new(xc.to_u32() as i64);
-                            let key = pyre_object::gc_roots::pin_root(key);
+                            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(key);
                             let value = pyre_object::w_int_new(yc.to_u32() as i64);
                             unsafe {
                                 pyre_object::w_dict_store(
                                     pyre_object::gc_roots::shadow_stack_get(d_slot),
-                                    key,
+                                    pyre_object::gc_roots::shadow_stack_get(key_slot),
                                     value,
                                 );
                             }
@@ -8266,7 +8390,7 @@ fn init_str_type(ns: PyObjectRef) {
                     Ok(pyre_object::gc_roots::shadow_stack_get(d_slot))
                 },
                 "(x, y=<unrepresentable>, z=<unrepresentable>, /)"
-            ),
+            )
         )
     };
     for (name, func) in [
@@ -8278,18 +8402,18 @@ fn init_str_type(ns: PyObjectRef) {
         ("__ge__", str_dunder_ge),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, func, 2),
+                make_builtin_function_with_arity(name, func, 2)
             )
         };
     }
     // unicodeobject.py descr_getnewargs — `(W_UnicodeObject(self._utf8),)`:
     // a fresh plain str from the contents, so a str subclass reduces to str.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getnewargs__",
             make_builtin_function_with_arity(
                 "__getnewargs__",
@@ -8300,7 +8424,7 @@ fn init_str_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 1,
-            ),
+            )
         )
     };
     // CPython 3.14 Argument Clinic metadata for the PyPy unicode TypeDef
@@ -8376,9 +8500,11 @@ fn init_str_type(ns: PyObjectRef) {
         ("__sizeof__", "($self, /)"),
         ("__getnewargs__", "($self, /)"),
     ] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("str TypeDef callable was just installed");
-        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -8390,7 +8516,13 @@ fn dict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     crate::type_methods::arity_no_args(args, "__sizeof__")?;
 
     let receiver = args[0];
-    let dict = crate::type_methods::resolve_dict_backing(receiver);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let receiver_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(receiver);
+    let dict = crate::type_methods::resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(
+        receiver_slot,
+    ));
+    let receiver = pyre_object::gc_roots::shadow_stack_get(receiver_slot);
     debug_assert!(!dict.is_null());
     let w_type = crate::typedef::r#type(receiver)
         .expect("every dict has a type")
@@ -8462,9 +8594,14 @@ fn dict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// are rooted before the first store of their round.
 fn dict_or_new(base: PyObjectRef, overlay: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
+    let src_base = pyre_object::gc_roots::pin_roots(&[base, overlay]);
     let dst_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
-    for source in [base, overlay] {
+    for source_offset in [0usize, 1] {
+        let source = pyre_object::gc_roots::shadow_stack_get(src_base + source_offset);
+        // One source's pairs stay pinned until that round's stores finish,
+        // then the bracket closes. The destination dict stays on `_roots`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
         if source.is_null() {
             continue;
         }
@@ -8608,9 +8745,12 @@ fn dict_fromkeys_impl(
 }
 
 fn init_dict_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
             w_str_new(
                 "dict() -> new empty dictionary\n\
@@ -8622,35 +8762,29 @@ fn init_dict_type(ns: PyObjectRef) {
                          d[k] = v\n\
                  dict(**kwargs) -> new dictionary initialized with the name=value pairs\n\
                      in the keyword argument list.  For example:  dict(one=1, two=2)",
-            ),
+            )
         )
     };
     // dictmultiobject.py `__hash__ = None`.
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none()) };
+    unsafe { crate::__pyre_put_new!(ns_slot, "__hash__", w_none()) };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__sizeof__",
             crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__sizeof__",
                 dict_descr_sizeof,
                 1,
                 "($self, /)",
-            ),
+            )
         )
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(dict_descr_new),
-        )
-    };
+    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr(dict_descr_new)) };
     // dictmultiobject.py:446 __class_getitem__ = interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__class_getitem__",
             pyre_object::function::w_classmethod_new(
                 crate::gateway::make_builtin_function_with_arity_and_text_signature(
@@ -8659,188 +8793,226 @@ fn init_dict_type(ns: PyObjectRef) {
                     2,
                     "($type, object, /)",
                 ),
-            ),
+            )
         )
     };
     // `dictmultiobject.py descr_init` →
     // `init_or_update(space, self, __args__, 'dict')`
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__init__",
             make_builtin_function("__init__", |args| {
                 crate::type_methods::dict_init_or_update(args, "dict")
-            }),
+            })
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "get",
-            make_builtin_function("get", crate::type_methods::__majit_wrap_dict_descr_get),
+            make_builtin_function("get", crate::type_methods::__majit_wrap_dict_descr_get)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "keys",
             make_builtin_function_with_arity(
                 "keys",
                 crate::type_methods::__majit_wrap_dict_descr_keys,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "values",
             make_builtin_function_with_arity(
                 "values",
                 crate::type_methods::__majit_wrap_dict_descr_values,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "items",
             make_builtin_function_with_arity(
                 "items",
                 crate::type_methods::__majit_wrap_dict_descr_items,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "update",
-            make_builtin_function("update", crate::type_methods::dict_method_update),
+            make_builtin_function("update", crate::type_methods::dict_method_update)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "pop",
-            make_builtin_function("pop", crate::type_methods::dict_method_pop),
+            make_builtin_function("pop", crate::type_methods::dict_method_pop)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "popitem",
             make_builtin_function_with_arity(
                 "popitem",
                 crate::type_methods::dict_method_popitem,
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "setdefault",
-            make_builtin_function("setdefault", crate::type_methods::dict_method_setdefault),
+            make_builtin_function("setdefault", crate::type_methods::dict_method_setdefault)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__setitem__",
             make_builtin_function_with_arity(
                 "__setitem__",
                 |args| {
                     crate::type_methods::arity_exact_unpack(args, "__setitem__", 2)?;
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     // For plain dict: direct store. For dict subclass instance: use backing dict.
                     unsafe {
-                        if pyre_object::is_dict(args[0]) {
-                            crate::type_methods::dict_store_checked(args[0], args[1], args[2])?;
-                        } else if pyre_object::is_instance(args[0]) {
+                        if pyre_object::is_dict(pyre_object::gc_roots::shadow_stack_get(base)) {
+                            crate::type_methods::dict_store_checked(
+                                pyre_object::gc_roots::shadow_stack_get(base),
+                                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                                pyre_object::gc_roots::shadow_stack_get(base + 2),
+                            )?;
+                        } else if pyre_object::is_instance(pyre_object::gc_roots::shadow_stack_get(
+                            base,
+                        )) {
                             // dict subclass — read its reserved payload slot
                             // directly, bypassing Python __getattribute__.
-                            let backing = crate::type_methods::resolve_dict_backing(args[0]);
+                            let backing = crate::type_methods::resolve_dict_backing(
+                                pyre_object::gc_roots::shadow_stack_get(base),
+                            );
                             if pyre_object::is_dict(backing) {
-                                crate::type_methods::dict_store_checked(backing, args[1], args[2])?;
+                                crate::type_methods::dict_store_checked(
+                                    backing,
+                                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                                    pyre_object::gc_roots::shadow_stack_get(base + 2),
+                                )?;
                             }
                         }
                     }
                     Ok(pyre_object::w_none())
                 },
                 3,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getitem__",
             make_builtin_function_with_arity(
                 "__getitem__",
                 |args| {
                     crate::type_methods::arity_exact(args, "__getitem__", 1)?;
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     unsafe {
-                        if pyre_object::is_dict(args[0]) {
-                            return crate::baseobjspace::getitem(args[0], args[1]);
+                        if pyre_object::is_dict(pyre_object::gc_roots::shadow_stack_get(base)) {
+                            return crate::baseobjspace::getitem(
+                                pyre_object::gc_roots::shadow_stack_get(base),
+                                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                            );
                         }
-                        if pyre_object::is_instance(args[0]) {
-                            let backing = crate::type_methods::resolve_dict_backing(args[0]);
+                        if pyre_object::is_instance(pyre_object::gc_roots::shadow_stack_get(base)) {
+                            let backing = crate::type_methods::resolve_dict_backing(
+                                pyre_object::gc_roots::shadow_stack_get(base),
+                            );
                             if pyre_object::is_dict(backing) {
                                 // `dictmultiobject.py:166-170` — on a miss,
                                 // dispatch `__missing__` against the SUBCLASS
                                 // instance's type, not the plain-`dict` backing
                                 // (so e.g. `defaultdict.__missing__` fires).
                                 return match pyre_object::dictmultiobject::w_dict_lookup_checked(
-                                    backing, args[1],
+                                    backing,
+                                    pyre_object::gc_roots::shadow_stack_get(base + 1),
                                 ) {
                                     Ok(Some(val)) => Ok(val),
                                     Ok(None) => crate::baseobjspace::dict_missing_or_key_error(
-                                        args[0], args[1],
+                                        pyre_object::gc_roots::shadow_stack_get(base),
+                                        pyre_object::gc_roots::shadow_stack_get(base + 1),
                                     ),
-                                    Err(_) => Err(
-                                        crate::baseobjspace::take_pending_dict_key_error(args[1]),
-                                    ),
+                                    Err(_) => {
+                                        Err(crate::baseobjspace::take_pending_dict_key_error(
+                                            pyre_object::gc_roots::shadow_stack_get(base + 1),
+                                        ))
+                                    }
                                 };
                             }
                         }
                     }
-                    crate::baseobjspace::getitem(args[0], args[1])
+                    crate::baseobjspace::getitem(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    )
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__contains__",
             make_builtin_function_with_arity(
                 "__contains__",
                 |args| {
                     crate::type_methods::arity_exact(args, "__contains__", 1)?;
-                    let dict = crate::type_methods::resolve_dict_backing(args[0]);
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    let dict = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
                     if !dict.is_null() {
                         return match unsafe {
-                            pyre_object::dictmultiobject::w_dict_lookup_checked(dict, args[1])
+                            pyre_object::dictmultiobject::w_dict_lookup_checked(
+                                dict,
+                                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                            )
                         } {
                             Ok(v) => Ok(pyre_object::w_bool_from(v.is_some())),
-                            Err(_) => {
-                                Err(crate::baseobjspace::take_pending_dict_key_error(args[1]))
-                            }
+                            Err(_) => Err(crate::baseobjspace::take_pending_dict_key_error(
+                                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                            )),
                         };
                     }
                     Ok(pyre_object::w_bool_from(
-                        crate::baseobjspace::contains_slot(args[0], args[1])?,
+                        crate::baseobjspace::contains_slot(
+                            pyre_object::gc_roots::shadow_stack_get(base),
+                            pyre_object::gc_roots::shadow_stack_get(base + 1),
+                        )?,
                     ))
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__len__",
             make_builtin_function_with_arity(
                 "__len__",
@@ -8849,21 +9021,25 @@ fn init_dict_type(ns: PyObjectRef) {
                         return Ok(pyre_object::w_int_new(0));
                     }
                     crate::type_methods::arity_slot(args, 0)?;
-                    let dict = crate::type_methods::resolve_dict_backing(args[0]);
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    let dict = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
                     if !dict.is_null() {
                         return Ok(pyre_object::w_int_new(
                             unsafe { pyre_object::w_dict_len(dict) } as i64,
                         ));
                     }
-                    crate::baseobjspace::len_slot(args[0])
+                    crate::baseobjspace::len_slot(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -8874,13 +9050,18 @@ fn init_dict_type(ns: PyObjectRef) {
                     if args.is_empty() {
                         return Ok(pyre_object::w_str_new_managed("{}"));
                     }
-                    let recv = args[0];
-                    let dict = crate::type_methods::resolve_dict_backing(recv);
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    let dict = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
                     if dict.is_null() {
                         // Unbound `dict.__repr__(x)` on a non-dict receiver —
                         // reject it like a builtin descriptor rather than
                         // formatting an empty `{}`.
-                        let tp_name = crate::error::type_name_of(recv);
+                        let tp_name = crate::error::type_name_of(
+                            pyre_object::gc_roots::shadow_stack_get(base),
+                        );
                         return Err(crate::PyError::type_error(format!(
                             "descriptor '__repr__' for 'dict' objects \
                          doesn't apply to a '{tp_name}' object"
@@ -8893,12 +9074,12 @@ fn init_dict_type(ns: PyObjectRef) {
                     }
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__iter__",
             make_builtin_function_with_arity(
                 "__iter__",
@@ -8906,47 +9087,63 @@ fn init_dict_type(ns: PyObjectRef) {
                     if args.is_empty() {
                         return Ok(pyre_object::w_none());
                     }
-                    let dict = crate::type_methods::resolve_dict_backing(args[0]);
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    let dict = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
                     if !dict.is_null() {
                         // Iterate over dict keys
                         return crate::baseobjspace::iter(dict);
                     }
-                    crate::baseobjspace::iter(args[0])
+                    crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__delitem__",
             make_builtin_function_with_arity(
                 "__delitem__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     // For plain dict: direct delete. For dict subclass instance: use backing dict.
                     unsafe {
-                        if pyre_object::is_dict(args[0]) {
-                            crate::baseobjspace::delitem_slot(args[0], args[1])?;
-                        } else if pyre_object::is_instance(args[0]) {
+                        if pyre_object::is_dict(pyre_object::gc_roots::shadow_stack_get(base)) {
+                            crate::baseobjspace::delitem_slot(
+                                pyre_object::gc_roots::shadow_stack_get(base),
+                                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                            )?;
+                        } else if pyre_object::is_instance(pyre_object::gc_roots::shadow_stack_get(
+                            base,
+                        )) {
                             // dict subclass — delete through the reserved
                             // payload slot without Python attribute lookup.
-                            let backing = crate::type_methods::resolve_dict_backing(args[0]);
+                            let backing = crate::type_methods::resolve_dict_backing(
+                                pyre_object::gc_roots::shadow_stack_get(base),
+                            );
                             if pyre_object::is_dict(backing) {
-                                crate::baseobjspace::delitem(backing, args[1])?;
+                                crate::baseobjspace::delitem(
+                                    backing,
+                                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                                )?;
                             }
                         }
                     }
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__eq__",
             make_builtin_function_with_arity(
                 "__eq__",
@@ -8957,20 +9154,26 @@ fn init_dict_type(ns: PyObjectRef) {
                     // a dict and would re-dispatch to this `__eq__`, recursing.
                     // Resolve each operand to its backing dict first; exact dicts
                     // and non-dict operands are left unchanged for `compare`.
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     let resolve = |o: PyObjectRef| {
                         let backing = crate::type_methods::resolve_dict_backing(o);
                         if backing.is_null() { o } else { backing }
                     };
-                    let a = resolve(args[0]);
                     // `W_DictProxyObject` is not a `W_DictMultiObject`, so a
                     // proxy operand fails `descr_eq`'s isinstance test.  It has
                     // to reach the reflected `mappingproxy.__eq__`, which
                     // unwraps only its own receiver and so lets an ordered
                     // wrapped mapping compare under its own ordering rules.
-                    if unsafe { pyre_object::is_dict_proxy(args[1]) } {
+                    if unsafe {
+                        pyre_object::is_dict_proxy(pyre_object::gc_roots::shadow_stack_get(
+                            base + 1,
+                        ))
+                    } {
                         return Ok(pyre_object::w_not_implemented());
                     }
-                    let b = resolve(args[1]);
+                    let a = resolve(pyre_object::gc_roots::shadow_stack_get(base));
+                    let b = resolve(pyre_object::gc_roots::shadow_stack_get(base + 1));
                     // `dictmultiobject.py descr_eq`: a non-dict operand yields
                     // NotImplemented. Handing it to `compare` would re-dispatch
                     // to this `__eq__` (the operand is not a dict for compare's
@@ -8981,24 +9184,34 @@ fn init_dict_type(ns: PyObjectRef) {
                     crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ne__",
             make_builtin_function_with_arity(
                 "__ne__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     // See `__eq__`: a proxy operand belongs to the reflected
                     // `mappingproxy` comparison, not to this one.
-                    if unsafe { pyre_object::is_dict_proxy(args[1]) } {
+                    if unsafe {
+                        pyre_object::is_dict_proxy(pyre_object::gc_roots::shadow_stack_get(
+                            base + 1,
+                        ))
+                    } {
                         return Ok(pyre_object::w_not_implemented());
                     }
-                    let a = crate::type_methods::resolve_dict_backing(args[0]);
-                    let b = crate::type_methods::resolve_dict_backing(args[1]);
+                    let a = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
+                    let b = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    );
                     if a.is_null() || b.is_null() {
                         return Ok(pyre_object::w_not_implemented());
                     }
@@ -9010,7 +9223,7 @@ fn init_dict_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)?))
                 },
                 2,
-            ),
+            )
         )
     };
     // CPython 3.14 keeps the inherited object ordering descriptors visible in
@@ -9018,16 +9231,16 @@ fn init_dict_type(ns: PyObjectRef) {
     // return NotImplemented.
     for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, |_| Ok(w_not_implemented()), 2),
+                make_builtin_function_with_arity(name, |_| Ok(w_not_implemented()), 2)
             )
         };
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__or__",
             make_builtin_function_with_arity(
                 "__or__",
@@ -9040,8 +9253,14 @@ fn init_dict_type(ns: PyObjectRef) {
                     //       new.descr_update(space, w_other)
                     //       return new
                     crate::type_methods::arity_slot(args, 1)?;
-                    let src = crate::type_methods::resolve_dict_backing(args[0]);
-                    let other = crate::type_methods::resolve_dict_backing(args[1]);
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    let src = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
+                    let other = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    );
                     if other.is_null() {
                         return Ok(pyre_object::w_not_implemented());
                     }
@@ -9051,12 +9270,12 @@ fn init_dict_type(ns: PyObjectRef) {
                     Ok(dict_or_new(src, other))
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ror__",
             make_builtin_function_with_arity(
                 "__ror__",
@@ -9064,20 +9283,26 @@ fn init_dict_type(ns: PyObjectRef) {
                     // `dictmultiobject.py descr_ror`: `other | dict` copies
                     // the right-hand-side base (other) and overlays self.
                     crate::type_methods::arity_slot(args, 1)?;
-                    let self_ = crate::type_methods::resolve_dict_backing(args[0]);
-                    let other = crate::type_methods::resolve_dict_backing(args[1]);
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    let self_ = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
+                    let other = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    );
                     if other.is_null() {
                         return Ok(pyre_object::w_not_implemented());
                     }
                     Ok(dict_or_new(other, self_))
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ior__",
             make_builtin_function_with_arity(
                 "__ior__",
@@ -9106,12 +9331,12 @@ fn init_dict_type(ns: PyObjectRef) {
                     Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__reversed__",
             make_builtin_function_with_arity(
                 "__reversed__",
@@ -9127,7 +9352,11 @@ fn init_dict_type(ns: PyObjectRef) {
                         &pyre_object::DICT_TYPE,
                         true,
                     )?;
-                    let d = crate::type_methods::resolve_dict_backing(args[0]);
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    let d = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
                     Ok(
                         pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(
                             d,
@@ -9136,19 +9365,19 @@ fn init_dict_type(ns: PyObjectRef) {
                     )
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "copy",
-            make_builtin_function_with_arity("copy", crate::type_methods::dict_method_copy, 1),
+            make_builtin_function_with_arity("copy", crate::type_methods::dict_method_copy, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "clear",
             make_builtin_function_with_arity(
                 "clear",
@@ -9159,14 +9388,18 @@ fn init_dict_type(ns: PyObjectRef) {
                     // strategy's `clear` (`celldict.py` for
                     // module dicts).  `w_dict_clear` does the dispatch.
                     crate::type_methods::arity_no_args(args, "clear")?;
-                    let d = crate::type_methods::resolve_dict_backing(args[0]);
+                    let _scope = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    let d = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
                     if !d.is_null() {
                         unsafe { pyre_object::dictmultiobject::w_dict_clear(d) };
                     }
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
+            )
         )
     };
     // dict.fromkeys(iterable, value=None) — classmethod
@@ -9175,11 +9408,15 @@ fn init_dict_type(ns: PyObjectRef) {
         descr_fromkeys,
         "($type, iterable, value=None, /)",
     );
+    let fromkeys_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(fromkeys);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "fromkeys",
-            pyre_object::function::w_classmethod_new(fromkeys),
+            pyre_object::function::w_classmethod_new(pyre_object::gc_roots::shadow_stack_get(
+                fromkeys_slot
+            ))
         )
     };
     // CPython 3.14 Argument Clinic metadata. Keep the PyPy TypeDef carriers
@@ -9215,9 +9452,11 @@ fn init_dict_type(ns: PyObjectRef) {
         ("copy", "($self, /)"),
         ("__reversed__", "($self, /)"),
     ] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("dict TypeDef callable was just installed");
-        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -9283,38 +9522,41 @@ fn init_dict_view_common_slots(
     ns: PyObjectRef,
     reversed_fn: fn(&[PyObjectRef]) -> crate::PyResult,
 ) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__iter__",
             make_builtin_function_with_arity(
                 "__iter__",
                 |args| crate::baseobjspace::iter(args[0]),
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__len__",
             make_builtin_function_with_arity(
                 "__len__",
                 |args| crate::baseobjspace::len_slot(args[0]),
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__reversed__",
-            make_builtin_function_with_arity("__reversed__", reversed_fn, 1),
+            make_builtin_function_with_arity("__reversed__", reversed_fn, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -9327,35 +9569,37 @@ fn init_dict_view_common_slots(
                     }))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        let mapping_getter = make_builtin_function_with_arity(
+            "mapping",
+            |args| {
+                let view = args[1];
+                if view.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                let dict = unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
+                if dict.is_null() {
+                    return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
+                }
+                Ok(pyre_object::w_dict_proxy_new(dict))
+            },
+            2,
+        );
+        let mapping_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(mapping_getter);
+        crate::__pyre_put_new!(
+            ns_slot,
             "mapping",
             make_getset_property_named_doc(
-                make_builtin_function_with_arity(
-                    "mapping",
-                    |args| {
-                        let view = args[1];
-                        if view.is_null() {
-                            return Ok(pyre_object::w_none());
-                        }
-                        let dict =
-                            unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
-                        if dict.is_null() {
-                            return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
-                        }
-                        Ok(pyre_object::w_dict_proxy_new(dict))
-                    },
-                    2,
-                ),
+                pyre_object::gc_roots::shadow_stack_get(mapping_getter_slot),
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
                 "dictionary that this view refers to",
                 "mapping",
-            ),
+            )
         )
     };
 }
@@ -9368,10 +9612,16 @@ fn init_dict_view_set_like_type(
     ns: PyObjectRef,
     reversed_fn: fn(&[PyObjectRef]) -> crate::PyResult,
 ) {
-    init_dict_view_common_slots(ns, reversed_fn);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    init_dict_view_common_slots(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        reversed_fn,
+    );
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__contains__",
             make_builtin_function_with_arity(
                 "__contains__",
@@ -9384,21 +9634,15 @@ fn init_dict_view_set_like_type(
                     )?))
                 },
                 2,
-            ),
+            )
         )
     };
     // The keys and items views are set-like and therefore unhashable
     // (`dictmultiobject.py _is_set_like`); the values view is not and
     // keeps `object.__hash__`.  Declare the slot `None` so a `hash()` finds it
     // and rejects the view instead of falling back to the identity hash.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__hash__",
-            pyre_object::w_none(),
-        )
-    };
-    register_dict_view_set_operators(ns);
+    unsafe { crate::__pyre_put_new!(ns_slot, "__hash__", pyre_object::w_none()) };
+    register_dict_view_set_operators(pyre_object::gc_roots::shadow_stack_get(ns_slot));
 }
 
 /// `dictmultiobject.py W_DictViewValuesObject.typedef` —
@@ -9541,30 +9785,33 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn init_pytraceback_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // CPython 3.14 `PyTraceBack_Type` public documentation. PyPy's
     // `PyTraceback.typedef` is the structural owner below.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
-            w_str_new("Create a new traceback object."),
+            w_str_new("Create a new traceback object.")
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__new__",
             make_new_descr_with_doc(
                 traceback_descr_new,
                 "Create and return a new object.  See help(type) for accurate signature.",
-            ),
+            )
         )
     };
     // `PyTraceback.typedef` registers `__dir__` immediately after the
     // 3.14-omitted pickle helpers; preserve that relative TypeDef order.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__dir__",
             make_builtin_function_with_arity(
                 "__dir__",
@@ -9590,7 +9837,7 @@ fn init_pytraceback_type(ns: PyObjectRef) {
                     ))
                 },
                 1,
-            ),
+            )
         )
     };
 
@@ -9613,14 +9860,14 @@ fn init_pytraceback_type(ns: PyObjectRef) {
     // `<member 'tb_frame' of 'traceback' objects>`), and it is also the
     // read-only attrproperty half of PyPy's own split.  Measured at 3.14.6.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "tb_frame",
             pyre_object::w_member_new_direct(
                 pyre_object::MEMBER_TRACEBACK_FRAME,
                 "tb_frame".to_owned(),
                 pyre_object::PY_NULL,
-            ),
+            )
         )
     };
     // pytraceback.py descr_get_tb_lasti — the slot is handed out as it is
@@ -9637,14 +9884,14 @@ fn init_pytraceback_type(ns: PyObjectRef) {
     // gives.  The constructor still takes both values, which is how a
     // traceback with a chosen offset is built here as it is there.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "tb_lasti",
             pyre_object::w_member_new_direct(
                 pyre_object::MEMBER_TRACEBACK_LASTI,
                 "tb_lasti".to_owned(),
                 pyre_object::PY_NULL,
-            ),
+            )
         )
     };
 
@@ -9664,16 +9911,18 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         },
         2,
     );
+    let lineno_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lineno_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "tb_lineno",
             make_getset_property_named(
-                lineno_getter,
+                pyre_object::gc_roots::shadow_stack_get(lineno_getter_slot),
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
                 "tb_lineno",
-            ),
+            )
         )
     };
 
@@ -9695,6 +9944,8 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         },
         2,
     );
+    let next_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(next_getter);
     let next_setter = make_builtin_function_with_arity(
         "tb_next",
         |args| {
@@ -9727,6 +9978,8 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         },
         3,
     );
+    let next_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(next_setter);
     // `del tb.tb_next` is a delete the descriptor answers itself.  Without a
     // deleter the attribute falls through to the immutable-type path, which
     // reports the type rather than the attribute and reports it as an
@@ -9736,11 +9989,18 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         |_args| Err(crate::PyError::type_error("can't delete tb_next attribute")),
         2,
     );
+    let next_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(next_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "tb_next",
-            make_getset_property_named(next_getter, next_setter, next_deleter, "tb_next"),
+            make_getset_property_named(
+                pyre_object::gc_roots::shadow_stack_get(next_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(next_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(next_deleter_slot),
+                "tb_next"
+            )
         )
     };
 
@@ -9750,9 +10010,11 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         ("__new__", "($type, *args, **kwargs)"),
         ("__dir__", "($self, /)"),
     ] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("traceback TypeDef callable was just installed");
-        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -9765,6 +10027,9 @@ fn init_pytraceback_type(ns: PyObjectRef) {
 /// which validates the line-jump via `mark_stacks`; the read-only getsets
 /// and `f_trace*` setters mirror `pyframe.py` directly.
 fn init_frame_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     use crate::pyframe::PyFrame;
 
     // Helper: resolve the receiver to `&mut PyFrame`, or return `w_none()`
@@ -9780,11 +10045,16 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_code,
         2,
     );
+    let code_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(code_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_code",
-            make_getset_descriptor_named(code_getter, "f_code"),
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(code_getter_slot),
+                "f_code"
+            )
         )
     };
 
@@ -9794,11 +10064,16 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_get_w_globals,
         2,
     );
+    let globals_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(globals_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_globals",
-            make_getset_descriptor_named(globals_getter, "f_globals"),
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(globals_getter_slot),
+                "f_globals"
+            )
         )
     };
 
@@ -9811,11 +10086,16 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_getdictscope,
         2,
     );
+    let locals_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(locals_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_locals",
-            make_getset_descriptor_named(locals_getter, "f_locals"),
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(locals_getter_slot),
+                "f_locals"
+            )
         )
     };
 
@@ -9825,11 +10105,16 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_back,
         2,
     );
+    let back_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(back_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_back",
-            make_getset_descriptor_named(back_getter, "f_back"),
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(back_getter_slot),
+                "f_back"
+            )
         )
     };
 
@@ -9842,11 +10127,16 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_get_generator,
         2,
     );
+    let generator_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(generator_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_generator",
-            make_getset_descriptor_named(generator_getter, "f_generator"),
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(generator_getter_slot),
+                "f_generator"
+            )
         )
     };
 
@@ -9858,11 +10148,16 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_lasti,
         2,
     );
+    let lasti_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lasti_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_lasti",
-            make_getset_descriptor_named(lasti_getter, "f_lasti"),
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(lasti_getter_slot),
+                "f_lasti"
+            )
         )
     };
 
@@ -9872,11 +10167,16 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_builtins,
         2,
     );
+    let builtins_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(builtins_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_builtins",
-            make_getset_descriptor_named(builtins_getter, "f_builtins"),
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(builtins_getter_slot),
+                "f_builtins"
+            )
         )
     };
 
@@ -9890,25 +10190,32 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_lineno,
         2,
     );
+    let lineno_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lineno_getter);
     let lineno_setter = make_builtin_function_with_arity(
         "f_lineno",
         crate::pyframe::__majit_wrap_descr_typecheck_fset_f_lineno,
         3,
     );
+    let lineno_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lineno_setter);
+    let lineno_deleter = make_builtin_function_with_arity(
+        "f_lineno",
+        |_args| Err(crate::PyError::attribute_error("cannot delete attribute")),
+        2,
+    );
+    let lineno_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lineno_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_lineno",
             make_getset_property_named(
-                lineno_getter,
-                lineno_setter,
-                make_builtin_function_with_arity(
-                    "f_lineno",
-                    |_args| Err(crate::PyError::attribute_error("cannot delete attribute")),
-                    2,
-                ),
+                pyre_object::gc_roots::shadow_stack_get(lineno_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(lineno_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(lineno_deleter_slot),
                 "f_lineno",
-            ),
+            )
         )
     };
 
@@ -9918,21 +10225,32 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace,
         2,
     );
+    let trace_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_getter);
     let trace_setter = make_builtin_function_with_arity(
         "f_trace",
         crate::pyframe::__majit_wrap_descr_typecheck_fset_f_trace,
         3,
     );
+    let trace_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_setter);
     let trace_deleter = make_builtin_function_with_arity(
         "f_trace",
         crate::pyframe::__majit_wrap_descr_typecheck_fdel_f_trace,
         2,
     );
+    let trace_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_trace",
-            make_getset_property_named(trace_getter, trace_setter, trace_deleter, "f_trace"),
+            make_getset_property_named(
+                pyre_object::gc_roots::shadow_stack_get(trace_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(trace_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(trace_deleter_slot),
+                "f_trace"
+            )
         )
     };
 
@@ -9942,29 +10260,36 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace_lines,
         2,
     );
+    let trace_lines_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_lines_getter);
     let trace_lines_setter = make_builtin_function_with_arity(
         "f_trace_lines",
         crate::pyframe::__majit_wrap_descr_typecheck_fset_f_trace_lines,
         3,
     );
+    let trace_lines_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_lines_setter);
+    let trace_lines_deleter = make_builtin_function_with_arity(
+        "f_trace_lines",
+        |_args| {
+            Err(crate::PyError::type_error(
+                "can't delete numeric/char attribute",
+            ))
+        },
+        2,
+    );
+    let trace_lines_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_lines_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_trace_lines",
             make_getset_property_named(
-                trace_lines_getter,
-                trace_lines_setter,
-                make_builtin_function_with_arity(
-                    "f_trace_lines",
-                    |_args| {
-                        Err(crate::PyError::type_error(
-                            "can't delete numeric/char attribute",
-                        ))
-                    },
-                    2,
-                ),
+                pyre_object::gc_roots::shadow_stack_get(trace_lines_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(trace_lines_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(trace_lines_deleter_slot),
                 "f_trace_lines",
-            ),
+            )
         )
     };
 
@@ -9983,32 +10308,39 @@ fn init_frame_type(ns: PyObjectRef) {
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace_opcodes,
         2,
     );
+    let trace_opcodes_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_opcodes_getter);
     let trace_opcodes_setter = make_builtin_function_with_arity(
         "f_trace_opcodes",
         crate::pyframe::__majit_wrap_descr_typecheck_fset_f_trace_opcodes,
         3,
     );
+    let trace_opcodes_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_opcodes_setter);
+    let trace_opcodes_deleter = make_builtin_function_with_arity(
+        "f_trace_opcodes",
+        |_args| Err(crate::PyError::attribute_error("cannot delete attribute")),
+        2,
+    );
+    let trace_opcodes_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(trace_opcodes_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "f_trace_opcodes",
             make_getset_property_named(
-                trace_opcodes_getter,
-                trace_opcodes_setter,
-                make_builtin_function_with_arity(
-                    "f_trace_opcodes",
-                    |_args| Err(crate::PyError::attribute_error("cannot delete attribute")),
-                    2,
-                ),
+                pyre_object::gc_roots::shadow_stack_get(trace_opcodes_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(trace_opcodes_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(trace_opcodes_deleter_slot),
                 "f_trace_opcodes",
-            ),
+            )
         )
     };
 
     // clear() — interp2app (pyframe.py descr_clear).
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "clear",
             crate::gateway::make_builtin_function_with_arity_and_doc(
                 "clear",
@@ -10021,14 +10353,14 @@ fn init_frame_type(ns: PyObjectRef) {
                 },
                 1,
                 "Clear all references held by the frame.",
-            ),
+            )
         )
     };
 
     // __repr__ — interp2app (pyframe.py descr_repr).
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__repr__",
@@ -10043,7 +10375,7 @@ fn init_frame_type(ns: PyObjectRef) {
                 },
                 1,
                 "Return repr(self).",
-            ),
+            )
         )
     };
 
@@ -10051,9 +10383,11 @@ fn init_frame_type(ns: PyObjectRef) {
     // `PyFrame_Type` supplies their method/slot metadata, which the Rust
     // gateway cannot infer from the upstream Python function objects.
     for name in ["clear", "__repr__"] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("frame TypeDef callable was just installed");
-        unsafe { crate::function::fset_func_text_signature(function, w_str_new("($self, /)")) };
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            "($self, /)",
+        );
     }
 }
 
@@ -10452,6 +10786,9 @@ fn dict_view_descr_rxor(
 }
 
 fn register_dict_view_set_operators(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // Comparisons (Items/Keys only — Values returns NotImplemented
     // because `dict_view_is_set_like` rejects non-set-like LHS).
     for (name, func) in [
@@ -10463,19 +10800,19 @@ fn register_dict_view_set_operators(ns: PyObjectRef) {
         ("__ge__", dict_view_descr_ge),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, func, 2),
+                make_builtin_function_with_arity(name, func, 2)
             )
         };
     }
     // `dictmultiobject.py isdisjoint = interp2app(descr_isdisjoint)`
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "isdisjoint",
-            make_builtin_function_with_arity("isdisjoint", dict_view_descr_isdisjoint, 2),
+            make_builtin_function_with_arity("isdisjoint", dict_view_descr_isdisjoint, 2)
         )
     };
     // `dictmultiobject.py _as_set_op` — set ops route
@@ -10492,10 +10829,10 @@ fn register_dict_view_set_operators(ns: PyObjectRef) {
         ("__rxor__", dict_view_descr_rxor),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, func, 2),
+                make_builtin_function_with_arity(name, func, 2)
             )
         };
     }
@@ -10540,6 +10877,9 @@ pub(crate) fn mappingproxy_from_mapping(
 }
 
 fn init_mappingproxy_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // PyPy `interp2app` rejects an unbound receiver before entering every
     // `W_DictProxyObject` method. CPython exposes the ordinary methods as
     // method descriptors and the operator methods as slot wrappers, which
@@ -10563,27 +10903,27 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
     // PyPy's module doc spells out the same contract, while its TypeDef
     // predates the explicit type-doc slot.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
-            pyre_object::w_str_new("Read-only proxy of a mapping."),
+            pyre_object::w_str_new("Read-only proxy of a mapping.")
         )
     };
     // dictproxyobject.py __new__=interp2app(descr_new)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__new__",
             make_new_descr_with_doc(
                 mappingproxy_descr_new,
                 "Create and return a new object.  See help(type) for accurate signature.",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_len → space.len(self.w_mapping)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__len__",
             crate::gateway::make_builtin_function_with_doc(
                 "__len__",
@@ -10593,13 +10933,13 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     crate::baseobjspace::len_slot(args[0])
                 },
                 "Return len(self).",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_getitem → space.getitem(self.w_mapping, w_key)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getitem__",
             crate::gateway::make_builtin_function_with_doc(
                 "__getitem__",
@@ -10609,13 +10949,13 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     crate::baseobjspace::getitem(args[0], args[1])
                 },
                 "Return self[key].",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_contains → space.contains(self.w_mapping, w_key)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__contains__",
             crate::gateway::make_builtin_function_with_doc(
                 "__contains__",
@@ -10627,13 +10967,13 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     )?))
                 },
                 "Return bool(key in self).",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_iter → space.iter(self.w_mapping)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__iter__",
             crate::gateway::make_builtin_function_with_doc(
                 "__iter__",
@@ -10643,13 +10983,13 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     crate::baseobjspace::iter(args[0])
                 },
                 "Implement iter(self).",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_str → space.str(self.w_mapping)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__str__",
             crate::gateway::make_builtin_function_with_doc(
                 "__str__",
@@ -10663,14 +11003,14 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     }
                 },
                 "Return str(self).",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_repr →
     // `b"mappingproxy(%s)" % space.utf8_w(space.repr(self.w_mapping))`
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             crate::gateway::make_builtin_function_with_doc(
                 "__repr__",
@@ -10684,7 +11024,7 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     }
                 },
                 "Return repr(self).",
-            ),
+            )
         )
     };
     // Python 3.14 `mappingproxy_hash`: delegate to the wrapped mapping.
@@ -10692,8 +11032,8 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
     // proxy around dict therefore raises `unhashable type: 'dict'`, while a
     // proxy around a custom hashable mapping returns that mapping's hash.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__hash__",
             crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__hash__",
@@ -10707,7 +11047,7 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                 },
                 1,
                 "Return hash(self).",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_or →
@@ -10715,8 +11055,8 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
     // `dict_method_copy` (unwraps proxy through resolve_dict_backing)
     // followed by an items merge from `w_other`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__or__",
             crate::gateway::make_builtin_function_with_doc(
                 "__or__",
@@ -10731,23 +11071,31 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                             args[1]
                         }
                     };
-                    if !unsafe { crate::baseobjspace::isinstance_w(rhs, gettypeobject(&DICT_TYPE)) }
-                    {
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let or_base = pyre_object::gc_roots::pin_roots(&[lhs, rhs]);
+                    if !unsafe {
+                        crate::baseobjspace::isinstance_w(
+                            pyre_object::gc_roots::shadow_stack_get(or_base + 1),
+                            gettypeobject(&DICT_TYPE),
+                        )
+                    } {
                         return Ok(pyre_object::w_not_implemented());
                     }
-                    let mut new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
-                    pyre_object::with_roots!(new_dict => crate::type_methods::dict_method_update(&[new_dict, rhs]))?;
+                    let mut new_dict = crate::type_methods::dict_method_copy(&[
+                        pyre_object::gc_roots::shadow_stack_get(or_base),
+                    ])?;
+                    pyre_object::with_roots!(new_dict => crate::type_methods::dict_method_update(&[new_dict, pyre_object::gc_roots::shadow_stack_get(or_base + 1)]))?;
                     Ok(new_dict)
                 },
                 "Return self|value.",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_ror →
     // `space.call_method(w_other, '__or__', self.w_mapping)`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ror__",
             crate::gateway::make_builtin_function_with_doc(
                 "__ror__",
@@ -10775,15 +11123,15 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     crate::baseobjspace::call_method_result(lhs, "__or__", &[self_mapping])
                 },
                 "Return value|self.",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_ior → unconditional TypeError; the
     // proxy is read-only so in-place merge is rejected by name even
     // when the rhs would otherwise be acceptable for `__or__`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ior__",
             crate::gateway::make_builtin_function_with_doc(
                 "__ior__",
@@ -10795,14 +11143,14 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     ))
                 },
                 "Return self|=value.",
-            ),
+            )
         )
     };
     // dictproxyobject.py descr_reversed →
     // `space.call_method(self.w_mapping, '__reversed__')`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__reversed__",
             crate::gateway::make_builtin_function_with_doc(
                 "__reversed__",
@@ -10812,7 +11160,7 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     forward_mapping_method(args, "__reversed__")
                 },
                 "D.__reversed__() -> reverse iterator",
-            ),
+            )
         )
     };
     // dictproxyobject.py __class_getitem__ = interp2app(
@@ -10823,14 +11171,23 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         2,
         "mappingproxy objects are generic over two types, signifying (respectively) the types of their keys and values",
     );
+    let class_getitem_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(class_getitem);
     unsafe {
-        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"))
+        let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new("($type, object, /)"));
+        crate::function::fset_func_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(class_getitem_slot),
+            pyre_object::gc_roots::shadow_stack_get(signature_slot),
+        )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(class_getitem),
+            pyre_object::function::w_classmethod_new(pyre_object::gc_roots::shadow_stack_get(
+                class_getitem_slot
+            ))
         )
     };
     // dictproxyobject.py get_w / 75 keys_w / 78 values_w / 81 items_w /
@@ -10877,58 +11234,58 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         forward_mapping_method(args, "copy")
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "get",
             crate::gateway::make_builtin_function_with_doc(
                 "get",
                 proxy_get,
                 "Return the value for key if key is in the mapping, else default.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "keys",
             crate::gateway::make_builtin_function_with_doc(
                 "keys",
                 proxy_keys,
                 "D.keys() -> a set-like object providing a view on D's keys",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "values",
             crate::gateway::make_builtin_function_with_doc(
                 "values",
                 proxy_values,
                 "D.values() -> an object providing a view on D's values",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "items",
             crate::gateway::make_builtin_function_with_doc(
                 "items",
                 proxy_items,
                 "D.items() -> a set-like object providing a view on D's items",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "copy",
             crate::gateway::make_builtin_function_with_doc(
                 "copy",
                 proxy_copy,
                 "D.copy() -> a shallow copy of D",
-            ),
+            )
         )
     };
     // dictproxyobject.py:91-100 cmp methods (eq/ne/lt/le/gt/ge) →
@@ -10984,69 +11341,69 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         cmp_helper(args, crate::baseobjspace::CompareOp::Ge)
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__eq__",
             crate::gateway::make_builtin_function_with_doc(
                 "__eq__",
                 proxy_eq,
                 "Return self==value.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ne__",
             crate::gateway::make_builtin_function_with_doc(
                 "__ne__",
                 proxy_ne,
                 "Return self!=value.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__gt__",
             crate::gateway::make_builtin_function_with_doc(
                 "__gt__",
                 proxy_gt,
                 "Return self>value.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ge__",
             crate::gateway::make_builtin_function_with_doc(
                 "__ge__",
                 proxy_ge,
                 "Return self>=value.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__lt__",
             crate::gateway::make_builtin_function_with_doc(
                 "__lt__",
                 proxy_lt,
                 "Return self<value.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__le__",
             crate::gateway::make_builtin_function_with_doc(
                 "__le__",
                 proxy_le,
                 "Return self<=value.",
-            ),
+            )
         )
     };
     // PyPy `W_DictProxyObject.typedef` supplies the callable carriers and
@@ -11078,34 +11435,39 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         ("__lt__", "($self, value, /)"),
         ("__le__", "($self, value, /)"),
     ] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("mappingproxy TypeDef callable was just installed");
-        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
 // ── Tuple TypeDef ────────────────────────────────────────────────────
 
 fn init_tuple_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
             w_str_new(
                 "Built-in immutable sequence.\n\nIf no argument is given, the constructor returns an empty tuple.\nIf iterable is specified the tuple is initialized from iterable's items.\n\nIf the argument is a tuple, the return value is the same object.",
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__new__",
-            make_new_descr(__majit_wrap_tuple_descr_new),
+            make_new_descr(__majit_wrap_tuple_descr_new)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -11117,12 +11479,12 @@ fn init_tuple_type(ns: PyObjectRef) {
                     }))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
@@ -11134,14 +11496,14 @@ fn init_tuple_type(ns: PyObjectRef) {
                     Ok(w_int_new(crate::builtins::tuple_structural_hash(tuple)?))
                 },
                 1,
-            ),
+            )
         )
     };
     // tupleobject.py:354 __class_getitem__ = interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__class_getitem__",
             pyre_object::function::w_classmethod_new(
                 crate::gateway::make_builtin_function_with_arity_and_text_signature(
@@ -11150,26 +11512,26 @@ fn init_tuple_type(ns: PyObjectRef) {
                     2,
                     "($type, object, /)",
                 ),
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "index",
-            make_builtin_function("index", crate::type_methods::tuple_method_index),
+            make_builtin_function("index", crate::type_methods::tuple_method_index)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "count",
-            make_builtin_function_with_arity("count", crate::type_methods::tuple_method_count, 2),
+            make_builtin_function_with_arity("count", crate::type_methods::tuple_method_count, 2,)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__contains__",
             make_builtin_function_with_arity(
                 "__contains__",
@@ -11181,12 +11543,12 @@ fn init_tuple_type(ns: PyObjectRef) {
                     ))
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__len__",
             make_builtin_function_with_arity(
                 "__len__",
@@ -11199,12 +11561,12 @@ fn init_tuple_type(ns: PyObjectRef) {
                     ))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__iter__",
             // Build the storage iterator directly rather than re-entering
             // `space.iter()` — a `tuple` subclass that calls `super().__iter__()`
@@ -11217,12 +11579,12 @@ fn init_tuple_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_tuple_iter_new(obj))
                 },
                 1,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getitem__",
             make_builtin_function_with_arity(
                 "__getitem__",
@@ -11232,7 +11594,7 @@ fn init_tuple_type(ns: PyObjectRef) {
                     crate::baseobjspace::getitem_slot(args[0], args[1])
                 },
                 2,
-            ),
+            )
         )
     };
     // `tupleobject.py descr_add` returns NotImplemented for a non-tuple
@@ -11240,8 +11602,8 @@ fn init_tuple_type(ns: PyObjectRef) {
     // "unsupported operand type(s)" TypeError is raised); `*` requires an
     // integer count.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__add__",
             make_builtin_function_with_arity(
                 "__add__",
@@ -11255,21 +11617,21 @@ fn init_tuple_type(ns: PyObjectRef) {
                     }
                 },
                 2,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__mul__",
-            make_builtin_function_with_arity("__mul__", tuple_descr_mul, 2),
+            make_builtin_function_with_arity("__mul__", tuple_descr_mul, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__rmul__",
-            make_builtin_function_with_arity("__rmul__", tuple_descr_rmul, 2),
+            make_builtin_function_with_arity("__rmul__", tuple_descr_rmul, 2)
         )
     };
     for (name, func) in [
@@ -11281,17 +11643,17 @@ fn init_tuple_type(ns: PyObjectRef) {
         ("__ge__", tuple_dunder_ge),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, func, 2),
+                make_builtin_function_with_arity(name, func, 2)
             )
         };
     }
     // tupleobject.py descr_getnewargs — `((self-copy),)`
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getnewargs__",
             make_builtin_function_with_arity(
                 "__getnewargs__",
@@ -11317,7 +11679,7 @@ fn init_tuple_type(ns: PyObjectRef) {
                     ]))
                 },
                 1,
-            ),
+            )
         )
     };
     // CPython 3.14 Argument Clinic metadata. Keep the PyPy TypeDef entry
@@ -11344,9 +11706,11 @@ fn init_tuple_type(ns: PyObjectRef) {
         ("index", "($self, value, start=0, stop=sys.maxsize, /)"),
         ("count", "($self, value, /)"),
     ] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("tuple TypeDef callable was just installed");
-        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -11719,6 +12083,9 @@ fn slice_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 fn init_slice_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // sliceobject.py W_SliceObject.typedef declares interp2app objects;
     // GatewayCache binds each declaration to a Function in this space.
     // Keep the already-established CPython text signatures/arity contract.
@@ -11733,24 +12100,24 @@ fn init_slice_type(ns: PyObjectRef) {
         crate::gateway::interp2app_spacebind(gateway, crate::baseobjspace::object_space())
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
             w_str_new(
                 "slice(stop)\nslice(start, stop[, step])\n\nCreate a slice object. This is used for extended slicing (e.g. a[0:10:2]).",
-            ),
+            )
         )
     };
     let new_descr = make_new_descr(slice_descr_new);
     unsafe {
         crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"));
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr)
+        crate::__pyre_put_new!(ns_slot, "__new__", new_descr)
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
-            wrap_method("__repr__", slice_descr_repr, 1, "($self, /)"),
+            wrap_method("__repr__", slice_descr_repr, 1, "($self, /)")
         )
     };
     for (name, func) in [
@@ -11762,66 +12129,66 @@ fn init_slice_type(ns: PyObjectRef) {
         ("__ge__", slice_descr_ge),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                wrap_method(name, func, 2, "($self, value, /)"),
+                wrap_method(name, func, 2, "($self, value, /)")
             )
         };
     }
     // PyPy 3.11 has `__hash__ = None`; CPython 3.14 made slices hashable.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__hash__",
-            wrap_method("__hash__", slice_descr_hash, 1, "($self, /)"),
+            wrap_method("__hash__", slice_descr_hash, 1, "($self, /)")
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__reduce__",
-            wrap_method("__reduce__", slice_descr_reduce, 1, "($self, /)"),
+            wrap_method("__reduce__", slice_descr_reduce, 1, "($self, /)")
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "start",
             pyre_object::w_member_new_direct(
                 pyre_object::MEMBER_SLICE_START,
                 "start".to_owned(),
                 PY_NULL,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "stop",
             pyre_object::w_member_new_direct(
                 pyre_object::MEMBER_SLICE_STOP,
                 "stop".to_owned(),
                 PY_NULL,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "step",
             pyre_object::w_member_new_direct(
                 pyre_object::MEMBER_SLICE_STEP,
                 "step".to_owned(),
                 PY_NULL,
-            ),
+            )
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "indices",
-            wrap_method("indices", slice_method_indices, 2, "($self, object, /)"),
+            wrap_method("indices", slice_method_indices, 2, "($self, object, /)")
         )
     };
 }
@@ -12005,13 +12372,16 @@ fn union_name_getter(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn init_union_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // `_pypy_generic_alias.py UnionType` docstring, plus CPython
     // 3.14's three read-only identity getsets on union instances.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
-            pyre_object::w_str_new("Represent a union type\n\nE.g. for int | str"),
+            pyre_object::w_str_new("Represent a union type\n\nE.g. for int | str")
         )
     };
     for (name, getter) in [
@@ -12046,14 +12416,17 @@ fn init_union_type(ns: PyObjectRef) {
             Ok(gettypeobject(&pyre_object::UNION_TYPE))
         }),
     ] {
+        let getter_w = make_builtin_function_with_arity(name, getter, 2);
+        let getter_w_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter_w);
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
                 make_getset_descriptor_named(
-                    make_builtin_function_with_arity(name, getter, 2),
+                    pyre_object::gc_roots::shadow_stack_get(getter_w_slot),
                     name,
-                ),
+                )
             )
         };
     }
@@ -12062,21 +12435,23 @@ fn init_union_type(ns: PyObjectRef) {
     // the value in the typedef namespace so generic object attribute lookup
     // reaches it (the metatype's type-name-derived module alone is not an
     // instance attribute).
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__module__",
-            pyre_object::w_str_new("typing"),
-        )
-    };
+    unsafe { crate::__pyre_put_new!(ns_slot, "__module__", pyre_object::w_str_new("typing")) };
     // Python 3.14 exposes these special attributes on every union instance.
     for name in ["__name__", "__qualname__"] {
+        // The getter is pinned only across this iteration's descriptor store.
+        // `ns_slot` belongs to the enclosing type-init bracket.
+        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
         let getter = make_builtin_function_with_arity(name, union_name_getter, 2);
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_getset_descriptor_named(getter, name),
+                make_getset_descriptor_named(
+                    pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                    name
+                )
             )
         };
     }
@@ -12094,19 +12469,20 @@ fn init_union_type(ns: PyObjectRef) {
         },
         2,
     );
+    let origin_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(origin_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__origin__",
-            make_getset_descriptor_named(origin_getter, "__origin__"),
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(origin_getter_slot),
+                "__origin__"
+            )
         );
         // _pypy_generic_alias.py:325 — suppress the legacy
         // `__getitem__`-based iteration fallback.
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__iter__",
-            pyre_object::w_none(),
-        );
+        crate::__pyre_put_new!(ns_slot, "__iter__", pyre_object::w_none());
     }
     // UnionType.__args__ — returns the tuple of union member types
     let args_getter = make_builtin_function_with_arity(
@@ -12121,11 +12497,13 @@ fn init_union_type(ns: PyObjectRef) {
         },
         2,
     );
+    let args_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__args__",
-            make_getset_descriptor(args_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(args_getter_slot))
         )
     };
     // UnionType.__parameters__ — the slot stored at construction from the raw
@@ -12143,11 +12521,13 @@ fn init_union_type(ns: PyObjectRef) {
         },
         2,
     );
+    let params_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(params_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__parameters__",
-            make_getset_descriptor(params_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(params_getter_slot))
         )
     };
     // `_pypy_generic_alias.py`: `hash(frozenset(self.__args__))`.
@@ -12155,8 +12535,8 @@ fn init_union_type(ns: PyObjectRef) {
     // contain classes with an unhashable metaclass and fail at the same point
     // as CPython/PyPy.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
@@ -12185,15 +12565,15 @@ fn init_union_type(ns: PyObjectRef) {
                     )?))
                 },
                 1,
-            ),
+            )
         )
     };
     // CPython unionobject.c `union_mro_entries`: a union participates in the
     // PEP 560 base-resolution protocol solely to provide the precise error
     // instead of falling through to the generic non-type-base rejection.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__mro_entries__",
             make_builtin_function_with_arity(
                 "__mro_entries__",
@@ -12210,35 +12590,35 @@ fn init_union_type(ns: PyObjectRef) {
                     )))
                 },
                 2,
-            ),
+            )
         )
     };
     // UnionType.__getitem__ (`_pypy_generic_alias.py`) — substitute the
     // free parameters with `items`, then fold the results back into a union
     // with `|`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getitem__",
-            make_builtin_function("__getitem__", union_getitem),
+            make_builtin_function("__getitem__", union_getitem)
         )
     };
     // UnionType.__class_getitem__ — `typing.Union` is this type, so
     // `Union[int, str]` folds members into a union.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__class_getitem__",
             pyre_object::function::w_classmethod_new(make_builtin_function(
                 "__class_getitem__",
-                union_class_getitem,
-            )),
+                union_class_getitem
+            ),)
         )
     };
     // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__or__",
             make_builtin_function_with_arity(
                 "__or__",
@@ -12256,13 +12636,13 @@ fn init_union_type(ns: PyObjectRef) {
                     }
                 },
                 2,
-            ),
+            )
         )
     };
     // UnionType.__ror__
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ror__",
             make_builtin_function_with_arity(
                 "__ror__",
@@ -12280,14 +12660,14 @@ fn init_union_type(ns: PyObjectRef) {
                     }
                 },
                 2,
-            ),
+            )
         )
     };
     // UnionType.__eq__ — `set(self.__args__) == set(other.__args__)`
     // (`_pypy_generic_alias.py`).
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__eq__",
             make_builtin_function_with_arity(
                 "__eq__",
@@ -12302,37 +12682,37 @@ fn init_union_type(ns: PyObjectRef) {
                     ))
                 },
                 2,
-            ),
+            )
         )
     };
     // These are slots for ordinary operations, but CPython 3.14 and PyPy
     // expose them as callable attributes on union instances as well.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
-            make_builtin_function_with_arity("__repr__", union_repr_method, 1),
+            make_builtin_function_with_arity("__repr__", union_repr_method, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__hash__",
-            make_builtin_function_with_arity("__hash__", union_hash_method, 1),
+            make_builtin_function_with_arity("__hash__", union_hash_method, 1)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__mro_entries__",
-            make_builtin_function_with_arity("__mro_entries__", union_mro_entries_method, 2),
+            make_builtin_function_with_arity("__mro_entries__", union_mro_entries_method, 2)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ne__",
-            make_builtin_function_with_arity("__ne__", union_ne_method, 2),
+            make_builtin_function_with_arity("__ne__", union_ne_method, 2)
         )
     };
     for (name, method) in [
@@ -12342,29 +12722,23 @@ fn init_union_type(ns: PyObjectRef) {
         ("__ge__", union_ordering_method),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, method, 2),
+                make_builtin_function_with_arity(name, method, 2)
             )
         };
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getattribute__",
-            make_builtin_function_with_arity("__getattribute__", union_getattribute_method, 2),
+            make_builtin_function_with_arity("__getattribute__", union_getattribute_method, 2)
         )
     };
     // `_pypy_generic_alias.py:322`: prevent the sequence protocol from using
     // `__getitem__` as an iteration fallback.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__iter__",
-            pyre_object::w_none(),
-        )
-    };
+    unsafe { crate::__pyre_put_new!(ns_slot, "__iter__", pyre_object::w_none()) };
 }
 
 static GETSET_DESCRIPTOR_TYPE: pyre_object::gc_roots::RootedOnceRef =
@@ -12710,6 +13084,9 @@ fn call_getset_fset_direct(
 
 /// typedef.py GetSetProperty.typedef = TypeDef("getset_descriptor", ...)
 fn init_getset_descriptor_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // typedef.py GetSetProperty.descr_property_get
     //
     // ```python
@@ -12734,8 +13111,8 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
     //                                                space.newtext(self.name)]))
     // ```
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__get__",
             make_descr_get_builtin(|args| {
                 crate::type_methods::arity_at_least(args, "__get__", 1)?;
@@ -12745,7 +13122,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                     args[1],
                     args.get(2).copied().unwrap_or(pyre_object::PY_NULL),
                 )
-            }),
+            })
         )
     };
     // typedef.py GetSetProperty.descr_property_set
@@ -12765,10 +13142,10 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
     //                                            w_value]))
     // ```
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__set__",
-            make_builtin_function_with_arity("__set__", __majit_wrap_getset_descr_property_set, 3),
+            make_builtin_function_with_arity("__set__", __majit_wrap_getset_descr_property_set, 3,)
         )
     };
     // typedef.py GetSetProperty.descr_property_del
@@ -12787,8 +13164,8 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
     //                                            space.newtext(self.name)]))
     // ```
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__delete__",
             make_builtin_function_with_arity(
                 "__delete__",
@@ -12859,15 +13236,15 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                     }
                 },
                 2,
-            ),
+            )
         )
     };
     // CPython 3.14 `PyGetSetDescr_Type.tp_repr` renders
     // `<attribute 'name' of 'Owner' objects>`. PyPy's GetSetProperty typedef
     // has no explicit repr; this is the selected 3.14 surface.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -12894,7 +13271,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                     }))
                 },
                 1,
-            ),
+            )
         )
     };
     // The four metadata getsets (typedef.py:470-473
@@ -12960,91 +13337,108 @@ fn patch_getset_descriptor_metadata() {
     //     return space.newtext(qualname)
     // ```
     let _roots = pyre_object::gc_roots::push_roots();
-    let tp = pyre_object::gc_roots::pin_root(tp);
+    let tp_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _tp = pyre_object::gc_roots::pin_root(tp);
+    let qualname_meta_getter = make_builtin_function_with_arity(
+        "__qualname__",
+        |args| {
+            let mut descr = args[1];
+            if descr.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            unsafe {
+                let cached = pyre_object::typedef::w_getset_get_qualname(descr);
+                if !cached.is_null() {
+                    return Ok(cached);
+                }
+                // typedef.py _calculate_qualname:
+                //   if self.reqcls is None: type_qualname = '?'
+                //   else:
+                //       w_type = space.gettypeobject(self.reqcls.typedef)
+                //       type_qualname = space.text_w(
+                //           space.getattr(w_type, space.newtext('__qualname__')))
+                //
+                // PyPy reads the bound class's `__qualname__`
+                // (which respects nested-class scoping and any
+                // explicit `__qualname__` assignment in the class
+                // body), NOT the bare `__name__`.  Pyre's
+                // `getattr(w_type, '__qualname__')` resolves
+                // through the type-side __qualname__ getset that
+                // already mirrors PyPy's lookup-then-fallback
+                // chain (`baseobjspace.rs`).
+                // PyPy's original only consults `reqcls`. During type
+                // materialisation `copy_for_type` deliberately leaves
+                // reqcls null and records the concrete owner in
+                // `w_objclass`; CPython 3.14 uses that owner for both
+                // __objclass__ and __qualname__, so prefer it here.
+                let owner = getset_descriptor_owner(descr);
+                let type_qualname = if owner.is_null() {
+                    "?".to_string()
+                } else {
+                    descriptor_owner_qualname(owner)
+                };
+                let name_obj = pyre_object::typedef::w_getset_get_name(descr);
+                let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
+                    pyre_object::with_roots!(descr => crate::baseobjspace::str_utf8_w(name_obj))?
+                        .to_string()
+                } else {
+                    "<generic property>".to_string()
+                };
+                let combined = pyre_object::w_str_new_managed(&format!("{type_qualname}.{name}"));
+                pyre_object::typedef::w_getset_set_qualname(descr, combined);
+                Ok(combined)
+            }
+        },
+        2,
+    );
+    let qualname_meta_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(qualname_meta_getter);
     let descr = copy_for_type(
         make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "__qualname__",
-                |args| {
-                    let mut descr = args[1];
-                    if descr.is_null() {
-                        return Ok(pyre_object::w_none());
-                    }
-                    unsafe {
-                        let cached = pyre_object::typedef::w_getset_get_qualname(descr);
-                        if !cached.is_null() {
-                            return Ok(cached);
-                        }
-                        // typedef.py _calculate_qualname:
-                        //   if self.reqcls is None: type_qualname = '?'
-                        //   else:
-                        //       w_type = space.gettypeobject(self.reqcls.typedef)
-                        //       type_qualname = space.text_w(
-                        //           space.getattr(w_type, space.newtext('__qualname__')))
-                        //
-                        // PyPy reads the bound class's `__qualname__`
-                        // (which respects nested-class scoping and any
-                        // explicit `__qualname__` assignment in the class
-                        // body), NOT the bare `__name__`.  Pyre's
-                        // `getattr(w_type, '__qualname__')` resolves
-                        // through the type-side __qualname__ getset that
-                        // already mirrors PyPy's lookup-then-fallback
-                        // chain (`baseobjspace.rs`).
-                        // PyPy's original only consults `reqcls`. During type
-                        // materialisation `copy_for_type` deliberately leaves
-                        // reqcls null and records the concrete owner in
-                        // `w_objclass`; CPython 3.14 uses that owner for both
-                        // __objclass__ and __qualname__, so prefer it here.
-                        let owner = getset_descriptor_owner(descr);
-                        let type_qualname = if owner.is_null() {
-                            "?".to_string()
-                        } else {
-                            descriptor_owner_qualname(owner)
-                        };
-                        let name_obj = pyre_object::typedef::w_getset_get_name(descr);
-                        let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
-                            pyre_object::with_roots!(descr => crate::baseobjspace::str_utf8_w(name_obj))?.to_string()
-                        } else {
-                            "<generic property>".to_string()
-                        };
-                        let combined =
-                            pyre_object::w_str_new_managed(&format!("{type_qualname}.{name}"));
-                        pyre_object::typedef::w_getset_set_qualname(descr, combined);
-                        Ok(combined)
-                    }
-                },
-                2,
-            ),
+            pyre_object::gc_roots::shadow_stack_get(qualname_meta_getter_slot),
             "__qualname__",
         ),
-        tp,
+        pyre_object::gc_roots::shadow_stack_get(tp_slot),
     );
-    let descr = pyre_object::gc_roots::pin_root(descr);
-    crate::type_dict_store(tp, "__qualname__", descr);
+    let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(descr);
+    crate::type_dict_store(
+        pyre_object::gc_roots::shadow_stack_get(tp_slot),
+        "__qualname__",
+        pyre_object::gc_roots::shadow_stack_get(descr_slot),
+    );
     // typedef.py __doc__ = interp_attrproperty('doc', ...)
+    let doc_meta_getter = make_builtin_function_with_arity(
+        "__doc__",
+        |args| {
+            let descr = args[1];
+            if descr.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
+            if doc.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            Ok(doc)
+        },
+        2,
+    );
+    let doc_meta_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(doc_meta_getter);
     let descr = copy_for_type(
         make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "__doc__",
-                |args| {
-                    let descr = args[1];
-                    if descr.is_null() {
-                        return Ok(pyre_object::w_none());
-                    }
-                    let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
-                    if doc.is_null() {
-                        return Ok(pyre_object::w_none());
-                    }
-                    Ok(doc)
-                },
-                2,
-            ),
+            pyre_object::gc_roots::shadow_stack_get(doc_meta_getter_slot),
             "__doc__",
         ),
-        tp,
+        pyre_object::gc_roots::shadow_stack_get(tp_slot),
     );
-    let descr = pyre_object::gc_roots::pin_root(descr);
-    crate::type_dict_store(tp, "__doc__", descr);
+    let descr_slot_2 = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(descr);
+    crate::type_dict_store(
+        pyre_object::gc_roots::shadow_stack_get(tp_slot),
+        "__doc__",
+        pyre_object::gc_roots::shadow_stack_get(descr_slot_2),
+    );
 }
 
 #[inline]
@@ -13462,6 +13856,9 @@ fn type_weakrefoffset_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 fn init_type_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // `type` carries the weakref capability without publishing a
     // `__weakref__` descriptor: `PyType_Type` sets `tp_weaklistoffset` but its
     // getset table has no `__weakref__` entry, so `type.__dict__` has none and
@@ -13472,15 +13869,15 @@ fn init_type_type(ns: PyObjectRef) {
     // has to stay that class's own descriptor.
     // type.__new__(metatype, name, bases, dict) — creates new type
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__new__",
-            make_new_descr(crate::builtins::type_descr_new),
+            make_new_descr(crate::builtins::type_descr_new)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__sizeof__",
             crate::gateway::make_builtin_function_with_arity_and_text_signature(
                 "__sizeof__",
@@ -13506,7 +13903,7 @@ fn init_type_type(ns: PyObjectRef) {
                 },
                 1,
                 "($self, /)",
-            ),
+            )
         )
     };
     // `type[int]` builds a GenericAlias, but `type` carries no
@@ -13519,8 +13916,8 @@ fn init_type_type(ns: PyObjectRef) {
     // counts only the arguments behind the receiver, which is its own gateway
     // parameter — so keywords never enter the total.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__init__",
             make_builtin_function("__init__", |args| {
                 let (positional, _) = crate::builtins::split_builtin_kwargs(args);
@@ -13531,7 +13928,7 @@ fn init_type_type(ns: PyObjectRef) {
                     ));
                 }
                 Ok(pyre_object::w_none())
-            }),
+            })
         )
     };
     // CPython 3.14 typeobject.c slotdefs: type has its own native
@@ -13540,8 +13937,8 @@ fn init_type_type(ns: PyObjectRef) {
     // indirect call to object.__setattr__ must not jump over type's native
     // override, while an explicit type.__setattr__ remains valid.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__setattr__",
             make_builtin_function_with_arity(
                 "__setattr__",
@@ -13558,10 +13955,10 @@ fn init_type_type(ns: PyObjectRef) {
                     }
                 },
                 3,
-            ),
+            )
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__delattr__",
             make_builtin_function_with_arity(
                 "__delattr__",
@@ -13578,7 +13975,7 @@ fn init_type_type(ns: PyObjectRef) {
                     }
                 },
                 2,
-            ),
+            )
         );
     }
     // type.__call__(cls, *args, **kwargs) — PyPy typeobject.py
@@ -13588,8 +13985,8 @@ fn init_type_type(ns: PyObjectRef) {
     // entry to preserve the complete Arguments shape while resolving to the
     // default __new__/__init__ behaviour.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__call__",
             crate::make_builtin_function_with_signature(
                 "__call__",
@@ -13654,15 +14051,15 @@ fn init_type_type(ns: PyObjectRef) {
                     )
                 },
                 crate::Signature::new(vec!["cls"], Some("args"), Some("kwargs"), 0, 1),
-            ),
+            )
         )
     };
     // typeobject.py `W_TypeObject.descr_repr`.  Native `py_repr` handles the
     // common direct path, but the descriptor must also exist for
     // `super().__repr__()` in user metaclasses such as typing._AnyMeta.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -13681,7 +14078,7 @@ fn init_type_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_str_from_wtf8_managed(rendered))
                 },
                 1,
-            ),
+            )
         )
     };
     // typeobject.py `W_TypeObject.descr_getattribute`.  The terminal
@@ -13689,8 +14086,8 @@ fn init_type_type(ns: PyObjectRef) {
     // (metatype data descriptor, class MRO, metatype non-data descriptor);
     // expose it as type's own descriptor as PyPy's TypeDef does.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__getattribute__",
             make_builtin_function_with_arity(
                 "__getattribute__",
@@ -13714,14 +14111,14 @@ fn init_type_type(ns: PyObjectRef) {
                     }
                 },
                 2,
-            ),
+            )
         )
     };
     // typeobject.py:1234-1236 `descr__dir__` delegates to util.py `_classdir`
     // and materialises the result as a list.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__dir__",
             make_builtin_function_with_arity(
                 "__dir__",
@@ -13736,7 +14133,7 @@ fn init_type_type(ns: PyObjectRef) {
                     crate::builtins::type_dir_default(w_type)
                 },
                 1,
-            ),
+            )
         )
     };
     // CPython 3.14 `typeobject.c:type_members`: these are read-only member
@@ -13748,35 +14145,44 @@ fn init_type_type(ns: PyObjectRef) {
         ("__dictoffset__", type_dictoffset_getter as DunderFn),
         ("__weakrefoffset__", type_weakrefoffset_getter as DunderFn),
     ] {
+        // The getter pin lives across this iteration's descriptor store.
+        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
         let getter = make_builtin_function_with_arity(name, function, 2);
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_getset_property_named(getter, PY_NULL, PY_NULL, name),
+                make_getset_property_named(
+                    pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                    PY_NULL,
+                    PY_NULL,
+                    name
+                )
             )
         };
     }
     // typeobject.py `W_TypeObject.descr_or` / `descr_ror` delegate
     // to `_pypy_generic_alias._create_union`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__or__",
             make_builtin_function_with_arity(
                 "__or__",
                 |args| crate::_pypy_generic_alias::create_union(args[0], args[1]),
                 2,
-            ),
+            )
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__ror__",
             make_builtin_function_with_arity(
                 "__ror__",
                 |args| crate::_pypy_generic_alias::create_union(args[1], args[0]),
                 2,
-            ),
+            )
         );
     }
     // typeobject.py / W_TypeObject.typedef:1317-1318.
@@ -13791,15 +14197,19 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let instancecheck_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(instancecheck);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__instancecheck__",
-            instancecheck,
+            pyre_object::gc_roots::shadow_stack_get(instancecheck_slot)
         );
+        let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("($self, instance, /)"));
         crate::function::fset_func_text_signature(
-            instancecheck,
-            pyre_object::w_str_new("($self, instance, /)"),
+            pyre_object::gc_roots::shadow_stack_get(instancecheck_slot),
+            pyre_object::gc_roots::shadow_stack_get(signature_slot),
         );
     }
     let subclasscheck = make_builtin_function_with_arity(
@@ -13811,19 +14221,23 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let subclasscheck_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(subclasscheck);
     unsafe {
         // CPython/PyPy expose these method-descriptor signatures to inspect.
         // Keep slot wrappers such as type.__or__ distinct: inspect's PyPy
         // compatibility path intentionally does not treat those as supported
         // MethodDescriptorType callables.
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__subclasscheck__",
-            subclasscheck,
+            pyre_object::gc_roots::shadow_stack_get(subclasscheck_slot)
         );
+        let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("($self, subclass, /)"));
         crate::function::fset_func_text_signature(
-            subclasscheck,
-            pyre_object::w_str_new("($self, subclass, /)"),
+            pyre_object::gc_roots::shadow_stack_get(subclasscheck_slot),
+            pyre_object::gc_roots::shadow_stack_get(signature_slot),
         );
     }
     // type.__annotations__ / __dict__ / __mro__ / __name__ / __bases__ /
@@ -13847,21 +14261,31 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let annotations_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotations_getter);
     let annotations_setter = make_builtin_function_with_arity(
         "__annotations__",
         |args| crate::baseobjspace::type_set_annotations(args[1], args[2]),
         3,
     );
+    let annotations_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotations_setter);
     let annotations_deleter = make_builtin_function_with_arity(
         "__annotations__",
         |args| crate::baseobjspace::type_del_annotations(args[1]),
         2,
     );
+    let annotations_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotations_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__annotations__",
-            make_getset_property(annotations_getter, annotations_setter, annotations_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(annotations_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(annotations_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(annotations_deleter_slot)
+            )
         )
     };
 
@@ -13885,6 +14309,8 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let abstractmethods_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(abstractmethods_getter);
     let abstractmethods_setter = make_builtin_function_with_arity(
         "__abstractmethods__",
         |args| {
@@ -13924,6 +14350,8 @@ fn init_type_type(ns: PyObjectRef) {
         },
         3,
     );
+    let abstractmethods_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(abstractmethods_setter);
     let abstractmethods_deleter = make_builtin_function_with_arity(
         "__abstractmethods__",
         |args| {
@@ -13950,16 +14378,18 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let abstractmethods_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(abstractmethods_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__abstractmethods__",
             make_getset_property_named(
-                abstractmethods_getter,
-                abstractmethods_setter,
-                abstractmethods_deleter,
+                pyre_object::gc_roots::shadow_stack_get(abstractmethods_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(abstractmethods_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(abstractmethods_deleter_slot),
                 "__abstractmethods__",
-            ),
+            )
         )
     };
 
@@ -13972,11 +14402,15 @@ fn init_type_type(ns: PyObjectRef) {
         |args| crate::baseobjspace::type_get_annotate(args[1]),
         2,
     );
+    let annotate_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_getter);
     let annotate_setter = make_builtin_function_with_arity(
         "__annotate__",
         |args| crate::baseobjspace::type_set_annotate(args[1], args[2]),
         3,
     );
+    let annotate_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_setter);
     let annotate_deleter = make_builtin_function_with_arity(
         "__annotate__",
         |_args| {
@@ -13986,16 +14420,18 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let annotate_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__annotate__",
             make_getset_property_named(
-                annotate_getter,
-                annotate_setter,
-                annotate_deleter,
+                pyre_object::gc_roots::shadow_stack_get(annotate_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(annotate_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(annotate_deleter_slot),
                 "__annotate__",
-            ),
+            )
         )
     };
 
@@ -14004,11 +14440,15 @@ fn init_type_type(ns: PyObjectRef) {
         |args| crate::baseobjspace::type_get_type_params(args[1]),
         2,
     );
+    let type_params_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(type_params_getter);
     let type_params_setter = make_builtin_function_with_arity(
         "__type_params__",
         |args| crate::baseobjspace::type_set_type_params(args[1], args[2]),
         3,
     );
+    let type_params_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(type_params_setter);
     let type_params_deleter = make_builtin_function_with_arity(
         "__type_params__",
         |args| {
@@ -14019,16 +14459,18 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let type_params_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(type_params_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__type_params__",
             make_getset_property_named(
-                type_params_getter,
-                type_params_setter,
-                type_params_deleter,
+                pyre_object::gc_roots::shadow_stack_get(type_params_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(type_params_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(type_params_deleter_slot),
                 "__type_params__",
-            ),
+            )
         )
     };
 
@@ -14039,21 +14481,32 @@ fn init_type_type(ns: PyObjectRef) {
         |args| crate::baseobjspace::type_get_doc(args[1]),
         2,
     );
+    let doc_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(doc_getter);
     let doc_setter = make_builtin_function_with_arity(
         "__doc__",
         |args| crate::baseobjspace::type_set_doc(args[1], args[2]),
         3,
     );
+    let doc_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(doc_setter);
     let doc_deleter = make_builtin_function_with_arity(
         "__doc__",
         |args| crate::baseobjspace::type_del_doc(args[1]),
         2,
     );
+    let doc_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(doc_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
-            make_getset_property_named(doc_getter, doc_setter, doc_deleter, "__doc__"),
+            make_getset_property_named(
+                pyre_object::gc_roots::shadow_stack_get(doc_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(doc_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(doc_deleter_slot),
+                "__doc__"
+            )
         )
     };
 
@@ -14074,11 +14527,13 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let mro_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(mro_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__mro__",
-            make_getset_descriptor(mro_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(mro_getter_slot))
         )
     };
 
@@ -14088,6 +14543,18 @@ fn init_type_type(ns: PyObjectRef) {
         |args| Ok(w_int_new(unsafe { pyre_object::w_type_get_flags(args[1]) })),
         2,
     );
+    let flags_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(flags_getter);
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__flags__",
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(flags_getter_slot),
+                "__flags__",
+            )
+        )
+    };
     let base_getter = make_builtin_function_with_arity(
         "__base__",
         |args| {
@@ -14096,15 +14563,18 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
-    for (name, getter) in [("__flags__", flags_getter), ("__base__", base_getter)] {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                make_getset_descriptor_named(getter, name),
+    let base_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(base_getter);
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__base__",
+            make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(base_getter_slot),
+                "__base__",
             )
-        };
-    }
+        )
+    };
 
     // typeobject.py `type_get_text_signature` and
     // W_TypeObject.typedef's `__text_signature__` GetSetProperty. Keeping
@@ -14143,16 +14613,18 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let text_signature_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(text_signature_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__text_signature__",
             make_getset_property_named(
-                text_signature_getter,
+                pyre_object::gc_roots::shadow_stack_get(text_signature_getter_slot),
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
                 "__text_signature__",
-            ),
+            )
         )
     };
 
@@ -14175,7 +14647,15 @@ fn init_type_type(ns: PyObjectRef) {
         1,
         "Return a type's method resolution order.",
     );
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "mro", mro_method) };
+    let mro_method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(mro_method);
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "mro",
+            pyre_object::gc_roots::shadow_stack_get(mro_method_slot)
+        )
+    };
 
     // typeobject.py `descr___prepare__` —
     //
@@ -14190,8 +14670,8 @@ fn init_type_type(ns: PyObjectRef) {
     // in, so a metaclass that does not override it never sees the name,
     // bases, or keywords `build_class` forwards.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__prepare__",
             pyre_object::function::w_classmethod_new(
                 crate::gateway::make_builtin_function_with_text_signature(
@@ -14199,7 +14679,7 @@ fn init_type_type(ns: PyObjectRef) {
                     |_args| Ok(pyre_object::w_module_dict_new()),
                     "($cls, name, bases, /, **kwds)",
                 ),
-            ),
+            )
         )
     };
 
@@ -14232,11 +14712,13 @@ fn init_type_type(ns: PyObjectRef) {
                 .collect(),
         ))
     });
+    let subclasses_method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(subclasses_method);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__subclasses__",
-            subclasses_method,
+            pyre_object::gc_roots::shadow_stack_get(subclasses_method_slot)
         )
     };
 
@@ -14256,6 +14738,8 @@ fn init_type_type(ns: PyObjectRef) {
         2,
         "($self, inst, /)",
     );
+    let instancecheck_method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(instancecheck_method);
     let subclasscheck_method = crate::gateway::make_builtin_function_with_arity_and_text_signature(
         "__subclasscheck__",
         |args| {
@@ -14267,16 +14751,18 @@ fn init_type_type(ns: PyObjectRef) {
         2,
         "($self, sub, /)",
     );
+    let subclasscheck_method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(subclasscheck_method);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__instancecheck__",
-            instancecheck_method,
+            pyre_object::gc_roots::shadow_stack_get(instancecheck_method_slot)
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__subclasscheck__",
-            subclasscheck_method,
+            pyre_object::gc_roots::shadow_stack_get(subclasscheck_method_slot)
         );
     };
 
@@ -14324,6 +14810,8 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let module_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module_getter);
     let module_setter = make_builtin_function_with_arity(
         "__module__",
         |args| {
@@ -14354,16 +14842,21 @@ fn init_type_type(ns: PyObjectRef) {
         },
         3,
     );
+    let module_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module_setter);
+    let module_deleter = make_builtin_function_with_arity("__module__", type_del_module, 2);
+    let module_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__module__",
             make_getset_property_named(
-                module_getter,
-                module_setter,
-                make_builtin_function_with_arity("__module__", type_del_module, 2),
+                pyre_object::gc_roots::shadow_stack_get(module_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(module_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(module_deleter_slot),
                 "__module__",
-            ),
+            )
         )
     };
 
@@ -14380,11 +14873,13 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let dict_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__dict__",
-            make_getset_descriptor(dict_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(dict_getter_slot))
         )
     };
 
@@ -14393,19 +14888,26 @@ fn init_type_type(ns: PyObjectRef) {
         |args| unsafe { Ok(pyre_object::w_type_get_name_obj(args[1])) },
         2,
     );
+    let name_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_getter);
     // typeobject.py descr_set__name__
     let name_setter =
         make_builtin_function_with_arity("__name__", __majit_wrap_type_descr_set_name, 3);
+    let name_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_setter);
+    let name_deleter = make_builtin_function_with_arity("__name__", type_del_name, 2);
+    let name_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__name__",
             make_getset_property_named(
-                name_getter,
-                name_setter,
-                make_builtin_function_with_arity("__name__", type_del_name, 2),
+                pyre_object::gc_roots::shadow_stack_get(name_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(name_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(name_deleter_slot),
                 "__name__",
-            ),
+            )
         )
     };
 
@@ -14416,6 +14918,8 @@ fn init_type_type(ns: PyObjectRef) {
         |args| unsafe { Ok(pyre_object::w_type_get_qualname_obj(args[1])) },
         2,
     );
+    let qualname_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(qualname_getter);
     let qualname_setter = make_builtin_function_with_arity(
         "__qualname__",
         |args| {
@@ -14437,16 +14941,21 @@ fn init_type_type(ns: PyObjectRef) {
         },
         3,
     );
+    let qualname_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(qualname_setter);
+    let qualname_deleter = make_builtin_function_with_arity("__qualname__", type_del_qualname, 2);
+    let qualname_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(qualname_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__qualname__",
             make_getset_property_named(
-                qualname_getter,
-                qualname_setter,
-                make_builtin_function_with_arity("__qualname__", type_del_qualname, 2),
+                pyre_object::gc_roots::shadow_stack_get(qualname_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(qualname_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(qualname_deleter_slot),
                 "__qualname__",
-            ),
+            )
         )
     };
 
@@ -14461,17 +14970,24 @@ fn init_type_type(ns: PyObjectRef) {
         },
         2,
     );
+    let bases_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(bases_getter);
     let bases_setter = make_builtin_function_with_arity("__bases__", type_set_bases, 3);
+    let bases_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(bases_setter);
+    let bases_deleter = make_builtin_function_with_arity("__bases__", type_del_bases, 2);
+    let bases_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(bases_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__bases__",
             make_getset_property_named(
-                bases_getter,
-                bases_setter,
-                make_builtin_function_with_arity("__bases__", type_del_bases, 2),
+                pyre_object::gc_roots::shadow_stack_get(bases_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(bases_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(bases_deleter_slot),
                 "__bases__",
-            ),
+            )
         )
     };
     // CPython 3.14 Argument Clinic metadata for type's callable descriptor
@@ -14495,9 +15011,11 @@ fn init_type_type(ns: PyObjectRef) {
         ("__dir__", "($self, /)"),
         ("__sizeof__", "($self, /)"),
     ] {
-        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            .expect("type TypeDef callable was just installed");
-        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
     }
 }
 
@@ -14851,6 +15369,9 @@ fn function_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate:
 }
 
 fn init_function_type_common(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // `pypy/interpreter/typedef.py __doc__ = getset_func_doc` —
     // `getset_func_doc = GetSetProperty(Function.fget_func_doc,
     // fset_func_doc, fdel_func_doc)` (typedef.py) lives on
@@ -14870,6 +15391,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         )?;
         Ok(unsafe { crate::function::fget_func_doc(func) })
     });
+    let doc_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(doc_getter);
     let doc_setter = make_builtin_function("__doc__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -14879,6 +15402,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_doc(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let doc_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(doc_setter);
     let doc_deleter = make_builtin_function("__doc__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -14887,11 +15412,17 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fdel_func_doc(func)? };
         Ok(pyre_object::w_none())
     });
+    let doc_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(doc_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__doc__",
-            make_getset_property(doc_getter, doc_setter, doc_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(doc_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(doc_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(doc_deleter_slot)
+            )
         )
     };
     // `pypy/interpreter/typedef.py:811 __annotations__ =
@@ -14911,6 +15442,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         )?;
         unsafe { crate::function::function_get_annotations(func) }
     });
+    let ann_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ann_getter);
     let ann_setter = make_builtin_function("__annotations__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -14920,6 +15453,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_annotations(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let ann_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ann_setter);
     let ann_deleter = make_builtin_function("__annotations__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -14928,11 +15463,17 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fdel_func_annotations(func)? };
         Ok(pyre_object::w_none())
     });
+    let ann_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ann_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__annotations__",
-            make_getset_property(ann_getter, ann_setter, ann_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(ann_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(ann_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(ann_deleter_slot)
+            )
         )
     };
     // ── Remaining `pypy/interpreter/typedef.py:758-815 Function.typedef`
@@ -14954,6 +15495,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         )?;
         Ok(unsafe { crate::function::fget_func_name(func) })
     });
+    let name_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_getter);
     let name_setter = make_builtin_function("__name__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -14963,6 +15506,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_name(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let name_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_setter);
     let name_deleter = make_builtin_function("__name__", |args| {
         function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -14972,11 +15517,17 @@ fn init_function_type_common(ns: PyObjectRef) {
             "__name__ must be set to a string object",
         ))
     });
+    let name_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__name__",
-            make_getset_property(name_getter, name_setter, name_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(name_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(name_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(name_deleter_slot)
+            )
         )
     };
     // `typedef.py getset_func_qualname = GetSetProperty(
@@ -14992,6 +15543,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         )?;
         Ok(unsafe { crate::function::function_get_qualname_obj(func) })
     });
+    let qualname_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(qualname_getter);
     let qualname_setter = make_builtin_function("__qualname__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15001,6 +15554,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_qualname(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let qualname_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(qualname_setter);
     let qualname_deleter = make_builtin_function("__qualname__", |args| {
         function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15010,11 +15565,17 @@ fn init_function_type_common(ns: PyObjectRef) {
             "__qualname__ must be set to a string object",
         ))
     });
+    let qualname_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(qualname_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__qualname__",
-            make_getset_property(qualname_getter, qualname_setter, qualname_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(qualname_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(qualname_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(qualname_deleter_slot)
+            )
         )
     };
     // `typedef.py getset___module__ = GetSetProperty(
@@ -15026,6 +15587,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         )?;
         Ok(unsafe { crate::function::fget___module__(func) })
     });
+    let module_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module_getter);
     let module_setter = make_builtin_function("__module__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15035,6 +15598,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset___module__(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let module_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module_setter);
     let module_deleter = make_builtin_function("__module__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15043,11 +15608,17 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fdel___module__(func)? };
         Ok(pyre_object::w_none())
     });
+    let module_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__module__",
-            make_getset_property(module_getter, module_setter, module_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(module_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(module_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(module_deleter_slot)
+            )
         )
     };
     // `typedef.py getset_func_defaults = GetSetProperty(
@@ -15059,6 +15630,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         )?;
         Ok(unsafe { crate::function::fget_func_defaults(func) })
     });
+    let defaults_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(defaults_getter);
     let defaults_setter = make_builtin_function("__defaults__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15068,6 +15641,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_defaults(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let defaults_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(defaults_setter);
     let defaults_deleter = make_builtin_function("__defaults__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15076,11 +15651,17 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fdel_func_defaults(func)? };
         Ok(pyre_object::w_none())
     });
+    let defaults_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(defaults_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__defaults__",
-            make_getset_property(defaults_getter, defaults_setter, defaults_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(defaults_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(defaults_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(defaults_deleter_slot)
+            )
         )
     };
     // `typedef.py getset_func_kwdefaults = GetSetProperty(...)`.
@@ -15091,6 +15672,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         )?;
         Ok(unsafe { crate::function::fget_func_kwdefaults(func) })
     });
+    let kwdefaults_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwdefaults_getter);
     let kwdefaults_setter = make_builtin_function("__kwdefaults__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15100,6 +15683,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_kwdefaults(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let kwdefaults_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwdefaults_setter);
     let kwdefaults_deleter = make_builtin_function("__kwdefaults__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15108,11 +15693,17 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fdel_func_kwdefaults(func)? };
         Ok(pyre_object::w_none())
     });
+    let kwdefaults_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwdefaults_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__kwdefaults__",
-            make_getset_property(kwdefaults_getter, kwdefaults_setter, kwdefaults_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(kwdefaults_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(kwdefaults_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(kwdefaults_deleter_slot)
+            )
         )
     };
     // `typedef.py getset_func_code = GetSetProperty(
@@ -15125,6 +15716,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         let raw = unsafe { crate::function::fget_func_code(func) };
         Ok(raw as pyre_object::PyObjectRef)
     });
+    let code_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(code_getter);
     let code_setter = make_builtin_function("__code__", |args| {
         let func = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15134,6 +15727,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_code(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let code_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(code_setter);
     let code_deleter = make_builtin_function("__code__", |args| {
         function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -15143,11 +15738,17 @@ fn init_function_type_common(ns: PyObjectRef) {
             "__code__ must be set to a code object",
         ))
     });
+    let code_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(code_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__code__",
-            make_getset_property(code_getter, code_setter, code_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(code_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(code_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(code_deleter_slot)
+            )
         )
     };
     // `typedef.py __closure__ = GetSetProperty(Function.fget_func_closure)`
@@ -15159,11 +15760,13 @@ fn init_function_type_common(ns: PyObjectRef) {
         )?;
         Ok(unsafe { crate::function::fget_func_closure(func) })
     });
+    let closure_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(closure_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__closure__",
-            make_getset_descriptor(closure_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(closure_getter_slot))
         )
     };
     // `typedef.py __globals__ = interp_attrproperty_w('w_func_globals',
@@ -15186,11 +15789,13 @@ fn init_function_type_common(ns: PyObjectRef) {
             Ok(w_value)
         }
     });
+    let globals_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(globals_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__globals__",
-            make_getset_descriptor(globals_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(globals_getter_slot))
         )
     };
     // CPython 3.14 `func.__builtins__` is the construction-time
@@ -15210,11 +15815,15 @@ fn init_function_type_common(ns: PyObjectRef) {
             Ok(w_builtin)
         }
     });
+    let func_builtins_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(func_builtins_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__builtins__",
-            make_getset_descriptor(func_builtins_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(
+                func_builtins_getter_slot
+            ))
         )
     };
     // `pypy/interpreter/typedef.py __objclass__ = getset_func_objclass`
@@ -15227,20 +15836,25 @@ fn init_function_type_common(ns: PyObjectRef) {
     // introspection helpers (`inspect.getfullargspec` etc.); raises
     // AttributeError when no class is bound (`function.py:498-501`).
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        let objclass_getter = make_builtin_function_with_arity(
             "__objclass__",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "__objclass__",
-                |args| {
-                    let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if func.is_null() {
-                        return Err(crate::PyError::attribute_error("__objclass__"));
-                    }
-                    unsafe { crate::function::fget_func_objclass(func) }
-                },
-                2,
-            )),
+            |args| {
+                let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if func.is_null() {
+                    return Err(crate::PyError::attribute_error("__objclass__"));
+                }
+                unsafe { crate::function::fget_func_objclass(func) }
+            },
+            2,
+        );
+        let objclass_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(objclass_getter);
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__objclass__",
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(
+                objclass_getter_slot
+            ))
         )
     };
     // `pypy/interpreter/typedef.py:806 __text_signature__ =
@@ -15258,6 +15872,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         }
         unsafe { crate::function::fget_func_text_signature(func) }
     });
+    let text_signature_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(text_signature_getter);
     let text_signature_setter = make_builtin_function("__text_signature__", |args| {
         let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
         let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
@@ -15266,15 +15882,17 @@ fn init_function_type_common(ns: PyObjectRef) {
         }
         Ok(pyre_object::w_none())
     });
+    let text_signature_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(text_signature_setter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__text_signature__",
             make_getset_property(
-                text_signature_getter,
-                text_signature_setter,
+                pyre_object::gc_roots::shadow_stack_get(text_signature_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(text_signature_setter_slot),
                 pyre_object::PY_NULL,
-            ),
+            )
         )
     };
     // `pypy/interpreter/typedef.py:809 __defaults_count__ =
@@ -15290,37 +15908,42 @@ fn init_function_type_common(ns: PyObjectRef) {
     // Pyre stores `defs_w` as either a tuple PyObjectRef or PY_NULL
     // (the latter mirrors PyPy's empty-list `[]`).
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        let defaults_count_getter = make_builtin_function_with_arity(
             "__defaults_count__",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "__defaults_count__",
-                |args| {
-                    let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if func.is_null() {
-                        return Ok(pyre_object::w_int_new(0));
-                    }
-                    let defaults = unsafe { crate::function::function_get_defaults(func) };
-                    let n = if defaults.is_null() {
-                        0
-                    } else if unsafe { pyre_object::is_tuple(defaults) } {
-                        unsafe { pyre_object::w_tuple_len(defaults) as i64 }
-                    } else {
-                        0
-                    };
-                    Ok(pyre_object::w_int_new(n))
-                },
-                2,
-            )),
+            |args| {
+                let func = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if func.is_null() {
+                    return Ok(pyre_object::w_int_new(0));
+                }
+                let defaults = unsafe { crate::function::function_get_defaults(func) };
+                let n = if defaults.is_null() {
+                    0
+                } else if unsafe { pyre_object::is_tuple(defaults) } {
+                    unsafe { pyre_object::w_tuple_len(defaults) as i64 }
+                } else {
+                    0
+                };
+                Ok(pyre_object::w_int_new(n))
+            },
+            2,
+        );
+        let defaults_count_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(defaults_count_getter);
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__defaults_count__",
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(
+                defaults_count_getter_slot
+            ))
         )
     };
     // typedef.py:793-794 `Function.typedef.__call__`; copied verbatim into
     // `BuiltinFunction.typedef` by `**Function.typedef.rawdict`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__call__",
-            make_builtin_function("__call__", function_descr_call),
+            make_builtin_function("__call__", function_descr_call)
         )
     };
 }
@@ -16201,19 +16824,25 @@ const DESCR_MEMBERS: [(&str, u32); 2] = [
 /// is left for `stamp_new_descr_self`, which fills every Member in a builtin
 /// namespace once the type object exists.
 fn install_descr_members(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     for (name, kind) in DESCR_MEMBERS {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                pyre_object::w_member_new_direct(kind, name.to_owned(), pyre_object::PY_NULL),
-            );
+                pyre_object::w_member_new_direct(kind, name.to_owned(), pyre_object::PY_NULL)
+            )
         }
     }
 }
 
 fn init_function_type(ns: PyObjectRef) {
-    init_function_type_common(ns);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    init_function_type_common(pyre_object::gc_roots::shadow_stack_get(ns_slot));
     // CPython 3.14 `func_memberlist`: these five entries are direct
     // member_descriptor objects. PyPy's equivalent values live in
     // Function.typedef as GetSetProperty; the observable descriptor kind is
@@ -16226,17 +16855,17 @@ fn init_function_type(ns: PyObjectRef) {
         ("__builtins__", pyre_object::MEMBER_FUNCTION_BUILTINS),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                pyre_object::w_member_new_direct(kind, name.to_owned(), pyre_object::PY_NULL),
-            );
+                pyre_object::w_member_new_direct(kind, name.to_owned(), pyre_object::PY_NULL)
+            )
         }
     }
     // CPython 3.14 func_repr: `<function {qualname} at {address}>`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -16248,17 +16877,21 @@ fn init_function_type(ns: PyObjectRef) {
                     // `function_get_qualname` can allocate the fallback string.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let function_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let function = pyre_object::gc_roots::pin_root(function);
+                    let _ = pyre_object::gc_roots::pin_root(function);
                     // `format!` renders the WTF-8 qualname through `Display`,
                     // which substitutes U+FFFD for a lone surrogate.
                     let mut repr = Wtf8Buf::from_string("<function ".to_string());
-                    repr.push_wtf8(&unsafe { crate::function::function_get_qualname(function) });
+                    repr.push_wtf8(&unsafe {
+                        crate::function::function_get_qualname(
+                            pyre_object::gc_roots::shadow_stack_get(function_slot),
+                        )
+                    });
                     let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
                     repr.push_str(&format!(" at {}>", crate::display::repr_gc_addr(function)));
                     Ok(pyre_object::w_str_from_wtf8_managed(repr))
                 },
                 1,
-            ),
+            )
         )
     };
     // PyPy typedef.py `getset_func_dict = GetSetProperty(
@@ -16275,6 +16908,8 @@ fn init_function_type(ns: PyObjectRef) {
         },
         2,
     );
+    let dict_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict_getter);
     let dict_setter = make_builtin_function_with_arity(
         "__dict__",
         |args| {
@@ -16286,6 +16921,8 @@ fn init_function_type(ns: PyObjectRef) {
         },
         3,
     );
+    let dict_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict_setter);
     let dict_deleter = make_builtin_function_with_arity(
         "__dict__",
         |args| {
@@ -16297,11 +16934,17 @@ fn init_function_type(ns: PyObjectRef) {
         },
         2,
     );
+    let dict_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__dict__",
-            make_getset_property(dict_getter, dict_setter, dict_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(dict_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(dict_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(dict_deleter_slot)
+            )
         )
     };
     // CPython 3.14 `function.__annotate__`: callable-or-None, not deletable.
@@ -16317,6 +16960,8 @@ fn init_function_type(ns: PyObjectRef) {
         }
         Ok(unsafe { crate::function::function_get_annotate(function) })
     });
+    let annotate_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_getter);
     let annotate_setter = make_builtin_function("__annotate__", |args| {
         let function = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -16326,6 +16971,8 @@ fn init_function_type(ns: PyObjectRef) {
         unsafe { crate::function::function_set_annotate(function, value)? };
         Ok(pyre_object::w_none())
     });
+    let annotate_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_setter);
     let annotate_deleter = make_builtin_function("__annotate__", |args| {
         let function = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -16334,11 +16981,17 @@ fn init_function_type(ns: PyObjectRef) {
         unsafe { crate::function::function_set_annotate(function, pyre_object::PY_NULL)? };
         Ok(pyre_object::w_none())
     });
+    let annotate_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__annotate__",
-            make_getset_property(annotate_getter, annotate_setter, annotate_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(annotate_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(annotate_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(annotate_deleter_slot)
+            )
         )
     };
     // CPython 3.14 `function.__type_params__`: tuple-only and not deletable.
@@ -16349,6 +17002,8 @@ fn init_function_type(ns: PyObjectRef) {
         )?;
         Ok(unsafe { crate::function::function_get_typeparams(function) })
     });
+    let typeparams_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(typeparams_getter);
     let typeparams_setter = make_builtin_function("__type_params__", |args| {
         let function = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -16358,6 +17013,8 @@ fn init_function_type(ns: PyObjectRef) {
         unsafe { crate::function::function_set_typeparams(function, value)? };
         Ok(pyre_object::w_none())
     });
+    let typeparams_setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(typeparams_setter);
     let typeparams_deleter = make_builtin_function("__type_params__", |args| {
         let function = function_receiver(
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
@@ -16366,11 +17023,17 @@ fn init_function_type(ns: PyObjectRef) {
         unsafe { crate::function::function_set_typeparams(function, pyre_object::PY_NULL)? };
         Ok(pyre_object::w_none())
     });
+    let typeparams_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(typeparams_deleter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__type_params__",
-            make_getset_property(typeparams_getter, typeparams_setter, typeparams_deleter),
+            make_getset_property(
+                pyre_object::gc_roots::shadow_stack_get(typeparams_getter_slot),
+                pyre_object::gc_roots::shadow_stack_get(typeparams_setter_slot),
+                pyre_object::gc_roots::shadow_stack_get(typeparams_deleter_slot)
+            )
         )
     };
     // The shared rawdict mirrors PyPy and is still used by BuiltinCode-backed
@@ -16382,20 +17045,23 @@ fn init_function_type(ns: PyObjectRef) {
     // but TypeCache.build stamps it on FunctionWithFixedCode descriptors.
     // `__defaults_count__` remains hidden from Python user functions.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__defaults_count__");
+        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "__defaults_count__",
+        );
     }
     // `funcobject.c func_new` — `FunctionType(code, globals, name=None,
     // argdefs=None, closure=None, kwdefaults=None)`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__new__",
-            make_new_descr(crate::function::descr_function_new),
+            make_new_descr(crate::function::descr_function_new)
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__get__",
             make_builtin_function("__get__", |args| {
                 let w_function = function_receiver(
@@ -16436,7 +17102,7 @@ fn init_function_type(ns: PyObjectRef) {
                     };
                     Ok(pyre_object::w_method_new(w_function, w_obj, owner))
                 }
-            }),
+            })
         )
     };
 }
@@ -16558,7 +17224,10 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
 /// `del rawdict['__get__']` step. The `update({...})` overrides go below as
 /// pyre starts modeling them.
 fn init_builtin_function_type(ns: PyObjectRef) {
-    init_function_type_common(ns);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    init_function_type_common(pyre_object::gc_roots::shadow_stack_get(ns_slot));
 
     // CPython 3.14 `PyCFunction_Type` does not expose the user-function
     // storage copied by PyPy's `**Function.typedef.rawdict`. Keep the PyPy
@@ -16575,20 +17244,25 @@ fn init_builtin_function_type(ns: PyObjectRef) {
         "__new__",
         "__objclass__",
     ] {
-        unsafe { pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, name) };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                name,
+            )
+        };
     }
 
     // methodobject.c `meth_members`: `__module__` is the one direct member;
     // it accepts arbitrary assignments and deletion stores None.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__module__",
             pyre_object::w_member_new_direct(
                 pyre_object::MEMBER_FUNCTION_MODULE,
                 "__module__".to_owned(),
                 pyre_object::PY_NULL,
-            ),
+            )
         )
     };
 
@@ -16624,19 +17298,23 @@ fn init_builtin_function_type(ns: PyObjectRef) {
             crate::function::fget_func_text_signature(builtin_function_carrier(obj))
         }),
     ] {
+        // The getter pin lives across this iteration's descriptor store.
+        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
         let get = make_builtin_function_with_arity(name, getter, 2);
+        let get_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(get);
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_getset_descriptor(get),
+                make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(get_slot))
             )
         };
     }
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__call__",
             make_builtin_function("__call__", |args| {
                 let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -16649,13 +17327,13 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                 } else {
                     function_descr_call_impl(positional, kwargs, function)
                 }
-            }),
+            })
         )
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__repr__",
             make_builtin_function_with_arity(
                 "__repr__",
@@ -16676,14 +17354,14 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                     }))
                 },
                 1,
-            ),
+            )
         )
     };
 
     // function.py `BuiltinFunction.descr__reduce__`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__reduce__",
             make_builtin_function_with_arity(
                 "__reduce__",
@@ -16699,7 +17377,7 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                     }
                 },
                 1,
-            ),
+            )
         )
     };
 
@@ -16749,10 +17427,10 @@ fn init_builtin_function_type(ns: PyObjectRef) {
         }),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, method, 2),
+                make_builtin_function_with_arity(name, method, 2)
             )
         };
     }
@@ -16780,16 +17458,16 @@ fn init_builtin_function_type(ns: PyObjectRef) {
         ("__ge__", ge),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 name,
-                make_builtin_function_with_arity(name, function, 2),
+                make_builtin_function_with_arity(name, function, 2)
             )
         };
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__hash__",
             make_builtin_function_with_arity(
                 "__hash__",
@@ -16816,7 +17494,7 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                     }
                 },
                 1,
-            ),
+            )
         )
     };
 }
@@ -16956,6 +17634,9 @@ fn patch_frame_traceback_descriptors() {
 /// PyPy exposes co_name, co_varnames, co_argcount, co_flags, co_consts.
 /// No __get__ — BuiltinCode is a code object, not a descriptor.
 fn init_builtin_code_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     let co_name_getter = make_builtin_function_with_arity(
         "co_name",
         |args| {
@@ -16968,11 +17649,13 @@ fn init_builtin_code_type(ns: PyObjectRef) {
         },
         2,
     );
+    let co_name_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(co_name_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "co_name",
-            make_getset_descriptor(co_name_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(co_name_getter_slot))
         )
     };
 
@@ -16997,11 +17680,15 @@ fn init_builtin_code_type(ns: PyObjectRef) {
         },
         2,
     );
+    let argcount_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(argcount_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "co_argcount",
-            make_getset_descriptor(argcount_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(
+                argcount_getter_slot
+            ))
         )
     };
     let posonly_getter = make_builtin_function_with_arity(
@@ -17013,11 +17700,13 @@ fn init_builtin_code_type(ns: PyObjectRef) {
         },
         2,
     );
+    let posonly_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(posonly_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "co_posonlyargcount",
-            make_getset_descriptor(posonly_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(posonly_getter_slot))
         )
     };
     let kwonly_getter = make_builtin_function_with_arity(
@@ -17029,11 +17718,13 @@ fn init_builtin_code_type(ns: PyObjectRef) {
         },
         2,
     );
+    let kwonly_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwonly_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "co_kwonlyargcount",
-            make_getset_descriptor(kwonly_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(kwonly_getter_slot))
         )
     };
     let varnames_getter = make_builtin_function_with_arity(
@@ -17053,11 +17744,15 @@ fn init_builtin_code_type(ns: PyObjectRef) {
         },
         2,
     );
+    let varnames_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(varnames_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "co_varnames",
-            make_getset_descriptor(varnames_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(
+                varnames_getter_slot
+            ))
         )
     };
     let flags_getter = make_builtin_function_with_arity(
@@ -17076,11 +17771,13 @@ fn init_builtin_code_type(ns: PyObjectRef) {
         },
         2,
     );
+    let flags_getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(flags_getter);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "co_flags",
-            make_getset_descriptor(flags_getter),
+            make_getset_descriptor(pyre_object::gc_roots::shadow_stack_get(flags_getter_slot))
         )
     };
 }
