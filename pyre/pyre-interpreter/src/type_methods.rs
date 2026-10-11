@@ -6988,11 +6988,17 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
             }
         } else {
             // `dictmultiobject.py update1`
-            let w_keys_method = match crate::baseobjspace::getattr_str(data(), "keys") {
-                Ok(value) => Some(value),
-                Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
-                Err(e) => return Err(e),
-            };
+            // `space.findattr(w_data, "keys")`: the lookup runs suppressed, so
+            // a sequence of pairs reaches the absent arm without an
+            // AttributeError being built. Only a missing attribute reads as
+            // absent (`PyObject_GetOptionalAttr`).
+            let w_keys_method =
+                match crate::baseobjspace::getattr_str_impl(data(), "keys", true, true) {
+                    Ok(value) if value.is_null() => None,
+                    Ok(value) => Some(value),
+                    Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
+                    Err(e) => return Err(e),
+                };
             if let Some(w_method) = w_keys_method {
                 // `dictmultiobject.py update1_keys`
                 let w_keys_view = crate::call::call_function_impl_result(w_method, &[])?;
