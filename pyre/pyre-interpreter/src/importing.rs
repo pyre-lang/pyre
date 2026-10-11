@@ -939,8 +939,11 @@ fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
-        ns,
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_put_new!(
+        ns_slot,
         "formatter_parser",
         crate::make_builtin_function("formatter_parser", |args| {
             use rustpython_common::format::{FormatPart, FormatString, FromTemplate};
@@ -1005,10 +1008,10 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                     .map(pyre_object::gc_roots::shadow_stack_get)
                     .collect(),
             ))
-        }),
+        })
     );
-    crate::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "formatter_field_name_split",
         crate::make_builtin_function("formatter_field_name_split", |args| {
             use rustpython_common::format::{FieldName, FieldNamePart, FieldType};
@@ -1068,7 +1071,7 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 pyre_object::gc_roots::shadow_stack_get(first_slot),
                 pyre_object::gc_roots::shadow_stack_get(rest_slot),
             ]))
-        }),
+        })
     );
     Ok(())
 }
@@ -1091,8 +1094,11 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
 /// extension`. `_sysconfigdata` publishes the same keys for `_init_posix` but
 /// spells `SOABI` shorter — see [`soabi_tag`].
 fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
-        ns,
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_put_new!(
+        ns_slot,
         "config_vars",
         crate::make_builtin_function("config_vars", |_| {
             // A `dict` header moves, and every store allocates the key, the
@@ -1105,15 +1111,24 @@ fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
             let so_ext = extension_abi_suffix();
             unsafe {
                 for (name, value) in [("Py_DEBUG", 0), ("Py_GIL_DISABLED", 1)] {
+                    // Key and value pins live across this one store. The dict
+                    // stays on `roots`.
+                    let _pyre_store_roots = pyre_object::gc_roots::push_roots();
                     let key_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
-                    let w_value = pyre_object::w_int_new(value);
-                    pyre_object::w_dict_store(roots.get(vars_slot), roots.get(key_slot), w_value);
+                    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = roots.pin_root(pyre_object::w_int_new(value));
+                    pyre_object::w_dict_store(
+                        roots.get(vars_slot),
+                        roots.get(key_slot),
+                        roots.get(value_slot),
+                    );
                 }
                 for (name, value) in [
                     ("SOABI", soabi_middle(&so_ext)),
                     ("EXT_SUFFIX", so_ext.clone()),
                 ] {
+                    let _pyre_store_roots = pyre_object::gc_roots::push_roots();
                     let key_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
                     let val_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1126,7 +1141,7 @@ fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 }
             }
             Ok(roots.get(vars_slot))
-        }),
+        })
     );
     Ok(())
 }
@@ -1525,6 +1540,9 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // Python 3.14's relocation check reads these from the generated data.
     unsafe {
         for key in ["prefix", "exec_prefix", "srcdir"] {
+            // The key pin lives across this one store. `vars_slot` and
+            // `prefix_slot` stay on the enclosing bracket.
+            let _pyre_store_roots = pyre_object::gc_roots::push_roots();
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(key));
             pyre_object::w_dict_store(
@@ -1588,43 +1606,44 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
 /// tracing primitives are neutral no-ops that let `tracemalloc` import and
 /// report an inactive tracer.
-fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
+fn init_tracemalloc(mut ns: PyObjectRef) -> Result<(), crate::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    crate::__pyre_store!(
         ns,
         "start",
-        crate::make_builtin_function("start", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("start", |_| Ok(pyre_object::w_none()))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "stop",
-        crate::make_builtin_function("stop", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("stop", |_| Ok(pyre_object::w_none()))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "clear_traces",
-        crate::make_builtin_function("clear_traces", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("clear_traces", |_| Ok(pyre_object::w_none()))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "reset_peak",
-        crate::make_builtin_function("reset_peak", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("reset_peak", |_| Ok(pyre_object::w_none()))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "is_tracing",
-        crate::make_builtin_function("is_tracing", |_| Ok(pyre_object::w_bool_from(false))),
+        crate::make_builtin_function("is_tracing", |_| Ok(pyre_object::w_bool_from(false)))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "get_traceback_limit",
-        crate::make_builtin_function("get_traceback_limit", |_| Ok(pyre_object::w_int_new(1))),
+        crate::make_builtin_function("get_traceback_limit", |_| Ok(pyre_object::w_int_new(1)))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "get_tracemalloc_memory",
-        crate::make_builtin_function("get_tracemalloc_memory", |_| Ok(pyre_object::w_int_new(0))),
+        crate::make_builtin_function("get_tracemalloc_memory", |_| Ok(pyre_object::w_int_new(0)))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "get_traced_memory",
         crate::make_builtin_function("get_traced_memory", |_| {
@@ -1632,17 +1651,17 @@ fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
             fields.push(pyre_object::w_int_new(0));
             fields.push(pyre_object::w_int_new(0));
             Ok(pyre_object::w_tuple_new(fields.take()))
-        }),
+        })
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "_get_traces",
-        crate::make_builtin_function("_get_traces", |_| Ok(pyre_object::w_list_new(Vec::new()))),
+        crate::make_builtin_function("_get_traces", |_| Ok(pyre_object::w_list_new(Vec::new())))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "_get_object_traceback",
-        crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none()))
     );
     Ok(())
 }
@@ -1855,7 +1874,7 @@ fn new_builtin_module(
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
-    let w_dict = pyre_object::gc_roots::pin_root(w_dict);
+    let _ = pyre_object::gc_roots::pin_root(w_dict);
     // Immortal builtin functions stamp this as `w_module`. A nursery
     // string in that slot is reached only by `walk_raw_function_roots`,
     // which clean minors skip, so intern it the way `w(modulename)` does.
@@ -1863,13 +1882,13 @@ fn new_builtin_module(
     let _ = pyre_object::gc_roots::pin_root(name_obj);
     // Set __name__ (PyPy: Module.__init__ sets __name__)
     crate::module_ns_store(
-        w_dict,
+        pyre_object::gc_roots::shadow_stack_get(save_point),
         "__name__",
         pyre_object::gc_roots::shadow_stack_get(save_point + 1),
     );
-    init_extra_module_attrs(w_dict);
+    init_extra_module_attrs(pyre_object::gc_roots::shadow_stack_get(save_point));
     // Run module-specific initializer (PyPy: interpleveldefs)
-    (module_def.init)(w_dict)?;
+    (module_def.init)(pyre_object::gc_roots::shadow_stack_get(save_point))?;
     // One flag for the holder and the module object. Before `sys.modules`
     // exists, or for a legacy MixedModule, functions stay Box-immortal and
     // are retagged in place. A collectible module follows
@@ -1881,14 +1900,25 @@ fn new_builtin_module(
     // name as `__module__`, so `pickle` can save them by reference
     // (`save_global`) without guessing via `whichmodule`. Snapshot owned
     // keys, then reload each movable value and the rooted name afresh.
-    let keys: Vec<String> = unsafe { pyre_object::dictmultiobject::w_dict_str_entries(w_dict) }
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
+    let keys: Vec<String> = unsafe {
+        pyre_object::dictmultiobject::w_dict_str_entries(pyre_object::gc_roots::shadow_stack_get(
+            save_point,
+        ))
+    }
+    .into_iter()
+    .map(|(key, _)| key)
+    .collect();
     for key in &keys {
-        if let Some(value) =
-            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, key) }
-        {
+        // A managed copy's pin stays through `module_ns_store`,
+        // `builtin_function_set_module` and `with_module`, then drops.
+        // `w_dict` and the module name stay on `_roots`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
+        if let Some(value) = unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(save_point),
+                key,
+            )
+        } {
             let value = if managed_holder && unsafe { untraced_mixed_module_function(value) } {
                 // `BuiltinFunction(func)`. Pin the result before the dict
                 // store: until that store it is reachable only from this
@@ -1898,7 +1928,7 @@ fn new_builtin_module(
                 let created_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(created);
                 crate::module_ns_store(
-                    w_dict,
+                    pyre_object::gc_roots::shadow_stack_get(save_point),
                     key,
                     pyre_object::gc_roots::shadow_stack_get(created_slot),
                 );
@@ -1933,8 +1963,19 @@ fn new_builtin_module(
     // A Rust module def carries no class docstring, so the None arm is what
     // every def that stays silent resolves to; the key itself is not optional,
     // and `dir(<module>)` lists it.
-    if unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, "__doc__") }.is_none() {
-        crate::module_ns_store(w_dict, "__doc__", pyre_object::w_none());
+    if unsafe {
+        pyre_object::dictmultiobject::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(save_point),
+            "__doc__",
+        )
+    }
+    .is_none()
+    {
+        crate::module_ns_store(
+            pyre_object::gc_roots::shadow_stack_get(save_point),
+            "__doc__",
+            pyre_object::w_none(),
+        );
     }
     // Before `sys.modules` exists the native bootstrap registry is the only
     // owner and retains the legacy immortal module shape. Afterwards an
@@ -1942,17 +1983,33 @@ fn new_builtin_module(
     // graph; legacy MixedModules retain the immortal holder until their
     // native/JIT caches have been migrated to traced owners.
     let module = if !managed_holder {
-        pyre_object::w_module_new_aliasing_dict(name, w_dict)
+        pyre_object::w_module_new_aliasing_dict(
+            name,
+            pyre_object::gc_roots::shadow_stack_get(save_point),
+        )
     } else {
-        pyre_object::w_module_new_aliasing_dict_managed(name, w_dict)
+        pyre_object::w_module_new_aliasing_dict_managed(
+            name,
+            pyre_object::gc_roots::shadow_stack_get(save_point),
+        )
     };
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module);
     // function.py BuiltinFunction.w_moduleobj — MixedModule binds
     // every interp-level function to the live defining module object.
     for key in &keys {
-        if let Some(value) =
-            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, key) }
-        {
-            unsafe { crate::function::builtin_function_set_module_obj(value, module) };
+        if let Some(value) = unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(save_point),
+                key,
+            )
+        } {
+            unsafe {
+                crate::function::builtin_function_set_module_obj(
+                    value,
+                    pyre_object::gc_roots::shadow_stack_get(module_slot),
+                )
+            };
         }
     }
     // `baseobjspace.py make_builtins` installs the self
@@ -1965,9 +2022,13 @@ fn new_builtin_module(
     // so `import builtins; builtins.__builtins__ is builtins` holds
     // for user code regardless of the split.
     if name == "builtins" {
-        crate::module_ns_store(w_dict, "__builtins__", module);
+        crate::module_ns_store(
+            pyre_object::gc_roots::shadow_stack_get(save_point),
+            "__builtins__",
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+        );
     }
-    Ok(module)
+    Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
 }
 
 /// Set a builtin module's `__spec__`/`__loader__`/`__package__` from the
@@ -4120,10 +4181,13 @@ pub fn set_sys_modules_dict(dict: PyObjectRef) {
     let _ = roots.pin_root(dict);
     // Populate with all modules already in the cache.
     for (name, &module) in SYS_MODULES.lock().iter() {
-        let key_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
+        // Key and module pins live across this one store. The modules dict
+        // stays on `roots`.
+        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
         let module_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(module as PyObjectRef);
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
         unsafe {
             pyre_object::w_dict_store(
                 roots.get(dict_slot),
@@ -6185,7 +6249,15 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     if !unsafe { crate::objspace::std::mapdict::has_mapdict_storage(w_spec) } {
         return None;
     }
-    let spec_dict = crate::objspace::std::mapdict::_obj_getdict(w_spec);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let spec_slot = pyre_object::gc_roots::pin_roots(&[w_spec, w_module, spec_type]);
+    let module_slot = spec_slot + 1;
+    let type_slot = spec_slot + 2;
+    let spec_dict = crate::objspace::std::mapdict::_obj_getdict(
+        pyre_object::gc_roots::shadow_stack_get(spec_slot),
+    );
+    let w_module = pyre_object::gc_roots::shadow_stack_get(module_slot);
+    let spec_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
     if spec_dict.is_null() {
         return None;
     }

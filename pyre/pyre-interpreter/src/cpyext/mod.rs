@@ -163,8 +163,11 @@ static EXTENSION_LOAD_LOCK: ForkExtensionLoadLock = ForkExtensionLoadLock::new()
 static DLOPEN_FLAGS: AtomicIsize = AtomicIsize::new((libc::RTLD_NOW | libc::RTLD_LOCAL) as isize);
 
 pub fn register_sys_dlopenflags(ns: PyObjectRef) {
-    crate::module_ns_store(
-        ns,
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_put_new!(
+        ns_slot,
         "getdlopenflags",
         crate::make_builtin_function_with_arity(
             "getdlopenflags",
@@ -174,10 +177,10 @@ pub fn register_sys_dlopenflags(ns: PyObjectRef) {
                 ))
             },
             0,
-        ),
+        )
     );
-    crate::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "setdlopenflags",
         crate::make_builtin_function_with_arity(
             "setdlopenflags",
@@ -189,7 +192,7 @@ pub fn register_sys_dlopenflags(ns: PyObjectRef) {
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
+        )
     );
 }
 

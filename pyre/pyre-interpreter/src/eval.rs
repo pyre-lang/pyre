@@ -4356,11 +4356,15 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             // every non-data descriptor — never bind self for it.  (Data
             // descriptors that win over the instance dict — property /
             // member — resolve to PY_NULL either way.)
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[obj, attr]);
             let shadowed = crate::objspace::std::mapdict::instance_node_getdictvalue(
-                obj,
+                pyre_object::gc_roots::shadow_stack_get(base),
                 rustpython_wtf8::Wtf8::new(name),
             )
             .is_some();
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            let attr = pyre_object::gc_roots::shadow_stack_get(base + 1);
             let w_type = pyre_object::w_instance_get_type(obj);
             // callmethod.py:33 `w_type.has_object_getattribute()`: a non-default
             // `__getattribute__` produced `attr` through the override rather
@@ -6166,29 +6170,32 @@ impl OpcodeStepExecutor for PyFrame {
         // function + receiver) so CALL_METHOD binds self without allocating a
         // Method wrapper.  Shared with the JIT tracer (trace_opcode.rs) so the
         // concrete and symbolic frames produce the identical stack shape.
-        if let Some((_, _, w_descr)) =
-            unsafe { crate::baseobjspace::load_method_fast_path(obj, name) }
-        {
-            self.push(w_descr);
-            self.push(obj);
-            return Ok(());
-        }
-        // `__getattribute__` allocates: the receiver is popped, so nothing but
-        // this local still reaches it, and the same collection relocates a
-        // JIT-created frame.  Pin the receiver and push onto the forwarded
-        // live frame.
+        // `__getattribute__` allocates and relocates a JIT-created frame, so
+        // the receiver is published before either lookup.
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
-        let obj = roots.pin_root(obj);
+        let _ = roots.pin_root(obj);
+        if let Some((_, _, w_descr)) =
+            unsafe { crate::baseobjspace::load_method_fast_path(roots.get(obj_slot), name) }
+        {
+            self.push(w_descr);
+            self.push(roots.get(obj_slot));
+            return Ok(());
+        }
         let anchor = FrameAnchor::new(self);
-        let attr = crate::baseobjspace::getattr_str(obj, name)?;
-        let obj = roots.get(obj_slot);
+        let attr = crate::baseobjspace::getattr_str(roots.get(obj_slot), name)?;
+        let attr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(attr);
         // LOOKUP_METHOD pushes (attr, null_or_self): the resolved attribute
         // first, then the bound receiver computed by the shared, side-effect
         // free binding decision (NULL when no self should be prepended).
-        let bound = compute_load_method_bound(obj, attr, name);
+        let bound = compute_load_method_bound(
+            roots.get(obj_slot),
+            pyre_object::gc_roots::shadow_stack_get(attr_slot),
+            name,
+        );
         let live = unsafe { &mut *anchor.live() };
-        live.push(attr);
+        live.push(pyre_object::gc_roots::shadow_stack_get(attr_slot));
         live.push(bound);
         Ok(())
     }

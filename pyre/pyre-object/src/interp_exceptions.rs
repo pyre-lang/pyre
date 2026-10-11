@@ -1136,12 +1136,20 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// permanent old→young edge: if the setter misses the remembered set, the
 /// next minor recycles the array and a later read walks a dead block.
 ///
-/// `value` is built first. At birth the only live GC child is `w_class`
+/// `value` is built first, including the typeptr
+/// `get_unique_interplevel_subclass` selected (`*_USER_TYPE` for a user
+/// layout). At birth the only live GC child is `w_class`
 /// (`w_exception_base_defaults` / the extended-layout builder leave every
 /// other pointer `PY_NULL`). That word is the rooted slot
 /// `try_gc_alloc_collecting_rooted` forwards across the minor; the shadow
 /// stack does not stand in for it. The collector rewrites the slot, so the
 /// word is stored back into `value` before `ptr::write`.
+///
+/// The nursery shell is uninitialized until that write. `pin_root` publishes
+/// it (`normalize_published_slot`), and a foreign collector can trace it
+/// from then on, so the header is written before the pin. The barrier is a
+/// `gc_op` and can move the shell; the returned word is the one the slot
+/// carries afterwards.
 fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let mut rooted_class = exception_header_w_class(&value);
@@ -1163,19 +1171,19 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRe
     };
     set_exception_header_w_class(&mut value, rooted_class);
     if !raw.is_null() {
-        let slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
-        let raw = crate::gc_roots::shadow_stack_get(slot) as *mut u8;
         unsafe {
             std::ptr::write(raw as *mut T, value);
         }
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
+        let raw = crate::gc_roots::shadow_stack_get(slot) as *mut u8;
         // A nursery header needs no creation barrier. The collecting
         // allocator can still spill old (pinned nursery gap); only that
         // placement remembers the `w_class` edge.
         if needs_write_barrier {
             crate::gc_hook::try_gc_write_barrier(raw as crate::gc_hook::GCREF);
         }
-        return raw as PyObjectRef;
+        return crate::gc_roots::shadow_stack_get(slot);
     }
     crate::lltype::malloc_typed(value) as PyObjectRef
 }

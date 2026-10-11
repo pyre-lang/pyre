@@ -3360,228 +3360,415 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
 }
 
 pub fn install_default_builtins(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
     // The `Module` class docstring at `pypy/module/__builtin__/moduledef.py`,
     // which `MixedModule.get__doc__` publishes as this module's `__doc__`.
     // Seeded here rather than in the module def because the execution
     // context builds this namespace directly, and the module `import
     // builtins` returns wraps that same dict.
-    crate::module_ns_get_or_insert_with(ns, "__doc__", || {
-        pyre_object::w_str_new("Built-in functions, exceptions, and other objects.")
-    });
-    crate::module_ns_get_or_insert_with(ns, "print", || {
-        make_module_builtin_function("print", builtin_print)
-    });
-    crate::module_ns_get_or_insert_with(ns, "range", || {
-        crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "len", || {
-        // operation.py `len(space, w_obj)` — one positional-only `obj`, so
-        // `len` no longer receives the `__pyre_kw__` marker dict and any
-        // keyword is rejected with "takes no keyword arguments".
-        crate::gateway::make_module_builtin_function_with_arity_and_sig(
-            "len",
-            __majit_wrap_builtin_len,
-            1,
-            crate::gateway::Signature::new(vec!["obj"], None, None, 0, 1),
-        )
-    });
-    crate::module_ns_get_or_insert_with(ns, "abs", || {
-        // operation.py `abs(space, w_val)` — one positional-only `val`, so
-        // `abs` no longer receives the `__pyre_kw__` marker dict and any
-        // keyword is rejected with "takes no keyword arguments".
-        crate::gateway::make_module_builtin_function_with_arity_and_sig(
-            "abs",
-            __majit_wrap_builtin_abs,
-            1,
-            crate::gateway::Signature::new(vec!["val"], None, None, 0, 1),
-        )
-    });
-    crate::module_ns_get_or_insert_with(ns, "min", || {
-        make_module_builtin_function_with_doc(
-            "min",
-            __majit_wrap_builtin_min,
-            "min(iterable, *[, default=obj, key=func]) -> value\n\
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "__doc__",
+        || pyre_object::w_str_new("Built-in functions, exceptions, and other objects."),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "print",
+        || make_module_builtin_function("print", builtin_print),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "range",
+        || crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "len",
+        || {
+            // operation.py `len(space, w_obj)` — one positional-only `obj`, so
+            // `len` no longer receives the `__pyre_kw__` marker dict and any
+            // keyword is rejected with "takes no keyword arguments".
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "len",
+                __majit_wrap_builtin_len,
+                1,
+                crate::gateway::Signature::new(vec!["obj"], None, None, 0, 1),
+            )
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "abs",
+        || {
+            // operation.py `abs(space, w_val)` — one positional-only `val`, so
+            // `abs` no longer receives the `__pyre_kw__` marker dict and any
+            // keyword is rejected with "takes no keyword arguments".
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "abs",
+                __majit_wrap_builtin_abs,
+                1,
+                crate::gateway::Signature::new(vec!["val"], None, None, 0, 1),
+            )
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "min",
+        || {
+            make_module_builtin_function_with_doc(
+                "min",
+                __majit_wrap_builtin_min,
+                "min(iterable, *[, default=obj, key=func]) -> value\n\
              min(arg1, arg2, *args, *[, key=func]) -> value\n\
              \n\
              With a single iterable argument, return its smallest item. The\n\
              default keyword-only argument specifies an object to return if\n\
              the provided iterable is empty.\n\
              With two or more positional arguments, return the smallest argument.",
-        )
-    });
-    crate::module_ns_get_or_insert_with(ns, "max", || {
-        make_module_builtin_function_with_doc(
-            "max",
-            __majit_wrap_builtin_max,
-            "max(iterable, *[, default=obj, key=func]) -> value\n\
+            )
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "max",
+        || {
+            make_module_builtin_function_with_doc(
+                "max",
+                __majit_wrap_builtin_max,
+                "max(iterable, *[, default=obj, key=func]) -> value\n\
              max(arg1, arg2, *args, *[, key=func]) -> value\n\
              \n\
              With a single iterable argument, return its biggest item. The\n\
              default keyword-only argument specifies an object to return if\n\
              the provided iterable is empty.\n\
              With two or more positional arguments, return the largest argument.",
-        )
-    });
-    crate::module_ns_get_or_insert_with(ns, "type", crate::typedef::w_type);
-    crate::module_ns_get_or_insert_with(ns, "isinstance", || {
-        make_module_builtin_function_with_arity("isinstance", __majit_wrap_builtin_isinstance, 2)
-    });
-    crate::module_ns_get_or_insert_with(ns, "str", || crate::typedef::gettypeobject(&STR_TYPE));
-    crate::module_ns_get_or_insert_with(ns, "repr", || {
-        make_module_builtin_function_with_arity("repr", builtin_repr, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "ascii", || {
-        make_module_builtin_function_with_arity("ascii", builtin_ascii, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "int", || crate::typedef::gettypeobject(&INT_TYPE));
-    crate::module_ns_get_or_insert_with(ns, "float", || crate::typedef::gettypeobject(&FLOAT_TYPE));
-    crate::module_ns_get_or_insert_with(ns, "bool", || crate::typedef::gettypeobject(&BOOL_TYPE));
-    crate::module_ns_get_or_insert_with(ns, "True", || w_bool_from(true));
-    crate::module_ns_get_or_insert_with(ns, "False", || w_bool_from(false));
-    crate::module_ns_get_or_insert_with(ns, "None", w_none);
-    crate::module_ns_get_or_insert_with(ns, "NotImplemented", w_not_implemented);
-    crate::module_ns_get_or_insert_with(ns, "hasattr", || {
-        make_module_builtin_function_with_arity("hasattr", builtin_hasattr, 2)
-    });
-    crate::module_ns_get_or_insert_with(ns, "getattr", || {
-        make_module_builtin_function("getattr", builtin_getattr)
-    });
-    crate::module_ns_get_or_insert_with(ns, "setattr", || {
-        make_module_builtin_function_with_arity("setattr", builtin_setattr, 3)
-    });
-    crate::module_ns_get_or_insert_with(ns, "delattr", || {
-        make_module_builtin_function_with_arity("delattr", builtin_delattr, 2)
-    });
-    crate::module_ns_get_or_insert_with(ns, "tuple", || crate::typedef::gettypeobject(&TUPLE_TYPE));
-    crate::module_ns_get_or_insert_with(ns, "list", || crate::typedef::gettypeobject(&LIST_TYPE));
-    crate::module_ns_get_or_insert_with(ns, "dict", || crate::typedef::gettypeobject(&DICT_TYPE));
-    crate::module_ns_get_or_insert_with(ns, "object", || {
-        // `object` is a W_TypeObject, not a builtin function.
-        // PyPy: baseobjspace.py w_object = W_TypeObject("object", ...)
-        crate::typedef::w_object()
-    });
-    crate::module_ns_get_or_insert_with(ns, "super", || {
-        crate::typedef::gettypeobject(&pyre_object::descriptor::SUPER_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "id", || {
-        make_module_builtin_function_with_arity("id", builtin_id, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "hash", || {
-        make_module_builtin_function_with_arity("hash", __majit_wrap_builtin_hash, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "ord", || {
-        make_module_builtin_function_with_arity("ord", __majit_wrap_builtin_ord, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "chr", || {
-        make_module_builtin_function_with_arity("chr", builtin_chr, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "map", || {
-        crate::typedef::gettypeobject(&pyre_object::functional::MAP_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "zip", || {
-        crate::typedef::gettypeobject(&pyre_object::functional::ZIP_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "enumerate", || {
-        crate::typedef::gettypeobject(&pyre_object::functional::ENUMERATE_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "reversed", || {
-        crate::typedef::gettypeobject(&pyre_object::functional::REVERSED_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "sorted", || {
-        make_module_builtin_function("sorted", crate::app_functional::__majit_wrap_builtin_sorted)
-    });
-    crate::module_ns_get_or_insert_with(ns, "iter", || {
-        make_module_builtin_function("iter", __majit_wrap_builtin_iter)
-    });
-    crate::module_ns_get_or_insert_with(ns, "next", || {
-        make_module_builtin_function("next", builtin_next)
-    });
+            )
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "type",
+        crate::typedef::w_type,
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "isinstance",
+        || {
+            make_module_builtin_function_with_arity(
+                "isinstance",
+                __majit_wrap_builtin_isinstance,
+                2,
+            )
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "str",
+        || crate::typedef::gettypeobject(&STR_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "repr",
+        || make_module_builtin_function_with_arity("repr", builtin_repr, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "ascii",
+        || make_module_builtin_function_with_arity("ascii", builtin_ascii, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "int",
+        || crate::typedef::gettypeobject(&INT_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "float",
+        || crate::typedef::gettypeobject(&FLOAT_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "bool",
+        || crate::typedef::gettypeobject(&BOOL_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "True",
+        || w_bool_from(true),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "False",
+        || w_bool_from(false),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "None",
+        w_none,
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "NotImplemented",
+        w_not_implemented,
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "hasattr",
+        || make_module_builtin_function_with_arity("hasattr", builtin_hasattr, 2),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "getattr",
+        || make_module_builtin_function("getattr", builtin_getattr),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "setattr",
+        || make_module_builtin_function_with_arity("setattr", builtin_setattr, 3),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "delattr",
+        || make_module_builtin_function_with_arity("delattr", builtin_delattr, 2),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "tuple",
+        || crate::typedef::gettypeobject(&TUPLE_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "list",
+        || crate::typedef::gettypeobject(&LIST_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "dict",
+        || crate::typedef::gettypeobject(&DICT_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "object",
+        || {
+            // `object` is a W_TypeObject, not a builtin function.
+            // PyPy: baseobjspace.py w_object = W_TypeObject("object", ...)
+            crate::typedef::w_object()
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "super",
+        || crate::typedef::gettypeobject(&pyre_object::descriptor::SUPER_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "id",
+        || make_module_builtin_function_with_arity("id", builtin_id, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "hash",
+        || make_module_builtin_function_with_arity("hash", __majit_wrap_builtin_hash, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "ord",
+        || make_module_builtin_function_with_arity("ord", __majit_wrap_builtin_ord, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "chr",
+        || make_module_builtin_function_with_arity("chr", builtin_chr, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "map",
+        || crate::typedef::gettypeobject(&pyre_object::functional::MAP_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "zip",
+        || crate::typedef::gettypeobject(&pyre_object::functional::ZIP_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "enumerate",
+        || crate::typedef::gettypeobject(&pyre_object::functional::ENUMERATE_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "reversed",
+        || crate::typedef::gettypeobject(&pyre_object::functional::REVERSED_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "sorted",
+        || {
+            make_module_builtin_function(
+                "sorted",
+                crate::app_functional::__majit_wrap_builtin_sorted,
+            )
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "iter",
+        || make_module_builtin_function("iter", __majit_wrap_builtin_iter),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "next",
+        || make_module_builtin_function("next", builtin_next),
+    );
     // aiter/anext resolve their app-level implementations lazily; the
     // builtins dict is filled before an execution context exists.  Arity is
     // enforced by the app-level `def aiter(obj)` / `def anext(iterator,
     // default=...)` signatures, so no interp-level arity is imposed here.
-    crate::module_ns_get_or_insert_with(ns, "aiter", || {
-        make_module_builtin_function("aiter", crate::async_operation::builtin_aiter)
-    });
-    crate::module_ns_get_or_insert_with(ns, "anext", || {
-        make_module_builtin_function("anext", crate::async_operation::builtin_anext)
-    });
-    crate::module_ns_get_or_insert_with(ns, "breakpoint", || {
-        make_module_builtin_function("breakpoint", builtin_breakpoint)
-    });
-    crate::module_ns_get_or_insert_with(ns, "callable", || {
-        make_module_builtin_function_with_arity("callable", builtin_callable, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "vars", || {
-        make_module_builtin_function("vars", builtin_vars)
-    });
-    crate::module_ns_get_or_insert_with(ns, "dir", || {
-        make_module_builtin_function("dir", builtin_dir)
-    });
-    crate::module_ns_get_or_insert_with(ns, "__build_class__", || {
-        make_module_builtin_function("__build_class__", builtin_build_class)
-    });
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "aiter",
+        || make_module_builtin_function("aiter", crate::async_operation::builtin_aiter),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "anext",
+        || make_module_builtin_function("anext", crate::async_operation::builtin_anext),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "breakpoint",
+        || make_module_builtin_function("breakpoint", builtin_breakpoint),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "callable",
+        || make_module_builtin_function_with_arity("callable", builtin_callable, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "vars",
+        || make_module_builtin_function("vars", builtin_vars),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "dir",
+        || make_module_builtin_function("dir", builtin_dir),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "__build_class__",
+        || make_module_builtin_function("__build_class__", builtin_build_class),
+    );
     // bytearrayobject.py W_BytearrayObject — register the real type
     // (callable as a constructor and usable in isinstance(x, bytearray)).
-    crate::module_ns_get_or_insert_with(ns, "bytearray", || {
-        crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
-    });
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "bytearray",
+        || crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+    );
     // bytesobject.py W_BytesObject — immutable bytes type.
-    crate::module_ns_get_or_insert_with(ns, "bytes", || {
-        crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "slice", || {
-        // The slice type object, for isinstance(x, slice) checks.
-        crate::typedef::gettypefor(&pyre_object::sliceobject::SLICE_TYPE)
-            .map_or(pyre_object::PY_NULL, |p| p.as_ptr())
-    });
-    crate::module_ns_get_or_insert_with(ns, "frozenset", || {
-        crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "set", || {
-        crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "property", || {
-        crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "staticmethod", || {
-        crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "classmethod", || {
-        crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "Ellipsis", pyre_object::special::w_ellipsis);
-    crate::module_ns_get_or_insert_with(ns, "__debug__", || w_bool_from(true));
-    crate::module_ns_get_or_insert_with(ns, "memoryview", || {
-        crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "globals", || {
-        make_module_builtin_function_with_arity("globals", builtin_globals, 0)
-    });
-    crate::module_ns_get_or_insert_with(ns, "locals", || {
-        make_module_builtin_function_with_arity("locals", __majit_wrap_builtin_locals, 0)
-    });
-    crate::module_ns_get_or_insert_with(ns, "exec", || {
-        make_module_builtin_function("exec", builtin_exec)
-    });
-    crate::module_ns_get_or_insert_with(ns, "eval", || {
-        make_module_builtin_function("eval", builtin_eval)
-    });
-    crate::module_ns_get_or_insert_with(ns, "compile", || {
-        make_module_builtin_function("compile", builtin_compile)
-    });
-    crate::module_ns_get_or_insert_with(ns, "complex", || {
-        crate::typedef::gettypeobject(&pyre_object::COMPLEX_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "filter", || {
-        crate::typedef::gettypeobject(&pyre_object::functional::FILTER_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "input", || {
-        make_module_builtin_function("input", builtin_input)
-    });
-    crate::module_ns_get_or_insert_with(ns, "open", || {
-        make_module_builtin_function("open", builtin_open)
-    });
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "bytes",
+        || crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "slice",
+        || {
+            // The slice type object, for isinstance(x, slice) checks.
+            crate::typedef::gettypefor(&pyre_object::sliceobject::SLICE_TYPE)
+                .map_or(pyre_object::PY_NULL, |p| p.as_ptr())
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "frozenset",
+        || crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "set",
+        || crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "property",
+        || crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "staticmethod",
+        || crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "classmethod",
+        || crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "Ellipsis",
+        pyre_object::special::w_ellipsis,
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "__debug__",
+        || w_bool_from(true),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "memoryview",
+        || crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "globals",
+        || make_module_builtin_function_with_arity("globals", builtin_globals, 0),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "locals",
+        || make_module_builtin_function_with_arity("locals", __majit_wrap_builtin_locals, 0),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "exec",
+        || make_module_builtin_function("exec", builtin_exec),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "eval",
+        || make_module_builtin_function("eval", builtin_eval),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "compile",
+        || make_module_builtin_function("compile", builtin_compile),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "complex",
+        || crate::typedef::gettypeobject(&pyre_object::COMPLEX_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "filter",
+        || crate::typedef::gettypeobject(&pyre_object::functional::FILTER_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "input",
+        || make_module_builtin_function("input", builtin_input),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "open",
+        || make_module_builtin_function("open", builtin_open),
+    );
+    ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     // Exception hierarchy — exceptions are real types so they can be
     // subclassed (`class FrozenInstanceError(AttributeError): pass`).
     // Built in dependency order: each subclass refers to its already-built
@@ -3594,7 +3781,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         Some(__majit_wrap_base_exception_descr_init),
         crate::typedef::w_object(),
     ));
-    crate::module_ns_store(ns, "BaseException", base_exc);
+    crate::__pyre_store!(ns, "BaseException", base_exc);
 
     let mut exception = pyre_object::with_roots!(ns, base_exc => make_exc_type_with_doc(
         "Exception",
@@ -3602,7 +3789,9 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         exc_exception_new,
         base_exc,
     ));
-    crate::module_ns_store(ns, "Exception", exception);
+    pyre_object::with_roots!(base_exc => {
+        crate::__pyre_store!(ns, "Exception", exception);
+    });
 
     let mut arithmetic = pyre_object::with_roots!(ns, base_exc, exception => make_exc_type_with_doc(
         "ArithmeticError",
@@ -3610,8 +3799,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         exc_arithmetic_error_new,
         exception,
     ));
-    crate::module_ns_store(ns, "ArithmeticError", arithmetic);
-    let exc_type = pyre_object::with_roots!(ns, arithmetic, base_exc, exception =>
+    pyre_object::with_roots!(base_exc, exception => {
+        crate::__pyre_store!(ns, "ArithmeticError", arithmetic);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, arithmetic, base_exc, exception =>
         make_exc_type_with_doc(
             "ZeroDivisionError",
             "Second argument to a division or modulo operation was zero.",
@@ -3619,8 +3810,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             arithmetic,
         )
     );
-    crate::module_ns_store(ns, "ZeroDivisionError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, arithmetic, base_exc, exception =>
+    pyre_object::with_roots!(arithmetic, base_exc, exception => {
+        crate::__pyre_store!(ns, "ZeroDivisionError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, arithmetic, base_exc, exception =>
         make_exc_type_with_doc(
             "OverflowError",
             "Result too large to be represented.",
@@ -3628,14 +3821,18 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             arithmetic,
         )
     );
-    crate::module_ns_store(ns, "OverflowError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception => make_exc_type_with_doc(
+    pyre_object::with_roots!(base_exc, exception, arithmetic => {
+        crate::__pyre_store!(ns, "OverflowError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, arithmetic => make_exc_type_with_doc(
         "FloatingPointError",
         "Floating-point operation failed.",
         exc_arithmetic_error_new,
         arithmetic,
     ));
-    crate::module_ns_store(ns, "FloatingPointError", exc_type);
+    pyre_object::with_roots!(base_exc, exception => {
+        crate::__pyre_store!(ns, "FloatingPointError", exc_type);
+    });
 
     let mut lookup_error = pyre_object::with_roots!(ns, base_exc, exception =>
         make_exc_type_with_doc(
@@ -3645,8 +3842,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "LookupError", lookup_error);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, lookup_error =>
+    pyre_object::with_roots!(base_exc, exception => {
+        crate::__pyre_store!(ns, "LookupError", lookup_error);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, lookup_error =>
         make_exc_type_with_doc(
             "IndexError",
             "Sequence index out of range.",
@@ -3654,30 +3853,38 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             lookup_error,
         )
     );
-    crate::module_ns_store(ns, "IndexError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception => make_exc_type_with_doc(
+    pyre_object::with_roots!(base_exc, exception, lookup_error => {
+        crate::__pyre_store!(ns, "IndexError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, lookup_error => make_exc_type_with_doc(
         "KeyError",
         "Mapping key not found.",
         exc_key_error_new,
         lookup_error,
     ));
-    crate::module_ns_store(ns, "KeyError", exc_type);
+    pyre_object::with_roots!(base_exc, exception => {
+        crate::__pyre_store!(ns, "KeyError", exc_type);
+    });
 
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception => make_exc_type_with_init(
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception => make_exc_type_with_init(
         "AttributeError",
         Some("Attribute not found."),
         exc_attribute_error_new,
         Some(exc_attribute_error_init),
         exception,
     ));
-    crate::module_ns_store(ns, "AttributeError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception => make_exc_type_with_doc(
+    pyre_object::with_roots!(base_exc, exception => {
+        crate::__pyre_store!(ns, "AttributeError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception => make_exc_type_with_doc(
         "TypeError",
         "Inappropriate argument type.",
         exc_type_error_new,
         exception,
     ));
-    crate::module_ns_store(ns, "TypeError", exc_type);
+    pyre_object::with_roots!(base_exc, exception => {
+        crate::__pyre_store!(ns, "TypeError", exc_type);
+    });
     let mut value_error = pyre_object::with_roots!(ns, base_exc, exception =>
         make_exc_type_with_doc(
             "ValueError",
@@ -3686,8 +3893,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "ValueError", value_error);
-    let name_error = pyre_object::with_roots!(ns, base_exc, exception, value_error =>
+    pyre_object::with_roots!(base_exc, exception => {
+        crate::__pyre_store!(ns, "ValueError", value_error);
+    });
+    let mut name_error = pyre_object::with_roots!(ns, base_exc, exception, value_error =>
         make_exc_type_with_init(
             "NameError",
             Some("Name not found globally."),
@@ -3696,17 +3905,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "NameError", name_error);
+    pyre_object::with_roots!(base_exc, exception, value_error => {
+        crate::__pyre_store!(ns, "NameError", name_error);
+    });
     // `exceptions.c` — `UnboundLocalError(NameError)`.
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, value_error =>
-        make_exc_type_with_doc(
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, value_error, name_error => make_exc_type_with_doc(
             "UnboundLocalError",
             "Local name referenced but not bound to a value.",
             exc_name_error_new,
             name_error,
         )
     );
-    crate::module_ns_store(ns, "UnboundLocalError", exc_type);
+    pyre_object::with_roots!(base_exc, exception, value_error => {
+        crate::__pyre_store!(ns, "UnboundLocalError", exc_type);
+    });
 
     let mut runtime_error = pyre_object::with_roots!(ns, base_exc, exception, value_error =>
         make_exc_type_with_doc(
@@ -3716,8 +3928,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "RuntimeError", runtime_error);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, value_error => {
+        crate::__pyre_store!(ns, "RuntimeError", runtime_error);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_doc(
             "NotImplementedError",
             "Method or function hasn't been implemented yet.",
@@ -3725,8 +3939,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             runtime_error,
         )
     );
-    crate::module_ns_store(ns, "NotImplementedError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "NotImplementedError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_doc(
             "RecursionError",
             "Recursion limit exceeded.",
@@ -3734,9 +3950,11 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             runtime_error,
         )
     );
-    crate::module_ns_store(ns, "RecursionError", exc_type);
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "RecursionError", exc_type);
+    });
 
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_init(
             "StopIteration",
             Some("Signal the end from iterator.__next__()."),
@@ -3745,8 +3963,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "StopIteration", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "StopIteration", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_doc(
             "StopAsyncIteration",
             "Signal the end from iterator.__anext__().",
@@ -3754,8 +3974,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "StopAsyncIteration", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "StopAsyncIteration", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_doc(
             "GeneratorExit",
             "Request that a generator exit.",
@@ -3763,8 +3985,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             base_exc,
         )
     );
-    crate::module_ns_store(ns, "GeneratorExit", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "GeneratorExit", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_init(
             "SystemExit",
             Some("Request to exit from the interpreter."),
@@ -3773,8 +3997,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             base_exc,
         )
     );
-    crate::module_ns_store(ns, "SystemExit", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "SystemExit", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_doc(
             "KeyboardInterrupt",
             "Program interrupted by user.",
@@ -3782,9 +4008,11 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             base_exc,
         )
     );
-    crate::module_ns_store(ns, "KeyboardInterrupt", exc_type);
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "KeyboardInterrupt", exc_type);
+    });
 
-    let import_error = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    let mut import_error = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_init(
             "ImportError",
             Some("Import can't find module, or can't find name in module."),
@@ -3793,17 +4021,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "ImportError", import_error);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
-        make_exc_type_with_doc(
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "ImportError", import_error);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error, import_error => make_exc_type_with_doc(
             "ModuleNotFoundError",
             "Module not found.",
             exc_import_error_new,
             import_error,
         )
     );
-    crate::module_ns_store(ns, "ModuleNotFoundError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "ModuleNotFoundError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_doc(
             "AssertionError",
             "Assertion failed.",
@@ -3811,7 +4042,9 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "AssertionError", exc_type);
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "AssertionError", exc_type);
+    });
 
     let mut os_error = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_init(
@@ -3822,15 +4055,23 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "OSError", os_error);
-    crate::module_ns_store(ns, "IOError", os_error);
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "OSError", os_error);
+    });
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "IOError", os_error);
+    });
     // `exceptions.c` — `EnvironmentError` is a deprecated alias of `OSError`.
-    crate::module_ns_store(ns, "EnvironmentError", os_error);
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "EnvironmentError", os_error);
+    });
     // `_PyBuiltins_AddExceptions` binds `WindowsError` to `OSError` under
     // `MS_WINDOWS`, so the name exists only on Windows.
     #[cfg(windows)]
-    crate::module_ns_store(ns, "WindowsError", os_error);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "WindowsError", os_error);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
         make_exc_type_with_doc(
             "FileNotFoundError",
             "File not found.",
@@ -3838,8 +4079,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "FileNotFoundError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "FileNotFoundError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
         make_exc_type_with_doc(
             "FileExistsError",
             "File already exists.",
@@ -3847,8 +4090,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "FileExistsError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "FileExistsError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
         make_exc_type_with_doc(
             "PermissionError",
             "Not enough permissions.",
@@ -3856,8 +4101,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "PermissionError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "PermissionError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
         make_exc_type_with_doc(
             "NotADirectoryError",
             "Operation only works on directories.",
@@ -3865,8 +4112,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "NotADirectoryError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "NotADirectoryError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
         make_exc_type_with_doc(
             "IsADirectoryError",
             "Operation doesn't work on directories.",
@@ -3874,7 +4123,9 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "IsADirectoryError", exc_type);
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "IsADirectoryError", exc_type);
+    });
 
     let mut warning = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error =>
         make_exc_type_with_doc(
@@ -3884,7 +4135,9 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "Warning", warning);
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "Warning", warning);
+    });
     for (warn_name, doc) in [
         (
             "UserWarning",
@@ -3931,22 +4184,25 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             "Base class for warnings about encodings.",
         ),
     ] {
-        let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error, warning =>
+        let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error, warning =>
             make_exc_type_with_doc(warn_name, doc, exc_exception_new, warning)
         );
-        crate::module_ns_store(ns, warn_name, exc_type);
+        pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, value_error, warning => {
+            crate::__pyre_store!(ns, warn_name, exc_type)
+        });
     }
 
-    let mut unicode_error = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
-        make_exc_type_with_doc(
+    let mut unicode_error = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, value_error => make_exc_type_with_doc(
             "UnicodeError",
             "Unicode related error.",
             exc_unicode_error_new,
             value_error,
         )
     );
-    crate::module_ns_store(ns, "UnicodeError", unicode_error);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, unicode_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "UnicodeError", unicode_error);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, unicode_error =>
         make_exc_type_with_init(
             "UnicodeDecodeError",
             Some("Unicode decoding error."),
@@ -3955,8 +4211,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             unicode_error,
         )
     );
-    crate::module_ns_store(ns, "UnicodeDecodeError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, unicode_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, unicode_error => {
+        crate::__pyre_store!(ns, "UnicodeDecodeError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, unicode_error =>
         make_exc_type_with_init(
             "UnicodeEncodeError",
             Some("Unicode encoding error."),
@@ -3965,9 +4223,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             unicode_error,
         )
     );
-    crate::module_ns_store(ns, "UnicodeEncodeError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
-        make_exc_type_with_init(
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, unicode_error => {
+        crate::__pyre_store!(ns, "UnicodeEncodeError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, unicode_error => make_exc_type_with_init(
             "UnicodeTranslateError",
             Some("Unicode translation error."),
             exc_unicode_translate_error_new,
@@ -3975,13 +4234,17 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             unicode_error,
         )
     );
-    crate::module_ns_store(ns, "UnicodeTranslateError", exc_type);
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "UnicodeTranslateError", exc_type);
+    });
 
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc("BufferError", "Buffer error.", exc_exception_new, exception)
     );
-    crate::module_ns_store(ns, "BufferError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "BufferError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "MemoryError",
             "Out of memory.",
@@ -3989,8 +4252,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "MemoryError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "MemoryError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "ReferenceError",
             "Weak ref proxy used after referent went away.",
@@ -3998,8 +4263,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "ReferenceError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "ReferenceError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "SystemError",
             "Internal error in the Python interpreter.\n\nPlease report this to the Python maintainer, along with the traceback,\nthe Python version, and the hardware/OS platform and version.",
@@ -4007,8 +4274,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "SystemError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "SystemError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "EOFError",
             "Read beyond end of file.",
@@ -4016,7 +4285,9 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "EOFError", exc_type);
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "EOFError", exc_type);
+    });
     let mut syntax_error = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_init(
             "SyntaxError",
@@ -4026,12 +4297,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             exception,
         )
     );
-    crate::module_ns_store(ns, "SyntaxError", syntax_error);
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "SyntaxError", syntax_error);
+    });
     // Python 3.14 `exceptions.c` — the private exception raised by
     // `compile(..., flags=PyCF_ALLOW_INCOMPLETE_INPUT)` for an unfinished
     // interactive input.  `codeop._maybe_compile` intentionally resolves the
     // underscore-prefixed name through builtins rather than importing it.
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, syntax_error =>
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, syntax_error =>
         make_exc_type_with_doc(
             "_IncompleteInputError",
             "incomplete input.",
@@ -4039,26 +4312,30 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             syntax_error,
         )
     );
-    crate::module_ns_store(ns, "_IncompleteInputError", exc_type);
-    let indentation_error = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
-        make_exc_type_with_doc(
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, syntax_error => {
+        crate::__pyre_store!(ns, "_IncompleteInputError", exc_type);
+    });
+    let mut indentation_error = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, syntax_error => make_exc_type_with_doc(
             "IndentationError",
             "Improper indentation.",
             exc_syntax_error_new,
             syntax_error,
         )
     );
-    crate::module_ns_store(ns, "IndentationError", indentation_error);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
-        make_exc_type_with_doc(
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "IndentationError", indentation_error);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, indentation_error => make_exc_type_with_doc(
             "TabError",
             "Improper mixture of spaces and tabs.",
             exc_syntax_error_new,
             indentation_error,
         )
     );
-    crate::module_ns_store(ns, "TabError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "TabError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "BlockingIOError",
             "I/O operation would block.",
@@ -4066,8 +4343,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "BlockingIOError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "BlockingIOError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "ChildProcessError",
             "Child process error.",
@@ -4075,7 +4354,9 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "ChildProcessError", exc_type);
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "ChildProcessError", exc_type);
+    });
     let mut connection_error = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "ConnectionError",
@@ -4084,8 +4365,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "ConnectionError", connection_error);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, connection_error, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "ConnectionError", connection_error);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, connection_error, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "BrokenPipeError",
             "Broken pipe.",
@@ -4093,8 +4376,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             connection_error,
         )
     );
-    crate::module_ns_store(ns, "BrokenPipeError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, connection_error, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, connection_error, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "BrokenPipeError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, connection_error, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "ConnectionAbortedError",
             "Connection aborted.",
@@ -4102,8 +4387,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             connection_error,
         )
     );
-    crate::module_ns_store(ns, "ConnectionAbortedError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, connection_error, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, connection_error, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "ConnectionAbortedError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, connection_error, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "ConnectionRefusedError",
             "Connection refused.",
@@ -4111,17 +4398,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             connection_error,
         )
     );
-    crate::module_ns_store(ns, "ConnectionRefusedError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
-        make_exc_type_with_doc(
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error, connection_error => {
+        crate::__pyre_store!(ns, "ConnectionRefusedError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, connection_error => make_exc_type_with_doc(
             "ConnectionResetError",
             "Connection reset.",
             exc_os_error_new,
             connection_error,
         )
     );
-    crate::module_ns_store(ns, "ConnectionResetError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "ConnectionResetError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "InterruptedError",
             "Interrupted by signal.",
@@ -4129,8 +4419,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "InterruptedError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
+    pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
+        crate::__pyre_store!(ns, "InterruptedError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "ProcessLookupError",
             "Process not found.",
@@ -4138,99 +4430,138 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             os_error,
         )
     );
-    crate::module_ns_store(ns, "ProcessLookupError", exc_type);
-    let exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error =>
-        make_exc_type_with_doc(
+    pyre_object::with_roots!(base_exc, exception, runtime_error, os_error => {
+        crate::__pyre_store!(ns, "ProcessLookupError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, os_error => make_exc_type_with_doc(
             "TimeoutError",
             "Timeout expired.",
             exc_os_error_new,
             os_error,
         )
     );
-    crate::module_ns_store(ns, "TimeoutError", exc_type);
-    let base_exception_group = pyre_object::with_roots!(ns, exception, runtime_error =>
-        make_exception_group_type(
+    pyre_object::with_roots!(exception, runtime_error, base_exc => {
+        crate::__pyre_store!(ns, "TimeoutError", exc_type);
+    });
+    let mut base_exception_group = pyre_object::with_roots!(ns, exception, runtime_error, base_exc => make_exception_group_type(
             "BaseExceptionGroup",
             Some("A combination of multiple unrelated exceptions."),
             &[base_exc],
         )
     );
-    crate::module_ns_store(ns, "BaseExceptionGroup", base_exception_group);
-    let exception_group = pyre_object::with_roots!(ns, runtime_error =>
-        make_exception_group_type("ExceptionGroup", None, &[base_exception_group, exception])
+    pyre_object::with_roots!(runtime_error, exception => {
+        crate::__pyre_store!(ns, "BaseExceptionGroup", base_exception_group);
+    });
+    let mut exception_group = pyre_object::with_roots!(ns, runtime_error, base_exception_group, exception => make_exception_group_type("ExceptionGroup", None, &[base_exception_group, exception])
     );
-    crate::module_ns_store(ns, "ExceptionGroup", exception_group);
-    let exc_type = pyre_object::with_roots!(ns => make_exc_type_with_doc(
+    pyre_object::with_roots!(runtime_error => {
+        crate::__pyre_store!(ns, "ExceptionGroup", exception_group);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, runtime_error => make_exc_type_with_doc(
         "PythonFinalizationError",
         "Operation blocked during Python finalization.",
         exc_runtime_error_new,
         runtime_error,
     ));
-    crate::module_ns_store(ns, "PythonFinalizationError", exc_type);
-    crate::module_ns_get_or_insert_with(ns, "any", || {
-        make_module_builtin_function_with_arity("any", builtin_any, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "all", || {
-        make_module_builtin_function_with_arity("all", builtin_all, 1)
-    });
-    crate::module_ns_get_or_insert_with(ns, "sum", || {
-        make_module_builtin_function("sum", builtin_sum)
-    });
-    crate::module_ns_get_or_insert_with(ns, "round", || {
-        make_module_builtin_function("round", builtin_round)
-    });
-    crate::module_ns_get_or_insert_with(ns, "divmod", || {
-        // operation.py `divmod(space, w_x, w_y)` — two positional-only
-        // arguments, so any keyword is rejected with "takes no keyword
-        // arguments".
-        crate::gateway::make_module_builtin_function_with_arity_and_sig(
-            "divmod",
-            __majit_wrap_builtin_divmod,
-            2,
-            crate::gateway::Signature::new(vec!["x", "y"], None, None, 0, 2),
-        )
-    });
-    crate::module_ns_get_or_insert_with(ns, "pow", || {
-        make_module_builtin_function("pow", __majit_wrap_builtin_pow)
-    });
-    crate::module_ns_get_or_insert_with(ns, "hex", || {
-        make_module_builtin_function("hex", builtin_hex)
-    });
-    crate::module_ns_get_or_insert_with(ns, "oct", || {
-        make_module_builtin_function("oct", builtin_oct)
-    });
-    crate::module_ns_get_or_insert_with(ns, "bin", || {
-        make_module_builtin_function("bin", builtin_bin)
-    });
-    crate::module_ns_get_or_insert_with(ns, "format", || {
-        make_module_builtin_function("format", builtin_format)
-    });
-    crate::module_ns_get_or_insert_with(ns, "issubclass", || {
-        make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
-    });
-    crate::module_ns_get_or_insert_with(ns, "__import__", || {
-        // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
-        // `baseobjspace.py` keeps that same object as
-        // `space.w_default_importlib_import`.
-        let w_import =
-            make_module_builtin_function("__import__", __majit_wrap_builtin_dunder_import);
-        crate::importing::set_default_importlib_import(w_import);
-        w_import
-    });
+    crate::__pyre_store!(ns, "PythonFinalizationError", exc_type);
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "any",
+        || make_module_builtin_function_with_arity("any", builtin_any, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "all",
+        || make_module_builtin_function_with_arity("all", builtin_all, 1),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "sum",
+        || make_module_builtin_function("sum", builtin_sum),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "round",
+        || make_module_builtin_function("round", builtin_round),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "divmod",
+        || {
+            // operation.py `divmod(space, w_x, w_y)` — two positional-only
+            // arguments, so any keyword is rejected with "takes no keyword
+            // arguments".
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "divmod",
+                __majit_wrap_builtin_divmod,
+                2,
+                crate::gateway::Signature::new(vec!["x", "y"], None, None, 0, 2),
+            )
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "pow",
+        || make_module_builtin_function("pow", __majit_wrap_builtin_pow),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "hex",
+        || make_module_builtin_function("hex", builtin_hex),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "oct",
+        || make_module_builtin_function("oct", builtin_oct),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "bin",
+        || make_module_builtin_function("bin", builtin_bin),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "format",
+        || make_module_builtin_function("format", builtin_format),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "issubclass",
+        || make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "__import__",
+        || {
+            // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
+            // `baseobjspace.py` keeps that same object as
+            // `space.w_default_importlib_import`.
+            let w_import =
+                make_module_builtin_function("__import__", __majit_wrap_builtin_dunder_import);
+            crate::importing::set_default_importlib_import(w_import);
+            w_import
+        },
+    );
 
     // Descriptor types
-    crate::module_ns_get_or_insert_with(ns, "property", || {
-        crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE)
-    });
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "property",
+        || crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
+    );
     // staticmethod/classmethod registered as types for isinstance() support.
     // The type's __new__ creates the descriptor wrapper.
-    crate::module_ns_get_or_insert_with(ns, "staticmethod", || {
-        crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE)
-    });
-    crate::module_ns_get_or_insert_with(ns, "classmethod", || {
-        crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
-    });
-    install_builtin_text_signatures(ns);
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "staticmethod",
+        || crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "classmethod",
+        || crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE),
+    );
+    install_builtin_text_signatures(pyre_object::gc_roots::shadow_stack_get(ns_slot));
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:60-69
@@ -6792,46 +7123,57 @@ pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError>
 /// `cls.__dict__['__new__'].__func__` resolves and the descriptors bind with
 /// the right implicit first argument.
 pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) {
-    let _ns_root = pyre_object::gc_roots::push_roots();
-    let ns_root = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
-    if let Some(f) = unsafe { pyre_object::w_dict_getitem_str(ns, "__new__") }
-        && unsafe { crate::function::is_function(f) }
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    if let Some(mut f) = unsafe {
+        pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), "__new__")
+    } && unsafe { crate::function::is_function(f) }
         && !unsafe { pyre_object::function::is_staticmethod(f) }
     {
-        let wrapped = pyre_object::function::w_staticmethod_new(f);
-        let wrapped_root = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(wrapped);
-        let ns = pyre_object::gc_roots::shadow_stack_get(ns_root);
-        let wrapped = pyre_object::gc_roots::shadow_stack_get(wrapped_root);
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__new__", wrapped) };
+        pyre_object::with_roots!(f => {
+            crate::__pyre_put_new!(
+                ns_slot,
+                "__new__",
+                pyre_object::function::w_staticmethod_new(f)
+            )
+        });
     }
     for name in ["__init_subclass__", "__class_getitem__"] {
-        let ns = pyre_object::gc_roots::shadow_stack_get(ns_root);
-        if let Some(f) = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
-            && unsafe { crate::function::is_function(f) }
+        if let Some(mut f) = unsafe {
+            pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), name)
+        } && unsafe { crate::function::is_function(f) }
             && !unsafe { pyre_object::function::is_classmethod(f) }
         {
-            let wrapped = pyre_object::function::w_classmethod_new(f);
-            let wrapped_root = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(wrapped);
-            let ns = pyre_object::gc_roots::shadow_stack_get(ns_root);
-            let wrapped = pyre_object::gc_roots::shadow_stack_get(wrapped_root);
-            unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, wrapped) };
+            pyre_object::with_roots!(f => {
+                crate::__pyre_put_new!(
+                    ns_slot,
+                    name,
+                    pyre_object::function::w_classmethod_new(f)
+                )
+            });
         }
     }
 }
 
 /// A class that supplies equality but no hash is explicitly unhashable.
 pub(crate) fn type_new_set_hash_if_eq(ns: PyObjectRef) {
-    let _ns_root = pyre_object::gc_roots::push_roots();
-    let ns_root = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::gc_roots::pin_root(ns);
-    if unsafe { pyre_object::w_dict_getitem_str(ns, "__eq__") }.is_some()
-        && unsafe { pyre_object::w_dict_getitem_str(ns, "__hash__") }.is_none()
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    if unsafe {
+        pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), "__eq__")
+    }
+    .is_some()
+        && unsafe {
+            pyre_object::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                "__hash__",
+            )
+        }
+        .is_none()
     {
-        let ns = pyre_object::gc_roots::shadow_stack_get(ns_root);
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__hash__", pyre_object::w_none()) };
+        unsafe { crate::__pyre_put_new!(ns_slot, "__hash__", pyre_object::w_none()) };
     }
 }
 
@@ -10452,12 +10794,15 @@ pub(crate) fn is_exception_canonical_fget(fget: PyObjectRef) -> bool {
 /// store because nothing references it yet.
 fn type_ns_store(ns_slot: usize, key: &str, value: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
-    let value = pyre_object::gc_roots::pin_root(value);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value);
+    // `pop_roots` reloads the value before setitem; the pin's return is not
+    // that writeback once setitem allocates.
     unsafe {
         pyre_object::w_dict_setitem_str_no_proxy(
             pyre_object::gc_roots::shadow_stack_get(ns_slot),
             key,
-            value,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
         )
     };
 }
@@ -11309,7 +11654,8 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
     }
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    let exception_group = lookup_exc_class("ExceptionGroup").unwrap();
+    let base_group = pyre_object::gc_roots::pin_root(base_group);
+    let mut exception_group = lookup_exc_class("ExceptionGroup").unwrap();
     let exception = lookup_exc_class("Exception").unwrap();
     // `isinstance` / `issubclass` collect.  `base_group` is still read after
     // those calls for the layout test, so it sits in this pin with the others.
@@ -21815,15 +22161,20 @@ pub(crate) fn init_fileio_type(ns: PyObjectRef) {
         ),
     ] {
         let getter = make_builtin_function_with_arity(name, getter, 2);
+        let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(getter);
         let descriptor = match doc {
             Some(doc) => crate::typedef::make_getset_property_named_doc(
-                getter,
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
                 doc,
                 name,
             ),
-            None => crate::typedef::make_getset_descriptor_named(getter, name),
+            None => crate::typedef::make_getset_descriptor_named(
+                pyre_object::gc_roots::shadow_stack_get(getter_slot),
+                name,
+            ),
         };
         type_ns_store(ns_slot, name, descriptor);
     }
@@ -21831,12 +22182,23 @@ pub(crate) fn init_fileio_type(ns: PyObjectRef) {
     // and delete the typed `w_name` field. A null field is AttributeError,
     // and delete stores null so `repr_w` switches to the fd form.
     let name_getter = make_builtin_function_with_arity("name", fileio_get_name, 2);
+    let getter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_getter);
     let name_setter = make_builtin_function_with_arity("name", fileio_set_name, 3);
+    let setter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_setter);
     let name_deleter = make_builtin_function_with_arity("name", fileio_del_name, 2);
+    let deleter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_deleter);
     type_ns_store(
         ns_slot,
         "name",
-        crate::typedef::make_getset_property_named(name_getter, name_setter, name_deleter, "name"),
+        crate::typedef::make_getset_property_named(
+            pyre_object::gc_roots::shadow_stack_get(getter_slot),
+            pyre_object::gc_roots::shadow_stack_get(setter_slot),
+            pyre_object::gc_roots::shadow_stack_get(deleter_slot),
+            "name",
+        ),
     );
     type_ns_store(
         ns_slot,
@@ -28244,35 +28606,82 @@ mod tests {
         let os_error = lookup_exc_class("OSError").unwrap();
         let import_error = lookup_exc_class("ImportError").unwrap();
         let module_not_found = lookup_exc_class("ModuleNotFoundError").unwrap();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[
+            base_exception,
+            exception,
+            value_error,
+            os_error,
+            import_error,
+            module_not_found,
+        ]);
         unsafe {
             // `TypeCache.build` substitutes `applevel_subclasses_base.typedef`
             // for `_new_exception` classes, but concrete W_* owners start a
             // new Layout and their fieldless descendants reuse that one.
             assert_eq!(
-                pyre_object::w_type_get_layout_ptr(base_exception),
-                pyre_object::w_type_get_layout_ptr(exception),
+                pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(base)),
+                pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(
+                    base + 1
+                )),
             );
             assert_eq!(
-                pyre_object::w_type_get_layout_ptr(exception),
-                pyre_object::w_type_get_layout_ptr(value_error),
+                pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(
+                    base + 1
+                )),
+                pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(
+                    base + 2
+                )),
             );
             assert_ne!(
-                pyre_object::w_type_get_layout_ptr(exception),
-                pyre_object::w_type_get_layout_ptr(import_error),
+                pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(
+                    base + 1
+                )),
+                pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(
+                    base + 4
+                )),
             );
             assert_eq!(
-                pyre_object::w_type_get_layout_ptr(import_error),
-                pyre_object::w_type_get_layout_ptr(module_not_found),
+                pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(
+                    base + 4
+                )),
+                pyre_object::w_type_get_layout_ptr(pyre_object::gc_roots::shadow_stack_get(
+                    base + 5
+                )),
             );
         }
-        let compatible = pyre_object::w_tuple_new(vec![value_error, os_error]);
-        let best = unsafe { crate::call::check_and_find_best_base(compatible) }.unwrap();
-        assert!(std::ptr::eq(best, os_error));
+        let compatible = pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+            pyre_object::gc_roots::shadow_stack_get(base + 3),
+        ]);
+        let compatible_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(compatible);
+        let best = unsafe {
+            crate::call::check_and_find_best_base(pyre_object::gc_roots::shadow_stack_get(
+                compatible_slot,
+            ))
+        }
+        .unwrap();
+        assert!(std::ptr::eq(
+            best,
+            pyre_object::gc_roots::shadow_stack_get(base + 3)
+        ));
 
         let translate = lookup_exc_class("UnicodeTranslateError").unwrap();
         let encode = lookup_exc_class("UnicodeEncodeError").unwrap();
-        let conflicting = pyre_object::w_tuple_new(vec![translate, encode]);
-        let error = unsafe { crate::call::check_and_find_best_base(conflicting) }.unwrap_err();
+        let te_base = pyre_object::gc_roots::pin_roots(&[translate, encode]);
+        let conflicting = pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(te_base),
+            pyre_object::gc_roots::shadow_stack_get(te_base + 1),
+        ]);
+        let conflicting_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(conflicting);
+        let error = unsafe {
+            crate::call::check_and_find_best_base(pyre_object::gc_roots::shadow_stack_get(
+                conflicting_slot,
+            ))
+        }
+        .unwrap_err();
         assert_eq!(error.kind, crate::PyErrorKind::TypeError);
         assert_eq!(
             error.message_text(),
@@ -28281,14 +28690,37 @@ mod tests {
 
         let arithmetic = lookup_exc_class("ArithmeticError").unwrap();
         let exception_group = lookup_exc_class("ExceptionGroup").unwrap();
-        let compatible_group = pyre_object::w_tuple_new(vec![arithmetic, exception_group]);
-        let best = unsafe { crate::call::check_and_find_best_base(compatible_group) }.unwrap();
-        assert!(std::ptr::eq(best, exception_group));
+        let ag_base = pyre_object::gc_roots::pin_roots(&[arithmetic, exception_group]);
+        let compatible_group = pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(ag_base),
+            pyre_object::gc_roots::shadow_stack_get(ag_base + 1),
+        ]);
+        let cg_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(compatible_group);
+        let best = unsafe {
+            crate::call::check_and_find_best_base(pyre_object::gc_roots::shadow_stack_get(cg_slot))
+        }
+        .unwrap();
+        assert!(std::ptr::eq(
+            best,
+            pyre_object::gc_roots::shadow_stack_get(ag_base + 1)
+        ));
 
         let base_exception_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-        let conflicting_group = pyre_object::w_tuple_new(vec![os_error, base_exception_group]);
-        let error =
-            unsafe { crate::call::check_and_find_best_base(conflicting_group) }.unwrap_err();
+        let beg_base = pyre_object::gc_roots::pin_roots(&[
+            pyre_object::gc_roots::shadow_stack_get(base + 3),
+            base_exception_group,
+        ]);
+        let conflicting_group = pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(beg_base),
+            pyre_object::gc_roots::shadow_stack_get(beg_base + 1),
+        ]);
+        let cfg_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(conflicting_group);
+        let error = unsafe {
+            crate::call::check_and_find_best_base(pyre_object::gc_roots::shadow_stack_get(cfg_slot))
+        }
+        .unwrap_err();
         assert_eq!(error.kind, crate::PyErrorKind::TypeError);
         assert_eq!(
             error.message_text(),

@@ -6416,25 +6416,33 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
         // dispatch.  Surface the same shape here so
         // `dict_method_{keys,values,items,get,copy,update,...}` work
         // on `type.__dict__` without per-method proxy plumbing.
-        if pyre_object::is_dict_proxy(obj) {
-            let inner = pyre_object::w_dict_proxy_get_mapping(obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        if pyre_object::is_dict_proxy(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
+            let inner = pyre_object::w_dict_proxy_get_mapping(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            );
             // The wrapped mapping may itself be a dict subclass (e.g. a
             // class whose namespace is an `OrderedDict`), which keeps its
             // entries in a native backing dict — resolve through to that
             // rather than requiring `inner` to be an exact dict.
-            if !inner.is_null() && inner != obj {
+            if !inner.is_null() && inner != pyre_object::gc_roots::shadow_stack_get(obj_slot) {
                 let backing = resolve_dict_backing(inner);
                 if !backing.is_null() {
                     return backing;
                 }
             }
         }
-        if is_instance(obj) {
+        if is_instance(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
             // Read the reserved layout slot directly: going through
             // `getattr_str` would incorrectly expose internal dict operations
             // to a subclass's Python-level `__getattribute__` hook.
-            if let Some(slot) = dict_data_slot(obj)
-                && let Some(backing) = crate::objspace::std::mapdict::getslotvalue(obj, slot)
+            if let Some(slot) = dict_data_slot(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+                && let Some(backing) = crate::objspace::std::mapdict::getslotvalue(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    slot,
+                )
                 && is_dict(backing)
             {
                 return backing;
@@ -6449,8 +6457,17 @@ fn dict_lookup_checked(
     key: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
-        pyre_object::dictmultiobject::w_dict_lookup_checked(dict, key)
-            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[dict, key]);
+        pyre_object::dictmultiobject::w_dict_lookup_checked(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        )
+        .map_err(|_| {
+            crate::baseobjspace::take_pending_dict_key_error(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )
+        })
     }
 }
 
@@ -6643,23 +6660,33 @@ crate::builtin_wrapper_descriptor!(
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "get", 1)?;
     arity_at_most(args, "get", 2)?;
-    let mut dict = resolve_dict_backing(args[0]);
+    let nargs = args.len();
+    // The lookup hashes and compares the key, which is user code. Pin the
+    // receiver before resolving its backing so the slice is not live across
+    // that call, then reload every operand from its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let dict = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(base));
     if dict.is_null() {
-        return Ok(args.get(2).copied().unwrap_or_else(w_none));
-    }
-    // The lookup hashes and compares the key, which is user code.
-    // `with_roots!` roots the backing, key, and default and reloads them.
-    let mut key = args[1];
-    if args.len() >= 3 {
-        let mut default = args[2];
-        let found = pyre_object::with_roots!(dict, key, default => {
-            dict_lookup_checked(dict, key)
+        return Ok(if nargs >= 3 {
+            pyre_object::gc_roots::shadow_stack_get(base + 2)
+        } else {
+            w_none()
         });
-        Ok(found?.unwrap_or(default))
-    } else {
-        let found = pyre_object::with_roots!(dict, key => dict_lookup_checked(dict, key));
-        Ok(found?.unwrap_or_else(w_none))
     }
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict);
+    let found = dict_lookup_checked(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    )?;
+    Ok(found.unwrap_or_else(|| {
+        if nargs >= 3 {
+            pyre_object::gc_roots::shadow_stack_get(base + 2)
+        } else {
+            w_none()
+        }
+    }))
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:descr_keys` parity — returns
@@ -6867,18 +6894,21 @@ pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `dictmultiobject.py update1` — merge `w_data` into
 /// `w_dict`.  Shared by `dict.__init__` and `dict.update`.
 pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(), crate::PyError> {
-    let dict = resolve_dict_backing(w_dict);
-    if dict.is_null() {
-        return Ok(());
-    }
     // RPython's shadowstack transform keeps both operands live across
     // `keys`, iteration, `__getitem__`, hashing, and equality calls.  Those
     // are arbitrary Python collection points; without the explicit roots an
     // otherwise-unreachable destination dict can be swept while this Rust
-    // frame still holds its raw pointer.
+    // frame still holds its raw pointer. Resolve the backing from the pinned
+    // destination so `w_data` is not live across that call.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::pin_roots(&[dict, w_data]);
-    let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_dict, w_data]);
+    let dict = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(root_base));
+    if dict.is_null() {
+        return Ok(());
+    }
+    let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict);
+    let dict = || pyre_object::gc_roots::shadow_stack_get(backing_slot);
     let data = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     unsafe {
         let fast_path_eligible = !resolve_dict_backing(data()).is_null()
@@ -7189,25 +7219,37 @@ fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
 pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "pop", 1)?;
     arity_at_most(args, "pop", 2)?;
-    let dict = resolve_dict_backing(args[0]);
-    let key = args[1];
+    let nargs = args.len();
     // Rooted as `dict_method_get`: the removal hashes the key, and the default
-    // is only consumed once that has run.
+    // is only consumed once that has run. Resolve the backing from the pinned
+    // receiver so `args` is not live across that call.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
+    let dict = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(base));
     if !dict.is_null() {
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(dict);
         unsafe {
-            match pyre_object::dictmultiobject::w_dict_pop_checked(dict, key) {
+            match pyre_object::dictmultiobject::w_dict_pop_checked(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ) {
                 Ok(Some(val)) => return Ok(val),
                 Ok(None) => {}
-                Err(_) => return Err(crate::baseobjspace::take_pending_dict_key_error(key)),
+                Err(_) => {
+                    return Err(crate::baseobjspace::take_pending_dict_key_error(
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    ));
+                }
             }
         }
     }
-    if args.len() >= 3 {
+    if nargs >= 3 {
         return Ok(pyre_object::gc_roots::shadow_stack_get(base + 2));
     }
-    Err(crate::PyError::key_error_with_key(key))
+    Err(crate::PyError::key_error_with_key(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    ))
 }
 
 /// `dictmultiobject.py` `W_DictMultiObject.descr_popitem`:
@@ -7251,29 +7293,36 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "setdefault", 1)?;
     arity_at_most(args, "setdefault", 2)?;
-    let dict = resolve_dict_backing(args[0]);
-    if dict.is_null() {
-        return Ok(args.get(2).copied().unwrap_or_else(w_none));
-    }
-    // Hashing the key can collect; pin the backing, key, and default first
-    // the way `dict.get` publishes `args` before the lookup.
+    let nargs = args.len();
+    // Hashing the key can collect; pin the receiver before resolving its
+    // backing, then reload the key and default from those slots.
     let _roots = pyre_object::gc_roots::push_roots();
-    let live: Vec<PyObjectRef> = if args.len() >= 3 {
-        vec![dict, args[1], args[2]]
-    } else {
-        vec![dict, args[1]]
-    };
-    let base = pyre_object::gc_roots::pin_roots(&live);
-    let dict = pyre_object::gc_roots::shadow_stack_get(base);
-    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let default = if args.len() >= 3 {
-        pyre_object::gc_roots::shadow_stack_get(base + 2)
-    } else {
-        w_none()
-    };
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let dict = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(base));
+    if dict.is_null() {
+        return Ok(if nargs >= 3 {
+            pyre_object::gc_roots::shadow_stack_get(base + 2)
+        } else {
+            w_none()
+        });
+    }
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setdefault_checked(dict, key, default)
-            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
+        pyre_object::dictmultiobject::w_dict_setdefault_checked(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            if nargs >= 3 {
+                pyre_object::gc_roots::shadow_stack_get(base + 2)
+            } else {
+                w_none()
+            },
+        )
+        .map_err(|_| {
+            crate::baseobjspace::take_pending_dict_key_error(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )
+        })
     }
 }
 

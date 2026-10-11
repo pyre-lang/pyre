@@ -1511,10 +1511,20 @@ pub fn module_ns_get(ns: PyObjectRef, name: &str) -> Option<PyObjectRef> {
 }
 
 /// Store into a proxy-free GC module/namespace dict (successor to
-/// `dict_storage_store` for migrated namespaces). `ns` must be a
-/// non-moving module dict so the by-value handle stays valid across stores.
+/// `dict_storage_store` for migrated namespaces).
+///
+/// Both words already exist. `ShadowStackFrameworkGCTransformer.push_roots`
+/// publishes that live set once; `pop_roots` reloads each local before setitem.
 pub fn module_ns_store(ns: PyObjectRef, name: &str, value: PyObjectRef) {
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) }
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[ns, value]);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        );
+    }
 }
 
 pub fn module_ns_store_wtf8(ns: PyObjectRef, name: &Wtf8, value: PyObjectRef) {
@@ -1531,11 +1541,28 @@ pub fn module_ns_delete_wtf8(ns: PyObjectRef, name: &Wtf8) -> bool {
 }
 
 /// Run and store `f()` only when `name` is absent from a GC namespace dict.
+///
+/// The value does not exist until `f` returns, so the namespace is pinned
+/// first and the newborn after. `pop_roots` reloads both words before setitem.
 pub fn module_ns_get_or_insert_with(ns: PyObjectRef, name: &str, f: impl FnOnce() -> PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        if pyre_object::dictmultiobject::w_dict_getitem_str(ns, name).is_none() {
+        if pyre_object::dictmultiobject::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+        )
+        .is_none()
+        {
             let value = f();
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value);
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(value);
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                name,
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            );
         }
     }
 }

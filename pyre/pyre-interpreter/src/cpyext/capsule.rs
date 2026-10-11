@@ -25,21 +25,24 @@ static CAPSULE_TYPE: pyre_object::gc_roots::RootedOnceRef =
 pub(crate) fn capsule_type() -> PyObjectRef {
     CAPSULE_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("PyCapsule", |ns| unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ns);
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__repr__",
-                crate::make_builtin_function_with_arity("__repr__", capsule_repr, 1),
+                crate::make_builtin_function_with_arity("__repr__", capsule_repr, 1)
             );
             // `PyCapsule_Type` carries no `tp_new`: every capsule comes from
             // `PyCapsule_New`, which allocates the carrier directly.
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__new__",
                 crate::typedef::make_new_descr(|_| {
                     Err(crate::PyError::type_error(
                         "cannot create 'PyCapsule' instances",
                     ))
-                }),
+                })
             );
         });
         unsafe {

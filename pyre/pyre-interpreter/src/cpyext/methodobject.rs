@@ -198,16 +198,19 @@ fn descr_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// Install the stores every carrier type refuses, so only a function
 /// carrier's `__module__` can be written into a namespace from Python.
 pub(super) fn install_attribute_fence(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__setattr__",
-            crate::make_builtin_function_with_arity("__setattr__", descr_setattr, 3),
+            crate::make_builtin_function_with_arity("__setattr__", descr_setattr, 3)
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "__delattr__",
-            crate::make_builtin_function_with_arity("__delattr__", descr_delattr, 2),
+            crate::make_builtin_function_with_arity("__delattr__", descr_delattr, 2)
         );
     }
 }
@@ -223,19 +226,22 @@ pub(super) fn install_attribute_fence(ns: PyObjectRef) {
 pub fn pycfunction_type() -> PyObjectRef {
     PYCFUNCTION_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("builtin_function_or_method", |ns| {
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ns);
             unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
+                crate::__pyre_put_new!(
+                    ns_slot,
                     "__call__",
-                    crate::make_builtin_function("__call__", descr_call),
+                    crate::make_builtin_function("__call__", descr_call)
                 );
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
+                crate::__pyre_put_new!(
+                    ns_slot,
                     "__repr__",
-                    crate::make_builtin_function_with_arity("__repr__", descr_repr, 1),
+                    crate::make_builtin_function_with_arity("__repr__", descr_repr, 1)
                 );
             };
-            install_attribute_fence(ns);
+            install_attribute_fence(pyre_object::gc_roots::shadow_stack_get(ns_slot));
         });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp

@@ -1990,9 +1990,16 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
             // Marking first would leave the young dict stored under a clean
             // bit, so the next minor walk skips the slot and the dict goes
             // stale (`walk_raw_function_roots` then drags a dead pointer).
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
             let w_dict = crate::objspace::std::mapdict::make_instance_dict();
-            function_write_barrier(obj);
-            (*func).w_func_dict = w_dict;
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_dict);
+            function_write_barrier(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let func = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut Function;
+            (*func).w_func_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            return pyre_object::gc_roots::shadow_stack_get(dict_slot);
         }
         (*func).w_func_dict
     }
@@ -2919,6 +2926,11 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
         if (*func).w_module.is_null() {
             // function.py:505-506: space.call_method(self.w_func_globals,
             // "get", space.newtext("__name__"))
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let name_key = pyre_object::unicodeobject::intern_str_value("__name__");
+            let func = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut Function;
             let w_globals = (*func).w_func_globals_obj;
             if !w_globals.is_null() && !pyre_object::is_none(w_globals) {
                 // Dispatch through `dict.get` so dict subclasses that
@@ -2932,18 +2944,11 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
                 // call is the dict's pre-move address, and storing the
                 // unrooted result writes an interior word into `w_module`
                 // that the next minor copies as a root.
-                let name_key = pyre_object::unicodeobject::intern_str_value("__name__");
-                let _roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(obj);
-                let globals_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_globals);
-                let key_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(name_key);
+                let pair = pyre_object::gc_roots::pin_roots(&[w_globals, name_key]);
                 let result = crate::baseobjspace::call_method(
-                    pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                    pyre_object::gc_roots::shadow_stack_get(pair),
                     "get",
-                    &[pyre_object::gc_roots::shadow_stack_get(key_slot)],
+                    &[pyre_object::gc_roots::shadow_stack_get(pair + 1)],
                 );
                 let stored = if result.is_null() {
                     pyre_object::w_none()
@@ -2959,8 +2964,10 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
                 return (*func).w_module;
             }
             // function.py `fget___module__`: self.w_module = space.w_None
-            function_write_barrier(obj);
+            function_write_barrier(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let func = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut Function;
             (*func).w_module = pyre_object::w_none();
+            return (*func).w_module;
         }
         // function.py:509: return self.w_module
         let func = obj as *mut Function;
@@ -2992,15 +2999,28 @@ pub unsafe fn descr_function__new__(
         } else {
             w_closure
         };
-        let func = function_new_with_closure(code, name, w_globals, closure);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[w_name, w_globals, closure]);
+        let func = function_new_with_closure(
+            code,
+            name,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        );
+        let func_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(func);
+        let w_name = pyre_object::gc_roots::shadow_stack_get(base);
         // `name` above is only the UTF-8 mirror. The object the caller passed
         // is what `__name__` must answer with, so store it: otherwise the
         // getter rebuilds one from the mirror and a name carrying a lone
         // surrogate comes back escaped instead of equal to what went in.
         if !w_name.is_null() && !pyre_object::is_none(w_name) {
-            function_set_name_obj(func, w_name);
+            function_set_name_obj(
+                pyre_object::gc_roots::shadow_stack_get(func_slot),
+                pyre_object::gc_roots::shadow_stack_get(base),
+            );
         }
-        func
+        pyre_object::gc_roots::shadow_stack_get(func_slot)
     }
 }
 
@@ -3109,12 +3129,30 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     // `PyDict_Check` accepts dict subclasses (annotationlib hands a
     // `_StringifierDict`); resolve the backing storage rather than
-    // demanding an exact `dict`.
+    // demanding an exact `dict`. The closure is addressed later as a
+    // tuple, so publish it before this call and read it back after.
+    let _closure_roots = pyre_object::gc_roots::push_roots();
+    // All six words exist. `RootScope::pin_roots` publishes them once;
+    // each `pin_root` would normalize after the first write.
+    let base = pyre_object::gc_roots::pin_roots(&[
+        w_code,
+        w_globals,
+        w_name,
+        w_argdefs,
+        w_kwdefaults,
+        w_closure,
+    ]);
+    let closure_slot = base + 5;
+    let w_globals = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if crate::type_methods::resolve_dict_backing(w_globals).is_null() {
         return Err(crate::PyError::type_error(
             "function() argument 'globals' must be dict, not ...",
         ));
     }
+    // `pop_roots` writes every live local. `resolve_dict_backing` can collect,
+    // so the words below are the slots, not the pre-pin copies.
+    let w_code = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_name = pyre_object::gc_roots::shadow_stack_get(base + 2);
     let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
     let name = if w_name.is_null() || unsafe { pyre_object::is_none(w_name) } {
         unsafe { (*code_ptr).obj_name.to_string() }
@@ -3125,6 +3163,11 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "arg 3 (name) must be None or string",
         ));
     };
+    // `name_utf8_mirror` can collect. Reload before the defaults and closure
+    // reads (`ShadowStackFrameworkGCTransformer.pop_roots`).
+    let w_code = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_argdefs = pyre_object::gc_roots::shadow_stack_get(base + 3);
+    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
     // [3.14-spec] PyPy `Function.descr_function__new__` calls
     // `space.fixedview(argdefs)` before it inspects `closure`, but that accepts
     // lists and then reports PyPy's `TypeError("invalid closure")` for
@@ -3152,6 +3195,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // immutability of the cells it holds, and every accepted element is still
     // checked to be a `Cell` below.
     let nfreevars = unsafe { (&(*code_ptr).freevars).len() };
+    let w_closure = pyre_object::gc_roots::shadow_stack_get(closure_slot);
     let closure = if w_closure.is_null() || unsafe { pyre_object::is_none(w_closure) } {
         if nfreevars != 0 {
             return Err(crate::PyError::type_error("arg 5 (closure) must be tuple"));
@@ -3193,14 +3237,21 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // dict subclass here is observable: annotationlib's `_StringifierDict`
     // supplies unresolved names through `__missing__` when it clones a PEP
     // 649 annotate function with `types.FunctionType`.
+    let w_code = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_globals = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let closure = if closure.is_null() {
+        PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(closure_slot)
+    };
     let func = function_new_with_closure(w_code as *const (), name, w_globals, closure);
     // `function.py` `self.name = forcename or code.co_name`. The raw `name`
     // mirror cannot hold a lone surrogate, so `__name__` reads the str object.
     let _qual_roots = pyre_object::gc_roots::push_roots();
-    let code_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_code);
-    let func_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(func);
+    let code_slot =
+        pyre_object::gc_roots::pin_roots(&[pyre_object::gc_roots::shadow_stack_get(base), func]);
+    let func_slot = code_slot + 1;
+    let w_name = pyre_object::gc_roots::shadow_stack_get(base + 2);
     let name_obj = if !w_name.is_null() && !unsafe { pyre_object::is_none(w_name) } {
         w_name
     } else {
@@ -3223,6 +3274,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             pyre_object::gc_roots::shadow_stack_get(qualname_slot),
         )
     };
+    let w_argdefs = pyre_object::gc_roots::shadow_stack_get(base + 3);
     if !w_argdefs.is_null() && !unsafe { pyre_object::is_none(w_argdefs) } {
         unsafe {
             function_set_defaults(
@@ -3231,6 +3283,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             )
         };
     }
+    let w_kwdefaults = pyre_object::gc_roots::shadow_stack_get(base + 4);
     if !w_kwdefaults.is_null() && !unsafe { pyre_object::is_none(w_kwdefaults) } {
         if !unsafe { pyre_object::is_dict(w_kwdefaults) } {
             return Err(crate::PyError::type_error(
