@@ -5948,6 +5948,14 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "object_array::PREBUILT_EMPTY_ITEMS_BLOCK",
             pyre_object::object_array::ll_prebuilt_empty_items_block() as usize as i64,
         ),
+        (
+            "object_array::PREBUILT_EMPTY_INT_ITEMS_BLOCK",
+            pyre_object::object_array::ll_prebuilt_empty_int_items_block() as usize as i64,
+        ),
+        (
+            "object_array::PREBUILT_EMPTY_FLOAT_ITEMS_BLOCK",
+            pyre_object::object_array::ll_prebuilt_empty_float_items_block() as usize as i64,
+        ),
         // Process-wide StdObjSpace prebuilt (`baseobjspace.py` space).
         (
             "baseobjspace::OBJECT_SPACE",

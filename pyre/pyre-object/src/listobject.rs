@@ -1658,20 +1658,28 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
     list.set_length_relaxed(0);
     list.items = std::ptr::null_mut();
     if is_plain_int1(w_item) {
-        let fresh = IntArray::with_capacity(sizehint);
+        // `get_empty_storage(sizehint)`: `ll_newemptylist` when there is no
+        // hint, else `ll_newlist_hint`'s `malloc(ITEMS, lengthhint)`.
+        let items = if sizehint == 0 {
+            crate::object_array::ll_prebuilt_empty_int_items_block()
+        } else {
+            crate::object_array::ll_new_int_items(sizehint as i64)
+        };
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
-        list.int_items.install(fresh);
-        let obj = crate::gc_roots::shadow_stack_get(root_base);
-        let list = &mut *(obj as *mut W_ListObject);
+        ll_list_int_set_items(list, items);
+        ll_list_int_set_len(list, 0);
         list.strategy = ListStrategy::Integer;
     } else if is_float_strategy_item(w_item) {
-        let fresh = FloatArray::with_capacity(sizehint);
+        let items = if sizehint == 0 {
+            crate::object_array::ll_prebuilt_empty_float_items_block()
+        } else {
+            crate::object_array::ll_new_float_items(sizehint as i64) as *mut TypedItemsBlock
+        };
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
-        list.float_items.install(fresh);
-        let obj = crate::gc_roots::shadow_stack_get(root_base);
-        let list = &mut *(obj as *mut W_ListObject);
+        ll_list_float_set_items(list, items);
+        ll_list_float_set_len(list, 0);
         list.strategy = ListStrategy::Float;
     } else if is_bytes_strategy_item(w_item) {
         // The immediately following append grows this null/zero rlist form
@@ -3177,12 +3185,15 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
     let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > list.int_items.heap_capacity() as i64 {
-        let target_cap = (crate::object_array::rlist_overallocate_signed(newsize) as usize)
-            .max(crate::int_array::INT_ARRAY_INLINE_CAP);
+    if overallocate || newsize > ll_list_int_capacity(list) as i64 {
+        let target_cap = crate::object_array::rlist_overallocate_signed(newsize) as usize;
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
-        let newitems = grow_int_items_block(list.int_items.block, target_cap, list.int_items.len());
+        let newitems = grow_int_items_block(
+            ll_list_int_items(list),
+            target_cap,
+            ll_list_int_length(list),
+        );
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
         ll_list_int_set_items(list, newitems);
@@ -3273,6 +3284,14 @@ pub fn ll_list_float_set_items(l: &mut W_ListObject, items: *mut TypedItemsBlock
     l.float_items.block = items;
 }
 
+/// `rlist.py LIST.ll_items` for Float storage (`l.items`); see
+/// [`ll_list_int_items`].
+#[inline(never)]
+#[majit_macros::oopspec("list.float_items(l)")]
+pub fn ll_list_float_items(l: &W_ListObject) -> *mut TypedItemsBlock {
+    l.float_items.block
+}
+
 /// `rlist.py _ll_list_resize_hint_really` for Float storage.
 ///
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
@@ -3293,13 +3312,15 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
     let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > list.float_items.heap_capacity() as i64 {
-        let target_cap = (crate::object_array::rlist_overallocate_signed(newsize) as usize)
-            .max(crate::float_array::FLOAT_ARRAY_INLINE_CAP);
+    if overallocate || newsize > ll_list_float_capacity(list) as i64 {
+        let target_cap = crate::object_array::rlist_overallocate_signed(newsize) as usize;
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
-        let newitems =
-            grow_float_items_block(list.float_items.block, target_cap, list.float_items.len());
+        let newitems = grow_float_items_block(
+            ll_list_float_items(list),
+            target_cap,
+            ll_list_float_length(list),
+        );
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
         ll_list_float_set_items(list, newitems);

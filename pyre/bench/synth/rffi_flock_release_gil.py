@@ -1,6 +1,5 @@
-# pyre-check: skip-backends=cranelift,wasm
-# cranelift runs the core build, which has no `pyre-module` and so no `fcntl`;
-# the wasm guest has no `fcntl` either.
+# pyre-check: requires-modules=fcntl
+# A build without `pyre-module` has no `fcntl`, and neither has the wasm guest.
 # pyre-check: skip-cpython
 # pyre-check: skip-platforms=win32
 # Hot flock in a compiled loop, then a failing call whose errno comes back

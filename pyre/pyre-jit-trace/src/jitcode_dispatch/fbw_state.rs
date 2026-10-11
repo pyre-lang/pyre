@@ -1181,10 +1181,12 @@ pub(crate) unsafe fn fbw_gc_store_word(
         Value::Int(v) if matches!(size, 1 | 2 | 4 | 8) => unsafe { raw_store_int(addr, size, v) },
         Value::Float(v) if size == 8 => unsafe { addr.cast::<f64>().write_unaligned(v) },
         Value::Ref(r) if size == std::mem::size_of::<usize>() => {
-            unsafe { addr.cast::<usize>().write_unaligned(r.0) };
+            // `transform_generic_set` (framework.py): the barrier comes
+            // before the bare store.
             if managed {
                 pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
             }
+            unsafe { addr.cast::<usize>().write_unaligned(r.0) };
         }
         _ => return false,
     }

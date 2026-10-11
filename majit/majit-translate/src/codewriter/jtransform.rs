@@ -9132,6 +9132,7 @@ impl<'a> Transformer<'a> {
     /// GC array:
     ///   `list.int_len(l)`         → getfield_gc_i(l, int_items.len)
     ///   `list.int_items(l)`       → getfield_gc_r(l, int_items.block)
+    ///   `list.float_items(l)`     → getfield_gc_r(l, float_items.block)
     ///   `list.int_getitem(l, i)`  → getfield_gc_r(l, int_items.block);
     ///                                getarrayitem_gc_i(block, i)
     ///   `list.int_setitem(l,i,v)` → getfield_gc_r(l, int_items.block);
@@ -9362,6 +9363,25 @@ impl<'a> Transformer<'a> {
                             base: l,
                             field: FieldDescriptor::new(
                                 "int_items.block",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            ty: ValueType::Ref(None),
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            // `LIST.ll_items` for the Float backing array.
+            "list.float_items" => {
+                let l = args.first()?.clone();
+                (
+                    "list.float_items → getfield_gc_r(float_items.block)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "float_items.block",
                                 Some(LIST_OWNER.to_string()),
                             ),
                             ty: ValueType::Ref(None),
@@ -28351,48 +28371,54 @@ mod tests {
         assert_eq!(lowered, count);
     }
 
-    /// `list.int_items(l)` lowers to `getfield_gc_r(l, int_items.block)`
+    /// `list.int_items(l)` / `list.float_items(l)` lower to
+    /// `getfield_gc_r(l, {int,float}_items.block)`
     /// (`rlist.py LIST.ll_items` / `emit_list_items_read`).
     #[test]
-    fn handle_list_call_int_items_lowers_to_getfield_block() {
-        let config = GraphTransformConfig::default();
-        let mut graph = FunctionGraph::new("list_int_items");
-        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let op = SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::ConstInt(0),
-        };
-        let mut transformer = Transformer::new(&config);
-        let rewrite = transformer
-            ._handle_list_call(
-                "list.int_items",
-                &op,
-                std::slice::from_ref(&l),
-                &mut graph,
-                "list_int_items",
-            )
-            .expect("list.int_items must lower");
-        let RewriteResult::Replace(ops) = rewrite else {
-            panic!("expected Replace");
-        };
-        assert_eq!(ops.len(), 1);
-        match &ops[0].kind {
-            OpKind::FieldRead {
-                base,
-                field,
-                ty,
-                pure,
-            } => {
-                assert_eq!(base, &l);
-                assert_eq!(field.name, "int_items.block");
-                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
-                assert!(matches!(ty, ValueType::Ref(None)));
-                assert!(!*pure);
+    fn handle_list_call_typed_items_lowers_to_getfield_block() {
+        for (oopspec, field_name) in [
+            ("list.int_items", "int_items.block"),
+            ("list.float_items", "float_items.block"),
+        ] {
+            let config = GraphTransformConfig::default();
+            let mut graph = FunctionGraph::new("list_typed_items");
+            let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let op = SpaceOperation {
+                result: Some(result.clone()),
+                kind: OpKind::ConstInt(0),
+            };
+            let mut transformer = Transformer::new(&config);
+            let rewrite = transformer
+                ._handle_list_call(
+                    oopspec,
+                    &op,
+                    std::slice::from_ref(&l),
+                    &mut graph,
+                    "list_typed_items",
+                )
+                .unwrap_or_else(|| panic!("{oopspec} must lower"));
+            let RewriteResult::Replace(ops) = rewrite else {
+                panic!("expected Replace");
+            };
+            assert_eq!(ops.len(), 1);
+            match &ops[0].kind {
+                OpKind::FieldRead {
+                    base,
+                    field,
+                    ty,
+                    pure,
+                } => {
+                    assert_eq!(base, &l);
+                    assert_eq!(field.name, field_name);
+                    assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                    assert!(matches!(ty, ValueType::Ref(None)));
+                    assert!(!*pure);
+                }
+                other => panic!("expected FieldRead, got {other:?}"),
             }
-            other => panic!("expected FieldRead, got {other:?}"),
+            assert_eq!(ops[0].result.as_ref(), Some(&result));
         }
-        assert_eq!(ops[0].result.as_ref(), Some(&result));
     }
 
     /// `list.int_getitem(l, i)` lowers to `getfield_gc_r(l,

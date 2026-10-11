@@ -14360,7 +14360,9 @@ fn handle<Sym: WalkSym>(
             let value = read_ref_reg(code, op, 2, ctx)?;
             let descr = read_descr(code, op, 3, ctx)?;
             let descr_index = descr.index();
-            // pyjitpl.py `_opimpl_setarrayitem_gc_any`.
+            // pyjitpl.py `_opimpl_setarrayitem_gc_any`: execute, record,
+            // then `heapcache.setarrayitem`.
+            walker_execute_setarrayitem_gc(code, op, ctx, 'r', array, index, value, &descr)?;
             ctx.trace_ctx
                 .profiler()
                 .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
@@ -14375,7 +14377,6 @@ fn handle<Sym: WalkSym>(
             );
             ctx.trace_ctx
                 .heapcache_setarrayitem(array, index, descr_index, value);
-            walker_execute_setarrayitem_gc(code, op, ctx, 'r', array, index, value, &descr)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),

@@ -1,6 +1,5 @@
-# pyre-check: skip-backends=cranelift,wasm
-# cranelift runs the core build, which has no `pyre-module` and so no `termios`;
-# the wasm guest has no `termios` either.
+# pyre-check: requires-modules=termios
+# A build without `pyre-module` has no `termios`, and neither has the wasm guest.
 # pyre-check: skip-cpython
 # pyre-check: skip-platforms=win32
 # Hot tcdrain in a compiled loop, then a failing call whose errno comes back

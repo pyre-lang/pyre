@@ -138,7 +138,9 @@ fn walker_execute_gc_store<Sym: WalkSym>(
     // `offset` / `size` come from the op's own descr.
     if unsafe { fbw_gc_store_word(obj, offset, size, value, managed) } {
         ctx.trace_ctx.set_cut_observer(fbw_gc_store_journal_cut);
-        let op_count = ctx.trace_ctx.get_trace_position()._count;
+        // `execute_and_record` executes, then records: the op this store
+        // belongs to is the next one, and a cut back past it undoes the store.
+        let op_count = ctx.trace_ctx.get_trace_position()._count + 1;
         fbw_gc_store_journal_push(obj, offset, size, before, op_count);
         Ok(())
     } else {
@@ -453,6 +455,9 @@ pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
     let descr = read_descr(code, op, 3, ctx)?;
     let descr_index = descr.index();
 
+    // `execute_setarrayitem_gc`: `execute_and_record` runs the store, then
+    // records it, and `heapcache.setarrayitem` comes last.
+    walker_execute_setarrayitem_gc(code, op, ctx, value_bank, array, index, value, &descr)?;
     ctx.trace_ctx
         .profiler()
         .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
@@ -471,7 +476,6 @@ pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
     // hit time.
     ctx.trace_ctx
         .heapcache_setarrayitem(array, index, descr_index, value);
-    walker_execute_setarrayitem_gc(code, op, ctx, value_bank, array, index, value, &descr)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -1190,19 +1194,6 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
     } else {
-        ctx.trace_ctx
-            .profiler()
-            .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::OPS);
-        ctx.trace_ctx
-            .profiler()
-            .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::RECORDED_OPS);
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr.clone());
-        // Write-through with alias-clearing semantics
-        // (`heapcache.py do_write_with_aliasing`).  Mirrors
-        // `upd.setfield(valuebox)` (heapcache.py).
-        ctx.trace_ctx
-            .heapcache_setfield_cached(obj, descr_index, valuebox);
         // Authoritative-executor eager store, the same posture as the
         // module-global cell fold in `mod.rs`: `_opimpl_setfield_gc_any`
         // reaches `executor.execute` → `cpu.bh_setfield_gc_*` through
@@ -1242,6 +1233,19 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
             let before = obj_ptr.and_then(|p| ctx.trace_ctx.field_sanity_load(p, &descr, ty));
             walker_execute_gc_store(ctx, obj_ptr, offset, size, ty, before, value, op.pc)?;
         }
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::OPS);
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::SetfieldGc, majit_metainterp::counters::RECORDED_OPS);
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr.clone());
+        // Write-through with alias-clearing semantics
+        // (`heapcache.py do_write_with_aliasing`).  Mirrors
+        // `upd.setfield(valuebox)` (heapcache.py).
+        ctx.trace_ctx
+            .heapcache_setfield_cached(obj, descr_index, valuebox);
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
