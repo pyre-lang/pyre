@@ -501,7 +501,19 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // pc applied to the outer body is not an instruction boundary.
         let prepared_handler = walked_jitcode_index
             .and_then(|index| prepared_handler_in(wc.trace_ctx, jitcode_code, index, position));
-        let handler_entry = prepared_handler.or(exc_edge_catch_target);
+        // `handle_possible_exception` already chose the arm:
+        // a pending exception records GUARD_EXCEPTION and
+        // `finishframe_exception` may move to the handler (`prepared_handler`);
+        // a null pending cell records GUARD_NO_EXCEPTION and stays at
+        // `position`. `exc_edge_catch_target` is the unprepared fallback and
+        // must not override that choice: using SAVE_EXCEPTION as the caught
+        // exception on the no-exception arm GETFIELDs `w_traceback` off a
+        // runtime-NULL box.
+        let handler_entry = if exception_resume_prepared {
+            prepared_handler
+        } else {
+            prepared_handler.or(exc_edge_catch_target)
+        };
         // Set by the carrier seed's no-handler arm: the root frame lets the
         // exception through, so the trace ends at bridge entry and the walk is
         // skipped entirely.
