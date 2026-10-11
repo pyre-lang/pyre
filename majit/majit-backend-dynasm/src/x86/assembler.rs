@@ -74,7 +74,7 @@ use crate::jitframe::{
 };
 use crate::jump::RegallocMoves;
 use crate::regalloc::{RegAlloc, RegAllocOp};
-use crate::regloc::{Loc, RegLoc};
+use crate::regloc::Loc;
 use crate::runner::GuardGcTypeInfo;
 
 /// x86/assembler.py: managed general-purpose registers.
@@ -1897,7 +1897,8 @@ struct SlowPath {
 /// Body selected by `SlowPath.generate`.
 enum SlowPathKind {
     WriteBarrier {
-        loc_base: RegLoc,
+        /// `arglocs[0]`. A register, or the immediate `addr_add_const` encodes.
+        loc_base: Loc,
         loc_index: Option<Loc>,
         helper_num: usize,
         card_marking: bool,
@@ -2135,6 +2136,10 @@ pub struct Assembler386<'a> {
     /// which the `LoadFromGcTable` genop reads PC-relative. Empty when the
     /// trace references no reference constants.
     gcref_table: Vec<dynasmrt::DynamicLabel>,
+    /// `genop_finish`'s `MOV_rp` targets. Each word is the singleton descr
+    /// pointer, bound after the recoveries so the load stays rip-relative
+    /// and the word is not executed.
+    finish_descr_words: Vec<(dynasmrt::DynamicLabel, u64)>,
     /// `assembler.py` `datablockwrapper`. Float constants live here
     /// (`X86XMMRegisterManager.convert_to_imm` → `ConstFloatLoc`), not in
     /// the instruction stream.
@@ -2387,6 +2392,7 @@ impl<'a> Assembler386<'a> {
             cond_call_slowpath,
             failure_recovery_code,
             gcref_table: Vec::new(),
+            finish_descr_words: Vec::new(),
             datablockwrapper,
             scratch_register_value: -1,
         }
@@ -2577,6 +2583,18 @@ impl<'a> Assembler386<'a> {
         }
         if n % 2 == 1 {
             dynasm!(self.mc ; .u64 0);
+        }
+    }
+
+    /// Bind `genop_finish` descr words after every executable path.
+    fn emit_finish_descr_words(&mut self) {
+        let words = std::mem::take(&mut self.finish_descr_words);
+        for (slot, ptr) in words {
+            self.forget_scratch_register();
+            dynasm!(self.mc ; =>slot);
+            for byte in ptr.to_le_bytes() {
+                DynasmApi::push(&mut self.mc, byte);
+            }
         }
     }
 
@@ -3815,6 +3833,7 @@ impl<'a> Assembler386<'a> {
         // assembler.py:556 materialize_loop — finalize to executable memory
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
+        self.emit_finish_descr_words();
         let mut buffer = codebuf::finalize_writable(self.mc, &self.asm_memory_manager)?;
 
         // assembler.py:849 patch_pending_failure_recoveries
@@ -3950,6 +3969,7 @@ impl<'a> Assembler386<'a> {
 
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
+        self.emit_finish_descr_words();
         let mut buffer = codebuf::finalize_writable(self.mc, &self.asm_memory_manager)?;
 
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
@@ -4383,61 +4403,34 @@ impl<'a> Assembler386<'a> {
                     self.guard_success_cc = Some(CC_NO);
                 }
             }
-            // ── Integer binary (result_loc == arglocs[0], guaranteed by regalloc) ──
-            // x86/assembler.py:1881 genop_int_add uses LEA, not ADD, because
-            // regalloc.py consider_int_add routes 32-bit constants through
-            // `_consider_lea`, which force-allocates a fresh result register
-            // (independent of arg0). Emitting `add dst, src` here would
-            // operate on whatever stale value Rq(dst) still held — for the
-            // fib_loop trace this turned `t = i + 1` into `t = n_obj_ptr + 1`,
-            // poisoning the new W_IntObject and tripping GuardTrue on the
-            // next iteration. LEA also handles the consider_binop_symm path
-            // where `dst == arg0`: `lea dst, [dst + src]` is identical to
-            // `add dst, src`.
+            // `_binaryop_or_lea(asmop='ADD', is_add=True)`, also bound as
+            // `genop_nursery_ptr_increment`. ADD when `result_loc is
+            // arglocs[0]`; otherwise `_consider_lea` produced a fresh
+            // result and the form is `LEA result, [arglocs[0] + delta]`.
             OpCode::IntAdd | OpCode::NurseryPtrIncrement => {
                 if let (Some(Loc::Reg(dst)), Some(a0), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
                 {
-                    match (a0, src) {
-                        (Loc::Reg(a), Loc::Reg(s)) => {
-                            self.forget_if_scratch_written(dst.value);
-                            rx86::lea_ra(
-                                &mut self.mc,
-                                dst.value,
-                                (i16::from(a.value), s.value, 0, 0),
-                            );
-                        }
-                        (Loc::Reg(a), Loc::Immed(i) | Loc::ImmedFloat(i))
-                        | (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(a)) => {
-                            // The `_consider_lea` route guarantees a fitting
-                            // disp32, but the `consider_binop_symm` fallback
-                            // reaches this arm with an arbitrary 64-bit
-                            // constant (regloc.py:456-464); materialize a wide
-                            // one into the scratch register and use the
-                            // base+index form.
-                            if let Ok(v) = i32::try_from(i.value) {
+                    let same_as_lhs = matches!(a0, Loc::Reg(a) if a.value == dst.value);
+                    if same_as_lhs {
+                        self.emit_binop_reg_loc(op.opcode, dst.value, src);
+                    } else {
+                        match (a0, src) {
+                            (Loc::Reg(a), Loc::Immed(i) | Loc::ImmedFloat(i)) => {
+                                // `_consider_lea` is guarded by
+                                // `fits_in_32bits` of the immediate.
+                                let v = i32::try_from(i.value).expect(
+                                    "IntAdd LEA requires an immediate \
+                                     encodable as signed disp32",
+                                );
                                 self.forget_if_scratch_written(dst.value);
                                 rx86::lea_rm(&mut self.mc, dst.value, (a.value, v));
-                            } else {
-                                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                self.load_scratch(i.value);
-                                self.forget_if_scratch_written(dst.value);
-                                rx86::lea_ra(
-                                    &mut self.mc,
-                                    dst.value,
-                                    (i16::from(a.value), scratch, 0, 0),
-                                );
                             }
+                            _ => panic!(
+                                "IntAdd: result_loc != arglocs[0] requires LEA form \
+                                 (arglocs[0]=Reg, arglocs[1]=Immed); got a0={a0:?} src={src:?}",
+                            ),
                         }
-                        (
-                            Loc::Immed(i0) | Loc::ImmedFloat(i0),
-                            Loc::Immed(i1) | Loc::ImmedFloat(i1),
-                        ) => {
-                            let sum = i0.value.wrapping_add(i1.value);
-                            self.forget_if_scratch_written(dst.value);
-                            rx86::mov_ri(&mut self.mc, dst.value, sum);
-                        }
-                        _ => self.emit_binop_reg_loc(op.opcode, dst.value, src),
                     }
                 }
             }
@@ -4563,14 +4556,10 @@ impl<'a> Assembler386<'a> {
                 }
             }
             // ── Integer comparisons ──
-            // x86/assembler.py `_cmpop` + 1286 `flush_cc` parity.
-            // When the regalloc picks `frame_reg` (rbp) as the result
-            // sentinel, the comparison's outcome lives in the condition
-            // flags and the following guard consumes it directly —
-            // saving the SETcc + MOVZX (+ later TEST) per CompOp. The
-            // result-in-register path emits the boolean materialisation
-            // as before for cases where the value is also read by a
-            // non-guard consumer.
+            // `_cmpop` + `flush_cc`. When the regalloc picks `frame_reg`
+            // (rbp) as the result sentinel, the comparison's outcome lives
+            // in the condition flags and the following guard consumes it.
+            // Otherwise `flush_cc` materialises with `MOV_ri` 0 + `SET_ir`.
             OpCode::IntLt
             | OpCode::IntLe
             | OpCode::IntGt
@@ -5691,19 +5680,18 @@ impl<'a> Assembler386<'a> {
                 } else if let (Some(descr_ref), Some(descr)) = (descr_arc.as_ref(), jump_descr) {
                     let target = descr.ll_loop_code();
                     // External JUMP: direct JMP to target loop code.
-                    // assembler.py:2461 mc.JMP(imm(target)) — PyPy's
-                    // `LocationCodeBuilder._addr_as_reg_offset` (regloc.py)
-                    // stages a 64-bit absolute target through
-                    // `X86_64_SCRATCH_REG = r11`, never RAX.  Using RAX
-                    // here clobbers the loop-carried Ref that the
-                    // regalloc bound to it: a bridge whose body
-                    // succeeds and rejoins the trace loop returns with
-                    // RAX = `target` (a code address), and the next
-                    // iteration's GuardClass(RAX) then misreads RAX as
-                    // a Ref and SEGVs when it dereferences trace + 0x1B3
-                    // expecting a class pointer.
-                    // assembler.py:1003-1008 `_assemble`: record the target
-                    // loop's frame depth so this trace's frame grows to fit it.
+                    // `closing_jump` is `JMP(imm(target))`.
+                    // `LocationCodeBuilder._addr_as_reg_offset` stages a
+                    // 64-bit absolute target through `X86_64_SCRATCH_REG`
+                    // (r11), never RAX. Using RAX clobbers a loop-carried Ref
+                    // the regalloc bound there: a bridge that rejoins the loop
+                    // would return with RAX = `target`, and the next
+                    // GuardClass(RAX) would read that code address as a Ref.
+                    // `_assemble` records the target loop's frame depth so
+                    // this trace's frame grows to fit it. A target below
+                    // `MIN_RELOCATED_JUMP_TARGET` is still an in-buffer offset
+                    // or zero; recording it fails the compile instead of
+                    // baking a wild branch.
                     if target < MIN_RELOCATED_JUMP_TARGET {
                         self.unrelocated_jump_target =
                             Some((target, majit_ir::descr_identity(descr_ref)));
@@ -5713,10 +5701,7 @@ impl<'a> Assembler386<'a> {
                         let addr = target as i64;
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                         self.load_scratch(addr);
-                        dynasm!(self.mc ; .arch x64
-                                                    ; jmp Rq(scratch)
-
-                        );
+                        dynasm!(self.mc ; .arch x64 ; jmp Rq(scratch));
                         self.forget_after_call_or_jmp();
                     }
                 }
@@ -5748,16 +5733,13 @@ impl<'a> Assembler386<'a> {
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
                 // `compile.py` skips these — not a `ResumeDescr`.
-                // `genop_finish` (assembler.py) stamps the
-                // metainterp singleton directly into `jf_descr` via the GC
-                // table index; pyre's runtime classifier (`runner.rs::
-                // find_descr_by_ptr` lines 1115-1151) short-circuits the
-                // FINISH/Exit/Propagate ptrs to the cpu-attached singleton
-                // before consulting the registry, so the per-emission
-                // wrapper has no jf_descr role.  Push the singleton Arc
-                // directly.  Test scaffolds must attach singletons (via
-                // `attach_default_test_descrs` or `MetaInterp::new` per
-                // `pyjitpl.py finish_setup`) before emitting FINISH.
+                // `genop_finish` loads the descr with rip-relative `MOV_rp`
+                // and stores it at `jf_descr`. The word is the cpu-attached
+                // singleton: `find_descr_by_ptr` matches that cell before the
+                // registry, so a gc-table index would name a different
+                // pointer. `fail_descrs` keeps the Arc alive. Test scaffolds
+                // must attach singletons (`attach_default_test_descrs` or
+                // `MetaInterp::new` / `finish_setup`) before emitting FINISH.
                 let descr: majit_ir::DescrRef = if is_exit_exc {
                     self.cpu_handle
                         .read()
@@ -5781,10 +5763,14 @@ impl<'a> Assembler386<'a> {
                     self.regalloc_mov(result, &slot0);
                 }
 
-                // Store descr ptr to jf_descr.
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                self.load_scratch(global_descr_ptr);
-                rx86::mov_br(&mut self.mc, JF_DESCR_OFS, scratch);
+                // `genop_finish`: `MOV_rp(eax, 0)` of the descr word, then
+                // `mov(eax, RawEbpLoc(jf_descr))`. The word is the singleton
+                // pointer selected above, bound after the recoveries.
+                let slot = self.mc.new_dynamic_label();
+                self.finish_descr_words
+                    .push((slot, global_descr_ptr as u64));
+                dynasm!(self.mc ; .arch x64 ; mov rax, [=>slot]);
+                rx86::mov_br(&mut self.mc, JF_DESCR_OFS, rx86::EAX);
 
                 if result_type == Type::Ref {
                     if let Some(gcmap) = self.finish_gcmap {
@@ -6586,72 +6572,26 @@ impl<'a> Assembler386<'a> {
         rx86::mov_mi(&mut self.mc, (sr, so), 0);
     }
 
-    /// Emit SETcc into a register (zero-extend to 64-bit).
-    fn emit_setcc(&mut self, cc: u8, dst_reg: u8) {
+    /// Hardware condition for `SET_ir` (`rx86.py` `Conditions`).
+    /// Abstract `CC_L` is 10; hardware `L` is 12.
+    fn hw_condition(cc: u8) -> u8 {
         match cc {
-            CC_E => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
-            }
-            CC_NE => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setne Rb(dst_reg));
-            }
-            CC_L => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setl  Rb(dst_reg));
-            }
-            CC_GE => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setge Rb(dst_reg));
-            }
-            CC_LE => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setle Rb(dst_reg));
-            }
-            CC_G => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setg  Rb(dst_reg));
-            }
-            CC_B => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setb  Rb(dst_reg));
-            }
-            CC_AE => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setae Rb(dst_reg));
-            }
-            CC_BE => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setbe Rb(dst_reg));
-            }
-            CC_A => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; seta  Rb(dst_reg));
-            }
-            CC_S => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; sets  Rb(dst_reg));
-            }
-            CC_NS => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setns Rb(dst_reg));
-            }
-            CC_O => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; seto  Rb(dst_reg));
-            }
-            CC_NO => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; setno Rb(dst_reg));
-            }
-            _ => {
-                self.forget_if_scratch_written(dst_reg);
-                dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
-            }
+            CC_O => 0,
+            CC_NO => 1,
+            CC_B => 2,
+            CC_AE => 3,
+            CC_E => 4,
+            CC_NE => 5,
+            CC_BE => 6,
+            CC_A => 7,
+            CC_S => 8,
+            CC_NS => 9,
+            CC_L => 12,
+            CC_GE => 13,
+            CC_LE => 14,
+            CC_G => 15,
+            _ => 4,
         }
-        self.forget_if_scratch_written(dst_reg);
-        dynasm!(self.mc ; .arch x64 ; movzx Rd(dst_reg), Rb(dst_reg));
     }
 
     /// `assembler.py _if_parity_clear_zero_and_carry`.
@@ -6673,22 +6613,17 @@ impl<'a> Assembler386<'a> {
         );
     }
 
-    /// x86/assembler.py `flush_cc` parity.
+    /// `flush_cc`.
     ///
-    /// After emitting a CMP/TEST that leaves a boolean in the
-    /// condition flags, call this. If the regalloc picked `frame_reg`
-    /// (rbp) for `result_loc` the value is treated as living in the cc
-    /// — `guard_success_cc` is published for the following guard to
-    /// consume. Otherwise the boolean is materialised via a zeroed
-    /// register + `SETcc` of its low byte. The MOV-zero + SETcc shape
-    /// matches PyPy's emission and gives the regalloc a clean i64
-    /// value for non-guard consumers (e.g. boolean stored into a
-    /// frame slot).
+    /// After a CMP/TEST that leaves a boolean in the flags, call this.
+    /// `result_loc is ebp` publishes `guard_success_cc` for the next
+    /// guard. Any other register is `MOV_ri(result, 0)` then `SET_ir`
+    /// of `lowest8bits` (`rex_fw`, so the low byte is `sil`/`dil`/`bpl`/`spl`).
+    /// `MOV` does not clobber the flags.
     fn flush_cc(&mut self, cond: u8, result_loc: Option<&Loc>) {
-        // `assembler.py:1293 flush_cc` opens with
-        // `assert self.guard_success_cc == rx86.cond_none` — a condition
-        // still pending here was published by an earlier op and never
-        // consumed, which would make the following guard branch on it.
+        // `flush_cc` opens with `guard_success_cc == cond_none`. A
+        // condition still pending was published by an earlier op and
+        // never consumed.
         debug_assert!(
             self.guard_success_cc.is_none(),
             "flush_cc: guard_success_cc already set",
@@ -6696,16 +6631,16 @@ impl<'a> Assembler386<'a> {
         let frame_reg_value = crate::x86::regalloc::frame_reg().value;
         if let Some(Loc::Reg(r)) = result_loc {
             if r.value == frame_reg_value {
-                // Sentinel: the next op accepts cc.
                 self.guard_success_cc = Some(cond);
                 return;
             }
-            // `assembler.py:1300` clears the destination with `MOV imm0`
-            // before `SET_ir` because `SETcc` writes only the low byte.
-            // `emit_setcc` ends in `movzx r32, r8`, which zeroes bits 8..63
-            // on its own, so the same two-instruction sequence is spelled
-            // without the leading MOV.
-            self.emit_setcc(cond, r.value);
+            self.forget_if_scratch_written(r.value);
+            rx86::mov_ri(&mut self.mc, r.value, 0);
+            rx86::set_ir(
+                &mut self.mc,
+                Self::hw_condition(cond),
+                r.value | rx86::BYTE_REG_FLAG,
+            );
         }
     }
 
@@ -7317,7 +7252,14 @@ impl<'a> Assembler386<'a> {
                 };
 
                 if helper_num != 4 {
-                    dynasm!(self.mc ; .arch x64 ; push Rq(loc_base.value));
+                    // `PUSH(loc_base)` accepts an immediate (`_unaryop`).
+                    match loc_base {
+                        Loc::Reg(r) => {
+                            dynasm!(self.mc ; .arch x64 ; push Rq(r.value));
+                        }
+                        Loc::Immed(i) | Loc::ImmedFloat(i) => self.push_imm(i.value),
+                        other => panic!("write barrier base {other:?}"),
+                    }
                 }
                 let helper = self.wb_slowpath[helper_num];
                 assert!(
@@ -7334,18 +7276,13 @@ impl<'a> Assembler386<'a> {
                     self.emit_jcc_to_label(CC_NS, after_cards);
                     dynasm!(self.mc ; .arch x64 ; =>card_mark);
                     let loc_index = loc_index.expect("card marking records loc_index");
-                    // Register and frame arms copy the index into r11 and do not
-                    // update `scratch_register_value`. The immediate arm is an
-                    // `OR8` and leaves r11 alone.
+                    // A register base copies the index through r11 and does not
+                    // update `scratch_register_value`. An immediate index is
+                    // `OR8` via `addr_add_const`.
                     if matches!(loc_index, Loc::Reg(_) | Loc::Frame(_)) {
                         self.forget_scratch_register();
                     }
-                    encode_wb_array_card_mark(
-                        &mut self.mc,
-                        loc_base.value,
-                        &loc_index,
-                        card_page_shift,
-                    );
+                    self.mark_wb_cards(loc_base, &loc_index, card_page_shift);
                     dynasm!(self.mc ; .arch x64 ; =>after_cards);
                 }
             }
@@ -9818,20 +9755,15 @@ impl<'a> Assembler386<'a> {
             );
             mask = wb.jit_wb_if_flag_singlebyte as i8 | -0x80;
         }
-        // x86/assembler.py feeds `loc_base = arglocs[0]` into
-        // `addr_add_const`, and `AddressLoc` (x86/regloc.py) accepts an
-        // immediate base, so upstream needs no assertion here. This backend
-        // addresses the flag byte only through a core register, and the paired
-        // lowered `GcStore` already contracts for one, so state the contract
-        // instead of emitting nothing — a barrier that assembles to zero bytes
-        // stays invisible until it corrupts memory.
+        // `loc_base = arglocs[0]`. `is_frame` uses `raw_stack`; otherwise
+        // `addr_add_const`, which accepts an immediate base (`AddressLoc`
+        // code `'j'`, or `_addr_as_reg_offset` when the address does not
+        // fit a signed disp32).
         let loc_base = match arglocs.first() {
-            Some(Loc::Reg(r)) => *r,
-            other => {
-                panic!("write barrier base loc must be Loc::Reg (regalloc contract), got {other:?}")
-            }
+            Some(loc @ (Loc::Reg(_) | Loc::Immed(_) | Loc::ImmedFloat(_))) => *loc,
+            other => panic!("write barrier base must be a register or an immediate, got {other:?}"),
         };
-        debug_assert!(!is_frame || loc_base == crate::regloc::EBP);
+        debug_assert!(!is_frame || matches!(loc_base, Loc::Reg(r) if r == crate::regloc::EBP));
         let byteofs = wb.jit_wb_if_flag_byteofs;
 
         let helper_num = if is_frame {
@@ -9852,11 +9784,17 @@ impl<'a> Assembler386<'a> {
             "wb_slowpath[{helper_num}] was not built (X86CpuExt::ensure_wb_slowpath)"
         );
 
-        rx86::test8_mi(
-            &mut self.mc,
-            (loc_base.value as u8, byteofs),
-            i32::from(mask),
-        );
+        // `TEST8(loc, imm(mask))`. A frame base is `[rbp + byteofs]`.
+        match loc_base {
+            Loc::Reg(r) => {
+                rx86::test8_mi(&mut self.mc, (r.value, byteofs), i32::from(mask));
+            }
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                let addr = i.value.wrapping_add(i64::from(byteofs));
+                self.emit_test8_addr(addr, i32::from(mask));
+            }
+            _ => unreachable!("loc_base was checked above"),
+        }
         // `_write_barrier_fastpath`: `TEST8` then `WriteBarrierSlowPath` on
         // `NZ`. The flag-clear edge falls through `set_continue_addr`.
         // The helper call and the card mark live in `generate_body`.
@@ -9872,6 +9810,83 @@ impl<'a> Assembler386<'a> {
         );
         self.set_continue_here(&mut sp);
         self.pending_slowpaths.push(sp);
+    }
+
+    /// `TEST8_ji`, or `_addr_as_reg_offset` then `TEST8_mi`.
+    fn emit_test8_addr(&mut self, addr: i64, mask: i32) {
+        if rx86::fits_in_32bits(addr) {
+            rx86::test8_ji(&mut self.mc, addr as i32, mask);
+        } else {
+            let (reg, disp) = self.addr_as_reg_offset(addr);
+            rx86::test8_mi(&mut self.mc, (reg, disp), mask);
+        }
+    }
+
+    /// `OR8` of an `addr_add_const` result.
+    fn emit_or8_addr(&mut self, addr: i64, imm: i32) {
+        if rx86::fits_in_32bits(addr) {
+            rx86::or8_ji(&mut self.mc, addr as i32, imm);
+        } else {
+            let (reg, disp) = self.addr_as_reg_offset(addr);
+            rx86::or8_mi(&mut self.mc, (reg, disp), imm);
+        }
+    }
+
+    /// `BTS` of an `addr_add_const` result. `bit_reg` is not r11.
+    fn emit_bts_addr(&mut self, addr: i64, bit_reg: u8) {
+        debug_assert!(bit_reg != crate::regloc::X86_64_SCRATCH_REG.value);
+        if rx86::fits_in_32bits(addr) {
+            rx86::bts_jr(&mut self.mc, addr as i32, bit_reg);
+        } else {
+            let (reg, disp) = self.addr_as_reg_offset(addr);
+            rx86::bts_mr(&mut self.mc, (reg, disp), bit_reg);
+        }
+    }
+
+    /// Card mark. A register base keeps `encode_wb_array_card_mark`. An
+    /// immediate base uses `addr_add_const` so the address is not treated
+    /// as a GPR. The `-GcHeader::SIZE` bias matches that register form.
+    fn mark_wb_cards(&mut self, loc_base: Loc, loc_index: &Loc, page_shift: u32) {
+        match loc_base {
+            Loc::Reg(base) => {
+                encode_wb_array_card_mark(&mut self.mc, base.value, loc_index, page_shift);
+            }
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                self.mark_wb_cards_imm(i.value, loc_index, page_shift);
+            }
+            other => panic!("write barrier base {other:?}"),
+        }
+    }
+
+    fn mark_wb_cards_imm(&mut self, base: i64, loc_index: &Loc, page_shift: u32) {
+        let header = majit_gc::header::GcHeader::SIZE as i64;
+        match loc_index {
+            Loc::Reg(idx) => {
+                // Non-register base: save `loc_index`, mutate it, `BTS` the
+                // staged address, then pop. r11 only stages the address.
+                dynasm!(self.mc ; .arch x64 ; push Rq(idx.value));
+                rx86::shr_ri(&mut self.mc, idx.value, page_shift as i32);
+                rx86::xor_ri(&mut self.mc, idx.value, -8);
+                self.emit_bts_addr(base.wrapping_sub(header), idx.value);
+                dynasm!(self.mc ; .arch x64 ; pop Rq(idx.value));
+            }
+            Loc::Frame(idx) => {
+                // The bit index and the address scratch cannot both be r11.
+                dynasm!(self.mc ; .arch x64 ; push rax);
+                rx86::mov_rb(&mut self.mc, rx86::EAX, idx.ebp_loc.value);
+                rx86::shr_ri(&mut self.mc, rx86::EAX, page_shift as i32);
+                rx86::xor_ri(&mut self.mc, rx86::EAX, -8);
+                self.emit_bts_addr(base.wrapping_sub(header), rx86::EAX);
+                dynasm!(self.mc ; .arch x64 ; pop rax);
+            }
+            Loc::Immed(idx) | Loc::ImmedFloat(idx) => {
+                let byte_index = idx.value >> page_shift;
+                let byte_ofs = !((byte_index >> 3) as i64) - header;
+                let byte_val = 1_i64 << (byte_index & 7);
+                self.emit_or8_addr(base.wrapping_add(byte_ofs), i32::from(byte_val as i8));
+            }
+            _ => panic!("index is neither RegLoc nor ImmedLoc"),
+        }
     }
 
     fn mov_gpr_from_loc(&mut self, dst: u8, loc: Loc) {

@@ -5,7 +5,9 @@
 //! `_store_force_index`, `store_force_descr`, `genop_guard_guard_no_exception`,
 //! `cond_call` / `CondCallSlowPath`, `generate_quick_failure`,
 //! `_build_failure_recovery`, `malloc_cond`,
-//! `malloc_cond_varsize_frame`, `malloc_cond_varsize`.
+//! `malloc_cond_varsize_frame`, `malloc_cond_varsize`,
+//! `_binaryop_or_lea`, `flush_cc`, `addr_add_const`, `genop_finish`,
+//! `closing_jump`.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -24,7 +26,7 @@ use majit_ir::forwarding::bound_operand_from_opref as rb;
 use majit_ir::operand::Operand;
 use majit_ir::{
     CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, InputArgRc,
-    LoopTokenDescr, OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value,
+    LoopTokenDescr, OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value, make_loop_target_descr,
 };
 
 fn compile_and_run_int(opcode: OpCode, extra: Option<i64>, input: i64, token_id: u64) -> i64 {
@@ -3285,4 +3287,254 @@ fn call_subtract_esp_aligned_passes_args() {
         &[rb(OpRef::const_float(1.5)), rb(OpRef::const_float(2.25))],
         vec![Type::Float, Type::Float],
     );
+}
+
+fn compile_add_regs(lhs: i64, rhs: i64) -> i64 {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[rb(inputargs[0].opref()), rb(inputargs[1].opref())],
+    );
+    add.pos().set(OpRef::int_op(1));
+    let ops = vec![
+        OpRc::new(add),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile reg/reg INT_ADD: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Int(lhs), Value::Int(rhs)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    backend.get_int_value(&frame, 0)
+}
+
+/// LHS stays live past the add, and the immediate fits a disp32, so
+/// `_consider_lea` puts the sum in a register other than the LHS.
+/// A failing guard publishes both; `genop_finish` only stores its first arg.
+/// Returns `(sum, lhs)`.
+fn compile_add_fresh(imm: i64, input: i64) -> (i64, i64) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(imm))]);
+    add.pos().set(OpRef::int_op(1));
+    // `input` is never 0, so this compare fails and the guard exits.
+    let eq = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(0))]);
+    eq.pos().set(OpRef::int_op(2));
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+    guard.pos().set(OpRef::void_op(3));
+    guard.setdescr(make_resume_guard_descr_typed(vec![Type::Int, Type::Int]));
+    guard.set_fail_arg_types(vec![Type::Int, Type::Int]);
+    guard.setfailargs(vec![rb(OpRef::int_op(1)), rb(i0)].into());
+    let ops = vec![
+        OpRc::new(add),
+        OpRc::new(eq),
+        OpRc::new(guard),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 4)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile fresh INT_ADD: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Int(input)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    (
+        backend.get_int_value(&frame, 0),
+        backend.get_int_value(&frame, 1),
+    )
+}
+
+/// `_binaryop_or_lea`: ADD when the result reuses the first operand's
+/// register, LEA when the sum is a fresh register. Both wrap.
+#[test]
+fn int_add_reuses_lhs_or_leas_into_a_fresh_reg() {
+    assert_eq!(compile_add_regs(20, 22), 42);
+    assert_eq!(compile_add_regs(i64::MAX, 1), i64::MIN);
+    let (sum, saved) = compile_add_fresh(3, 10);
+    assert_eq!((sum, saved), (13, 10));
+    let (sum, saved) = compile_add_fresh(1, i64::MAX);
+    assert_eq!((sum, saved), (i64::MIN, i64::MAX));
+}
+
+/// `flush_cc` materialises every comparison condition into a register.
+#[test]
+fn flush_cc_materializes_every_condition() {
+    let cases = [
+        (OpCode::IntLt, -2, -1, 1),
+        (OpCode::IntLt, 2, 2, 0),
+        (OpCode::IntLe, 2, 2, 1),
+        (OpCode::IntLe, 3, 2, 0),
+        (OpCode::IntGt, 3, 2, 1),
+        (OpCode::IntGt, 2, 2, 0),
+        (OpCode::IntGe, 2, 2, 1),
+        (OpCode::IntGe, 1, 2, 0),
+        (OpCode::IntEq, 5, 5, 1),
+        (OpCode::IntEq, 5, 6, 0),
+        (OpCode::IntNe, 5, 6, 1),
+        (OpCode::IntNe, 5, 5, 0),
+        (OpCode::UintLt, 1, -1, 1),
+        (OpCode::UintLt, -1, 1, 0),
+        (OpCode::UintLe, -1, -1, 1),
+        (OpCode::UintLe, -1, 1, 0),
+        (OpCode::UintGt, -1, 1, 1),
+        (OpCode::UintGt, 1, -1, 0),
+        (OpCode::UintGe, -1, -1, 1),
+        (OpCode::UintGe, 1, -1, 0),
+    ];
+    for (op, input, rhs, expected) in cases {
+        let got = compile_and_run_int(op, Some(rhs), input, next_token_id());
+        assert_eq!(got, expected, "{op:?}({input}, {rhs})");
+    }
+}
+
+fn imm_base_encoded(code: &[u8], addr: i64) -> bool {
+    let bytes = (addr as u64).to_le_bytes();
+    if code.windows(8).any(|window| window == bytes) {
+        return true;
+    }
+    if (-2147483648..=2147483647).contains(&addr)
+        && code.windows(4).any(|window| window == &bytes[..4])
+    {
+        return true;
+    }
+    // `_addr_as_reg_offset` reuses r11: an earlier imm64 plus a disp32.
+    code.windows(8).any(|window| {
+        let base = i64::from_le_bytes(window.try_into().unwrap());
+        let delta = addr.wrapping_sub(base);
+        (-2147483648..=2147483647).contains(&delta)
+            && code
+                .windows(4)
+                .any(|disp| disp == (delta as i32).to_le_bytes())
+    })
+}
+
+/// `addr_add_const` of an immediate base: flag clear falls through, flag
+/// set pushes that immediate and calls the helper.
+#[test]
+fn write_barrier_immediate_base_checks_the_flag_byte() {
+    for clear_flag in [true, false] {
+        let mut gc = MiniMarkGC::new();
+        let tid = gc.register_type(majit_gc::TypeInfo::object(16));
+        let old = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, tid, 16);
+        unsafe {
+            let hdr = &mut *header_of(old.0);
+            hdr.set_flag(GcFlags::GCFLAG_NO_HEAP_PTRS);
+            if clear_flag {
+                hdr.clear_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+            } else {
+                assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+            }
+        }
+        let mut backend = wb_backend(gc);
+        let addr = old.0 as i64;
+        let ops = vec![
+            op_at(
+                OpCode::CondCallGcWb,
+                &[OpRef::const_int(addr)],
+                OpRef::void_op(1),
+            ),
+            finish(2),
+        ];
+        let token = JitCellToken::new(next_token_id());
+        let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+        backend
+            .compile_loop(&[], &ops, &token)
+            .unwrap_or_else(|err| panic!("compile immediate write barrier: {err:?}"));
+        let byteofs = majit_gc::WriteBarrierDescr::for_current_gc().jit_wb_if_flag_byteofs;
+        let flag_addr = addr.wrapping_add(i64::from(byteofs));
+        assert!(
+            imm_base_encoded(compiled_bytes(&token), flag_addr),
+            "TEST8 must encode the immediate flag address {flag_addr:#x}"
+        );
+        let frame = backend.execute_token(&token, &[]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let hdr = unsafe { &*header_of(old.0) };
+        assert!(!hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert_eq!(
+            hdr.has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS),
+            clear_flag,
+            "helper runs only when the flag byte is set (clear_flag={clear_flag})"
+        );
+    }
+}
+
+/// `genop_finish` stores a ref and a float, and the rip-relative descr
+/// word still classifies the exit.
+#[test]
+fn finish_returns_ref_and_float() {
+    let mut gc = MiniMarkGC::new();
+    let tid = gc.register_type(majit_gc::TypeInfo::object(16));
+    let obj = gc.alloc_with_type(tid, 16);
+    let mut backend = wb_backend(gc);
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let ops = vec![OpRc::new(finish_of(inputargs[0].opref(), Type::Ref, 1))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile FINISH ref: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Ref(obj)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_ref_value(&frame, 0), obj);
+
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+    let ops = vec![OpRc::new(finish_of(inputargs[0].opref(), Type::Float, 1))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile FINISH float: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Float(-2.25)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_float_value(&frame, 0), -2.25);
+}
+
+/// `closing_jump` to another loop's relocated token runs that loop.
+/// A target that was never compiled stays below `MIN_RELOCATED_JUMP_TARGET`
+/// and `check_unrelocated_jump_target` fails the compile.
+#[test]
+fn jump_to_another_loop_target_token() {
+    let mut backend = fresh_backend();
+    let unresolved = make_loop_target_descr(next_token_id(), false);
+    let jump = Op::new(OpCode::Jump, &[]);
+    jump.pos().set(OpRef::void_op(1));
+    jump.setdescr(unresolved);
+    let token = JitCellToken::new(next_token_id());
+    let err = backend
+        .compile_loop(&[], &[OpRc::new(jump)], &token)
+        .expect_err("unrelocated JUMP must fail to compile");
+    assert!(
+        err.to_string()
+            .contains("is not a relocated executable address"),
+        "{err}"
+    );
+
+    let descr = make_loop_target_descr(next_token_id(), false);
+    let target = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let label = Op::new(OpCode::Label, &[rb(i0)]);
+    label.pos().set(OpRef::void_op(1));
+    label.setdescr(descr.clone());
+    let ops = vec![OpRc::new(label), OpRc::new(finish_of(i0, Type::Int, 2))];
+    backend
+        .compile_loop(&inputargs, &ops, &target)
+        .unwrap_or_else(|err| panic!("compile jump target: {err:?}"));
+
+    let source = JitCellToken::new(next_token_id());
+    let jump = Op::new(OpCode::Jump, &[rb(i0)]);
+    jump.pos().set(OpRef::void_op(1));
+    jump.setdescr(descr);
+    backend
+        .compile_loop(&inputargs, &[OpRc::new(jump)], &source)
+        .unwrap_or_else(|err| panic!("compile JUMP: {err:?}"));
+    let frame = backend.execute_token(&source, &[Value::Int(42)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 42);
+    // Keep the target buffer mapped across the jump.
+    drop(target);
 }
