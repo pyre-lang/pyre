@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn default_mode_includes_now() {
         let mode = super::_dlopen_default_mode();
-        assert_ne!(mode & super::RTLD_NOW, 0);
-        assert_ne!(mode & super::RTLD_LOCAL, 0);
+        // `RTLD_LOCAL` is 0 on Linux, so only the combined value is portable.
+        assert_eq!(mode, super::RTLD_NOW | super::RTLD_LOCAL);
     }
 }
