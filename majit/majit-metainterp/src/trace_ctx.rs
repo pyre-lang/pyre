@@ -3411,7 +3411,7 @@ impl TraceCtx {
     /// — i.e. over exactly what the loop-carried list is about to become — so
     /// no entry of that list is a constant and none appears twice. Both
     /// properties are assumed downstream and neither is checked:
-    /// `TreeLoop::cut_trace_from_with_consts` keys its remap on the `OpRef`, so
+    /// `TreeLoop::cut_trace_from` keys its remap on the `OpRef`, so
     /// a repeat overwrites the earlier slot's mapping, and its `remap_ref`
     /// short-circuits on `!is_runtime_opref`, so a constant is never rewritten
     /// to the inputarg the LABEL declares for it.
@@ -3530,7 +3530,7 @@ impl TraceCtx {
     /// pyjitpl.py:2981-2989 builds ONE `live_arg_boxes` and hands it to both
     /// the merge-point registration and the closing JUMP. The registration
     /// side becomes a cut trace's LABEL inputargs, and those are *typed*
-    /// (`TreeLoop::cut_trace_from_with_consts` → `OpRef::input_arg_typed`), so
+    /// (`TreeLoop::cut_trace_from` → `OpRef::input_arg_typed`), so
     /// the type tag has to travel with the box for a registration to be able
     /// to reproduce the close's shape.
     pub fn collect_virtualizable_typed_boxes(&self) -> Option<Vec<(OpRef, Type)>> {
@@ -8305,7 +8305,7 @@ mod tests {
         assert!(
             !boxes[3].0.is_constant(),
             "a SAME_AS result is a runtime box, which is the point: \
-             `TreeLoop::cut_trace_from_with_consts`'s `remap_ref` skips \
+             `TreeLoop::cut_trace_from`'s remap skips \
              non-runtime oprefs, so a constant would never be rewritten to \
              the inputarg the LABEL declares for it"
         );

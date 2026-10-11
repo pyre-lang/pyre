@@ -2555,7 +2555,7 @@ pub struct MetaInterp<M: Clone> {
     /// own header.
     ///
     /// A cut loop's entry is not a general procedure entry, even though it is
-    /// structurally shaped like one. `cut_trace_from_with_consts` does run
+    /// structurally shaped like one. `cut_trace_from` does run
     /// (`[jit] cut_trace_from: start.op_index=40 original_boxes=33
     /// trace_ops=77`) and the artifact does carry a peeled preamble —
     /// `token.target_tokens` is `[preamble(no virtual state), specialized]`,
@@ -8840,41 +8840,30 @@ impl<M: Clone> MetaInterp<M> {
         let trace = if let Some((ref original_boxes, start)) = cross_loop_cut {
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] cut_trace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
+                    "[jit] cut_trace_from: start.op_index={} original_boxes={} jump_args={} trace_ops={} header_pc={}",
                     start.op_index,
                     original_boxes.len(),
+                    jump_args.len(),
                     trace.ops.len(),
                     ctx.header_pc,
                 );
             }
-            // cut_trace_from_with_consts remaps escaped original inputargs to
-            // their trace-entry Const via a transient build-time map keyed by
-            // `OpRef.raw()`.  It declines (`None`) when the cut would drop a
-            // value held only by a guard snapshot.  The uncut trace is NOT a
-            // fallback here: everything downstream of a live merge point is
-            // built for the cut namespace and entry contract, so cancel this
-            // compilation and let the interpreter run the loop instead.
-            //
-            // `compile.py:269` cannot reach this: `trace.cut_trace_from` builds
-            // a lazy view and is total.  The cancellation is not a new exit
-            // though — it lands on the outcome the `except InvalidLoop` arm
-            // just below it already defines, "this trace produced no loop",
-            // reached one step earlier because pyre's cut is materialized.
-            // A loop entry (`compile.py compile_loop`) supplies only the
-            // merge-point red boxes. A snapshot box that cannot be replayed
-            // is an inputarg only on a bridge (`compile.py compile_retrace`,
-            // `opencoder.py CutTrace`); appending it here widens the entry
-            // `patch_new_loop_to_load_virtualizable_fields` asserts, so the
-            // cut declines and this compilation is cancelled.
-            let Some(cut) = trace.cut_trace_from_with_consts(
-                start,
-                original_boxes,
-                &ctx.initial_inputarg_consts,
-                false,
-            ) else {
-                return CompileOutcome::Cancelled;
-            };
-            cut
+            // pyjitpl.py `reached_loop_header`
+            // `assert len(original_boxes) == len(live_arg_boxes)`: the first
+            // visit and the closing JUMP build the same list.
+            assert_eq!(
+                original_boxes.len(),
+                jump_args.len(),
+                "pyjitpl.py reached_loop_header: len(original_boxes) == len(live_arg_boxes) \
+                 (first visit {} vs JUMP {})",
+                original_boxes.len(),
+                jump_args.len(),
+            );
+            // `compile.py compile_loop` `trace.cut_trace_from(start, inputargs)`
+            // is total: `opencoder.py CutTrace` views the suffix with
+            // `inputargs` = the merge-point live boxes. A pre-cut producer
+            // the suffix names is one of those boxes (`TraceIterator._get`).
+            trace.cut_trace_from(start, original_boxes)
         } else {
             trace
         };
@@ -10839,7 +10828,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             };
-            let (orig_vable_ptr_retrace, retrace_cut, initial_inputarg_consts, call_pure_results) = {
+            let (orig_vable_ptr_retrace, retrace_cut, call_pure_results) = {
                 let ctx = self.compile_tracing.as_ref().unwrap();
                 let retrace_merge_point = ctx
                     .merge_point_at_start(retrace_pos)
@@ -10885,17 +10874,8 @@ impl<M: Clone> MetaInterp<M> {
                     ctx,
                     driver_descriptor.as_ref(),
                 );
-                // The recorder carries Const values inline on the OpRef variants
-                // (history.py ConstInt / ConstFloat / ConstPtr), so there is no legacy TraceCtx
-                // ConstantPool to snapshot — this typed-constant map starts fresh.
-                let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
                 let call_pure_results = ctx.call_pure_results.clone();
-                (
-                    orig_vable_ptr_retrace,
-                    retrace_cut,
-                    initial_inputarg_consts,
-                    call_pure_results,
-                )
+                (orig_vable_ptr_retrace, retrace_cut, call_pure_results)
             };
             let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
@@ -10919,24 +10899,20 @@ impl<M: Clone> MetaInterp<M> {
                         trace.ops.len(),
                     );
                 }
-                // A declined cut cannot fall back to the uncut trace: the
-                // retrace is installed against the merge point's entry
-                // contract. `compile.py compile_retrace` `cut_trace_from` is
-                // total, so this is the same outcome as `InvalidLoop`:
-                // `history.cut` the tentative JUMP and keep tracing.
-                let Some(cut) = trace.cut_trace_from_with_consts(
-                    start,
-                    original_boxes,
-                    &initial_inputarg_consts,
-                    true,
-                ) else {
-                    ctx.cut_trace(jump_cut);
-                    self.tracing = Some(ctx);
-                    self.partial_trace = Some(partial);
-                    self.retracing_from = retracing_from_kept;
-                    return false;
-                };
-                cut
+                // pyjitpl.py `reached_loop_header`
+                // `assert len(original_boxes) == len(live_arg_boxes)`.
+                assert_eq!(
+                    original_boxes.len(),
+                    jump_args.len(),
+                    "pyjitpl.py reached_loop_header: len(original_boxes) == len(live_arg_boxes) \
+                     (first visit {} vs JUMP {})",
+                    original_boxes.len(),
+                    jump_args.len(),
+                );
+                // `compile.py compile_retrace` `cut_trace_from` is total:
+                // `opencoder.py CutTrace` views the suffix with the merge
+                // point's live boxes as inputargs.
+                trace.cut_trace_from(start, original_boxes)
             } else {
                 trace
             };
