@@ -2586,7 +2586,13 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // already binds each key; without the slot, `setup_insns` never
     // records the byte and a guard-failure resume panics here.
     // A backend that did not emit `getarrayitem_raw_i` (wasm jitcodes)
-    // omits that key. `setarrayitem_raw_i/iiid` is the store twin
+    // omits that key from `build_emitted_insns`. The four raw-array keys
+    // now have wellknown bytes (`BC_{GET,SET}ARRAYITEM_RAW_{I,F}`), so
+    // `insns_opname_to_byte` overlays them even when this build did not
+    // emit them; `wire_bhimpl_handlers` already binds
+    // `bhimpl_getarrayitem_raw_{i,f}` / `bhimpl_setarrayitem_raw_{i,f}`.
+    // Fall back to the wellknown byte so `setup_insns` records the slot.
+    // `setarrayitem_raw_i/iiid` is the store twin
     // (`blackhole.py bhimpl_setarrayitem_raw_i`); looking inside
     // `copy_object_slice_range_into_vec` emits it when the dest is a
     // residual `ll_vec_alloc_and_set_r` Int header.
@@ -2596,12 +2602,21 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
         "recursive_call_f/iIRFIRF>f",
         "recursive_call_v/iIRFIRF",
         "getarrayitem_raw_i/iid>i",
+        "getarrayitem_raw_f/iid>f",
         "setarrayitem_raw_i/iiid",
+        "setarrayitem_raw_f/iifd",
         "int_isvirtual/i>i",
     ];
+    let wellknown = majit_jitcode::insns::wellknown_bh_insns();
     let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
         .iter()
-        .filter_map(|&key| build_emitted_insns().get(key).map(|&byte| (key, byte)))
+        .filter_map(|&key| {
+            build_emitted_insns()
+                .get(key)
+                .copied()
+                .or_else(|| wellknown.get(key).copied())
+                .map(|byte| (key, byte))
+        })
         .collect();
     let mut builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
     // Legacy `NewList` / `NewTuple` that the rtyper did not rewrite still

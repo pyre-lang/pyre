@@ -183,9 +183,23 @@ pub const BC_RECORD_KNOWN_RESULT_R_IR_V: u8 = 31;
 pub const BC_MOVE_R: u8 = 27;
 // Float-typed bytecodes
 pub const BC_MOVE_F: u8 = 33;
-// slot 34 (formerly BC_CALL_FLOAT) freed — see the BC_CALL_REF
-// (slot 28) note above for the canonical replacement.
-// slot 35 (formerly BC_CALL_PURE_FLOAT) freed — see slot 23 above.
+/// `blackhole.py` `bhimpl_setarrayitem_raw_i`
+/// (`@arguments("cpu", "i", "i", "i", "d")`). Slot 34 was the former
+/// `BC_CALL_FLOAT` byte; `assembler.py` `setdefault(key, len(self.insns))`
+/// assigned this canonical key the lowest free byte, which is the byte
+/// `pipeline.insns` already serialises for `setarrayitem_raw_i/iiid`.
+pub const BC_SETARRAYITEM_RAW_I: u8 = 34;
+/// `blackhole.py` `bhimpl_getarrayitem_raw_i`
+/// (`@arguments("cpu", "i", "i", "d", returns="i")`). Slot 35 was the
+/// former `BC_CALL_PURE_FLOAT` byte; same `setdefault` assignment as
+/// [`BC_SETARRAYITEM_RAW_I`].
+pub const BC_GETARRAYITEM_RAW_I: u8 = 35;
+/// `blackhole.py` `bhimpl_getarrayitem_raw_f`
+/// (`@arguments("cpu", "i", "i", "d", returns="f")`).
+pub const BC_GETARRAYITEM_RAW_F: u8 = 36;
+/// `blackhole.py` `bhimpl_setarrayitem_raw_f`
+/// (`@arguments("cpu", "i", "i", "f", "d")`).
+pub const BC_SETARRAYITEM_RAW_F: u8 = 37;
 // slots 38..=40 (formerly BC_CALL_MAY_FORCE_{INT,REF,FLOAT}) freed —
 // the may_force policy now rides on
 // `EffectInfo.extraeffect = EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` carried
@@ -1103,6 +1117,15 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("new_array_clear/cd>r", BC_NEW_ARRAY_CLEAR_C);
     m.insert("getarrayitem_gc_i/rid>i", BC_GETARRAYITEM_GC_I);
     m.insert("getarrayitem_gc_f/rid>f", BC_GETARRAYITEM_GC_F);
+    // Raw-array element load/store — `blackhole.py`
+    // `bhimpl_getarrayitem_raw_{i,f}` / `bhimpl_setarrayitem_raw_{i,f}`.
+    // The array address lives in the int bank (`iid>i` / `iiid`); there
+    // is no `_r` form (`jtransform.py` `rewrite_op_getarrayitem` /
+    // `rewrite_op_setarrayitem` refuse a GC pointer in a raw array).
+    m.insert("getarrayitem_raw_i/iid>i", BC_GETARRAYITEM_RAW_I);
+    m.insert("getarrayitem_raw_f/iid>f", BC_GETARRAYITEM_RAW_F);
+    m.insert("setarrayitem_raw_i/iiid", BC_SETARRAYITEM_RAW_I);
+    m.insert("setarrayitem_raw_f/iifd", BC_SETARRAYITEM_RAW_F);
     // RPython `blackhole.py:1339-1341` aliases
     // `bhimpl_getarrayitem_gc_{i,r,f}_pure = bhimpl_getarrayitem_gc_{i,r,f}`
     // — pure-getter shape on immutable-array descrs.  Each
@@ -1429,10 +1452,10 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// Every distinct `(opname, argcodes)` key must own a UNIQUE opcode
-    /// byte.  RPython `assembler.py:220 self.insns.setdefault(key,
+    /// byte, and every `BC_*` constant must own a UNIQUE value.
+    /// RPython `assembler.py` `Assembler.write_insn` `setdefault(key,
     /// len(self.insns))` assigns a fresh int per key, so the byte→opname
     /// inverse is 1:1 by construction.  pyre hand-assigns the `BC_*`
     /// constants, so this test is the structural replacement for that
@@ -1445,20 +1468,56 @@ mod tests {
     /// `new_with_vtable/d>r` @219).
     #[test]
     fn opcode_bytes_are_one_to_one() {
-        let mut byte_to_key: HashMap<u8, String> = HashMap::new();
+        let src = include_str!("insns.rs");
+        let mut const_owner: [Option<&str>; 256] = [None; 256];
+        let mut n_consts = 0usize;
+        for line in src.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((name, after_name)) = rest.split_once(':') else {
+                continue;
+            };
+            if !name.starts_with("BC_") {
+                continue;
+            }
+            let Some((_, rhs)) = after_name.split_once('=') else {
+                panic!("BC_* constant {name} has no '='");
+            };
+            let rhs = rhs.trim().trim_end_matches(';').trim();
+            let byte = if rhs == "u8::MAX" {
+                u8::MAX
+            } else {
+                rhs.parse::<u8>()
+                    .unwrap_or_else(|e| panic!("BC_* constant {name} value {rhs:?}: {e}"))
+            };
+            if let Some(prev) = const_owner[byte as usize] {
+                panic!(
+                    "opcode byte {byte} is assigned to both {prev} and {name}; \
+                     assembler.py setdefault(key, len(self.insns)) never reuses a byte"
+                );
+            }
+            const_owner[byte as usize] = Some(name);
+            n_consts += 1;
+        }
+        assert!(
+            n_consts > 200,
+            "parsed only {n_consts} BC_* constants from insns.rs; parser likely broken"
+        );
+
+        let mut byte_to_key: [Option<&str>; 256] = [None; 256];
         for table in [wellknown_bh_insns(), extension_insns()] {
-            for (key, byte) in table.iter() {
-                let key = (*key).to_string();
-                let byte = *byte;
-                if let Some(prev) = byte_to_key.get(&byte) {
+            for (key, byte) in table {
+                if let Some(prev) = byte_to_key[byte as usize] {
                     assert_eq!(
-                        *prev, key,
+                        prev, key,
                         "opcode byte {byte} maps to two distinct keys \
                          {prev:?} and {key:?}; every key needs its own byte \
-                         (assembler.py:220 setdefault(key, len(insns)))",
+                         (assembler.py setdefault(key, len(self.insns)))",
                     );
                 }
-                byte_to_key.insert(byte, key);
+                byte_to_key[byte as usize] = Some(key);
             }
         }
     }

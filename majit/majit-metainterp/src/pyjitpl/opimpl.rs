@@ -67,6 +67,10 @@ where
         table[jitcode::insns::BC_SETARRAYITEM_GC_I as usize] = Self::opimpl_setarrayitem_gc_i;
         table[jitcode::insns::BC_SETARRAYITEM_GC_R as usize] = Self::opimpl_setarrayitem_gc_i;
         table[jitcode::insns::BC_SETARRAYITEM_GC_F as usize] = Self::opimpl_setarrayitem_gc_i;
+        table[jitcode::insns::BC_GETARRAYITEM_RAW_I as usize] = Self::opimpl_getarrayitem_raw_i;
+        table[jitcode::insns::BC_GETARRAYITEM_RAW_F as usize] = Self::opimpl_getarrayitem_raw_f;
+        table[jitcode::insns::BC_SETARRAYITEM_RAW_I as usize] = Self::opimpl_setarrayitem_raw_i;
+        table[jitcode::insns::BC_SETARRAYITEM_RAW_F as usize] = Self::opimpl_setarrayitem_raw_i;
         table[jitcode::insns::BC_GETARRAYITEM_VABLE_I as usize] = Self::opimpl_getarrayitem_vable_i;
         table[jitcode::insns::BC_GETARRAYITEM_VABLE_R as usize] = Self::opimpl_getarrayitem_vable_r;
         table[jitcode::insns::BC_GETARRAYITEM_VABLE_F as usize] = Self::opimpl_getarrayitem_vable_f;
@@ -1234,15 +1238,36 @@ where
             // an entry seeded without a live concrete and skips
             // the check.  A null struct fabricated `loaded` rather
             // than reading, so it has nothing to compare either.
+            //
+            // RPython runs `executor.execute(cpu, metainterp,
+            // opnum, fielddescr, box)` for this compare
+            // (`_opimpl_getfield_gc_any_pureornot`). That is
+            // `bh_getfield_gc_{i,r}`, a word-sized ref load —
+            // not a raw i64 read that on a 32-bit target
+            // swallows the next field.
             let expected = match ctx.box_value(cached) {
                 Some(Value::Int(n)) => Some(n),
                 Some(Value::Ref(r)) => Some(r.0 as i64),
                 _ => None,
             };
+            let executed = if is_ref {
+                ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Ref)
+                    .and_then(|v| match v {
+                        Value::Ref(r) => Some(r.0 as i64),
+                        _ => None,
+                    })
+            } else {
+                ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Int)
+                    .and_then(|v| match v {
+                        Value::Int(n) => Some(n),
+                        _ => None,
+                    })
+            };
+            let compare = executed.unwrap_or(loaded);
             assert!(
-                struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
+                struct_ptr == 0 || !matches!(expected, Some(exp) if exp != compare),
                 "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
-                     loaded {loaded} != cached {expected:?} \
+                     loaded {compare} != cached {expected:?} \
                      (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
                 if is_ref { "ref" } else { "int" },
             );
@@ -2210,6 +2235,164 @@ where
         TraceAction::Continue
     }
 
+    /// `pyjitpl.py` `opimpl_getarrayitem_raw_i`:
+    /// `execute_with_descr(rop.GETARRAYITEM_RAW_I, arraydescr, arraybox, indexbox)`.
+    /// `blackhole.py` `bhimpl_getarrayitem_raw_i` (`iid>i`): array and
+    /// index are int-banked; the array address is a raw pointer.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_getarrayitem_raw_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.trace_getarrayitem_raw(ctx, false)
+    }
+
+    /// `pyjitpl.py` `opimpl_getarrayitem_raw_f`:
+    /// `execute_with_descr(rop.GETARRAYITEM_RAW_F, arraydescr, arraybox, indexbox)`.
+    /// `blackhole.py` `bhimpl_getarrayitem_raw_f` (`iid>f`).
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_getarrayitem_raw_f(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.trace_getarrayitem_raw(ctx, true)
+    }
+
+    fn trace_getarrayitem_raw(&mut self, ctx: &mut TraceCtx, is_float: bool) -> TraceAction {
+        let (array_reg, index_reg, descr_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let array_reg = frame.next_reg() as usize;
+            let index_reg = frame.next_reg() as usize;
+            let descr_idx = frame.next_u16() as usize;
+            let dst = frame.next_reg() as usize;
+            (array_reg, index_reg, descr_idx, dst)
+        };
+        let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+            return TraceAction::Abort;
+        };
+        let Some((base_size, itemsize, is_signed)) = self.dispatch_array_geometry(descr_idx) else {
+            return TraceAction::Abort;
+        };
+        let (array_opref, array_addr) = self.read_int_reg(ctx, array_reg);
+        let (index_opref, index_value) = self.read_int_reg(ctx, index_reg);
+        let item_addr = (array_addr as usize)
+            .wrapping_add(base_size)
+            .wrapping_add((index_value as usize).wrapping_mul(itemsize));
+        if is_float {
+            if itemsize != 8 {
+                panic!("getarrayitem_raw_f: unsupported itemsize {itemsize}");
+            }
+            let concrete = unsafe { core::ptr::read_unaligned(item_addr as *const i64) };
+            let opref = ctx.execute_and_record(
+                Some(self.cpu.as_ref()),
+                OpCode::GetarrayitemRawF,
+                Some(descr),
+                &[array_opref, index_opref],
+                Some(Value::Float(f64::from_bits(concrete as u64))),
+                self.last_exception_value,
+            );
+            self.set_float_reg(ctx, dst, Some(opref), Some(concrete));
+        } else {
+            let concrete = unsafe {
+                match (itemsize, is_signed) {
+                    (1, true) => core::ptr::read_unaligned(item_addr as *const i8) as i64,
+                    (1, false) => core::ptr::read_unaligned(item_addr as *const u8) as i64,
+                    (2, true) => core::ptr::read_unaligned(item_addr as *const i16) as i64,
+                    (2, false) => core::ptr::read_unaligned(item_addr as *const u16) as i64,
+                    (4, true) => core::ptr::read_unaligned(item_addr as *const i32) as i64,
+                    (4, false) => core::ptr::read_unaligned(item_addr as *const u32) as i64,
+                    (8, _) => core::ptr::read_unaligned(item_addr as *const i64),
+                    other => {
+                        panic!("getarrayitem_raw_i: unsupported (itemsize, signed) = {other:?}")
+                    }
+                }
+            };
+            let opref = ctx.execute_and_record(
+                Some(self.cpu.as_ref()),
+                OpCode::GetarrayitemRawI,
+                Some(descr),
+                &[array_opref, index_opref],
+                Some(Value::Int(concrete)),
+                self.last_exception_value,
+            );
+            self.set_int_reg(ctx, dst, Some(opref), Some(concrete));
+        }
+        TraceAction::Continue
+    }
+
+    /// `pyjitpl.py` `_opimpl_setarrayitem_raw_any` (`opimpl_setarrayitem_raw_i`
+    /// / `opimpl_setarrayitem_raw_f`):
+    /// `execute_with_descr(rop.SETARRAYITEM_RAW, arraydescr, arraybox, indexbox, itembox)`.
+    /// `blackhole.py` `bhimpl_setarrayitem_raw_{i,f}` (`iiid` / `iifd`).
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_setarrayitem_raw_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let is_float = bytecode == jitcode::insns::BC_SETARRAYITEM_RAW_F;
+        let (array_reg, index_reg, value_reg, descr_idx) = {
+            let frame = self.frames.current_mut();
+            let array_reg = frame.next_reg() as usize;
+            let index_reg = frame.next_reg() as usize;
+            let value_reg = frame.next_reg() as usize;
+            let descr_idx = frame.next_u16() as usize;
+            (array_reg, index_reg, value_reg, descr_idx)
+        };
+        let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+            return TraceAction::Abort;
+        };
+        let Some((base_size, itemsize, _is_signed)) = self.dispatch_array_geometry(descr_idx)
+        else {
+            return TraceAction::Abort;
+        };
+        let (array_opref, array_addr) = self.read_int_reg(ctx, array_reg);
+        let (index_opref, index_value) = self.read_int_reg(ctx, index_reg);
+        let (value_opref, value_concrete) = if is_float {
+            self.read_float_reg(ctx, value_reg)
+        } else {
+            self.read_int_reg(ctx, value_reg)
+        };
+        ctx.heapcache_invalidate_caches_varargs(
+            OpCode::SetarrayitemRaw,
+            None,
+            &[array_opref, index_opref, value_opref],
+        );
+        ctx.profiler()
+            .count_ops(OpCode::SetarrayitemRaw, crate::counters::OPS);
+        ctx.profiler()
+            .count_ops(OpCode::SetarrayitemRaw, crate::counters::RECORDED_OPS);
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemRaw,
+            &[array_opref, index_opref, value_opref],
+            descr,
+        );
+        let item_addr = (array_addr as usize)
+            .wrapping_add(base_size)
+            .wrapping_add((index_value as usize).wrapping_mul(itemsize));
+        unsafe {
+            match itemsize {
+                1 => core::ptr::write_unaligned(item_addr as *mut u8, value_concrete as u8),
+                2 => core::ptr::write_unaligned(item_addr as *mut u16, value_concrete as u16),
+                4 => core::ptr::write_unaligned(item_addr as *mut u32, value_concrete as u32),
+                8 => core::ptr::write_unaligned(item_addr as *mut i64, value_concrete),
+                other => panic!("setarrayitem_raw: unsupported itemsize {other}"),
+            }
+        }
+        TraceAction::Continue
+    }
+
     #[inline(never)]
     #[allow(unused_variables)]
     fn opimpl_getarrayitem_vable_i(
@@ -2633,14 +2816,19 @@ where
         // return ConstInt(result)`.  RPython reads from the live
         // struct; pyre's trace-side shadow is
         // `virtualizable_array_lengths`, populated by
-        // `init_virtualizable_boxes` (resume.py:471-486 parity)  allow-line-citation
+        // `init_virtualizable_boxes` (resume.py ResumeDataVirtualAdder._number_virtuals parity)
         // before the trace runs, so it carries the same length
-        // RPython would dereference.
-        let len = ctx
-            .virtualizable_array_lengths()
-            .and_then(|lengths| lengths.get(array_idx).copied())
-            .unwrap_or(0);
-        self.set_int_reg(ctx, dest, Some(result), Some(len as i64));
+        // RPython would dereference.  The nonstandard leg goes
+        // through `opimpl_arraylen_gc` / `bh_arraylen_gc` and
+        // stamps that length on `result`.
+        let len = match ctx.box_value(result) {
+            Some(Value::Int(n)) => n,
+            _ => ctx
+                .virtualizable_array_lengths()
+                .and_then(|lengths| lengths.get(array_idx).copied())
+                .unwrap_or(0) as i64,
+        };
+        self.set_int_reg(ctx, dest, Some(result), Some(len));
         TraceAction::Continue
     }
 
