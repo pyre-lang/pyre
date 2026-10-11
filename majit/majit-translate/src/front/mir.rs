@@ -70081,7 +70081,11 @@ fn charon_dyn_trait_to_ast_string(dynt: &serde_json::Value, llbc: &Llbc) -> Stri
     fn find_trait_id(v: &serde_json::Value) -> Option<u64> {
         match v {
             serde_json::Value::Object(m) => {
-                if let Some(id) = m.get("trait_decl_id").and_then(serde_json::Value::as_u64) {
+                if let Some(id) = m
+                    .get("trait_decl_id")
+                    .or_else(|| m.get("id"))
+                    .and_then(serde_json::Value::as_u64)
+                {
                     return Some(id);
                 }
                 m.values().find_map(find_trait_id)
@@ -85491,6 +85495,36 @@ mod tests {
         }
     }
 
+    /// `w_set_items` is `(*(obj as *const W_SetObject)).strategy.getkeys(obj)`.
+    /// Every FieldRead base must be a block inputarg or op result.
+    #[test]
+    fn w_set_items_fieldread_bases_are_defined() {
+        use crate::model::OpKind;
+        let graph = lower_object_fn("pyre_object::setobject::w_set_items");
+        assert_graph_operands_defined(&graph);
+        assert!(
+            !graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr")
+            ),
+            "cast_int_to_ptr must be simple_call at flowspace\n{}",
+            graph.dump()
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "strategy")
+            ),
+            "w_set_items must FieldRead strategy\n{}",
+            graph.dump()
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "imp")
+            ),
+            "w_set_items must FieldRead imp\n{}",
+            graph.dump()
+        );
+    }
+
     /// `w_type_set_w_doc` is `type_write_barrier(obj); t.w_doc = w_doc`.
     /// The barrier call is dropped and the `setfield` stays; the backend
     /// rewrite puts `COND_CALL_GC_WB` in front of it.
@@ -92548,6 +92582,313 @@ mod tests {
         );
     }
 
+    /// Nested `Deref+Field+Deref` through a RawPtr cast onto a GC struct,
+    /// then `SetStrategyRef::deref` (`self.imp`) and a Dynamic `getkeys`.
+    /// Every FieldRead base must be a block inputarg or op result —
+    /// `rclass.py InstanceRepr.getfield`'s `vinst`.
+    #[test]
+    fn nested_rawptr_strategy_deref_fieldread_bases_are_defined() {
+        use crate::model::{FieldDescriptor, OpKind};
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let empty_generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let set_adt =
+            serde_json::json!({"Adt": {"id": 0, "builtin": null, "generics": empty_generics}});
+        let holder_adt =
+            serde_json::json!({"Adt": {"id": 1, "builtin": null, "generics": empty_generics}});
+        let vtable_adt =
+            serde_json::json!({"Adt": {"id": 2, "builtin": null, "generics": empty_generics}});
+        let obj_ty = serde_json::json!({"Ref": [null, set_adt, "Shared"]});
+        let raw_ty = serde_json::json!({"RawPtr": [set_adt, "Const"]});
+        let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+        let fat_ty = serde_json::json!({"Ref": ["static", {"DynTrait": {}}, "Shared"]});
+        let vtable_ptr = serde_json::json!({"RawPtr": [vtable_adt, "Const"]});
+        let fn_ptr = serde_json::json!({"FnPtr": {"inputs": [fat_ty.clone(), obj_ty.clone()], "output": {"Tuple": []}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let raw_u8 =
+            serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let w_set = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "W_SetObject"]),
+            "kind": {"Struct": [
+                {"name": "ob_header", "ty": i64_ty, "attr_info": field_attr},
+                {"name": "sstorage", "ty": i64_ty, "attr_info": field_attr},
+                {"name": "strategy", "ty": holder_ref, "attr_info": field_attr}
+            ]}
+        });
+        let holder = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "SetStrategyRef"]),
+            "kind": {"Struct": [
+                {"name": "kind", "ty": i64_ty, "attr_info": field_attr},
+                {"name": "imp", "ty": fat_ty, "attr_info": field_attr},
+                {"name": "owner", "ty": raw_u8, "attr_info": field_attr}
+            ]}
+        });
+        let vtable = serde_json::json!({
+            "def_id": 2,
+            "item_meta": meta(&["fixture", "SetStrategy", "{vtable}"]),
+            "kind": {"Struct": [{
+                "name": "method_getkeys",
+                "ty": fn_ptr,
+                "attr_info": field_attr
+            }]}
+        });
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+        let obj_place = place(serde_json::json!({"Local": 1}), &obj_ty);
+        let raw_place = place(serde_json::json!({"Local": 6}), &raw_ty);
+        let strategy_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Projection": [
+                        raw_place.clone(),
+                        "Deref"
+                    ]}), &set_adt),
+                    {"Field": [null, 2]}
+                ]}), &holder_ref),
+                "Deref"
+            ]}),
+            &holder_adt,
+        );
+        let assign_raw = serde_json::json!({"span": span, "kind": {"Assign": [
+            raw_place,
+            {"UnaryOp": [
+                {"Cast": {"RawPtr": [obj_ty.clone(), raw_ty.clone()]}},
+                {"Copy": obj_place.clone()}
+            ]}
+        ]}});
+        let assign_ref = serde_json::json!({"span": span, "kind": {"Assign": [
+            place(serde_json::json!({"Local": 5}), &holder_ref),
+            {"Ref": {"place": strategy_place, "kind": "Shared", "ptr_metadata": null}}
+        ]}});
+        let lock = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "lock"]),
+            "signature": {"is_unsafe": false, "inputs": [obj_ty.clone()], "output": unit},
+            "body": "Opaque"
+        });
+        let deref_self = place(serde_json::json!({"Local": 1}), &holder_ref);
+        let deref_imp = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    deref_self.clone(),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 1]}
+            ]}),
+            &fat_ty,
+        );
+        let deref_fn = serde_json::json!({
+            "def_id": 2,
+            "item_meta": meta(&["fixture", "SetStrategyRef", "<Impl>", "deref"]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [holder_ref.clone()],
+                "output": fat_ty
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &fat_ty),
+                    local(1, &holder_ref)
+                ]},
+                "body": [{
+                    "statements": [{"span": span, "kind": {"Assign": [
+                        place(serde_json::json!({"Local": 0}), &fat_ty),
+                        {"Use": [{"Copy": deref_imp}, "No"]}
+                    ]}}],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let fat_local = place(serde_json::json!({"Local": 4}), &fat_ty);
+        let metadata_place = place(
+            serde_json::json!({"Projection": [
+                fat_local.clone(),
+                "PtrMetadata"
+            ]}),
+            &vtable_ptr,
+        );
+        let slot_field = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    metadata_place,
+                    "Deref"
+                ]}), &vtable_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fn_ptr,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "getkeys_via_strategy"]),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [obj_ty.clone()],
+                "output": unit
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &unit),
+                    local(1, &obj_ty),
+                    local(2, &unit),
+                    local(3, &obj_ty),
+                    local(4, &fat_ty),
+                    local(5, &holder_ref),
+                    local(6, &raw_ty),
+                    local(7, &fn_ptr)
+                ]},
+                "body": [
+                    {
+                        "statements": [{"span": span, "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 3}), &obj_ty),
+                            {"Use": [{"Copy": obj_place.clone()}, "No"]}
+                        ]}}],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 1},
+                                    "generics": empty_generics
+                                }},
+                                "args": [{"Move": place(serde_json::json!({"Local": 3}), &obj_ty)}],
+                                "dest": place(serde_json::json!({"Local": 2}), &unit)
+                            },
+                            "target": 1,
+                            "on_unwind": 4
+                        }}}
+                    },
+                    {
+                        "statements": [assign_raw, assign_ref],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 2},
+                                    "generics": empty_generics
+                                }},
+                                "args": [{"Move": place(serde_json::json!({"Local": 5}), &holder_ref)}],
+                                "dest": fat_local.clone()
+                            },
+                            "target": 2,
+                            "on_unwind": 4
+                        }}}
+                    },
+                    {
+                        "statements": [{"span": span, "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 7}), &fn_ptr),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [fn_ptr.clone(), fn_ptr.clone()]}},
+                                {"Copy": slot_field}
+                            ]}
+                        ]}}],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Copy": place(
+                                    serde_json::json!({"Local": 7}),
+                                    &fn_ptr
+                                )}},
+                                "args": [
+                                    {"Move": fat_local.clone()},
+                                    {"Move": obj_place.clone()}
+                                ],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 3,
+                            "on_unwind": 4
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [w_set, holder, vtable],
+                "fun_decls": [caller, lock, deref_fn],
+                "global_decls": [],
+                "trait_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(&["majit_gc", "header", "GcType"]),
+                        "methods": []
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(&["fixture", "SetStrategy"]),
+                        "methods": [{"skip_binder": {"name": "getkeys"}}]
+                    }
+                ],
+                "trait_impls": [gctype_impl_for_adt(0)]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph = super::lower_function(&llbc, "getkeys_via_strategy")
+            .expect("lower getkeys_via_strategy");
+        assert_graph_operands_defined(&graph);
+        assert!(
+            !graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr")
+            ),
+            "cast_int_to_ptr must be simple_call at flowspace\n{}",
+            graph.dump()
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "strategy")
+            ),
+            "must FieldRead strategy\n{}",
+            graph.dump()
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "imp")
+            ),
+            "must FieldRead imp\n{}",
+            graph.dump()
+        );
+        let method_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field: FieldDescriptor { name, .. }, .. }
+                        if name == "method_getkeys"
+                )
+            })
+            .count();
+        assert!(
+            method_reads > 0,
+            "must read method_getkeys\n{}",
+            graph.dump()
+        );
+    }
+
     /// Charon emits `PtrMetadata` for `.len()` on a place. A one-word
     /// object-pointer slice parameter is the length-prefixed array, so the
     /// metadata word is `ArrayLen` of that argument.
@@ -97822,6 +98163,28 @@ mod tests {
             .iter()
             .flat_map(|block| block.operations.iter())
             .collect()
+    }
+
+    fn assert_graph_operands_defined(graph: &FunctionGraph) {
+        for block in &graph.blocks {
+            let mut defined: std::collections::HashSet<u64> =
+                block.inputargs.iter().map(|var| var.id()).collect();
+            for op in &block.operations {
+                for operand in crate::inline::op_variable_refs(&op.kind) {
+                    assert!(
+                        defined.contains(&operand.id()),
+                        "block {:?} uses undefined operand {:?} in {:?}\n{}",
+                        block.id,
+                        operand,
+                        op.kind,
+                        graph.dump()
+                    );
+                }
+                if let Some(result) = &op.result {
+                    defined.insert(result.id());
+                }
+            }
+        }
     }
 
     #[test]
