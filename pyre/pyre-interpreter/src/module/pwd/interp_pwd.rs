@@ -166,11 +166,14 @@ impl Drop for EndpwentOnDrop {
 /// `c_endpwent`.
 #[cfg(unix)]
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     // `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
-    pyre_interpreter::module_ns_store(ns, "struct_passwd", struct_passwd_type());
-    pyre_interpreter::module_ns_store(ns, "struct_pwent", struct_passwd_type());
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(ns_slot, "struct_passwd", struct_passwd_type());
+    crate::__pyre_put_new!(ns_slot, "struct_pwent", struct_passwd_type());
+    crate::__pyre_put_new!(
+        ns_slot,
         "getpwuid",
         pyre_interpreter::make_builtin_function_with_arity(
             "getpwuid",
@@ -207,10 +210,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "getpwnam",
         pyre_interpreter::make_builtin_function_with_arity(
             "getpwnam",
@@ -240,10 +243,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "getpwall",
         pyre_interpreter::make_builtin_function_with_arity(
             "getpwall",
@@ -263,7 +266,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_list_new(items.take()))
             },
             0,
-        ),
+        )
     );
     Ok(())
 }

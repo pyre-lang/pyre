@@ -449,8 +449,11 @@ fn faulthandler_get_fileno_and_file(
 }
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    pyre_interpreter::module_ns_store(
-        ns,
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_put_new!(
+        ns_slot,
         "enable",
         pyre_interpreter::make_builtin_function_with_signature(
             "enable",
@@ -542,10 +545,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 0,
                 0,
             ),
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "disable",
         pyre_interpreter::make_builtin_function_with_arity(
             "disable",
@@ -569,10 +572,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "is_enabled",
         pyre_interpreter::make_builtin_function_with_arity(
             "is_enabled",
@@ -587,10 +590,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_bool_from(false))
             },
             0,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "dump_traceback",
         pyre_interpreter::make_builtin_function("dump_traceback", |_| {
             // No Python-level traceback machinery — emit a placeholder
@@ -602,23 +605,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 b"<faulthandler: pyre has no Python-level traceback yet>\n",
             );
             Ok(pyre_object::w_none())
-        }),
+        })
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "dump_traceback_later",
         pyre_interpreter::make_builtin_function("dump_traceback_later", |_| {
             Ok(pyre_object::w_none())
-        }),
+        })
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "cancel_dump_traceback_later",
         pyre_interpreter::make_builtin_function_with_arity(
             "cancel_dump_traceback_later",
             |_| Ok(pyre_object::w_none()),
             0,
-        ),
+        )
     );
     // register/unregister user signals: host_env supports the full API,
     // but it needs the user-signal handler to be a fixed extern "C" fn.
@@ -632,8 +635,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // A name that is there but answers every call with an error is worse than
     // no name: `hasattr(faulthandler, "register")` is how its callers ask.
     #[cfg(unix)]
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "register",
         pyre_interpreter::make_builtin_function_with_signature(
             "register",
@@ -725,11 +728,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 0,
                 0,
             ),
-        ),
+        )
     );
     #[cfg(unix)]
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "unregister",
         pyre_interpreter::make_builtin_function_with_arity(
             "unregister",
@@ -756,7 +759,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
+        )
     );
 
     // `handler.py:225-245` test-only crash helpers from
@@ -764,8 +767,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // process — only ever called from test_faulthandler.py in a
     // subprocess.  Pyre cannot construct an OperationError here
     // because the abort/segfault leaves no caller to catch it.
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "_read_null",
         pyre_interpreter::make_builtin_function("_read_null", |args| {
             if args.len() > 1 {
@@ -782,10 +785,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             let p: *const u8 = std::ptr::null();
             let _ = unsafe { p.read_volatile() };
             Ok(pyre_object::w_none())
-        }),
+        })
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "_sigsegv",
         pyre_interpreter::make_builtin_function("_sigsegv", |args| {
             if args.len() > 1 {
@@ -806,10 +809,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 libc::raise(libc::SIGSEGV);
             }
             Ok(pyre_object::w_none())
-        }),
+        })
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "_sigfpe",
         pyre_interpreter::make_builtin_function_with_arity(
             "_sigfpe",
@@ -832,10 +835,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "_sigabrt",
         pyre_interpreter::make_builtin_function_with_arity(
             "_sigabrt",
@@ -849,17 +852,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
+        )
     );
     // `faulthandler.c:1416-1436` publishes the statuses and `_raise_exception`
     // only where structured exceptions exist.
     #[cfg(windows)]
     {
         for (name, code) in WINDOWS_EXCEPTIONS {
-            pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(i64::from(code)));
+            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(i64::from(code)));
         }
-        pyre_interpreter::module_ns_store(
-            ns,
+        crate::__pyre_put_new!(
+            ns_slot,
             "_raise_exception",
             pyre_interpreter::make_builtin_function("_raise_exception", |args| {
                 // `_raise_exception(code, flags=0)`.
@@ -890,11 +893,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     rustpython_host_env::faulthandler::raise_exception(code, flags);
                 }
                 Ok(pyre_object::w_none())
-            }),
+            })
         );
     }
-    pyre_interpreter::module_ns_store(
-        ns,
+    crate::__pyre_put_new!(
+        ns_slot,
         "_stack_overflow",
         pyre_interpreter::make_builtin_function_with_arity(
             "_stack_overflow",
@@ -911,7 +914,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
+        )
     );
     Ok(())
 }
