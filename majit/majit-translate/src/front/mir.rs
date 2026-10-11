@@ -67463,6 +67463,14 @@ fn object_pointer_item_spelling(item: &str) -> bool {
     pointee == "PyObject" || pointee.ends_with("::PyObject")
 }
 
+/// `GCREF` / `majit_gc::GCREF`: a GC box, not a host pointer. A `[GCREF; N]`
+/// is a `GcArray` or a `push_roots` livevar list (`shadowstack.py`), not a
+/// raw `lltype.malloc(Array(T), N, flavor='raw')` buffer.
+fn gcref_item_spelling(item: &str) -> bool {
+    let item = item.trim();
+    item == "GCREF" || item.ends_with("::GCREF")
+}
+
 /// The item kind of `Option<&[T]>` / `Option<&mut [T]>` when the payload
 /// slice is a pair. `None` is a null item pointer; both words are the pair.
 fn tyref_option_pair_slice_item_kind(
@@ -68029,6 +68037,10 @@ fn tyref_raw_array_item_kind(
     llbc: &Llbc,
 ) -> Option<(majit_ir::rvec::VecItemKind, u64)> {
     let (item, len) = tyref_raw_array_parts(ty, llbc)?;
+    let spelling = charon_type_value_to_ast_string(item, llbc, 0);
+    if gcref_item_spelling(&spelling) {
+        return None;
+    }
     let kind = pair_item_kind_of_node(item, llbc)?;
     PAIR_SLICE_ITEM_KINDS.contains(&kind).then_some((kind, len))
 }
@@ -68186,12 +68198,6 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
                 return None;
             }
             let (kind, len) = tyref_raw_array_item_kind(&decl.ty, llbc)?;
-            // GCREFs live in GC arrays or as individual boxes
-            // (`shadowstack.py push_roots`). A raw malloc of pointer
-            // items is not traced, so a collection leaves stale words.
-            if kind == majit_ir::rvec::VecItemKind::Ref {
-                return None;
-            }
             Some(RawArrayRole::Storage { kind, len })
         })
         .collect();
@@ -94388,6 +94394,9 @@ mod tests {
             super::spelling_pair_field_kind("[*mut u8]"),
             Some(VecItemKind::Ref)
         );
+        assert!(super::gcref_item_spelling("GCREF"));
+        assert!(super::gcref_item_spelling("majit_gc::GCREF"));
+        assert!(!super::gcref_item_spelling("*mut u8"));
         assert_eq!(
             super::spelling_pair_field_kind("[usize]"),
             Some(VecItemKind::Int)
