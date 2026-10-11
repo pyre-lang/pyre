@@ -241,8 +241,8 @@ pub const BC_LOAD_STATE_FIELD_REF: u8 = 54;
 pub const BC_STORE_STATE_FIELD_REF: u8 = 55;
 pub const BC_LOAD_STATE_FIELD: u8 = 56;
 pub const BC_STORE_STATE_FIELD: u8 = 57;
-pub const BC_LOAD_STATE_ARRAY: u8 = 58;
-pub const BC_STORE_STATE_ARRAY: u8 = 59;
+// slots 58-59 (formerly load_state_array / store_state_array) freed:
+// a plain `[int]` is ptr then len; cells are `getarrayitem_raw_i`.
 pub const BC_LOAD_STATE_FIELD_FLOAT: u8 = 60;
 pub const BC_STORE_STATE_FIELD_FLOAT: u8 = 61;
 pub const BC_GETFIELD_VABLE_I: u8 = 62;
@@ -1349,18 +1349,19 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
 ///    converts into `DispatchError::AbortTrace` /
 ///    `DispatchError::AbortPermanentTrace` `Result` returns.
 ///
-/// 2. **Proc-macro JIT-machine state addressing** (the 6 `*_state_*`
+/// 2. **Proc-macro JIT-machine state addressing** (the 4 `*_state_field*`
 ///    keys).  Pyre uses Rust proc-macros (`#[jit_interp]`,
 ///    `#[jit_driver]`, `state_fields = { ... }`) to generate the entire
 ///    JIT machine from a single function definition. RPython's
 ///    metaprogramming is runtime / annotator-driven and has no
 ///    proc-macro counterpart. The generated machine carries a
-///    `JitCodeSym` whose state fields use flat slot indices (`d` argcode)
+///    `JitCodeSym` whose scalar state fields use flat slot indices (`d` argcode)
 ///    without an explicit virtualizable-pointer register. The canonical
 ///    `setfield_vable_*` shape requires an `r` vable pointer plus a `d`
 ///    `FieldDescr`, so it cannot address these proc-macro-owned slots. Keeping
-///    the six state opcodes in `pyre_local_bh_insns()` isolates that adaptation
-///    while `wellknown_bh_insns()` remains canonical.
+///    the scalar state opcodes in `pyre_local_bh_insns()` isolates that adaptation
+///    while `wellknown_bh_insns()` remains canonical. A plain `[int]` array is
+///    ptr then len and uses `getarrayitem_raw_i`.
 ///
 /// All extension keys retain their fixed `BC_*` byte values in the same
 /// number-space as the canonical opcodes; only the catalogue is split
@@ -1376,16 +1377,12 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // Proc-macro JIT-machine state addressing — emit sites are in
     // `majit-macros/src/jit_interp/jitcode_lower.rs`. Argcodes:
     //   `d` = state-slot index (u16); `i` = int register (u16).
-    //   Array variants carry an extra `i` for the index register
-    //   before the destination/source slot.
     m.insert("load_state_field_ref/dr", BC_LOAD_STATE_FIELD_REF);
     m.insert("store_state_field_ref/dr", BC_STORE_STATE_FIELD_REF);
     m.insert("load_state_field/di", BC_LOAD_STATE_FIELD);
     m.insert("store_state_field/di", BC_STORE_STATE_FIELD);
     m.insert("load_state_field_float/df", BC_LOAD_STATE_FIELD_FLOAT);
     m.insert("store_state_field_float/df", BC_STORE_STATE_FIELD_FLOAT);
-    m.insert("load_state_array/dii", BC_LOAD_STATE_ARRAY);
-    m.insert("store_state_array/dii", BC_STORE_STATE_ARRAY);
     // TODO: pyre nested-bytecode `inline_call`.
     //
     // RPython's canonical `inline_call_*` keys (`/dIRF>i`, `/dIR>r`, …)

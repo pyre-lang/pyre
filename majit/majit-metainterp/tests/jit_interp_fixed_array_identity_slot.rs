@@ -1,9 +1,6 @@
-//! Verifies virtualizable identity handling when a fixed integer array appears
-//! before a virtualizable array in the flattened input layout.
-//!
-//! Runtime-sized fixed arrays prevent the macro from declaring a constant
-//! identity slot. The optimizer must decline identity tracking instead of
-//! falling back to slot zero, which contains an integer in this fixture.
+//! Verifies virtualizable identity handling when a plain `[int]` array appears
+//! before a virtualizable array. The `[int]` is ptr then len, so the
+//! identity slot is a constant (`warmspot.py` `index_of_virtualizable`).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -24,11 +21,11 @@ fn expected(limit: i64) -> i64 {
     limit
 }
 
-/// A fixed `[int]` array between the loop-dead `int` scalar and the
+/// A plain `[int]` array between the loop-dead `int` scalar and the
 /// `[int; virt]` array. `ret` sits on the virtualizable with `iregs`
 /// (`virtualizable.py VirtualizableInfo.__init__`), so `extract_live`
-/// emits `[cells[0], cells[1], identity]`. The identity is at flat slot
-/// 2 — not at 0.
+/// emits `[cells items-pointer, cells len, identity]`. The identity is at
+/// flat slot 2 — not at 0, and not at `cells.len()`.
 mod fixed_array_before_virt_array {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
     use majit_metainterp::JitState as _;
@@ -106,10 +103,12 @@ mod fixed_array_before_virt_array {
     }
 
     /// Ground truth for the slot the identity occupies. `ret` is a
-    /// virtualizable static, so the red block is the fixed array's cells
-    /// then the identity. No `iregs` element belongs in the red block.
+    /// virtualizable static, so the red block is the plain `[int]`
+    /// items-pointer then length then the identity. No `iregs` element
+    /// belongs in the red block, and ptr+len is two slots regardless of
+    /// `cells.len()`.
     #[test]
-    fn the_identity_sits_past_the_fixed_array_cells() {
+    fn the_identity_sits_past_the_plain_int_array_pointer() {
         let state = FixedAndVirt {
             ret: 0,
             cells: vec![0i64, 0i64],
@@ -121,14 +120,25 @@ mod fixed_array_before_virt_array {
         assert_eq!(
             state.live_value_types(&meta),
             vec![
-                majit_ir::Type::Int, // cells[0]
-                majit_ir::Type::Int, // cells[1]
+                majit_ir::Type::Int, // cells items-pointer
+                majit_ir::Type::Int, // cells length
                 majit_ir::Type::Ref, // vable identity
             ],
-            "the identity must follow the fixed array's cells, so its flat slot \
-             is `cells.len()` = 2 — not the legacy frame-first 0",
+            "the identity must follow ptr then len, so its flat slot is 2 — \
+             independent of cells.len()",
         );
-        assert_eq!(state.extract_live(&meta).len(), 3);
+        let live = state.extract_live(&meta);
+        assert_eq!(live.len(), 3);
+        assert_eq!(
+            live[0],
+            state.cells.as_ptr() as i64,
+            "the [int] first red is the Vec items pointer"
+        );
+        assert_eq!(
+            live[1],
+            state.cells.len() as i64,
+            "the [int] second red is the Vec length"
+        );
     }
 
     #[test]
@@ -146,12 +156,9 @@ mod fixed_array_before_virt_array {
         );
         assert!(
             COMPILES.load(Ordering::Relaxed) >= 1,
-            "declaring a fixed `[int]` array beside a `[int; virt]` one stopped \
-             the hot loop from compiling at all: the macro emits no \
-             `identity_live_index` for that combination and the optimizer fell \
-             back to flat slot 0, which here is the loop-dead `ret` int scalar, \
-             so every trace aborted with VirtualStatesCantMatch (expected Ref, \
-             got Int) on slot 0"
+            "declaring a plain `[int]` array beside a `[int; virt]` one must \
+             still compile the hot loop: identity_live_index is the constant \
+             after ptr then len"
         );
     }
 }

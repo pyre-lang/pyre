@@ -248,23 +248,12 @@ pub(super) fn liveness_prebuild_tokens(
     op_metadata: &[OpMeta],
     inline_prebuild: &[TokenStream],
 ) -> TokenStream {
-    liveness_prebuild_tokens_ex(op_metadata, inline_prebuild, false)
-}
-
-/// When `union_flat_array_identity` is set, each triple unions
-/// `__flat_array_identity_slots` (Meta-length `[int]` cells) so
-/// `-live-` / guard resume restore them (`handle_jit_marker__jit_merge_point`).
-pub(super) fn liveness_prebuild_tokens_ex(
-    op_metadata: &[OpMeta],
-    inline_prebuild: &[TokenStream],
-    union_flat_array_identity: bool,
-) -> TokenStream {
     let live_regs = op_metadata.iter().filter_map(|m| {
         if !matches!(m.control, ControlFlowClass::LiveMarker) {
             return None;
         }
         let (live_i, live_r, live_f) = liveness_triple_from_reads(&m.reads);
-        let live_i_tokens = live_i_tokens(&live_i, union_flat_array_identity);
+        let live_i_tokens = live_i_tokens(&live_i);
         let register = quote! {
             let _ = __asm._register_liveness_offset(
                 #live_i_tokens,
@@ -440,36 +429,13 @@ pub(super) fn remove_repeated_live(
 /// `Register::new` constructor asserts this bound at every
 /// emit site, so by the time the walker hands us a `BTreeSet<Register>`
 /// the indices are guaranteed `u8`-clean.
+fn live_i_tokens(live_i: &[u8]) -> TokenStream {
+    quote! { &[#(#live_i),*] }
+}
+
 pub(super) fn rewrite_live_marker_statements_with_triples(
     op_metadata: &[OpMeta],
     statements: &mut [TokenStream],
-) {
-    rewrite_live_marker_statements_with_triples_ex(op_metadata, statements, false);
-}
-
-fn live_i_tokens(live_i: &[u8], union_flat_array_identity: bool) -> TokenStream {
-    if union_flat_array_identity {
-        quote! {
-            &{
-                let mut __live_i: Vec<u8> = vec![#(#live_i),*];
-                for &__s in __flat_array_identity_slots.iter() {
-                    if !__live_i.contains(&__s) {
-                        __live_i.push(__s);
-                    }
-                }
-                __live_i.sort_unstable();
-                __live_i
-            }
-        }
-    } else {
-        quote! { &[#(#live_i),*] }
-    }
-}
-
-pub(super) fn rewrite_live_marker_statements_with_triples_ex(
-    op_metadata: &[OpMeta],
-    statements: &mut [TokenStream],
-    union_flat_array_identity: bool,
 ) {
     debug_assert_eq!(op_metadata.len(), statements.len());
     let live_sets = compute_per_marker_liveness(op_metadata);
@@ -480,7 +446,7 @@ pub(super) fn rewrite_live_marker_statements_with_triples_ex(
         }
         let (live_i, live_r, live_f) = liveness_triple(&live_sets[next_marker]);
         next_marker += 1;
-        let live_i_tokens = live_i_tokens(&live_i, union_flat_array_identity);
+        let live_i_tokens = live_i_tokens(&live_i);
         let live_stmt = quote! {
             let _ = __builder.live_placeholder_with_triple(
                 #live_i_tokens,

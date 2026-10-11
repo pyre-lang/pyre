@@ -1009,8 +1009,9 @@ where
     let (ri, rr, rf) = descriptor.red_kind_counts();
     let (ei, er, ef) = driver.merge_point_identity_reds;
     // Greens are the portal-runner arguments. Reds on the marker are
-    // those plus the identity/cell registers `resolve_reds` lists
-    // (`identity_slot_registers` / `__flat_array_identity_slots`).
+    // those plus the identity registers `resolve_reds` lists
+    // (`identity_slot_registers`). A plain `[int]` is ptr then len,
+    // not a cell per element.
     let expected = [gi, gr, gf, ri + ei, rr + er, rf + ef];
     for (slot, expect) in expected.iter().enumerate() {
         assert!(
@@ -1839,9 +1840,9 @@ pub struct JitDriver<S: JitState> {
     /// `register_descriptor` (each of which clears this cache), and no
     /// `JitState::driver_descriptor` implementation reads its `meta` argument.
     descriptor_cache: Option<Option<std::sync::Arc<JitDriverStaticData>>>,
-    /// Identity/cell reds the lowerer lists on `jit_merge_point` after the
-    /// named portal reds (`identity_slot_registers` plus Meta-length
-    /// flattened `[int]` cells). Not `JitDriverStaticData::vars`: those
+    /// Identity reds the lowerer lists on `jit_merge_point` after the
+    /// named portal reds (`identity_slot_registers`). A plain `[int]` is
+    /// ptr then len. Not `JitDriverStaticData::vars`: those
     /// are the portal-runner arguments (`warmspot.py`
     /// `cpu.calldescrof(portal_runner)`). `(int, ref, float)`.
     merge_point_identity_reds: (usize, usize, usize),
@@ -2587,12 +2588,12 @@ impl<S: JitState> JitDriver<S> {
         self.descriptor_cache = None;
     }
 
-    /// Identity/cell reds the lowerer lists on `jit_merge_point` after the
+    /// Identity reds the lowerer lists on `jit_merge_point` after the
     /// named portal reds. `register_dispatch_jitcode` adds these to
     /// `red_kind_counts` so the payload length is exact.
     ///
-    /// `(int, ref, float)` from `identity_slot_registers` plus Meta-length
-    /// flattened `[int]` cells (`__flat_array_identity_slots`).
+    /// `(int, ref, float)` from `identity_slot_registers`. A plain `[int]`
+    /// is ptr then len.
     pub fn declare_merge_point_identity_reds(&mut self, counts: (usize, usize, usize)) {
         self.merge_point_identity_reds = counts;
     }
@@ -3126,10 +3127,9 @@ impl<S: JitState> JitDriver<S> {
     /// identity seeded into its own slot plus handed to the chain alongside the
     /// vinfo pointer `seed_deopt_vinfo_ptr` allows.
     ///
-    /// One shape still declines: a flattened fixed `[int]` array (`array_lens`),
-    /// whose per-element slots have no sym-side collector.  No frontend
-    /// currently declares one — the supported loop-carried form is
-    /// `[.. ; virt]`.
+    /// A generated plain `[int]` is ptr then len identity slots. The abort
+    /// conversion seeds those from `extract_live` (the same prefix the
+    /// compiled entry uses). `num_scalars` is the real int scalar count.
     pub fn take_interpret_bail_residual(&mut self) -> Option<String> {
         self.meta.interpret_bail_residual.take()
     }
@@ -3157,20 +3157,10 @@ impl<S: JitState> JitDriver<S> {
             raising_exception,
         } = pending;
         // pyjitpl.py popframe appends to free_frames_list; the standalone
-        // walk's pool is that list. Recycle on every exit, including the
-        // unseeded-array decline below.
+        // walk's pool is that list. Recycle on every exit.
         let mut recycle = crate::pyjitpl::RecycleFramestackOnDrop(framestack);
         let framestack = &mut recycle.0;
         let layout = state.state_field_layout();
-        if !layout.array_lens.is_empty() {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[bh] abort-blackhole declined: unseeded state shape (arrays={})",
-                    layout.array_lens.len(),
-                );
-            }
-            return None;
-        }
         // `writeback_virt_array_state_fields_from_values`, run here rather than
         // by the `jit_merge_point!` hook's own virt-array writeback: the chain
         // is about to re-execute the tail of the aborted opcodes against the
@@ -3207,6 +3197,28 @@ impl<S: JitState> JitDriver<S> {
             let slot = layout.scalar_slot(field_idx);
             if slot < root.int_regs.len() {
                 root.int_regs[slot] = Some(majit_ir::OpRef::const_int(*value));
+            }
+        }
+        // Dispatch `getarrayitem_raw_i` reads the ptr register, so a
+        // re-executed root frame needs the ptr/len identity slots seeded.
+        // `extract_live` already emits that prefix (scalars, then ptr then
+        // len per plain `[int]`).
+        if layout.num_plain_int_arrays > 0 {
+            let meta = state.build_meta(0, env);
+            let live = state.extract_live(&meta);
+            for k in 0..layout.num_plain_int_arrays {
+                let (ptr_slot, len_slot) = layout.array_identity_slots(k);
+                let live_base = layout.num_scalars + 2 * k;
+                if let Some(&ptr) = live.get(live_base)
+                    && ptr_slot < root.int_regs.len()
+                {
+                    root.int_regs[ptr_slot] = Some(majit_ir::OpRef::const_int(ptr));
+                }
+                if let Some(&len) = live.get(live_base + 1)
+                    && len_slot < root.int_regs.len()
+                {
+                    root.int_regs[len_slot] = Some(majit_ir::OpRef::const_int(len));
+                }
             }
         }
         for (field_idx, value) in scalar_values.iter().skip(layout.num_scalars).enumerate() {
@@ -11499,7 +11511,7 @@ fn layout_has_no_scalar_identity(layout: &crate::blackhole::StateFieldLayout) ->
         && layout.num_ref_scalars == 0
         && layout.num_float_scalars == 0
         && layout.num_vable_identity_slots == 0
-        && layout.array_lens.is_empty()
+        && layout.num_plain_int_arrays == 0
 }
 
 /// `ContinueRunningNormally` restore inputs.

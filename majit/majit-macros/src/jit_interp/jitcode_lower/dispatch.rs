@@ -1849,9 +1849,9 @@ fn lower_matchless_portal_body(
 /// `jit_merge_point` or the default exit, never a value).
 pub(super) fn dispatch_arm_inline_call_tokens(
     layout: &[CallerLocalLayout],
+    identity_int_pairs: &[(u16, u16)],
 ) -> proc_macro2::TokenStream {
     use quote::quote;
-    let has_int = layout.iter().any(|l| matches!(l.kind, BindingKind::Int));
     let has_float = layout.iter().any(|l| matches!(l.kind, BindingKind::Float));
     let pair_tokens = |kind: BindingKind| -> Vec<proc_macro2::TokenStream> {
         layout
@@ -1864,7 +1864,18 @@ pub(super) fn dispatch_arm_inline_call_tokens(
             })
             .collect()
     };
-    let args_i = pair_tokens(BindingKind::Int);
+    let args_i_pairs = extend_int_args_with_array_identity(
+        layout
+            .iter()
+            .filter(|l| l.kind == BindingKind::Int)
+            .map(|l| (l.parent_reg, l.callee_reg))
+            .collect(),
+        identity_int_pairs,
+    );
+    let has_int = !args_i_pairs.is_empty();
+    let args_i = args_i_pairs.iter().map(|&(parent, callee)| {
+        quote! { (#parent as u16, #callee as u16) }
+    });
     let args_r = pair_tokens(BindingKind::Ref);
     let args_f = pair_tokens(BindingKind::Float);
     if has_float {
@@ -1906,9 +1917,9 @@ pub(super) fn dispatch_arm_inline_call_tokens(
 pub(super) fn dispatch_arm_inline_call_tokens_i(
     layout: &[CallerLocalLayout],
     return_i_reg: u16,
+    identity_int_pairs: &[(u16, u16)],
 ) -> proc_macro2::TokenStream {
     use quote::quote;
-    let has_int = layout.iter().any(|l| matches!(l.kind, BindingKind::Int));
     let has_float = layout.iter().any(|l| matches!(l.kind, BindingKind::Float));
     let pair_tokens = |kind: BindingKind| -> Vec<proc_macro2::TokenStream> {
         layout
@@ -1921,7 +1932,18 @@ pub(super) fn dispatch_arm_inline_call_tokens_i(
             })
             .collect()
     };
-    let args_i = pair_tokens(BindingKind::Int);
+    let args_i_pairs = extend_int_args_with_array_identity(
+        layout
+            .iter()
+            .filter(|l| l.kind == BindingKind::Int)
+            .map(|l| (l.parent_reg, l.callee_reg))
+            .collect(),
+        identity_int_pairs,
+    );
+    let has_int = !args_i_pairs.is_empty();
+    let args_i = args_i_pairs.iter().map(|&(parent, callee)| {
+        quote! { (#parent as u16, #callee as u16) }
+    });
     let args_r = pair_tokens(BindingKind::Ref);
     let args_f = pair_tokens(BindingKind::Float);
     if has_float {
@@ -1973,7 +1995,7 @@ mod dispatch_arm_inline_call_tokens_tests {
 
     #[test]
     fn empty_layout_emits_inline_call_r_v_no_args() {
-        let out = dispatch_arm_inline_call_tokens(&[]);
+        let out = dispatch_arm_inline_call_tokens(&[], &[]);
         let s = render(&out);
         assert!(s.contains("inline_call_r_v"), "got: {s}");
         // Both arg vec literal and the no-return None must appear.
@@ -1984,7 +2006,7 @@ mod dispatch_arm_inline_call_tokens_tests {
     #[test]
     fn ref_only_layout_uses_inline_call_r_v() {
         let layout = vec![entry("program", 3, 0, BindingKind::Ref)];
-        let s = render(&dispatch_arm_inline_call_tokens(&layout));
+        let s = render(&dispatch_arm_inline_call_tokens(&layout, &[]));
         assert!(s.contains("inline_call_r_v"), "got: {s}");
         assert!(s.contains("3u16") || s.contains("3 as u16"), "got: {s}");
         assert!(!s.contains("inline_call_ir_v"), "got: {s}");
@@ -1996,7 +2018,7 @@ mod dispatch_arm_inline_call_tokens_tests {
             entry("pc", 7, 0, BindingKind::Int),
             entry("program", 3, 0, BindingKind::Ref),
         ];
-        let s = render(&dispatch_arm_inline_call_tokens(&layout));
+        let s = render(&dispatch_arm_inline_call_tokens(&layout, &[]));
         assert!(s.contains("inline_call_ir_v"), "got: {s}");
         // Both parent regs land in their respective arg slices.
         assert!(s.contains("7"), "got: {s}");
@@ -2009,8 +2031,22 @@ mod dispatch_arm_inline_call_tokens_tests {
             entry("pc", 7, 0, BindingKind::Int),
             entry("flt", 9, 0, BindingKind::Float),
         ];
-        let s = render(&dispatch_arm_inline_call_tokens(&layout));
+        let s = render(&dispatch_arm_inline_call_tokens(&layout, &[]));
         assert!(s.contains("inline_call_irf_v"), "got: {s}");
+    }
+
+    #[test]
+    fn plain_array_identity_pairs_are_declared_int_args() {
+        // `MIFrame.setup_call` / `bhimpl_inline_call_ir_v`: a value the
+        // callee reads must be a declared argument. Empty caller-locals
+        // still pass ptr/len at the identity slot numbers. Holes below
+        // those slots are padded so the I-list stays positional.
+        let s = render(&dispatch_arm_inline_call_tokens(&[], &[(2, 2), (3, 3)]));
+        assert!(s.contains("inline_call_ir_v"), "got: {s}");
+        assert!(s.contains("2u16 as u16"), "got: {s}");
+        assert!(s.contains("3u16 as u16"), "got: {s}");
+        assert!(s.contains("0u16 as u16"), "got: {s}");
+        assert!(s.contains("1u16 as u16"), "got: {s}");
     }
 }
 
@@ -3142,11 +3178,23 @@ pub(super) fn lower_dispatch_chain(
                                         arm_inline_call_reads.push(reg);
                                     }
                                 }
+                                // `MIFrame.setup_call` / `bhimpl_inline_call_ir_v`
+                                // give the callee only the declared argument
+                                // boxes. A plain `[int]` ptr/len is appended
+                                // as `(slot, slot)` here, not through
+                                // `assign_caller_local_layout`.
+                                let identity_int_pairs =
+                                    plain_array_identity_int_pairs(Some(config));
                                 let inline_call_emit = match pc_return_reg {
-                                    Some(pc_reg) => {
-                                        dispatch_arm_inline_call_tokens_i(&layout, pc_reg)
-                                    }
-                                    None => dispatch_arm_inline_call_tokens(&layout),
+                                    Some(pc_reg) => dispatch_arm_inline_call_tokens_i(
+                                        &layout,
+                                        pc_reg,
+                                        &identity_int_pairs,
+                                    ),
+                                    None => dispatch_arm_inline_call_tokens(
+                                        &layout,
+                                        &identity_int_pairs,
+                                    ),
                                 };
                                 // Reserve the identity-slot prefix in the sub-JitCode
                                 // register file so int[int_identity_base..int_end) /
@@ -3249,7 +3297,7 @@ pub(super) fn lower_dispatch_chain(
                                             __sub_builder.finish()
                                         }
                                     },
-                                    dispatch_arm_inline_call_tokens(&[]),
+                                    dispatch_arm_inline_call_tokens(&[], &[]),
                                 )
                             }
                         }
@@ -3623,8 +3671,7 @@ pub(super) fn resolve_reds(
 
     // `handle_jit_marker__jit_merge_point` / `make_three_lists`: every
     // declared red is a live Variable on the marker. State-field identity
-    // slots (plain scalars; flattened `[int]` cells join at JitCode-build
-    // from Meta lengths) are those reds.
+    // slots (plain scalars and ptr then len per `[int]`) are those reds.
     for reg in config.identity_slot_registers() {
         match reg.kind {
             BindingKind::Int => reds_i.push(reg.index),
@@ -4134,20 +4181,14 @@ pub(crate) fn lower_dispatch_body(
         OpMeta::linear(OpKind::JitMergePoint, merge_reads, vec![]),
         quote::quote! {
             // __jdindex: jtransform.py:1704 portal_jd.index threaded as runtime param.
-            // Flattened `[int]` cells join here from Meta lengths
+            // Identity reds include ptr then len per plain `[int]`
             // (`handle_jit_marker__jit_merge_point` / `make_three_lists`).
-            let mut __reds_i: Vec<u8> = vec![#(#reds_i_lit),*];
-            for &__s in __flat_array_identity_slots.iter() {
-                if !__reds_i.contains(&__s) {
-                    __reds_i.push(__s);
-                }
-            }
             __builder.jit_merge_point(
                 __jdindex,
                 &[#(#greens_i_lit),*],
                 &[#(#greens_r_lit),*],
                 &[#(#greens_f_lit),*],
-                &__reds_i,
+                &[#(#reds_i_lit),*],
                 &[#(#reds_r_lit),*],
                 &[#(#reds_f_lit),*],
             );
@@ -4380,34 +4421,23 @@ pub(crate) fn lower_dispatch_body(
             .floats
             .max(portal_f_regs)
             .max(config.float_identity_end());
-        let int_identity_base = config.int_identity_base() as usize;
-        let plain_int_scalars = config.plain_int_scalar_count() as usize;
+        let int_identity_end = config
+            .int_identity_base()
+            .saturating_add(config.plain_int_scalar_count())
+            .saturating_add(config.plain_array_identity_slots());
+        let final_i_regs = final_i_regs.max(int_identity_end);
         lowerer.statements[ensure_regs_stmt_idx] = quote::quote! {
             __builder.ensure_r_regs(#final_r_regs);
-            // Span flattened `[int]` cells the marker lists from Meta
-            // lengths (`typed_array_parts` / `make_three_lists`).
-            let __i_regs = (#final_i_regs as usize).max(
-                #int_identity_base
-                    + #plain_int_scalars
-                    + __flat_array_lens.iter().copied().sum::<usize>(),
-            );
-            __builder.ensure_i_regs(__i_regs as u16);
+            __builder.ensure_i_regs(#final_i_regs);
             __builder.ensure_f_regs(#final_f_regs);
         };
     }
 
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
-    rewrite_live_marker_statements_with_triples_ex(
-        &lowerer.op_metadata,
-        &mut lowerer.statements,
-        true,
-    );
-    let liveness_prebuild = liveness_prebuild_tokens_ex(
-        &lowerer.op_metadata,
-        &lowerer.inline_liveness_prebuild,
-        true,
-    );
+    rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);
+    let liveness_prebuild =
+        liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
     // Slice (audit Issue #5) — surface the dispatch JitCode's
     // (name, IR Type) green / red schemas to the install path so it
     // can populate `JitDriverStaticData::vars` via
