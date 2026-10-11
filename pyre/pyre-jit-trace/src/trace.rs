@@ -1897,8 +1897,17 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // `Caught` would push the trace-time exception constant, and a missing
     // handler would resume the no-exception fallthrough because a prepared
     // resume disables the fallback route.
+    //
+    // `prepare_resume_from_failure` / `handle_possible_exception`
+    // (`pyjitpl.py`): a null `cpu.grab_exc_value(deadframe)` records
+    // `GUARD_NO_EXCEPTION` and continues at the resume pc. `Restored` is
+    // the ChangeFrame into the catching frame, which only happens when
+    // that grab was non-null.
+    let grabbed = ctx.bridge_grab_seeded()
+        || majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get()) != 0;
     let handler_entry = (ctx.is_bridge_trace
         && ctx.bridge_source_is_exception_guard()
+        && grabbed
         && !sym.last_exc_box().is_none()
         && !sym.last_exc_value().is_null())
     .then(|| crate::jitcode_dispatch::FrameHandlerEntry::Restored {
