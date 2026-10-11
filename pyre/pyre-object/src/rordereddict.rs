@@ -1530,16 +1530,6 @@ where
         self.reindex(size);
     }
 
-    /// `ll_dict_resize` into `_ll_dict_resize_to`.
-    ///
-    /// `num_extra` is what makes the table *quadruple* rather than double:
-    /// `(num_live_items + num_live_items + 1) * 2` until the dict is large
-    /// enough for the 30000 cap to bite.  Both call sites reach the table
-    /// through `ll_dict_resize`, and neither passes a `num_extra` of its own.
-    fn resize(&mut self) {
-        ll_dict_resize(self);
-    }
-
     fn resize_inner(&mut self) {
         let num_extra = (self.num_live_items + 1).min(30000);
         let new_estimate = (self.num_live_items + num_extra) * 2;
@@ -1690,16 +1680,6 @@ where
             None => -1,
         };
         ll_dict_setitem_lookup_done(self, hash, i, key, value);
-    }
-
-    /// `ll_dict_grow`. Returns whether the index was rebuilt (compaction).
-    fn dict_grow(&mut self) -> bool
-    where
-        K: Copy + EntryDummy + GcRefOffsets,
-        V: Copy + EntryDummy + GcRefOffsets,
-        (K, V): GcEntriesType,
-    {
-        ll_dict_grow(self)
     }
 
     /// `rordereddict.py::ll_dict_delete_by_entry_index` — re-probe from
