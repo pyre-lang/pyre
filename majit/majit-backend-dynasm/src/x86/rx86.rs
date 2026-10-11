@@ -1009,6 +1009,11 @@ pub fn movups_mx(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0, &[0x0F, 0x11], src, mem.0, mem.1);
 }
 
+/// `MOVUPS_ax` — `movups [base + index*scale + ofs], xmm`.
+pub fn movups_ax(mc: &mut Assembler, addr: (i16, u8, u8, i32), src: u8) {
+    op_addr(mc, RexKind::Nw, 0, &[0x0F, 0x11], src, addr);
+}
+
 /// `MOVQ_mx` — `movq [base + ofs], xmm`.
 pub(crate) fn movq_mx(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0x66, &[0x0F, 0xD6], src, mem.0, mem.1);

@@ -690,6 +690,22 @@ enum AbiArgPlacement {
     Stack(i32),
 }
 
+/// `AddressLoc` from `addr_add`: `'m'` is `[base+ofs]`, `'a'` is
+/// `[base + index*scale + ofs]`.
+#[derive(Clone, Copy)]
+enum AddrAdd {
+    Mem {
+        base: u8,
+        ofs: i32,
+    },
+    Sib {
+        base: i16,
+        index: u8,
+        scale: u8,
+        ofs: i32,
+    },
+}
+
 /// `x86/assembler.py _push_all_regs_to_frame` parity — free-fn
 /// variant that emits into an arbitrary `dynasmrt::x64::Assembler`,
 /// for use by helper-buffer builders that operate outside of an
@@ -3298,6 +3314,22 @@ impl<'a> Assembler386<'a> {
     fn emit_release_abi_call_area(&mut self, adjust: i32) {
         if adjust != 0 {
             rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
+        }
+    }
+
+    /// `CallBuilderX86.subtract_esp_aligned`. Returns the bytes subtracted.
+    fn subtract_esp_aligned(&mut self, count: i32) -> i32 {
+        let bytes = super::callbuilder::aligned_esp_bytes(count);
+        if bytes != 0 {
+            rx86::sub_ri(&mut self.mc, rx86::ESP, bytes);
+        }
+        bytes
+    }
+
+    /// `CallBuilderX86.restore_stack_pointer` with `target_esp == 0`.
+    fn restore_stack_pointer(&mut self, current_esp: i32) {
+        if current_esp != 0 {
+            rx86::add_ri(&mut self.mc, rx86::ESP, current_esp);
         }
     }
 
@@ -8995,8 +9027,12 @@ impl<'a> Assembler386<'a> {
             }
         }
 
-        dynasm!(self.mc ; .arch x64 ; push rbp);
-        let call_area_adjust = self.emit_reserve_abi_call_area(1, stack_slots);
+        // `CallBuilder64.prepare_arguments` then `subtract_esp_aligned`:
+        // reserve the outgoing argument area (Win64 shadow included)
+        // aligned to 16 bytes, once. Body rsp is already 0-mod-16, so
+        // SysV with no stack args subtracts nothing.
+        let on_stack = super::callbuilder::outgoing_stack_words(stack_slots);
+        let call_area_adjust = self.subtract_esp_aligned(on_stack);
 
         // Pass 1: emit stack-dst args first.  Their sources may be
         // registers the parallel move below will overwrite, but stack
@@ -9110,7 +9146,7 @@ impl<'a> Assembler386<'a> {
         let mut tlofs_loaded = false;
         self.write_real_errno(
             save_err,
-            WORD as i32 + call_area_adjust,
+            call_area_adjust,
             &mut tlofs_loaded,
             win64_arg_gpr,
             win64_arg_xmm,
@@ -9137,9 +9173,8 @@ impl<'a> Assembler386<'a> {
             );
         }
 
-        self.emit_release_abi_call_area(call_area_adjust);
-        self.read_real_errno(save_err, WORD as i32, &mut tlofs_loaded);
-        dynasm!(self.mc ; .arch x64 ; pop rbp);
+        self.restore_stack_pointer(call_area_adjust);
+        self.read_real_errno(save_err, 0, &mut tlofs_loaded);
     }
 
     /// Load an immediate or frame call target into rax. The register case
@@ -11023,8 +11058,91 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// ZERO_ARRAY: zero a range in an array.
-    /// arg(0)=base, arg(1)=start, arg(2)=size, arg(3)=scale_start, arg(4)=scale_size.
+    /// `addr_add(base, start, offset, scale)` for ZERO_ARRAY. Immediate
+    /// start folds `start * itemsize` into the displacement (`_scaled_addr`);
+    /// a register start uses SIB scale `get_scale(itemsize)`.
+    fn addr_add_zero_array(base: &Loc, start: &Loc, itemsize: i64, offset: i64) -> AddrAdd {
+        let Loc::Reg(b) = base else {
+            panic!("ZERO_ARRAY base must be a register, got {base:?}");
+        };
+        match start {
+            Loc::Reg(s) => {
+                if !crate::regalloc::valid_addressing_size(itemsize as usize) {
+                    panic!("ZERO_ARRAY start scale must be 1, 2, 4, or 8, got {itemsize}");
+                }
+                let shift = crate::regalloc::get_scale(itemsize as usize);
+                AddrAdd::Sib {
+                    base: i16::from(b.value),
+                    index: s.value,
+                    scale: shift,
+                    ofs: offset as i32,
+                }
+            }
+            Loc::Immed(s) | Loc::ImmedFloat(s) => AddrAdd::Mem {
+                base: b.value,
+                ofs: offset.wrapping_add(s.value.wrapping_mul(itemsize)) as i32,
+            },
+            other => panic!("ZERO_ARRAY start must be a GPR or immediate, got {other:?}"),
+        }
+    }
+
+    fn emit_movups_addr(&mut self, addr: AddrAdd, xmm: u8) {
+        match addr {
+            AddrAdd::Mem { base, ofs } => rx86::movups_mx(&mut self.mc, (base, ofs), xmm),
+            AddrAdd::Sib {
+                base,
+                index,
+                scale,
+                ofs,
+            } => rx86::movups_ax(&mut self.mc, (base, index, scale, ofs), xmm),
+        }
+    }
+
+    /// `save_into_mem(addr, imm0, size)` for the ZERO_ARRAY tail.
+    fn emit_zero_imm_addr(&mut self, addr: AddrAdd, size: i64) {
+        match addr {
+            AddrAdd::Mem { base, ofs } => match size {
+                8 => rx86::mov_mi(&mut self.mc, (base, ofs), 0),
+                4 => rx86::mov32_mi(&mut self.mc, (base, ofs), 0),
+                2 => rx86::mov16_mi(&mut self.mc, (base, ofs), 0),
+                1 => rx86::mov8_mi(&mut self.mc, (base, ofs), 0),
+                other => panic!("ZERO_ARRAY tail size {other}"),
+            },
+            AddrAdd::Sib {
+                base,
+                index,
+                scale,
+                ofs,
+            } => {
+                let sib = (base, index, scale, ofs);
+                match size {
+                    8 => rx86::mov_ai(&mut self.mc, sib, 0),
+                    4 => rx86::mov32_ai(&mut self.mc, sib, 0),
+                    2 => rx86::mov16_ai(&mut self.mc, sib, 0),
+                    1 => rx86::mov8_ai(&mut self.mc, sib, 0),
+                    other => panic!("ZERO_ARRAY tail size {other}"),
+                }
+            }
+        }
+    }
+
+    fn emit_lea_addr_add(&mut self, dst: u8, addr: AddrAdd) {
+        self.forget_if_scratch_written(dst);
+        match addr {
+            AddrAdd::Mem { base, ofs } => rx86::lea_rm(&mut self.mc, dst, (base, ofs)),
+            AddrAdd::Sib {
+                base,
+                index,
+                scale,
+                ofs,
+            } => rx86::lea_ra(&mut self.mc, dst, (base, index, scale, ofs)),
+        }
+    }
+
+    /// `genop_discard_zero_array`. Immediate `nbytes` in `0..=16*8` unrolls
+    /// `XORPS` + `MOVUPS` / `save_into_mem(imm0)` through `addr_add`. Larger
+    /// or non-constant sizes `LEA` the dest and call `memset`
+    /// (`consider_zero_array`).
     fn genop_discard_zero_array(&mut self, op: &Op, arglocs: &[Loc]) {
         let [
             base_loc,
@@ -11043,13 +11161,6 @@ impl<'a> Assembler386<'a> {
             .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
 
-        // The scale operands are the `st.const_int(scale)` pair that
-        // `rewrite.rs` emits for every ZERO_ARRAY, so `make_sure_var_in_reg`
-        // hands them back as bare immediates (`return_constant` with no
-        // selected_reg).  Read them from there rather than re-resolving the
-        // op: a non-constant scale is an invariant break the emitter cannot
-        // encode, and failing loud declines the trace instead of silently
-        // scaling by one.
         let (Loc::Immed(scale_start) | Loc::ImmedFloat(scale_start)) = scale_start_loc else {
             panic!("ZERO_ARRAY scale_start must be an immediate, got {scale_start_loc:?}");
         };
@@ -11058,89 +11169,54 @@ impl<'a> Assembler386<'a> {
         };
         let (scale_start, scale_size) = (scale_start.value, scale_size.value);
 
-        // x86/regalloc.py consider_zero_array + assembler.py:2694-2725.  Materialize  allow-line-citation
-        // the effective address in r11, PyPy's reserved x86-64 scratch GPR.
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.regalloc_mov(base_loc, &Loc::Reg(crate::regloc::X86_64_SCRATCH_REG));
-        match start_loc {
-            Loc::Reg(start) => {
-                let shift = match scale_start {
-                    1 => 0,
-                    2 => 1,
-                    4 => 2,
-                    8 => 3,
-                    _ => panic!("ZERO_ARRAY invalid start scale {scale_start}"),
-                };
-                self.forget_if_scratch_written(scratch);
-                rx86::lea_ra(
-                    &mut self.mc,
-                    scratch,
-                    (i16::from(scratch), start.value, shift, base_size as i32),
-                );
-            }
-            Loc::Immed(start) | Loc::ImmedFloat(start) => {
-                let offset = base_size + start.value * scale_start;
-                self.forget_if_scratch_written(scratch);
-                rx86::add_ri(&mut self.mc, scratch, offset as i32);
-            }
-            Loc::Frame(start) => {
-                let offset = start.ebp_loc.value;
-                rx86::imul_rmi(
-                    &mut self.mc,
-                    rx86::EAX,
-                    (rx86::EBP, offset),
-                    scale_start as i32,
-                );
-                self.forget_if_scratch_written(scratch);
-                dynasm!(self.mc ; .arch x64 ; add Rq(scratch), rax);
-                self.forget_if_scratch_written(scratch);
-                rx86::add_ri(&mut self.mc, scratch, base_size as i32);
-            }
-            other => panic!("ZERO_ARRAY expected GPR/frame/immediate start, got {other:?}"),
-        }
-
         if let Loc::Immed(bytes) | Loc::ImmedFloat(bytes) = size_loc {
             let nbytes = bytes.value * scale_size;
             if (0..=16 * 8).contains(&nbytes) {
                 let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                let mut cleared = false;
-                let mut offset = 0;
-                while offset < nbytes {
-                    let remaining = nbytes - offset;
+                let mut null_reg_cleared = false;
+                let mut i = 0i64;
+                while i < nbytes {
+                    let addr =
+                        Self::addr_add_zero_array(base_loc, start_loc, scale_start, base_size + i);
+                    let remaining = nbytes - i;
                     let current = if remaining >= 16 {
-                        if !cleared {
+                        if !null_reg_cleared {
                             rx86::xorps_xx(&mut self.mc, xmm, xmm);
-                            cleared = true;
+                            null_reg_cleared = true;
                         }
-                        rx86::movups_mx(&mut self.mc, (scratch, offset as i32), xmm);
+                        self.emit_movups_addr(addr, xmm);
                         16
-                    } else if remaining >= 8 {
-                        rx86::mov_mi(&mut self.mc, (scratch, offset as i32), 0);
-                        8
+                    } else if remaining >= WORD as i64 {
+                        self.emit_zero_imm_addr(addr, WORD as i64);
+                        WORD as i64
                     } else if remaining >= 4 {
-                        rx86::mov32_mi(&mut self.mc, (scratch, offset as i32), 0);
+                        self.emit_zero_imm_addr(addr, 4);
                         4
                     } else if remaining >= 2 {
-                        rx86::mov16_mi(&mut self.mc, (scratch, offset as i32), 0);
+                        self.emit_zero_imm_addr(addr, 2);
                         2
                     } else {
-                        rx86::mov8_mi(&mut self.mc, (scratch, offset as i32), 0);
+                        self.emit_zero_imm_addr(addr, 1);
                         1
                     };
-                    offset += current;
+                    i += current;
                 }
                 return;
             }
         }
 
-        // Large/non-constant residual call.  Regalloc has already run the
-        // backend's ordinary non-collecting `before_call` preservation.
+        // `consider_zero_array`: LEA dest from `_scaled_addr`, then memset.
+        // Regalloc has already run the non-collecting `before_call`.
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        self.emit_lea_addr_add(
+            scratch,
+            Self::addr_add_zero_array(base_loc, start_loc, scale_start, base_size),
+        );
         let memset_ptr = libc::memset as *const () as i64;
         self.regalloc_mov(size_loc, &Loc::Reg(crate::regloc::EDX));
         if scale_size != 1 {
             rx86::imul_ri(&mut self.mc, rx86::EDX, scale_size as i32);
         }
-        // memset(dest, 0, byte_length)
         self.emit_abi_int_arg_from_reg(2, 2);
         self.emit_abi_int_arg_from_imm(1, 0);
         self.emit_abi_int_arg_from_reg(0, scratch);

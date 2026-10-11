@@ -2789,3 +2789,215 @@ fn call_malloc_nursery_varsize_frame_live_ref_across_recycled_header() {
         hdr.tid_and_flags
     );
 }
+
+const ZERO_ARRAY_BASEOFS: usize = 16;
+const ZERO_ARRAY_UNROLL_LIMIT: i64 = 16 * 8;
+
+fn zero_array_descr() -> DescrRef {
+    Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        ZERO_ARRAY_BASEOFS,
+        1,
+        1,
+        Type::Int,
+    ))
+}
+
+fn run_zero_array(nbytes: i64, start: i64, start_in_reg: bool) {
+    let prefix = ZERO_ARRAY_BASEOFS + start as usize;
+    let total = prefix + nbytes as usize + 8;
+    let mut buf = vec![0xAAu8; total];
+    for slot in buf.iter_mut().take(prefix + nbytes as usize).skip(prefix) {
+        *slot = 0xBB;
+    }
+    let ptr = buf.as_mut_ptr() as usize;
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let mut inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let mut zero_args = vec![
+        rb(OpRef::input_arg_ref(0)),
+        rb(OpRef::const_int(start)),
+        rb(OpRef::const_int(nbytes)),
+        rb(OpRef::const_int(1)),
+        rb(OpRef::const_int(1)),
+    ];
+    if start_in_reg {
+        inputargs.push(InputArg::from_type_rc(Type::Int, 1));
+        zero_args[1] = rb(OpRef::input_arg_int(1));
+    }
+    let zero = Op::new(OpCode::ZeroArray, &zero_args);
+    zero.pos().set(OpRef::void_op(1));
+    zero.setdescr(zero_array_descr());
+    let ops = vec![OpRc::new(zero), OpRc::new(finish(2))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile ZERO_ARRAY nbytes={nbytes}: {err:?}"));
+    let mut values = vec![Value::Ref(GcRef(ptr))];
+    if start_in_reg {
+        values.push(Value::Int(start));
+    }
+    let frame = backend.execute_token(&token, &values);
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "ZERO_ARRAY nbytes={nbytes} must finish"
+    );
+    assert!(
+        buf[..prefix].iter().all(|&b| b == 0xAA),
+        "bytes before the range must stay set, nbytes={nbytes}: {:02x?}",
+        &buf[..prefix]
+    );
+    assert!(
+        buf[prefix..prefix + nbytes as usize]
+            .iter()
+            .all(|&b| b == 0),
+        "ZERO_ARRAY must clear nbytes={nbytes}: {:02x?}",
+        &buf[prefix..prefix + nbytes as usize]
+    );
+    assert!(
+        buf[prefix + nbytes as usize..].iter().all(|&b| b == 0xAA),
+        "bytes after the range must stay set, nbytes={nbytes}: {:02x?}",
+        &buf[prefix + nbytes as usize..]
+    );
+}
+
+#[test]
+fn zero_array_unroll_and_memset_leave_neighbors() {
+    for nbytes in [0, 8, 16, 24, 136, ZERO_ARRAY_UNROLL_LIMIT + 16] {
+        run_zero_array(nbytes, 0, false);
+    }
+    run_zero_array(16, 4, true);
+}
+
+static CALL_ENTRY_RSP: AtomicUsize = AtomicUsize::new(0);
+
+fn assert_call_entry_aligned() {
+    let rsp = CALL_ENTRY_RSP.load(Ordering::SeqCst);
+    assert_ne!(rsp, 0, "callee must record entry rsp");
+    assert_eq!(
+        (rsp + 8) % 16,
+        0,
+        "rsp at entry minus the return address must be 16-byte aligned, rsp={rsp:#x}"
+    );
+}
+
+macro_rules! aligned_int_callee {
+    ($entry:ident, $real:ident $(, $arg:ident: $ty:ty = $expect:expr)*) => {
+        #[unsafe(naked)]
+        extern "C" fn $entry() {
+            naked_asm!(
+                "mov [rip + {seen}], rsp",
+                "jmp {real}",
+                seen = sym CALL_ENTRY_RSP,
+                real = sym $real,
+            );
+        }
+        extern "C" fn $real($($arg: $ty),*) -> i64 {
+            let ok = true $(&& $arg == $expect)*;
+            ok as i64
+        }
+    };
+}
+
+aligned_int_callee!(call_align_0, call_align_0_real);
+aligned_int_callee!(
+    call_align_4,
+    call_align_4_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4
+);
+aligned_int_callee!(
+    call_align_6,
+    call_align_6_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4,
+    a4: i64 = 5,
+    a5: i64 = 6
+);
+aligned_int_callee!(
+    call_align_7,
+    call_align_7_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4,
+    a4: i64 = 5,
+    a5: i64 = 6,
+    a6: i64 = 7
+);
+aligned_int_callee!(
+    call_align_9,
+    call_align_9_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4,
+    a4: i64 = 5,
+    a5: i64 = 6,
+    a6: i64 = 7,
+    a7: i64 = 8,
+    a8: i64 = 9
+);
+
+#[unsafe(naked)]
+extern "C" fn call_align_float() {
+    naked_asm!(
+        "mov [rip + {seen}], rsp",
+        "jmp {real}",
+        seen = sym CALL_ENTRY_RSP,
+        real = sym call_align_float_real,
+    );
+}
+
+extern "C" fn call_align_float_real(a: f64, b: f64) -> i64 {
+    (a == 1.5 && b == 2.25) as i64
+}
+
+fn run_aligned_call(func: i64, args: &[Operand], types: Vec<Type>) {
+    CALL_ENTRY_RSP.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_call(
+        OpCode::CallI,
+        func,
+        args,
+        types,
+        OpRef::int_op(1),
+        Type::Int,
+        true,
+        8,
+    );
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        1,
+        "callee must see every argument"
+    );
+    assert_call_entry_aligned();
+}
+
+fn int_args(n: i64) -> (Vec<Operand>, Vec<Type>) {
+    let args = (1..=n).map(|i| rb(OpRef::const_int(i))).collect();
+    (args, vec![Type::Int; n as usize])
+}
+
+#[test]
+fn call_subtract_esp_aligned_passes_args() {
+    let (args, types) = int_args(0);
+    run_aligned_call(call_align_0 as usize as i64, &args, types);
+    let (args, types) = int_args(4);
+    run_aligned_call(call_align_4 as usize as i64, &args, types);
+    let (args, types) = int_args(6);
+    run_aligned_call(call_align_6 as usize as i64, &args, types);
+    let (args, types) = int_args(7);
+    run_aligned_call(call_align_7 as usize as i64, &args, types);
+    let (args, types) = int_args(9);
+    run_aligned_call(call_align_9 as usize as i64, &args, types);
+    run_aligned_call(
+        call_align_float as usize as i64,
+        &[rb(OpRef::const_float(1.5)), rb(OpRef::const_float(2.25))],
+        vec![Type::Float, Type::Float],
+    );
+}
