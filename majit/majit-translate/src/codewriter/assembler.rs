@@ -3092,6 +3092,39 @@ impl AssemblerEncode for Assembler {
                     argcodes.push(kind_char);
                     state.code.push(reg);
                 }
+                // `flatten.py flatten_list` colors every arg. A Void
+                // operand of an int-bank binop is a typing gap
+                // (`rint.py` IntegerRepr); dropping it here would emit
+                // `int_sub/i>i`, which blackhole cannot dispatch.
+                if let OpKind::BinOp { op: binop_name, .. } = other
+                    && matches!(
+                        binop_name.as_str(),
+                        "add"
+                            | "sub"
+                            | "mul"
+                            | "and"
+                            | "or"
+                            | "xor"
+                            | "lshift"
+                            | "rshift"
+                            | "int_add"
+                            | "int_sub"
+                            | "int_mul"
+                            | "int_and"
+                            | "int_or"
+                            | "int_xor"
+                            | "int_lshift"
+                            | "int_rshift"
+                    )
+                    && operand_kinds.len() != 2
+                {
+                    panic!(
+                        "BinOp {binop_name} in graph {:?} encoded {} live operands; \
+                         flatten.py flatten_list colors every arg",
+                        self.current_graph_name,
+                        operand_kinds.len()
+                    );
+                }
                 let opname = op_kind_to_opname_with_kinds(other, &operand_kinds);
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);

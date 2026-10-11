@@ -389,14 +389,13 @@ pub(crate) fn dual_gate_check_with_registry(
     }
     // `follow_link` records `links_followed` only for an edge the
     // annotator walks (`annrpython.py`). Phase B still
-    // `setconcretetype`s an unfollowed return to `Void` after
+    // `setconcretetype`s an unfollowed Variable to `Void` after
     // `force_return_var_annotation` seeds `s_ImpossibleValue`.
-    // Publishing that twin would replace the legacy walker's kind, and
-    // `func_result_kind` would then disagree with `history.getkind` of
-    // the live CFG edge. A followed return typed `Void` still diverges
-    // above and skips.
-    keep_legacy_return_when_unfollowed_void(
-        legacy_graph,
+    // Publishing that twin would replace the legacy walker's kind
+    // (`func_result_kind` of a return, `getcalldescr` NON_VOID_ARGS of
+    // a residual call). A followed Variable typed `Void` still
+    // diverges above and skips.
+    keep_legacy_kind_when_unfollowed_void(
         &mut real_value_to_var,
         &mut real_constants,
         excluded_legacy.as_ref(),
@@ -2467,6 +2466,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // between-passes seeding as the stdlib table; jtransform drops the
     // residual (`is_no_effect_external`) instead of emitting empty asm.
     register_no_effect_externals(registry);
+    register_runtime_residual_externals(registry);
     // Opaque `f64` methods the front remaps to `ll_math::math_*` C
     // llexternals (`f64_method_llexternal`).  The `std::f64::<Impl>::floor`
     // rows in FOREIGN_STDLIB_EXTERNALS no longer match those callsites;
@@ -3359,6 +3359,11 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         LowLevelType::Float,
     ),
     (
+        &["std", "f64", "<Impl>", "fract"],
+        &["self"],
+        LowLevelType::Float,
+    ),
+    (
         &["std", "f64", "<Impl>", "ceil"],
         &["self"],
         LowLevelType::Float,
@@ -3389,6 +3394,14 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &[],
         LowLevelType::Float,
     ),
+    // `Vec::set_len(&mut self, new_len)` is a foreign leaf (Charon does
+    // not extract `alloc`). The residual mutates length in place and
+    // returns `()`.
+    (
+        &["vec", "Vec", "set_len"],
+        &["self", "new_len"],
+        LowLevelType::Void,
+    ),
 ];
 
 /// Zero-arg Void externals with no effects and no graph.
@@ -3406,6 +3419,47 @@ const NO_EFFECT_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[(
     &[],
     LowLevelType::Void,
 )];
+
+/// Residual runtime helpers the interpreter spells in source. Analog of
+/// `extfunc.py register_external` / `@jit.dont_look_inside`: the annotator
+/// sees an opaque stub so the caller graph can finish, and the codewriter
+/// residualizes the real call. `set_gc_interp` arms a breaker bit;
+/// `slot_from_cached` is the shadow-stack slot handle.
+const RUNTIME_RESIDUAL_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
+    (
+        &["majit_ir", "eval_breaker_word", "set_gc_interp"],
+        &[],
+        LowLevelType::Void,
+    ),
+    (
+        &["majit_gc", "shadow_stack", "slot_from_cached"],
+        &["raw"],
+        LowLevelType::Address,
+    ),
+    (
+        &["majit_gc", "shadow_stack", "cache_root_stack_slot"],
+        &["cached"],
+        LowLevelType::Void,
+    ),
+    (
+        &["majit_gc", "shadow_stack", "shadow_stack_slot"],
+        &[],
+        LowLevelType::Address,
+    ),
+    // `GcAllocOutcome::allocated_or_abort` returns `Option<*mut u8>`.
+    // The frontend may spell the enum type as the sole path prefix.
+    (
+        &["GcAllocOutcome", "allocated_or_abort"],
+        &["self", "payload_size"],
+        LowLevelType::Address,
+    ),
+    // `OnceLock<fn(...)>` for the `sys.exc_info` JIT-direct helper.
+    (
+        &["pyre_interpreter", "function", "SYS_EXC_INFO_DIRECT_FN"],
+        &[],
+        LowLevelType::Address,
+    ),
+];
 
 /// True when `segments` is a [`NO_EFFECT_EXTERNALS`] path.
 ///
@@ -3427,6 +3481,22 @@ pub(crate) fn register_no_effect_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in NO_EFFECT_EXTERNALS {
         register_opaque_external(registry, segments, argnames, return_lltype.clone());
     }
+}
+
+/// Register the [`RUNTIME_RESIDUAL_EXTERNALS`] table into `registry`.
+pub(crate) fn register_runtime_residual_externals(registry: &CallRegistry) {
+    for (segments, argnames, return_lltype) in RUNTIME_RESIDUAL_EXTERNALS {
+        register_opaque_external(registry, segments, argnames, return_lltype.clone());
+    }
+    // `sys_exc_info_code` loads the process-global BuiltinCode pointer
+    // (`function.py` `space._code_of_sys_exc_info`). Residual; the
+    // result is a `PyObjectRef`.
+    register_opaque_external(
+        registry,
+        &["pyre_interpreter", "function", "sys_exc_info_code"],
+        &[],
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
 }
 
 /// Register one opaque external through the annotator-only stub carrier.
@@ -3490,6 +3560,16 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
         register_opaque_external(registry, segments, argnames, return_lltype.clone());
     }
+    // `<[T]>::to_vec` leftover the pair-slice rewrite did not retarget
+    // (`front::mir` `is_slice_to_vec` only fires on an enabled pair
+    // receiver). Analog of `extfunc.py register_external` returning a
+    // list: the residual is an owned Vec, a GC pointer.
+    register_opaque_external(
+        registry,
+        &["alloc", "slice", "<Impl>", "to_vec"],
+        &["self"],
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
 }
 
 /// Register every `f64_method_llexternal` name as `["ll_math", name]`.
@@ -4285,6 +4365,19 @@ fn check_access_directly_sanity(
             continue;
         }
         let desc = desc.borrow();
+        // `default_specialize` writes `(AccessDirect, key)` onto a callee
+        // the annotator reached with flagged args. That callee is a JIT
+        // graph even when `find_all_graphs` did not list it as a candidate
+        // (`warmspot.py collect_called_graphs` is the annotator's reach
+        // set, not only the codewriter's).
+        if desc
+            .cache
+            .borrow()
+            .keys()
+            .any(crate::annotator::description::GraphCacheKey::is_access_direct)
+        {
+            continue;
+        }
         for graph in desc.cache.borrow().values() {
             assert!(
                 !graph.access_directly.get(),
@@ -4348,6 +4441,14 @@ fn run_two_phase_prepass_inner(
                         constant_hlvalues,
                     },
                 );
+                // Independent AccessDirect subjects never go through
+                // `pycall` → `default_specialize`. Record the
+                // `(AccessDirect, None)` PyGraph on the origin FunctionDesc
+                // so dual_gate finds the annotator's cache key
+                // (`specialize.py cachedgraph`).
+                if crate::codewriter::call::is_access_directly_path(path) {
+                    record_access_direct_pygraph_for_path(call_registry, path);
+                }
             }
             ref other @ (Ok(Err(_)) | Err(_)) => {
                 // The graph was a prepass subject: record the annotate-half
@@ -5121,6 +5222,22 @@ fn function_desc_has_access_direct_pygraph(call_registry: &CallRegistry, diag_ke
         .any(crate::annotator::description::GraphCacheKey::is_access_direct)
 }
 
+/// `FunctionDesc.cachedgraph` the `(AccessDirect, None)` copy for an
+/// independent AccessDirect two-phase subject.
+fn record_access_direct_pygraph_for_path(
+    call_registry: &CallRegistry,
+    path: &crate::parse::CallPath,
+) {
+    let origin =
+        crate::codewriter::call::access_directly_origin_path(path).unwrap_or_else(|| path.clone());
+    let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
+        origin.segments.iter().cloned(),
+    )) else {
+        return;
+    };
+    let _ = entry.function_desc.borrow().record_access_directly_graph();
+}
+
 /// Two-phase publish: derive the [`DualGateOutcome`] for `legacy` from the
 /// prepass cache instead of re-running the real path. Mirrors
 /// [`dual_gate_check_with_registry`]'s legacy-baseline comparison (the
@@ -5257,8 +5374,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
             "two-phase compared set empty".to_string(),
         ));
     }
-    keep_legacy_return_when_unfollowed_void(
-        legacy,
+    keep_legacy_kind_when_unfollowed_void(
         &mut value_to_var,
         &mut constants,
         excluded_legacy.as_ref(),
@@ -5269,15 +5385,22 @@ pub(crate) fn dual_gate_outcome_from_cache(
     })
 }
 
-/// Drop an unfollowed return whose real concretetype is `Void` when the
+/// Drop an unfollowed Variable whose real concretetype is `Void` when the
 /// legacy cell already has a kind. See the call in
 /// [`dual_gate_check_with_registry`].
+///
+/// Phase B `setconcretetype`s `Void` on an unfollowed cell after
+/// `s_ImpossibleValue` (`force_return_var_annotation`). The AccessDirect
+/// copy is a fresh `copygraph` (`cachedgraph` copies before rtyping);
+/// `emit_one_word_guard_release` already stamped the residual ABI word
+/// Signed, and the skip-arm `IntegerRepr` analog keeps it. Publishing the
+/// Void twin would make `getcalldescr` drop that actual (`call.py`
+/// NON_VOID_ARGS) while `FUNC.ARGS` still has Int.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-fn keep_legacy_return_when_unfollowed_void(
-    legacy: &LegacyGraph,
+fn keep_legacy_kind_when_unfollowed_void(
     value_to_var: &mut LegacyToTyped,
     constants: &mut HashMap<Variable, LowLevelType>,
     excluded_legacy: Option<&HashSet<Variable>>,
@@ -5285,32 +5408,29 @@ fn keep_legacy_return_when_unfollowed_void(
     let Some(excluded) = excluded_legacy else {
         return;
     };
-    let Some(ret) = legacy.block(legacy.returnblock).inputargs.first().cloned() else {
-        return;
-    };
-    if !excluded.contains(&ret) {
-        return;
+    let drop_keys: Vec<Variable> = value_to_var
+        .iter()
+        .filter_map(|(legacy, typed)| {
+            if !excluded.contains(legacy) {
+                return None;
+            }
+            let ll = typed.concretetype()?;
+            let kind = lowleveltype_to_concrete(&ll).ok()?;
+            if kind != crate::model::ConcreteType::Void {
+                return None;
+            }
+            match LegacyGraph::concretetype_of(legacy) {
+                crate::model::ConcreteType::Void | crate::model::ConcreteType::Unknown => None,
+                crate::model::ConcreteType::Signed
+                | crate::model::ConcreteType::GcRef
+                | crate::model::ConcreteType::Float => Some(legacy.clone()),
+            }
+        })
+        .collect();
+    for key in drop_keys {
+        value_to_var.remove(&key);
+        constants.remove(&key);
     }
-    let Some(typed) = value_to_var.get(&ret) else {
-        return;
-    };
-    let Some(ll) = typed.concretetype() else {
-        return;
-    };
-    let Ok(kind) = lowleveltype_to_concrete(&ll) else {
-        return;
-    };
-    if kind != crate::model::ConcreteType::Void {
-        return;
-    }
-    match LegacyGraph::concretetype_of(&ret) {
-        crate::model::ConcreteType::Void | crate::model::ConcreteType::Unknown => return,
-        crate::model::ConcreteType::Signed
-        | crate::model::ConcreteType::GcRef
-        | crate::model::ConcreteType::Float => {}
-    }
-    value_to_var.remove(&ret);
-    constants.remove(&ret);
 }
 
 #[cfg(test)]
@@ -9683,6 +9803,37 @@ mod tests {
     }
 
     #[test]
+    fn runtime_residual_externals_register_in_the_call_registry() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_runtime_residual_externals(&registry);
+        for segments in [
+            ["majit_ir", "eval_breaker_word", "set_gc_interp"].as_slice(),
+            ["majit_gc", "shadow_stack", "slot_from_cached"].as_slice(),
+            ["majit_gc", "shadow_stack", "cache_root_stack_slot"].as_slice(),
+            ["majit_gc", "shadow_stack", "shadow_stack_slot"].as_slice(),
+        ] {
+            assert!(
+                registry
+                    .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                    .is_some(),
+                "runtime residual {segments:?} must register"
+            );
+        }
+        assert!(
+            !is_no_effect_external(
+                &["majit_ir", "eval_breaker_word", "set_gc_interp"]
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>()
+            ),
+            "set_gc_interp arms a breaker bit; jtransform must residualize it"
+        );
+    }
+
+    #[test]
     fn foreign_stdlib_externals_registers_cell_get_and_atomic_scalar_rows() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::translator::rtyper::call_registry::CallRegistry;
@@ -10509,12 +10660,7 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(ret.clone(), LowLevelType::Void);
         let excluded = HashSet::from([ret.clone()]);
-        keep_legacy_return_when_unfollowed_void(
-            &legacy,
-            &mut value_to_var,
-            &mut constants,
-            Some(&excluded),
-        );
+        keep_legacy_kind_when_unfollowed_void(&mut value_to_var, &mut constants, Some(&excluded));
         assert!(
             !value_to_var.contains_key(&ret),
             "unfollowed void twin stays out of the publish map"
@@ -10533,8 +10679,7 @@ mod tests {
         let mut followed_map = LegacyToTyped::new();
         followed_map.insert(ret.clone(), typed);
         let mut followed_constants = HashMap::new();
-        keep_legacy_return_when_unfollowed_void(
-            &legacy,
+        keep_legacy_kind_when_unfollowed_void(
             &mut followed_map,
             &mut followed_constants,
             Some(&HashSet::new()),
@@ -10551,15 +10696,43 @@ mod tests {
         let mut unscoped = LegacyToTyped::new();
         unscoped.insert(ret.clone(), typed);
         let mut unscoped_constants = HashMap::new();
-        keep_legacy_return_when_unfollowed_void(
-            &legacy,
-            &mut unscoped,
-            &mut unscoped_constants,
-            None,
-        );
+        keep_legacy_kind_when_unfollowed_void(&mut unscoped, &mut unscoped_constants, None);
         assert!(
             unscoped.contains_key(&ret),
             "no links_followed record leaves the twin in place"
+        );
+    }
+
+    /// Residual-call actual (`emit_one_word_guard_release` Signed stamp)
+    /// whose AccessDirect copy was unfollowed: Phase B Void must not
+    /// publish over the skip-arm kind, or `getcalldescr` drops the actual.
+    #[test]
+    fn unfollowed_void_call_arg_keeps_the_legacy_kind() {
+        use crate::model::ConcreteType;
+
+        let arg = Variable::new();
+        arg.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            ConcreteType::Signed,
+        ));
+        let typed = Variable::new();
+        typed.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            ConcreteType::Void,
+        ));
+        let mut value_to_var = LegacyToTyped::new();
+        value_to_var.insert(arg.clone(), typed);
+        let mut constants = HashMap::new();
+        constants.insert(arg.clone(), LowLevelType::Void);
+        let excluded = HashSet::from([arg.clone()]);
+        keep_legacy_kind_when_unfollowed_void(&mut value_to_var, &mut constants, Some(&excluded));
+        assert!(
+            !value_to_var.contains_key(&arg),
+            "unfollowed void call-arg twin stays out of the publish map"
+        );
+        assert!(!constants.contains_key(&arg));
+        assert_eq!(
+            LegacyGraph::concretetype_of(&arg),
+            ConcreteType::Signed,
+            "legacy kind is the residual ABI word getcalldescr reads"
         );
     }
 }

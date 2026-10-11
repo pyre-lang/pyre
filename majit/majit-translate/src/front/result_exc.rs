@@ -7466,7 +7466,7 @@ fn peel_recast_to_source(graph: &FunctionGraph, block: usize, mut arg: LinkArg) 
     }
 }
 
-fn is_gc_root_reload(kind: &OpKind) -> bool {
+pub(crate) fn is_gc_root_reload(kind: &OpKind) -> bool {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments, .. },
         ..
@@ -7474,10 +7474,14 @@ fn is_gc_root_reload(kind: &OpKind) -> bool {
     else {
         return false;
     };
+    // `reload_top_root_at` is the same GC-erasure identity as
+    // `reload_top_root`: the gctransformer inserts these reloads after
+    // the codewriter (`rpython/memory/gctransform/shadowstack.py`,
+    // `framework.py push_roots/pop_roots`). pyre writes them in source.
     segments.iter().any(|segment| segment == "gc_roots")
         && matches!(
             segments.last().map(String::as_str),
-            Some("get" | "shadow_stack_get" | "reload_top_root")
+            Some("get" | "shadow_stack_get" | "reload_top_root" | "reload_top_root_at")
         )
 }
 

@@ -1823,6 +1823,20 @@ impl FunctionDesc {
         Ok(graph)
     }
 
+    /// Record the `(AccessDirect, None)` graph `default_specialize` would
+    /// cache after seeing a flagged virtualizable argument.
+    ///
+    /// Two-phase subjects for `{name}__AccessDirect_None` are annotated as
+    /// independent roots, so no pycall drives `default_specialize`. The
+    /// lifted `GraphCacheKey::None` template is cloned under the AccessDirect
+    /// key the same way `cachedgraph` specialises a non-default key.
+    pub(crate) fn record_access_directly_graph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
+        let key = GraphCacheKey::Tuple(vec![GraphCacheKey::AccessDirect, GraphCacheKey::None]);
+        let graph = self.cachedgraph(key, None, None)?;
+        graph.access_directly.set(true);
+        Ok(graph)
+    }
+
     pub(crate) fn specialize_argvalue(
         &self,
         args_s: &[Option<SomeValue>],
@@ -3655,6 +3669,31 @@ mod tests {
             "isconstant__call_location_g1_b2_i3"
         );
         assert_eq!(fd.cache.borrow().len(), 3);
+    }
+
+    #[test]
+    fn record_access_directly_graph_inserts_the_access_direct_cache_key() {
+        let fd = FunctionDesc::new(bk(), None, "pop", int_sig(&["self"]), None, None);
+        let template = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
+        fd.cache
+            .borrow_mut()
+            .insert(GraphCacheKey::None, template.clone());
+
+        let graph = fd
+            .record_access_directly_graph()
+            .expect("AccessDirect cache clone");
+        assert!(graph.access_directly.get());
+        assert!(!Rc::ptr_eq(&graph, &template));
+        assert!(
+            fd.cache
+                .borrow()
+                .keys()
+                .any(GraphCacheKey::is_access_direct)
+        );
+        let again = fd
+            .record_access_directly_graph()
+            .expect("AccessDirect cache hit");
+        assert!(Rc::ptr_eq(&graph, &again));
     }
 
     #[test]

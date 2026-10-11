@@ -1709,6 +1709,15 @@ pub fn remember_frame_locals_array(array: *mut FixedObjectArray) {
     }
 }
 
+/// Same barrier as [`remember_frame_locals_array`], taking the frame so a
+/// looked-inside caller (`function.py funccall_valuestack`, `_flat_pycall`)
+/// does not pass `locals_cells_stack_w` (`jtransform.py check_no_vable_array`).
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn remember_frame_locals(frame: &PyFrame) {
+    remember_frame_locals_array(frame.locals_cells_stack_w);
+}
+
 /// Deallocate a `FixedObjectArray` allocated with
 /// [`alloc_fixed_array_with_header`].
 /// # Safety
@@ -4883,11 +4892,9 @@ impl PyFrame {
     }
 
     /// PyPy-compatible pop-values helper.
-    /// `pyframe.py popvalues` is `@jit.unroll_safe`. The return is a
-    /// `Vec` (two residual words); until that ABI exists, looking
-    /// inside residualizes a one-slot pointer and the length is
-    /// garbage. Keep the loop residual.
+    /// `pyframe.py popvalues` is `@jit.unroll_safe`.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn popvalues(&mut self, n: usize) -> Vec<PyObjectRef> {
         let mut out = vec![PY_NULL; n];
         let mut idx = n;
@@ -4905,8 +4912,9 @@ impl PyFrame {
         self.popvalues(n)
     }
 
-    /// pyframe.py peekvalues. Same residual-ABI constraint as `popvalues`.
+    /// pyframe.py peekvalues. `@jit.unroll_safe`.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn peekvalues(&self, n: usize) -> Vec<PyObjectRef> {
         let base = self.valuestackdepth - n;
         // Reads cover `[base, valuestackdepth)`; the highest index is

@@ -867,6 +867,8 @@ pub fn register_depth_bump(f: DepthBumpFn) {
 /// overflow) and on missing required positional / keyword-only args after
 /// defaults application, mirroring `argument.py` `ArgErrTooMany` and
 /// `argument.py` `ArgErrMissing`.
+/// `argument.py _match_signature` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 pub fn fill_user_function_args(
     callable: PyObjectRef,
     code_ref: &crate::CodeObject,
@@ -1759,51 +1761,23 @@ fn call_function_ex_impl(
     let kwargs_or_null = || pyre_object::gc_roots::shadow_stack_get(callable_slot + 1);
     let self_or_null = || pyre_object::gc_roots::shadow_stack_get(callable_slot + 2);
     let starargs = || pyre_object::gc_roots::shadow_stack_get(callable_slot + 3);
-    let mut args: Vec<PyObjectRef> = unsafe {
-        // argument.py reaches `space.fixedview`, whose fast paths
-        // (`objspace.py:519-527`) are a tuple whose `__iter__` is still
-        // `tuple.__iter__` and an exact list.  A subtype that replaced
-        // `__iter__` falls through to the generic path so the override runs.
-        if pyre_object::is_tuple(starargs())
-            && crate::baseobjspace::builtin_iter_replacement(starargs(), &pyre_object::TUPLE_TYPE)
-                .is_none()
-        {
-            let n = pyre_object::w_tuple_len(starargs());
-            (0..n as i64)
-                .filter_map(|i| pyre_object::w_tuple_getitem(starargs(), i))
-                .collect()
-        } else if pyre_object::is_exact_list(starargs()) {
-            let n = pyre_object::w_list_len(starargs());
-            (0..n as i64)
-                .filter_map(|i| pyre_object::w_list_getitem(starargs(), i))
-                .collect()
-        } else {
-            // argument.py `_combine_starargs_wrapped` — a non-tuple/list
-            // stararg unpacks through `fixedview`, and a non-iterable surfaces
-            // "argument after * must be an iterable, not %T" (not the bare
-            // `iter()` TypeError).
-            let mut unpacked: Vec<PyObjectRef> = Vec::new();
-            crate::argument::combine_starargs_wrapped(&mut unpacked, starargs(), callable())?;
-            unpacked
-        }
-    };
+    // `pyopcode.py CALL_FUNCTION_EX` is loop-free: `argument_factory` unpacks
+    // `*` through `_combine_starargs_wrapped` / `space.fixedview`.  Keep this
+    // function in that shape so its AccessDirect copy stays loop-free while
+    // still carrying `profile_frame`.  A non-null `self_or_null` is the
+    // pre-callable stack slot and prepends as arg0 before the stararg items.
+    let mut args: Vec<PyObjectRef> = Vec::new();
     if !self_or_null().is_null() {
-        args.insert(0, self_or_null());
+        args.push(self_or_null());
     }
+    crate::argument::combine_starargs_wrapped(&mut args, starargs(), callable())?;
 
     // The unpacked positional set is a native `Vec` no root walker updates and
-    // the `**` merge below runs Python too, so publish it and rebuild the
-    // slice for the dispatch.
-    let args_base = pyre_object::gc_roots::shadow_stack_len();
-    for &arg in &args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
-    let nargs = args.len();
-    let args = || -> Vec<PyObjectRef> {
-        (0..nargs)
-            .map(|index| pyre_object::gc_roots::shadow_stack_get(args_base + index))
-            .collect()
-    };
+    // the `**` merge below runs Python too, so publish it and reload in place
+    // for the dispatch.  `pin_roots` / `shadow_stack_copy_range_into_vec` are
+    // the GC-transform helpers; their loops do not sit in this graph.
+    let args_base = pyre_object::gc_roots::pin_roots(&args);
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(args_base, &mut args);
 
     // CPython 3.14's AST tp_init is the one builtin constructor that receives
     // its raw kwargs dict before enforcing string keys.  Preserve that narrow
@@ -1812,7 +1786,7 @@ fn call_function_ex_impl(
     if !kwargs_or_null().is_null()
         && let Some(result) = crate::module::_ast::moduledef::call_with_raw_kwargs(
             callable(),
-            &args(),
+            &args,
             kwargs_or_null(),
         )
     {
@@ -1838,10 +1812,11 @@ fn call_function_ex_impl(
             // (`_combine_starstarargs_wrapped`). The impl applies `text_w`
             // where a name is compared and `setitem`s the object into
             // `**kwargs` (`_collect_keyword_args`).
+            pyre_object::gc_roots::shadow_stack_copy_range_into_vec(args_base, &mut args);
             return call_with_kwargs_in_ctx_impl(
                 execution_context,
                 callable(),
-                &args(),
+                &args,
                 &keyword_names_w,
                 &keywords_w,
                 true,
@@ -1850,10 +1825,11 @@ fn call_function_ex_impl(
         }
     }
 
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(args_base, &mut args);
     call_callable_with_mode(
         execution_context,
         callable(),
-        &args(),
+        &args,
         CallMode::Jit,
         profile_anchor.live(),
     )
@@ -1909,6 +1885,8 @@ pub fn call_kw_in_ctx(
 /// [`call_kw_in_ctx`] with the caller frame `pyopcode.py CALL_FUNCTION_KW`
 /// and `callmethod.py CALL_METHOD_KW` carry, or null for the frameless
 /// `space.call_args`.  See [`c_profile_frame`] for what the frame decides.
+/// `pyopcode.py CALL_FUNCTION_KW` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 fn call_kw_in_ctx_impl(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,

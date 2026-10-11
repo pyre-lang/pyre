@@ -272,7 +272,8 @@ pub(crate) fn rewrite_jit_merge_point(
 /// and does not move the original `OpKind::Input` ops, so the
 /// annotator has neither an Input op nor a `Variable.annotation`.
 /// Emit one Input per new inputarg, typed from the pre-split producer
-/// and, for reds, the driver's red-type name.
+/// and, for reds, the driver's red-type name. Flagged merge-point reds
+/// are bound next by `inherit_split_portal_access_directly`.
 pub(crate) fn seed_split_portal_input_ops(
     graph: &mut FunctionGraph,
     start: BlockId,

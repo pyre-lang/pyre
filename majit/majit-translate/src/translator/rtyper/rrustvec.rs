@@ -117,6 +117,11 @@ impl RustVecRepr {
         self.kind
     }
 
+    /// Item repr `rlist.py ListRepr.item_repr` carries for `hop.inputargs`.
+    pub fn item_repr(&self) -> &Arc<dyn Repr> {
+        &self.item_repr
+    }
+
     /// The helper this repr lowers `op` to.
     pub fn helper_path(&self, op: VecOp) -> &'static str {
         vec_helper_path(op, self.kind)
@@ -411,12 +416,19 @@ pub fn rtype_newrustvec(hop: &HighLevelOp) -> RTypeResult {
         .ok_or_else(|| TyperError::message("rtype_newrustvec: result is not a RustVec header"))?;
     hop.exception_cannot_occur()?;
     // `newrustvec(kind, count, item)` — `rlist.py ll_alloc_and_set`.
+    // `hop.inputargs(Signed, r_list.item_repr)`: a GC item has no primitive
+    // repr (`rtyper.py getprimitiverepr`), so the fill must convert through
+    // the vec's item repr the way `rtype_alloc_and_set` does.
     if hop.nb_args() > 2 {
         let item_ll = rust_vec_item_lltype(&lltype)
             .cloned()
             .ok_or_else(|| TyperError::message("rtype_newrustvec: alloc_and_set item lltype"))?;
+        let any_r: &dyn std::any::Any = r_result.as_ref();
+        let rust_vec = any_r.downcast_ref::<RustVecRepr>().ok_or_else(|| {
+            TyperError::message("rtype_newrustvec: r_result is not a RustVecRepr")
+        })?;
         let v_count = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 1)?;
-        let v_item = hop.inputarg(ConvertedTo::LowLevelType(&item_ll), 2)?;
+        let v_item = hop.inputarg(ConvertedTo::Repr(rust_vec.item_repr().as_ref()), 2)?;
         return genop_helper_call(
             hop,
             vec_helper_path(VecOp::AllocAndSet, kind),

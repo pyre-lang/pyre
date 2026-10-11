@@ -1496,9 +1496,14 @@ fn real_main() {
             static_addrs,
             Some(&mut jitpolicy),
         );
+        eprintln!(
+            "[pyre-jit-trace build.rs] analyze done: {} jitcodes",
+            pipeline.jitcodes.len()
+        );
 
         // Generate tracing code from the canonical graph-first analysis result.
         let code = majit_translate::generate_trace_code_from_pipeline(&pipeline);
+        eprintln!("[pyre-jit-trace build.rs] generate_trace_code done");
 
         std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
@@ -1510,12 +1515,18 @@ fn real_main() {
         // boundary. Keep the live pipeline untouched: trace-code generation
         // above consumes its Arc identities, while these clones are solely the
         // translated constants written below.
+        eprintln!("[pyre-jit-trace build.rs] freeze clone start");
         let mut frozen_descrs = pipeline.descrs.clone();
         let mut frozen_jitcodes: Vec<std::sync::Arc<majit_translate::jitcode::JitCode>> = pipeline
             .jitcodes
             .iter()
             .map(|jitcode| std::sync::Arc::new((**jitcode).clone()))
             .collect();
+        eprintln!(
+            "[pyre-jit-trace build.rs] freeze clone done: {} descrs {} jitcodes",
+            frozen_descrs.len(),
+            frozen_jitcodes.len()
+        );
         let mut frozen_mints = pipeline.ei_descr_mints.clone();
         let mut call_descrs: Vec<&mut majit_translate::jitcode::BhCallDescr> = Vec::new();
         for descr in &mut frozen_descrs {
@@ -1577,6 +1588,7 @@ fn real_main() {
             );
             majit_ir::effectinfo::compute_frozen_bitstrings(&mut effect_infos)
         };
+        eprintln!("[pyre-jit-trace build.rs] compute_frozen_bitstrings done");
         let serialized_effect_info_ids: Vec<u32> = frozen_layout
             .effect_info_ids
             .iter()

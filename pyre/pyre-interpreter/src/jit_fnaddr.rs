@@ -1691,6 +1691,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::reload_top_root",
         pyre_object::gc_roots::reload_top_root_jit_abi,
     );
+    cpa2(
+        &mut entries,
+        "pyre_object::gc_roots::reload_top_root_at",
+        "pyre_object::reload_top_root_at",
+        pyre_object::gc_roots::reload_top_root_at_jit_abi,
+    );
     // `&[PyObjectRef]` arrives as one length-prefixed array word.
     cpa1(
         &mut entries,

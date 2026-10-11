@@ -7842,7 +7842,14 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
 
     let mut varmap: HashMap<Variable, Variable> = HashMap::new();
     let mut intern = |var: &Variable| {
-        varmap.entry(var.clone()).or_insert_with(|| var.copy());
+        varmap.entry(var.clone()).or_insert_with(|| {
+            let copied = var.copy();
+            // `copygraph` copyvar (`model.py`): `Variable(v)` then
+            // `concretetype` only. `Variable.copy` also clones
+            // `annotation`; a lifted clone must not inherit it.
+            *copied.annotation.borrow_mut() = None;
+            copied
+        });
     };
     for block in &graph.blocks {
         for var in &block.inputargs {
