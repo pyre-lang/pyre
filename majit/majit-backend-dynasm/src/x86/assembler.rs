@@ -8927,14 +8927,15 @@ impl<'a> Assembler386<'a> {
                     TLFIELD_RPY_LASTERROR_OFS
                 } as i32;
                 // `save_result_value`: keep rax/xmm0 above a fresh shadow
-                // area. rsp is 8 mod 16 here (one push below the body rsp),
-                // so 56 realigns it. r12 already names the thread-local
-                // block (`get_tlofs_reg`), so the `sub rsp` does not change
-                // the address.
+                // area. rsp is the body rsp here (`restore_stack_pointer`
+                // ran), so 48 = 32-byte shadow + two save slots keeps it
+                // 16-byte aligned for the call. r12 already names the
+                // thread-local block (`get_tlofs_reg`), so the `sub rsp`
+                // does not change the address.
                 self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
-                debug_assert_eq!(esp_ofs % 16, 8);
+                debug_assert_eq!(esp_ofs % 16, 0);
                 dynasm!(self.mc ; .arch x64
-                ; sub rsp, 56
+                ; sub rsp, 48
                 );
                 dynasm!(self.mc ; .arch x64
                 ; mov [rsp + 32], rax
@@ -8955,7 +8956,7 @@ impl<'a> Assembler386<'a> {
                 ; movsd xmm0, [rsp + 40]
                 );
                 dynasm!(self.mc ; .arch x64
-                    ; add rsp, 56
+                    ; add rsp, 48
                 );
             }
         }
@@ -11136,28 +11137,66 @@ impl<'a> Assembler386<'a> {
 
     /// `addr_add(base, start, offset, scale)` for ZERO_ARRAY. Immediate
     /// start folds `start * itemsize` into the displacement (`_scaled_addr`);
-    /// a register start uses SIB scale `get_scale(itemsize)`.
-    fn addr_add_zero_array(base: &Loc, start: &Loc, itemsize: i64, offset: i64) -> AddrAdd {
-        let Loc::Reg(b) = base else {
-            panic!("ZERO_ARRAY base must be a register, got {base:?}");
-        };
+    /// a register start uses SIB scale `get_scale(itemsize)`. An immediate
+    /// base is an absolute address (`AddressLoc` with an `ImmedLoc` base),
+    /// and a displacement outside the signed 32-bit range goes through the
+    /// scratch register (`_fix_static_offset_64_m`).
+    fn addr_add_zero_array(
+        &mut self,
+        base: &Loc,
+        start: &Loc,
+        itemsize: i64,
+        offset: i64,
+    ) -> AddrAdd {
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         match start {
             Loc::Reg(s) => {
                 if !crate::regalloc::valid_addressing_size(itemsize as usize) {
                     panic!("ZERO_ARRAY start scale must be 1, 2, 4, or 8, got {itemsize}");
                 }
                 let shift = crate::regalloc::get_scale(itemsize as usize);
+                let (base_reg, ofs) = match base {
+                    Loc::Reg(b) => (b.value, offset),
+                    Loc::Immed(b) | Loc::ImmedFloat(b) => {
+                        self.load_scratch(b.value.wrapping_add(offset));
+                        (scratch, 0)
+                    }
+                    other => panic!("ZERO_ARRAY base must be a GPR or immediate, got {other:?}"),
+                };
+                let ofs = i32::try_from(ofs)
+                    .unwrap_or_else(|_| panic!("ZERO_ARRAY base offset {ofs} out of range"));
                 AddrAdd::Sib {
-                    base: i16::from(b.value),
+                    base: i16::from(base_reg),
                     index: s.value,
                     scale: shift,
-                    ofs: offset as i32,
+                    ofs,
                 }
             }
-            Loc::Immed(s) | Loc::ImmedFloat(s) => AddrAdd::Mem {
-                base: b.value,
-                ofs: offset.wrapping_add(s.value.wrapping_mul(itemsize)) as i32,
-            },
+            Loc::Immed(s) | Loc::ImmedFloat(s) => {
+                let ofs = offset.wrapping_add(s.value.wrapping_mul(itemsize));
+                match base {
+                    Loc::Reg(b) => match i32::try_from(ofs) {
+                        Ok(ofs) => AddrAdd::Mem { base: b.value, ofs },
+                        Err(_) => {
+                            self.load_scratch(ofs);
+                            AddrAdd::Sib {
+                                base: i16::from(b.value),
+                                index: scratch,
+                                scale: 0,
+                                ofs: 0,
+                            }
+                        }
+                    },
+                    Loc::Immed(b) | Loc::ImmedFloat(b) => {
+                        self.load_scratch(b.value.wrapping_add(ofs));
+                        AddrAdd::Mem {
+                            base: scratch,
+                            ofs: 0,
+                        }
+                    }
+                    other => panic!("ZERO_ARRAY base must be a GPR or immediate, got {other:?}"),
+                }
+            }
             other => panic!("ZERO_ARRAY start must be a GPR or immediate, got {other:?}"),
         }
     }
@@ -11253,7 +11292,7 @@ impl<'a> Assembler386<'a> {
                 let mut i = 0i64;
                 while i < nbytes {
                     let addr =
-                        Self::addr_add_zero_array(base_loc, start_loc, scale_start, base_size + i);
+                        self.addr_add_zero_array(base_loc, start_loc, scale_start, base_size + i);
                     let remaining = nbytes - i;
                     let current = if remaining >= 16 {
                         if !null_reg_cleared {
@@ -11284,10 +11323,8 @@ impl<'a> Assembler386<'a> {
         // `consider_zero_array`: LEA dest from `_scaled_addr`, then memset.
         // Regalloc has already run the non-collecting `before_call`.
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.emit_lea_addr_add(
-            scratch,
-            Self::addr_add_zero_array(base_loc, start_loc, scale_start, base_size),
-        );
+        let addr = self.addr_add_zero_array(base_loc, start_loc, scale_start, base_size);
+        self.emit_lea_addr_add(scratch, addr);
         let memset_ptr = libc::memset as *const () as i64;
         self.regalloc_mov(size_loc, &Loc::Reg(crate::regloc::EDX));
         if scale_size != 1 {

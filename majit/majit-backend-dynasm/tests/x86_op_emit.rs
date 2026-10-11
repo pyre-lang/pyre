@@ -1725,6 +1725,44 @@ fn call_release_gil_round_trips_errno() {
     assert_eq!(run_errno_swap(errno_save_flags(2), 0), 9);
 }
 
+#[cfg(target_os = "windows")]
+extern "C" fn set_last_error_and_return(code: i64) -> i64 {
+    unsafe { majit_rlib::rwin32::_SetLastError(code as u32) };
+    code + 1000
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn call_release_gil_saves_last_error() {
+    // `read_real_errno` with `RFFI_SAVE_LASTERROR`: after
+    // `restore_stack_pointer`, `GetLastError` runs below a fresh shadow
+    // area and rax survives around it.
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let call = Op::new(
+        OpCode::CallReleaseGilI,
+        &[
+            rb(OpRef::const_int(majit_jitcode::rffi::RFFI_SAVE_LASTERROR)),
+            rb(OpRef::const_int(set_last_error_and_return as usize as i64)),
+            rb(OpRef::const_int(123)),
+        ],
+    );
+    call.pos().set(OpRef::int_op(1));
+    call.setdescr(call_descr(vec![Type::Int], Type::Int, true, 8));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile CALL_RELEASE_GIL: {err:?}"));
+    majit_rlib::rwin32::SetLastError_saved(0);
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 1123);
+    assert_eq!(majit_rlib::rwin32::GetLastError_saved(), 123);
+}
+
 fn op_at(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let operands: Vec<_> = args.iter().copied().map(rb).collect();
     let op = Op::new(opcode, &operands);
@@ -3091,6 +3129,13 @@ fn zero_array_descr() -> DescrRef {
 }
 
 fn run_zero_array(nbytes: i64, start: i64, start_in_reg: bool) {
+    run_zero_array_at(nbytes, start, start_in_reg, false, 0);
+}
+
+/// `base_const` passes the array as an immediate base. `bias` moves the
+/// base down and an immediate start up by the same amount, so the stores
+/// land on the same bytes through a larger displacement.
+fn run_zero_array_at(nbytes: i64, start: i64, start_in_reg: bool, base_const: bool, bias: i64) {
     let prefix = ZERO_ARRAY_BASEOFS + start as usize;
     let total = prefix + nbytes as usize + 8;
     let mut buf = vec![0xAAu8; total];
@@ -3100,14 +3145,18 @@ fn run_zero_array(nbytes: i64, start: i64, start_in_reg: bool) {
     let ptr = buf.as_mut_ptr() as usize;
     let mut backend = fresh_backend();
     let token = JitCellToken::new(next_token_id());
+    let base_value = (ptr as i64).wrapping_sub(bias);
     let mut inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
     let mut zero_args = vec![
         rb(OpRef::input_arg_ref(0)),
-        rb(OpRef::const_int(start)),
+        rb(OpRef::const_int(start + bias)),
         rb(OpRef::const_int(nbytes)),
         rb(OpRef::const_int(1)),
         rb(OpRef::const_int(1)),
     ];
+    if base_const {
+        zero_args[0] = rb(OpRef::const_int(base_value));
+    }
     if start_in_reg {
         inputargs.push(InputArg::from_type_rc(Type::Int, 1));
         zero_args[1] = rb(OpRef::input_arg_int(1));
@@ -3119,9 +3168,9 @@ fn run_zero_array(nbytes: i64, start: i64, start_in_reg: bool) {
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile ZERO_ARRAY nbytes={nbytes}: {err:?}"));
-    let mut values = vec![Value::Ref(GcRef(ptr))];
+    let mut values = vec![Value::Ref(GcRef(base_value as usize))];
     if start_in_reg {
-        values.push(Value::Int(start));
+        values.push(Value::Int(start + bias));
     }
     let frame = backend.execute_token(&token, &values);
     assert!(
@@ -3153,6 +3202,26 @@ fn zero_array_unroll_and_memset_leave_neighbors() {
         run_zero_array(nbytes, 0, false);
     }
     run_zero_array(16, 4, true);
+}
+
+#[test]
+fn zero_array_immediate_base() {
+    // `addr_add` with an `ImmedLoc` base: inline stores and the memset
+    // destination, with an immediate and a register start.
+    for nbytes in [24, ZERO_ARRAY_UNROLL_LIMIT + 16] {
+        run_zero_array_at(nbytes, 0, false, true, 0);
+        run_zero_array_at(nbytes, 4, true, true, 0);
+    }
+}
+
+#[test]
+fn zero_array_displacement_crosses_i32() {
+    // The first 16-byte store sits just below `i32::MAX`; the second is
+    // above it and must go through the scratch register
+    // (`_fix_static_offset_64_m`), not wrap to a negative displacement.
+    let bias = i64::from(i32::MAX) - 8 - ZERO_ARRAY_BASEOFS as i64;
+    run_zero_array_at(32, 0, false, false, bias);
+    run_zero_array_at(ZERO_ARRAY_UNROLL_LIMIT + 16, 0, false, false, bias);
 }
 
 static CALL_ENTRY_RSP: AtomicUsize = AtomicUsize::new(0);
