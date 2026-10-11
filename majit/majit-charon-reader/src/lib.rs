@@ -117,11 +117,17 @@ pub struct Llbc {
     /// `stack_sensitive_fns`.  Sorted.  Harvested in link order like
     /// the sensitive set, so a later crate sees earlier crates' answers.
     stack_depth_neutral_fns: parking_lot::RwLock<Vec<String>>,
-    /// Function paths whose body never reads a slot below its entry
-    /// depth, but can return with slots still published above it.
+    /// Function paths whose body can return with slots still published
+    /// above its entry depth, or at a depth the walk could not bound.
     /// A subset of `stack_sensitive_fns`.  Sorted.  Harvested in link
     /// order like the sensitive set.
     stack_leaves_above_fns: parking_lot::RwLock<Vec<String>>,
+    /// Function paths whose body can read or write a slot below its
+    /// entry depth, or can end at a depth the walk could not bound.
+    /// A subset of `stack_sensitive_fns`; a path may also be in
+    /// `stack_leaves_above_fns`.  Sorted.  Harvested in link order like
+    /// the sensitive set.
+    stack_observes_fns: parking_lot::RwLock<Vec<String>>,
     /// Functions that read or write a slot whose index is one of their
     /// own parameters.  Sorted by path.  The `Vec<u8>` is 0-based
     /// positions in the callee's argument list.
@@ -325,6 +331,7 @@ impl Llbc {
             stack_sensitive_ready: std::sync::atomic::AtomicBool::new(false),
             stack_depth_neutral_fns: parking_lot::RwLock::new(Vec::new()),
             stack_leaves_above_fns: parking_lot::RwLock::new(Vec::new()),
+            stack_observes_fns: parking_lot::RwLock::new(Vec::new()),
             stack_param_slots_fns: parking_lot::RwLock::new(Vec::new()),
             stack_returns_index_fns: parking_lot::RwLock::new(Vec::new()),
             trait_assoc_index: std::sync::OnceLock::new(),
@@ -496,6 +503,23 @@ impl Llbc {
     /// [`register_stack_leaves_above_fns`](Self::register_stack_leaves_above_fns).
     pub fn is_stack_leaves_above_fn(&self, path: &str) -> bool {
         self.stack_leaves_above_fns
+            .read()
+            .binary_search_by(|known| known.as_str().cmp(path))
+            .is_ok()
+    }
+
+    /// Record function paths that can touch a slot below their entry.
+    pub fn register_stack_observes_fns(&self, paths: impl IntoIterator<Item = String>) {
+        let mut known = self.stack_observes_fns.write();
+        known.extend(paths);
+        known.sort();
+        known.dedup();
+    }
+
+    /// Whether `path` was registered through
+    /// [`register_stack_observes_fns`](Self::register_stack_observes_fns).
+    pub fn is_stack_observes_fn(&self, path: &str) -> bool {
+        self.stack_observes_fns
             .read()
             .binary_search_by(|known| known.as_str().cmp(path))
             .is_ok()

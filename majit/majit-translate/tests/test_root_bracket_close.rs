@@ -641,26 +641,30 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
     let object = Llbc::load(OBJECT_LLBC).expect("load object llbc");
     let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load interpreter llbc");
     let context = LowerContext::new(&interpreter);
-    let (mut sensitive, mut leaves, mut params, mut ret_idx) =
+    let (mut sensitive, mut leaves, mut params, mut ret_idx, mut observes) =
         majit_translate::front::mir::discover_stack_fn_effects(&object);
     object.register_stack_sensitive_fns(sensitive.iter().cloned());
+    object.register_stack_observes_fns(observes.iter().cloned());
     object.register_stack_leaves_above_fns(leaves.iter().cloned());
     object.register_stack_param_slots_fns(params.iter().cloned());
     object.register_stack_returns_index_fns(ret_idx.iter().cloned());
     let mut neutral = majit_translate::front::mir::discover_depth_neutral_fns(&object);
     object.register_stack_depth_neutral_fns(neutral.iter().cloned());
     interpreter.register_stack_sensitive_fns(sensitive.iter().cloned());
+    interpreter.register_stack_observes_fns(observes.iter().cloned());
     interpreter.register_stack_depth_neutral_fns(neutral.iter().cloned());
     interpreter.register_stack_leaves_above_fns(leaves.iter().cloned());
     interpreter.register_stack_param_slots_fns(params.iter().cloned());
     interpreter.register_stack_returns_index_fns(ret_idx.iter().cloned());
-    let (sens, more_leaves, more_params, more_ret) =
+    let (sens, more_leaves, more_params, more_ret, more_observes) =
         majit_translate::front::mir::discover_stack_fn_effects(&interpreter);
     sensitive.extend(sens);
+    observes.extend(more_observes);
     leaves.extend(more_leaves);
     params.extend(more_params);
     ret_idx.extend(more_ret);
     interpreter.register_stack_sensitive_fns(sensitive);
+    interpreter.register_stack_observes_fns(observes);
     interpreter.register_stack_leaves_above_fns(leaves);
     interpreter.register_stack_param_slots_fns(params);
     interpreter.register_stack_returns_index_fns(ret_idx);

@@ -534,16 +534,17 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     if !llbc.stack_sensitive_fns_complete() {
         return Err("callee-stack-effects-unknown");
     }
-    // LeavesAbove / ParamSlots / ReturnsIndex still refuse here: after
-    // the rewrite nothing rewinds a leftover (`_fix_graph_after_inlining`).
-    // Observes is checked against the entry-depth in the walk below.
+    // A callee that leaves slots, indexes through a parameter or returns
+    // an index refuses here, whether or not it also reads below entry:
+    // after the rewrite nothing rewinds a leftover
+    // (`_fix_graph_after_inlining`). A callee that only reads below entry
+    // is checked against the entry depth in the walk below.
     for block in &body.body {
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && classify_call(call, llbc).is_none()
-            && callee_path(call, llbc).as_deref().is_some_and(|path| {
-                let effect = callee_effect_of(llbc, path);
-                !effect.is_none() && !effect.observes
-            })
+            && callee_path(call, llbc)
+                .as_deref()
+                .is_some_and(|path| callee_effect_of(llbc, path).refuses_erase())
         {
             return Err("calls-stack-sensitive-fn");
         }
@@ -1455,8 +1456,9 @@ impl Depth {
 }
 
 /// Effect of a callee on the caller's shadow stack.
-/// `observes` dominates: a body that reads below entry is Observes
-/// regardless of leftover slots or parameter indices.
+/// `observes` and `leaves_above` are independent: a body that reads
+/// below entry can also return with slots still published, and a caller
+/// whose bracket is erased has no Close left to rewind them.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 struct CalleeEffect {
     observes: bool,
@@ -1471,6 +1473,8 @@ impl CalleeEffect {
         Self::default()
     }
 
+    /// Reads below entry and returns at entry depth on every path.
+    #[cfg(test)]
     fn observes() -> Self {
         Self {
             observes: true,
@@ -1478,6 +1482,23 @@ impl CalleeEffect {
             param_slots: Vec::new(),
             returns_index: false,
         }
+    }
+
+    /// Reads below entry and may end at any depth.
+    fn worst() -> Self {
+        Self {
+            observes: true,
+            leaves_above: true,
+            param_slots: Vec::new(),
+            returns_index: false,
+        }
+    }
+
+    /// The erased caller cannot keep this call: something the callee
+    /// publishes or indexes outlives it, and nothing rewinds a leftover
+    /// once the caller's Open / Close are gone.
+    fn refuses_erase(&self) -> bool {
+        self.leaves_above || !self.param_slots.is_empty() || self.returns_index
     }
 
     #[allow(dead_code)]
@@ -1495,7 +1516,9 @@ impl CalleeEffect {
     }
 
     fn as_str(&self) -> &'static str {
-        if self.observes {
+        if self.observes && self.leaves_above {
+            "ObservesLeaves"
+        } else if self.observes {
             "Observes"
         } else if !self.param_slots.is_empty() {
             "ParamSlots"
@@ -1510,9 +1533,6 @@ impl CalleeEffect {
 
     #[allow(dead_code)]
     fn join(&self, other: &Self) -> Self {
-        if self.observes || other.observes {
-            return Self::observes();
-        }
         let mut param_slots = self.param_slots.clone();
         for &p in &other.param_slots {
             if !param_slots.contains(&p) {
@@ -1521,7 +1541,7 @@ impl CalleeEffect {
         }
         param_slots.sort_unstable();
         Self {
-            observes: false,
+            observes: self.observes || other.observes,
             leaves_above: self.leaves_above || other.leaves_above,
             param_slots,
             returns_index: self.returns_index || other.returns_index,
@@ -1530,9 +1550,9 @@ impl CalleeEffect {
 }
 
 /// Registered effect of `path`: `None` if not sensitive or proven
-/// neutral; `LeavesAbove` / `ParamSlots` / `ReturnsIndex` from those
-/// sets; otherwise `Observes`. A path that is merely not-yet-proven is
-/// not registered, so this does not map it to Observes.
+/// neutral; otherwise the union of the sets it was registered in. A
+/// sensitive path in none of them comes from an artefact that did not
+/// classify it, and is taken at its worst.
 fn callee_effect_of(llbc: &Llbc, path: &str) -> CalleeEffect {
     if llbc.is_stack_depth_neutral_fn(path) {
         return CalleeEffect::none();
@@ -1540,19 +1560,17 @@ fn callee_effect_of(llbc: &Llbc, path: &str) -> CalleeEffect {
     let param_slots = llbc.stack_param_slots(path).unwrap_or_default();
     let leaves = llbc.is_stack_leaves_above_fn(path);
     let returns_index = llbc.is_stack_returns_index_fn(path);
-    let sensitive = llbc.is_stack_sensitive_fn(path);
-    if !sensitive && param_slots.is_empty() && !leaves && !returns_index {
-        return CalleeEffect::none();
-    }
-    if sensitive && !leaves && param_slots.is_empty() && !returns_index {
-        return CalleeEffect::observes();
-    }
-    CalleeEffect {
-        observes: false,
+    let observes = llbc.is_stack_observes_fn(path);
+    let effect = CalleeEffect {
+        observes,
         leaves_above: leaves,
         param_slots,
         returns_index,
+    };
+    if effect.is_none() && llbc.is_stack_sensitive_fn(path) {
+        return CalleeEffect::worst();
     }
+    effect
 }
 
 fn first_non_none_callee(body: &Unstructured, llbc: &Llbc) -> Option<(String, CalleeEffect)> {
@@ -1603,15 +1621,19 @@ struct StackWalk {
 
 impl StackWalk {
     fn effect(&self) -> CalleeEffect {
-        if self.reads_below || self.unknown_exit {
-            CalleeEffect::observes()
-        } else {
-            CalleeEffect {
-                observes: false,
-                leaves_above: self.leaves_above,
-                param_slots: self.param_slots.clone(),
-                returns_index: self.returns_index,
-            }
+        // An exit the walk could not bound may sit below entry (the
+        // caller's slots are gone) or above it (slots are left), so it
+        // sets both.
+        let observes = self.reads_below || self.unknown_exit;
+        CalleeEffect {
+            observes,
+            leaves_above: self.leaves_above || self.unknown_exit,
+            param_slots: if observes {
+                Vec::new()
+            } else {
+                self.param_slots.clone()
+            },
+            returns_index: self.returns_index && !observes,
         }
     }
 }
@@ -1709,6 +1731,10 @@ fn stack_walk(
     depth_in[0] = Some(Depth::Known(0));
     let mut queue: VecDeque<usize> = VecDeque::from([0]);
     let mut reads_below = false;
+    // The first read below entry. The walk goes on past it so the exits
+    // are still judged: a reader that also leaves slots is a different
+    // callee from one that returns at its entry depth.
+    let mut read_why: Option<String> = None;
     let mut leaves_above = false;
     let mut unknown_exit = false;
     let mut returns_index: Option<bool> = None;
@@ -1718,9 +1744,9 @@ fn stack_walk(
         if rounds > n_blocks * 8 + 64 {
             // A depth that keeps growing round a loop: slots pile up.
             return StackWalk {
-                why: Some("depth-grows-in-loop".into()),
+                why: Some(read_why.unwrap_or_else(|| "depth-grows-in-loop".into())),
                 saw_open,
-                reads_below: false,
+                reads_below,
                 leaves_above,
                 unknown_exit: true,
                 param_slots,
@@ -2051,7 +2077,13 @@ fn stack_walk(
                                     path.as_deref().unwrap_or("")
                                 );
                             }
-                            depth = depth.after_unknown_push();
+                            // A reader that may also leave slots, or end
+                            // below its entry, leaves no bound at all.
+                            depth = if callee.leaves_above {
+                                Depth::Unknown
+                            } else {
+                                depth
+                            };
                         } else {
                             // pin() returns shadow_stack_len() captured at
                             // callee entry, an own index >= entry; the
@@ -2131,18 +2163,8 @@ fn stack_walk(
             ),
             _ => {}
         }
-        if reads_below {
-            param_slots.sort_unstable();
-            param_slots.dedup();
-            return StackWalk {
-                why: Some(why),
-                saw_open,
-                reads_below: true,
-                leaves_above,
-                unknown_exit,
-                param_slots,
-                returns_index: false,
-            };
+        if reads_below && read_why.is_none() {
+            read_why = Some(why.clone());
         }
         for target in successors {
             let target = target as usize;
@@ -2159,11 +2181,17 @@ fn stack_walk(
             }
         }
     }
-    let why = if reads_below || unknown_exit || leaves_above {
+    let why = if reads_below {
+        read_why
+    } else if unknown_exit || leaves_above {
         Some(why)
     } else {
         None
     };
+    // A reader's parameter-indexed accesses add nothing to "reads below".
+    if reads_below {
+        param_slots.clear();
+    }
     param_slots.sort_unstable();
     param_slots.dedup();
     StackWalk {
@@ -2286,14 +2314,15 @@ pub fn discover_stack_returns_index_fns(llbc: &Llbc) -> Vec<String> {
     discover_stack_fn_effects(llbc).3
 }
 
-/// Sensitive, leaves-above, param-slots, and returns-index sets from
-/// one fixpoint, so harvest does not recompute the body walks thrice.
+/// Sensitive, leaves-above, param-slots, returns-index and observes
+/// sets from one fixpoint, so harvest does not recompute the body walks.
 pub fn discover_stack_fn_effects(
     llbc: &Llbc,
 ) -> (
     Vec<String>,
     Vec<String>,
     Vec<(String, Vec<u8>)>,
+    Vec<String>,
     Vec<String>,
 ) {
     discover_stack_effects(llbc)
@@ -2314,6 +2343,7 @@ fn discover_stack_effects(
     Vec<String>,
     Vec<String>,
     Vec<(String, Vec<u8>)>,
+    Vec<String>,
     Vec<String>,
 ) {
     let fds: Vec<&FunDecl> = llbc
@@ -2374,8 +2404,8 @@ fn discover_stack_effects(
                 .get(&names[i])
                 .cloned()
                 .unwrap_or_else(CalleeEffect::none);
-            class.insert(names[i].clone(), CalleeEffect::observes());
-            if !old.observes {
+            class.insert(names[i].clone(), CalleeEffect::worst());
+            if old != CalleeEffect::worst() {
                 for &caller in callers.get(&names[i]).into_iter().flatten() {
                     if queued[caller] {
                         continue;
@@ -2428,26 +2458,31 @@ fn discover_stack_effects(
     let mut leaves: Vec<String> = Vec::new();
     let mut param_slots: Vec<(String, Vec<u8>)> = Vec::new();
     let mut returns_index: Vec<String> = Vec::new();
+    let mut observes: Vec<String> = Vec::new();
     for (name, effect) in class {
         if effect.is_none() {
             continue;
         }
         sensitive.push(name.clone());
-        if effect.leaves_above && !effect.observes {
+        if effect.leaves_above {
             leaves.push(name.clone());
         }
-        if !effect.observes && !effect.param_slots.is_empty() {
+        if effect.observes {
+            observes.push(name.clone());
+        }
+        if !effect.param_slots.is_empty() {
             param_slots.push((name.clone(), effect.param_slots));
         }
-        if !effect.observes && effect.returns_index {
+        if effect.returns_index {
             returns_index.push(name);
         }
     }
     sensitive.sort();
+    observes.sort();
     leaves.sort();
     param_slots.sort_by(|a, b| a.0.cmp(&b.0));
     returns_index.sort();
-    (sensitive, leaves, param_slots, returns_index)
+    (sensitive, leaves, param_slots, returns_index, observes)
 }
 
 /// Local bodies proven depth-neutral: every path restores the entry
@@ -2496,8 +2531,9 @@ pub fn ensure_stack_sensitive_fns(llbc: &Llbc) {
     if llbc.stack_sensitive_fns_complete() {
         return;
     }
-    let (found, leaves, params, ret_idx) = discover_stack_effects(llbc);
+    let (found, leaves, params, ret_idx, observes) = discover_stack_effects(llbc);
     llbc.register_stack_sensitive_fns(found);
+    llbc.register_stack_observes_fns(observes);
     llbc.register_stack_leaves_above_fns(leaves);
     llbc.register_stack_param_slots_fns(params);
     llbc.register_stack_returns_index_fns(ret_idx);
@@ -2908,7 +2944,8 @@ mod tests {
                     opaque_fun(7, &["other", "leaves_above_callee"], json!("Opaque")),
                     opaque_fun(8, &["other", "reload_slot"], json!("Opaque")),
                     opaque_fun(9, &["other", "pin_helper"], json!("Opaque")),
-                    opaque_fun(10, &["other", "storage_helper"], json!("Opaque"))
+                    opaque_fun(10, &["other", "storage_helper"], json!("Opaque")),
+                    opaque_fun(11, &["other", "observes_and_leaves"], json!("Opaque"))
                 ]
             }
         });
@@ -2919,10 +2956,16 @@ mod tests {
             "other::reload_slot".into(),
             "other::pin_helper".into(),
             "other::storage_helper".into(),
+            "other::observes_and_leaves".into(),
+        ]);
+        llbc.register_stack_observes_fns([
+            "other::unproven_callee".into(),
+            "other::observes_and_leaves".into(),
         ]);
         llbc.register_stack_leaves_above_fns([
             "other::leaves_above_callee".into(),
             "other::pin_helper".into(),
+            "other::observes_and_leaves".into(),
         ]);
         llbc.register_stack_param_slots_fns([("other::reload_slot".into(), vec![0])]);
         llbc.register_stack_returns_index_fns([
@@ -3167,6 +3210,36 @@ mod tests {
             Ok(None) => panic!("expected calls-stack-sensitive-fn, got no bracket"),
             Err(reason) => panic!("expected calls-stack-sensitive-fn, got {reason}"),
         }
+        // A callee that reads below entry and also leaves slots: Close
+        // still rewinds it, so the body stays neutral, but the erased
+        // body would have no Close left.
+        let observes_and_leaves_inside = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(11, vec![], 3, 3)),
+                bb(drop_local(1, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        assert!(
+            body_is_depth_neutral(&observes_and_leaves_inside, &llbc, &effect),
+            "Open -> Pin -> Observes+LeavesAbove -> Close is depth-neutral"
+        );
+        match analyze(&observes_and_leaves_inside, &llbc) {
+            Err("calls-stack-sensitive-fn") => {}
+            Ok(Some(_)) => panic!("expected calls-stack-sensitive-fn, got accepted"),
+            Ok(None) => panic!("expected calls-stack-sensitive-fn, got no bracket"),
+            Err(reason) => panic!("expected calls-stack-sensitive-fn, got {reason}"),
+        }
+        let only_observes_and_leaves =
+            body_of(2, vec![bb(call_fun(11, vec![], 1, 1)), bb(json!("Return"))]);
+        assert_eq!(
+            stack_walk(&only_observes_and_leaves, &llbc, &effect).effect(),
+            CalleeEffect::worst(),
+            "a reader's leftover reaches its caller's summary"
+        );
         let only_leaves = body_of(2, vec![bb(call_fun(7, vec![], 1, 1)), bb(json!("Return"))]);
         let walk = stack_walk(&only_leaves, &llbc, &effect);
         assert_eq!(

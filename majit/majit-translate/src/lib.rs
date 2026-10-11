@@ -269,6 +269,7 @@ fn build_semantic_program_via_active_frontend(
             let mut stack_leaves_above: Vec<String> = Vec::new();
             let mut stack_param_slots: Vec<(String, Vec<u8>)> = Vec::new();
             let mut stack_returns_index: Vec<String> = Vec::new();
+            let mut stack_observes: Vec<String> = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
@@ -278,7 +279,10 @@ fn build_semantic_program_via_active_frontend(
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
                 llbc.register_stack_param_slots_fns(stack_param_slots.iter().cloned());
                 llbc.register_stack_returns_index_fns(stack_returns_index.iter().cloned());
-                let (sens, leaves, params, ret_idx) = front::mir::discover_stack_fn_effects(&llbc);
+                llbc.register_stack_observes_fns(stack_observes.iter().cloned());
+                let (sens, leaves, params, ret_idx, observes) =
+                    front::mir::discover_stack_fn_effects(&llbc);
+                stack_observes.extend(observes);
                 stack_sensitive.extend(sens);
                 stack_leaves_above.extend(leaves);
                 stack_param_slots.extend(params);
@@ -287,6 +291,7 @@ fn build_semantic_program_via_active_frontend(
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
                 llbc.register_stack_param_slots_fns(stack_param_slots.iter().cloned());
                 llbc.register_stack_returns_index_fns(stack_returns_index.iter().cloned());
+                llbc.register_stack_observes_fns(stack_observes.iter().cloned());
                 stack_depth_neutral.extend(front::mir::discover_depth_neutral_fns(&llbc));
                 crate_names.push(llbc.crate_name().to_string());
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
@@ -352,6 +357,7 @@ fn build_semantic_program_via_active_frontend(
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
                 llbc.register_stack_param_slots_fns(stack_param_slots.iter().cloned());
                 llbc.register_stack_returns_index_fns(stack_returns_index.iter().cloned());
+                llbc.register_stack_observes_fns(stack_observes.iter().cloned());
                 llbc.mark_stack_sensitive_fns_complete();
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
