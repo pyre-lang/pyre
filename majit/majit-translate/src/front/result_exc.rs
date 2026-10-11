@@ -4319,7 +4319,7 @@ fn rewire_one_call_site(
         // `catch_and_rewrap`.  The fusion is fail-safe: an `Err` from
         // `try_fuse_drain_match` MUST NOT propagate (that would decline the
         // whole graph); it converts here into the existing rewrap path.
-        match try_fuse_drain_match(graph, a, r, suffix, payload_ty, spec) {
+        match try_fuse_drain_match(graph, a, r, payload_ty, spec) {
             Ok(()) => return Ok(SiteOutcome::Fused),
             Err(msg) => {
                 // The fusion's reason string, which reaches the census rather
@@ -6395,7 +6395,6 @@ fn try_fuse_drain_match(
     graph: &mut FunctionGraph,
     a: usize,
     r: &Variable,
-    suffix: &str,
     payload_ty: &ValueType,
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
@@ -6465,8 +6464,9 @@ fn try_fuse_drain_match(
     // the exception link, the handler stays as written.
     assert_single_pred(graph, err_target, &name)?;
     let Some(r_err) = forward_alias(graph, &r_b, &err_link) else {
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
-        return Ok(());
+        return Err(format!(
+            "{name}: drain fuse: err arm does not forward the Result shell"
+        ));
     };
     let err_payload_read = graph.blocks[err_target]
         .operations
@@ -6486,22 +6486,17 @@ fn try_fuse_drain_match(
             _ => None,
         });
     let Some((errpay_idx, err_payload)) = err_payload_read else {
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
-        return Ok(());
+        return Err(format!(
+            "{name}: drain fuse: err arm has no Err.__pos_0 payload read"
+        ));
     };
     // A recast that retypes the payload may sit between the payload read
     // and the carrier predicate, and the predicate may be the single
     // successor of that recast (`with_roots!` restore hops included). A
     // keep-style predicate returns the reloaded handle as its second
     // field; `H` re-issues the predicate on the caught carrier.
-    let located =
-        match locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload, spec) {
-            Ok(located) => located,
-            Err(_) => {
-                catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
-                return Ok(());
-            }
-        };
+    let located = locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload, spec)
+        .map_err(|e| format!("{name}: drain fuse: no drain stop predicate: {e}"))?;
     let predicate_target = located.predicate_target.clone();
     let predicate_result = located.predicate_result.clone();
     let predicate_result_ty = located.predicate_result_ty.clone();
@@ -12170,8 +12165,8 @@ mod rebuilt_shell_collapse_tests {
 }
 
 /// `match f() { Ok(_) => …, Err(e) if pred(x) => raise e, Err(_) => raise new }`.
-/// Discriminant 0/1 plus payload uses identify the Result drain; the Err
-/// edge is the exception link and the guard stays ordinary flow
+/// A guarded Err whose predicate is not a carrier StopIteration test
+/// declines from [`try_fuse_drain_match`]; the caller rewraps
 /// (`flowcontext.py` `FlowContext.guessexception`).
 #[cfg(test)]
 mod drain_fuse_guarded_err_tests {
@@ -12322,11 +12317,38 @@ mod drain_fuse_guarded_err_tests {
     }
 
     #[test]
-    fn a_guarded_err_arm_fuses_to_last_exception() {
+    fn a_guarded_err_arm_without_carrier_predicate_declines() {
+        let (mut graph, r, _, _) = guarded_err_fixture();
+        let a = graph.startblock.0;
+        let err = try_fuse_drain_match(&mut graph, a, &r, &ValueType::Void, spec())
+            .expect_err("a guarded Err without a carrier StopIteration predicate is not a drain");
+        assert!(err.contains("no drain stop predicate"), "{err}");
+        assert!(
+            !matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
+            "identification failure does not rewrite the call"
+        );
+    }
+
+    #[test]
+    fn a_guarded_err_arm_rewraps_to_last_exception() {
         let (mut graph, r, reraise, new_raise) = guarded_err_fixture();
         let a = graph.startblock.0;
-        try_fuse_drain_match(&mut graph, a, &r, "<(),PyError>", &ValueType::Void, spec())
-            .expect("guarded Err drain fuses");
+        let payload_ty = ValueType::Void;
+        let outcome = rewire_one_call_site(
+            &mut graph,
+            &r,
+            "<(),PyError>",
+            &payload_ty,
+            true,
+            true,
+            &[(r.clone(), Some("<(),PyError>".into()), payload_ty.clone())],
+            spec(),
+        )
+        .expect("guarded Err rewraps");
+        assert!(
+            matches!(outcome, SiteOutcome::Rewrapped),
+            "the caller rewraps a guarded Err that is not a drain"
+        );
         assert!(
             matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
             "the call site is the exception link"
@@ -12376,18 +12398,42 @@ mod drain_fuse_guarded_err_tests {
     }
 
     #[test]
-    fn a_discarded_ok_payload_with_guarded_err_fuses_to_last_exception() {
+    fn a_discarded_ok_payload_with_guarded_err_declines() {
+        let (mut graph, r, _, _) = discarded_ok_guarded_err_fixture();
+        let a = graph.startblock.0;
+        let err = try_fuse_drain_match(&mut graph, a, &r, &ValueType::Ref(None), spec())
+            .expect_err("discarded Ok(_) with guarded Err still lacks a carrier predicate");
+        assert!(err.contains("no drain stop predicate"), "{err}");
+        assert!(
+            !matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
+            "identification failure does not rewrite the call"
+        );
+    }
+
+    #[test]
+    fn a_discarded_ok_payload_with_guarded_err_rewraps_to_last_exception() {
         let (mut graph, r, reraise, new_raise) = discarded_ok_guarded_err_fixture();
         let a = graph.startblock.0;
-        try_fuse_drain_match(
+        let payload_ty = ValueType::Ref(None);
+        let outcome = rewire_one_call_site(
             &mut graph,
-            a,
             &r,
             "<*mut PyObject,PyError>",
-            &ValueType::Ref(None),
+            &payload_ty,
+            true,
+            true,
+            &[(
+                r.clone(),
+                Some("<*mut PyObject,PyError>".into()),
+                payload_ty.clone(),
+            )],
             spec(),
         )
-        .expect("discarded Ok(_) with guarded Err fuses");
+        .expect("discarded Ok(_) with guarded Err rewraps");
+        assert!(
+            matches!(outcome, SiteOutcome::Rewrapped),
+            "the caller rewraps a discarded Ok(_) with guarded Err that is not a drain"
+        );
         assert!(
             matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
             "the call site is the exception link"
@@ -12470,19 +12516,9 @@ mod drain_fuse_guarded_err_tests {
             ),
         ];
         graph.set_goto(a, m, vec![r.clone()]);
-        let err = try_fuse_drain_match(
-            &mut graph,
-            a.0,
-            &r,
-            "<(),PyError>",
-            &ValueType::Void,
-            spec(),
-        )
-        .expect_err("a method on the Result shell is not a drain");
-        assert!(
-            err.contains("outside __pos_0") || err.contains("Result"),
-            "{err}"
-        );
+        let err = try_fuse_drain_match(&mut graph, a.0, &r, &ValueType::Void, spec())
+            .expect_err("a method on the Result shell is not a drain");
+        assert!(err.contains("outside __pos_0"), "{err}");
         assert!(
             !matches!(
                 graph.blocks[a.0].exitswitch,
