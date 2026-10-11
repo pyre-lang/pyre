@@ -5344,32 +5344,6 @@ pub fn init_importlib_bootstrap(
     Ok(())
 }
 
-/// `_bootstrap._setup` (importlib/_bootstrap.py) reads the bootstrap builtins
-/// `_thread`/`_warnings`/`_weakref` from `sys.modules`, so import them first to
-/// seed `sys.modules`; a name already present skips `_builtin_from_name` and
-/// keeps the natively-registered module object authoritative.
-#[cfg(feature = "host_env")]
-#[cfg(test)]
-fn seed_importlib_bootstrap_builtins(
-    execution_context: *const PyExecutionContext,
-) -> Result<(), crate::PyError> {
-    // `moduledef.py` `startup_at_translation_time_only` passes
-    // `space.getbuiltinmodule('sys')` and `getbuiltinmodule('_imp')`.
-    // `_setup` reads `_thread` / `_warnings` / `_weakref` from `sys.modules`
-    // and calls `_builtin_from_name` only on a miss. That lookup is
-    // `getbuiltinmodule`, not `importhook`: `BuiltinImporter.find_spec` is
-    // what `_setup` runs later, once, when it stamps the spec.
-    for name in ["sys", "_imp", "_thread", "_warnings", "_weakref"] {
-        if getbuiltinmodule(name, false, true, execution_context)?.is_none() {
-            return Err(crate::PyError::module_not_found_with_name(
-                format!("No module named {name}"),
-                name,
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(feature = "host_env")]
 fn bootstrap_importlib_modules(
     canonical: PyObjectRef,
@@ -8852,7 +8826,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_seed_and_appleveldef_install() {
+    fn appleveldef_install_binds_through_the_plain_dispatch() {
         crate::test_hooks::install_hash_hook();
         crate::typedef::init_typeobjects();
         {
@@ -8870,20 +8844,6 @@ mod tests {
             .expect("applevel body binds answer");
             let bound = unsafe { pyre_object::w_dict_getitem_str(ns, "answer") };
             assert!(bound.is_some(), "answer is copied into the module dict");
-        }
-        #[cfg(feature = "host_env")]
-        {
-            // bootstrap_seed_registers_builtins_via_getbuiltinmodule
-            install_builtin_modules();
-            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
-            seed_importlib_bootstrap_builtins(std::rc::Rc::as_ptr(&ec)).expect("seed");
-            for name in ["sys", "_imp", "_thread", "_warnings", "_weakref"] {
-                assert!(
-                    check_sys_modules(name).is_some(),
-                    "{name} is in sys.modules"
-                );
-            }
         }
     }
 
