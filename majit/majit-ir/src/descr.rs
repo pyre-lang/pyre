@@ -4211,6 +4211,18 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         None
     }
+    /// `compile.py AbstractResumeGuardDescr.get_resumestorage(): return
+    /// self` — the shared handle to this descr as the resume storage its
+    /// readers hold. `None` for a descr that is not a `FailDescr`.
+    fn as_fail_descr_arc(self: Arc<Self>) -> Option<Arc<dyn FailDescr>> {
+        None
+    }
+    /// The shared handle to this descr as `Any`, for a frontend reader that
+    /// stores its own descr type on a backend-visible list
+    /// (`JitCellToken.target_tokens` holding `history.TargetToken`).
+    fn as_any_arc(self: Arc<Self>) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
     fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
         None
     }
@@ -8539,6 +8551,9 @@ impl Descr for SimpleFailDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
 }
 
 impl FailDescr for SimpleFailDescr {
@@ -10634,6 +10649,11 @@ mod tests {
         }
         impl Descr for TestFailDescr {
             fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+                Some(self)
+            }
+            fn as_fail_descr_arc(
+                self: std::sync::Arc<Self>,
+            ) -> Option<std::sync::Arc<dyn FailDescr>> {
                 Some(self)
             }
         }

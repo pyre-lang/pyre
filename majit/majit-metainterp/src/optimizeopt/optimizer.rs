@@ -3149,8 +3149,8 @@ impl Optimizer {
         // but after the optimizer is constructed (setup already done at __init__).
         if let Some(prd) = self.pending_bridge_rd.take() {
             crate::optimizeopt::bridgeopt::deserialize_optimizer_knowledge(
-                &prd.storage.rd_numb,
-                prd.storage.rd_consts(),
+                prd.storage.rd_numb().expect("rd_numb"),
+                prd.storage.rd_consts().unwrap_or(&[]),
                 &prd.frontend_boxes,
                 &prd.liveboxes,
                 &prd.livebox_types,
@@ -4288,7 +4288,7 @@ impl Optimizer {
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
-        front_target_tokens: &mut [crate::history::TargetToken],
+        target_tokens: &[std::sync::Arc<crate::history::TargetToken>],
         runtime_boxes: &[OpRef],
         inline_short_preamble: bool,
         retraced_count: &mut u32,
@@ -4362,7 +4362,7 @@ impl Optimizer {
             .any(|op| op.opcode.is_guard() && op.rd_resume_position() >= 0);
         let retarget_close_jump = ops.last().is_some_and(|op| op.opcode == OpCode::Jump)
             && inline_short_preamble
-            && front_target_tokens.len() > 1
+            && target_tokens.len() > 1
             && has_body_guard;
         let skip_flush_saved = self.skip_flush;
         self.skip_flush = retarget_close_jump;
@@ -4441,7 +4441,7 @@ impl Optimizer {
                 "@@@SMALLIR BRIDGE total={} has_jump={} front_targets={}",
                 optimized_ops.len(),
                 terminal_jump.is_some() as i32,
-                front_target_tokens.len(),
+                target_tokens.len(),
             );
             for (i, op) in optimized_ops.iter().enumerate() {
                 eprintln!(
@@ -4468,13 +4468,13 @@ impl Optimizer {
         // unroll.py: not inline_short_preamble → jump_to_preamble
         // RPython calls send_extra_operation(jump_op) which forces virtuals
         // through the full pass chain. No explicit flush()/force_box() needed.
-        if !inline_short_preamble || front_target_tokens.len() <= 1 {
+        if !inline_short_preamble || target_tokens.len() <= 1 {
             // unroll.py `cell_token = jump_op.getdescr()`: the jump-to
             // jitcell is the one the recorded close JUMP points to, which is
-            // also where `front_target_tokens` comes from (`compile_bridge`
+            // also where `target_tokens` comes from (`compile_bridge`
             // resolves it off the JUMP target, not the bridge origin).
             // `assert cell_token.target_tokens`: require a target.
-            if !front_target_tokens.is_empty() {
+            if !target_tokens.is_empty() {
                 let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
                     // opencoder.py:259 inputarg_from_tp parity — seed inputarg
                     // operands with the producer-side types when available; the
@@ -4494,12 +4494,8 @@ impl Optimizer {
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
-                let result = self.jump_to_preamble(
-                    &terminal_jump,
-                    front_target_tokens,
-                    optimized_ops,
-                    &mut ctx,
-                );
+                let result =
+                    self.jump_to_preamble(&terminal_jump, target_tokens, optimized_ops, &mut ctx);
                 self.final_ctx = Some(ctx);
                 return result;
             }
@@ -4581,7 +4577,7 @@ impl Optimizer {
         let vs = match Self::try_jump_to_existing_trace(
             &opt_unroll,
             &jump_args,
-            front_target_tokens,
+            target_tokens,
             self,
             &mut ctx,
             false,
@@ -4592,10 +4588,10 @@ impl Optimizer {
             // unroll.py: except InvalidLoop → jump_to_preamble
             // RPython: self.jump_to_preamble → send_extra_operation
             Err(_) => {
-                if !front_target_tokens.is_empty() {
+                if !target_tokens.is_empty() {
                     let result = self.jump_to_preamble(
                         &terminal_jump,
-                        front_target_tokens,
+                        target_tokens,
                         optimized_ops,
                         &mut ctx,
                     );
@@ -4702,7 +4698,7 @@ impl Optimizer {
         let vs2 = match Self::try_jump_to_existing_trace(
             &opt_unroll,
             &jump_args,
-            front_target_tokens,
+            target_tokens,
             self,
             &mut ctx,
             true,
@@ -4733,8 +4729,8 @@ impl Optimizer {
                 retraced_count, retrace_limit,
             );
         }
-        let result = if !front_target_tokens.is_empty() {
-            self.jump_to_preamble(&terminal_jump, front_target_tokens, optimized_ops, &mut ctx)
+        let result = if !target_tokens.is_empty() {
+            self.jump_to_preamble(&terminal_jump, target_tokens, optimized_ops, &mut ctx)
         } else {
             let mut result = optimized_ops;
             result.append(&mut ctx.new_operations);
@@ -4751,20 +4747,20 @@ impl Optimizer {
     fn jump_to_preamble(
         &mut self,
         terminal_jump: &Op,
-        front_target_tokens: &[crate::history::TargetToken],
+        target_tokens: &[std::sync::Arc<crate::history::TargetToken>],
         mut optimized_ops: Vec<majit_ir::OpRc>,
         ctx: &mut OptContext,
     ) -> Result<(Vec<majit_ir::OpRc>, bool), crate::optimize::InvalidLoop> {
         // unroll.py: `assert cell_token.target_tokens[0].virtual_state is None`
-        if front_target_tokens
+        if target_tokens
             .first()
-            .is_some_and(|token| token.virtual_state.is_some())
+            .is_some_and(|token| token.attrs().virtual_state.is_some())
         {
             return Err(crate::optimize::InvalidLoop(
                 "jump_to_preamble: target_tokens[0].virtual_state is not None",
             ));
         }
-        let preamble = front_target_tokens
+        let preamble = target_tokens
             .first()
             .map(|token| token.as_jump_target_descr());
         let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, Some(preamble));
@@ -4800,7 +4796,7 @@ impl Optimizer {
     fn try_jump_to_existing_trace(
         opt_unroll: &crate::optimizeopt::unroll::OptUnroll,
         jump_args: &[OpRef],
-        front_target_tokens: &mut [crate::history::TargetToken],
+        target_tokens: &[std::sync::Arc<crate::history::TargetToken>],
         optimizer: &mut Self,
         ctx: &mut OptContext,
         force_boxes: bool,
@@ -4810,7 +4806,7 @@ impl Optimizer {
         let vs = opt_unroll.jump_to_existing_trace_with_vs(
             jump_args,
             None,
-            front_target_tokens,
+            target_tokens,
             optimizer,
             ctx,
             force_boxes,

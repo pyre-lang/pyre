@@ -2857,76 +2857,6 @@ impl<S: JitState> JitDriver<S> {
             .front_target_inputarg_types_on_driver(self.index().unwrap_or(0), green_key)
     }
 
-    /// resume.py blackhole_from_resumedata parity: get the
-    /// recovery slot types for building typed Value array from raw fail_values.
-    pub fn get_recovery_slot_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<Type>> {
-        self.meta
-            .get_recovery_slot_types(green_key, trace_id, fail_index)
-    }
-
-    /// compile.py `ResumeGuardDescr` storage handle forwarder.
-    pub fn get_resume_storage(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<std::sync::Arc<crate::resume::ResumeStorage>> {
-        self.meta
-            .get_resume_storage(green_key, trace_id, fail_index)
-    }
-
-    /// The storage and the fail-argument types of one and the same exit
-    /// layout — see `MetaInterp::get_resume_storage_with_slot_types`.
-    pub fn get_resume_storage_with_slot_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<(std::sync::Arc<crate::resume::ResumeStorage>, Vec<Type>)> {
-        self.meta
-            .get_resume_storage_with_slot_types(green_key, trace_id, fail_index)
-    }
-
-    /// Descr-first form of [`Self::get_resume_storage_with_slot_types`]
-    /// (`ResumeGuardDescr.get_resumestorage`): a bridge guard has no
-    /// frontend record, so the storage is read off the descr itself.
-    pub fn get_resume_storage_with_slot_types_for_descr(
-        &self,
-        descr: &dyn majit_ir::FailDescr,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<(std::sync::Arc<crate::resume::ResumeStorage>, Vec<Type>)> {
-        self.meta
-            .get_resume_storage_with_slot_types_for_descr(descr, green_key, trace_id, fail_index)
-    }
-
-    pub fn get_exit_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<Type>> {
-        self.meta.get_exit_types(green_key, trace_id, fail_index)
-    }
-
-    /// compile.py recovery_layout header_pc parity: get the merge point
-    /// PC for blackhole resume from a guard exit.
-    pub fn get_merge_point_pc(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<u64> {
-        self.meta
-            .get_merge_point_pc(green_key, trace_id, fail_index)
-    }
-
     /// Attach a GC allocator to the active backend.
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
         self.meta.backend_mut().set_gc_allocator(gc);
@@ -4465,7 +4395,7 @@ impl<S: JitState> JitDriver<S> {
                                     &live_arg_boxes,
                                 ),
                                 // compile.py:269-270: a cross-loop CUT keeps its cut prefix
-                                // in `front_target_tokens[0]`, where a loop closed at its own
+                                // in `target_tokens[0]`, where a loop closed at its own
                                 // header keeps its PREAMBLE — the peeled iteration that
                                 // re-derives the specialized label's invariants from the
                                 // loop's entry state, which is what makes `jump_to_preamble`
@@ -6090,22 +6020,11 @@ impl<S: JitState> JitDriver<S> {
         &self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     ) -> bool {
-        let Some(descr_fd) = descr_arc.as_fail_descr() else {
-            return false;
-        };
-        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
-            return false;
-        };
-        self.meta
-            .get_compiled_exit_layout_in_trace(
-                jct.green_key(),
-                descr_fd.trace_id(),
-                descr_fd.fail_index_per_trace(),
-            )
-            .and_then(|layout| layout.storage)
-            .is_some_and(|storage| {
-                !storage.rd_pendingfields().is_empty() && storage.rd_virtuals().len() > 1
-            })
+        // `ResumeGuardDescr.get_resumestorage()`: the payload is the descr's.
+        crate::resume::get_resumestorage(descr_arc).is_some_and(|storage| {
+            !storage.rd_pendingfields().is_none_or(<[_]>::is_empty)
+                && storage.rd_virtuals().map_or(0, <[_]>::len) > 1
+        })
     }
 
     /// `compile.py handle_fail`'s bridging arm.
@@ -6417,7 +6336,7 @@ impl<S: JitState> JitDriver<S> {
             let virtual_count = resume
                 .storage
                 .as_ref()
-                .map_or(0, |storage| storage.rd_virtuals().len());
+                .map_or(0, |storage| storage.rd_virtuals().map_or(0, <[_]>::len));
             let mut virt_cache = match allocator {
                 Some(allocator) => crate::BridgeVirtualCache::executing(
                     virtual_count,
@@ -6547,7 +6466,7 @@ impl<S: JitState> JitDriver<S> {
                                     let rd_virtuals = resume
                                         .storage
                                         .as_ref()
-                                        .map(|storage| storage.rd_virtuals());
+                                        .map(|storage| storage.rd_virtuals().unwrap_or(&[]));
                                     let opref = crate::materialize_bridge_virtual(
                                         ctx,
                                         *vidx,
@@ -7617,7 +7536,7 @@ impl<S: JitState> JitDriver<S> {
             eprintln!(
                 "@@@FAILVALS fail_index={} resume_pc={} raw_values={:?}",
                 fail_index,
-                self.get_merge_point_pc(green_key, trace_id, fail_index)
+                crate::compile::guard_resume_pc(fd)
                     .map(|p| p as i64)
                     .unwrap_or(-1),
                 raw_values
@@ -8210,17 +8129,16 @@ impl<S: JitState> JitDriver<S> {
         // which resumes at the loop entry against state the recovery has
         // already rewound. The failing guard's own layout carries the same
         // header pc, so reading it first also answers without a lookup.
-        // A bridge guard carries no frontend recovery layout
-        // (`compile.py send_bridge_to_backend`); the backend stamped
-        // its trace's header pc on the descr (`CompiledTraceInfo`), so
-        // that is read next.
+        // The backend may have stamped its trace's header pc on the
+        // descr (`CompiledTraceInfo`); otherwise the pc is the one the
+        // guard's own `rd_numb` encodes for its outermost frame.
         let guard_resume_pc = fd
             .trace_info_any()
             .and_then(|info| {
                 info.downcast_ref::<majit_backend::CompiledTraceInfo>()
                     .map(|info| info.header_pc)
             })
-            .or_else(|| self.get_merge_point_pc(owning_key, trace_id, fail_index))
+            .or_else(|| crate::compile::guard_resume_pc(fd))
             .map(|pc| pc as usize)
             .unwrap_or(target_pc);
         state.recover_after_compiled_run();
@@ -11376,7 +11294,7 @@ impl<S: JitState> JitDriver<S> {
             let virtual_count = retrace
                 .storage
                 .as_deref()
-                .map_or(0, |storage| storage.rd_virtuals().len());
+                .map_or(0, |storage| storage.rd_virtuals().map_or(0, <[_]>::len));
             let boxes: crate::VrefVableBoxes;
             let mut reader = match replay_allocator {
                 Some(allocator) => crate::BridgeVirtualCache::executing(
@@ -11407,7 +11325,8 @@ impl<S: JitState> JitDriver<S> {
                 if execute_replay
                     && replay_allocator.is_none()
                     && retrace.storage.as_deref().is_some_and(|storage| {
-                        !storage.rd_pendingfields().is_empty() || !storage.rd_virtuals().is_empty()
+                        !storage.rd_pendingfields().is_none_or(<[_]>::is_empty)
+                            || !storage.rd_virtuals().is_none_or(<[_]>::is_empty)
                     })
                 {
                     ctx.mark_bridge_replay_incomplete();
@@ -11420,7 +11339,7 @@ impl<S: JitState> JitDriver<S> {
                     sym,
                     ctx,
                     bfm,
-                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    retrace.storage.as_deref().and_then(|s| s.rd_virtuals()),
                     frontend_fail_values,
                     &retrace.fail_types,
                     &mut reader,
@@ -11431,7 +11350,7 @@ impl<S: JitState> JitDriver<S> {
                     sym,
                     ctx,
                     bfm,
-                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    retrace.storage.as_deref().and_then(|s| s.rd_virtuals()),
                     frontend_fail_values,
                     &retrace.fail_types,
                     &mut reader,
@@ -11491,7 +11410,7 @@ impl<S: JitState> JitDriver<S> {
                     sym,
                     ctx,
                     bfm,
-                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    retrace.storage.as_deref().and_then(|s| s.rd_virtuals()),
                     frontend_fail_values,
                     &retrace.fail_types,
                     &mut reader,
@@ -12843,7 +12762,6 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -12925,7 +12843,6 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -12973,7 +12890,6 @@ mod tests {
         let entry = |meta: Arc<()>, root_trace_id: u64| crate::pyjitpl::CompiledEntry {
             token: std::sync::Weak::new(),
             meta,
-            front_target_tokens: Vec::new(),
             front_entry_index: None,
             front_target_source_positions: None,
             root_trace_id,
@@ -15599,7 +15515,7 @@ mod cross_loop_cut_close_tests {
         });
     }
 
-    /// A cross-loop cut leaves no PREAMBLE in `front_target_tokens[0]` — that
+    /// A cross-loop cut leaves no PREAMBLE in `target_tokens[0]` — that
     /// slot holds the cut prefix, whose entry invariants only the cutting trace
     /// has proven. `jump_to_preamble` (unroll.py) is the fallback
     /// whenever no specialized label matches, and an interp-origin entry bridge

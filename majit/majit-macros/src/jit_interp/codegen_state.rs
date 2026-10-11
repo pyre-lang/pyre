@@ -2339,8 +2339,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // `register_dispatch_jitcode`, so an absent callback is
                 // legitimate and keeps the previous fallback behaviour.
                 let storage = storage?;
-                let rd_numb = storage.rd_numb.as_ref();
-                let rd_consts = storage.rd_consts();
+                let rd_numb = storage.rd_numb().expect("rd_numb");
+                let rd_consts = storage.rd_consts().unwrap_or(&[]);
                 let __fvc = majit_ir::resumedata::get_frame_value_count_fn();
                 let __fvc_ref: ::std::option::Option<&dyn Fn(i32, i32) -> usize> =
                     __fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
@@ -2350,7 +2350,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                         rd_consts,
                         fail_arg_types,
                         __fvc_ref,
-                        storage.rd_virtuals.len(),
+                        storage.rd_virtuals().map_or(0, <[_]>::len),
                     );
                 if frames.is_empty() {
                     return None;

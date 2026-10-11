@@ -636,11 +636,6 @@ pub(crate) struct StoredExitLayout {
     pub(crate) source_op_index: Option<usize>,
     pub(crate) recovery_layout: Option<std::sync::Arc<ExitRecoveryLayout>>,
     pub(crate) resume_layout: Option<std::sync::Arc<ResumeLayoutSummary>>,
-    /// compile.py `ResumeGuardDescr` storage — single guard-owned
-    /// shared pool containing rd_numb / rd_consts / rd_virtuals /
-    /// rd_pendingfields. All readers (blackhole resume, bridge
-    /// retrace, GC root walker) share this Arc.
-    pub(crate) storage: Option<Arc<ResumeStorage>>,
     /// Source-op `descr` Arc, captured at trace-build time. Production
     /// guards / FINISH carry their `ResumeGuardDescr` /
     /// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescrRef`
@@ -684,9 +679,12 @@ impl StoredExitLayout {
             exit_types: ExitTypes::from_slice(self.resolve_exit_types()),
             is_finish: self.resolve_is_finish(),
             is_exception_exit: self.resolve_is_exception_exit(),
-            recovery_layout: self.recovery_layout.clone(),
-            resume_layout: self.resume_layout.clone(),
-            storage: self.storage.clone(),
+            // `ResumeGuardDescr.get_resumestorage()`: the `rd_*` payload is
+            // the descr's own; this record only names the descr.
+            storage: self
+                .descr
+                .as_ref()
+                .and_then(crate::resume::get_resumestorage),
         }
     }
 
@@ -2174,10 +2172,7 @@ pub(crate) struct CompiledEntry<M> {
     /// Behind an `Arc` the pyre entry path matches that: a warm entry clones a
     /// refcount where it used to clone the whole struct, on every call.
     pub(crate) meta: std::sync::Arc<M>,
-    /// Front-end loop-version state, mirroring RPython's
-    /// jitcell_token.target_tokens ownership across recompilations.
-    pub(crate) front_target_tokens: Vec<crate::history::TargetToken>,
-    /// Index into `front_target_tokens` of the LABEL the Cranelift host
+    /// Index into the token's `target_tokens` of the LABEL the Cranelift host
     /// enters this loop through, decided once when the entry is installed.
     ///
     /// Upstream has no counterpart: `JitCellToken.target_tokens`
@@ -2324,9 +2319,9 @@ impl<M> CompiledEntry<M> {
 /// will tell you.
 ///
 /// These two are carried at **all five** replace paths. They are deliberately
-/// the *only* members: `front_target_tokens` is carried at exactly one site
-/// (`compile_entry_bridge`) because the other four **mint** fresh labels, so
-/// inheriting it elsewhere would be a behaviour change, not a fix. Likewise
+/// the *only* members: the label list is `JitCellToken.target_tokens`
+/// (`history.py`), and a token minted by `make_jitcell_token` starts with
+/// none, so no replace path inherits the displaced loop's labels. Likewise
 /// `migrate_bridges` is called at three of the five and must stay at the call
 /// sites. Adding a field here that is not universal re-introduces exactly the
 /// bug this type exists to prevent.
@@ -2572,7 +2567,7 @@ pub struct MetaInterp<M: Clone> {
     /// structurally shaped like one. `cut_trace_from_with_consts` does run
     /// (`[jit] cut_trace_from: start.op_index=40 original_boxes=33
     /// trace_ops=77`) and the artifact does carry a peeled preamble —
-    /// `front_target_tokens` is `[preamble(no virtual state), specialized]`,
+    /// `token.target_tokens` is `[preamble(no virtual state), specialized]`,
     /// the same pair a loop compiled at its own header gets, which is what
     /// makes `jump_to_preamble` (unroll.py) sound there.
     ///
@@ -2842,12 +2837,6 @@ pub struct MetaInterp<M: Clone> {
     /// so explicitly. Set by [`register_retrace_merge_point`], consumed once
     /// by the driver.
     pub(crate) keep_tracing_after_close: bool,
-    /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
-    /// even when Phase 2 raises InvalidLoop. Keyed by
-    /// `(jitdriver_sd.index, cell green_key)` like `compiled_loops`; entries
-    /// are added on InvalidLoop and removed when the next retrace succeeds,
-    /// so the active set is bounded by the count of in-flight retraces.
-    pending_preamble_tokens: crate::FxIndexMap<(usize, u64), Vec<crate::history::TargetToken>>,
     // pyjitpl.py `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs()`.
@@ -3562,12 +3551,6 @@ impl<M: Clone> MetaInterp<M> {
             for entry in self.compiled_loops.values_mut() {
                 for trace in entry.traces.values_mut() {
                     for layout in trace.exit_layouts.values_mut() {
-                        visit_pool(
-                            layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                            generation,
-                            is_minor,
-                            &mut visitor,
-                        );
                         let descr_pool = layout
                             .descr
                             .as_ref()
@@ -3576,12 +3559,6 @@ impl<M: Clone> MetaInterp<M> {
                         visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
                     }
                     for layout in trace.terminal_exit_layouts.values_mut() {
-                        visit_pool(
-                            layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                            generation,
-                            is_minor,
-                            &mut visitor,
-                        );
                         let descr_pool = layout
                             .descr
                             .as_ref()
@@ -3601,13 +3578,32 @@ impl<M: Clone> MetaInterp<M> {
                 // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
                 // the other tracer kinds (GcTables) are rooted through
                 // the gcreftracer registry.
-                let tokens = entry.live_token().into_iter().chain(
-                    entry
-                        .previous_tokens
-                        .iter()
-                        .filter_map(std::sync::Weak::upgrade),
-                );
-                for token in tokens {
+                let mut tokens: Vec<std::sync::Arc<JitCellToken>> = entry
+                    .live_token()
+                    .into_iter()
+                    .chain(
+                        entry
+                            .previous_tokens
+                            .iter()
+                            .filter_map(std::sync::Weak::upgrade),
+                    )
+                    .collect();
+                // `history.py JitCellToken.record_jump_to` keeps the target
+                // of a JUMP alive through `_keepalive_jitcell_tokens` even
+                // after its own cell row is gone; follow that set to a fixed
+                // point so those tokens are walked with the ones above.
+                let mut next = 0;
+                while next < tokens.len() {
+                    let kept: Vec<std::sync::Arc<JitCellToken>> =
+                        tokens[next].keepalive_tokens.lock().clone();
+                    for token in kept {
+                        if !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token)) {
+                            tokens.push(token);
+                        }
+                    }
+                    next += 1;
+                }
+                for token in &tokens {
                     let Some(clt) = token.compiled_loop_token() else {
                         continue;
                     };
@@ -3627,17 +3623,26 @@ impl<M: Clone> MetaInterp<M> {
                         }
                     }
                 }
-                for tt in entry.front_target_tokens.iter_mut() {
+                // A displaced token stays alive while a JUMP still enters it
+                // (`history.py JitCellToken.record_jump_to`), and its
+                // `TargetToken.virtual_state` / `short_preamble` graphs with
+                // it, so the walk covers the same live-plus-previous set as
+                // the descr pools above.
+                let target_tokens = tokens
+                    .iter()
+                    .flat_map(|token| crate::history::target_tokens_of(token));
+                for tt in target_tokens {
                     // `history.TargetToken` is a GC object upstream. MiniMark
                     // visits it in a minor only while its write barrier is
                     // dirty; after forwarding its graph, clean tokens stay out
                     // of later minor walks until another traced-field store. A
                     // major must still see every token graph.
                     if !is_minor || tt.take_minor_scan_pending() {
-                        if let Some(virtual_state) = tt.virtual_state.as_mut() {
+                        let mut attrs = tt.attrs();
+                        if let Some(virtual_state) = attrs.virtual_state.as_mut() {
                             virtual_state.walk_const_ptr_refs_mut(&mut visitor);
                         }
-                        if let Some(sp) = tt.short_preamble.as_mut() {
+                        if let Some(sp) = attrs.short_preamble.as_mut() {
                             sp.walk_const_ptr_refs_mut(&mut visitor);
                         }
                     }
@@ -4034,37 +4039,6 @@ impl<M: Clone> MetaInterp<M> {
         trace.ops.get(source_op_index).map(|op| op.opcode)
     }
 
-    /// O(1) owner lookup via `descr.rd_loop_token` (compile.py stamp,
-    /// stored as the owning loop's green_key).  Every guard produced by
-    /// the regular compile_loop / compile_bridge paths goes through the
-    /// `record_loop_or_bridge` walker, which stamps the owning clt onto
-    /// the descr.  Returns `None` for pre-populated descrs
-    /// (`compile_tmp_callback` stubs) so callers fall through to the
-    /// legacy scan.
-    ///
-    /// Issue 1.1 fix: old traces from a prior compilation are merged
-    /// into the new entry's `traces` map at recompile time
-    /// (`retire_compiled_entry`), mirroring main's eager-merge
-    /// behavior.  The previous retired-tokens fallback was a pyre-only
-    /// side-table that has been removed.
-    fn trace_for_exit_by_rd_loop_token(
-        &self,
-        jd_no: usize,
-        rd_loop_token: Option<u64>,
-        trace_id: u64,
-    ) -> Option<(u64, u64, &CompiledTrace)> {
-        // `compile.py handle_fail` reads `descr.rd_loop_token` off the
-        // failing guard; the cell lives on that token's `jitdriver_sd.warmstate`.
-        // Ambient `compiled_entry` follows leftover `active_jitdriver_sd`.
-        let green_key = rd_loop_token?;
-        let compiled = self.compiled_entry_on_driver(jd_no, green_key)?;
-        let resolved = trace_id;
-        compiled
-            .traces
-            .get(&resolved)
-            .map(|trace| (green_key, resolved, trace))
-    }
-
     fn compiled_exit_layout_from_trace(
         trace: &CompiledTrace,
         owning_key: u64,
@@ -4075,67 +4049,6 @@ impl<M: Clone> MetaInterp<M> {
             .exit_layouts
             .get(&fail_index)
             .map(|layout| layout.public(owning_key, trace_id, fail_index))
-    }
-
-    /// Build the `CompiledExitLayout` for an exit identified by `descr`, owned
-    /// by the loop registered under `green_key`. Mirrors the inline layout
-    /// construction in `run_compiled_detailed_with_values`; the wasm in-guest
-    /// CALL_ASSEMBLER deopt path (`call_jit::wasm_ca_resume_deopt`) reuses it to
-    /// blackhole-resume a callee frame that left its trace through a guard,
-    /// rather than re-running it from the entry.
-    pub fn build_exit_layout_for_descr(
-        &self,
-        green_key: u64,
-        descr: &dyn majit_ir::FailDescr,
-    ) -> CompiledExitLayout {
-        let fail_index = descr.fail_index();
-        let trace_id = descr.trace_id();
-        let is_finish = descr.is_finish();
-        let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
-        let exit_types = ExitTypes::from_slice(descr.fail_arg_types());
-        let rd_loop_token = majit_backend::descr_owning_green_key(descr);
-
-        let default_layout = || CompiledExitLayout {
-            rd_loop_token: green_key,
-            trace_id,
-            fail_index,
-            source_op_index: None,
-            exit_types: exit_types.clone(),
-            is_finish,
-            is_exception_exit: is_exit_frame_with_exception,
-            recovery_layout: None,
-            resume_layout: None,
-            storage: None,
-        };
-
-        // FINISH descrs (singletons) have `trace_id == 0`; skip the trace lookup
-        // and synthesize the default layout, as `run_compiled_detailed_with_values`
-        // does for the is_finish arm.
-        if is_finish {
-            return default_layout();
-        }
-        // A guard with no frontend record — every bridge guard
-        // (`compile.py send_bridge_to_backend`) — answers off its own
-        // `ResumeGuardDescr` payload.
-        let from_descr = || {
-            Self::compiled_exit_layout_from_descr(descr, green_key, trace_id, fail_index)
-                .unwrap_or_else(default_layout)
-        };
-        // `handle_fail` is the failing descr's: its loop is
-        // `rd_loop_token`, and the cell lives on that token's
-        // `outermost_jitdriver_sd.warmstate`.
-        let jd_no = self
-            .jitdriver_index_for_failed_token(majit_backend::descr_owning_jct(descr).as_deref());
-        let Some(compiled) = self.compiled_entry_on_driver(jd_no, green_key) else {
-            return from_descr();
-        };
-        Self::trace_for_exit(compiled, trace_id)
-            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-            .or_else(|| self.trace_for_exit_by_rd_loop_token(jd_no, rd_loop_token, trace_id))
-            .and_then(|(owning_key, resolved_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
-            })
-            .unwrap_or_else(from_descr)
     }
 
     /// `compile.py ResumeGuardDescr._attrs_` parity: per-guard exit
@@ -4225,50 +4138,6 @@ impl<M: Clone> MetaInterp<M> {
             })
     }
 
-    fn terminal_exit_layout_from_trace(
-        trace: &CompiledTrace,
-        owning_key: u64,
-        trace_id: u64,
-        op_index: usize,
-    ) -> Option<CompiledExitLayout> {
-        trace.terminal_exit_layouts.get(&op_index).map(|layout| {
-            layout.public(
-                owning_key,
-                trace_id,
-                compile::find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
-            )
-        })
-    }
-
-    #[allow(dead_code)]
-    fn backend_terminal_exit_layout(
-        &self,
-        compiled: &CompiledEntry<M>,
-        trace_id: u64,
-        op_index: usize,
-    ) -> Option<majit_backend::TerminalExitLayout> {
-        let lookup = |token: &JitCellToken| {
-            token.compiled.get()?;
-            self.backend
-                .compiled_trace_terminal_exit_layouts(token, trace_id)
-                .and_then(|layouts| {
-                    layouts
-                        .into_iter()
-                        .find(|layout| layout.op_index == op_index)
-                })
-        };
-        compiled
-            .live_token()
-            .as_deref()
-            .and_then(lookup)
-            .or_else(|| {
-                compiled
-                    .previous_tokens
-                    .iter()
-                    .find_map(|weak| weak.upgrade().and_then(|t| lookup(&t)))
-            })
-    }
-
     fn compiled_exit_layout_from_backend(
         &self,
         compiled: &CompiledEntry<M>,
@@ -4285,9 +4154,7 @@ impl<M: Clone> MetaInterp<M> {
                 let storage = layout
                     .descr
                     .as_ref()
-                    .and_then(|descr| descr.as_fail_descr())
-                    .and_then(crate::resume::ResumeStorage::from_fail_descr)
-                    .map(std::sync::Arc::new);
+                    .and_then(crate::resume::get_resumestorage);
                 // `from_vec`, so whichever arm wins hands over the buffer it
                 // already owns instead of being copied into a fresh one.
                 let exit_types = ExitTypes::from_vec(if layout.fail_arg_types.is_empty() {
@@ -4303,151 +4170,9 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types,
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
-                    resume_layout: None,
                     storage,
                 }
             })
-    }
-
-    fn terminal_exit_layout_from_backend(
-        &self,
-        compiled: &CompiledEntry<M>,
-        owning_key: u64,
-        trace_id: u64,
-        op_index: usize,
-    ) -> Option<CompiledExitLayout> {
-        self.backend_terminal_exit_layout(compiled, trace_id, op_index)
-            .map(|layout| CompiledExitLayout {
-                rd_loop_token: owning_key, // compile.py record_loop_or_bridge
-                trace_id,
-                fail_index: layout.fail_index,
-                source_op_index: Some(layout.op_index),
-                exit_types: ExitTypes::from_vec(layout.exit_types),
-                is_finish: layout.is_finish,
-                is_exception_exit: layout.is_exception_exit,
-                recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
-                resume_layout: None,
-                storage: None,
-            })
-    }
-
-    fn compiled_trace_layout_for_trace(
-        &self,
-        compiled: &CompiledEntry<M>,
-        owning_key: u64,
-        trace_id: u64,
-    ) -> Option<CompiledTraceLayout> {
-        let mut exit_layouts =
-            if let Some((resolved_trace_id, trace)) = Self::trace_for_exit(compiled, trace_id) {
-                let mut layouts: Vec<_> = trace
-                    .exit_layouts
-                    .iter()
-                    .map(|(&fail_index, layout)| {
-                        layout.public(owning_key, resolved_trace_id, fail_index)
-                    })
-                    .collect();
-                layouts.sort_by_key(|layout| layout.fail_index);
-                layouts
-            } else {
-                Vec::new()
-            };
-        if let Some(backend_layouts) = compiled.live_token().as_deref().and_then(|token| {
-            self.backend
-                .compiled_trace_fail_descr_layouts(token, trace_id)
-        }) {
-            let mut merged: crate::FxIndexMap<u32, CompiledExitLayout> =
-                crate::FxIndexMap::default();
-            for layout in exit_layouts.drain(..) {
-                merged.insert(layout.fail_index, layout);
-            }
-            for layout in backend_layouts {
-                merged.insert(
-                    layout.fail_index,
-                    CompiledExitLayout {
-                        rd_loop_token: owning_key, // compile.py record_loop_or_bridge
-                        trace_id,
-                        fail_index: layout.fail_index,
-                        source_op_index: layout.source_op_index,
-                        exit_types: ExitTypes::from_vec(layout.fail_arg_types),
-                        is_finish: layout.is_finish,
-                        is_exception_exit: layout.is_exception_exit,
-                        recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
-                        resume_layout: merged
-                            .get(&layout.fail_index)
-                            .and_then(|existing| existing.resume_layout.clone()),
-                        storage: None,
-                    },
-                );
-            }
-            exit_layouts = merged.into_iter().map(|(_, v)| v).collect();
-            exit_layouts.sort_by_key(|layout| layout.fail_index);
-        }
-
-        let mut terminal_exit_layouts =
-            if let Some((resolved_trace_id, trace)) = Self::trace_for_exit(compiled, trace_id) {
-                let mut layouts: Vec<_> = trace
-                    .terminal_exit_layouts
-                    .iter()
-                    .map(|(&op_index, layout)| CompiledTerminalExitLayout {
-                        op_index,
-                        exit_layout: layout.public(
-                            owning_key,
-                            resolved_trace_id,
-                            compile::find_fail_index_for_exit_op(&trace.ops, op_index)
-                                .unwrap_or(u32::MAX),
-                        ),
-                    })
-                    .collect();
-                layouts.sort_by_key(|layout| layout.op_index);
-                layouts
-            } else {
-                Vec::new()
-            };
-        if let Some(backend_layouts) = compiled.live_token().as_deref().and_then(|token| {
-            self.backend
-                .compiled_trace_terminal_exit_layouts(token, trace_id)
-        }) {
-            let mut merged: crate::FxIndexMap<usize, CompiledTerminalExitLayout> =
-                crate::FxIndexMap::default();
-            for layout in terminal_exit_layouts.drain(..) {
-                merged.insert(layout.op_index, layout);
-            }
-            for layout in backend_layouts {
-                merged.insert(
-                    layout.op_index,
-                    CompiledTerminalExitLayout {
-                        op_index: layout.op_index,
-                        exit_layout: CompiledExitLayout {
-                            rd_loop_token: owning_key, // compile.py record_loop_or_bridge
-                            trace_id,
-                            fail_index: layout.fail_index,
-                            source_op_index: Some(layout.op_index),
-                            exit_types: ExitTypes::from_vec(layout.exit_types),
-                            is_finish: layout.is_finish,
-                            is_exception_exit: layout.is_exception_exit,
-                            recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
-                            resume_layout: merged
-                                .get(&layout.op_index)
-                                .and_then(|existing| existing.exit_layout.resume_layout.clone()),
-                            storage: None,
-                        },
-                    },
-                );
-            }
-            terminal_exit_layouts = merged.into_iter().map(|(_, v)| v).collect();
-            terminal_exit_layouts.sort_by_key(|layout| layout.op_index);
-        }
-
-        if exit_layouts.is_empty() && terminal_exit_layouts.is_empty() {
-            None
-        } else {
-            Some(CompiledTraceLayout {
-                trace_id,
-                exit_layouts,
-                terminal_exit_layouts,
-            })
-        }
     }
 
     /// Create a new MetaInterp with the given compilation threshold.
@@ -4506,7 +4231,6 @@ impl<M: Clone> MetaInterp<M> {
             cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
-            pending_preamble_tokens: crate::FxIndexMap::default(),
             pending_frontend_boxes: None,
             pending_frontend_box_types: None,
             cpu: crate::cpu::default_cpu(),
@@ -9075,13 +8799,8 @@ impl<M: Clone> MetaInterp<M> {
         // its own labels. `ensure_preamble_target_token`
         // (`optimizeopt/unroll.rs`) inserts that one element, so an empty list
         // here is `[start_descr]`, not an absent label.
-        //
-        // The drain stays: reaching this point means a recompile is under way,
-        // so the tokens a previous InvalidLoop attempt parked for this green
-        // key are spent either way.
-        let preamble_key = self.compiled_loop_key(green_key);
-        self.pending_preamble_tokens.swap_remove(&preamble_key);
-        let prior_front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
+        let prior_front_target_tokens: Vec<std::sync::Arc<crate::history::TargetToken>> =
+            Vec::new();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.enable_opts = enable_opts.clone();
         unroll_opt.supports_efficient_uint_mul_high =
@@ -9909,32 +9628,9 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compile_loop InvalidLoop, aborting trace at key={green_key}"),
                     );
                 }
-                // compile.py:288 parity: preserve preamble target_tokens
-                // even on InvalidLoop/panic. The unroller's Phase 1 created
-                // target_tokens that the next retrace needs.
-                // Store in compiled_loops if available, otherwise in
-                // pending_preamble_tokens for the first InvalidLoop before
-                // any successful compilation (RPython: jitcell_token.
-                // target_tokens = [start_descr] before Phase 2 runs).
-                if is_invalid_loop && !unroll_opt.target_tokens.is_empty() {
-                    if let Some(compiled) = self.compiled_entry_mut(green_key) {
-                        if compiled.front_target_tokens.is_empty() {
-                            compiled.front_target_tokens = unroll_opt.target_tokens.clone();
-                            if compiled.front_entry_index.is_none() {
-                                compiled.front_entry_index =
-                                    Self::front_entry_index_for(&compiled.front_target_tokens);
-                            }
-                        }
-                    } else {
-                        let preamble_key = self.compiled_loop_key(green_key);
-                        if !self.pending_preamble_tokens.contains_key(&preamble_key) {
-                            self.pending_preamble_tokens
-                                .entry_or_insert_with(preamble_key, || {
-                                    unroll_opt.target_tokens.clone()
-                                });
-                        }
-                    }
-                }
+                // `compile.py compile_loop` `except InvalidLoop: return None`:
+                // the token this compile minted, and the `[start_descr]` it
+                // was given, are dropped with it.
                 // pyjitpl.py disable_noninlinable_function is only the
                 // ABORT_TOO_LONG arm of blackhole_if_trace_too_long.
                 // compile.py compile_loop InvalidLoop / panic returns None
@@ -10060,7 +9756,7 @@ impl<M: Clone> MetaInterp<M> {
                             format!(
                                 "{}{}",
                                 if target.is_preamble_target { "P" } else { "S" },
-                                target.virtual_state.is_some() as u8,
+                                target.attrs().virtual_state.is_some() as u8,
                             )
                         })
                         .collect();
@@ -10084,7 +9780,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_target_tokens,
                         front_entry_index,
                         front_target_source_positions,
                         root_trace_id: trace_id,
@@ -10723,7 +10418,7 @@ impl<M: Clone> MetaInterp<M> {
                     origin_key,
                     green_key,
                     fail_index,
-                    fail_descr,
+                    &descr_arc,
                     bridge_ops,
                     &bridge_inputargs,
                     finish_args,
@@ -11141,11 +10836,8 @@ impl<M: Clone> MetaInterp<M> {
         // installs (`record_jump_to`).
         let prior_front_target_tokens = self
             .compiled_entry(green_key)
-            .map(|compiled| compiled.front_target_tokens.clone())
-            .or_else(|| {
-                let preamble_key = self.compiled_loop_key(green_key);
-                self.pending_preamble_tokens.swap_remove(&preamble_key)
-            })
+            .and_then(|compiled| compiled.live_token())
+            .map(|live| crate::history::target_tokens_of(&live))
             .unwrap_or_default();
         let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
         let retrace_limit = self.warm_state_for_driver(compiling_jd).retrace_limit();
@@ -11632,19 +11324,14 @@ impl<M: Clone> MetaInterp<M> {
                 // not by republishing its labels as this token's entry.
                 // `compile_retrace` installs a trace that ends in a JUMP to
                 // the previous `TargetToken`; it does not re-emit that
-                // LABEL. No new label: keep the previous list only as the
-                // optimizer scan state a later retrace seeds, and leave
-                // `front_entry_index` unset so the host does not dispatch
-                // on a LABEL this function never emitted.
+                // LABEL. No new label: the fresh token's `target_tokens`
+                // holds nothing, and `front_entry_index` stays unset so the
+                // host does not dispatch on a LABEL this function never
+                // emitted.
                 let front_entry_index = if minted_label_tokens.is_empty() {
                     None
                 } else {
                     Self::front_entry_index_for(&minted_label_tokens)
-                };
-                let front_target_tokens = if minted_label_tokens.is_empty() {
-                    prior_front_target_tokens
-                } else {
-                    minted_label_tokens
                 };
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.note_compiled_loops_changed();
@@ -11654,7 +11341,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
@@ -11913,15 +11599,23 @@ impl<M: Clone> MetaInterp<M> {
                     // newly minted TargetToken to `jitcelltoken.target_tokens`
                     // — the SAME list `unroll.py:198/239/277` scans when a
                     // later trace looks for a label to jump onto. majit keeps
-                    // that scan list on the compiled entry, so the token has to
+                    // that scan list on the loop's token, so the token has to
                     // land there whichever way the artifact is installed;
                     // otherwise no later bridge can ever reach this retrace's
                     // label and each one grows another guard-attached retrace.
                     if !unroll_opt.target_tokens.is_empty() {
-                        compiled.front_target_tokens = unroll_opt.target_tokens.clone();
+                        if let Some(live) = compiled.live_token() {
+                            live.set_target_tokens(
+                                unroll_opt
+                                    .target_tokens
+                                    .iter()
+                                    .map(|target| target.as_jump_target_descr())
+                                    .collect(),
+                            );
+                        }
                         if compiled.front_entry_index.is_none() {
                             compiled.front_entry_index =
-                                Self::front_entry_index_for(&compiled.front_target_tokens);
+                                Self::front_entry_index_for(&unroll_opt.target_tokens);
                         }
                     }
                     // `compile.py send_bridge_to_backend`: the bridge is
@@ -12700,7 +12394,8 @@ impl<M: Clone> MetaInterp<M> {
                     let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                     let ft = self
                         .compiled_entry(green_key)
-                        .map(|c| c.front_target_tokens.clone())
+                        .and_then(|c| c.live_token())
+                        .map(|live| crate::history::target_tokens_of(&live))
                         .unwrap_or_default();
                     let _had_old = self.has_compiled_loop_entry(green_key);
                     // Carried forward for the same reason as the compile_loop site.
@@ -12731,7 +12426,7 @@ impl<M: Clone> MetaInterp<M> {
                     // and attaches through `resumekey.compile_and_attach`.  It
                     // never builds a `TargetToken`/LABEL and never adds to
                     // `jitcell_token.target_tokens`.  So a FINISH-only trace
-                    // leaves `front_target_tokens` empty: `has_compiled_targets`
+                    // leaves `target_tokens` empty: `has_compiled_targets`
                     // (`pyjitpl.py` = `bool(token.target_tokens)`) is
                     // false, while the trace stays enterable through
                     // `has_compiled_loop`
@@ -12752,7 +12447,6 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledEntry {
                             token: Arc::downgrade(&token),
                             meta: Arc::new(meta),
-                            front_target_tokens: ft,
                             front_entry_index,
                             front_target_source_positions: None,
                             root_trace_id: trace_id,
@@ -12820,7 +12514,7 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py compile_simple_loop parity.
     ///
     /// Compiles the trace with simple optimizer (no preamble peeling),
-    /// prepends a LABEL (via front_target_tokens) for bridge attachment.
+    /// prepends a LABEL (via the token's `target_tokens`) for bridge attachment.
     /// Returns the green_key on success (caller must call
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
@@ -13201,7 +12895,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
@@ -13772,7 +13465,9 @@ impl<M: Clone> MetaInterp<M> {
             .any(|(jump_arg, label_arg)| jump_arg.is_constant() && !label_arg.is_constant())
     }
 
-    fn front_entry_index_for(tokens: &[crate::history::TargetToken]) -> Option<usize> {
+    fn front_entry_index_for(
+        tokens: &[std::sync::Arc<crate::history::TargetToken>],
+    ) -> Option<usize> {
         tokens
             .iter()
             .position(|target| !target.is_preamble_target)
@@ -13781,15 +13476,14 @@ impl<M: Clone> MetaInterp<M> {
 
     fn selected_front_target_token(
         compiled: &CompiledEntry<M>,
-    ) -> Option<&crate::history::TargetToken> {
-        compiled
-            .front_target_tokens
-            .get(compiled.front_entry_index?)
+    ) -> Option<std::sync::Arc<crate::history::TargetToken>> {
+        let live = compiled.live_token()?;
+        crate::history::target_token_at(&live, compiled.front_entry_index?)
     }
 
     fn compact_label_values_for_selected_target(
         green_key: u64,
-        front_target_tokens: &[crate::history::TargetToken],
+        front_target_tokens: &[std::sync::Arc<crate::history::TargetToken>],
         compiled_ops: &[majit_ir::OpRc],
         trace: &TreeLoop,
         full_live_values: Option<&[Value]>,
@@ -13900,13 +13594,6 @@ impl<M: Clone> MetaInterp<M> {
             .clone()
             .map(|layout| {
                 let trace_layout_ref = trace_layout.as_ref();
-                let mut resume_layout = trace_layout
-                    .as_ref()
-                    .and_then(|tl| tl.resume_layout.as_deref().cloned());
-                compile::enrich_resume_layout_with_frame_stack(
-                    &mut resume_layout,
-                    layout.frame_stack.as_deref(),
-                );
                 CompiledExitLayout {
                     rd_loop_token: green_key, // compile.py:186
                     trace_id,
@@ -13923,22 +13610,9 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    recovery_layout: layout.recovery_layout.map(std::sync::Arc::new).or_else(
-                        || trace_layout_ref.and_then(|layout| layout.recovery_layout.clone()),
-                    ),
-                    resume_layout: resume_layout.map(std::sync::Arc::new),
-                    // A bridge guard has no frontend record
-                    // (`send_bridge_to_backend`); its pool is the descr's
-                    // own (`ResumeGuardDescr.get_resumestorage`).
-                    storage: trace_layout_ref
-                        .and_then(|layout| layout.storage.clone())
-                        .or_else(|| {
-                            result
-                                .descr_arc
-                                .as_fail_descr()
-                                .and_then(crate::resume::ResumeStorage::from_fail_descr)
-                                .map(Arc::new)
-                        }),
+                    // `ResumeGuardDescr.get_resumestorage()`: the pool is the
+                    // failing descr's own.
+                    storage: crate::resume::get_resumestorage(&result.descr_arc),
                 }
             })
             .or(trace_layout)
@@ -13954,11 +13628,7 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types,
                     is_finish: result.is_finish,
                     is_exception_exit: result.is_exit_frame_with_exception,
-                    recovery_layout: None,
-                    resume_layout: None,
-                    storage: fd
-                        .and_then(crate::resume::ResumeStorage::from_fail_descr)
-                        .map(Arc::new),
+                    storage: crate::resume::get_resumestorage(&result.descr_arc),
                 }
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
@@ -14111,12 +13781,10 @@ impl<M: Clone> MetaInterp<M> {
                 // Fresh, fallible lookup — see `run_compiled_raw_detailed_with_values`.
                 self.compiled_entry(green_key)
                     .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
-                    .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-                    .or_else(|| self.trace_for_exit_by_rd_loop_token(0, rd_loop_token, trace_id))
-                    .and_then(|(owning_key, resolved_id, trace)| {
+                    .and_then(|(resolved_id, trace)| {
                         Self::compiled_exit_layout_from_trace(
                             trace,
-                            owning_key,
+                            green_key,
                             resolved_id,
                             fail_index,
                         )
@@ -14129,14 +13797,11 @@ impl<M: Clone> MetaInterp<M> {
                         exit_types: ExitTypes::from_slice(exit_types),
                         is_finish,
                         is_exception_exit: is_exit_frame_with_exception,
-                        recovery_layout: None,
-                        resume_layout: None,
                         // The green-key index no longer holds this trace, but the
                         // failing descr still carries the resume payload it was
                         // compiled with (`compile.py get_resumestorage`), so a
                         // blackhole resume off this layout stays possible.
-                        storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                            .map(std::sync::Arc::new),
+                        storage: crate::resume::get_resumestorage(&descr_arc),
                     }),
             )
         };
@@ -14235,13 +13900,10 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(descr_arc) = &result.descr_arc
             && !Self::is_jump_exit(result.is_finish, result.fail_index)
         {
-            let descr = descr_arc
-                .as_fail_descr()
-                .expect("a guard exit carries a FailDescr");
             result.exit_layout = Some(Box::new(self.guard_exit_layout(
                 jd_no,
                 green_key,
-                descr,
+                &descr_arc,
                 result.rd_loop_token,
             )));
         }
@@ -14273,9 +13935,12 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         jd_no: usize,
         green_key: u64,
-        descr: &dyn majit_ir::FailDescr,
+        descr_arc: &majit_ir::DescrRef,
         rd_loop_token: Option<u64>,
     ) -> CompiledExitLayout {
+        let descr: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("a guard exit carries a FailDescr");
         let fail_index = descr.fail_index();
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
@@ -14292,10 +13957,8 @@ impl<M: Clone> MetaInterp<M> {
         // green key no longer holds it.
         let mut exit_layout = compiled
             .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
-            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-            .or_else(|| self.trace_for_exit_by_rd_loop_token(jd_no, rd_loop_token, trace_id))
-            .and_then(|(owning_key, resolved_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
+            .and_then(|(resolved_id, trace)| {
+                Self::compiled_exit_layout_from_trace(trace, green_key, resolved_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
                 rd_loop_token: green_key,
@@ -14305,14 +13968,11 @@ impl<M: Clone> MetaInterp<M> {
                 exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
-                recovery_layout: None,
-                resume_layout: None,
                 // The green-key index no longer holds this trace, but the
                 // failing descr still carries the resume payload it was
                 // compiled with (`compile.py get_resumestorage`), so a
                 // blackhole resume off this layout stays possible.
-                storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                    .map(std::sync::Arc::new),
+                storage: crate::resume::get_resumestorage(descr_arc),
             });
         // RPython: deadframe has ALL jitframe slots accessible.
         // If the backend's descr covers more slots than the trace layout,
@@ -14770,220 +14430,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Attach resume data to a specific guard in a compiled loop.
-    ///
-    /// `resume.py rebuild_from_resumedata` consumes this storage at
-    /// blackhole resume time via the descr; only test fixtures install
-    /// resume data through this MetaInterp-side helper today.
-    ///
-    /// **No PyPy counterpart**: PyPy builds `ResumeGuardDescr` storage
-    /// during compilation (`compile.py:858 compile_loop_or_bridge`
-    /// → `record_loop_or_bridge` populates `descr.rd_*` from the live
-    /// `ResumeData` snapshot before the loop executes). There is no
-    /// helper that injects resume data after the fact. Tests that need
-    /// the production `get_resume_storage` chain can use this helper
-    /// because it installs both the layout summary and the guard-owned
-    /// `ResumeStorage` surrogate.
-    pub fn attach_resume_data(&mut self, green_key: u64, fail_index: u32, resume_data: ResumeData) {
-        let Some(trace_id) = self.compiled_entry(green_key).map(|c| c.root_trace_id) else {
-            return;
-        };
-        self.attach_resume_data_to_trace(green_key, trace_id, fail_index, resume_data);
-    }
-
-    /// Attach resume data to a specific guard in a specific compiled trace.
-    ///
-    /// **Test-helper-only divergence (no PyPy counterpart).** The
-    /// production compile path populates two views of guard-owned resume
-    /// data on `StoredExitLayout`: the `ResumeLayoutSummary` used by
-    /// frontend recovery helpers and the shared `ResumeStorage` consumed
-    /// by `get_resume_storage` (`compile.py ResumeGuardDescr`
-    /// parity). This helper now installs both views from the same
-    /// `EncodedResumeData` so tests observe the same lookup chain as
-    /// production. Pending-field replay still requires the production
-    /// compile path because the test helper input has descriptor
-    /// indices but not the live field/array descriptors.
-    ///
-    /// **Convergence path**: retire this helper after the 8 fixtures
-    /// in `tests/jit_driver_runtime_parity.rs` migrate to
-    /// compile-path resume data injection (test
-    /// refactor). Reaching strict line-by-line parity removes the
-    /// out-of-band injection surface entirely, matching PyPy's "resume
-    /// data is built at compile time, never injected" contract.
-    pub fn attach_resume_data_to_trace(
-        &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        resume_data: ResumeData,
-    ) {
-        // pyjitpl.py: `attach_resume_data_to_trace` callers always pass
-        // the real allocated trace_id; `alloc_trace_id` starts at 1, so
-        // `trace_id == 0` would be a sentinel-misuse bug, not a valid
-        // input.  RPython has no `0 → root_trace_id` fallback because
-        // it dispatches by descr object identity, not numeric trace id.
-        let Some((trace_id, trace_info)) = self
-            .compiled_entry(green_key)
-            .and_then(|compiled| compiled.live_token())
-            .map(|token| (trace_id, self.backend.compiled_trace_info(&token, trace_id)))
-        else {
-            return;
-        };
-        let mut patched_recovery_layout = None;
-        if let Some(compiled) = self.compiled_entry_mut(green_key)
-            && let Some(trace) = compiled.traces.get_mut(&trace_id)
-        {
-            let recovery_layout = trace
-                .exit_layouts
-                .get(&fail_index)
-                .and_then(|layout| layout.recovery_layout.clone());
-            let encoded = resume_data.encode();
-            let mut layout = encoded.layout_summary();
-            let Ok(storage) = encoded.to_resume_storage() else {
-                // `resume.py tag` raises `TagOverflow`; `compile.py giveup`
-                // abandons the compile. This injector is not that path, so
-                // a tag that does not fit is storage we do not attach.
-                return;
-            };
-            compile::enrich_resume_layout_with_trace_metadata(
-                &mut layout,
-                trace_id,
-                &trace.inputargs,
-                trace_info.as_ref(),
-                recovery_layout.as_deref(),
-            );
-            if let Some(exit_layout) = trace.exit_layouts.get_mut(&fail_index) {
-                exit_layout.resume_layout = Some(std::sync::Arc::new(layout));
-                exit_layout.storage = Some(storage);
-                if let Some(summary) = exit_layout.resume_layout.as_ref() {
-                    let recovery_layout = summary.to_exit_recovery_layout_with_caller_prefix(
-                        exit_layout.recovery_layout.as_deref(),
-                    );
-                    exit_layout.recovery_layout =
-                        Some(std::sync::Arc::new(recovery_layout.clone()));
-                    patched_recovery_layout = Some(recovery_layout);
-                }
-            }
-        }
-        // The backend no longer caches a per-descr recovery layout;
-        // the metainterp's `StoredExitLayout.recovery_layout` (updated above)
-        // is the single canonical store consumed via
-        // `trace_layout_ref.recovery_layout` at deopt.
-        let _ = patched_recovery_layout;
-    }
-
-    /// Get the full static layout for a compiled exit in a specific trace.
-    pub fn get_compiled_exit_layout_in_trace(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<CompiledExitLayout> {
-        let compiled = self.compiled_entry(green_key)?;
-        if let Some((resolved_trace_id, trace)) = Self::trace_for_exit(compiled, trace_id)
-            && let Some(layout) = Self::compiled_exit_layout_from_trace(
-                trace,
-                green_key,
-                resolved_trace_id,
-                fail_index,
-            )
-        {
-            return Some(layout);
-        }
-        self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
-    }
-
-    /// `AbstractResumeGuardDescr.handle_fail(self, deadframe)`: the failing
-    /// guard's exit metadata read off the descr the deadframe named.  The
-    /// root loop's frontend record is consulted first (it carries the
-    /// enriched `resume_layout` the cranelift recovery path reads); a
-    /// bridge guard has no such record (`send_bridge_to_backend`), so its
-    /// layout is assembled from the descr's own `rd_*` pool, types and
-    /// stamped trace positions.  No backend scan.
-    pub fn get_compiled_exit_layout_for_descr(
-        &self,
-        descr: &dyn majit_ir::FailDescr,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<CompiledExitLayout> {
-        // `handle_fail` is the failing descr's: its loop is `rd_loop_token`
-        // and the cell lives on that token's `outermost_jitdriver_sd`.
-        let jd_no = self
-            .jitdriver_index_for_failed_token(majit_backend::descr_owning_jct(descr).as_deref());
-        if let Some(compiled) = self.compiled_entry_on_driver(jd_no, green_key)
-            && let Some((resolved_trace_id, trace)) = Self::trace_for_exit(compiled, trace_id)
-            && let Some(layout) = Self::compiled_exit_layout_from_trace(
-                trace,
-                green_key,
-                resolved_trace_id,
-                fail_index,
-            )
-        {
-            return Some(layout);
-        }
-        if let Some(layout) =
-            Self::compiled_exit_layout_from_descr(descr, green_key, trace_id, fail_index)
-        {
-            return Some(layout);
-        }
-        // A descr that carries no resume payload of its own: only the test
-        // scaffolds mint such guards (codegen fills in the backend-side
-        // copy), so the backend index is the last place to ask.  Production
-        // guards answer above.
-        let compiled = self.compiled_entry_on_driver(jd_no, green_key)?;
-        self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
-    }
-
-    /// `ResumeGuardDescr` read into the exit-layout shape: `rd_numb` /
-    /// `rd_consts` / `rd_virtuals` / `rd_pendingfields` become the shared
-    /// `ResumeStorage`, `fail_arg_types` the slot types.  `None` when the
-    /// descr carries no resume payload (a non-resume FailDescr).
-    fn compiled_exit_layout_from_descr(
-        descr: &dyn majit_ir::FailDescr,
-        owning_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<CompiledExitLayout> {
-        let storage = crate::resume::ResumeStorage::from_fail_descr(descr)?;
-        Some(CompiledExitLayout {
-            rd_loop_token: owning_key, // compile.py record_loop_or_bridge
-            trace_id,
-            fail_index,
-            source_op_index: descr.source_op_index(),
-            exit_types: ExitTypes::from_slice(descr.fail_arg_types()),
-            is_finish: descr.is_finish(),
-            is_exception_exit: descr.is_exit_frame_with_exception(),
-            recovery_layout: None,
-            resume_layout: None,
-            storage: Some(Arc::new(storage)),
-        })
-    }
-
-    /// Get the full static layout for a terminal FINISH/JUMP op in a specific trace.
-    pub fn get_terminal_exit_layout_in_trace(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        op_index: usize,
-    ) -> Option<CompiledExitLayout> {
-        let compiled = self.compiled_entry(green_key)?;
-        let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-        Self::terminal_exit_layout_from_trace(trace, green_key, trace_id, op_index).or_else(|| {
-            self.terminal_exit_layout_from_backend(compiled, green_key, trace_id, op_index)
-        })
-    }
-
-    /// Get the full static layout for a compiled trace in a specific trace id.
-    pub fn get_compiled_trace_layout_in_trace(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-    ) -> Option<CompiledTraceLayout> {
-        let compiled = self.compiled_entry(green_key)?;
-        self.compiled_trace_layout_for_trace(compiled, green_key, trace_id)
-    }
-
     /// Invalidate a compiled loop (e.g., due to GUARD_NOT_INVALIDATED).
     ///
     /// Marks the loop token as invalidated. Subsequent executions of the
@@ -15013,8 +14459,6 @@ impl<M: Clone> MetaInterp<M> {
     pub fn remove_compiled_loop_on_driver(&mut self, jd_no: usize, green_key: u64) {
         self.note_compiled_loops_changed();
         self.compiled_loops.swap_remove(&(jd_no, green_key));
-        self.pending_preamble_tokens
-            .swap_remove(&(jd_no, green_key));
         self.forget_loop_side_tables(jd_no, green_key);
     }
 
@@ -15035,7 +14479,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Drop the per-loop side tables (`loop_header_greens`,
-    /// `cut_compiled_keys`, `pending_preamble_tokens`) when a loop is retired,
+    /// `cut_compiled_keys`) when a loop is retired,
     /// so they cannot outlive `compiled_loops`. `compiled_key_for_greens`
     /// already skips keys without compiled targets, so a leftover entry could
     /// not mis-target a bridge — but keeping them would grow the maps without
@@ -15050,7 +14494,6 @@ impl<M: Clone> MetaInterp<M> {
         let key = (jd_no, green_key);
         self.loop_header_greens.swap_remove(&key);
         self.cut_compiled_keys.swap_remove(&key);
-        self.pending_preamble_tokens.swap_remove(&key);
     }
 
     /// rpython/rlib/rstack.py `stack_almost_full` — delegates to
@@ -15306,7 +14749,7 @@ impl<M: Clone> MetaInterp<M> {
     /// trace's saved ops, so rebuild their types from that trace.
     ///
     /// Two parity paths cover every JUMP target:
-    /// 1. Peeled (unrolled) loops — `front_target_tokens.first()` names the
+    /// 1. Peeled (unrolled) loops — `target_tokens.first()` names the
     ///    peeled-entry `TargetToken`; locate its LABEL in the root trace and
     ///    read each arg's type via `build_trace_value_maps`. RPython:
     ///    `optimizeopt/unroll.py` peeled-entry LABEL is the JUMP target.
@@ -15907,10 +15350,7 @@ impl<M: Clone> MetaInterp<M> {
     /// unrecoverable (null Ref in resume data).
     ///
     /// Bulk form of `remove_compiled_loop`, so it drops the per-loop side
-    /// tables too — see `forget_loop_side_tables`. `pending_preamble_tokens`
-    /// is left alone: it is keyed by `(jitdriver_sd.index, cell green_key)`
-    /// but holds tokens for a recompile that has not happened yet, not for
-    /// the loops being dropped.
+    /// tables too — see `forget_loop_side_tables`.
     pub fn clear_compiled_loops(&mut self) {
         self.note_compiled_loops_changed();
         self.compiled_loops.clear();
@@ -16319,202 +15759,6 @@ impl<M: Clone> crate::jit::JitParameterTarget for MetaInterp<M> {
 }
 
 impl<M: Clone> MetaInterp<M> {
-    fn recovery_slot_types_from_exit_types_and_layout(
-        exit_types: &[Type],
-        _recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
-    ) -> Vec<Type> {
-        exit_types.to_vec()
-    }
-
-    /// Return the compact fail-argument types for a guard exit.
-    ///
-    /// `ResumeDataDirectReader` indexes `deadframe` with TAGBOX numbers, so
-    /// this vector must stay parallel to the guard's compact fail arguments.
-    /// `ExitFrameLayout::slot_types` describes semantic frame slots in frame
-    /// order and is not interchangeable, even when the two vectors happen to
-    /// have the same length.
-    pub fn get_recovery_slot_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<Type>> {
-        let exit_layout =
-            self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
-        Some(Self::recovery_slot_types_from_exit_types_and_layout(
-            &exit_layout.exit_types,
-            exit_layout.recovery_layout.as_deref(),
-        ))
-    }
-
-    /// Return the merge point PC for blackhole resume from a guard exit.
-    ///
-    /// Producer invariant: after build_guard_metadata + backend merge,
-    /// every guard has recovery_layout with header_pc on all frames.
-    /// Returns None only if the (green_key, trace_id, fail_index) lookup
-    /// itself fails — a metadata consistency error, not a missing field.
-    ///
-    /// Resolved here rather than through `get_compiled_exit_layout_in_trace`,
-    /// which answers the same two lookups by building a whole
-    /// `CompiledExitLayout` around them: `StoredExitLayout::public` copies the
-    /// exit types and clones three `Arc`s, and the backend arm reassembles a
-    /// `ResumeStorage` out of clones of the fail descriptor's whole `rd_*`
-    /// pool. A caller after one `u64` drops every one of them again, and this
-    /// one runs on each reported guard failure. The resolution order is the
-    /// same — the trace's own entry first, the backend's only when the trace
-    /// holds none — so the two agree on which layout answers.
-    pub fn get_merge_point_pc(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<u64> {
-        let compiled = self.compiled_entry(green_key)?;
-        if let Some((_, trace)) = Self::trace_for_exit(compiled, trace_id)
-            && let Some(layout) = trace.exit_layouts.get(&fail_index)
-        {
-            return layout.recovery_layout.as_ref()?.frames.first()?.header_pc;
-        }
-        let backend = self.backend_fail_descr_layout(compiled, trace_id, fail_index)?;
-        let recovery = backend.recovery_layout.as_ref()?;
-        recovery.frames.first()?.header_pc
-    }
-
-    /// compile.py:853 `ResumeGuardDescr` storage handle lookup.
-    /// Returns the shared `Arc<ResumeStorage>` owned by the guard at
-    /// (green_key, trace_id, fail_index). Readers use this instead of
-    /// the legacy owned-copy accessors (`get_rd_numb`, `get_rd_virtuals`)
-    /// so every observer sees the same `rd_consts` pool the GC root
-    /// walker updates.
-    pub fn get_resume_storage(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Arc<ResumeStorage>> {
-        // compile.py `ResumeGuardDescr` storage is shared via the
-        // FailDescr identity, so the same guard descriptor exposes the
-        // same `rd_*` pool regardless of which retrieval path looks it
-        // up (frontend export, backend-recovered layout, previous-token
-        // bridge). Mirror that by falling back to the same lookup chain
-        // `get_compiled_exit_layout_in_trace` uses (frontend trace ->
-        // backend layout -> previous-token bridges) so callers like
-        // `get_rd_virtuals` and `get_resume_data_summary` see the
-        // storage even when only the backend has it.
-        let compiled = self.compiled_entry(green_key)?;
-        if let Some((_, trace_data)) = Self::trace_for_exit(compiled, trace_id)
-            && let Some(exit_layout) = trace_data.exit_layouts.get(&fail_index)
-            && let Some(ref storage) = exit_layout.storage
-        {
-            return Some(storage.clone());
-        }
-        self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
-            .and_then(|layout| layout.storage.clone())
-    }
-
-    /// A guard's resume storage together with the fail-argument types that
-    /// describe the very same deadframe.
-    ///
-    /// Asking for the two separately can pair them across *different*
-    /// layouts: `get_resume_storage` prefers the trace's own `exit_layouts`
-    /// entry and only then falls back to `get_compiled_exit_layout_in_trace`,
-    /// while `get_recovery_slot_types` always takes the fallback route — so a
-    /// caller can get storage from one and `None` from the other.  A `None`
-    /// there is not benign: it disarms the deadframe GC rooting and makes
-    /// `decode_ref` read every TAGBOX slot as a pointer.  `resume.py
-    /// blackhole_from_resumedata` reads both out of the one deadframe+descr
-    /// it was handed; resolve once here for the same reason.
-    pub fn get_resume_storage_with_slot_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<(Arc<ResumeStorage>, Vec<Type>)> {
-        let compiled = self.compiled_entry(green_key)?;
-        let layout = Self::trace_for_exit(compiled, trace_id)
-            .and_then(|(resolved_trace_id, trace)| {
-                Self::compiled_exit_layout_from_trace(
-                    trace,
-                    green_key,
-                    resolved_trace_id,
-                    fail_index,
-                )
-            })
-            .filter(|layout| layout.storage.is_some())
-            .or_else(|| {
-                self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
-            })?;
-        let storage = layout.storage.clone()?;
-        Some((
-            storage,
-            Self::recovery_slot_types_from_exit_types_and_layout(
-                &layout.exit_types,
-                layout.recovery_layout.as_deref(),
-            ),
-        ))
-    }
-
-    /// [`Self::get_resume_storage_with_slot_types`] answered off the
-    /// failing descr (`ResumeGuardDescr.get_resumestorage`), so a bridge
-    /// guard with no frontend record resolves without a backend scan.
-    pub fn get_resume_storage_with_slot_types_for_descr(
-        &self,
-        descr: &dyn majit_ir::FailDescr,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<(Arc<ResumeStorage>, Vec<Type>)> {
-        let layout = self
-            .get_compiled_exit_layout_for_descr(descr, green_key, trace_id, fail_index)
-            .filter(|layout| layout.storage.is_some())
-            .or_else(|| {
-                Self::compiled_exit_layout_from_descr(descr, green_key, trace_id, fail_index)
-            })?;
-        let storage = layout.storage.clone()?;
-        Some((
-            storage,
-            Self::recovery_slot_types_from_exit_types_and_layout(
-                &layout.exit_types,
-                layout.recovery_layout.as_deref(),
-            ),
-        ))
-    }
-
-    /// Get exit_types for a guard (for decode_ref type dispatch).
-    pub fn get_exit_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<Type>> {
-        let exit_layout =
-            self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
-        Some(exit_layout.exit_types.to_vec())
-    }
-
-    /// resume.py _prepare: get rd_virtuals + rd_pendingfields
-    /// for blackhole resume at a guard failure.
-    pub fn get_rd_virtuals(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>> {
-        let storage = self.get_resume_storage(green_key, trace_id, fail_index)?;
-        Some(storage.rd_virtuals().to_vec())
-    }
-
-    /// resume.py _prepare parity: get rd_pendingfields for a guard.
-    pub fn get_rd_pendingfields(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<majit_ir::GuardPendingFieldEntry>> {
-        let storage = self.get_resume_storage(green_key, trace_id, fail_index)?;
-        Some(storage.rd_pendingfields().to_vec())
-    }
-
     /// compile.py ResumeFromInterpDescr.compile_and_attach parity.
     ///
     /// Optimize against the already-compiled loop at `green_key`, then
@@ -16708,12 +15952,18 @@ impl<M: Clone> MetaInterp<M> {
         let optimize_start = Instant::now();
         let mut retraced_count = retraced_count;
         let bridge_optimize_result = {
-            let compiled = self.compiled_entry_mut(green_key).unwrap();
+            // `unroll.py for target_token in jitcelltoken.target_tokens`
+            let scan_target_tokens = self
+                .compiled_entry(green_key)
+                .unwrap()
+                .live_token()
+                .map(|live| crate::history::target_tokens_of(&live))
+                .unwrap_or_default();
             optimizer.optimize_bridge(
                 bridge_ops,
                 &mut constants,
                 bridge_inputargs.len(),
-                &mut compiled.front_target_tokens,
+                &scan_target_tokens,
                 bridge_runtime_boxes,
                 true,
                 &mut retraced_count,
@@ -16983,26 +16233,17 @@ impl<M: Clone> MetaInterp<M> {
                 //
                 // `attach_procedure_to_interp` (warmstate.py) re-points
                 // the jitcell and keeps the old token alive; it never takes the
-                // loop's own TargetTokens away.  `compiled_loops` is the single
-                // map pyre reads for both, so the replacement entry carries the
-                // retired loop's labels forward — publishing an empty list here
-                // leaves a key whose loop nothing can close into again, and every
-                // later trace reaching it declines for want of a front target.
-                let mut front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
+                // loop's own TargetTokens away, and the fresh token's
+                // `target_tokens` stays empty.
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                // Carried forward for the same reason as `front_target_tokens`
-                // just below: the replacement entry inherits the retired loop's
-                // close target, and a key with labels but no header pc is just
-                // as unreachable to a closing bridge as one with neither.
+                // Carried forward: the replacement entry inherits the retired
+                // loop's close target, and a key with no header pc is
+                // unreachable to a closing bridge.
                 let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(original_green_key)
                 {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
-                    // Read off `old_entry`, not `carried`: this is the only one
-                    // of the five sites that inherits the retired loop's
-                    // labels, so it is not a `CarriedFields` member.
-                    front_target_tokens = old_entry.front_target_tokens.clone();
                     carried_loop_header_pc = carried.loop_header_pc;
                     if let Some(old_tok) = old_entry.live_token() {
                         self.backend.migrate_bridges(&old_tok, token.as_ref());
@@ -17010,8 +16251,8 @@ impl<M: Clone> MetaInterp<M> {
                     previous_tokens =
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
-                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
-                // The labels carry over, the retrace budget does not. `token`
+                let front_entry_index = None;
+                // The retrace budget does not carry over. `token`
                 // came out of `make_jitcell_token`, so its count is the
                 // `history.py JitCellToken` default — see the fresh-token note in
                 // `compile_loop`. The count read at the top of this function is
@@ -17025,7 +16266,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_target_tokens,
                         front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
@@ -17168,7 +16408,7 @@ impl<M: Clone> MetaInterp<M> {
         // and without this parameter.  It is a parity correction, not a lever.
         jump_target_key: u64,
         fail_index: u32,
-        fail_descr: &dyn majit_ir::FailDescr,
+        fail_descr_arc: &majit_ir::DescrRef,
         bridge_ops: Vec<majit_ir::OpRc>,
         bridge_inputargs: &[majit_ir::InputArgRc],
         jump_args: &[OpRef],
@@ -17189,6 +16429,9 @@ impl<M: Clone> MetaInterp<M> {
         self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
+        let fail_descr: &dyn majit_ir::FailDescr = fail_descr_arc
+            .as_fail_descr()
+            .expect("compile_bridge: the bridge origin descr is a FailDescr");
         if !self.has_compiled_loop_entry(green_key) {
             self.jitlog_trace_aborted();
             return false;
@@ -17288,8 +16531,7 @@ impl<M: Clone> MetaInterp<M> {
             // guard sits in the root loop or in a bridge the frontend never
             // indexed (`send_bridge_to_backend`).  The pool Arcs are the ones
             // the descr holds, so the deserializer shares them.
-            let pending = crate::resume::ResumeStorage::from_fail_descr(fail_descr).and_then(|storage| {
-                let storage = Arc::new(storage);
+            let pending = crate::resume::get_resumestorage(fail_descr_arc).and_then(|storage| {
                 // Each bridge inputarg carries its `box.type`
                 // (resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float});
                 // mint the typed `OpRef::input_arg_*` variant via
@@ -17535,22 +16777,18 @@ impl<M: Clone> MetaInterp<M> {
         }
         let _compiled = self.compiled_entry_mut(green_key).unwrap();
         // `unroll.py for target_token in jitcelltoken.target_tokens` scans
-        // the tokens of the loop the JUMP enters.  `compiled_loops` cannot
-        // hand out a second `&mut` alongside the origin entry, so a cross-loop
-        // close runs against a clone of the target's vector and stores it back
-        // below; a same-loop close keeps borrowing the entry in place.
-        let mut crossed_target_tokens = if cell_token_key != green_key {
-            self.compiled_entry(cell_token_key)
-                .map(|compiled| compiled.front_target_tokens.clone())
-        } else {
-            None
-        };
+        // the tokens of the loop the JUMP enters.
+        let scan_target_tokens = self
+            .compiled_entry(cell_token_key)
+            .and_then(|compiled| compiled.live_token())
+            .map(|live| crate::history::target_tokens_of(&live))
+            .unwrap_or_default();
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] compile_bridge origin={green_key} dest={jump_target_key} \
                  cell={cell_token_key} crossed={} dest_n={}",
-                crossed_target_tokens.is_some(),
-                crossed_target_tokens.as_ref().map(|t| t.len()).unwrap_or(0),
+                cell_token_key != green_key,
+                scan_target_tokens.len(),
             );
         }
         // compile.py compile_trace: ends_with_jump selects BridgeCompileData
@@ -17563,16 +16801,6 @@ impl<M: Clone> MetaInterp<M> {
         // bridge. Mirror that here so the trace abort doesn't unwind
         // past compile_bridge.
         let bridge_optimize_result = if ends_with_jump {
-            let front_target_tokens = match crossed_target_tokens.as_mut() {
-                Some(tokens) => tokens,
-                None => {
-                    &mut self
-                        .compiled_loops
-                        .get_mut(&(self.active_jitdriver_sd.unwrap_or(0), green_key))
-                        .unwrap()
-                        .front_target_tokens
-                }
-            };
             // compile.py BridgeCompileData.optimize → UnrollOptimizer.optimize_bridge
             let bridge_data = compile::BridgeCompileData::new(
                 &bridge_trace_data,
@@ -17588,7 +16816,7 @@ impl<M: Clone> MetaInterp<M> {
                     bridge_ops,
                     constants,
                     bridge_inputargs.len(),
-                    front_target_tokens,
+                    &scan_target_tokens,
                     bridge_runtime_boxes,
                     bridge_inline_short_preamble,
                     &mut retraced_count,
@@ -17618,12 +16846,6 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .map(|ops| (ops, false))
         };
-        if let Some(tokens) = crossed_target_tokens
-            && let Some(compiled) = self.compiled_entry_mut(cell_token_key)
-        {
-            compiled.front_entry_index = Self::front_entry_index_for(&tokens);
-            compiled.front_target_tokens = tokens;
-        }
         // Hand the descrs back as soon as the optimizer is done with them,
         // before any of the paths below can leave the function. `optimize_bridge`
         // is the last reader; everything after it touches `optimizer` only for
@@ -18147,9 +17369,7 @@ impl<M: Clone> MetaInterp<M> {
         // can rebuild parent virtuals via NEW_WITH_VTABLE + SETFIELD_GC
         // at trace start, mirroring ResumeDataBoxReader.consume_boxes
         // → rd_virtuals[i].allocate (resume.py getvirtual_ptr).
-        let storage = self
-            .get_compiled_exit_layout_for_descr(fail_descr, green_key, norm_tid, fail_index)
-            .and_then(|layout| layout.storage);
+        let storage = crate::resume::get_resumestorage(&descr_arc);
 
         let fail_types = bridge_input_types.to_vec();
 
@@ -18211,7 +17431,7 @@ impl<M: Clone> MetaInterp<M> {
     /// loop's frontend record.
     fn handle_async_forcing_with_allocator(
         &mut self,
-        descr: Option<&dyn majit_ir::FailDescr>,
+        descr: Option<&majit_ir::DescrRef>,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
@@ -18235,7 +17455,7 @@ impl<M: Clone> MetaInterp<M> {
         // loop's `compiled_loops` row and drops AllVirtuals. When
         // `descr` is None the test entry keeps the compiling/active
         // driver.
-        let jd_no = match descr {
+        let jd_no = match descr.and_then(|descr| descr.as_fail_descr()) {
             Some(descr) => self.jitdriver_index_for_failed_token(
                 majit_backend::descr_owning_jct(descr).as_deref(),
             ),
@@ -18252,9 +17472,9 @@ impl<M: Clone> MetaInterp<M> {
                 fail_index,
             ) {
             layout
-        } else if let Some(descr) = descr
-            && let Some(layout) =
-                Self::compiled_exit_layout_from_descr(descr, green_key, norm_tid, fail_index)
+        } else if let Some(layout) = descr
+            .map(crate::compile::exit_layout_for_descr)
+            .filter(|layout| layout.storage.is_some())
         {
             layout
         } else {
@@ -18272,9 +17492,8 @@ impl<M: Clone> MetaInterp<M> {
         // forced virtuals fell back to NullAllocator entries and pending
         // heap writes were dropped on async forcing.
         let storage = exit_layout.storage.as_deref();
-        let rd_numb = storage.map(|s| s.rd_numb.as_ref()).unwrap_or(&[]);
-        let empty_consts: [Const; 0] = [];
-        let rd_consts: &[Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
+        let rd_numb = storage.and_then(|s| s.rd_numb()).unwrap_or(&[]);
+        let rd_consts: &[Const] = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
         // resume.py _prepare(storage) parity: materialize rd_virtuals
         // entries before handling_async_forcing. The decoder needs the
         // resumecode item count up-front to size virtual layouts.
@@ -18285,10 +17504,9 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             fail_values.len() as i32
         };
-        let rd_virtuals = storage.map(|s| {
-            let num_virtuals = s.rd_virtuals().len();
-            s.rd_virtuals()
-                .iter()
+        let rd_virtuals = storage.and_then(|s| s.rd_virtuals()).map(|rds| {
+            let num_virtuals = rds.len();
+            rds.iter()
                 .map(|rd| {
                     crate::resume::rd_virtual_to_virtual_info(
                         rd.as_ref(),
@@ -18316,7 +17534,7 @@ impl<M: Clone> MetaInterp<M> {
                 fail_values,
                 Some(deadframe_types),
                 rd_virtuals.as_deref(),
-                storage.map(|s| s.rd_pendingfields()),
+                storage.and_then(|s| s.rd_pendingfields()),
                 Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
                 vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo — pyre has no greenfield mechanism
@@ -18401,7 +17619,7 @@ impl<M: Clone> MetaInterp<M> {
                 };
             // compile.py: faildescr.handle_async_forcing(deadframe)
             let cache = self.handle_async_forcing_with_allocator(
-                Some(descr),
+                Some(&descr_arc),
                 green_key,
                 trace_id,
                 fail_index,
@@ -18704,34 +17922,9 @@ impl<M: Clone> MetaInterp<M> {
                     is_finish: false,
                     is_exception_exit: false,
                     exit_types,
-                    recovery_layout: None,
-                    resume_layout: None,
                     storage: None,
                 }
             });
-        // pyjitpl.py initialize_state_from_guard_failure:
-        // guard failure rebuild is stack-critical code — must not be
-        // interrupted by StackOverflow, otherwise jit_virtual_refs are
-        // left in a dangling state. RPython try/finally; Rust Drop
-        // guard — see CriticalCodeGuard.
-        let _cc_guard = crate::CriticalCodeGuard::enter();
-        let reconstructed_state = exit_layout
-            .resume_layout
-            .as_ref()
-            .map(|layout| layout.reconstruct_state(fail_values));
-        let resume_layout = exit_layout.resume_layout.as_deref().cloned();
-        let reconstructed = reconstructed_state
-            .as_ref()
-            .map(|state| state.frames.clone());
-        let materialized_virtuals = reconstructed_state
-            .as_ref()
-            .map(|state| state.virtuals.clone())
-            .unwrap_or_default();
-        let pending_field_writes = reconstructed_state
-            .as_ref()
-            .map(|state| state.pending_fields.clone())
-            .unwrap_or_default();
-        drop(_cc_guard);
 
         Some(GuardRecovery {
             trace_id,
@@ -18739,11 +17932,6 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout,
             fail_values: fail_values.to_vec(),
             typed_fail_values: typed_fail_values.map(|values| values.to_vec()),
-            resume_layout,
-            reconstructed_frames: reconstructed,
-            reconstructed_state,
-            materialized_virtuals,
-            pending_field_writes,
             savedata,
             exception,
         })
@@ -20347,7 +19535,7 @@ impl<M: Clone> MetaInterp<M> {
                 let rd_virtuals = resume_data
                     .storage
                     .as_ref()
-                    .map(|storage| storage.rd_virtuals());
+                    .map(|storage| storage.rd_virtuals().unwrap_or(&[]));
                 for (bank, index, vidx) in virtuals {
                     let mut opref = crate::materialize_bridge_virtual(
                         ctx,
@@ -22586,16 +21774,6 @@ pub struct GuardRecovery {
     pub fail_values: Vec<i64>,
     /// Typed fail values decoded from the backend deadframe, when available.
     pub typed_fail_values: Option<Vec<Value>>,
-    /// Compact resume/jitframe layout for this exit, when available.
-    pub resume_layout: Option<ResumeLayoutSummary>,
-    /// Reconstructed interpreter frames (if resume data was available).
-    pub reconstructed_frames: Option<Vec<crate::resume::ReconstructedFrame>>,
-    /// Full reconstructed state, including materialized virtuals.
-    pub reconstructed_state: Option<ReconstructedState>,
-    /// Materialized virtuals referenced by the reconstructed state.
-    pub materialized_virtuals: Vec<MaterializedVirtual>,
-    /// Deferred heap writes reconstructed from resume data.
-    pub pending_field_writes: Vec<ResolvedPendingFieldWrite>,
     /// Optional saved-data GC ref captured from the failing exit.
     pub savedata: Option<GcRef>,
     /// Pending exception state captured from the failing deadframe.
@@ -24795,7 +23973,7 @@ mod portal_resume_rebuild_tests {
         install(&mut meta, jitcode.clone());
 
         let mut tracing = crate::TraceCtx::for_test(0);
-        let storage = crate::resume::ResumeStorage::new(
+        let storage = crate::resume::new_resume_storage(
             vec![],
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
@@ -24884,7 +24062,7 @@ mod portal_resume_rebuild_tests {
         }
 
         let mut tracing = crate::TraceCtx::for_test(0);
-        let storage = crate::resume::ResumeStorage::new(
+        let storage = crate::resume::new_resume_storage(
             vec![],
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
@@ -24962,7 +24140,7 @@ mod portal_resume_rebuild_tests {
             majit_ir::descr::SimpleSizeDescr::new(0, 16, 0).with_all_fielddescrs(vec![field]),
         );
         let mut tracing = crate::TraceCtx::for_test(0);
-        let storage = crate::resume::ResumeStorage::new(
+        let storage = crate::resume::new_resume_storage(
             vec![],
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
@@ -24994,7 +24172,7 @@ mod portal_resume_rebuild_tests {
         let rd_virtuals = resume_data
             .storage
             .as_ref()
-            .map(|storage| storage.rd_virtuals());
+            .map(|storage| storage.rd_virtuals().unwrap_or(&[]));
         let virtual_count = rd_virtuals.map_or(0, |entries| entries.len());
         let mut cache =
             crate::BridgeVirtualCache::new(virtual_count, crate::default_bridge_array_descr);
@@ -25485,7 +24663,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -27660,7 +26837,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -27720,7 +26896,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -27776,7 +26951,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -27841,7 +27015,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -27944,7 +27117,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -30146,7 +29318,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -30228,7 +29399,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -31000,12 +30170,11 @@ mod tests {
     fn compiled_graph_root_walk_consumes_its_aggregate_minor_barrier() {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
-        let storage = crate::resume::ResumeStorage::new(
-            Vec::new(),
-            vec![majit_ir::Const::Ref(GcRef(0x1000))],
-            Vec::new(),
-            Vec::new(),
-        );
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+        descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .set_rd_consts(Some(vec![majit_ir::Const::Ref(GcRef(0x1000))]));
         let mut exit_layouts = crate::FxIndexMap::default();
         exit_layouts.insert(
             0,
@@ -31013,8 +30182,7 @@ mod tests {
                 source_op_index: None,
                 recovery_layout: None,
                 resume_layout: None,
-                storage: Some(storage.clone()),
-                descr: None,
+                descr: Some(descr.clone()),
                 op_arg_types_for_jump: None,
             },
         );
@@ -31035,7 +30203,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -31059,7 +30226,11 @@ mod tests {
         });
         assert_eq!(seen, 1);
         assert!(matches!(
-            storage.rd_consts()[0],
+            descr
+                .as_fail_descr()
+                .expect("resume guard")
+                .rd_consts_arc()
+                .expect("pool")[0],
             majit_ir::Const::Ref(GcRef(0x2000))
         ));
         meta.walk_rd_consts_refs(|_| seen += 1);
@@ -31068,6 +30239,96 @@ mod tests {
         set_extra_root_walk_kind(ExtraRootWalkKind::Major);
         meta.walk_rd_consts_refs(|_| seen += 1);
         assert_eq!(seen, 2, "major marking always sees the compiled graph");
+    }
+
+    /// `history.py TargetToken` is a GC object on
+    /// `JitCellToken.target_tokens`. MiniMark traces it whenever the cell
+    /// token is alive, including a predecessor listed on
+    /// `CompiledEntry.previous_tokens`. The off-GC walker visits the same
+    /// live-plus-previous set it already uses for descr pools.
+    #[test]
+    fn compiled_graph_root_walk_visits_predecessor_target_token_attrs() {
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let pred_tt = crate::history::TargetToken::new_loop(11);
+        let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
+        sp.constants.insert(0, majit_ir::Const::Ref(GcRef(0x3000)));
+        pred_tt.attrs().short_preamble = Some(sp);
+
+        let pred = std::sync::Arc::new(JitCellToken::new(11));
+        pred.set_target_tokens(vec![pred_tt.as_jump_target_descr()]);
+
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.insert_compiled_loop(
+            8,
+            CompiledEntry {
+                token: std::sync::Weak::new(),
+                meta: std::sync::Arc::new(()),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: crate::FxIndexMap::default(),
+                previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut seen = Vec::new();
+        meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
+        assert_eq!(
+            seen,
+            vec![0x3000],
+            "a predecessor JCT's TargetToken.short_preamble is a root \
+             the same way the live token's descr pools are"
+        );
+    }
+
+    /// `history.py JitCellToken.record_jump_to` keeps the JUMP target in
+    /// `_keepalive_jitcell_tokens` after that target's own cell row is
+    /// gone. MiniMark traces those tokens through the jumper; the off-GC
+    /// walker follows `keepalive_tokens` to the same TargetToken attrs.
+    #[test]
+    fn compiled_graph_root_walk_visits_keepalive_target_token_attrs() {
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let kept_tt = crate::history::TargetToken::new_loop(12);
+        let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
+        sp.constants.insert(0, majit_ir::Const::Ref(GcRef(0x4000)));
+        kept_tt.attrs().short_preamble = Some(sp);
+
+        let kept = std::sync::Arc::new(JitCellToken::new(12));
+        kept.set_target_tokens(vec![kept_tt.as_jump_target_descr()]);
+
+        let jumper = std::sync::Arc::new(JitCellToken::new(8));
+        jumper.record_jump_to(kept);
+
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.insert_compiled_loop(
+            8,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&jumper),
+                meta: std::sync::Arc::new(()),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: crate::FxIndexMap::default(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut seen = Vec::new();
+        meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
+        assert_eq!(
+            seen,
+            vec![0x4000],
+            "a JUMP target kept only through keepalive_tokens is a root \
+             the same way a previous_tokens predecessor is"
+        );
     }
 
     #[test]
@@ -31197,7 +30458,7 @@ mod tests {
             vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()].into(),
         );
         let pending_bridge_rd = PendingBridgeRd {
-            storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),
+            storage: crate::resume::new_resume_storage(vec![1, 2, 3], vec![], vec![], vec![]),
             frontend_boxes: vec![11, 22],
             liveboxes: vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
             livebox_types: vec![Type::Int, Type::Ref],
@@ -31454,12 +30715,12 @@ mod tests {
             .keep_loop_alive(&token);
         meta.warm_state_for_driver(0)
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        token.set_target_tokens(vec![start_token.as_jump_target_descr()]);
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: vec![start_token],
                 front_entry_index: Some(0),
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
@@ -31527,12 +30788,12 @@ mod tests {
             .keep_loop_alive(&token);
         meta.warm_state_for_driver(0)
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        token.set_target_tokens(vec![start_token.as_jump_target_descr()]);
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: vec![start_token],
                 front_entry_index: Some(0),
                 front_target_source_positions: source_positions,
                 root_trace_id: trace_id,
@@ -31596,104 +30857,6 @@ mod tests {
         // No mapping recorded at all.
         let (meta, _token) = meta_with_front_label_int_ref_ref_ref(10, None);
         assert_eq!(meta.pack_front_target_live_values(10, &state_order), None);
-    }
-
-    #[test]
-    fn test_recovery_slot_types_keep_compact_failarg_types() {
-        let recovery_layout = majit_backend::ExitRecoveryLayout {
-            vable_array: vec![],
-            vref_array: vec![],
-            frames: vec![majit_backend::ExitFrameLayout {
-                trace_id: None,
-                header_pc: Some(17),
-                source_guard: None,
-                pc: 17,
-                jitcode_index: 0,
-                slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                slot_types: Some(vec![Type::Int]),
-            }],
-            virtual_layouts: vec![],
-            pending_field_layouts: vec![],
-        };
-
-        assert_eq!(
-            MetaInterp::<()>::recovery_slot_types_from_exit_types_and_layout(
-                &[Type::Ref],
-                Some(&recovery_layout),
-            ),
-            vec![Type::Ref]
-        );
-    }
-
-    #[test]
-    fn test_recovery_slot_types_fall_back_on_length_mismatch() {
-        let recovery_layout = majit_backend::ExitRecoveryLayout {
-            vable_array: vec![],
-            vref_array: vec![],
-            frames: vec![majit_backend::ExitFrameLayout {
-                trace_id: None,
-                header_pc: Some(17),
-                source_guard: None,
-                pc: 17,
-                jitcode_index: 0,
-                slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                slot_types: Some(vec![Type::Int]),
-            }],
-            virtual_layouts: vec![],
-            pending_field_layouts: vec![],
-        };
-
-        assert_eq!(
-            MetaInterp::<()>::recovery_slot_types_from_exit_types_and_layout(
-                &[Type::Ref, Type::Ref],
-                Some(&recovery_layout),
-            ),
-            vec![Type::Ref, Type::Ref]
-        );
-    }
-
-    #[test]
-    fn test_recovery_slot_types_do_not_substitute_frame_slot_order() {
-        let recovery_layout = majit_backend::ExitRecoveryLayout {
-            vable_array: vec![],
-            vref_array: vec![],
-            frames: vec![
-                majit_backend::ExitFrameLayout {
-                    trace_id: None,
-                    header_pc: Some(11),
-                    source_guard: None,
-                    pc: 11,
-                    jitcode_index: 0,
-                    slots: vec![
-                        majit_backend::ExitValueSourceLayout::ExitValue(0),
-                        majit_backend::ExitValueSourceLayout::ExitValue(1),
-                    ],
-                    slot_types: Some(vec![Type::Ref, Type::Int]),
-                },
-                majit_backend::ExitFrameLayout {
-                    trace_id: None,
-                    header_pc: Some(23),
-                    source_guard: None,
-                    pc: 23,
-                    jitcode_index: 1,
-                    slots: vec![
-                        majit_backend::ExitValueSourceLayout::ExitValue(2),
-                        majit_backend::ExitValueSourceLayout::ExitValue(3),
-                    ],
-                    slot_types: Some(vec![Type::Float, Type::Ref]),
-                },
-            ],
-            virtual_layouts: vec![],
-            pending_field_layouts: vec![],
-        };
-
-        assert_eq!(
-            MetaInterp::<()>::recovery_slot_types_from_exit_types_and_layout(
-                &[Type::Ref, Type::Int, Type::Float, Type::Ref],
-                Some(&recovery_layout),
-            ),
-            vec![Type::Ref, Type::Int, Type::Float, Type::Ref]
-        );
     }
 
     /// `pyjitpl.py:3319` reads the virtualizable out of a DECLARED red
@@ -31760,215 +30923,6 @@ mod tests {
     }
 
     #[test]
-    fn test_module_frame_slot_types_do_not_retype_vable_identity() {
-        let recovery_layout = majit_backend::ExitRecoveryLayout {
-            vable_array: vec![],
-            vref_array: vec![],
-            frames: vec![majit_backend::ExitFrameLayout {
-                trace_id: None,
-                header_pc: Some(9),
-                source_guard: None,
-                pc: 9,
-                jitcode_index: 0,
-                slots: vec![
-                    majit_backend::ExitValueSourceLayout::ExitValue(0),
-                    majit_backend::ExitValueSourceLayout::ExitValue(1),
-                    majit_backend::ExitValueSourceLayout::ExitValue(2),
-                    majit_backend::ExitValueSourceLayout::ExitValue(3),
-                ],
-                slot_types: Some(vec![Type::Int, Type::Ref, Type::Int, Type::Ref]),
-            }],
-            virtual_layouts: vec![],
-            pending_field_layouts: vec![],
-        };
-
-        assert_eq!(
-            MetaInterp::<()>::recovery_slot_types_from_exit_types_and_layout(
-                &[Type::Ref, Type::Ref, Type::Int, Type::Ref],
-                Some(&recovery_layout),
-            ),
-            vec![Type::Ref, Type::Ref, Type::Int, Type::Ref]
-        );
-    }
-
-    #[test]
-    fn test_guard_resume_getters_return_stored_exit_layout_metadata() {
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = 19;
-        let trace_id = 23;
-        let fail_index = 5;
-
-        let recovery_layout = majit_backend::ExitRecoveryLayout {
-            vable_array: vec![],
-            vref_array: vec![],
-            frames: vec![majit_backend::ExitFrameLayout {
-                trace_id: None,
-                header_pc: Some(41),
-                source_guard: None,
-                pc: 41,
-                jitcode_index: 0,
-                slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                slot_types: Some(vec![Type::Int]),
-            }],
-            virtual_layouts: vec![],
-            pending_field_layouts: vec![],
-        };
-
-        let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
-        exit_layouts.insert(
-            fail_index,
-            StoredExitLayout {
-                source_op_index: Some(0),
-                recovery_layout: Some(std::sync::Arc::new(recovery_layout)),
-                resume_layout: None,
-                storage: Some(crate::resume::ResumeStorage::new(
-                    vec![7, 8, 9],
-                    vec![majit_ir::Const::Int(11)],
-                    vec![],
-                    vec![],
-                )),
-                descr: Some(crate::compile::make_fail_descr_typed(vec![Type::Ref])),
-                op_arg_types_for_jump: None,
-            },
-        );
-
-        let mut traces = crate::FxIndexMap::default();
-        traces.insert(
-            trace_id,
-            CompiledTrace {
-                inputargs: vec![],
-                ops: vec![],
-                constants: majit_ir::ConstMap::default(),
-                exit_layouts,
-                terminal_exit_layouts: crate::FxIndexMap::default(),
-            },
-        );
-
-        let token = std::sync::Arc::new(JitCellToken::new(3));
-        // `compile.py` — `send_loop_to_backend` registers the token
-        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
-        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
-        // `token` alive past this fixture's own local.
-        meta.warm_state_for_driver(0)
-            .memory_manager
-            .keep_loop_alive(&token);
-        meta.warm_state_for_driver(0)
-            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
-        meta.insert_compiled_loop(
-            green_key,
-            CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
-                meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
-                front_entry_index: None,
-                front_target_source_positions: None,
-                root_trace_id: trace_id,
-                traces,
-                previous_tokens: Vec::new(),
-                loop_header_pc: None,
-                next_global_opref: 0,
-            },
-        );
-
-        assert_eq!(
-            meta.get_merge_point_pc(green_key, trace_id, fail_index),
-            Some(41)
-        );
-        let storage = meta
-            .get_resume_storage(green_key, trace_id, fail_index)
-            .expect("storage should be present");
-        assert_eq!(storage.rd_numb.as_ref(), &[7, 8, 9]);
-        assert_eq!(storage.rd_consts_snapshot(), vec![majit_ir::Const::Int(11)]);
-        assert_eq!(
-            meta.get_recovery_slot_types(green_key, trace_id, fail_index),
-            Some(vec![Type::Ref])
-        );
-        assert_eq!(
-            meta.get_rd_virtuals(green_key, trace_id, fail_index),
-            Some(vec![])
-        );
-        let pendingfields = meta
-            .get_rd_pendingfields(green_key, trace_id, fail_index)
-            .expect("stored exit layout should expose rd_pendingfields");
-        assert!(pendingfields.is_empty());
-    }
-
-    /// The trace's own entry is the whole answer once it exists: a guard the
-    /// trace holds with no recovery layout resolves to no merge point rather
-    /// than to whatever the backend would say about the same fail index.
-    /// `get_compiled_exit_layout_in_trace` picks the layout the same way, and
-    /// reads `recovery_layout` off it afterwards.
-    #[test]
-    fn a_trace_entry_without_a_recovery_layout_answers_no_merge_point() {
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = 61;
-        let trace_id = 67;
-        let fail_index = 2;
-
-        let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
-        exit_layouts.insert(
-            fail_index,
-            StoredExitLayout {
-                source_op_index: Some(0),
-                recovery_layout: None,
-                resume_layout: None,
-                storage: None,
-                descr: Some(crate::compile::make_fail_descr_typed(vec![Type::Int])),
-                op_arg_types_for_jump: None,
-            },
-        );
-
-        let mut traces = crate::FxIndexMap::default();
-        traces.insert(
-            trace_id,
-            CompiledTrace {
-                inputargs: vec![],
-                ops: vec![],
-                constants: majit_ir::ConstMap::default(),
-                exit_layouts,
-                terminal_exit_layouts: crate::FxIndexMap::default(),
-            },
-        );
-
-        let token = std::sync::Arc::new(JitCellToken::new(3));
-        meta.warm_state_for_driver(0)
-            .memory_manager
-            .keep_loop_alive(&token);
-        meta.warm_state_for_driver(0)
-            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
-        meta.insert_compiled_loop(
-            green_key,
-            CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
-                meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
-                front_entry_index: None,
-                front_target_source_positions: None,
-                root_trace_id: trace_id,
-                traces,
-                previous_tokens: Vec::new(),
-                loop_header_pc: None,
-                next_global_opref: 0,
-            },
-        );
-
-        assert_eq!(
-            meta.get_merge_point_pc(green_key, trace_id, fail_index),
-            None
-        );
-        // A fail index the trace does not hold falls through to the backend,
-        // which holds nothing for this fixture either.
-        assert_eq!(meta.get_merge_point_pc(green_key, trace_id, 99), None);
-        // An unknown green key resolves no compiled entry at all.
-        assert_eq!(
-            meta.get_merge_point_pc(green_key + 1, trace_id, fail_index),
-            None
-        );
-    }
-
-    #[test]
     fn test_handle_async_forcing_prepares_rd_virtuals_from_exit_layout() {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -31991,19 +30945,22 @@ mod tests {
                 source_op_index: Some(0),
                 recovery_layout: None,
                 resume_layout: None,
-                storage: Some(crate::resume::ResumeStorage::new(
-                    rd_numb,
-                    vec![],
-                    vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawBufferInfo {
-                        func: 77,
-                        size: 0,
-                        offsets: vec![],
-                        descrs: vec![],
-                        fieldnums: vec![],
-                    })],
-                    vec![],
-                )),
-                descr: Some(crate::compile::make_fail_descr_typed(vec![])),
+                descr: Some({
+                    let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+                    let fd = descr.as_fail_descr().expect("resume guard");
+                    fd.set_rd_numb(Some(rd_numb));
+                    fd.set_rd_consts(Some(vec![]));
+                    fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
+                        majit_ir::RdVirtualInfo::VRawBufferInfo {
+                            func: 77,
+                            size: 0,
+                            offsets: vec![],
+                            descrs: vec![],
+                            fieldnums: vec![],
+                        },
+                    )]));
+                    descr
+                }),
                 op_arg_types_for_jump: None,
             },
         );
@@ -32035,7 +30992,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
@@ -32356,7 +31312,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token_arc),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
@@ -32375,72 +31330,6 @@ mod tests {
             .find(|(_, layout)| !layout.resolve_is_finish())
             .map(|(fail_index, _)| fail_index)
             .expect("compiled guard exit")
-    }
-
-    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-    #[test]
-    fn guard_exit_getters_fall_back_to_previous_token_backend_layouts() {
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = 77;
-        let inputargs = vec![InputArg::new_int_rc(0)];
-        let mut guard = mk_op(
-            OpCode::GuardTrue,
-            &[OpRef::input_arg_int(0)],
-            OpRef::NONE.raw(),
-        );
-        guard.setfailargs(smallvec::smallvec![bound_operand(OpRef::input_arg_int(0))]);
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            guard,
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-        attach_procedure_to_interp_entry(
-            &mut meta,
-            green_key,
-            &inputargs,
-            ops,
-            majit_ir::ConstMap::default(),
-        );
-
-        let (trace_id, fail_index) = {
-            let entry = meta.compiled_entry(green_key).expect("compiled entry");
-            let trace_id = entry.root_trace_id;
-            let trace = entry.traces.get(&trace_id).expect("compiled trace");
-            let fail_index = guard_fail_index(trace);
-            (trace_id, fail_index)
-        };
-
-        let _fresh_token_keepalive = {
-            let entry = meta.compiled_entry_mut(green_key).expect("compiled entry");
-            let mut fresh_token = JitCellToken::new(9001);
-            fresh_token.green_key = std::cell::Cell::new(green_key);
-            let fresh_arc = std::sync::Arc::new(fresh_token);
-            let old_token =
-                std::mem::replace(&mut entry.token, std::sync::Arc::downgrade(&fresh_arc));
-            entry.previous_tokens.push(old_token);
-            entry
-                .traces
-                .get_mut(&trace_id)
-                .expect("compiled trace")
-                .exit_layouts
-                .swap_remove(&fail_index);
-            fresh_arc
-        };
-
-        let layout = meta
-            .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
-            .expect("previous token backend layout should remain visible");
-        assert_eq!(layout.exit_types.as_slice(), [Type::Int]);
-        assert!(!layout.is_finish);
-        assert_eq!(
-            meta.get_exit_types(green_key, trace_id, fail_index),
-            Some(vec![Type::Int])
-        );
     }
 
     // `guard_fail_descr_proxy_trusts_empty_backend_fail_arg_types`
@@ -32496,9 +31385,11 @@ mod tests {
                 fail_index,
                 layout.source_op_index,
                 layout
-                    .storage
+                    .descr
                     .as_ref()
-                    .map(|storage| storage.rd_numb.clone()),
+                    .and_then(|descr| descr.as_fail_descr())
+                    .and_then(|fd| fd.rd_numb_arc())
+                    .map(|numb| numb.as_ref().to_vec()),
                 layout.resolve_exit_types().to_vec(),
             )
         };
@@ -32541,141 +31432,13 @@ mod tests {
                 .exit_layout
                 .storage
                 .as_ref()
-                .map(|storage| storage.rd_numb.clone()),
+                .map(|storage| storage.rd_numb().expect("rd_numb").to_vec()),
             expected_rd_numb
         );
         assert_eq!(
             recovery.exit_layout.exit_types.as_slice(),
             expected_exit_types
         );
-    }
-
-    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-    #[test]
-    fn test_start_retrace_from_guard_uses_previous_token_backend_resume_data() {
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let first_driver = meta
-            .register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
-        let source_driver = meta
-            .register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
-        assert_ne!(first_driver, source_driver);
-        meta.active_jitdriver_sd = Some(source_driver);
-        let green_key = 89;
-        let inputargs = vec![InputArg::new_int_rc(0)];
-        let mut guard = mk_op(
-            OpCode::GuardTrue,
-            &[OpRef::input_arg_int(0)],
-            OpRef::NONE.raw(),
-        );
-        guard.setfailargs(smallvec::smallvec![bound_operand(OpRef::input_arg_int(0))]);
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            guard,
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-        attach_procedure_to_interp_entry(
-            &mut meta,
-            green_key,
-            &inputargs,
-            ops,
-            majit_ir::ConstMap::default(),
-        );
-
-        let (trace_id, fail_index, descr_arc) = {
-            let entry = meta.compiled_entry(green_key).expect("compiled entry");
-            let trace_id = entry.root_trace_id;
-            let trace = entry.traces.get(&trace_id).expect("compiled trace");
-            let fail_index = guard_fail_index(trace);
-            // Capture source descr Arc BEFORE evicting `exit_layouts`.
-            // Production path: `cpu.get_latest_descr(deadframe)` returns
-            // the same Arc independently of `exit_layouts`.
-            let descr_arc = trace
-                .exit_layouts
-                .get(&fail_index)
-                .and_then(|layout| layout.descr.clone())
-                .expect("test fixture guard should carry a ResumeGuardDescr");
-            // compile.py `record_loop_or_bridge` installs this on each
-            // ResumeDescr after backend compilation.
-            let source_token = entry.token.upgrade().expect("live source token");
-            descr_arc
-                .as_fail_descr()
-                .unwrap()
-                .set_rd_loop_token_clt(source_token.compiled_loop_token_expect());
-            (trace_id, fail_index, descr_arc)
-        };
-
-        let mut writer = crate::resumecode::Writer::new(4);
-        writer.append_int(0); // items_resume_section (patched below)
-        writer.append_int(0); // count
-        writer.append_int(0); // vable_size
-        writer.append_int(0); // vref_size
-        writer.patch_current_size(0);
-        let expected_rd_numb = writer.create_numbering();
-
-        let _fresh_token_keepalive = {
-            let map_key = (meta.active_jitdriver_sd.unwrap_or(0), green_key);
-            let entry = meta
-                .compiled_loops
-                .get_mut(&map_key)
-                .expect("compiled entry");
-            patch_dynasm_fail_descr_resume_data(
-                &meta.backend,
-                &entry.token,
-                fail_index,
-                expected_rd_numb.clone(),
-                vec![],
-            );
-            let mut fresh_token = JitCellToken::new(9004);
-            fresh_token.outermost_jitdriver_index = Some(first_driver);
-            fresh_token.green_key = std::cell::Cell::new(green_key);
-            let fresh_arc = std::sync::Arc::new(fresh_token);
-            let old_token =
-                std::mem::replace(&mut entry.token, std::sync::Arc::downgrade(&fresh_arc));
-            entry.previous_tokens.push(old_token);
-            entry
-                .traces
-                .get_mut(&trace_id)
-                .expect("compiled trace")
-                .exit_layouts
-                .swap_remove(&fail_index);
-            fresh_arc
-        };
-
-        // Neither the most recent trace nor the replacement token owns this
-        // guard. Its original token must supply the bridge's driver.
-        meta.active_jitdriver_sd = Some(first_driver);
-        let retrace = meta
-            .start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, &[42])
-            .expect("retrace should use previous token backend resume data");
-
-        assert_eq!(retrace.fail_types, vec![Type::Int]);
-        assert_eq!(meta.active_jitdriver_sd, Some(source_driver));
-        assert_eq!(
-            meta.trace_ctx()
-                .and_then(|ctx| ctx.driver_descriptor())
-                .and_then(|descriptor| descriptor.index),
-            Some(source_driver),
-        );
-        let storage = retrace
-            .storage
-            .as_ref()
-            .expect("retrace storage should be present");
-        assert_eq!(storage.rd_numb.as_ref(), expected_rd_numb.as_slice());
-        assert!(storage.rd_consts().is_empty());
-        assert!(storage.rd_virtuals().is_empty());
-        assert_eq!(meta.pending_frontend_boxes_ref(), Some([42].as_slice()));
-        assert_eq!(
-            meta.pending_frontend_box_types.as_deref(),
-            Some([Type::Int].as_slice()),
-        );
-        meta.clear_trace_session();
-        assert!(meta.pending_frontend_boxes_ref().is_none());
-        assert!(meta.pending_frontend_box_types.is_none());
     }
 
     #[test]
@@ -33419,7 +32182,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 0,
@@ -33936,7 +32698,7 @@ mod tests {
     /// previous occupant of the green key had run its own down.
     ///
     /// The state under test is the one `compile_loop` actually reaches: past
-    /// the `has_compiled_targets` give-up, which needs `front_target_tokens`
+    /// the `has_compiled_targets` give-up, which needs `target_tokens`
     /// empty, while the entry's own `Weak` still upgrades. The seeded token
     /// carries the `unroll.py disable_retracing_if_max_retrace_guards`
     /// sentinel, which is the value whose transfer costs the replacement loop
@@ -33969,7 +32731,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&stale),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 101,
@@ -34079,12 +32840,14 @@ mod tests {
 
         let old_token = std::sync::Arc::new(JitCellToken::new(1));
         old_token.set_compiled(Box::new(()));
+        old_token.set_target_tokens(vec![
+            crate::history::TargetToken::new_loop(1).as_jump_target_descr(),
+        ]);
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&old_token),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: vec![crate::history::TargetToken::new_loop(1)],
                 front_entry_index: Some(0),
                 front_target_source_positions: None,
                 root_trace_id: 1,
@@ -34153,7 +32916,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&stale),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 102,
@@ -34206,23 +32968,28 @@ mod tests {
         }
         meta.compile_loop(&[OpRef::input_arg_int(0)], ());
 
-        let jump_descr = meta
+        // Charge the live token. `history.py JitCellToken.target_tokens` is
+        // the label list `unroll.py optimize_bridge` scans; a hollow
+        // replacement would drop those labels, and cranelift compile of the
+        // JUMP then leaves an unfilled block. The production loop that an
+        // entry bridge replaces still owns its labels when
+        // `ResumeFromInterpDescr.compile_and_attach` mints the fresh token.
+        let stale = meta
             .compiled_entry(green_key)
-            .and_then(|entry| entry.front_target_tokens.first())
+            .and_then(|entry| entry.live_token())
+            .expect("the target loop installed a live token");
+        let jump_descr = crate::history::target_tokens_of(&stale)
+            .into_iter()
+            .next()
             .expect("the target loop installed a front target")
             .as_jump_target_descr();
         let original_green_key = green_key;
-        let stale = std::sync::Arc::new(JitCellToken::new(5));
-        stale.set_inputarg_types(vec![Type::Int]);
         stale.set_retraced_count(u32::MAX);
         assert_ne!(
             stale.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
             0,
             "the sentinel arms bridge segmenting, which is what must not travel"
         );
-        meta.compiled_entry_mut(green_key)
-            .expect("the target loop remains installed")
-            .token = std::sync::Arc::downgrade(&stale);
 
         let bridge_inputargs = vec![InputArg::new_int_rc(0)];
         let bridge_ops = vec![
@@ -35604,7 +34371,6 @@ mod bridge_cell_token_tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_target_tokens: Vec::new(),
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: green_key,
@@ -35658,7 +34424,6 @@ mod loop_side_table_tests {
         CompiledEntry {
             token: std::sync::Weak::new(),
             meta: std::sync::Arc::new(()),
-            front_target_tokens: Vec::new(),
             front_entry_index: None,
             front_target_source_positions: None,
             root_trace_id,
@@ -35892,19 +34657,22 @@ mod loop_side_table_tests {
                 source_op_index: Some(0),
                 recovery_layout: None,
                 resume_layout: None,
-                storage: Some(crate::resume::ResumeStorage::new(
-                    rd_numb,
-                    vec![],
-                    vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawBufferInfo {
-                        func: 77,
-                        size: 0,
-                        offsets: vec![],
-                        descrs: vec![],
-                        fieldnums: vec![],
-                    })],
-                    vec![],
-                )),
-                descr: Some(crate::compile::make_fail_descr_typed(vec![])),
+                descr: Some({
+                    let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+                    let fd = descr.as_fail_descr().expect("resume guard");
+                    fd.set_rd_numb(Some(rd_numb));
+                    fd.set_rd_consts(Some(vec![]));
+                    fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
+                        majit_ir::RdVirtualInfo::VRawBufferInfo {
+                            func: 77,
+                            size: 0,
+                            offsets: vec![],
+                            descrs: vec![],
+                            fieldnums: vec![],
+                        },
+                    )]));
+                    descr
+                }),
                 op_arg_types_for_jump: None,
             },
         );
@@ -35922,7 +34690,6 @@ mod loop_side_table_tests {
         CompiledEntry {
             token,
             meta: std::sync::Arc::new(()),
-            front_target_tokens: Vec::new(),
             front_entry_index: None,
             front_target_source_positions: None,
             root_trace_id,
@@ -35975,7 +34742,7 @@ mod loop_side_table_tests {
         meta.active_jitdriver_sd = Some(jd0);
         let (ptrs, ints) = meta
             .handle_async_forcing_with_allocator(
-                descr.as_fail_descr(),
+                Some(&descr),
                 green_key,
                 trace_id,
                 fail_index,
@@ -35988,56 +34755,6 @@ mod loop_side_table_tests {
         assert_eq!(ptrs, vec![0]);
         assert_eq!(ints, vec![0]);
         let _keep = token;
-    }
-
-    #[test]
-    fn trace_for_exit_fallback_reads_the_failed_token_driver() {
-        // compile.py handle_fail reads descr.rd_loop_token; the cell lives
-        // on that token's jitdriver_sd.warmstate. Ambient compiled_entry
-        // follows leftover active_jitdriver_sd.
-        let mut meta = MetaInterp::<()>::new(1);
-        extern "C" fn portal_runner_helper() -> i64 {
-            0
-        }
-        let mut first = JitDriverStaticData::new(vec![], vec![]);
-        first.portal_runner_adr = portal_runner_helper as *const () as i64;
-        let mut second = JitDriverStaticData::new(vec![], vec![]);
-        second.portal_runner_adr = portal_runner_helper as *const () as i64;
-        let jd0 = meta.register_jitdriver_sd(first);
-        let jd1 = meta.register_jitdriver_sd(second);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = 92;
-        let trace_id = 32;
-        let fail_index = 8;
-
-        meta.insert_compiled_loop_on_driver(jd0, green_key, compiled_entry(1));
-        meta.insert_compiled_loop_on_driver(
-            jd1,
-            green_key,
-            compiled_entry_with_forced_virtual(trace_id, fail_index, std::sync::Weak::new()),
-        );
-
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![majit_ir::Type::Int]);
-        let fd = descr.as_fail_descr().expect("resume guard");
-        fd.set_trace_id(trace_id);
-        fd.set_fail_index_per_trace(fail_index);
-
-        meta.active_jitdriver_sd = Some(jd0);
-        assert!(
-            meta.trace_for_exit_by_rd_loop_token(jd1, Some(green_key), trace_id)
-                .is_some(),
-            "rd_loop_token fallback must read the failed token's driver"
-        );
-        assert!(
-            meta.trace_for_exit_by_rd_loop_token(jd0, Some(green_key), trace_id)
-                .is_none(),
-            "portal leftover must not supply the secondary-driver trace"
-        );
-        let layout = meta.guard_exit_layout(jd1, 0xdead, fd, Some(green_key));
-        assert!(
-            layout.storage.is_some(),
-            "guard_exit_layout fallback must recover the jd1 resume storage"
-        );
     }
 
     #[test]
@@ -36138,15 +34855,11 @@ mod loop_side_table_tests {
         meta.record_loop_header_greens(green_key, (vec![10], vec![], vec![]));
         let jd0_key = meta.compiled_loop_key(green_key);
         meta.cut_compiled_keys.insert(jd0_key);
-        meta.pending_preamble_tokens
-            .insert(jd0_key, vec![crate::history::TargetToken::new_preamble(10)]);
 
         meta.active_jitdriver_sd = Some(jd1);
         meta.record_loop_header_greens(green_key, (vec![11], vec![], vec![]));
         let jd1_key = meta.compiled_loop_key(green_key);
         meta.cut_compiled_keys.insert(jd1_key);
-        meta.pending_preamble_tokens
-            .insert(jd1_key, vec![crate::history::TargetToken::new_preamble(11)]);
 
         meta.warm_state_for_driver(jd1)
             .memory_manager
@@ -36160,8 +34873,6 @@ mod loop_side_table_tests {
         assert!(meta.loop_header_greens.contains_key(&(jd1, green_key)));
         assert!(meta.cut_compiled_keys.contains(&(jd0, green_key)));
         assert!(meta.cut_compiled_keys.contains(&(jd1, green_key)));
-        assert!(meta.pending_preamble_tokens.contains_key(&(jd0, green_key)));
-        assert!(meta.pending_preamble_tokens.contains_key(&(jd1, green_key)));
 
         let mut jd1_gone = false;
         for _ in 0..8 {
@@ -36184,20 +34895,12 @@ mod loop_side_table_tests {
             "jd1 cut marker must go with the evicted row"
         );
         assert!(
-            !meta.pending_preamble_tokens.contains_key(&(jd1, green_key)),
-            "jd1 preamble must go with the evicted row"
-        );
-        assert!(
             meta.loop_header_greens.contains_key(&(jd0, green_key)),
             "same-key jd0 header greens must stay"
         );
         assert!(
             meta.cut_compiled_keys.contains(&(jd0, green_key)),
             "same-key jd0 cut marker must stay"
-        );
-        assert!(
-            meta.pending_preamble_tokens.contains_key(&(jd0, green_key)),
-            "same-key jd0 preamble must stay"
         );
         let _keep = token;
     }

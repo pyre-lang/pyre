@@ -2161,44 +2161,10 @@ fn jit_blackhole_resume_from_guard(
         return Some(result);
     }
 
-    // `descr_owning_jct == None` is the giveup signal: the descr's
-    // `rd_loop_token.loop_token_wref()` is dead (memmgr-evicted JCT —
-    // pyjitpl.py:2898 should-be-rare path). compile.giveup() raises
-    // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29) and falls
-    // through here.
-    //
-    // Note (pyre-only, Python-portal-specific):
-    // pyre's resume storage is keyed by `(green_key, trace_id, fail_index)`,
-    // so we MUST recover a green_key to look up the storage.  PyPy's
-    // `resume_in_blackhole` uses descr identity directly (descr.rd_data),
-    // so it has no such recovery problem.
-    //
-    // When the JCT weakref is dead we exploit pyre's CALL_ASSEMBLER
-    // virtualizable layout `vable_boxes = [frame, ni, code, vsd, ns,
-    // locals..., stack...]` (as `jit_ca_handle_guard_failure` reads it) —
-    // `fail_values[0]` IS the callee's `PyFrame*`, so `frame.pycode` plus
-    // `pc=0` reconstructs the entry green_key.  This contract is
-    // Python-portal-specific and would NOT hold for a non-virtualizable
-    // JIT or a portal whose first fail arg is a scalar.  Keying resume
-    // storage by descr identity directly would remove the need for this
-    // recovery block.
-    let actual_green_key = match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key()) {
-        Some(gk) => gk,
-        None => {
-            let frame_ptr = fail0 as *const pyre_interpreter::pyframe::PyFrame;
-            if !frame_ptr.is_null() {
-                let frame = unsafe { &*frame_ptr };
-                crate::eval::make_green_key(frame.pycode, 0, frame.get_is_being_profiled())
-            } else {
-                0
-            }
-        }
-    };
-
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[blackhole-resume] gk={} trace={} fail_idx={} nvals={}",
-            actual_green_key, trace_id, fail_index, n_fail_args,
+            "[blackhole-resume] trace={} fail_idx={} nvals={}",
+            trace_id, fail_index, n_fail_args,
         );
     }
 
@@ -2206,25 +2172,24 @@ fn jit_blackhole_resume_from_guard(
     // When rd_numb is present, use ResumeDataDirectReader to decode
     // frame sections precisely, matching RPython blackhole_from_resumedata.
     //
-    // compile.py guard-owned `ResumeGuardDescr` storage — share the
-    // pool through `Arc<ResumeStorage>` so blackhole resume reads the
-    // same `rd_consts` the GC root walker updates. No owned-Vec copy.
-    // resume.py parity: deadframe_types tells decode_ref() whether a TAGBOX
-    // slot holds a raw int (needs boxing) or a GcRef (use as-is). Without it,
-    // unboxed ints are treated as pointers → SIGSEGV. Both come out of one
-    // layout resolution so the storage and the types cannot describe
-    // different deadframes.
-    if let Some((storage, deadframe_types)) = driver.get_resume_storage_with_slot_types_for_descr(
-        descr_fd,
-        actual_green_key,
-        trace_id,
-        fail_index,
-    ) {
+    // `resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)`
+    // is handed the failing descr and reads everything off it:
+    // `ResumeGuardDescr.get_resumestorage()` for the `rd_*` pool (shared
+    // through `Arc<ResumeStorage>` so blackhole resume reads the same
+    // `rd_consts` the GC root walker updates) and the guard's own
+    // `fail_arg_types` for the deadframe slot types. resume.py parity:
+    // deadframe_types tells decode_ref() whether a TAGBOX slot holds a raw
+    // int (needs boxing) or a GcRef (use as-is). Without it, unboxed ints
+    // are treated as pointers → SIGSEGV. Both come off the one descr so
+    // the storage and the types cannot describe different deadframes.
+    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
+    if let Some(storage) = exit_layout.storage.clone() {
+        let deadframe_types = exit_layout.exit_types.to_vec();
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
-                storage.rd_numb.len(),
-                storage.rd_consts().len(),
+                storage.rd_numb().expect("rd_numb").len(),
+                storage.rd_consts().unwrap_or(&[]).len(),
                 fail_args.len(),
             );
         }
@@ -2254,18 +2219,18 @@ fn jit_blackhole_resume_from_guard(
             None
         };
         let result = blackhole_resume_via_rd_numb(
-            &storage.rd_numb,
-            storage.rd_consts(),
+            storage.rd_numb().expect("rd_numb"),
+            storage.rd_consts().unwrap_or(&[]),
             fail_args,
-            Some(&storage.rd_pendingfields),
-            Some(&storage.rd_virtuals),
+            storage.rd_pendingfields(),
+            storage.rd_virtuals(),
             Some(deadframe_types.as_slice()),
             guard_exc,
             false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
             all_virtuals,
             None, // `raw_deadframe` is rooted only by the copy made inside
         );
-        return handle_blackhole_result(result, actual_green_key);
+        return handle_blackhole_result(result);
     }
 
     // RPython compile.py:701-716 parity: every guard must have rd_numb
@@ -2283,8 +2248,8 @@ fn jit_blackhole_resume_from_guard(
     }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[blackhole-resume] no rd_numb for key={} trace={} fail={} (force_fn fallback)",
-            actual_green_key, trace_id, fail_index,
+            "[blackhole-resume] no rd_numb for trace={} fail={} (force_fn fallback)",
+            trace_id, fail_index,
         );
     }
     None
@@ -3426,7 +3391,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
 /// RPython captures result_kind in closure (warmspot.py). For pyre,
 /// portal result_type == REF (warmspot.py), so ALL CALL_ASSEMBLER
 /// ops use _R. The result is always a Ref (PyObjectRef).
-fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Option<i64> {
+fn handle_blackhole_result(bh_result: BlackholeResult) -> Option<i64> {
     match bh_result {
         // warmspot.py:985-987: DoneWithThisFrameVoid → return None
         BlackholeResult::DoneWithThisFrameVoid => {
@@ -4573,7 +4538,7 @@ fn jit_ca_handle_guard_failure(
     let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
 
     // compile.py must_compile: jitcounter.tick(guard_hash, increment)
-    let (must_compile, owning_key) = {
+    let (must_compile, _) = {
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().must_compile_with_values(
             &descr_arc,
@@ -4594,25 +4559,9 @@ fn jit_ca_handle_guard_failure(
         );
     }
 
-    // compile.py: get exit_layout from the compiled trace.
-    // Use owning_key (not green_key) — after retrace the descriptor
-    // may belong to a different compiled entry than green_key.
     // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
     // descr's own; a bridge guard has no frontend record.
-    let exit_layout = {
-        let (driver, _) = crate::eval::driver_pair();
-        descr_arc.as_fail_descr().and_then(|fd| {
-            driver.meta_interp().get_compiled_exit_layout_for_descr(
-                fd,
-                owning_key,
-                source_trace_id,
-                source_fail_index,
-            )
-        })
-    };
-    let Some(exit_layout) = exit_layout else {
-        return None;
-    };
+    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
 
     // compile.py try/finally: `start_compiling()` before
     // bridge, `done_compiling()` on every unwind path.  RAII guard
@@ -4722,9 +4671,7 @@ fn try_compile_ca_bridge(
     if raw_values.is_empty() {
         return None;
     }
-    let Some((source_green_key, source_trace_id, source_fail_index)) =
-        bridge_source_identity_from_descr(descr_arc)
-    else {
+    let Some((source_green_key, _, _)) = bridge_source_identity_from_descr(descr_arc) else {
         return None;
     };
     let (must_compile, owning_key) = {
@@ -4741,20 +4688,7 @@ fn try_compile_ca_bridge(
     }
     // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
     // descr's own; a bridge guard has no frontend record.
-    let exit_layout = {
-        let (driver, _) = crate::eval::driver_pair();
-        descr_arc.as_fail_descr().and_then(|fd| {
-            driver.meta_interp().get_compiled_exit_layout_for_descr(
-                fd,
-                owning_key,
-                source_trace_id,
-                source_fail_index,
-            )
-        })
-    };
-    let Some(exit_layout) = exit_layout else {
-        return None;
-    };
+    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
     let frame_ptr = raw_values[0] as *mut PyFrame;
     if frame_ptr.is_null() {
         return None;
@@ -4868,7 +4802,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             let green_key = majit_backend::descr_owning_jct(descr)
                 .map(|jct| jct.green_key())
                 .unwrap_or(0);
-            let exit_layout = mi.build_exit_layout_for_descr(green_key, descr);
+            let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
             // compile.py `AbstractResumeGuardDescr.must_compile` reads a
             // GUARD_VALUE's actual operand directly from the deadframe before
             // hashing `(descr, value)`.  It need not be one of the guard's
@@ -5000,7 +4934,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 false,
                 savedata,
             );
-            handle_blackhole_result(bh, green_key).unwrap_or(0)
+            handle_blackhole_result(bh).unwrap_or(0)
         }
     }
 }

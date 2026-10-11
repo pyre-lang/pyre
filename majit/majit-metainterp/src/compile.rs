@@ -194,33 +194,45 @@ pub struct CompiledExitLayout {
     /// `make_finish_fail_descr_typed` routes a `[Type::Ref]` exit to the
     /// correct `_DoneWithThisFrameDescr` subclass.
     pub is_exception_exit: bool,
-    /// Held behind a pointer, not inline. Both this and [`Self::resume_layout`]
-    /// describe how to REBUILD interpreter state after a guard failed, so both
-    /// are `None` on the two exits the steady path actually takes — a FINISH
-    /// and a loop-carried JUMP. Held inline they added 120 and 176 bytes to a
-    /// struct that is 120 bytes without them, and this layout is in turn a
-    /// field of the [`CompileResult`] every compiled entry returns by value,
-    /// so those 296 bytes were copied on every warm entry to carry two absent
-    /// values.
-    ///
-    /// The indirection costs an allocation only where the layout EXISTS, which
-    /// is the guard-failure arm — already several allocations deep building
-    /// the vectors these hold, and off the steady path by construction. A
-    /// FINISH or JUMP exit stores two null words and allocates nothing, so the
-    /// per-entry allocation count is unchanged.
-    ///
-    /// `Arc`, not `Box`, because both halves are decided once when the trace
-    /// is compiled and then only read: every guard failure asks
-    /// `StoredExitLayout::public` for them again, and through a `Box` that
-    /// question deep-copied both frame vectors per deopt. The few places that
-    /// still edit one — the backend merge in this file — take
-    /// `Arc::make_mut`, which is free while the trace-side handle is the only
-    /// one.
-    pub recovery_layout: Option<std::sync::Arc<ExitRecoveryLayout>>,
-    pub resume_layout: Option<std::sync::Arc<ResumeLayoutSummary>>,
     /// compile.py `ResumeGuardDescr` storage handle — shared
     /// pool with rd_numb / rd_consts / rd_virtuals / rd_pendingfields.
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
+}
+
+/// `compile.py AbstractResumeGuardDescr.handle_fail`: the failing exit is
+/// described by the descr the deadframe named and by nothing else —
+/// `ResumeGuardDescr.get_resumestorage()` for the `rd_*` payload,
+/// `fail_arg_types` for the slot types, `rd_loop_token` for the owning
+/// loop. No frontend record is consulted: `send_bridge_to_backend` keeps
+/// none for a bridge, and a loop's guard answers the same way.
+///
+/// `storage` is `None` for a descr with no resume payload (the
+/// `_DoneWithThisFrameDescr` family and `ExitFrameWithExceptionDescrRef`).
+pub fn exit_layout_for_descr(descr_arc: &majit_ir::DescrRef) -> CompiledExitLayout {
+    let descr = descr_arc
+        .as_fail_descr()
+        .expect("a compiled exit's descr always implements FailDescr");
+    CompiledExitLayout {
+        rd_loop_token: majit_backend::descr_owning_green_key(descr).unwrap_or(0),
+        trace_id: descr.trace_id(),
+        fail_index: descr.fail_index_per_trace(),
+        source_op_index: descr.source_op_index(),
+        exit_types: ExitTypes::from_slice(descr.fail_arg_types()),
+        is_finish: descr.is_finish(),
+        is_exception_exit: descr.is_exit_frame_with_exception(),
+        storage: crate::resume::get_resumestorage(descr_arc),
+    }
+}
+
+/// The pc the outermost frame of `descr`'s resume data resumes at.
+/// `resume.py ResumeDataVirtualAdder.number` writes each frame as
+/// `jitcode_index, pc, values...` after the vable and vref sections, and
+/// `rebuild_from_resumedata` / `blackhole_from_resumedata` set every
+/// rebuilt frame at its pc. `None` for a descr with no resume payload or
+/// no frame section.
+pub fn guard_resume_pc(descr: &dyn majit_ir::FailDescr) -> Option<u64> {
+    let rd_numb = descr.rd_numb_arc()?;
+    crate::resume::outermost_frame_pc(rd_numb.as_ref()).map(|pc| pc as u64)
 }
 
 impl CompiledExitLayout {
@@ -895,8 +907,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
         } else {
             None
         };
-        let resume_layout;
-        let storage = if is_guard {
+        let resume_layout = if is_guard {
             // store_final_boxes / ResumeGuardDescr: when rd_numb is present,
             // fail_args are liveboxes only. Project the frontend
             // ResumeLayoutSummary from that stream so TAGCONST/TAGINT slots
@@ -929,32 +940,13 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
             // One Arc; `enrich_guard_resume_layouts_for_trace` make_muts
             // it. Cloning the summary here minted a second frame_pcs /
             // slot_sources / slot_layouts heap per guard.
-            resume_layout = Some(std::sync::Arc::new(layout));
-            // compile.py `ResumeGuardDescr` storage — build the shared
-            // Arc once from the guard op's `rd_*` fields so every reader
-            // (StoredExitLayout, bridge retrace, blackhole resume, GC
-            // root walker) observes the same pool.  Resolve through
-            // descr.prev (`resolved_rd_*` chases the copied-descr chain)
-            // so a sharing-path guard's ResumeStorage points at the same
-            // byte stream the donor was built from (RPython compile.py:832
-            // ResumeGuardCopiedDescr).
-            let storage_for_guard = op.resolved_rd_numb().map(|numb| {
-                crate::resume::ResumeStorage::with_shared_consts(
-                    numb,
-                    op.resolved_rd_consts()
-                        .unwrap_or_else(|| majit_ir::SharedConstPool::new(Vec::new())),
-                    op.resolved_rd_virtuals(),
-                    op.resolved_rd_pendingfields(),
-                )
-            });
-            storage_for_guard
+            Some(std::sync::Arc::new(layout))
         } else {
-            resume_layout = None;
             None
         };
 
-        // rd_* values are now carried inside `storage` (an
-        // `Arc<ResumeStorage>` installed above). They still feed into
+        // The `rd_*` payload stays on the guard's descr
+        // (`ResumeGuardDescr.get_resumestorage`); it feeds into
         // `recovery_layout` below via the guard op's rd_numb / rd_consts.
         // Sharing-path guards (mod.rs::sharing-guard) own a
         // ResumeGuardCopiedDescr whose `prev` points at the donor;
@@ -1316,7 +1308,6 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
                 source_op_index: Some(op_idx),
                 recovery_layout: recovery_layout.map(std::sync::Arc::new),
                 resume_layout,
-                storage,
                 descr: op.getdescr(),
                 op_arg_types_for_jump: None,
             },
@@ -1333,16 +1324,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
     ops: &[T],
 ) {
     for layout in backend_layouts {
-        // `ResumeGuardDescr.get_resumestorage`: an exit the frontend never
-        // saw still carries its payload on its own descr, so downstream
-        // consumers (rebuild_guard_fail_state, blackhole_resume_via_rd_numb)
-        // see the same pool they get on the frontend-primed path.
-        let storage_from_backend = layout
-            .descr
-            .as_ref()
-            .and_then(|descr| descr.as_fail_descr())
-            .and_then(crate::resume::ResumeStorage::from_fail_descr)
-            .map(std::sync::Arc::new);
         // Pre-resolve the source-op `descr` for backend-only entries so
         // `entry.descr` matches what `build_guard_metadata` would have
         // primed had the frontend seen this exit.  When the source op
@@ -1381,7 +1362,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
                     source_op_index: layout.source_op_index,
                     recovery_layout: layout.recovery_layout.clone().map(std::sync::Arc::new),
                     resume_layout: None,
-                    storage: storage_from_backend.clone(),
                     descr: descr_from_op.clone(),
                     op_arg_types_for_jump: None,
                 });
@@ -1420,10 +1400,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
                 entry.recovery_layout = layout.recovery_layout.clone().map(std::sync::Arc::new);
             }
         }
-        if entry.storage.is_none() {
-            entry.storage = storage_from_backend.clone();
-        }
-
         // Merge backend frame_stack metadata into the stored resume layout.
         if let Some(frame_stack) = &layout.frame_stack {
             merge_frame_stack_into_resume_layout(entry, frame_stack);
@@ -1558,79 +1534,6 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
     }
 }
 
-/// Enrich an `Option<ResumeLayoutSummary>` with backend-origin `frame_stack`
-/// metadata at runtime, merging slot types and outer frames.
-pub(crate) fn enrich_resume_layout_with_frame_stack(
-    resume_layout: &mut Option<ResumeLayoutSummary>,
-    frame_stack: Option<&[ExitFrameLayout]>,
-) {
-    let Some(frame_stack) = frame_stack else {
-        return;
-    };
-    if frame_stack.is_empty() {
-        return;
-    }
-
-    let frame_layouts: Vec<ResumeFrameLayoutSummary> = frame_stack
-        .iter()
-        .map(crate::resume::resume_frame_layout_from_exit_frame_layout)
-        .collect();
-
-    if let Some(layout) = resume_layout {
-        let shared = layout.frame_layouts.len().min(frame_layouts.len());
-        for offset in 0..shared {
-            let resume_index = layout.frame_layouts.len() - 1 - offset;
-            let fs_index = frame_layouts.len() - 1 - offset;
-            let target = &mut layout.frame_layouts[resume_index];
-            let source = &frame_layouts[fs_index];
-
-            if target.trace_id.is_none() {
-                target.trace_id = source.trace_id;
-            }
-            if target.header_pc.is_none() {
-                target.header_pc = source.header_pc;
-            }
-            if target.source_guard.is_none() {
-                target.source_guard = source.source_guard;
-            }
-
-            let needs_slot_types = target
-                .slot_types
-                .as_ref()
-                .is_none_or(|types| types.len() != target.slot_layouts.len());
-            if needs_slot_types
-                && source
-                    .slot_types
-                    .as_ref()
-                    .is_some_and(|types| types.len() == target.slot_layouts.len())
-            {
-                target.slot_types = source.slot_types.clone();
-            }
-        }
-
-        if frame_layouts.len() > layout.frame_layouts.len() {
-            let extra_count = frame_layouts.len() - layout.frame_layouts.len();
-            let mut new_frames = frame_layouts[..extra_count].to_vec();
-            new_frames.append(&mut layout.frame_layouts);
-            layout.frame_layouts = new_frames;
-            layout.num_frames = layout.frame_layouts.len();
-        }
-    } else {
-        *resume_layout = Some(ResumeLayoutSummary {
-            num_frames: frame_layouts.len(),
-            frame_pcs: Vec::new(),
-            frame_slot_counts: Vec::new(),
-            frame_layouts,
-            num_virtuals: 0,
-            virtual_kinds: Vec::new(),
-            virtual_layouts: Vec::new(),
-            pending_field_count: 0,
-            pending_field_layouts: Vec::new(),
-            const_pool_size: 0,
-        });
-    }
-}
-
 pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     terminal_exit_layouts: &mut crate::FxIndexMap<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
@@ -1672,7 +1575,6 @@ pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
                 source_op_index: Some(layout.op_index),
                 recovery_layout: layout.recovery_layout.clone().map(std::sync::Arc::new),
                 resume_layout: None,
-                storage: None,
                 descr: descr_from_op.clone(),
                 op_arg_types_for_jump: op_arg_types_for_jump.clone(),
             });
@@ -1810,8 +1712,6 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>, A: AsRef<InputA
         exit_types,
         is_finish,
         is_exception_exit,
-        recovery_layout: None,
-        resume_layout: None,
         storage: None,
     })
 }
@@ -1842,7 +1742,6 @@ pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>, A: AsRef<Input
                     source_op_index: Some(op_index),
                     recovery_layout: None,
                     resume_layout: None,
-                    storage: None,
                     descr: op.getdescr(),
                     op_arg_types_for_jump,
                 },
@@ -2763,8 +2662,6 @@ mod tests {
             exit_types: ExitTypes::from_slice(&[Type::Ref, Type::Int, Type::Ref]),
             is_finish: false,
             is_exception_exit: false,
-            recovery_layout: None,
-            resume_layout: None,
             storage: None,
         };
 
@@ -3722,6 +3619,9 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
     fn is_resume_at_position(&self) -> bool {
         true
     }
@@ -4106,6 +4006,9 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
     fn is_guard_forced(&self) -> bool {
         true
     }
@@ -4385,6 +4288,9 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
         Some(&self.inner)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
     fn is_guard_exc(&self) -> bool {
@@ -4781,6 +4687,9 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
+        Some(self)
+    }
     fn is_resume_guard_copied(&self) -> bool {
         true
     }
@@ -5136,6 +5045,9 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
         self.inner.fail_index
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
     fn is_resume_guard_copied(&self) -> bool {
@@ -5577,6 +5489,9 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
         Some(&self.inner)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn as_fail_descr_arc(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<dyn FailDescr>> {
         Some(self)
     }
     fn is_loop_version(&self) -> bool {

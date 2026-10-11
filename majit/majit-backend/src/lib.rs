@@ -1540,11 +1540,9 @@ pub struct JitCellToken {
     /// `record_target_token`.  [`Self::first_target_token`] supplies the descr
     /// a bridge closes onto, while [`Self::has_target_tokens`] is the direct
     /// `has_compiled_targets` predicate.  Both therefore read the same current
-    /// token, as upstream does.  The metainterp-side
-    /// `TargetToken` value (with `virtual_state` / `short_preamble`)
-    /// stays on the `CompiledEntry::front_target_tokens` list per
-    /// the F.6 retirement plan — the per-target descr identity is the
-    /// part PyPy parity care about for `has_compiled_targets`.
+    /// token, as upstream does.  Each element is the metainterp-side
+    /// `TargetToken` itself (`virtual_state` / `short_preamble` included),
+    /// read back through `history::target_tokens_of`.
     pub target_tokens: parking_lot::Mutex<Vec<majit_ir::DescrRef>>,
     /// One off-GC frame parked after `DoneWithThisFrameDescrInt`.
     ///
@@ -1964,7 +1962,7 @@ impl JitCellToken {
 
     /// Append a freshly minted TargetToken's descr to
     /// `token.target_tokens`.  Idempotent on `Arc::ptr_eq` so retrace
-    /// paths that reuse `prior_front_target_tokens` do not duplicate.
+    /// paths that reseed the token's own list do not duplicate.
     ///
     /// This has no single upstream counterpart: `compile.py:245` /
     /// `:290` assign the list outright, and both are in
@@ -1975,6 +1973,13 @@ impl JitCellToken {
         if !guard.iter().any(|existing| Arc::ptr_eq(existing, &descr)) {
             guard.push(descr);
         }
+    }
+
+    /// `compile.py compile_loop` / `compile_simple_loop`:
+    /// `jitcell_token.target_tokens = [start_descr]` — the whole list,
+    /// replacing whatever the token held.
+    pub fn set_target_tokens(&self, descrs: Vec<majit_ir::DescrRef>) {
+        *self.target_tokens.lock() = descrs;
     }
 }
 

@@ -4579,7 +4579,7 @@ where
                 // off the bridge origin (`unroll.py UnrollOptimizer.optimize_bridge`
                 // `cell_token = jump_op.getdescr()` — pyre's
                 // `compile_bridge` hands `optimize_bridge` the ORIGIN
-                // loop's `front_target_tokens`) recovered only 7%.
+                // loop's `target_tokens`) recovered only 7%.
                 //
                 // A declined `compile_trace` does not append here.
                 // The walker has no `MetaInterp` to scan
