@@ -39705,8 +39705,14 @@ impl<'a> Lowering<'a> {
                 .and_then(|slot| slot.as_ref())
                 .map(LocalValue::link_word)
                 .ok_or_else(|| {
+                    let n_locals = self.body.locals.locals.len();
+                    let ty = if local_idx < n_locals {
+                        tyref_to_ast_string(&self.body.locals.locals[local_idx].ty, self.llbc)
+                    } else {
+                        "len_shadow_or_slot".to_string()
+                    };
                     LowerError::Unsupported(format!(
-                        "bb{from_bb}: edge to bb{target_bb} needs live MIR local {local_idx}, \
+                        "bb{from_bb}: edge to bb{target_bb} needs live MIR local {local_idx} ({ty}), \
                          but it is uninitialised"
                     ))
                 })?;
@@ -42521,7 +42527,6 @@ fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
         let lowers = drop_place_is_frame_anchor(place, body, llbc)
             || drop_place_is_list_guard(place, llbc)
             || drop_place_is_set_guard(place, llbc)
-            || tyref_rust_vec_item_kind(&place.ty, llbc).is_some()
             || match glue {
                 Some(fn_ptr) => drop_lowers_as_glue_call(place, fn_ptr, llbc),
                 None => place_ty_is_root_scope(place, llbc),
