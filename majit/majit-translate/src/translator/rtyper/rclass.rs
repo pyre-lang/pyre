@@ -565,6 +565,87 @@ pub fn ll_inst_hash(ins: Option<&_ptr>) -> i64 {
     }
 }
 
+/// `ll_inst_hash` (`rclass.py`): a null instance hashes as `0`, otherwise
+/// `lltype.identityhash`.
+fn build_ll_inst_hash_helper_graph(
+    name: &str,
+    arg_ty: &LowLevelType,
+) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
+    use crate::flowspace::model::{
+        Block, BlockRefExt, FunctionGraph, GraphFunc, Link, SpaceOperation,
+    };
+    use crate::translator::rtyper::rtyper::{
+        constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
+    };
+
+    let arg = variable_with_lltype("ins", arg_ty.clone());
+    let is_nonnull = variable_with_lltype("is_nonnull", LowLevelType::Bool);
+    let ins1 = variable_with_lltype("ins1", arg_ty.clone());
+    let hashed = variable_with_lltype("hashed", LowLevelType::Signed);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let hashblock = Block::shared(vec![Hlvalue::Variable(ins1.clone())]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(arg.clone())],
+        Hlvalue::Variable(is_nonnull.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_nonnull));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(arg)],
+            Some(hashblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![constant_with_lltype(
+                ConstValue::Int(0),
+                LowLevelType::Signed,
+            )],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+    hashblock.borrow_mut().operations.push(SpaceOperation::new(
+        "gc_identityhash",
+        vec![Hlvalue::Variable(ins1)],
+        Hlvalue::Variable(hashed.clone()),
+    ));
+    hashblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(hashed)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ins".to_string()],
+        func,
+    ))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[allow(dead_code)]
 struct MissingMarker;
@@ -1209,11 +1290,10 @@ impl ClassRepr {
     ///         vtable.instantiate = self.rtyper.getcallable(graph)
     /// ```
     ///
-    /// Pyre-port deviations:
-    /// - `instantiate` slot: deferred; OBJECT_VTABLE omits the
-    ///   `instantiate: Ptr(FuncType([], OBJECTPTR))` field, and
-    ///   `my_instantiate_graph` is only attached after
-    ///   `normalizecalls.create_instantiate_functions` runs.
+    /// `my_instantiate_graph` is a `FunctionGraph`. `getcallable`'s
+    /// non-sandbox body is `getfunctionptr` over `bindingrepr`; the
+    /// graph's `func` is unset, so the sandbox external-name branch
+    /// does not apply.
     pub fn fill_vtable_root(&self, vtable: &mut _ptr) -> Result<(), TyperError> {
         // Backward-compatible shim — leaf-level write at empty path.
         self.fill_vtable_root_at_path(vtable, &[])
@@ -1307,9 +1387,20 @@ impl ClassRepr {
             "name",
             lltype::LowLevelValue::Ptr(Box::new(name_ptr)),
         )?;
-        // `vtable.instantiate = ...` — deferred
-        // (LazyLock cycle on Ptr(FuncType([], OBJECTPTR));
-        // normalizecalls.create_instantiate_functions also pending).
+        // upstream: `if hasattr(self.classdef, 'my_instantiate_graph')`.
+        if let Some(graph) = classdef.borrow().my_instantiate_graph.clone() {
+            let funcptr =
+                crate::translator::rtyper::lltypesystem::lltype::getfunctionptr(&graph, |v| {
+                    rtyper
+                        .bindingrepr(v)
+                        .map(|repr| repr.lowleveltype().clone())
+                })?;
+            setattr_path(
+                vtable,
+                "instantiate",
+                lltype::LowLevelValue::Ptr(Box::new(funcptr)),
+            )?;
+        }
         Ok(())
     }
 
@@ -2041,8 +2132,9 @@ impl RootClassRepr {
     /// (the only target pyre supports today) that is `i64::MAX`. The
     /// `rtti` slot is populated via `getinstancerepr(rtyper, None)`
     /// + `getRuntimeTypeInfo(rinstance.object_type)`. The `name` slot
-    ///   is the upstream `"object"` string; `instantiate` is deferred
-    ///   until the `Ptr(FuncType([], OBJECTPTR))` cycle is resolved.
+    ///   is the upstream `"object"` string. `classdef is None`, so
+    ///   `hasattr(self.classdef, 'my_instantiate_graph')` is false and
+    ///   the `instantiate` slot stays unset.
     pub fn fill_vtable_root(&self, vtable: &mut _ptr) -> Result<(), TyperError> {
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
             TyperError::message("RootClassRepr.fill_vtable_root: RPythonTyper weak ref expired")
@@ -2090,7 +2182,6 @@ impl RootClassRepr {
                 )),
             )
             .map_err(TyperError::message)?;
-        // `vtable.instantiate` deferred — see `ClassRepr::fill_vtable_root`.
         Ok(())
     }
 
@@ -3954,6 +4045,41 @@ impl Repr for InstanceRepr {
     /// is intentionally absent here — a non-null instance always evaluates
     /// to true and the lowleveltype carrier is a `Ptr(GcStruct)` that
     /// `ptr_nonzero` lowers directly to a null comparison.
+    /// RPython `InstanceRepr.get_ll_eq_function` (`rclass.py`): `None`,
+    /// so a dict key compares by pointer identity.
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+
+    /// RPython `InstanceRepr.get_ll_hash_function` (`rclass.py`):
+    /// `ll_inst_hash`.
+    fn get_ll_hash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        let arg = self.lowleveltype.clone();
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_inst_hash",
+                vec![arg],
+                LowLevelType::Signed,
+                |_rtyper, args, _result| build_ll_inst_hash_helper_graph("ll_inst_hash", &args[0]),
+            )
+            .map(Some)
+    }
+
+    /// RPython `InstanceRepr.get_ll_fasthash_function = get_ll_hash_function`
+    /// (`rclass.py`).
+    fn get_ll_fasthash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        self.get_ll_hash_function(rtyper)
+    }
+
     fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
         let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
@@ -5314,6 +5440,68 @@ mod tests {
         };
         assert!(p.nonzero());
         assert_eq!(out.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+    }
+
+    #[test]
+    fn fill_vtable_root_stores_my_instantiate_graph() {
+        use crate::annotator::model::SomeInstance;
+        use crate::flowspace::model::GraphKey;
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, LowLevelValue};
+        use crate::translator::rtyper::normalizecalls::create_instantiate_function;
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::rc::Rc;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("pkg.Inst", None);
+        classdef.borrow_mut().minid = Some(3);
+        classdef.borrow_mut().maxid = Some(3);
+        create_instantiate_function(&ann, &classdef).expect("instantiate graph");
+        let graph = classdef
+            .borrow()
+            .my_instantiate_graph
+            .clone()
+            .expect("my_instantiate_graph");
+        // create_instantiate_function binds the return to SomeInstance(None).
+        // Confirm that binding is the one getfunctionptr will read.
+        let ret = graph.borrow().getreturnvar();
+        let Hlvalue::Variable(ret_var) = &ret else {
+            panic!("return var");
+        };
+        let bound = ret_var.annotation.borrow().as_ref().map(|s| (**s).clone());
+        assert!(matches!(
+            bound,
+            Some(SomeValue::Instance(SomeInstance { classdef: None, .. }))
+        ));
+
+        let repr_arc = match getclassrepr_arc(&rtyper, Some(&classdef)).expect("getclassrepr") {
+            ClassReprArc::Inst(r) => r,
+            _ => panic!("classdef != None routes to Inst"),
+        };
+        Repr::setup(repr_arc.as_ref()).expect("setup");
+        repr_arc.init_vtable().expect("init_vtable");
+        let mut vtable = repr_arc.vtable.borrow().clone().expect("vtable");
+        let slot = loop {
+            if let Ok(slot) = vtable.getattr("instantiate") {
+                break slot;
+            }
+            let LowLevelValue::Ptr(parent) = vtable.getattr("super").expect("vtable super") else {
+                panic!("vtable super must be a pointer");
+            };
+            vtable = *parent;
+        };
+        let LowLevelValue::Ptr(funcptr) = slot else {
+            panic!("instantiate must be a function pointer, got {slot:?}");
+        };
+        let Ok(_ptr_obj::Func(func)) = funcptr._obj() else {
+            panic!("instantiate pointer must expose a function");
+        };
+        assert_eq!(func.graph, Some(GraphKey::of(&graph).as_usize()));
+        assert!(func.TYPE.args.is_empty());
+        assert_eq!(&func.TYPE.result, &*OBJECTPTR);
     }
 
     #[test]

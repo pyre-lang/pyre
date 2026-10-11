@@ -523,6 +523,7 @@ struct ListItemCheckpoint {
     resized: bool,
     immutable: bool,
     must_not_resize: bool,
+    dont_change_any_more: bool,
     range_step: Option<i64>,
     read_locations: IndexSet<PositionKey>,
     /// `itemof` only grows (`ListItem.merge`). Restore truncates.
@@ -573,6 +574,7 @@ impl ListItemJournal {
             resized: item.resized,
             immutable: item.immutable,
             must_not_resize: item.must_not_resize,
+            dont_change_any_more: item.dont_change_any_more,
             range_step: item.range_step,
             read_locations: item.read_locations.clone(),
             itemof_len: item.itemof.len(),
@@ -617,6 +619,9 @@ impl ListItemJournal {
             }
             if current.must_not_resize != helper_saved.must_not_resize {
                 outer_saved.must_not_resize = current.must_not_resize;
+            }
+            if current.dont_change_any_more != helper_saved.dont_change_any_more {
+                outer_saved.dont_change_any_more = current.dont_change_any_more;
             }
             if current.range_step != helper_saved.range_step {
                 outer_saved.range_step = current.range_step;
@@ -667,6 +672,7 @@ impl ListItemJournal {
             item.resized = checkpoint.resized;
             item.immutable = checkpoint.immutable;
             item.must_not_resize = checkpoint.must_not_resize;
+            item.dont_change_any_more = checkpoint.dont_change_any_more;
             item.range_step = checkpoint.range_step;
             item.read_locations = checkpoint.read_locations;
             item.itemof.truncate(checkpoint.itemof_len);

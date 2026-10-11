@@ -215,6 +215,13 @@ pub struct Bookkeeper {
     /// the same rather than building a fresh ListDef per call outside
     /// a reflow frame.
     pub(crate) listdefs: RefCell<HashMap<Option<PositionKey>, ListDef>>,
+    /// Whole projected value of one `__cast_instance_intrinsic` root at
+    /// the current position. `getlistdef` (`bookkeeper.py`) keeps one
+    /// `ListDef` per position so a reflow `setbinding` sees the same
+    /// object. A tuple root contains two lists, so the cache stores the
+    /// projected value, not one shared `ListDef`. Class-attribute seeding
+    /// still calls [`Self::project_struct_field_type`] directly.
+    pub(crate) projected_roots: RefCell<HashMap<(Option<PositionKey>, String), SomeValue>>,
     /// RPython `self.dictdefs = {}` (bookkeeper.py). Same
     /// `Option<PositionKey>` key semantics as `listdefs`.
     pub(crate) dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
@@ -1071,6 +1078,18 @@ fn top_level_comma(spelling: &str) -> bool {
     false
 }
 
+fn projected_contains_list(value: &SomeValue) -> bool {
+    match value {
+        // `DictDef` equality is the identity of its key and value cells
+        // (`dictdef.py` `same_as`). A fresh `SomeDict` on reflow fails
+        // `setbinding` the same way a fresh `ListDef` does, so a dict
+        // root is cached in the same `projected_roots` map.
+        SomeValue::List(_) | SomeValue::Dict(_) => true,
+        SomeValue::Tuple(tuple) => tuple.items.iter().any(projected_contains_list),
+        _ => false,
+    }
+}
+
 impl Bookkeeper {
     /// RPython `Bookkeeper.__init__(self, annotator)` (bookkeeper.py).
     /// Once the annotator driver lands, this constructor takes an
@@ -1086,6 +1105,7 @@ impl Bookkeeper {
             policy,
             position_key: RefCell::new(None),
             listdefs: RefCell::new(HashMap::new()),
+            projected_roots: RefCell::new(HashMap::new()),
             dictdefs: RefCell::new(HashMap::new()),
             descs: RefCell::new(IndexMap::new()),
             classdefs: RefCell::new(Vec::new()),
@@ -2108,6 +2128,54 @@ impl Bookkeeper {
         let listdef = self.getlistdef(None);
         let _ = listdef.generalize(&list.listdef.s_value());
         SomeValue::List(SomeList::new(listdef))
+    }
+
+    /// Project `root` once per `(position_key, root)`.
+    ///
+    /// `__cast_instance_intrinsic` re-runs on reflow. A fresh `ListDef::new`
+    /// fails `setbinding` (`annrpython.py`): list equality is listitem
+    /// identity. The cached value is the one `getlistdef` would have built
+    /// at this position (`bookkeeper.py`). Two `Vec`s inside one tuple stay
+    /// distinct because only the outer root is cached.
+    pub fn stable_projected_root(self: &Rc<Self>, root: &str) -> SomeValue {
+        let key = (self.current_position_key(), root.to_string());
+        if let Some(existing) = self.projected_roots.borrow().get(&key) {
+            return existing.clone();
+        }
+        // Only the insert/get cast root is the ordered dict. A field
+        // whose type is `RDict<K, V, S>` stays the struct the other
+        // casts produce (`SomeInstance`); painting every field would
+        // store that instance into a dict-typed `Option` payload.
+        let projected = if majit_ir::descr::is_shaped_tuple_name(root) {
+            self.project_shaped_tuple(root)
+        } else if let Some(dict) = self.project_ordered_dict_root(root) {
+            dict
+        } else {
+            self.project_struct_field_type(root)
+        };
+        if projected_contains_list(&projected) {
+            self.projected_roots
+                .borrow_mut()
+                .insert(key, projected.clone());
+        }
+        projected
+    }
+
+    /// `RDict<K, V>` / `RDict<K, V, S>` at an insert/get cast
+    /// (`rordereddict.py` `OrderedDictRepr`). The hasher is not a
+    /// lattice type. `is_r_dict` stays false: a custom eq/hash dict
+    /// is `r_dict`, and that key function is not wired.
+    fn project_ordered_dict_root(self: &Rc<Self>, root: &str) -> Option<SomeValue> {
+        let inner = strip_generic_one(root.trim(), "RDict<")?;
+        let parts = split_generic_args(inner);
+        if parts.len() < 2 {
+            return None;
+        }
+        let s_key = self.project_struct_field_type(parts[0]);
+        let s_val = self.project_struct_field_type(parts[1]);
+        let dictdef =
+            super::dictdef::DictDef::new(Some(self.clone()), s_key, s_val, false, false, false);
+        Some(SomeValue::Dict(super::model::SomeDict::new(dictdef)))
     }
 
     /// RPython `Bookkeeper.newlist(*s_values, **flags)` (bookkeeper.py).
@@ -3711,6 +3779,14 @@ impl Bookkeeper {
         if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
             return self.project_struct_field_type("pyobject::PyObject");
         }
+        // `IdentityKey` is `repr(transparent)` over `PyObjectRef`
+        // (`IdentityDictStrategy`: the key is the object, compared by
+        // identity). The constructor is that pointer, so the dict key
+        // cell is the same instance. A separate `IdentityKey` class
+        // has no common base with `PyObject`.
+        if t == "IdentityKey" || t.ends_with("::IdentityKey") {
+            return self.project_struct_field_type("pyobject::PyObject");
+        }
         // A function-pointer field is `Ptr(FuncType)` (`lltype.py FuncType`,
         // `SomePtr`), not a classdef-less `SomeInstance`.  Raw `fn` has
         // `_gckind == 'raw'`, so `getkind` is Signed — the dual-gate twin
@@ -3804,7 +3880,14 @@ impl Bookkeeper {
             // `bytes_block_chars` folds the Rust raw-slice view back to this
             // owner, so the owner must carry the same `SomeString` annotation
             // as the slice it represents, not a nominal Rust-struct class.
-            "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str" => {
+            // `BytesKey` / `StrKey` are those block pointers
+            // (`repr(transparent)` over `*mut BytesBlock` /
+            // `*mut Utf8Str`). The dict stores the str and `RDict::get`
+            // queries it with the slice, so the key cell is the same
+            // `SomeString`. A nominal key instance cannot union with
+            // that slice.
+            "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "BytesKey" | "StrKey"
+            | "Utf8Str" => {
                 return super::model::s_str0();
             }
             // `malachite_bigint::BigInt` is deliberately foreign and opaque

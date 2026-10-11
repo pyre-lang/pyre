@@ -1189,6 +1189,18 @@ fn is_vec_push_segments(segments: &[String]) -> bool {
     segments.len() == 3 && segments[0] == "vec" && segments[1] == "Vec" && segments[2] == "push"
 }
 
+/// `RDict::insert` / `RDict::get` (`rordereddict.py` `ll_dict_setitem` /
+/// `ll_dict_lookup`). The owner segment is the type; `unspecialized_leaf`
+/// sees through the monomorphized copy. The hash in the leaf is not part
+/// of the match.
+fn rdict_insert_or_get_leaf(segments: &[String]) -> Option<&str> {
+    if segments.len() < 3 || segments[segments.len() - 2] != "RDict" {
+        return None;
+    }
+    let leaf = crate::front::clause_spec::unspecialized_leaf(segments.last()?);
+    matches!(leaf, "insert" | "get").then_some(leaf)
+}
+
 /// `Vec::extend_from_slice(l, slice)` (Rust MIR `vec::Vec::extend_from_slice`)
 /// — appends every element of `slice` to the resizable list. Routed to the
 /// resized `ListRepr.rtype_method("extend")` (`rlist.py`) via the
@@ -3080,6 +3092,84 @@ pub fn translate_op(
                                 bound_method.clone(),
                             ),
                             FlowspaceOp::new("simple_call", vec![bound_method, source], result),
+                        ]);
+                    }
+                    // `RDict::get(recv, key)` is `dict.get`
+                    // (`OrderedDictRepr.rtype_method_get` → `ll_dict_get`
+                    // → `ll_dict_lookup`). Two arguments: the missing key
+                    // answers the `None` default that method pushes.
+                    // `RDict::insert(recv, key, value)` returns the previous
+                    // value (`Option`), while `ll_dict_setitem` is void
+                    // (`rtype_setitem`). Read with `get` into the call's
+                    // result, then `setitem` (`ll_dict_setitem`). `get`
+                    // runs first so the displaced value is the one insert
+                    // returned.
+                    if let Some(leaf) = rdict_insert_or_get_leaf(segments) {
+                        if leaf == "get" {
+                            if arg_hls.len() != 2 {
+                                return Err(TyperError::message(format!(
+                                    "RDict::get requires exactly two args (receiver, key), got {}",
+                                    arg_hls.len()
+                                )));
+                            }
+                            let mut iter = arg_hls.into_iter();
+                            let receiver = iter.next().ok_or_else(|| {
+                                TyperError::message(
+                                    "RDict::get requires a receiver arg".to_string(),
+                                )
+                            })?;
+                            let key = iter.next().ok_or_else(|| {
+                                TyperError::message("RDict::get requires a key arg".to_string())
+                            })?;
+                            let bound_method = Hlvalue::Variable(Variable::new());
+                            return Ok(vec![
+                                FlowspaceOp::new(
+                                    "getattr",
+                                    vec![
+                                        receiver,
+                                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                            "get",
+                                        ))),
+                                    ],
+                                    bound_method.clone(),
+                                ),
+                                FlowspaceOp::new("simple_call", vec![bound_method, key], result),
+                            ]);
+                        }
+                        if arg_hls.len() != 3 {
+                            return Err(TyperError::message(format!(
+                                "RDict::insert requires exactly three args \
+                                 (receiver, key, value), got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message("RDict::insert requires a receiver arg".to_string())
+                        })?;
+                        let key = iter.next().ok_or_else(|| {
+                            TyperError::message("RDict::insert requires a key arg".to_string())
+                        })?;
+                        let value = iter.next().ok_or_else(|| {
+                            TyperError::message("RDict::insert requires a value arg".to_string())
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        let stored = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver.clone(),
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("get"))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new(
+                                "simple_call",
+                                vec![bound_method, key.clone()],
+                                result,
+                            ),
+                            FlowspaceOp::new("setitem", vec![receiver, key, value], stored),
                         ]);
                     }
                     // Fail-closed on an UNFUSED

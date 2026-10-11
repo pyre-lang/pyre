@@ -2261,6 +2261,7 @@ two-phase-rtype-skipped	pyre_module::module::bz2::compressor_methods::__majit_wr
 two-phase-rtype-skipped	pyre_module::module::bz2::decompressor_methods::__majit_wrap___getstate__
 two-phase-rtype-skipped	pyre_module::module::gc::hook::__majit_wrap_reset
 two-phase-rtype-skipped	pyre_module::module::mmap::interp_mmap::mmap_get_attr_i64::<Impl>::call_once
+two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::getitem
 two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::getitem_str
 two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::setitem
 two-phase-rtype-skipped	pyre_object::identitydict::<Impl>::delitem

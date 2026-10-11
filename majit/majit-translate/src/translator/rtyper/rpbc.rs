@@ -6107,6 +6107,68 @@ pub struct ClassesPBCRepr {
     lltype: LowLevelType,
 }
 
+fn object_vtable_field_type(
+    name: &str,
+) -> Result<crate::translator::rtyper::lltypesystem::lltype::LowLevelType, TyperError> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::OBJECT_VTABLE;
+
+    let LowLevelType::ForwardReference(fwd) = OBJECT_VTABLE.clone() else {
+        return Err(TyperError::message(
+            "OBJECT_VTABLE must be a ForwardReference",
+        ));
+    };
+    let LowLevelType::Struct(body) = fwd
+        .resolved()
+        .ok_or_else(|| TyperError::message("OBJECT_VTABLE forward reference is unresolved"))?
+    else {
+        return Err(TyperError::message(
+            "OBJECT_VTABLE must resolve to a Struct",
+        ));
+    };
+    body._flds
+        .get(name)
+        .cloned()
+        .ok_or_else(|| TyperError::message(format!("OBJECT_VTABLE has no field {name:?}")))
+}
+
+/// RPython `pairtype(ClassesPBCRepr, ClassRepr).convert_from_to` (rpbc.py).
+///
+/// `RootClassRepr` is a `ClassRepr` upstream. Both pyre class reprs use
+/// [`ReprClassId::Repr`], so the dispatcher selects this handler only
+/// when the target's concrete type is `ClassRepr` or `RootClassRepr`.
+pub(crate) fn pair_classes_pbc_class_convert_from_to(
+    r_from: &dyn crate::translator::rtyper::rmodel::Repr,
+    r_to: &dyn crate::translator::rtyper::rmodel::Repr,
+    v: &crate::flowspace::model::Hlvalue,
+    llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rmodel::{Repr, inputconst};
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let raw = r_from as *const dyn Repr as *const ();
+    let r_clspbc = unsafe { &*(raw as *const ClassesPBCRepr) };
+    if r_clspbc.lowleveltype() == r_to.lowleveltype() {
+        return Ok(Some(v.clone()));
+    }
+    if matches!(r_clspbc.lowleveltype(), LowLevelType::Void) {
+        let value = r_clspbc.s_pbc.base.const_box.as_ref().ok_or_else(|| {
+            TyperError::message("ClassesPBCRepr→ClassRepr: Void class PBC has no constant")
+        })?;
+        let constant = inputconst(r_to, &value.value)?;
+        return Ok(Some(Hlvalue::Constant(constant)));
+    }
+    Repr::setup(r_to)?;
+    let casted = llops.genop(
+        "cast_pointer",
+        vec![v.clone()],
+        GenopResult::LLType(r_to.lowleveltype().clone()),
+    );
+    Ok(casted.map(Hlvalue::Variable))
+}
+
 impl ClassesPBCRepr {
     /// RPython `ClassesPBCRepr.__init__(self, rtyper, s_pbc)`
     /// (rpbc.py). Both constant and non-constant arms ported.
@@ -6244,6 +6306,97 @@ impl ClassesPBCRepr {
             crate::translator::rtyper::rclass::getclassrepr_arc(&rtyper, Some(&commonbase))?;
         let _ = annotator; // silence unused after future-proofing the upgrade() guard.
         Ok((access, class_repr))
+    }
+
+    /// RPython `ClassesPBCRepr._instantiate_runtime_class` (rpbc.py).
+    ///
+    /// ```python
+    /// def _instantiate_runtime_class(self, hop, vtypeptr, r_instance):
+    ///     graphs = []
+    ///     for desc in self.s_pbc.descriptions:
+    ///         classdef = desc.getclassdef(None)
+    ///         assert hasattr(classdef, 'my_instantiate_graph')
+    ///         graphs.append(classdef.my_instantiate_graph)
+    ///     c_graphs = hop.inputconst(Void, graphs)
+    ///     c_name = hop.inputconst(Void, 'instantiate')
+    ///     v_instantiate = hop.genop('getfield', [vtypeptr, c_name],
+    ///                              resulttype=OBJECT_VTABLE.instantiate)
+    ///     v_inst = hop.genop('indirect_call', [v_instantiate, c_graphs],
+    ///                        resulttype=OBJECTPTR)
+    ///     return hop.genop('cast_pointer', [v_inst], resulttype=r_instance)
+    /// ```
+    ///
+    /// `r_instance` is the low-level result type. `rtype_instantiate`
+    /// passes `hop.r_result.lowleveltype`.
+    pub fn _instantiate_runtime_class(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+        vtypeptr: crate::flowspace::model::Hlvalue,
+        r_instance: &LowLevelType,
+    ) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
+        use crate::annotator::classdesc::ClassDesc;
+        use crate::flowspace::model::{ConstValue, GraphKey, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp};
+
+        let mut graph_ids = Vec::new();
+        for entry in self.s_pbc.descriptions.values() {
+            let DescEntry::Class(desc) = entry else {
+                return Err(TyperError::message(format!(
+                    "ClassesPBCRepr._instantiate_runtime_class: non-Class desc {entry:?}"
+                )));
+            };
+            let classdef =
+                ClassDesc::getclassdef(desc, ()).map_err(|e| TyperError::message(e.to_string()))?;
+            let graph = classdef
+                .borrow()
+                .my_instantiate_graph
+                .clone()
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "ClassesPBCRepr._instantiate_runtime_class: classdef has no \
+                         my_instantiate_graph",
+                    )
+                })?;
+            graph_ids.push(GraphKey::of(&graph).as_usize());
+        }
+        let c_graphs =
+            HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Graphs(graph_ids))?;
+        let c_name =
+            HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::byte_str("instantiate"))?;
+        let instantiate_type = object_vtable_field_type("instantiate")?;
+        let v_instantiate = hop
+            .genop(
+                "getfield",
+                vec![vtypeptr, Hlvalue::Constant(c_name)],
+                GenopResult::LLType(instantiate_type),
+            )
+            .ok_or_else(|| {
+                TyperError::message(
+                    "ClassesPBCRepr._instantiate_runtime_class: getfield returned no result",
+                )
+            })?;
+        let v_inst = hop
+            .genop(
+                "indirect_call",
+                vec![v_instantiate, Hlvalue::Constant(c_graphs)],
+                GenopResult::LLType(crate::translator::rtyper::rclass::OBJECTPTR.clone()),
+            )
+            .ok_or_else(|| {
+                TyperError::message(
+                    "ClassesPBCRepr._instantiate_runtime_class: indirect_call returned no result",
+                )
+            })?;
+        hop.genop(
+            "cast_pointer",
+            vec![v_inst],
+            GenopResult::LLType(r_instance.clone()),
+        )
+        .ok_or_else(|| {
+            TyperError::message(
+                "ClassesPBCRepr._instantiate_runtime_class: cast_pointer returned no result",
+            )
+        })
     }
 
     /// RPython `ClassesPBCRepr.replace_class_with_inst_arg(self, hop,
