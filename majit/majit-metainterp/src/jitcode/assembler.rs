@@ -3100,7 +3100,7 @@ impl JitCodeBuilder {
         );
     }
 
-    /// RPython `blackhole.py` `bhimpl_int_{neg,invert,is_zero,is_true}`
+    /// `blackhole.py` `bhimpl_int_{neg,invert,is_zero,is_true,force_ge_zero}`
     /// per-opname handlers. See `record_binop_i` for the keying rationale.
     /// Byte layout follows `assembler.py`: each `Register` is
     /// emitted in argcode order, so `int_neg/i>i` stores `[src][dst]`
@@ -3111,6 +3111,7 @@ impl JitCodeBuilder {
             OpCode::IntInvert => "int_invert/i>i",
             OpCode::IntIsZero => "int_is_zero/i>i",
             OpCode::IntIsTrue => "int_is_true/i>i",
+            OpCode::IntForceGeZero => "int_force_ge_zero/i>i",
             other => panic!("record_unary_i: unsupported opcode {other:?}"),
         };
         self.touch_reg(dst);

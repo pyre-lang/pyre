@@ -10757,6 +10757,14 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         // so without the byte here `wire_handler` no-ops and a
         // blackhole-executed `x == 0` test hits the unwired-opcode panic.
         ("int_is_zero/i>i", majit_jitcode::insns::BC_INT_IS_ZERO),
+        // `int_force_ge_zero/i>i` — `blackhole.py bhimpl_int_force_ge_zero`.
+        // `rlist.py ll_alloc_and_set` clamps `count` with this unary.
+        // `wire_bhimpl_handlers` binds `handler_int_force_ge_zero`; without
+        // the byte a forward resume through the clamp hits the unwired panic.
+        (
+            "int_force_ge_zero/i>i",
+            majit_jitcode::insns::BC_INT_FORCE_GE_ZERO,
+        ),
         ("float_add/ff>f", majit_jitcode::insns::BC_FLOAT_ADD),
         ("float_sub/ff>f", majit_jitcode::insns::BC_FLOAT_SUB),
         ("float_mul/ff>f", majit_jitcode::insns::BC_FLOAT_MUL),

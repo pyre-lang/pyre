@@ -9536,6 +9536,15 @@ fn int_is_zero_records_intiszero() {
     drive_int_unop("int_is_zero/i>i", majit_ir::OpCode::IntIsZero);
 }
 
+/// `int_force_ge_zero` is the exec-generated unary `pyjitpl.py` lists
+/// beside `int_neg`. `rlist.py ll_alloc_and_set` clamps `count` with it
+/// (`blackhole.py bhimpl_int_force_ge_zero`). Without the arm the walker
+/// answers `DispatchError::UnsupportedOpname` and aborts the trace.
+#[test]
+fn int_force_ge_zero_records_intforcegezero() {
+    drive_int_unop("int_force_ge_zero/i>i", majit_ir::OpCode::IntForceGeZero);
+}
+
 #[test]
 fn int_same_as_is_eliminated_from_generated_insns_table() {
     // RPython `jtransform.py rewrite_op_same_as` removes

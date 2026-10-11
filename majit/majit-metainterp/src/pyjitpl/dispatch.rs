@@ -5690,6 +5690,14 @@ pub fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
         OpCode::IntInvert => !value,
         OpCode::IntIsTrue => i64::from(value != 0),
         OpCode::IntIsZero => i64::from(value == 0),
+        // `opimpl.py op_int_force_ge_zero` / `blackhole.py bhimpl_int_force_ge_zero`.
+        OpCode::IntForceGeZero => {
+            if value < 0 {
+                0
+            } else {
+                value
+            }
+        }
         other => panic!("unsupported jitcode integer unary op {other:?}"),
     }
 }

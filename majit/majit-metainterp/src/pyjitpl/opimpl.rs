@@ -106,6 +106,7 @@ where
         table[jitcode::insns::BC_INT_INVERT as usize] = Self::opimpl_int_invert;
         table[jitcode::insns::BC_INT_IS_TRUE as usize] = Self::opimpl_int_is_true;
         table[jitcode::insns::BC_INT_IS_ZERO as usize] = Self::opimpl_int_is_zero;
+        table[jitcode::insns::BC_INT_FORCE_GE_ZERO as usize] = Self::opimpl_int_force_ge_zero;
         table[jitcode::insns::BC_PTR_EQ as usize] = Self::opimpl_ptr_eq;
         table[jitcode::insns::BC_PTR_NE as usize] = Self::opimpl_ptr_ne;
         table[jitcode::insns::BC_INSTANCE_PTR_EQ as usize] = Self::opimpl_instance_ptr_eq;
@@ -3073,6 +3074,21 @@ where
         bytecode: u8,
     ) -> TraceAction {
         self.trace_unary_i(ctx, OpCode::IntIsZero);
+        TraceAction::Continue
+    }
+
+    /// `pyjitpl.py` exec-generated `opimpl_int_force_ge_zero`.
+    /// `blackhole.py bhimpl_int_force_ge_zero`: `0` if `i < 0` else `i`.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_int_force_ge_zero(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.trace_unary_i(ctx, OpCode::IntForceGeZero);
         TraceAction::Continue
     }
 

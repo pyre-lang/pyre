@@ -121,6 +121,11 @@ pub const BC_INT_SIGNEXT: u8 = 248;
 pub const BC_SETFIELD_RAW_I: u8 = 252;
 pub const BC_SETFIELD_RAW_F: u8 = 250;
 pub const BC_GETFIELD_RAW_F: u8 = 251;
+/// `blackhole.py` `bhimpl_int_force_ge_zero(i)`: `0` if `i < 0` else `i`.
+/// `pyjitpl.py` generates `opimpl_int_force_ge_zero` beside `int_neg`.
+/// `rlist.py ll_alloc_and_set` clamps `count` with this unary.
+/// Next byte above [`BC_SETFIELD_RAW_I`].
+pub const BC_INT_FORCE_GE_ZERO: u8 = 253;
 
 /// "This cached control opcode is absent" sentinel for the
 /// `blackhole.py:72-74` fields (`op_live`, `op_catch_exception`,
@@ -983,6 +988,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_invert/i>i", BC_INT_INVERT);
     m.insert("int_is_true/i>i", BC_INT_IS_TRUE);
     m.insert("int_is_zero/i>i", BC_INT_IS_ZERO);
+    m.insert("int_force_ge_zero/i>i", BC_INT_FORCE_GE_ZERO);
     m.insert("uint_rshift/ii>i", BC_UINT_RSHIFT);
     m.insert("uint_mul_high/ii>i", BC_UINT_MUL_HIGH);
     m.insert("uint_lt/ii>i", BC_UINT_LT);

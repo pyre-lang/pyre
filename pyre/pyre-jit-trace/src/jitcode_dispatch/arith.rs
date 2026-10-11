@@ -332,7 +332,8 @@ pub(crate) fn execute_pure_binop_i<Sym: WalkSym>(
 
 /// Generic int-bank unary handler. Operand layout `i>i` (1B src + 1B
 /// dst). RPython parity: `pyjitpl.py` exec-generated
-/// `opimpl_int_<unary>` (int_neg / int_invert / int_is_zero etc.) +
+/// `opimpl_int_<unary>` (int_neg / int_invert / int_is_zero /
+/// int_force_ge_zero etc.) +
 /// the `>i` decorator's writeback. Walker reads `registers_i[src]`,
 /// records `OpCode::<Variant>` with `[a]`, writes the recorder result
 /// into `registers_i[dst]`.
@@ -1121,10 +1122,10 @@ regular_record_table! {
         "float_gt/ff>i" => FloatGt,
         "float_ge/ff>i" => FloatGe,
     }
-    // Int-bank unary ops: `pyjitpl.py` (int_neg / int_invert) +
-    // 371-375 (int_same_as, which records `rop.SAME_AS_I` via
-    // `_record_helper` — same shape, treated as a regular
-    // record-and-writeback). `int_is_true` / `int_is_zero`
+    // Int-bank unary ops: `pyjitpl.py` (int_neg / int_invert /
+    // int_force_ge_zero) + 371-375 (int_same_as, which records
+    // `rop.SAME_AS_I` via `_record_helper` — same shape, treated as a
+    // regular record-and-writeback). `int_is_true` / `int_is_zero`
     // (`pyjitpl.py`) are Int-typed on the bank though semantically
     // bool (matches the `>i` destination shape).
     //
@@ -1135,12 +1136,17 @@ regular_record_table! {
     // jitcode carried the opname and this arm's absence was invisible:
     // an unlisted key falls through to `DispatchError::UnsupportedOpname`,
     // which aborts the trace mid-walk.
+    //
+    // `int_force_ge_zero` is the same exec-generated unary
+    // (`opimpl_int_force_ge_zero`, `blackhole.py bhimpl_int_force_ge_zero`).
+    // `rlist.py ll_alloc_and_set` clamps `count` with it.
     unop_int_record {
         "int_neg/i>i" => IntNeg,
         "int_invert/i>i" => IntInvert,
         "int_same_as/i>i" => SameAsI,
         "int_is_true/i>i" => IntIsTrue,
         "int_is_zero/i>i" => IntIsZero,
+        "int_force_ge_zero/i>i" => IntForceGeZero,
     }
     unop_float_record {
         "float_neg/f>f" => FloatNeg,

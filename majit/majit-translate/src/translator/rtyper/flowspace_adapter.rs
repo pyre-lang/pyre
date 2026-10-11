@@ -9746,6 +9746,41 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_closure_pos_field_stays_getattr() {
+        // `<Impl>` is not a type-argument instantiation. A registered
+        // `__pos_0` on the closure must stay `getattr`; interning it as a
+        // variant of `bufferview::<Impl>::stride0` freezes the closure.
+        let owner = "bufferview::<Impl>::stride0::closure#1";
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk);
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", Some(owner.into())),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("closure payload stays getattr");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getattr");
+    }
+
+    #[test]
     fn translate_op_inline_vec_len_lowers_to_ll_length() {
         // `self.entries.len()` retargets the field read in place
         // (`retarget_vec_operand`). The result must be `len` of that
