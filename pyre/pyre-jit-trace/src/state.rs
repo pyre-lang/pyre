@@ -10430,52 +10430,27 @@ fn seed_bridge_standing_exception_from_current(
         return;
     }
     // `pyjitpl.py prepare_resume_from_failure`: `exception_obj` is
-    // `cpu.grab_exc_value(deadframe)`, and a null one is `clear_exception()`
-    // followed by GUARD_NO_EXCEPTION. `GUARD_EXC_VALUE` is that grab. A
-    // GUARD_EXCEPTION whose call did not raise fails with it null; the sym
-    // persists across walks and `sys_exc_value` is the exception an enclosing
-    // `except` block is handling, so neither may stand in for it — the
-    // carrier walk would enter the handler under that GUARD_NO_EXCEPTION with
-    // the null SAVE_EXCEPTION result as its exception.
-    if majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get()) == 0 {
-        sym.current_exc_value.set(std::ptr::null_mut());
-        sym.current_exc_box = OpRef::NONE;
-        sym.last_exc_value.set(std::ptr::null_mut());
-        sym.last_exc_box = OpRef::NONE;
-        sym.class_of_last_exc_is_const = false;
-        return;
-    }
-    if !sym.last_exc_box.is_none() {
-        return;
-    }
-
-    // `cpu.grab_exc_value(deadframe)` is parked in `GUARD_EXC_VALUE`.
-    // `current_exc_value` is initialized from `get_current_exception()`
-    // (`ec.sys_exc_value`, the exception the application is handling) and
-    // is not that grab: a `GuardException` failure with a null grab must
-    // not inherit it.
-    let grab = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
-    let exc = sym.current_exc_value.get();
-    let exc_box = sym.current_exc_box;
-    if grab == 0 || exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
-        sym.current_exc_value.set(std::ptr::null_mut());
-        sym.current_exc_box = OpRef::NONE;
-        sym.last_exc_value.set(std::ptr::null_mut());
-        sym.last_exc_box = OpRef::NONE;
-        sym.class_of_last_exc_is_const = false;
-        return;
-    }
-
-    let exc_box = if exc_box.is_none() {
-        ctx.const_ref(exc as i64)
+    // `cpu.grab_exc_value(deadframe)`; a non-null one is
+    // `execute_ll_raised(exception_obj)` and a null one is
+    // `clear_exception()` followed by GUARD_NO_EXCEPTION. `GUARD_EXC_VALUE`
+    // is that grab and the only source: the sym persists across walks and
+    // `sys_exc_value` is the exception an enclosing `except` block is
+    // handling, so neither may stand in for it. A GUARD_EXCEPTION whose call
+    // did not raise fails with a null grab, and a walk seeded from either
+    // would enter the handler under that GUARD_NO_EXCEPTION with the null
+    // SAVE_EXCEPTION result as its exception.
+    let exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get())
+        as pyre_object::PyObjectRef;
+    let exc_box = if exc.is_null() {
+        OpRef::NONE
     } else {
-        exc_box
+        ctx.const_ref(exc as i64)
     };
     sym.current_exc_value.set(exc);
     sym.current_exc_box = exc_box;
     sym.last_exc_value.set(exc);
     sym.last_exc_box = exc_box;
-    sym.class_of_last_exc_is_const = true;
+    sym.class_of_last_exc_is_const = !exc.is_null();
 }
 
 impl JitState for PyreJitState {

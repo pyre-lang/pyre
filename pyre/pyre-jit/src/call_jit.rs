@@ -3943,51 +3943,17 @@ pub fn trace_and_compile_from_bridge(
         driver.last_bridge_is_exception_guard = false;
     }
 
-    // A pending exception at a NON-exception guard means a may-force
-    // residual call both raised and forced the frame, so GUARD_NOT_FORCED
-    // failed before GUARD_NO_EXCEPTION ran. That guard's resume_pc is the
-    // no-exception semantic fallthrough (the next opcode, e.g.
-    // RETURN_VALUE), so a normal-path bridge walk would trace the return
-    // of the NULL call result — emitting `Finish(NONE)` with no
-    // return-value box — and run the post-call residual ops concretely on
-    // a NULL operand. Decline the bridge and resume in the blackhole,
-    // which propagates the pending exception to its `catch_exception`
-    // handler exactly once. Skipping the walk also prevents the walk's
-    // concrete side effects from double-applying the handler's mutations
-    // against the post-blackhole replay.
-    //
-    // GUARD_NOT_FORCED is not an exception guard, so it does not stash the
-    // raised value into `jf_guard_exc` (`guard_exc` is 0 here); the live
-    // signal is the backend `pos_exception` cell the compiled
-    // GUARD_NO_EXCEPTION reads. A stale cell only over-declines (the
-    // blackhole resume with `guard_exc == 0` runs the no-exception
-    // continuation, identical to the prior panic-then-fallback path), so
-    // this never changes a result — only whether a bridge is attached.
-    //
-    // An exception guard is the other way round: its failure stub moved
-    // `pos_exc_value` into `jf_guard_exc`, so `guard_exc` is the whole
-    // answer (`pyjitpl.py prepare_resume_from_failure` branches on
-    // `exception_obj` from `cpu.grab_exc_value(deadframe)` alone, and
-    // records GUARD_NO_EXCEPTION when it is null). A GUARD_EXCEPTION that
-    // failed because the call did not raise has `guard_exc == 0`; reading
-    // the backend cell there would let a stale class route the walk onto
-    // the `except` handler under that GUARD_NO_EXCEPTION, with the
-    // SAVE_EXCEPTION result — null at run time — as the handler's exception.
-    let pending_exc = guard_exc != 0
-        || !last_bridge_is_exception_guard && {
-            #[cfg(feature = "cranelift")]
-            {
-                majit_backend_cranelift::jit_exc_class_raw() != 0
-            }
-            #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-            {
-                majit_backend_dynasm::jit_exc_class_raw() != 0
-            }
-            #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
-            {
-                false
-            }
-        };
+    // `pyjitpl.py _prepare_exception_resumption`: `exception` is
+    // `cpu.grab_exc_value(deadframe)`, and only a `ResumeGuardExcDescr` /
+    // `ResumeGuardCopiedExcDescr` failure may carry one (`assert not
+    // exception` otherwise). `prepare_resume_from_failure` then branches on
+    // that grab alone and records GUARD_NO_EXCEPTION when it is null, so a
+    // GUARD_EXCEPTION whose call did not raise is not a pending exception.
+    // The backend `pos_exception` cell is not consulted: the failure stub
+    // of every `must_save_exception` guard already moved it into
+    // `jf_guard_exc`, and a GUARD_NOT_FORCED failure returned above.
+    debug_assert!(last_bridge_is_exception_guard || guard_exc == 0);
+    let pending_exc = guard_exc != 0;
     // A pending exception at an EXCEPTION guard (GUARD_NO_EXCEPTION /
     // GUARD_EXCEPTION) whose raising op sits inside an in-frame try is the
     // bridge-side analogue of the same fallthrough-not-catch resume gap.
