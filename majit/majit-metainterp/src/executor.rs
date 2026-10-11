@@ -129,6 +129,48 @@ pub fn do_setfield_gc(
     }
 }
 
+//     def do_setarrayitem_gc(cpu, _, arraybox, indexbox, itembox, arraydescr):
+//         array = arraybox.getref_base()
+//         index = indexbox.getint()
+//         if arraydescr.is_array_of_pointers():
+//             cpu.bh_setarrayitem_gc_r(array, index, itembox.getref_base(),
+//                                      arraydescr)
+//         elif arraydescr.is_array_of_floats():
+//             cpu.bh_setarrayitem_gc_f(array, index, itembox.getfloatstorage(),
+//                                      arraydescr)
+//         else:
+//             cpu.bh_setarrayitem_gc_i(array, index, itembox.getint(), arraydescr)
+//
+// The bank comes from the descr, as in `do_setfield_gc`; `false` when the
+// value's bank disagrees with it.
+pub fn do_setarrayitem_gc(
+    cpu: &dyn majit_backend::Backend,
+    _metainterp: (),
+    arraybox: i64,
+    indexbox: i64,
+    itembox: majit_ir::Value,
+    arraydescr: &majit_jitcode::jitcode::BhDescr,
+    item_type: majit_ir::Type,
+) -> bool {
+    let array = arraybox;
+    let index = indexbox;
+    match (item_type, itembox) {
+        (majit_ir::Type::Ref, majit_ir::Value::Ref(r)) => {
+            cpu.bh_setarrayitem_gc_r(array, index, r, arraydescr);
+            true
+        }
+        (majit_ir::Type::Float, majit_ir::Value::Float(f)) => {
+            cpu.bh_setarrayitem_gc_f(array, index, f, arraydescr);
+            true
+        }
+        (majit_ir::Type::Int, majit_ir::Value::Int(i)) => {
+            cpu.bh_setarrayitem_gc_i(array, index, i, arraydescr);
+            true
+        }
+        _ => false,
+    }
+}
+
 // executor.py:206-212 do_getarrayitem_gc_{i,r,f}: project box → gcref +
 // concrete index, dispatch to `cpu.bh_getarrayitem_gc_*`.  Pyre's flat
 // box analog passes `(array, index)` as plain `i64` values projected

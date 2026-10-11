@@ -84,6 +84,31 @@ fn concrete_store_value_operand<Sym: WalkSym>(
         })
 }
 
+/// `value` in the bank of the word it is stored into.  One word holds either
+/// bank: a pointer the jitcode carries in an `i` register is stored into a
+/// ref field as the same bits, and back.
+fn store_value_in_bank(ty: majit_ir::Type, value: majit_ir::Value) -> Option<majit_ir::Value> {
+    match (ty, value) {
+        (majit_ir::Type::Int, majit_ir::Value::Ref(r)) => Some(majit_ir::Value::Int(r.0 as i64)),
+        (majit_ir::Type::Ref, majit_ir::Value::Int(v)) => {
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(v as usize)))
+        }
+        (majit_ir::Type::Int, majit_ir::Value::Int(_))
+        | (majit_ir::Type::Ref, majit_ir::Value::Ref(_))
+        | (majit_ir::Type::Float, majit_ir::Value::Float(_)) => Some(value),
+        _ => None,
+    }
+}
+
+/// The word a walked store fills, as the executor names it.
+#[derive(Clone, Copy)]
+enum WalkedGcStore<'a> {
+    /// `do_setfield_gc(cpu, _, structbox, itembox, fielddescr)`.
+    Field(&'a DescrRef),
+    /// `do_setarrayitem_gc(cpu, _, arraybox, indexbox, itembox, arraydescr)`.
+    ArrayItem(&'a DescrRef, i64),
+}
+
 /// The executing half of `execute_and_record` (`pyjitpl.py`) for a
 /// `SETFIELD_GC` / `SETARRAYITEM_GC` into an object this walk did not
 /// allocate: `executor.execute` -> `cpu.bh_setfield_gc_*` /
@@ -98,10 +123,15 @@ fn concrete_store_value_operand<Sym: WalkSym>(
 /// — no live receiver or value, or a word the value's bank cannot fill — is
 /// one only that replay applies, which is what
 /// [`fbw_mark_unjournaled_effect`] records.
+///
+/// `store` names the word for `executor.py` `do_setfield_gc` /
+/// `do_setarrayitem_gc`; `offset` / `size` name the same word for the undo
+/// entry.
 #[allow(clippy::too_many_arguments)]
 fn walker_execute_gc_store<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     obj_ptr: Option<i64>,
+    store: WalkedGcStore<'_>,
     offset: usize,
     size: usize,
     ty: majit_ir::Type,
@@ -112,18 +142,7 @@ fn walker_execute_gc_store<Sym: WalkSym>(
     if !ctx.trace_ctx.has_cpu() {
         return Ok(());
     }
-    // One word holds either bank: a pointer the jitcode carries in an `i`
-    // register is stored into a ref field as the same bits, and back.
-    let value = value.and_then(|value| match (ty, value) {
-        (majit_ir::Type::Int, majit_ir::Value::Ref(r)) => Some(majit_ir::Value::Int(r.0 as i64)),
-        (majit_ir::Type::Ref, majit_ir::Value::Int(v)) => {
-            Some(majit_ir::Value::Ref(majit_ir::GcRef(v as usize)))
-        }
-        (majit_ir::Type::Int, majit_ir::Value::Int(_))
-        | (majit_ir::Type::Ref, majit_ir::Value::Ref(_))
-        | (majit_ir::Type::Float, majit_ir::Value::Float(_)) => Some(value),
-        _ => None,
-    });
+    let value = value.and_then(|value| store_value_in_bank(ty, value));
     let (Some(obj_ptr), Some(before), Some(value)) = (obj_ptr, before, value) else {
         if fbw_debug_abort_enabled() {
             eprintln!(
@@ -133,10 +152,13 @@ fn walker_execute_gc_store<Sym: WalkSym>(
         return walker_gc_store_not_executed(ctx, pc);
     };
     let obj = obj_ptr as usize as pyre_object::PyObjectRef;
-    let managed = pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF);
-    // SAFETY: `obj_ptr` is the live receiver the walk is executing over and
-    // `offset` / `size` come from the op's own descr.
-    if unsafe { fbw_gc_store_word(obj, offset, size, value, managed) } {
+    let stored = match store {
+        WalkedGcStore::Field(descr) => ctx.trace_ctx.field_store(obj_ptr, descr, value),
+        WalkedGcStore::ArrayItem(descr, index) => {
+            ctx.trace_ctx.array_store(obj_ptr, index, descr, value)
+        }
+    };
+    if stored {
         ctx.trace_ctx.set_cut_observer(fbw_gc_store_journal_cut);
         // `execute_and_record` executes, then records: the op this store
         // belongs to is the next one, and a cut back past it undoes the store.
@@ -563,11 +585,8 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
         // execute: the block is incomplete, so stop naming it as the
         // array's value.
         let stored = match (slot, value) {
-            (Some((ptr, _)), Some(value)) if ctx.trace_ctx.has_cpu() => {
-                let block = ptr as usize as pyre_object::PyObjectRef;
-                // SAFETY: `slot` passed the bounds proof against the live block.
-                unsafe { fbw_gc_store_word(block, offset, item_size, value, false) }
-            }
+            (Some((ptr, i)), Some(value)) => store_value_in_bank(ty, value)
+                .is_some_and(|value| ctx.trace_ctx.array_store(ptr, i, descr, value)),
             _ => false,
         };
         if !stored {
@@ -579,6 +598,7 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
     walker_execute_gc_store(
         ctx,
         slot.map(|(ptr, _)| ptr),
+        WalkedGcStore::ArrayItem(descr, slot.map_or(0, |(_, i)| i)),
         offset,
         item_size,
         ty,
@@ -1247,7 +1267,17 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
             let obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
             let value = concrete_store_value_operand(code, op, 1, value_bank, valuebox, ctx);
             let before = obj_ptr.and_then(|p| ctx.trace_ctx.field_sanity_load(p, &descr, ty));
-            walker_execute_gc_store(ctx, obj_ptr, offset, size, ty, before, value, op.pc)?;
+            walker_execute_gc_store(
+                ctx,
+                obj_ptr,
+                WalkedGcStore::Field(&descr),
+                offset,
+                size,
+                ty,
+                before,
+                value,
+                op.pc,
+            )?;
         }
         ctx.trace_ctx
             .profiler()

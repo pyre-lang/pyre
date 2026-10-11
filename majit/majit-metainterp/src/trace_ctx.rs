@@ -1218,6 +1218,27 @@ impl TraceCtx {
         crate::executor::do_setfield_gc(cpu, (), struct_ptr, value, &bh_descr, field_type)
     }
 
+    /// `execute_setarrayitem_gc`'s store (`pyjitpl.py`): the array sibling
+    /// of [`Self::field_store`], through `executor.py` `do_setarrayitem_gc`.
+    ///
+    /// Returns `false` when `self.cpu` is unwired, the descr is not an
+    /// array descr, or the value's bank disagrees with the item type.
+    pub fn array_store(&self, array_ptr: i64, index: i64, descr: &DescrRef, value: Value) -> bool {
+        let Some(cpu_ptr) = self.cpu else {
+            return false;
+        };
+        // SAFETY: cpu pointer was installed via `set_cpu` against a
+        // backend that outlives this TraceCtx.
+        let cpu = unsafe { &*cpu_ptr };
+        let Some(bh_descr) = descr_to_bh_array_descr(descr) else {
+            return false;
+        };
+        let Some(item_type) = descr.as_array_descr().map(|a| a.item_type()) else {
+            return false;
+        };
+        crate::executor::do_setarrayitem_gc(cpu, (), array_ptr, index, value, &bh_descr, item_type)
+    }
+
     /// `blackhole.py bhimpl_arraylen_gc(cpu, array, arraydescr)`
     /// analog — read the GC array's length through
     /// `cpu.bh_arraylen_gc(array_ptr, &arraydescr)`.  RPython has no
