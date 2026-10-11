@@ -1405,7 +1405,7 @@ fn descent_blocker_summary_for_entry_len(
 }
 
 /// Memoizing entry point for [`summarize_descent_blockers`].
-fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
+pub(crate) fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
     let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
         // The same condition the descent answers `body_not_walked` for, one
         // level up and with nothing walked at all.  Unreachable from the gate,
@@ -5572,6 +5572,71 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    walker_inline_builtin_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        ref_operand_offset,
+        r_args,
+        call_descr,
+        runtime_helper,
+        dst_bank,
+        dst,
+        false,
+    )
+}
+
+/// `typeobject.py descr_call` on an exception class, for the calls
+/// `try_walker_trace_exception_new` left alone: `__new__` and `__init__` both
+/// resolve to builtin gateways, and the generated bodies are walked like any
+/// other class's.  `W_UnicodeEncodeError.descr_init` parses its arguments, so
+/// that fold never served it; the descent records `descr_new_base_exception`'s
+/// allocation and the `descr_init` stores.
+///
+/// Consulted after the construct fold, never before it: a class the fold
+/// serves keeps its `dont_look_inside` leaves (`value_error_one_arg`), and
+/// descending those would trade the fold's virtual for a concrete instance.
+pub(crate) fn try_walker_inline_exception_type_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    ref_operand_offset: usize,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    walker_inline_builtin_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        ref_operand_offset,
+        r_args,
+        call_descr,
+        majit_ir::RuntimeHelperKind::CallFn,
+        dst_bank,
+        dst,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walker_inline_builtin_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    ref_operand_offset: usize,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    runtime_helper: majit_ir::RuntimeHelperKind,
+    dst_bank: char,
+    dst: usize,
+    exception_type_call: bool,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let is_call_kw = runtime_helper == majit_ir::RuntimeHelperKind::CallKw;
     if !ctx.is_authoritative_executor
         // `CallKw` is admitted when the builtin has a Signature: keyword
@@ -5615,12 +5680,13 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // records `value_error_one_arg` and `exc_init_one_positional`
     // (`dont_look_inside`), so the instance stays concrete and a caught
     // traceback cannot leave the bridge.  A keyword call is not that CallFn
-    // shape and keeps the descent.
-    if !is_call_kw
+    // shape and keeps the descent.  `try_walker_inline_exception_type_call`
+    // is the entry for an exception class that fold declined.
+    let exception_class = !is_call_kw
         && unsafe {
             pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(callable_operand)
-        }
-    {
+        };
+    if exception_class != exception_type_call {
         return Ok(None);
     }
     let null_or_self = match arg_concretes[1] {
@@ -5741,6 +5807,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             },
         }
     };
+    // An exception class reaches here only as `descr_call` with both halves
+    // resolved to builtin gateways; every other shape is the residual's.
+    if exception_type_call && (type_call_class.is_none() || type_call_init.is_none()) {
+        return Ok(None);
+    }
     // Every decline below is silent otherwise, and they are not
     // interchangeable: `not is_function` is a class call or another
     // non-Function callable, while `no jitcode for address` names a builtin
@@ -6409,7 +6480,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                         .unwrap_or(other),
                 };
                 if let Some(tp_init) = type_call_init {
-                    return try_walker_inline_type_call_builtin_init(
+                    let inlined = try_walker_inline_type_call_builtin_init(
                         ctx,
                         op,
                         code,
@@ -6420,7 +6491,24 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                         concrete,
                         &arg_concretes,
                         rewind,
-                    );
+                    )?;
+                    // An instance `descr_new_base_exception` allocated in
+                    // this trace, written only by the two walked bodies, is
+                    // the fresh exception `opimpl_raise` needs no call for:
+                    // its `w_context` is still null and nothing else holds
+                    // it.  One a residual arm returned has escaped and keeps
+                    // the `normalize_raise_varargs` residual.
+                    if exception_type_call
+                        && matches!(
+                            inlined,
+                            Some((DispatchOutcome::Continue, next)) if next == op.next_pc
+                        )
+                        && ctx.trace_ctx.heap_cache().is_unescaped(value)
+                    {
+                        ctx.trace_ctx.heap_cache_mut().class_now_known(value);
+                        fbw_built_exc_insert(value);
+                    }
+                    return Ok(inlined);
                 }
                 write_ref_reg(ctx, op.pc, dst, value, concrete)?;
                 Ok(Some((DispatchOutcome::Continue, op.next_pc)))
@@ -17122,6 +17210,20 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             });
         }
     };
+    // `execute_varargs`: `if pure and not last_exc_value and op:
+    // op = record_result_of_call_pure(...)`, then
+    // `exc = exc and not isinstance(op, Const)`.
+    let recorded = super::residual_call::record_result_of_executed_pure_call(
+        ctx,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        descr.clone(),
+        patch_pos,
+        recorded,
+        resid,
+    );
+    let can_raise = can_raise && recorded.inline_const_to_value().is_none();
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
     // `do_residual_call` writes dest before `GUARD_NOT_FORCED` so the

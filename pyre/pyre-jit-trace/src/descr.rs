@@ -1018,6 +1018,41 @@ fn build_object_descr_group_with_extra_gc_edges(
     cache_key_name: &str,
     headerless: bool,
 ) -> PyreObjectDescrGroup {
+    build_object_descr_group_inlining_parent(
+        obj_size,
+        type_id,
+        vtable,
+        fields,
+        simple_name,
+        def_path,
+        extra_gc_edges,
+        field_indices,
+        cache_key_name,
+        headerless,
+        &[],
+    )
+}
+
+/// [`build_object_descr_group_with_extra_gc_edges`] for a struct whose first
+/// field is another object struct (`base: W_BaseException`).
+///
+/// `heaptracker.py all_fielddescrs` recurses into the inlined STRUCT with
+/// `get_field_descr(gccache, INNER, name)`: an inherited field is the parent
+/// STRUCT's FieldDescr object at the parent's index. `inlined_parent` holds
+/// those rows; `fields` names only what this struct adds.
+fn build_object_descr_group_inlining_parent(
+    obj_size: usize,
+    type_id: u32,
+    vtable: usize,
+    fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
+    simple_name: &str,
+    def_path: &str,
+    extra_gc_edges: &[Arc<dyn FieldDescr>],
+    field_indices: &[u32],
+    cache_key_name: &str,
+    headerless: bool,
+    inlined_parent: &[Arc<majit_ir::descr::SimpleFieldDescr>],
+) -> PyreObjectDescrGroup {
     // `cache_key_name` names the `gc_cache._cache_size` STRUCT identity for a
     // group that publishes under neither name registry.  Zero is the
     // no-STRUCT-identity sentinel, not a key: a group keyed there collapses
@@ -1075,7 +1110,7 @@ fn build_object_descr_group_with_extra_gc_edges(
         let mut gc_edges: Vec<Arc<dyn majit_ir::descr::FieldDescr>> =
             vec![W_CLASS_FIELD_DESCR.clone()];
         gc_edges.extend(extra_gc_edges.iter().cloned());
-        let group = majit_ir::descr::publish_borrowed_struct_layout(
+        let group = majit_ir::descr::publish_borrowed_struct_layout_with_inlined_parent(
             SIZE_DESCR_TAG | (obj_size as u32 & 0x0FFF_FFFF),
             obj_size,
             type_id,
@@ -1085,6 +1120,7 @@ fn build_object_descr_group_with_extra_gc_edges(
             headerless,
             &gc_edges,
             borrowed,
+            inlined_parent,
         );
         let field_descrs = group.field_descrs;
         let size_descr = group.size_descr;
@@ -1153,7 +1189,7 @@ fn build_object_descr_group_with_extra_gc_edges(
     );
     let mut gc_edges: Vec<Arc<dyn FieldDescr>> = vec![W_CLASS_FIELD_DESCR.clone()];
     gc_edges.extend(extra_gc_edges.iter().cloned());
-    let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+    let group = majit_ir::descr::make_simple_descr_group_keyed_with_inlined_parent(
         SIZE_DESCR_TAG | (obj_size as u32 & 0x0FFF_FFFF),
         obj_size,
         type_id,
@@ -1163,6 +1199,7 @@ fn build_object_descr_group_with_extra_gc_edges(
         headerless,
         &specs,
         &gc_edges,
+        inlined_parent,
     );
     let field_descrs = group.field_descrs;
     let size_descr = group.size_descr;
@@ -7323,7 +7360,23 @@ fn finish_exception_descr_group(
             "interp_exceptions::W_ExceptionExtendedUser",
         ),
     };
-    build_object_descr_group_with_extra_gc_edges(
+    // `heaptracker.py all_fielddescrs` recurses into the inlined first STRUCT
+    // with `get_field_descr(gccache, INNER, name)`, so a derived layout holds
+    // the parent's FieldDescr objects for what it inherits, at the parent's
+    // indices (`get_fielddescr_index_in`). `OptHeap` keys its field cache on
+    // that object: a second descr for `args_w` lets a store through one miss
+    // the read through the other.
+    let inlined_parent: Vec<Arc<majit_ir::descr::SimpleFieldDescr>> = match (extended, user) {
+        (false, false) => Vec::new(),
+        // `W_BaseExceptionUser.base` / `W_ExceptionExtended.base`.
+        (false, true) | (true, false) => {
+            with_w_exception_group_for(ExcKind::BaseException, false, exception_payload_rows)
+        }
+        // `W_ExceptionExtendedUser.base`.
+        (true, true) => with_w_exception_group_for(ExcKind::OSError, false, exception_payload_rows),
+    };
+    fields.retain(|&(_, offset, ..)| inlined_parent.iter().all(|fd| fd.offset() != offset));
+    build_object_descr_group_inlining_parent(
         size,
         tid,
         vtable,
@@ -7334,16 +7387,38 @@ fn finish_exception_descr_group(
         &[],
         def_path,
         false,
+        &inlined_parent,
     )
 }
 
-static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
-    LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
+/// A group's positional rows without the trailing class-word row: what a
+/// struct embedding it as its first field inherits.
+fn exception_payload_rows(
+    group: &PyreObjectDescrGroup,
+) -> Vec<Arc<majit_ir::descr::SimpleFieldDescr>> {
+    group
+        .field_descrs
+        .iter()
+        .filter(|fd| fd.offset() != W_CLASS_OFFSET)
+        .cloned()
+        .collect()
+}
+
+static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Vec<std::sync::OnceLock<PyreObjectDescrGroup>>> =
+    LazyLock::new(|| {
+        (0..EXC_KIND_COUNT)
+            .map(|_| std::sync::OnceLock::new())
+            .collect()
+    });
 
 /// `_getusercls` groups, indexed by the same `ExcKind` as the base cache.
 /// Two `Vec`s, not a side table: base versus user is one bit.
-static W_EXCEPTION_USER_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
-    LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
+static W_EXCEPTION_USER_DESCR_CACHE: LazyLock<Vec<std::sync::OnceLock<PyreObjectDescrGroup>>> =
+    LazyLock::new(|| {
+        (0..EXC_KIND_COUNT)
+            .map(|_| std::sync::OnceLock::new())
+            .collect()
+    });
 
 fn with_w_exception_group_for<R>(
     kind: ExcKind,
@@ -7356,11 +7431,10 @@ fn with_w_exception_group_for<R>(
     } else {
         &W_BASE_EXCEPTION_DESCR_CACHE
     };
-    let mut cache = cache.lock();
-    if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind, user));
-    }
-    f(cache[idx].as_ref().unwrap())
+    // One build per slot.  A derived layout asks for its parent's group from
+    // inside its own build; that is another slot, so the nested request does
+    // not wait on this one.
+    f(cache[idx].get_or_init(|| build_w_exception_group(kind, user)))
 }
 
 /// Map or storage field of a `_getusercls` exception, looked up by offset on
@@ -7408,6 +7482,32 @@ pub fn w_exception_descrs_for(
             w_exception_field_at(group, EXC_ARGS_W_OFFSET),
         )
     })
+}
+
+/// The SizeDescr of the realbase whose vtable a `new_with_vtable` carries,
+/// when `published` is the shared extra-field exception struct and names
+/// another realbase.
+///
+/// `W_OSError`, `W_UnicodeEncodeError`, `W_StopIteration`, ... are separate
+/// STRUCTs upstream, so `get_size_descr(STRUCT)` already answers per class.
+/// They share [`pyre_object::interp_exceptions::W_ExceptionExtended`] here,
+/// and its `_cache_size` slot holds the one group [`DECLARED_GROUPS`] forces;
+/// the per-kind groups [`w_exception_descrs_for`] builds carry the vtables.
+/// Without this an allocation lowered from `allocate_instance` of one
+/// realbase would be stamped with the published group's type word.
+fn exception_realbase_size_descr(published: &DescrRef, vtable: usize) -> Option<DescrRef> {
+    let size = published.as_size_descr()?;
+    if vtable == 0 || size.type_id() != W_EXCEPTION_EXTENDED_GC_TYPE_ID || size.vtable() == vtable {
+        return None;
+    }
+    (0..EXC_KIND_COUNT)
+        .map(|raw| unsafe { std::mem::transmute::<u8, ExcKind>(raw as u8) })
+        .find(|&kind| {
+            exc_kind_uses_extended_layout(kind)
+                && !exc_kind_canonical_is_user_layout(kind)
+                && exc_realbase_pytype(kind) as *const _ as usize == vtable
+        })
+        .map(|kind| w_exception_descrs_for(kind, false).0)
 }
 
 pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
@@ -9194,6 +9294,64 @@ mod tests {
             .expect("W_ExceptionExtendedUser SizeDescr");
         assert_eq!(user.size(), W_EXCEPTION_EXTENDED_USER_SIZE);
         assert_eq!(user.type_id(), W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID);
+    }
+
+    /// `heaptracker.py all_fielddescrs` recurses into the inlined `base` with
+    /// `get_field_descr(gccache, INNER, name)`: every layout holds the
+    /// `W_BaseException` FieldDescr object for an inherited field, at the
+    /// index `get_fielddescr_index_in` gives it there, and it keeps the
+    /// `W_BaseException` SizeDescr as its parent.
+    #[test]
+    fn derived_exception_layouts_share_the_base_struct_field_descrs() {
+        let fields_of = |kind, user| {
+            let (size, ..) = w_exception_descrs_for(kind, user);
+            size.as_size_descr()
+                .expect("exception SizeDescr")
+                .all_fielddescrs()
+                .to_vec()
+        };
+        let (base_size, ..) = w_exception_descrs_for(ExcKind::BaseException, false);
+        let base = fields_of(ExcKind::BaseException, false);
+        let extended = fields_of(ExcKind::UnicodeEncodeError, false);
+        // Leading class word, then `kind` .. `w_dict`.
+        for derived in [
+            fields_of(ExcKind::ValueError, true),
+            extended.clone(),
+            fields_of(ExcKind::OSError, false),
+            fields_of(ExcKind::FileNotFoundError, true),
+        ] {
+            for i in 1..=7 {
+                assert!(
+                    std::ptr::addr_eq(Arc::as_ptr(&base[i]), Arc::as_ptr(&derived[i])),
+                    "{} and {} are two descrs for one field",
+                    base[i].field_name(),
+                    derived[i].field_name(),
+                );
+                assert_eq!(derived[i].index_in_parent(), i);
+                let parent = derived[i].get_parent_descr().expect("parent SizeDescr");
+                assert!(std::ptr::addr_eq(
+                    Arc::as_ptr(&parent),
+                    Arc::as_ptr(&base_size)
+                ));
+            }
+        }
+        assert_eq!(base[2].offset(), EXC_ARGS_W_OFFSET);
+        // `W_ExceptionExtendedUser.base` is `W_ExceptionExtended`: its own
+        // fields are that struct's descrs too.
+        let extended_user = fields_of(ExcKind::FileNotFoundError, true);
+        assert_eq!(extended[8].offset(), EXC_W_OBJECT_OFFSET);
+        for i in 8..extended.len() - 1 {
+            assert!(std::ptr::addr_eq(
+                Arc::as_ptr(&extended[i]),
+                Arc::as_ptr(&extended_user[i])
+            ));
+        }
+        assert_eq!(
+            w_exception_descrs_for(ExcKind::UnicodeEncodeError, false)
+                .3
+                .index(),
+            base[2].index(),
+        );
     }
 
     #[test]
@@ -12735,6 +12893,13 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     .get(&key)
                     .cloned();
                 if let Some(descr) = hit {
+                    // The cache holds one SizeDescr per STRUCT, and the
+                    // extra-field exception struct stands for several
+                    // interp-level classes, each with its own vtable.
+                    if let Some(realbase) = exception_realbase_size_descr(&descr, *vtable as usize)
+                    {
+                        return realbase;
+                    }
                     return descr;
                 }
             }

@@ -11730,6 +11730,166 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
     assert_eq!(tc.box_value(recorded), Some(majit_ir::Value::Int(42)));
 }
 
+extern "C" fn raising_add2_for_walker_test(_a: i64, _b: i64) -> i64 {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xDEAD));
+    0
+}
+
+/// One `EF_ELIDABLE_CAN_RAISE` residual taken through the dispatchers'
+/// sequence: record, execute, `record_result_of_executed_pure_call`, then
+/// `exc = exc and not isinstance(op, Const)`.  Returns the result OpRef,
+/// whether `GUARD_NO_EXCEPTION` is still owed, the executor's outcome and how
+/// many ops the sequence left in the trace.
+fn run_elidable_can_raise_residual(
+    tc: &mut TraceCtx,
+    func: extern "C" fn(i64, i64) -> i64,
+    arg0: OpRef,
+) -> (OpRef, bool, ResidualExecOutcome, usize) {
+    let funcbox = tc.const_int(func as *const () as i64);
+    let arg1 = tc.const_int(2);
+    let allboxes = [funcbox, arg0, arg1];
+    let descr = make_call_descr(
+        82,
+        vec![Type::Int, Type::Int],
+        Type::Int,
+        majit_ir::ExtraEffect::ElidableCanRaise,
+    );
+    let call_descr = descr.as_call_descr().expect("CallPureI descr");
+    let ops_before = tc.num_ops();
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (call_opcode, can_raise, _) =
+        select_residual_call_opcode(call_descr.get_extra_info(), 'i', "test");
+    assert_eq!(call_opcode, majit_ir::OpCode::CallPureI);
+    assert!(can_raise, "EF_ELIDABLE_CAN_RAISE owes the exception check");
+    let patch_pos = wc.trace_ctx.get_trace_position();
+    let recorded = wc
+        .trace_ctx
+        .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+    // The cannot-raise fast path leaves a can-raise callee to the executor.
+    let recorded = try_fold_pure_call_via_executor(
+        &mut wc,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        descr.clone(),
+        patch_pos,
+        recorded,
+    );
+    let exec = try_execute_residual_call_via_executor(
+        &mut wc,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        recorded,
+        0,
+        None,
+        false,
+    )
+    .expect("the executor must not abort the walk");
+    let result = record_result_of_executed_pure_call(
+        &mut wc,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        descr.clone(),
+        patch_pos,
+        recorded,
+        exec,
+    );
+    let can_raise = can_raise && result.inline_const_to_value().is_none();
+    drop(wc);
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    (result, can_raise, exec, tc.num_ops() - ops_before)
+}
+
+/// `MIFrame.execute_varargs`: `if pure and not last_exc_value and op:
+/// op = record_result_of_call_pure(...)`, then
+/// `exc = exc and not isinstance(op, Const)`.
+#[test]
+fn elidable_can_raise_call_follows_record_result_of_call_pure() {
+    // Every argbox a `Const` and no raise: the call is cut back out, the
+    // result is the constant, and no `GUARD_NO_EXCEPTION` is owed.
+    let mut tc = fresh_trace_ctx();
+    let arg0 = tc.const_int(40);
+    let (result, can_raise, exec, recorded) =
+        run_elidable_can_raise_residual(&mut tc, add2_for_walker_test, arg0);
+    assert_eq!(exec, ResidualExecOutcome::Executed(Ok(42)));
+    assert_eq!(
+        result.inline_const_to_value(),
+        Some(majit_ir::Value::Int(42))
+    );
+    assert!(!can_raise, "a constant result takes no GUARD_NO_EXCEPTION");
+    assert_eq!(recorded, 0, "the call must be cut back out");
+
+    // A non-constant argbox: the call stands as `CALL_PURE_I`, carries the
+    // executed value, and keeps its exception check.
+    let mut tc = fresh_trace_ctx();
+    let arg0 = dummy_int_add_box(&mut tc);
+    tc.set_opref_concrete(arg0, majit_ir::Value::Int(40));
+    let (result, can_raise, exec, recorded) =
+        run_elidable_can_raise_residual(&mut tc, add2_for_walker_test, arg0);
+    assert_eq!(exec, ResidualExecOutcome::Executed(Ok(42)));
+    assert_eq!(result.inline_const_to_value(), None);
+    assert_eq!(tc.box_value(result), Some(majit_ir::Value::Int(42)));
+    assert!(can_raise, "a standing CALL_PURE keeps GUARD_NO_EXCEPTION");
+    assert_eq!(recorded, 1);
+    assert_eq!(tc.opcode_of(result), Some(majit_ir::OpCode::CallPureI));
+
+    // The call raises: `last_exc_value` is set, so nothing is folded even
+    // though every argbox is a `Const`.
+    let mut tc = fresh_trace_ctx();
+    let arg0 = tc.const_int(40);
+    let (result, can_raise, exec, recorded) =
+        run_elidable_can_raise_residual(&mut tc, raising_add2_for_walker_test, arg0);
+    assert!(matches!(exec, ResidualExecOutcome::Executed(Err(_))));
+    assert_eq!(result.inline_const_to_value(), None);
+    assert!(can_raise, "a raising call still owes its exception guard");
+    assert_eq!(recorded, 1);
+    assert_eq!(tc.opcode_of(result), Some(majit_ir::OpCode::CallPureI));
+}
+
 fn may_force_call_i_fixture(tc: &mut TraceCtx) -> ([OpRef; 3], DescrRef, OpRef) {
     let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
     let arg0 = tc.const_int(40);

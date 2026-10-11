@@ -2708,7 +2708,7 @@ unsafe fn tuple_has_wrappeditems(obj: PyObjectRef) -> bool {
 /// bracket. The fill loop stays in this body so the step-1 caller has none.
 #[inline(never)]
 #[majit_macros::oopspec("newlist_clear(count)")]
-unsafe fn tuple_ll_newlist(count: i64) -> *mut pyre_object::object_array::ItemsBlock {
+pub(crate) unsafe fn tuple_ll_newlist(count: i64) -> *mut pyre_object::object_array::ItemsBlock {
     // `count` is Signed (`_ll_alloc_and_clear`). The usize conversion lives
     // in this oopspec body so a traced call keeps the Signed length and
     // `new_array_clear` sees a constant item count.

@@ -1479,6 +1479,94 @@ pub fn w_exception_new_empty_for_class(kind: ExcKind, cls: PyObjectRef) -> PyObj
     allocate_exception(layout_kind, w_class, false, false, None)
 }
 
+// `space.allocate_instance(W_Unicode*Error, w_subtype)` for the exact
+// class, followed by `descr_new_base_exception`'s `exc.args_w = args_w`.
+//
+// Looked inside, unlike [`allocate_exception`]: the type word is the one
+// realbase constant, so the cluster is the `malloc(STRUCT)` shape
+// `fuse_boxing_alloc` lowers to `new_with_vtable` plus one `setfield` per
+// member, and the instance stays a virtual where it does not escape. The
+// literal is spelled out here because that pass reads the struct and its
+// field stores off one graph.
+//
+// `malloc_typed_managed` does not collect, so `args_w` needs no root across
+// it. A full nursery spills the instance old; the creation barrier there
+// remembers the `args_w` edge [`alloc_exception_nursery`] describes.
+//
+// `w_class` must be the canonical class of the kind: a subclass takes the
+// `_getusercls` layout through [`w_exception_new_empty_for_class`].
+macro_rules! unicode_error_allocator {
+    ($(#[$doc:meta])* $name:ident, $pytype:ident, $kind:ident) => {
+        $(#[$doc])*
+        pub fn $name(w_class: PyObjectRef, args_w: PyObjectRef) -> PyObjectRef {
+            crate::lltype::malloc_typed_managed(W_ExceptionExtended {
+                base: W_BaseException {
+                    ob_header: PyObject {
+                        ob_type: &$pytype as *const PyType,
+                        w_class,
+                    },
+                    kind: ExcKind::$kind,
+                    args_w,
+                    w_cause: PY_NULL,
+                    w_context: PY_NULL,
+                    w_traceback: PY_NULL,
+                    suppress_context: false,
+                    w_dict: PY_NULL,
+                },
+                w_object: PY_NULL,
+                w_start: PY_NULL,
+                w_end: PY_NULL,
+                w_reason: PY_NULL,
+                w_encoding: PY_NULL,
+                w_errno: PY_NULL,
+                w_winerror: PY_NULL,
+                w_strerror: PY_NULL,
+                w_filename: PY_NULL,
+                w_filename2: PY_NULL,
+                written: -1,
+                w_code: PY_NULL,
+                w_value: PY_NULL,
+                w_exc_name: PY_NULL,
+                w_attr_obj: PY_NULL,
+                w_import_path: PY_NULL,
+                w_import_name_from: PY_NULL,
+                w_import_msg: PY_NULL,
+                w_syntax_msg: PY_NULL,
+                w_syntax_filename: PY_NULL,
+                w_syntax_lineno: PY_NULL,
+                w_syntax_offset: PY_NULL,
+                w_syntax_text: PY_NULL,
+                w_syntax_end_lineno: PY_NULL,
+                w_syntax_end_offset: PY_NULL,
+                w_syntax_print_file_and_line: PY_NULL,
+                w_syntax_metadata: PY_NULL,
+                w_group_message: PY_NULL,
+                w_group_exceptions: PY_NULL,
+                w_group_exceptions_repr: PY_NULL,
+            }) as PyObjectRef
+        }
+    };
+}
+
+unicode_error_allocator!(
+    /// `allocate_instance(W_UnicodeEncodeError, w_subtype)` and `exc.args_w = args_w`.
+    w_unicode_encode_error_allocate,
+    EXC_UNICODE_ENCODE_ERROR_TYPE,
+    UnicodeEncodeError
+);
+unicode_error_allocator!(
+    /// `allocate_instance(W_UnicodeDecodeError, w_subtype)` and `exc.args_w = args_w`.
+    w_unicode_decode_error_allocate,
+    EXC_UNICODE_DECODE_ERROR_TYPE,
+    UnicodeDecodeError
+);
+unicode_error_allocator!(
+    /// `allocate_instance(W_UnicodeTranslateError, w_subtype)` and `exc.args_w = args_w`.
+    w_unicode_translate_error_allocate,
+    EXC_UNICODE_TRANSLATE_ERROR_TYPE,
+    UnicodeTranslateError
+);
+
 /// Group allocation: `kind` stays slim (`Exception` / `BaseException`) while
 /// the bytes are [`W_ExceptionExtended`] or [`W_ExceptionExtendedUser`].
 ///
@@ -1605,8 +1693,11 @@ pub unsafe fn w_exception_get_args_storage(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_args(obj: PyObjectRef, args_list: PyObjectRef) {
     unsafe {
+        // The barrier precedes the store it guards, spelled as the
+        // `gc_hook` call: `handle_write_barrier_setfield` then owns it in
+        // a traced body and no residual call escapes the instance.
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_BaseException)).args_w = args_list;
-        exception_write_barrier(obj);
     }
 }
 
@@ -1814,8 +1905,8 @@ pub unsafe fn w_exception_get_object(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_object(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_object = value;
-        exception_write_barrier(obj);
     }
 }
 
@@ -1837,8 +1928,8 @@ pub unsafe fn w_exception_get_start(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_start(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_start = value;
-        exception_write_barrier(obj);
     }
 }
 
@@ -1860,8 +1951,8 @@ pub unsafe fn w_exception_get_end(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_end(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_end = value;
-        exception_write_barrier(obj);
     }
 }
 
@@ -1883,8 +1974,8 @@ pub unsafe fn w_exception_get_reason(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_reason = value;
-        exception_write_barrier(obj);
     }
 }
 
@@ -1910,8 +2001,8 @@ pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_encoding = value;
-        exception_write_barrier(obj);
     }
 }
 

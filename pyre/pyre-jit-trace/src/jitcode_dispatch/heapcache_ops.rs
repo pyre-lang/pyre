@@ -620,6 +620,16 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     if array.is_constant() {
         return;
     }
+    // A translated gateway body storing into an array this walk did not
+    // allocate is recorded without being executed; name it so the shape is
+    // visible when a descent first reaches one.
+    let report_record_only = |ctx: &WalkContext<'_, '_, Sym>| {
+        if let Some(helper) = ctx.fbw_mode.transparent_helper_jitcode_index
+            && super::diag::fbw_inline_diag_enabled()
+        {
+            eprintln!("[helper-setarrayitem-record-only] helper_jitcode={helper}");
+        }
+    };
     match ctx.trace_ctx.opcode_of(array) {
         Some(OpCode::NewArray | OpCode::NewArrayClear) => {}
         // The block a container this walk allocated points at now. A
@@ -636,10 +646,14 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
                     .ref_getfield_gc_r(array)
                     .is_some_and(|(_, obj)| ctx.trace_ctx.heap_cache().saw_allocation(obj));
             if !owned {
+                report_record_only(ctx);
                 return;
             }
         }
-        _ => return,
+        _ => {
+            report_record_only(ctx);
+            return;
+        }
     }
     let block = match ctx.trace_ctx.box_value(array) {
         Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 => {
