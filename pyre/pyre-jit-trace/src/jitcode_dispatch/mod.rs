@@ -8703,6 +8703,9 @@ enum FbwCellStore {
         size: usize,
         before: Value,
         managed: bool,
+        /// Whether the push moved the executed-effect odometer; `false` for
+        /// a store into an object the walk itself allocated.
+        counted: bool,
         /// `TracePosition::_count` once the store's op was recorded.  A cut
         /// back past it discards the op, and with it this store
         /// ([`fbw_gc_store_journal_cut`]).

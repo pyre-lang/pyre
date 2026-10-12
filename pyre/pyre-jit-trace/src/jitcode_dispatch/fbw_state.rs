@@ -1089,6 +1089,30 @@ pub(crate) fn fbw_gc_store_journal_push(
     before: Value,
     op_count: u32,
 ) {
+    gc_store_journal_push(obj, offset, size, before, op_count, true);
+    fbw_bump_executed_effect("gc_store_journal");
+}
+
+/// [`fbw_gc_store_journal_push`] for an object the walk allocated: the same
+/// undo entry, off the executed-effect odometer.
+pub(crate) fn fbw_gc_store_journal_push_fresh(
+    obj: pyre_object::PyObjectRef,
+    offset: usize,
+    size: usize,
+    before: Value,
+    op_count: u32,
+) {
+    gc_store_journal_push(obj, offset, size, before, op_count, false);
+}
+
+fn gc_store_journal_push(
+    obj: pyre_object::PyObjectRef,
+    offset: usize,
+    size: usize,
+    before: Value,
+    op_count: u32,
+    counted: bool,
+) {
     let managed = pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF);
     if fbw_debug_abort_enabled() {
         eprintln!(
@@ -1103,10 +1127,10 @@ pub(crate) fn fbw_gc_store_journal_push(
             size,
             before,
             managed,
+            counted,
             op_count,
         })
     });
-    fbw_bump_executed_effect("gc_store_journal");
 }
 
 /// [`majit_metainterp::trace_ctx::TraceCtx::cut_observer`] for the walker:
@@ -1125,9 +1149,13 @@ pub(crate) fn fbw_gc_store_journal_cut(pos: &majit_metainterp::recorder::TracePo
         let mut i = entries.len();
         while i > 0 {
             i -= 1;
-            if matches!(entries[i], FbwCellStore::Gc { op_count, .. } if op_count > pos._count) {
+            if let FbwCellStore::Gc {
+                op_count, counted, ..
+            } = entries[i]
+                && op_count > pos._count
+            {
                 undo_cell_store_entry(entries.remove(i));
-                undone += 1;
+                undone += usize::from(counted);
             }
         }
     });
@@ -1154,9 +1182,15 @@ pub(crate) fn fbw_gc_store_journal_keep_since(
         let mut i = entries.len();
         while i > mark.cells {
             i -= 1;
-            if matches!(entries[i], FbwCellStore::Gc { obj: stored, .. } if stored == obj) {
+            if let FbwCellStore::Gc {
+                obj: stored,
+                counted,
+                ..
+            } = entries[i]
+                && stored == obj
+            {
                 entries.remove(i);
-                kept += 1;
+                kept += usize::from(counted);
             }
         }
     });
@@ -2595,7 +2629,7 @@ pub(crate) fn fbw_effect_journal_rollback_since(mark: FbwEffectJournalMark) {
             let Some(entry) = entries.pop() else {
                 break;
             };
-            bumped += 1;
+            bumped += usize::from(!matches!(entry, FbwCellStore::Gc { counted: false, .. }));
             undo_cell_store_entry(entry);
         }
     });
