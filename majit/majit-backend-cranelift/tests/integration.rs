@@ -310,7 +310,6 @@ fn test_bridge_end_to_end() {
             &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
-            &[],
             None,
         )
         .expect("bridge compilation should succeed");
@@ -2212,7 +2211,6 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
             &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
-            &[],
             Some(&source_layout),
         )
         .expect("bridge compilation should succeed");

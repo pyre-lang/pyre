@@ -11278,78 +11278,6 @@ impl CraneliftBackend {
         unsafe { (ptr as *mut f64).write_unaligned(newvalue) }
     }
 
-    /// Propagate bridges from previous tokens' fail_descrs to the current
-    /// token's fail_descrs. Called after finish_and_compile replaces the
-    /// token — bridges compiled during main loop tracing were attached to
-    /// the old token and need to be copied to the new one.
-    pub fn propagate_bridges_from_previous_tokens(
-        &self,
-        current_token: &JitCellToken,
-        previous_tokens: &[std::sync::Arc<JitCellToken>],
-    ) {
-        let compiled = match current_token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)
-        {
-            Some(c) => c,
-            None => return,
-        };
-        let new_descrs = &compiled.fail_descrs;
-        for prev in previous_tokens {
-            if let Some(prev_compiled) = prev
-                .compiled
-                .get()
-                .and_then(|c| c.downcast_ref::<CompiledLoop>())
-                .map(CompiledLoop::current)
-            {
-                for prev_d in &prev_compiled.fail_descrs {
-                    if fail_descr_has_bridge(as_fd(prev_d)) {
-                        let prev_fd = as_fd(prev_d);
-                        let fi = prev_fd.fail_index();
-                        let tid = prev_fd.trace_id();
-                        if let Some(new_d) = find_fail_descr_in_fail_descrs(new_descrs, tid, fi)
-                            && !fail_descr_has_bridge(as_fd(&new_d))
-                            && let Some(b) = fail_descr_bridge_ref(as_fd(prev_d))
-                        {
-                            if majit_log_enabled() {
-                                eprintln!(
-                                    "[jit] propagate bridge tid={} fi={} to new token",
-                                    tid, fi,
-                                );
-                            }
-                            fail_descr_attach_bridge(
-                                as_fd(&new_d),
-                                BridgeData {
-                                    trace_id: b.trace_id,
-                                    input_types: b.input_types.clone(),
-                                    header_pc: b.header_pc,
-                                    source_guard: b.source_guard,
-                                    caller_prefix_layout: b.caller_prefix_layout.clone(),
-                                    code_ptr: b.code_ptr,
-                                    body_ptr: b.body_ptr,
-                                    fail_descrs: b.fail_descrs.clone(),
-                                    fail_descr_cells: b.fail_descr_cells.clone(),
-                                    num_inputs: b.num_inputs,
-                                    num_ref_roots: b.num_ref_roots,
-                                    max_output_slots: b.max_output_slots,
-                                    terminal_exit_layouts: UnsafeCell::new(
-                                        unsafe { &*b.terminal_exit_layouts.get() }.clone(),
-                                    ),
-                                    loop_reentry: b.loop_reentry,
-                                    invalidated_arc: b.invalidated_arc.clone(),
-                                    gc_table: b.gc_table.clone(),
-                                    merge_source: b.merge_source.as_ref().map(clone_merge_source),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", "speed").unwrap();
@@ -21901,17 +21829,13 @@ impl majit_backend::Backend for CraneliftBackend {
     /// (`majit-backend/src/lib.rs`) and passes it as `original_token`,
     /// so the source descr is always reachable from
     /// `original_token.compiled.fail_descrs` (no source-descr predecessor
-    /// scan).  `previous_tokens` is still consumed below to attach the
-    /// freshly compiled bridge to retired predecessor descrs whose machine
-    /// code remains live; `fail_descr_attach_bridge` patches each
-    /// predecessor trampoline in place.
+    /// scan).
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge lowering reads `type_info_group`.
@@ -22118,55 +22042,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     merge_source,
                 },
             );
-            // Cranelift can't patch machine code like RPython's x86 backend.
-            // After a retrace, the RUNNING machine code still references
-            // fail_descrs from previous tokens. Attach the bridge to ALL
-            // matching fail_descrs in previous_tokens so the running code
-            // can dispatch to it.
-            for prev_token in previous_tokens {
-                if let Some(prev_compiled) = prev_token
-                    .compiled
-                    .get()
-                    .and_then(|c| c.downcast_ref::<CompiledLoop>())
-                    .map(CompiledLoop::current)
-                    && let Some(prev_descr) = find_fail_descr_in_fail_descrs(
-                        &prev_compiled.fail_descrs,
-                        source_trace_id,
-                        fail_descr.fail_index_per_trace(),
-                    )
-                    && !fail_descr_has_bridge(as_fd(&prev_descr))
-                {
-                    // Reconstruct a minimal BridgeData from the
-                    // bridge already attached to `sd`.
-                    if let Some(b) = fail_descr_bridge_ref(as_fd(sd)) {
-                        fail_descr_attach_bridge(
-                            as_fd(&prev_descr),
-                            BridgeData {
-                                trace_id: b.trace_id,
-                                input_types: b.input_types.clone(),
-                                header_pc: b.header_pc,
-                                source_guard: b.source_guard,
-                                caller_prefix_layout: b.caller_prefix_layout.clone(),
-                                code_ptr: b.code_ptr,
-                                body_ptr: b.body_ptr,
-                                fail_descrs: b.fail_descrs.clone(),
-                                fail_descr_cells: b.fail_descr_cells.clone(),
-                                num_inputs: b.num_inputs,
-                                num_ref_roots: b.num_ref_roots,
-                                max_output_slots: b.max_output_slots,
-
-                                terminal_exit_layouts: UnsafeCell::new(
-                                    unsafe { &*b.terminal_exit_layouts.get() }.clone(),
-                                ),
-                                loop_reentry: b.loop_reentry,
-                                invalidated_arc: b.invalidated_arc.clone(),
-                                gc_table: b.gc_table.clone(),
-                                merge_source: b.merge_source.as_ref().map(clone_merge_source),
-                            },
-                        );
-                    }
-                }
-            }
         }
 
         // `assemble_bridge` ends at `patch_jump_for_descr(faildescr,
@@ -24894,7 +24769,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(1)]);
@@ -24965,7 +24840,7 @@ mod tests {
             finish,
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
         (backend, token, root)
     }
@@ -25079,7 +24954,7 @@ mod tests {
             finish,
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
         (backend, token, root)
     }
@@ -25175,7 +25050,7 @@ mod tests {
             finish,
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token_a, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token_a, None)
             .unwrap();
 
         let label_b = make_label_descr(1_500_442);
@@ -25296,7 +25171,7 @@ mod tests {
         bridge_constants.insert(111, 500);
         backend.set_constants(bridge_constants);
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -25326,7 +25201,6 @@ mod tests {
                 &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
                 &finish,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -25388,7 +25262,7 @@ mod tests {
             .expect("side guard should produce a descr");
         let finish = vec![mk_op(OpCode::Finish, &[s], OpRef::NONE.raw())];
         backend
-            .compile_bridge(side_descr, &inputargs, &finish, &token, &[], None)
+            .compile_bridge(side_descr, &inputargs, &finish, &token, None)
             .unwrap();
         let owner = token
             .compiled
@@ -25416,7 +25290,7 @@ mod tests {
         closing_constants.insert(110, 4);
         backend.set_constants(closing_constants);
         backend
-            .compile_bridge(exit_descr, &inputargs, &closing, &token, &[], None)
+            .compile_bridge(exit_descr, &inputargs, &closing, &token, None)
             .unwrap();
         let owner = token
             .compiled
@@ -25504,7 +25378,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge, &token, None)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(2)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -25570,7 +25444,7 @@ mod tests {
             mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge, &token, None)
             .unwrap();
         assert_eq!(
             owner.gc_table.as_ref().unwrap().slot(0),
@@ -25661,7 +25535,7 @@ mod tests {
             mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
         ];
         backend
-            .compile_bridge(as_fd(&enter_descr), &inputargs, &bridge, &token, &[], None)
+            .compile_bridge(as_fd(&enter_descr), &inputargs, &bridge, &token, None)
             .unwrap();
         assert_ne!(
             owner.entry_code_ptr.load(Ordering::Acquire),
@@ -25766,14 +25640,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(
-                as_fd(&enter_descr),
-                &inputargs,
-                &bridge,
-                &token_a,
-                &[],
-                None,
-            )
+            .compile_bridge(as_fd(&enter_descr), &inputargs, &bridge, &token_a, None)
             .unwrap();
         assert_ne!(owner.entry_code_ptr.load(Ordering::Acquire), entry_before);
 
@@ -25880,14 +25747,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(
-                guard_descr,
-                &bridge_inputargs,
-                &bridge_ops,
-                &token,
-                &[],
-                None,
-            )
+            .compile_bridge(guard_descr, &bridge_inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -26120,7 +25980,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -26350,7 +26209,7 @@ mod tests {
             label_c.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a, &[], None)
+            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a, None)
             .unwrap();
         let bridge_to_a = vec![mk_op_with_descr(
             OpCode::Jump,
@@ -26359,7 +26218,7 @@ mod tests {
             label_a.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c, &[], None)
+            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c, None)
             .unwrap();
 
         let (family_body, family_code) = {
@@ -26483,7 +26342,7 @@ mod tests {
             label_c.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a, &[], None)
+            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a, None)
             .unwrap();
         let bridge_to_a = vec![mk_op_with_descr(
             OpCode::Jump,
@@ -26492,7 +26351,7 @@ mod tests {
             label_a.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c, &[], None)
+            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c, None)
             .unwrap();
 
         let family_body = token_c
@@ -26594,7 +26453,7 @@ mod tests {
             label_c.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&to_c), &inputargs, &bridge, &token_a, &[], None)
+            .compile_bridge(as_fd(&to_c), &inputargs, &bridge, &token_a, None)
             .unwrap();
         {
             let compiled_a = token_a
@@ -26678,7 +26537,7 @@ mod tests {
             label_t.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&to_t), &inputargs, &bridge, &token_l, &[], None)
+            .compile_bridge(as_fd(&to_t), &inputargs, &bridge, &token_l, None)
             .unwrap();
         {
             let compiled_l = token_l
@@ -26872,7 +26731,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -26965,7 +26823,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27071,7 +26928,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27179,7 +27035,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27297,7 +27152,6 @@ mod tests {
                 &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27392,7 +27246,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27488,7 +27341,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &exc_bridge,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27517,7 +27369,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &hot_bridge,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27594,7 +27445,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27676,7 +27526,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27772,7 +27621,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -27865,7 +27713,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -28554,14 +28401,7 @@ mod tests {
         backend.set_next_trace_id(91);
         backend.set_next_header_pc(2000);
         backend
-            .compile_bridge(
-                fail_descr,
-                &bridge_inputargs,
-                &bridge_ops,
-                &token,
-                &[],
-                None,
-            )
+            .compile_bridge(fail_descr, &bridge_inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         let root_layouts = backend
@@ -28702,7 +28542,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 Some(&source_layout),
             )
             .unwrap();
@@ -28836,7 +28675,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 Some(&root_layout),
             )
             .unwrap();
@@ -28907,7 +28745,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 Some(&bridge_source_layout),
             )
             .unwrap();
@@ -31574,7 +31411,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -31723,7 +31559,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -32540,7 +32375,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -32615,7 +32450,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
         let clif = backend.last_body_clif.clone();
         assert!(
@@ -32679,7 +32514,7 @@ mod tests {
             head,
         )];
         backend
-            .compile_bridge(guard_descr, &bridge_inputs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &bridge_inputs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -32814,7 +32649,7 @@ mod tests {
             tail,
         )];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -32888,7 +32723,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -32988,7 +32823,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -33073,7 +32908,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -33170,7 +33005,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -33281,7 +33116,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -33383,7 +33218,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());

@@ -11478,18 +11478,8 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
         self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
 
-        // Read both backend inputs out of `compiled_loops` before the
-        // `&mut self.backend` borrow; see `compile_bridge` for what each is.
-        let previous_tokens_strong: Vec<Arc<JitCellToken>> = self
-            .compiled_entry(green_key)
-            .map(|compiled| {
-                compiled
-                    .previous_tokens
-                    .iter()
-                    .filter_map(|weak| weak.upgrade())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Read the backend input out of `compiled_loops` before the
+        // `&mut self.backend` borrow; see `compile_bridge` for what it is.
         let caller_recovery_layout = self
             .compiled_entry(green_key)
             .and_then(|compiled| compiled.traces.get(&source_trace_id))
@@ -11516,7 +11506,6 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &combined_ops,
                     &source_jct,
-                    &previous_tokens_strong,
                     caller_recovery_layout.as_deref(),
                 )
             }))
@@ -16912,19 +16901,6 @@ impl<M: Clone> MetaInterp<M> {
             // current running loop's token.  Pass `source_jct` so backend
             // stamping (`runner.rs`, `compiler.rs`) reaches the
             // correct CLT for newly compiled bridge-internal guards.
-            // `previous_tokens` lets cranelift attach the bridge to retired
-            // predecessor descrs whose machine code is still running (it
-            // cannot patch in place); see `compile_bridge` trait doc.
-            // Upgrade Weak refs to strong Arcs for the backend
-            // call; dead entries are filtered out.  The backend signature
-            // continues to take `&[Arc<JitCellToken>]` until a follow-up
-            // converts it to Weak.
-            let previous_tokens_strong: Vec<std::sync::Arc<JitCellToken>> = compiled
-                .previous_tokens
-                .iter()
-                .filter_map(|weak| weak.upgrade())
-                .collect();
-            let previous_tokens: &[std::sync::Arc<JitCellToken>] = &previous_tokens_strong;
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] calling backend.compile_bridge: key={} guard={} ops={}",
@@ -16970,7 +16946,6 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_inputargs,
                         &optimized_ops,
                         &source_jct,
-                        previous_tokens,
                         caller_recovery_layout.as_deref(),
                     )
                 }))

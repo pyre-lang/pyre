@@ -65,7 +65,6 @@ impl Backend for RejectingBackend {
         _: &[InputArgRc],
         _: &[OpRc],
         _: &JitCellToken,
-        _: &[Arc<JitCellToken>],
         _: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         unreachable!()
