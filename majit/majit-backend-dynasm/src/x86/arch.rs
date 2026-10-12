@@ -61,5 +61,12 @@ pub const SHADOWSTORE2_OFS: usize = (FRAME_FIXED_SIZE + 3) * WORD;
 #[cfg(target_os = "windows")]
 pub const SHADOWSTORE3_OFS: usize = (FRAME_FIXED_SIZE + 4) * WORD;
 
-/// arch.py:65 — return address + FRAME_FIXED_SIZE words.
+/// arch.py `DEFAULT_FRAME_BYTES`: return address + `FRAME_FIXED_SIZE` words.
 pub const DEFAULT_FRAME_BYTES: usize = (1 + FRAME_FIXED_SIZE) * WORD;
+
+// `arch.py` `assert PASS_ON_MY_FRAME >= 12`. `FRAME_FIXED_SIZE` is odd, so
+// `SUB rsp, FRAME_FIXED_SIZE * WORD` turns the 8-mod-16 entry rsp into a
+// 0-mod-16 body. `(1 + FRAME_FIXED_SIZE) * WORD` stays 0 mod 16.
+const _: () = assert!(PASS_ON_MY_FRAME >= 12);
+const _: () = assert!(DEFAULT_FRAME_BYTES % 16 == 0);
+const _: () = assert!((FRAME_FIXED_SIZE * WORD) % 16 == 8);

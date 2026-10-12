@@ -116,18 +116,18 @@ const X86_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
 /// repaired later.
 const MIN_RELOCATED_JUMP_TARGET: usize = 4096;
 
-/// Where `_call_header` keeps the thread-local address the entry received as
-/// its second argument: the body-rsp-relative padding slot above the saved
-/// registers. `arch.py` names this `THREADLOCAL_OFS`; this frame packs the
-/// saved registers from offset 0 and has no `PASS_ON_MY_FRAME` area, so the
-/// slot lands at the padding word instead. The offset differs, the mechanism
-/// does not.
-///
-/// Reads must add any `push` or `sub rsp` in effect at the read point.
-#[cfg(not(target_os = "windows"))]
-const SAVED_THREADLOCAL_OFS: i32 = 48;
+/// Win64 deviation from `arch.py` ("never use r13"). `emit_call_from_arglocs`
+/// parks a register call target in r13 across `write_real_errno`, so the
+/// prologue has to keep the caller's r13. `genop_call_assembler` returns
+/// through this same frame, and that nested call must still see the register.
+/// The home is `(FRAME_FIXED_SIZE - 1) * WORD`, outside `PASS_ON_MY_FRAME`.
 #[cfg(target_os = "windows")]
-const SAVED_THREADLOCAL_OFS: i32 = 64;
+const SAVED_R13_OFS: i32 = ((FRAME_FIXED_SIZE - 1) * WORD) as i32;
+
+#[cfg(target_os = "windows")]
+const _: () = assert!(SAVED_R13_OFS as usize >= PASS_ON_MY_FRAME * WORD);
+#[cfg(target_os = "windows")]
+const _: () = assert!((SAVED_R13_OFS as usize) < FRAME_FIXED_SIZE * WORD);
 
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
 enum ResolvedArg {
@@ -784,43 +784,68 @@ pub(crate) fn emit_footer_shadowstack_raw(asm: &mut Assembler) {
     rx86::sub_mi(asm, (scratch, 0), 16);
 }
 
+/// `CPU_X86_64.CALLEE_SAVE_REGISTERS`. Win64 index 4/5 are not contiguous:
+/// `_call_footer` reads them from `SHADOWSTORE2_OFS` / `SHADOWSTORE3_OFS`.
+fn callee_save_regs() -> &'static [u8] {
+    #[cfg(target_os = "windows")]
+    {
+        &[rx86::EBX, rx86::ESI, rx86::EDI, rx86::R12, 14, 15]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        &[rx86::EBX, rx86::R12, 13, 14, 15]
+    }
+}
+
+fn callee_save_ofs(index: usize) -> i32 {
+    #[cfg(target_os = "windows")]
+    {
+        match index {
+            4 => SHADOWSTORE2_OFS as i32,
+            5 => SHADOWSTORE3_OFS as i32,
+            _ => ((PASS_ON_MY_FRAME + index + 1) * WORD) as i32,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        ((PASS_ON_MY_FRAME + index + 1) * WORD) as i32
+    }
+}
+
+/// `_call_header`'s callee-save stores, after `ebp` and the thread-local
+/// word are already in the frame.
+fn emit_save_callee_saves(asm: &mut Assembler) {
+    for (index, reg) in callee_save_regs().iter().copied().enumerate() {
+        rx86::mov_sr(asm, callee_save_ofs(index), reg);
+    }
+    // See `SAVED_R13_OFS`. Restored just before `ebp` in
+    // `emit_restore_callee_saves`.
+    #[cfg(target_os = "windows")]
+    rx86::mov_sr(asm, SAVED_R13_OFS, 13);
+}
+
+/// `_call_footer` restore: callee-saves in reverse, then `ebp`, then
+/// `ADD rsp, FRAME_FIXED_SIZE * WORD`. Does not emit `ret`.
+fn emit_restore_callee_saves(asm: &mut Assembler) {
+    let regs = callee_save_regs();
+    for index in (0..regs.len()).rev() {
+        rx86::mov_rs(asm, regs[index], callee_save_ofs(index));
+    }
+    #[cfg(target_os = "windows")]
+    rx86::mov_rs(asm, 13, SAVED_R13_OFS);
+    rx86::mov_rs(asm, rx86::EBP, (PASS_ON_MY_FRAME * WORD) as i32);
+    rx86::add_ri(asm, rx86::ESP, (FRAME_FIXED_SIZE * WORD) as i32);
+}
+
 /// `x86/assembler.py _call_footer` parity (free-fn variant).
 /// Restores the callee-save set established by `_call_header` and
 /// returns the jitframe pointer in `rax`.  Must be entered with `rsp`
 /// at trace-body alignment (i.e. the same value the trace's
-/// `_call_header` left after its `SUB rsp, FRAME_FIXED_SIZE`).
+/// `_call_header` left after its `SUB rsp, FRAME_FIXED_SIZE * WORD`).
 pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
     emit_footer_shadowstack_raw(asm);
     dynasm!(asm ; .arch x64 ; mov rax, rbp);
-    // Win64: 8 callee-save GPRs × 8 = 64 bytes.  PyPy's
-    // `arch.py:43` notes "never use r13 on Win64", but pyre's
-    // `genop_call_assembler` uses r13 as a scratch that survives
-    // a `free()` call (no other unused callee-save reg is live
-    // enough at that point), so pyre adds r13 to the saved set —
-    // filling the slot that was 8-byte padding under PyPy's
-    // "5 regs + r14/r15 in shadow store + 12 pad" layout.
-    #[cfg(target_os = "windows")]
-    dynasm!(asm ; .arch x64
-        ; mov rbx, [rsp + 0]
-        ; mov rsi, [rsp + 8]
-        ; mov rdi, [rsp + 16]
-        ; mov r12, [rsp + 24]
-        ; mov r14, [rsp + 32]
-        ; mov r15, [rsp + 40]
-        ; mov rbp, [rsp + 48]
-        ; mov r13, [rsp + 56]
-        ; add rsp, 72
-    );
-    #[cfg(not(target_os = "windows"))]
-    dynasm!(asm ; .arch x64
-        ; mov rbx, [rsp + 0]
-        ; mov r12, [rsp + 8]
-        ; mov r13, [rsp + 16]
-        ; mov r14, [rsp + 24]
-        ; mov r15, [rsp + 32]
-        ; mov rbp, [rsp + 40]
-        ; add rsp, 56
-    );
+    emit_restore_callee_saves(asm);
     dynasm!(asm ; .arch x64 ; ret);
 }
 
@@ -1009,30 +1034,22 @@ fn restore_exception_frame(asm: &mut Assembler) {
 }
 
 /// `build_frame_realloc_slowpath`. The caller has executed
-/// `IncreaseStackSlowPath.generate_body`: depth at `[rsp + WORD]` and
-/// `push_gcmap` already done. `CALL` then pushes the return address, so
-/// the depth is at `[rsp + WORD*2]`.
-///
-/// `[rsp + WORD]` on the trace is a prologue spill (`_call_header` has no
-/// `PASS_ON_MY_FRAME` scratch). The per-site body parks that word in
-/// `X86_64_XMM_SCRATCH_REG`. This helper parks the same xmm across
-/// `realloc_frame` — Win64 xmm5 is volatile — then restores it before
-/// `add rsp`, so the per-site `movsd` can write the spill back.
+/// `IncreaseStackSlowPath.generate_body`: depth at `[rsp + WORD]` (the
+/// `PASS_ON_MY_FRAME` scratch) and `push_gcmap` already done. `CALL` then
+/// pushes the return address, so the depth is at `[rsp + WORD*2]`.
 pub(crate) fn build_frame_realloc_slowpath(
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
     let mut asm = Assembler::new(0);
     push_all_regs_to_jitframe_raw(&mut asm, &[], true, false);
     #[cfg(target_os = "windows")]
-    let (arg0, arg1, tmpreg, align, xmm_park) = (rx86::ECX, rx86::EDX, rx86::R12, 40, 32);
+    let (arg0, arg1, tmpreg, align) = (rx86::ECX, rx86::EDX, rx86::R12, 40);
     #[cfg(not(target_os = "windows"))]
-    let (arg0, arg1, tmpreg, align, xmm_park) = (rx86::EDI, rx86::ESI, rx86::ECX, 8, 0);
+    let (arg0, arg1, tmpreg, align) = (rx86::EDI, rx86::ESI, rx86::ECX, 8);
     // `MOV_rs(ARG1, WORD*2)` then `MOV ARG0, ebp`.
     rx86::mov_rs(&mut asm, arg1, (WORD * 2) as i32);
     dynasm!(asm ; .arch x64 ; mov Rq(arg0), rbp);
     rx86::sub_ri(&mut asm, rx86::ESP, align);
-    let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-    rx86::movsd_sx(&mut asm, xmm_park, xmm);
     store_and_reset_exception_frame(&mut asm, tmpreg);
     rx86::mov_ri(
         &mut asm,
@@ -1045,7 +1062,6 @@ pub(crate) fn build_frame_realloc_slowpath(
         ; mov rbp, rax
     );
     restore_exception_frame(&mut asm);
-    rx86::movsd_xs(&mut asm, xmm, xmm_park);
     rx86::add_ri(&mut asm, rx86::ESP, align);
     // `_load_shadowstack_top_in_ebx` then `MOV [ebx - WORD], eax`.
     // `eax` still holds the new frame; restore ran before this store.
@@ -1081,30 +1097,9 @@ fn emit_stack_overflow_footer(asm: &mut Assembler, propagate_descr: i64) {
     rx86::mov_ri(asm, scratch, propagate_descr);
     rx86::mov_br(asm, JF_DESCR_OFS, scratch);
     dynasm!(asm ; .arch x64 ; mov rax, rbp);
-    #[cfg(target_os = "windows")]
-    dynasm!(asm
-        ; .arch x64
-        ; mov rbx, [rsp + 0]
-        ; mov rsi, [rsp + 8]
-        ; mov rdi, [rsp + 16]
-        ; mov r12, [rsp + 24]
-        ; mov r14, [rsp + 32]
-        ; mov r15, [rsp + 40]
-        ; mov rbp, [rsp + 48]
-        ; mov r13, [rsp + 56]
-        ; add rsp, 72
-    );
-    #[cfg(not(target_os = "windows"))]
-    dynasm!(asm
-        ; .arch x64
-        ; mov rbx, [rsp + 0]
-        ; mov r12, [rsp + 8]
-        ; mov r13, [rsp + 16]
-        ; mov r14, [rsp + 24]
-        ; mov r15, [rsp + 32]
-        ; mov rbp, [rsp + 40]
-        ; add rsp, 56
-    );
+    // Same restore as `_call_footer`, without `emit_footer_shadowstack_raw`:
+    // the probe runs before the shadow push.
+    emit_restore_callee_saves(asm);
     dynasm!(asm ; .arch x64 ; ret);
 }
 
@@ -1428,13 +1423,11 @@ pub(crate) fn build_malloc_slowpath_headerless(
 
 /// `_build_malloc_slowpath(kind='var')`. Entry is `malloc_cond_varsize`'s
 /// contract: length in `edx`, tid in `ecx`, itemsize at `[rsp+WORD]` and
-/// `base_size` at `[rsp+2*WORD]` after the callsite's `sub rsp, 16`
-/// (`MallocCondVarsizeSlowPath` stores those two words in the slot it
-/// reserved; `_call_header` keeps a callee-save at `[rsp+WORD]`, so the
-/// store is not a bare `MOV_si(WORD, itemsize)`). The helper is
-/// `dynasm_nursery_slowpath_varsize(base_size, item_size, length, tid)`.
-/// OOM adds the reserved 16 bytes back before `propagate_exception_path`,
-/// because this trampoline does not return to the callsite's `add rsp, 16`.
+/// `base_size` at `[rsp+2*WORD]`. Both words sit in the `PASS_ON_MY_FRAME`
+/// scratch (`MallocCondVarsizeSlowPath` stores itemsize with
+/// `MOV_si(WORD, itemsize)`; pyre also passes `base_size` to
+/// `dynasm_nursery_slowpath_varsize`). OOM only pops the return address:
+/// there is no callsite `sub rsp` to undo.
 pub(crate) fn build_malloc_slowpath_varsize(
     cpu_handle: &crate::guard::CpuDescrHandle,
     propagate_path: usize,
@@ -1494,10 +1487,10 @@ fn build_malloc_slowpath_body(
     push_all_regs_to_jitframe_raw(asm, &ignored, true, false);
 
     // assembler.py `add_to_esp = 16 - WORD` plus Win64 shadow
-    // space.  pyre's JIT body is 0-mod-16 (per `_call_header`'s
-    // padding-slot SUB) and the outer `call rax` pushes the return
-    // address, leaving rsp 8-mod-16 inside the trampoline.  The SUB
-    // below brings rsp back to 0-mod-16 before the inner CALL — `8`
+    // space.  pyre's JIT body is 0-mod-16 (`_call_header`'s
+    // `SUB rsp, FRAME_FIXED_SIZE * WORD`) and the outer `call rax` pushes
+    // the return address, leaving rsp 8-mod-16 inside the trampoline.  The
+    // SUB below brings rsp back to 0-mod-16 before the inner CALL — `8`
     // alignment alone on SysV, `8 + 32` shadow on Win64.
     #[cfg(target_os = "windows")]
     let align: i32 = 40;
@@ -1511,9 +1504,10 @@ fn build_malloc_slowpath_body(
     // (`MOV ARG0, edx` after the caller's `SUB rdx, rcx`).
     // `kind='var'` passes `(base_size, item_size, length, tid)` to
     // `dynasm_nursery_slowpath_varsize`. After this `SUB`, the callsite's
-    // two words sit above the return address: itemsize at
-    // `[rsp+align+WORD]`, base_size at `[rsp+align+2*WORD]`
-    // (`MallocCondVarsizeSlowPath`).
+    // two scratch words sit above the return address: itemsize at
+    // `[rsp+align+2*WORD]`, base_size at `[rsp+align+3*WORD]`
+    // (`MallocCondVarsizeSlowPath` stored them at `[rsp+WORD]` and
+    // `[rsp+2*WORD]` on the trace).
     match kind {
         MallocSlowpathKind::Fixed => {
             #[cfg(target_os = "windows")]
@@ -1523,8 +1517,8 @@ fn build_malloc_slowpath_body(
             dynasm!(asm ; .arch x64 ; mov Rq(arg0_reg), rdx);
         }
         MallocSlowpathKind::Varsize => {
-            let item_ofs = align + WORD as i32;
-            let base_ofs = align + (WORD as i32) * 2;
+            let item_ofs = align + (WORD as i32) * 2;
+            let base_ofs = align + (WORD as i32) * 3;
             #[cfg(target_os = "windows")]
             {
                 // ARG0 is ecx and ARG1 is edx, which still hold tid and
@@ -1653,15 +1647,11 @@ fn build_malloc_slowpath_body(
     let propagate_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
     // `ADD esp, WORD` pops the trampoline return address so
     // `_call_footer` in `propagate_exception_path` sees the trace body
-    // alignment `_call_header` left. `kind='var'` also pops the 16 bytes
-    // `MallocCondVarsizeSlowPath` reserved: this tail does not return to
-    // the callsite's `add rsp, 16`.
-    let oom_pop: i32 = match kind {
-        MallocSlowpathKind::Fixed => WORD as i32,
-        MallocSlowpathKind::Varsize => (WORD as i32) * 3,
-    };
+    // rsp `_call_header` left. Varsize's itemsize and base_size live in
+    // the `PASS_ON_MY_FRAME` scratch, so this tail does not pop a callsite
+    // reservation.
     dynasm!(asm ; .arch x64 ; =>oom_tail);
-    rx86::add_ri(asm, rx86::ESP, oom_pop);
+    rx86::add_ri(asm, rx86::ESP, WORD as i32);
     rx86::mov_ri(asm, propagate_scratch, propagate_path as i64);
     dynasm!(asm ; .arch x64 ; jmp Rq(propagate_scratch));
 }
@@ -2960,7 +2950,7 @@ impl<'a> Assembler386<'a> {
         rx86::mov_br(&mut self.mc, offset, rx86::EAX);
     }
 
-    // assembler.py:543 _call_header — function prologue
+    // assembler.py `_call_header` — function prologue
 
     fn setup_input_state(&mut self, inputargs: &[InputArgRc]) {
         // opref_to_slot stores ABSOLUTE jitframe slot indices so that
@@ -3008,86 +2998,32 @@ impl<'a> Assembler386<'a> {
     /// returns through that helper's footer and does not pop the shadow
     /// stack: this probe runs before the push.
     fn _call_header(&mut self, inputargs: &[InputArgRc]) {
-        // x86/assembler.py _call_header parity. PyPy reserves the
-        // whole frame in a single `SUB esp, FRAME_FIXED_SIZE * WORD` and
-        // stores `CALLEE_SAVE_REGISTERS` plus `ebp` at fixed offsets.
-        // The Pyre variant uses the same shape (single SUB + offset
-        // stores) without the PASS_ON_MY_FRAME scratch area or vmprof
-        // slots that PyPy reserves but never populates here.
+        // x86/assembler.py `_call_header`. One
+        // `SUB rsp, FRAME_FIXED_SIZE * WORD` reserves the
+        // `PASS_ON_MY_FRAME` scratch and the callee-save homes. `ebp`
+        // lands at `PASS_ON_MY_FRAME * WORD`, arg2 (the thread-local
+        // address) at `THREADLOCAL_OFS` before that register is reused,
+        // then `ebp` becomes arg1. `CALLEE_SAVE_REGISTERS` follow at
+        // `(PASS_ON_MY_FRAME + i + 1) * WORD`; Win64 i == 4/5 use
+        // `SHADOWSTORE2_OFS` / `SHADOWSTORE3_OFS`. `FRAME_FIXED_SIZE` is
+        // odd, so the 8-mod-16 entry rsp becomes a 0-mod-16 body.
         //
-        // Saved set per platform (matches PyPy's CALLEE_SAVE_REGISTERS):
-        //   - x86_64 (System V): rbx, r12, r13, r14, r15 plus rbp
-        //   - x86_64 (Win64):    rbx, rsi, rdi, r12, r14, r15 plus rbp
-        //
-        // Layout (lowest address first, all offsets relative to the new
-        // rsp after the SUB):
-        //   Win64:  [+0 rbx, +8 rsi, +16 rdi, +24 r12, +32 r14, +40 r15,
-        //            +48 rbp, +56 r13, +64 pad]   → SUB 72 (8 slots +
-        //            1 padding; body rsp at 0 mod 16 since function
-        //            entry rsp was 8 mod 16)
-        //   SysV:   [+0 rbx, +8 r12, +16 r13, +24 r14, +32 r15, +40 rbp,
-        //            +48 pad]   → SUB 56 (6 slots + 1 padding; body rsp
-        //            at 0 mod 16)
-        //
-        // The trailing padding slot (`+64` Win64, `+48` SysV) holds the
-        // thread-local address (`SAVED_THREADLOCAL_OFS`), and it brings the
-        // body rsp from the function-entry 8-mod-16 down to 0-mod-16,
-        // matching PyPy's body alignment convention.  This lets every
-        // inner CALL omit the per-call `SUB rsp, 8` alignment fixup
-        // (PyPy `_build_malloc_slowpath` `add_to_esp = 16 - WORD = 8`
-        // accounts for the dual: PyPy trampoline body is 8-mod-16
-        // because PyPy JIT body is 0-mod-16 + CALL push).
-        //
-        // `r12` carries the caller's `rbp` (saved jf_ptr) across nested
-        // `genop_call_assembler` reentries, so it must be preserved
-        // alongside the rest of the callee-save set.  Win64 also saves
-        // `r13` even though PyPy's `arch.py:43` skips it ("never use
-        // r13"): pyre's `genop_call_assembler` does use r13 as a
-        // scratch reg that must survive `free()`, so r13 occupies the
-        // previously-padding slot at +56 and is restored by every
-        // `_call_footer`/`emit_call_footer_raw` variant.
+        // Win64 also saves r13 at `SAVED_R13_OFS` (see that constant).
+        // `arch.py` says "never use r13".
+        let frame = (FRAME_FIXED_SIZE * WORD) as i32;
+        rx86::sub_ri(&mut self.mc, rx86::ESP, frame);
+        rx86::mov_sr(&mut self.mc, (PASS_ON_MY_FRAME * WORD) as i32, rx86::EBP);
         #[cfg(target_os = "windows")]
         {
-            dynasm!(self.mc
-                ; .arch x64
-                ; sub rsp, 72
-                ; mov [rsp + 0],  rbx
-                ; mov [rsp + 8],  rsi
-                ; mov [rsp + 16], rdi
-                ; mov [rsp + 24], r12
-                ; mov [rsp + 32], r14
-                ; mov [rsp + 40], r15
-                ; mov [rsp + 48], rbp
-                ; mov [rsp + 56], r13
-            );
-            // assembler.py `_call_header`: keep the thread-local address
-            // the entry received as its second argument.
-            rx86::mov_sr(&mut self.mc, SAVED_THREADLOCAL_OFS, rx86::EDX);
+            rx86::mov_sr(&mut self.mc, THREADLOCAL_OFS as i32, rx86::EDX);
             dynasm!(self.mc ; .arch x64 ; mov rbp, rcx);
         }
         #[cfg(not(target_os = "windows"))]
         {
-            dynasm!(self.mc
-            ; .arch x64
-            ; sub rsp, 56
-            );
-            dynasm!(self.mc
-            ; .arch x64
-            ; mov [rsp + 0],  rbx
-            );
-            dynasm!(self.mc
-                ; .arch x64
-                ; mov [rsp + 8],  r12
-                ; mov [rsp + 16], r13
-                ; mov [rsp + 24], r14
-                ; mov [rsp + 32], r15
-                ; mov [rsp + 40], rbp
-            );
-            // assembler.py `_call_header`: keep the thread-local address
-            // the entry received as its second argument.
-            rx86::mov_sr(&mut self.mc, SAVED_THREADLOCAL_OFS, rx86::ESI);
+            rx86::mov_sr(&mut self.mc, THREADLOCAL_OFS as i32, rx86::ESI);
             dynasm!(self.mc ; .arch x64 ; mov rbp, rdi);
         }
+        emit_save_callee_saves(&mut self.mc);
         // `_call_header_with_stack_check`: emit nothing while
         // `stack_check_slowpath` is 0 (descr missing, or
         // `insert_stack_check` not registered). The helper is built
@@ -3344,42 +3280,31 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_arg_from_mem(Self::abi_int_arg(idx), offset, Type::Int);
     }
 
-    // Both call sites are `#[cfg(windows)]`, so every other host reads this
-    // as unreached.
-    #[allow(dead_code)]
-    fn emit_win64_call_adjust(extra_pushes: usize) -> i32 {
-        // Body rsp is 0-mod-16 (per `_call_header`'s padding-slot SUB).
-        // With 0 extra pushes, only the 32-byte shadow space is needed
-        // (rsp already aligned).  With 1 extra push, rsp is at 8-mod-16
-        // so an extra 8 bytes of alignment pad is required before the
-        // 32-byte shadow space → 40.
-        if extra_pushes & 1 == 0 { 32 } else { 40 }
-    }
-
+    /// Bytes to subtract before a C call so the callee's entry rsp is
+    /// 8 mod 16 and, on Win64, its shadow is writable.
+    ///
+    /// `extra_pushes == 0` means rsp is still the body rsp from
+    /// `_call_header`. `CallBuilderX86.subtract_esp_aligned` then
+    /// subtracts only `on_stack - PASS_ON_MY_FRAME` words (zero when the
+    /// outgoing area fits in that scratch).
+    ///
+    /// `extra_pushes != 0` means those pushes sit below the scratch, so
+    /// the outgoing area is not `PASS_ON_MY_FRAME`. Reserve the full
+    /// `outgoing_stack_words` block under the pushes, plus one word when
+    /// that would leave rsp not 0 mod 16. One push is 40 bytes on Win64
+    /// and 8 on SysV; two pushes are the 32-byte Win64 shadow alone.
     fn abi_reserved_call_area_size(extra_pushes: usize, stack_slots: usize) -> i32 {
-        // Body rsp is 0-mod-16; the inversion in `needs_pad` accounts
-        // for that vs the previous 8-mod-16 layout (see `_call_header`
-        // comment for the alignment rationale).
-        #[cfg(target_os = "windows")]
-        {
-            let base = 32 + (stack_slots * WORD) as i32;
-            let needs_pad = if extra_pushes & 1 == 0 {
-                base % 16 != 0
-            } else {
-                base % 16 == 0
-            };
-            base + if needs_pad { WORD as i32 } else { 0 }
+        let on_stack = super::callbuilder::outgoing_stack_words(stack_slots);
+        if extra_pushes == 0 {
+            return super::callbuilder::aligned_esp_bytes(on_stack - PASS_ON_MY_FRAME as i32);
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let base = (stack_slots * WORD) as i32;
-            let needs_pad = if extra_pushes & 1 == 0 {
-                base % 16 != 0
-            } else {
-                base % 16 == 0
-            };
-            base + if needs_pad { WORD as i32 } else { 0 }
-        }
+        let base = on_stack * WORD as i32;
+        let needs_pad = if extra_pushes & 1 == 0 {
+            base % 16 != 0
+        } else {
+            base % 16 == 0
+        };
+        base + if needs_pad { WORD as i32 } else { 0 }
     }
 
     fn emit_reserve_abi_call_area(&mut self, extra_pushes: usize, stack_slots: usize) -> i32 {
@@ -3413,26 +3338,14 @@ impl<'a> Assembler386<'a> {
     }
 
     fn emit_abi_call_rax_with_extra_pushes(&mut self, extra_pushes: usize) {
-        let _ = extra_pushes;
-        #[cfg(target_os = "windows")]
-        {
-            let adjust = Self::emit_win64_call_adjust(extra_pushes);
+        let adjust = Self::abi_reserved_call_area_size(extra_pushes, 0);
+        if adjust != 0 {
             rx86::sub_ri(&mut self.mc, rx86::ESP, adjust);
-            dynasm!(self.mc ; .arch x64 ; call rax);
-            self.forget_after_call_or_jmp();
-            rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let adjust = Self::abi_reserved_call_area_size(extra_pushes, 0);
-            if adjust != 0 {
-                rx86::sub_ri(&mut self.mc, rx86::ESP, adjust);
-            }
-            dynasm!(self.mc ; .arch x64 ; call rax);
-            self.forget_after_call_or_jmp();
-            if adjust != 0 {
-                rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
-            }
+        dynasm!(self.mc ; .arch x64 ; call rax);
+        self.forget_after_call_or_jmp();
+        if adjust != 0 {
+            rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
         }
     }
 
@@ -3441,14 +3354,9 @@ impl<'a> Assembler386<'a> {
     }
 
     fn emit_abi_call_rax_aligned(&mut self) {
-        // Body rsp is 0-mod-16 (see `_call_header`), so no alignment
-        // SUB is needed before the inner CALL on either ABI; Win64
-        // still needs the 32-byte shadow space.
-        #[cfg(target_os = "windows")]
-        self.emit_abi_call_rax_with_extra_pushes(0);
-        #[cfg(not(target_os = "windows"))]
-        dynasm!(self.mc ; .arch x64 ; call rax);
-        self.forget_after_call_or_jmp();
+        // Body rsp is already 0 mod 16 (`_call_header`). A register-only
+        // call fits in `PASS_ON_MY_FRAME`, including the Win64 shadow.
+        self.emit_abi_call_rax();
     }
 
     fn emit_abi_call_rax_after_one_push(&mut self) {
@@ -3456,26 +3364,14 @@ impl<'a> Assembler386<'a> {
     }
 
     fn emit_abi_call_reg_with_extra_pushes(&mut self, reg: u8, extra_pushes: usize) {
-        let _ = extra_pushes;
-        #[cfg(target_os = "windows")]
-        {
-            let adjust = Self::emit_win64_call_adjust(extra_pushes);
+        let adjust = Self::abi_reserved_call_area_size(extra_pushes, 0);
+        if adjust != 0 {
             rx86::sub_ri(&mut self.mc, rx86::ESP, adjust);
-            dynasm!(self.mc ; .arch x64 ; call Rq(reg));
-            self.forget_after_call_or_jmp();
-            rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let adjust = Self::abi_reserved_call_area_size(extra_pushes, 0);
-            if adjust != 0 {
-                rx86::sub_ri(&mut self.mc, rx86::ESP, adjust);
-            }
-            dynasm!(self.mc ; .arch x64 ; call Rq(reg));
-            self.forget_after_call_or_jmp();
-            if adjust != 0 {
-                rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
-            }
+        dynasm!(self.mc ; .arch x64 ; call Rq(reg));
+        self.forget_after_call_or_jmp();
+        if adjust != 0 {
+            rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
         }
     }
 
@@ -7339,16 +7235,10 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
                 self.forget_after_call_or_jmp();
             }
-            // `IncreaseStackSlowPath.generate_body`: park the prologue
-            // spill at `[rsp+WORD]` (`_call_header` has no
-            // `PASS_ON_MY_FRAME` scratch; that slot is a callee-save),
-            // store the depth, publish the gcmap captured at the check,
-            // call `build_frame_realloc_slowpath`, then write the spill
-            // back. The helper parks `X86_64_XMM_SCRATCH_REG` across
-            // `realloc_frame`.
+            // `IncreaseStackSlowPath.generate_body`: depth at `[rsp+WORD]`
+            // (the `PASS_ON_MY_FRAME` scratch), publish the gcmap captured
+            // at the check, then call `build_frame_realloc_slowpath`.
             SlowPathKind::IncreaseStack { gcmap } => {
-                let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                rx86::movsd_xs(&mut self.mc, xmm, WORD as i32);
                 rx86::mov_si(&mut self.mc, WORD as i32, 0x00ff_ffff);
                 let imm_ofs = self.mc.offset().0 - 4;
                 self.frame_depth_to_patch.push(imm_ofs);
@@ -7362,7 +7252,6 @@ impl<'a> Assembler386<'a> {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
                 self.forget_after_call_or_jmp();
-                rx86::movsd_sx(&mut self.mc, WORD as i32, xmm);
             }
             SlowPathKind::CondCall {
                 gcmap,
@@ -7416,15 +7305,13 @@ impl<'a> Assembler386<'a> {
                 // `load_scratch` (`MallocCondVarsizeSlowPath`).
                 self.forget_scratch_register();
                 // `MallocCondVarsizeSlowPath` stores itemsize with
-                // `MOV_si(WORD, itemsize)`. `_call_header` keeps a
-                // callee-save at `[rsp+WORD]`, so the callsite reserves
-                // 16 bytes: itemsize at `[rsp]`, base_size at `[rsp+WORD]`.
-                // The varsize trampoline reads them above its return address.
-                // OOM pops those 16 bytes inside the trampoline because it
-                // does not return to this `add rsp, 16`.
-                rx86::sub_ri(&mut self.mc, rx86::ESP, 16);
-                self.store_rsp_i64(0, itemsize);
-                self.store_rsp_i64(WORD as i32, base_size);
+                // `MOV_si(WORD, itemsize)`. pyre also passes `base_size`
+                // at `[rsp+2*WORD]`. Both words sit in the
+                // `PASS_ON_MY_FRAME` scratch; the varsize trampoline reads
+                // them above its return address and OOM does not pop a
+                // callsite reservation.
+                self.store_rsp_i64(WORD as i32, itemsize);
+                self.store_rsp_i64((WORD * 2) as i32, base_size);
                 self.publish_malloc_gcmap(gcmap);
                 rx86::mov_ri(&mut self.mc, rx86::ECX, type_id);
                 debug_assert!(
@@ -7433,7 +7320,6 @@ impl<'a> Assembler386<'a> {
                 );
                 self.mov_gpr_from_loc(rx86::EDX, lengthloc);
                 self.call_malloc_helper(self.malloc_slowpath_varsize);
-                rx86::add_ri(&mut self.mc, rx86::ESP, 16);
                 self.move_malloc_result(result_reg);
             }
         }
@@ -8852,7 +8738,7 @@ impl<'a> Assembler386<'a> {
         if *tlofs_loaded {
             return;
         }
-        rx86::mov_rs(&mut self.mc, rx86::R12, SAVED_THREADLOCAL_OFS + esp_ofs);
+        rx86::mov_rs(&mut self.mc, rx86::R12, THREADLOCAL_OFS as i32 + esp_ofs);
         *tlofs_loaded = true;
     }
 
@@ -9060,12 +8946,12 @@ impl<'a> Assembler386<'a> {
             }
         }
 
-        // `CallBuilder64.prepare_arguments` then `subtract_esp_aligned`:
-        // reserve the outgoing argument area (Win64 shadow included)
-        // aligned to 16 bytes, once. Body rsp is already 0-mod-16, so
-        // SysV with no stack args subtracts nothing.
+        // `CallBuilder64.prepare_arguments` then
+        // `subtract_esp_aligned(on_stack - stack_max)`. `stack_max` is
+        // `PASS_ON_MY_FRAME`, already reserved by `_call_header`. A
+        // non-positive count emits no `sub rsp`.
         let on_stack = super::callbuilder::outgoing_stack_words(stack_slots);
-        let call_area_adjust = self.subtract_esp_aligned(on_stack);
+        let call_area_adjust = self.subtract_esp_aligned(on_stack - PASS_ON_MY_FRAME as i32);
 
         // Pass 1: emit stack-dst args first.  Their sources may be
         // registers the parallel move below will overwrite, but stack
@@ -9670,9 +9556,9 @@ impl<'a> Assembler386<'a> {
         // `simple_call(addr, [argloc, threadlocal_loc])`: the callee's
         // `_call_header` saves its own copy of the thread-local address.
         #[cfg(not(target_os = "windows"))]
-        rx86::mov_rs(&mut self.mc, rx86::ESI, SAVED_THREADLOCAL_OFS);
+        rx86::mov_rs(&mut self.mc, rx86::ESI, THREADLOCAL_OFS as i32);
         #[cfg(target_os = "windows")]
-        rx86::mov_rs(&mut self.mc, rx86::EDX, SAVED_THREADLOCAL_OFS);
+        rx86::mov_rs(&mut self.mc, rx86::EDX, THREADLOCAL_OFS as i32);
         if let Some(addr) = target_addr.immediate {
             rx86::mov_ri(&mut self.mc, rx86::EAX, addr as i64);
             self.emit_abi_call_rax_aligned();
@@ -10618,10 +10504,11 @@ impl<'a> Assembler386<'a> {
             .unwrap_or((8, 8, 0, 0));
         let clear = matches!(op.opcode, OpCode::NewArrayClear) as i64;
         self.emit_load_to_rax(*len_loc);
-        // Six integer args: on Win64 args 4/5 live at [rsp+32]/[rsp+40], so
-        // the call area (shadow + two stack slots) must exist before those
-        // stores. `emit_abi_call_rax` would reserve after the stores and
-        // overwrite them. SysV keeps args 4/5 in registers.
+        // Six integer args. Win64 args 4/5 live at [rsp+32]/[rsp+40].
+        // `on_stack` is 6, which fits in `PASS_ON_MY_FRAME`, so the
+        // reserve subtracts nothing and the stores land in that scratch.
+        // Reserving after the stores would be wrong once `on_stack`
+        // exceeds the scratch. SysV keeps args 4/5 in registers.
         #[cfg(target_os = "windows")]
         let call_area_adjust = self.emit_reserve_abi_call_area(0, 2);
         self.emit_abi_int_arg_from_reg(4, 0);
@@ -11184,7 +11071,9 @@ impl<'a> Assembler386<'a> {
         );
         self.emit_abi_int_arg_from_reg(0, 0);
         rx86::mov_ri(&mut self.mc, rx86::EAX, malloc_ptr);
-        self.emit_abi_call_rax();
+        // Two pushes sit below the scratch, so the outgoing shadow is
+        // not `PASS_ON_MY_FRAME`.
+        self.emit_abi_call_rax_with_extra_pushes(2);
         dynasm!(self.mc ; .arch x64
         ; pop rcx                            // rcx = total_size
         );
@@ -11195,7 +11084,7 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_int_arg_from_imm(1, 0);
         self.emit_abi_int_arg_from_reg(0, 0);
         rx86::mov_ri(&mut self.mc, rx86::EAX, memset_ptr);
-        self.emit_abi_call_rax();
+        self.emit_abi_call_rax_with_extra_pushes(2);
         dynasm!(self.mc ; .arch x64
         ; pop rax                            // rax = ptr
         );

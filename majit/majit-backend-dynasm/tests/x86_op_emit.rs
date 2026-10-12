@@ -2912,9 +2912,10 @@ fn run_bridged(backend: &mut DynasmBackend, token: &JitCellToken) -> (usize, usi
     (seen, tip)
 }
 
-/// `[rsp+8]` is a prologue spill (`_call_header` has no `PASS_ON_MY_FRAME`
-/// scratch). The realloc body parks that word; these callee-saves come
-/// back only when the park is restored before the footer.
+/// `_call_footer` restores the callee-saves `_call_header` spilled.
+/// Win64 reserves 32 bytes before the direct `call`: the prologue writes
+/// `THREADLOCAL_OFS` and `SHADOWSTORE2_OFS` / `SHADOWSTORE3_OFS` into
+/// that shadow.
 fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
     let clt = token.compiled_loop_token().expect("compiled loop token");
     let bytes = majit_backend::jitframe::JitFrame::alloc_size(depth);
@@ -2951,7 +2952,8 @@ fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
     let head_addr = head as usize;
     // LLVM reserves rbx as an asm operand on this target. Save and restore
     // the prologue spills around the call and read them back from memory.
-    // slots: saved rbx, saved [rsp+8] reg, saved r12, got rbx, got [rsp+8], got r12.
+    // slots: saved rbx, saved rsi (Win64) or r12, saved r12, then the
+    // values those registers hold after `_call_footer`.
     let mut slots = [0u64; 6];
     let slots_ptr = slots.as_mut_ptr() as usize;
     unsafe {
@@ -2968,7 +2970,9 @@ fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
             "mov r12, 0x3333333333333333",
             "mov rcx, r13",
             "xor edx, edx",
+            "sub rsp, 32",
             "call r14",
+            "add rsp, 32",
             "mov rax, rbx",
             "mov [r15 + 24], rax",
             "mov rax, rsi",
@@ -3014,11 +3018,11 @@ fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
     assert_eq!(slots[3], 0x1111_1111_1111_1111, "rbx prologue spill");
     #[cfg(target_os = "windows")]
     {
-        assert_eq!(slots[4], 0x2222_2222_2222_2222, "rsi at [rsp+8]");
+        assert_eq!(slots[4], 0x2222_2222_2222_2222, "rsi");
         assert_eq!(slots[5], 0x3333_3333_3333_3333, "r12");
     }
     #[cfg(not(target_os = "windows"))]
-    assert_eq!(slots[4], 0x3333_3333_3333_3333, "r12 at [rsp+8]");
+    assert_eq!(slots[4], 0x3333_3333_3333_3333, "r12");
 }
 
 #[test]
@@ -3071,6 +3075,208 @@ fn bridge_frame_depth_skips_when_deep() {
         "jl is not taken when the entry frame is already deep enough"
     );
     call_entry_check_spills(&token, loop_depth as usize, 7);
+}
+
+/// Enter a finish loop from inline asm and check every callee-saved GPR
+/// `_call_header` / `_call_footer` own. Win64 includes r13 (`SAVED_R13_OFS`).
+/// The 32-byte shadow is inside the `sub rsp, 128` area.
+fn call_finish_preserves_callee_saves(token: &JitCellToken, depth: usize, input: i64) {
+    let clt = token.compiled_loop_token().expect("compiled loop token");
+    let bytes = majit_backend::jitframe::JitFrame::alloc_size(depth);
+    let head = majit_backend::llmodel::take_or_alloc_parked_entry_frame(token, bytes);
+    let info = clt.frame_info.data_ptr();
+    unsafe {
+        majit_backend::jitframe::JitFrame::init(head, info, depth);
+        majit_backend::llmodel::set_int_value(head, 0, -1);
+        majit_backend::llmodel::set_int_value(
+            head,
+            majit_backend_dynasm::arch::JITFRAME_FIXED_SIZE,
+            input as isize,
+        );
+    }
+    struct FreeHead<'a> {
+        token: &'a JitCellToken,
+        head: *mut majit_backend::jitframe::JitFrame,
+    }
+    impl Drop for FreeHead<'_> {
+        fn drop(&mut self) {
+            if self.head.is_null() {
+                return;
+            }
+            majit_backend::llmodel::park_or_free_done_entry_frame(
+                self.token,
+                self.head,
+                std::ptr::null_mut(),
+                false,
+            );
+            self.head = std::ptr::null_mut();
+        }
+    }
+    let _free = FreeHead { token, head };
+    let entry = token.ll_function_addr();
+    let head_addr = head as usize;
+    #[cfg(target_os = "windows")]
+    let mut got = [0u64; 9];
+    #[cfg(not(target_os = "windows"))]
+    let mut got = [0u64; 7];
+    let got_ptr = got.as_mut_ptr() as usize;
+    unsafe {
+        #[cfg(target_os = "windows")]
+        std::arch::asm!(
+            "sub rsp, 128",
+            "mov [rsp + 32], r13",
+            "mov [rsp + 40], r14",
+            "mov [rsp + 48], r15",
+            "mov rax, rbx",
+            "mov [rsp + 64], rax",
+            "mov rax, rsi",
+            "mov [rsp + 72], rax",
+            "mov rax, rdi",
+            "mov [rsp + 80], rax",
+            "mov rax, rbp",
+            "mov [rsp + 88], rax",
+            "mov rax, r12",
+            "mov [rsp + 96], rax",
+            "mov rax, r13",
+            "mov [rsp + 104], rax",
+            "mov rax, r14",
+            "mov [rsp + 112], rax",
+            "mov rax, r15",
+            "mov [rsp + 120], rax",
+            "mov rbx, 0x1111111111111111",
+            "mov rsi, 0x2222222222222222",
+            "mov rdi, 0x3333333333333333",
+            "mov rbp, 0x4444444444444444",
+            "mov r12, 0x5555555555555555",
+            "mov r13, 0x6666666666666666",
+            "mov r14, 0x7777777777777777",
+            "mov r15, 0x8888888888888888",
+            "mov rcx, [rsp + 32]",
+            "xor edx, edx",
+            "mov rax, [rsp + 40]",
+            "call rax",
+            "mov r11, [rsp + 48]",
+            "mov [r11], rbx",
+            "mov [r11 + 8], rsi",
+            "mov [r11 + 16], rdi",
+            "mov [r11 + 24], rbp",
+            "mov [r11 + 32], r12",
+            "mov [r11 + 40], r13",
+            "mov [r11 + 48], r14",
+            "mov [r11 + 56], r15",
+            "mov [r11 + 64], rax",
+            "mov rax, [rsp + 64]",
+            "mov rbx, rax",
+            "mov rax, [rsp + 72]",
+            "mov rsi, rax",
+            "mov rax, [rsp + 80]",
+            "mov rdi, rax",
+            "mov rax, [rsp + 88]",
+            "mov rbp, rax",
+            "mov rax, [rsp + 96]",
+            "mov r12, rax",
+            "mov rax, [rsp + 104]",
+            "mov r13, rax",
+            "mov rax, [rsp + 112]",
+            "mov r14, rax",
+            "mov rax, [rsp + 120]",
+            "mov r15, rax",
+            "add rsp, 128",
+            in("r13") head_addr,
+            in("r14") entry,
+            in("r15") got_ptr,
+            clobber_abi("win64"),
+        );
+        #[cfg(not(target_os = "windows"))]
+        std::arch::asm!(
+            "sub rsp, 128",
+            "mov [rsp + 32], r13",
+            "mov [rsp + 40], r14",
+            "mov [rsp + 48], r15",
+            "mov rax, rbx",
+            "mov [rsp + 64], rax",
+            "mov rax, rbp",
+            "mov [rsp + 72], rax",
+            "mov rax, r12",
+            "mov [rsp + 80], rax",
+            "mov rax, r13",
+            "mov [rsp + 88], rax",
+            "mov rax, r14",
+            "mov [rsp + 96], rax",
+            "mov rax, r15",
+            "mov [rsp + 104], rax",
+            "mov rbx, 0x1111111111111111",
+            "mov rbp, 0x4444444444444444",
+            "mov r12, 0x5555555555555555",
+            "mov r13, 0x6666666666666666",
+            "mov r14, 0x7777777777777777",
+            "mov r15, 0x8888888888888888",
+            "mov rdi, [rsp + 32]",
+            "xor esi, esi",
+            "mov rax, [rsp + 40]",
+            "call rax",
+            "mov r11, [rsp + 48]",
+            "mov [r11], rbx",
+            "mov [r11 + 8], rbp",
+            "mov [r11 + 16], r12",
+            "mov [r11 + 24], r13",
+            "mov [r11 + 32], r14",
+            "mov [r11 + 40], r15",
+            "mov [r11 + 48], rax",
+            "mov rax, [rsp + 64]",
+            "mov rbx, rax",
+            "mov rax, [rsp + 72]",
+            "mov rbp, rax",
+            "mov rax, [rsp + 80]",
+            "mov r12, rax",
+            "mov rax, [rsp + 88]",
+            "mov r13, rax",
+            "mov rax, [rsp + 96]",
+            "mov r14, rax",
+            "mov rax, [rsp + 104]",
+            "mov r15, rax",
+            "add rsp, 128",
+            in("r13") head_addr,
+            in("r14") entry,
+            in("r15") got_ptr,
+            clobber_abi("sysv64"),
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(got[0], 0x1111_1111_1111_1111, "rbx");
+        assert_eq!(got[1], 0x2222_2222_2222_2222, "rsi");
+        assert_eq!(got[2], 0x3333_3333_3333_3333, "rdi");
+        assert_eq!(got[3], 0x4444_4444_4444_4444, "rbp");
+        assert_eq!(got[4], 0x5555_5555_5555_5555, "r12");
+        assert_eq!(got[5], 0x6666_6666_6666_6666, "r13");
+        assert_eq!(got[6], 0x7777_7777_7777_7777, "r14");
+        assert_eq!(got[7], 0x8888_8888_8888_8888, "r15");
+        assert_eq!(got[8] as usize, head_addr, "footer returns the jitframe");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert_eq!(got[0], 0x1111_1111_1111_1111, "rbx");
+        assert_eq!(got[1], 0x4444_4444_4444_4444, "rbp");
+        assert_eq!(got[2], 0x5555_5555_5555_5555, "r12");
+        assert_eq!(got[3], 0x6666_6666_6666_6666, "r13");
+        assert_eq!(got[4], 0x7777_7777_7777_7777, "r14");
+        assert_eq!(got[5], 0x8888_8888_8888_8888, "r15");
+        assert_eq!(got[6] as usize, head_addr, "footer returns the jitframe");
+    }
+    assert_eq!(
+        majit_backend::llmodel::done_int_slot0(head),
+        input,
+        "finish stores the result at jf_frame[0]"
+    );
+}
+
+#[test]
+fn finish_loop_preserves_callee_saves() {
+    let mut backend = fresh_backend();
+    let token = compile_input_finish(&mut backend);
+    let (depth, _) = frame_info_words(&token);
+    call_finish_preserves_callee_saves(&token, depth as usize, 41);
 }
 
 fn compile_input_finish(backend: &mut DynasmBackend) -> JitCellToken {
@@ -3860,6 +4066,29 @@ aligned_int_callee!(
     a7: i64 = 8,
     a8: i64 = 9
 );
+aligned_int_callee!(
+    call_align_19,
+    call_align_19_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4,
+    a4: i64 = 5,
+    a5: i64 = 6,
+    a6: i64 = 7,
+    a7: i64 = 8,
+    a8: i64 = 9,
+    a9: i64 = 10,
+    a10: i64 = 11,
+    a11: i64 = 12,
+    a12: i64 = 13,
+    a13: i64 = 14,
+    a14: i64 = 15,
+    a15: i64 = 16,
+    a16: i64 = 17,
+    a17: i64 = 18,
+    a18: i64 = 19
+);
 
 #[unsafe(naked)]
 extern "C" fn call_align_float() {
@@ -3914,6 +4143,10 @@ fn call_subtract_esp_aligned_passes_args() {
     run_aligned_call(call_align_7 as usize as i64, &args, types);
     let (args, types) = int_args(9);
     run_aligned_call(call_align_9 as usize as i64, &args, types);
+    // 19 ints: SysV puts 13 words on the stack, Win64's `on_stack` is 19.
+    // Both exceed `PASS_ON_MY_FRAME`, so the call subtracts.
+    let (args, types) = int_args(19);
+    run_aligned_call(call_align_19 as usize as i64, &args, types);
     run_aligned_call(
         call_align_float as usize as i64,
         &[rb(OpRef::const_float(1.5)), rb(OpRef::const_float(2.25))],

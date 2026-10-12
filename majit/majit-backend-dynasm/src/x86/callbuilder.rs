@@ -18,9 +18,11 @@ pub fn align_stack_words(words: i32) -> i32 {
 }
 
 /// `CallBuilder64.prepare_arguments` `on_stack` before
-/// `subtract_esp_aligned`. Win64 starts at 4 shadow words; SysV at 0.
-/// `CallBuilderX86.stack_max` is `PASS_ON_MY_FRAME`; this frame has no
-/// that scratch, so the count is the outgoing area itself.
+/// `subtract_esp_aligned(on_stack - stack_max)`. Win64 starts at 4 shadow
+/// words; SysV at 0. `CallBuilderX86.stack_max` is `PASS_ON_MY_FRAME`,
+/// already reserved by `_call_header`. Callers subtract that scratch from
+/// this count; they do not pass the raw outgoing area to
+/// `subtract_esp_aligned`.
 pub fn outgoing_stack_words(stack_slots: usize) -> i32 {
     #[cfg(target_os = "windows")]
     {
@@ -33,7 +35,8 @@ pub fn outgoing_stack_words(stack_slots: usize) -> i32 {
 }
 
 /// Bytes `CallBuilderX86.subtract_esp_aligned` subtracts for `count`
-/// outgoing stack words. `count <= 0` is a no-op.
+/// extra stack words (`on_stack - PASS_ON_MY_FRAME`). `count <= 0` is a
+/// no-op: the outgoing area fits in the scratch.
 pub fn aligned_esp_bytes(count: i32) -> i32 {
     if count > 0 {
         align_stack_words(count) * WORD as i32
