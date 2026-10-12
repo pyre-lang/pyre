@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=15
-# macOS reads 8.8-9.1x on dynasm.
+# macOS reads 8.8-12.0x on dynasm.
 # Regression oracle: a callee entered through a CALL_ASSEMBLER fold reads a
 # local out of a frame the trace is being recorded for, forcing it.  The
 # recording stops there and execution goes on from behind the call, with the

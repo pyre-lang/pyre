@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=10
-# macOS reads 5.0x on dynasm.
+# pyre-check: max-pypy-ratio=16
+# macOS reads 4.0-8.1x on dynasm; the ceiling is twice the slowest.
 # Regression oracle: a callee that carries its own loop is entered from an
 # inlined call, and its loop runs as a call into its own compiled code.  The
 # frames between the code a force runs in and the loop that was traced are
