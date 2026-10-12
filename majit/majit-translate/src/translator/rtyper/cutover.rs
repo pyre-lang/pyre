@@ -448,9 +448,13 @@ pub(crate) fn dual_gate_check_with_registry(
 /// (`rpbc.py`) then `getcallable`s the calltable row
 /// (`lltype.getfunctionptr` walks `graph.getargs()`). Replacing
 /// `FunctionDesc.cache` with a never-flowed lift makes those getargs
-/// unbound. Phase B therefore keeps the original cache graph
-/// (`replace_cache = false`) — the one `FunctionDesc.cachedgraph` /
-/// `bookkeeper.getdesc` identity upstream keeps in `translator.graphs`.
+/// unbound. Phase B does not call `unpoison_failed_subject_callees`.
+/// A failing graph's blocks stay as `specialize_block` left them, the
+/// graph is Skipped, and nothing is restored (upstream
+/// `specialize_more_blocks` has no recovery). The annotated cache
+/// graph stays in place (`FunctionDesc.cachedgraph` /
+/// `bookkeeper.getdesc`). `replace_cache = false` is that same
+/// cache-keeping choice for a caller that does unpoison.
 #[derive(Default)]
 struct SubjectSessionSnapshot {
     fixed_graphs: HashSet<crate::flowspace::model::GraphKey>,
@@ -5513,7 +5517,7 @@ fn run_two_phase_prepass_inner(
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
     // progress survives even if this call is cut short.
-    run_phase_b_rtype_isolated(call_registry, function_graphs, determinism_trace, &paths);
+    run_phase_b_rtype_isolated(call_registry, determinism_trace, &paths);
 }
 
 /// Phase B: rtype every annotated block in one whole-program pass, tolerant of
@@ -5521,12 +5525,14 @@ fn run_two_phase_prepass_inner(
 /// single-pass-fatal, rtyper.py). A block's `specialize_block` failure
 /// records its owning graph into the cache's `rtype_skipped` set; that graph's
 /// remaining blocks are excluded from later rounds (the publish then Skips it to
-/// the legacy walker) and its half-fixed callees are repaired via
+/// the legacy walker). The failing graph's blocks stay as `specialize_block`
+/// left them, the graph is Skipped, and nothing is restored (upstream
+/// `specialize_more_blocks` has no recovery). A callee whose
+/// `specialize_block` returned `Ok` stays. This path does not call
 /// `unpoison_failed_subject_callees`. The skip set is written into the cache
 /// incrementally so partial progress survives a cut-short call.
 fn run_phase_b_rtype_isolated(
     call_registry: &CallRegistry,
-    lift_sources: &crate::codewriter::call::GraphStore,
     determinism_trace: bool,
     paths: &[&crate::parse::CallPath],
 ) {
@@ -5705,7 +5711,6 @@ fn run_phase_b_rtype_isolated(
             {
                 continue;
             }
-            let session_at_entry = SubjectSessionSnapshot::capture_fixed_only(call_registry);
             if let (Some(g), Some(trace_paths), Some(traced)) =
                 (&gopt, &phase_b_trace_paths, &mut phase_b_traced)
             {
@@ -5724,8 +5729,13 @@ fn run_phase_b_rtype_isolated(
                 rtyper.specialize_block(&block)
             }));
             match res {
-                Ok(Ok(())) => rtyper.mark_already_seen(&block),
+                Ok(Ok(())) => {
+                    rtyper.mark_already_seen(&block);
+                }
                 ref other @ (Ok(Err(_)) | Err(_)) => {
+                    // Blocks stay as `specialize_block` left them. Upstream
+                    // `specialize_more_blocks` has no recovery; the graph is
+                    // recorded in `rtype_skipped` below.
                     if rtyper_verbose_enabled() {
                         let reason = match other {
                             Ok(Err(e)) => format!("rtype Err: {e:?}"),
@@ -5824,16 +5834,6 @@ fn run_phase_b_rtype_isolated(
                             rtyper.mark_already_seen(&block);
                         }
                     }
-                    // Repair half-fixed callees; contained so an unpoison panic
-                    // can't escape Phase B.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        unpoison_failed_subject_callees(
-                            call_registry,
-                            &session_at_entry,
-                            lift_sources,
-                            false,
-                        );
-                    }));
                     break;
                 }
             }
@@ -10440,6 +10440,81 @@ mod tests {
             ConcreteType::Signed,
             "Int-typed inputarg must specialize to Signed via SomeInteger → IntegerRepr"
         );
+    }
+
+    /// `Vec::set_len` on a one-word header is a `raw_store` of `VEC_LEN_WORD`
+    /// (`ll_newlist` / `_ll_list_resize_really` assign `l.length = length`).
+    /// The store's result annotation is `s_None`, so `Entry.specialize_call`
+    /// must hand `genop` that `Void` lltype rather than a missing result.
+    #[test]
+    fn rustvec_length_word_store_rtypes_for_every_item_kind() {
+        let _lock = anchor_lock();
+        use crate::model::{CallTarget, OpKind, SpaceOperation};
+        use majit_ir::rvec::{VEC_LEN_WORD, VecItemKind, VecOp, vec_helper_path, vec_word_offset};
+
+        for kind in VecItemKind::ALL {
+            let mut graph = LegacyGraph::new(format!("set_len_word_{kind:?}"));
+            let entry = graph.startblock;
+            let length = graph.alloc_value_var();
+            graph.block_mut(entry).inputargs.push(length.clone());
+            setbinding(&length, ValueType::Unsigned);
+
+            let hint_path = vec_helper_path(VecOp::NewHint, kind);
+            let header = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: hint_path.split("::").map(str::to_string).collect(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![length.clone()]),
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .expect("header");
+            let word = crate::layout::target_word_size();
+            let offset = graph
+                .push_op_var(
+                    entry,
+                    OpKind::ConstInt(vec_word_offset(VEC_LEN_WORD, word) as i64),
+                    true,
+                )
+                .expect("offset");
+            graph.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawStore {
+                    base: header.clone(),
+                    offset,
+                    value: length.clone(),
+                    item_ty: ValueType::Int,
+                    itemsize: word,
+                    is_item_signed: false,
+                },
+            });
+            let free_path = vec_helper_path(VecOp::Free, kind);
+            graph.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: free_path.split("::").map(str::to_string).collect(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![header.clone()]),
+                    result_ty: ValueType::Void,
+                },
+            });
+            graph.set_return(entry, Some(header.clone()));
+
+            let (value_to_var, _) = specialize_legacy_graph(&graph)
+                .unwrap_or_else(|err| panic!("length-word store for {kind:?} must rtype: {err:?}"));
+            assert_eq!(
+                kind_of_in(&value_to_var, &header),
+                ConcreteType::Signed,
+                "{kind:?} header is an int-kind pointer"
+            );
+        }
     }
 
     #[test]
