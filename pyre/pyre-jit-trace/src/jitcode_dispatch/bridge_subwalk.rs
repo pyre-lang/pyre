@@ -207,7 +207,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // `trace_and_compile_from_bridge` just published; clearing it first makes
     // an exception-guard bridge look exception-free and record the
     // no-exception fallthrough (`Finish` of the NULL call result).
-    seed_standing_exception_for_walk(sym, trace_ctx, jitcode_code, position);
+    seed_standing_exception_for_walk(sym, trace_ctx);
     seed_execution_context_for_walk(sym, trace_ctx);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py)

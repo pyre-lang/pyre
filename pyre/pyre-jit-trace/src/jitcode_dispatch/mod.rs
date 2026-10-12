@@ -6339,44 +6339,25 @@ fn dispatch_switch_id<Sym: WalkSym>(
 /// (`full_body_walk_trace`) is the caller, dispatching each JitCode
 /// opcode through this entry as it walks the body.
 ///
-/// Bridge exception seeding follows `pyjitpl.py`: a
-/// `ResumeGuardExcDescr`/`ResumeGuardCopiedExcDescr` source guard carries
-/// exception state into bridge tracing. A non-exception-guard bridge whose
-/// entry path reads `last_exc_value` before the next `catch_exception/L`
-/// (the `except E as name:` cleanup tail) seeds from the frame's current
-/// exception (`ExecutionContext.sys_exc_value`) instead — the same slot the
-/// original trace already reads. Operand-stack values are never scanned to
-/// infer a standing exception.
-fn seed_standing_exception_for_walk<Sym: WalkSym>(
-    sym: &mut Sym,
-    trace_ctx: &mut TraceCtx,
-    code: &[u8],
-    position: usize,
-) {
-    if trace_ctx.is_bridge_trace
-        && !trace_ctx.bridge_source_is_exception_guard()
-        && !reads_last_exc_before_next_catch(code, position)
-    {
+/// Bridge exception seeding follows `pyjitpl.py`: every trace runs on a
+/// fresh `MetaInterp`, whose `last_exc_value` is null until an op of the
+/// trace raises. Only `prepare_resume_from_failure` installs one before the
+/// first op, and only for a `ResumeGuardExcDescr` /
+/// `ResumeGuardCopiedExcDescr` source guard, from that failure's
+/// `cpu.grab_exc_value(deadframe)`. A root trace and a non-exception-guard
+/// bridge are therefore not seeded: neither a residual helper's leftover in
+/// `BH_LAST_EXC_VALUE` nor the exception an enclosing `except` block is
+/// handling (`ExecutionContext.sys_exc_value`) is this trace's exception.
+fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut TraceCtx) {
+    if !(trace_ctx.is_bridge_trace && trace_ctx.bridge_source_is_exception_guard()) {
         return;
     }
 
-    // `_prepare_exception_resumption` (pyjitpl.py) reads the
-    // exception off THIS failure's deadframe (`cpu.grab_exc_value`), and every
-    // bridge compile runs on a fresh `MetaInterp`, so a previous compile's
-    // `last_exc_value` can never leak into a new bridge trace.  Pyre's sym
-    // persists across walks; the routed publish (`BH_LAST_EXC_VALUE`, set from
-    // the same grab) is the fresh-failure signal and must OVERWRITE any
-    // exception state a previous walk left on the sym.  A preseeded sym is
-    // kept only when no fresh signal exists — the multi-frame carrier walk
-    // re-seeds per frame after the first frame drained the cell.
-    // For the walks that reach here this cell is the delivery path for
-    // `_prepare_exception_resumption`: `call_jit.rs` publishes
-    // `cpu.grab_exc_value`'s result before bridge tracing starts and zeroes
-    // it when the guard carried no exception.  On an exception-guard
-    // bridge one of the two arms below always returns, so a pre-seed
-    // placed on the sym in `setup_bridge_sym` could only rewrite the
-    // pointer this read applies anyway.  The multi-frame carrier walk
-    // seeds the same cell in `drive_bridge_carrier_walk`.
+    // `call_jit.rs` publishes the grab in `BH_LAST_EXC_VALUE` before bridge
+    // tracing starts and zeroes it when the guard carried no exception. The
+    // sym persists across walks, so the publish overwrites whatever a
+    // previous walk left on it. The multi-frame carrier walk seeds the same
+    // cell in `drive_bridge_carrier_walk`.
     let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
     if bh_exc != 0 {
         let exc = bh_exc as pyre_object::PyObjectRef;
@@ -6391,49 +6372,23 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(
         }
     }
 
-    if trace_ctx.is_bridge_trace && trace_ctx.bridge_source_is_exception_guard() {
-        // The carrier already copied this failure's grab onto the sym.
-        // A residual between that copy and this seed clears the cell, so
-        // an empty cell is not "the deadframe published nothing".
-        if trace_ctx.bridge_grab_seeded() && !sym.last_exc_value().is_null() {
-            return;
-        }
-        // Null arm (`pyjitpl.py:3152-3154`): the deadframe published NO
-        // exception, and for an exception-guard bridge that publish is the
-        // sole authority — `clear_exception()` on the fresh MetaInterp.
-        // Keeping a preseeded sym here would walk the exception-flavor
-        // continuation for a no-exception failure: a loop whose exception
-        // guard was recorded through a raising iteration then compiles the
-        // HANDLER as its no-exception bridge, and every non-raising
-        // iteration runs the handler body.
-        sym.set_current_exc_value(pyre_object::PY_NULL);
-        sym.set_current_exc_box(OpRef::NONE);
-        sym.set_last_exc_value(pyre_object::PY_NULL);
-        sym.set_last_exc_box(OpRef::NONE);
-        sym.set_class_of_last_exc_is_const(false);
+    // The carrier already copied this failure's grab onto the sym. A
+    // residual between that copy and this seed clears the cell, so an empty
+    // cell is not "the deadframe published nothing".
+    if trace_ctx.bridge_grab_seeded() && !sym.last_exc_value().is_null() {
         return;
     }
-
-    if !sym.last_exc_box().is_none() {
-        return;
-    }
-
-    let current = pyre_interpreter::eval::get_current_exception();
-    if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
-        let exc_box = standing_exc_box_from_current(sym, trace_ctx, current);
-        sym.set_current_exc_value(current);
-        sym.set_current_exc_box(exc_box);
-        sym.set_last_exc_value(current);
-        sym.set_last_exc_box(exc_box);
-        // `execute_ll_raised`: the class is a Const only after
-        // GUARD_EXCEPTION or GUARD_CLASS. A live `GetfieldGcR` of
-        // `sys_exc_value` has no such guard, so the flag stays false and
-        // `handle_possible_exception` keeps the guard op as `last_exc_box`
-        // instead of a `ConstPtr` of the recording-time object.
-        // `pin_nonconst_standing_exception_class` records the GUARD_CLASS
-        // (`opimpl_raise`) once the walk can capture its resume snapshot.
-        sym.set_class_of_last_exc_is_const(exc_box.is_constant());
-    }
+    // Null grab (`prepare_resume_from_failure`): `clear_exception()` on the
+    // fresh MetaInterp. Keeping a preseeded sym here would walk the
+    // exception-flavor continuation for a no-exception failure: a loop whose
+    // exception guard was recorded through a raising iteration then compiles
+    // the HANDLER as its no-exception bridge, and every non-raising
+    // iteration runs the handler body.
+    sym.set_current_exc_value(pyre_object::PY_NULL);
+    sym.set_current_exc_box(OpRef::NONE);
+    sym.set_last_exc_value(pyre_object::PY_NULL);
+    sym.set_last_exc_box(OpRef::NONE);
+    sym.set_class_of_last_exc_is_const(false);
 }
 
 /// `opimpl_raise` / `handle_possible_exception`: a seeded exception whose
@@ -6477,28 +6432,6 @@ pub(crate) fn pin_nonconst_standing_exception_class<Sym: WalkSym>(
     ctx.trace_ctx.heap_cache_mut().class_now_known(exc);
     ctx.fbw_mode.class_of_last_exc_is_const = true;
     Ok(())
-}
-
-/// Box for a current-exception seed: a live `GetfieldGcR` of
-/// `ExecutionContext.sys_exc_value` on a bridge that has the portal EC red,
-/// otherwise a const-ref of the recording-time pointer.
-fn standing_exc_box_from_current<Sym: WalkSym>(
-    sym: &Sym,
-    trace_ctx: &mut TraceCtx,
-    current: pyre_object::PyObjectRef,
-) -> OpRef {
-    let ec = sym.execution_context();
-    if trace_ctx.is_bridge_trace && !ec.is_none() {
-        let exc_box = trace_ctx.record_op_with_descr(
-            OpCode::GetfieldGcR,
-            &[ec],
-            crate::descr::ec_sys_exc_value_descr(),
-        );
-        trace_ctx.set_opref_concrete(exc_box, Value::Ref(majit_ir::GcRef(current as usize)));
-        exc_box
-    } else {
-        trace_ctx.const_ref(current as i64)
-    }
 }
 
 /// Resolve the top-level walk's live frame code when the promoted `pycode`
