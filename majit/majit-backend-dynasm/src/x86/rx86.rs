@@ -1287,6 +1287,16 @@ pub(crate) fn movdq_rx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0x66, &[0x0F, 0x7E], src, dst);
 }
 
+/// `MOVD32_xr` — `movd xmm, r32`. `rex_nw`, unlike `MOVDQ_xr`.
+pub(crate) fn movd32_xr(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x6E], dst, src);
+}
+
+/// `MOVD32_rx` — `movd r32, xmm`. The ModRM reg field is the xmm.
+pub(crate) fn movd32_rx(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x7E], src, dst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1741,6 +1751,12 @@ mod tests {
         let mut d = Assembler::new(0);
         dynasm!(d ; .arch x64 ; movq rax, xmm1 ; movq r8, xmm1 ; movq rax, xmm9 ; movq r8, xmm9);
         assert_same(&quad_rx(movdq_rx), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; movd xmm1, eax ; movd xmm1, r8d ; movd xmm9, eax ; movd xmm9, r8d);
+        assert_same(&quad(movd32_xr), &finish(d));
+        let mut d = Assembler::new(0);
+        dynasm!(d ; .arch x64 ; movd eax, xmm1 ; movd r8d, xmm1 ; movd eax, xmm9 ; movd r8d, xmm9);
+        assert_same(&quad_rx(movd32_rx), &finish(d));
     }
 
     #[test]

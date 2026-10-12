@@ -2863,7 +2863,9 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// Emit: TEST loc, loc (for guard_true/guard_false)
+    /// `test_location`: `TEST` a register; `CMP [mem], imm0` for a frame
+    /// location. Upstream rejects `ImmedLoc`; a constant is staged through
+    /// the scratch register so the following branch does not read stale flags.
     fn emit_test_loc(&mut self, loc: &Loc) {
         match loc {
             Loc::Reg(r) => {
@@ -4777,6 +4779,25 @@ impl<'a> Assembler386<'a> {
                     rx86::cvttsd2si_rx(&mut self.mc, dst.value, src.value);
                 }
             }
+            // `genop_cast_float_to_singlefloat`: CVTSD2SS into the xmm temp,
+            // then MOVD32_rx into the GPR. The f32 bits occupy the low 32.
+            OpCode::CastFloatToSinglefloat => {
+                if let (Some(Loc::Reg(src)), Some(Loc::Reg(tmp)), Some(Loc::Reg(dst))) =
+                    (arglocs.first(), arglocs.get(1), result_loc)
+                {
+                    rx86::cvtsd2ss_xx(&mut self.mc, tmp.value, src.value);
+                    self.forget_if_scratch_written(dst.value);
+                    rx86::movd32_rx(&mut self.mc, dst.value, tmp.value);
+                }
+            }
+            // `genop_cast_singlefloat_to_float`: MOVD32_xr, then CVTSS2SD
+            // of the result into itself.
+            OpCode::CastSinglefloatToFloat => {
+                if let (Some(Loc::Reg(src)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    rx86::movd32_xr(&mut self.mc, dst.value, src.value);
+                    rx86::cvtss2sd_xx(&mut self.mc, dst.value, dst.value);
+                }
+            }
             // ── Same-as / identity ──
             OpCode::SameAsI
             | OpCode::SameAsR
@@ -5167,20 +5188,9 @@ impl<'a> Assembler386<'a> {
 
                     // Dynasm's `*N` operand is a compile-time literal, so the
                     // runtime factor is dispatched to four parallel emitters.
-                    // Each inner `emit` closure receives the ready-to-use
-                    // (base, ofs, scale, disp) triple as explicit dynasm
-                    // syntax. `factor == 1` drops the `*1` token because
-                    // dynasm emits a tighter encoding without it.
-                    // Immediate stores stage the value through
-                    // `X86_64_SCRATCH_REG` (r11).  `r0`/rax is in the GPR
-                    // allocation pool (x86/regalloc.rs), so using it as
-                    // the scratch here would silently clobber `base.value`
-                    // or `ofs_reg.value` whenever regalloc assigned them
-                    // to EAX.  Upstream `save_into_mem` emits `MOV [mem],
-                    // imm` directly (assembler.py:1671); dynasm-rs does
-                    // not accept an immediate operand in the scaled-index
-                    // `mov` template, so we stage through the dedicated
-                    // non-allocatable scratch register instead.
+                    // `save_into_mem` emits `MOV8`/`MOV16`/`MOV32`/`MOV`
+                    // (`MOV_ai`) when the constant fits that width, and
+                    // stages through `X86_64_SCRATCH_REG` otherwise.
                     macro_rules! emit_store_scaled {
                         ($shift:expr) => {{
                             let addr = (
@@ -5214,14 +5224,7 @@ impl<'a> Assembler386<'a> {
                                     rx86::movss_ax(&mut self.mc, addr, xmm);
                                 }
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                    self.load_scratch(i.value);
-                                    match size {
-                                        1 => rx86::mov8_ar(&mut self.mc, addr, scratch),
-                                        2 => rx86::mov16_ar(&mut self.mc, addr, scratch),
-                                        4 => rx86::mov32_ar(&mut self.mc, addr, scratch),
-                                        _ => rx86::mov_ar(&mut self.mc, addr, scratch),
-                                    }
+                                    self.emit_indexed_imm_store(addr, i.value, size);
                                 }
                                 other => panic!(
                                     "emit_store_scaled: unhandled value location {other:?} — no store \
@@ -5244,14 +5247,7 @@ impl<'a> Assembler386<'a> {
                                     _ => rx86::mov_ar(&mut self.mc, addr, val.value),
                                 },
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                    self.load_scratch(i.value);
-                                    match size {
-                                        1 => rx86::mov8_ar(&mut self.mc, addr, scratch),
-                                        2 => rx86::mov16_ar(&mut self.mc, addr, scratch),
-                                        4 => rx86::mov32_ar(&mut self.mc, addr, scratch),
-                                        _ => rx86::mov_ar(&mut self.mc, addr, scratch),
-                                    }
+                                    self.emit_indexed_imm_store(addr, i.value, size);
                                 }
                                 other => panic!(
                                     "emit_store_unscaled: unhandled value location {other:?} — no store \
@@ -8637,6 +8633,37 @@ impl<'a> Assembler386<'a> {
         }
     }
 
+    /// `save_into_mem` for an indexed address: `MOV8_ai` / `MOV16_ai` /
+    /// `MOV32_ai` / `MOV_ai` when the constant fits that store's immediate
+    /// (imm32, sign-extended, for an 8-byte store). Otherwise
+    /// `_load_scratch` and `MOV*_ar`.
+    fn emit_indexed_imm_store(&mut self, addr: (i16, u8, u8, i32), val: i64, size: usize) {
+        let val_fits_imm32 = (val as i32) as i64 == val;
+        let fits = match size {
+            1 => (val & !0xFF) == 0 || (val | 0xFF) == -1,
+            2 => (val & !0xFFFF) == 0 || (val | 0xFFFF) == -1,
+            4 => (val & !0xFFFF_FFFFi64) == 0 || (val | 0xFFFF_FFFFi64) == -1,
+            _ => val_fits_imm32,
+        };
+        if fits {
+            match size {
+                1 => rx86::mov8_ai(&mut self.mc, addr, val as i32),
+                2 => rx86::mov16_ai(&mut self.mc, addr, val as i32),
+                4 => rx86::mov32_ai(&mut self.mc, addr, val as i32),
+                _ => rx86::mov_ai(&mut self.mc, addr, val as i32),
+            }
+            return;
+        }
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        self.load_scratch(val);
+        match size {
+            1 => rx86::mov8_ar(&mut self.mc, addr, scratch),
+            2 => rx86::mov16_ar(&mut self.mc, addr, scratch),
+            4 => rx86::mov32_ar(&mut self.mc, addr, scratch),
+            _ => rx86::mov_ar(&mut self.mc, addr, scratch),
+        }
+    }
+
     /// Sized direct memory-immediate store: `mov SIZE [base + ofs(_reg)], imm`.
     fn emit_gcstore_imm_sized(
         &mut self,
@@ -10644,32 +10671,6 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64
                     ; andpd xmm0, xmm1
 
-        );
-        self.store_d0_to_result(op.pos().get());
-    }
-
-    /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
-    #[allow(dead_code)]
-    fn genop_cast_float_to_singlefloat(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0).to_opref());
-        dynasm!(self.mc ; .arch x64
-        ; cvtsd2ss xmm0, xmm0
-        );
-        dynasm!(self.mc ; .arch x64
-            ; movd eax, xmm0
-        );
-        self.store_rax_to_result(op.pos().get());
-    }
-
-    /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
-    #[allow(dead_code)]
-    fn genop_cast_singlefloat_to_float(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        dynasm!(self.mc ; .arch x64
-        ; movd xmm0, eax
-        );
-        dynasm!(self.mc ; .arch x64
-            ; cvtss2sd xmm0, xmm0
         );
         self.store_d0_to_result(op.pos().get());
     }

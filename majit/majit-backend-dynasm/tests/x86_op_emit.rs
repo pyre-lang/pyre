@@ -7,7 +7,9 @@
 //! `_build_failure_recovery`, `malloc_cond`,
 //! `malloc_cond_varsize_frame`, `malloc_cond_varsize`,
 //! `_binaryop_or_lea`, `flush_cc`, `addr_add_const`, `genop_finish`,
-//! `closing_jump`.
+//! `closing_jump`, `genop_discard_gc_store_indexed` / `save_into_mem`,
+//! `test_location`, `AddressLoc`, `genop_cast_float_to_singlefloat`,
+//! `genop_cast_singlefloat_to_float`.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -4402,4 +4404,279 @@ fn jump_to_another_loop_target_token() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     // Keep the target buffer mapped across the jump.
     drop(target);
+}
+
+fn read_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len) };
+    out
+}
+
+fn read_i64_unaligned(ptr: *const u8) -> i64 {
+    i64::from_le_bytes(read_bytes(ptr, 8).try_into().unwrap())
+}
+
+/// `save_into_mem`: constants 0 and -1 fit every width (`MOV*_ai`);
+/// `0x7fff_ffff` fits 4 and 8; `0x1_0000_0000` fits none and is staged
+/// through the scratch register. The index is an input, not a constant.
+#[test]
+fn gc_store_indexed_immediate_values_round_trip_memory() {
+    let values = [0i64, -1, 0x7fff_ffff, 0x1_0000_0000];
+    let sizes = [1i64, 2, 4, 8];
+    let factors = [1i64, 8];
+    let mut slots = Vec::new();
+    let mut slot = 0i64;
+    for &value in &values {
+        for &size in &sizes {
+            for &factor in &factors {
+                slots.push((slot * 16, factor, size, value));
+                slot += 1;
+            }
+        }
+    }
+    let bytes = (slot as usize) * 16 + 16;
+    let mut storage = vec![0xA5u8; bytes];
+    let base_ptr = storage.as_mut_ptr();
+
+    let mut backend = fresh_backend();
+    let base = OpRef::input_arg_ref(0);
+    let index = OpRef::input_arg_int(1);
+    let mut ops = Vec::new();
+    for (n, &(static_ofs, factor, size, value)) in slots.iter().enumerate() {
+        ops.push(op_at(
+            OpCode::GcStoreIndexed,
+            &[
+                base,
+                index,
+                OpRef::const_int(value),
+                OpRef::const_int(factor),
+                OpRef::const_int(static_ofs),
+                OpRef::const_int(size),
+            ],
+            OpRef::void_op(n as u32 + 1),
+        ));
+    }
+    ops.push(finish_int(index, slots.len() as u32 + 1));
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Ref(GcRef(base_ptr as usize)), Value::Int(1)],
+    );
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 1);
+
+    for &(static_ofs, factor, size, value) in &slots {
+        let at = unsafe { base_ptr.add((static_ofs + factor) as usize) };
+        let size = size as usize;
+        assert_eq!(
+            unsafe { *at.sub(1) },
+            0xA5,
+            "byte before value {value:#x} size {size} factor {factor}"
+        );
+        assert_eq!(
+            read_bytes(at, size),
+            &value.to_le_bytes()[..size],
+            "value {value:#x} size {size} factor {factor} ofs {static_ofs}"
+        );
+        assert_eq!(
+            unsafe { *at.add(size) },
+            0xA5,
+            "byte after value {value:#x} size {size} factor {factor}"
+        );
+    }
+}
+
+extern "C" fn spilled_guard_nop() {}
+
+/// `test_location` on a frame slot: `CMP [rbp+disp], 0`.
+///
+/// The first results land in callee-saved registers, which a
+/// non-collecting call leaves alone. `GUARDED` is past that pool, so
+/// `before_call` spills it once every callee-saved register is live.
+fn spilled_guard_trace(opcode: OpCode, input: i64) -> (bool, i64, Vec<u8>) {
+    const LIVE: u32 = 13;
+    const GUARDED: u32 = 7;
+    let mut backend = fresh_backend();
+    let base = OpRef::input_arg_int(0);
+    let mut ops = Vec::new();
+    let mut lives = vec![rb(OpRef::int_op(GUARDED))];
+    for n in 1..=LIVE {
+        ops.push(op_at(
+            OpCode::IntAdd,
+            &[base, OpRef::const_int(i64::from(n))],
+            OpRef::int_op(n),
+        ));
+        if n != GUARDED {
+            lives.push(rb(OpRef::int_op(n)));
+        }
+    }
+    let func = spilled_guard_nop as *const () as usize as i64;
+    let call = op_at(OpCode::CallN, &[OpRef::const_int(func)], OpRef::void_op(20));
+    call.setdescr(call_descr(vec![], Type::Void, false, 0));
+    ops.push(call);
+    let guarded = OpRef::int_op(GUARDED);
+    let guard = Op::new(opcode, &[rb(guarded)]);
+    guard.pos().set(OpRef::void_op(21));
+    let types = vec![Type::Int; LIVE as usize];
+    guard.setdescr(make_resume_guard_descr_typed(types.clone()));
+    guard.set_fail_arg_types(types);
+    guard.setfailargs(lives.into());
+    ops.push(guard);
+    ops.push(finish_int(guarded, 22));
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let code = compiled_bytes(&token).to_vec();
+    let frame = backend.execute_token(&token, &[Value::Int(input)]);
+    let finished = backend.get_latest_descr(&frame).is_finish();
+    let value = backend.get_int_value(&frame, 0);
+    (finished, value, code)
+}
+
+fn has_cmp_frame_imm0(code: &[u8]) -> bool {
+    // `cmp_bi(..., 0)`: `48 83 7D disp8 00` or `48 83 BD disp32 00`.
+    code.windows(5)
+        .any(|w| w[0] == 0x48 && w[1] == 0x83 && w[2] == 0x7D && w[4] == 0x00)
+        || code
+            .windows(8)
+            .any(|w| w[0] == 0x48 && w[1] == 0x83 && w[2] == 0xBD && w[7] == 0x00)
+}
+
+#[test]
+fn spilled_guard_true_and_false_read_frame() {
+    // The guarded box is input + 7.
+    let (pass, value, code) = spilled_guard_trace(OpCode::GuardTrue, 0);
+    assert!(pass, "GUARD_TRUE of 7 must finish");
+    assert_eq!(value, 7);
+    assert!(
+        has_cmp_frame_imm0(&code),
+        "unfused guard must CMP the spilled box, not TEST a register"
+    );
+
+    let (pass, value, _) = spilled_guard_trace(OpCode::GuardTrue, -7);
+    assert!(!pass, "GUARD_TRUE of 0 must fail");
+    assert_eq!(value, 0);
+
+    let (pass, value, code) = spilled_guard_trace(OpCode::GuardFalse, -7);
+    assert!(pass, "GUARD_FALSE of 0 must finish");
+    assert_eq!(value, 0);
+    assert!(has_cmp_frame_imm0(&code));
+
+    let (pass, value, _) = spilled_guard_trace(OpCode::GuardFalse, 0);
+    assert!(!pass, "GUARD_FALSE of 7 must fail");
+    assert_eq!(value, 7);
+}
+
+/// x86 displacements are the full `fits_in_32bits` range. A 12-bit mask
+/// would send 4096 and 0x10000 to offset 0, which stays poisoned.
+#[test]
+fn gc_load_store_negative_and_large_displacements() {
+    let offsets = [-8i64, 4096, 0x10000];
+    let values = [0x1111i64, 0x2222, 0x3333];
+    let mut storage = vec![0xA5u8; 8 + 0x10000 + 8];
+    let base_ptr = unsafe { storage.as_mut_ptr().add(8) };
+
+    let mut backend = fresh_backend();
+    let base = OpRef::input_arg_ref(0);
+    let mut ops = Vec::new();
+    for (n, (&ofs, &value)) in offsets.iter().zip(values.iter()).enumerate() {
+        ops.push(gc_store(
+            base,
+            ofs,
+            OpRef::const_int(value),
+            8,
+            n as u32 + 1,
+        ));
+    }
+    let loaded = [OpRef::int_op(10), OpRef::int_op(11), OpRef::int_op(12)];
+    for (n, (&ofs, dst)) in offsets.iter().zip(loaded).enumerate() {
+        ops.push(op_at(
+            OpCode::GcLoadI,
+            &[base, OpRef::const_int(ofs), OpRef::const_int(8)],
+            dst,
+        ));
+        let _ = n;
+    }
+    let sum = OpRef::int_op(13);
+    let total = OpRef::int_op(14);
+    ops.push(op_at(OpCode::IntAdd, &[loaded[0], loaded[1]], sum));
+    ops.push(op_at(OpCode::IntAdd, &[sum, loaded[2]], total));
+    ops.push(finish_int(total, 20));
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(base_ptr as usize))]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), values.iter().sum::<i64>());
+    for (&ofs, &value) in offsets.iter().zip(values.iter()) {
+        let at = unsafe { base_ptr.offset(ofs as isize) };
+        assert_eq!(read_i64_unaligned(at), value, "offset {ofs}");
+    }
+    assert_eq!(
+        read_bytes(base_ptr, 8),
+        [0xA5u8; 8],
+        "offset 0 must stay untouched"
+    );
+}
+
+fn singlefloat_bits(input: f64) -> i64 {
+    let mut backend = fresh_backend();
+    let src = OpRef::input_arg_float(0);
+    let bits = OpRef::int_op(1);
+    let ops = vec![
+        op_at(OpCode::CastFloatToSinglefloat, &[src], bits),
+        finish_int(bits, 2),
+    ];
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Float(input)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    backend.get_int_value(&frame, 0)
+}
+
+fn singlefloat_roundtrip(input: f64) -> f64 {
+    let mut backend = fresh_backend();
+    let src = OpRef::input_arg_float(0);
+    let bits = OpRef::int_op(1);
+    let back = OpRef::float_op(2);
+    let ops = vec![
+        op_at(OpCode::CastFloatToSinglefloat, &[src], bits),
+        op_at(OpCode::CastSinglefloatToFloat, &[bits], back),
+        finish_of(back, Type::Float, 3),
+    ];
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Float(input)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    backend.get_float_value(&frame, 0)
+}
+
+/// `genop_cast_float_to_singlefloat` / `genop_cast_singlefloat_to_float`.
+/// The int result holds the f32 bits in the low 32. 0.1 rounds; -0.0
+/// keeps its sign bit.
+#[test]
+fn singlefloat_casts_round_trip_bits() {
+    let cases = [1.5f64, 0.1, -0.0];
+    for input in cases {
+        let expect_bits = i64::from((input as f32).to_bits());
+        assert_eq!(
+            singlefloat_bits(input),
+            expect_bits,
+            "f32 bits of {input:?}"
+        );
+        let got = singlefloat_roundtrip(input);
+        let expect = f64::from(input as f32);
+        assert_eq!(
+            got.to_bits(),
+            expect.to_bits(),
+            "round-trip {input:?} -> {got:?}"
+        );
+    }
+    assert_ne!(
+        singlefloat_roundtrip(0.1).to_bits(),
+        0.1f64.to_bits(),
+        "0.1 must take the f32 rounding, not pass the f64 through"
+    );
 }

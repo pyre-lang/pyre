@@ -3307,13 +3307,34 @@ impl<'a> RegAlloc<'a> {
                     output,
                 );
             }
-            OpCode::FloatNeg
-            | OpCode::FloatAbs
-            | OpCode::CastFloatToSinglefloat
-            | OpCode::CastSinglefloatToFloat
-                if !args.is_empty() =>
-            {
+            OpCode::FloatNeg | OpCode::FloatAbs if !args.is_empty() => {
                 self.consider_float_unary_j2(dst.unwrap_or(op.pos().get()), args[0], i, output);
+            }
+            // aarch64 keeps both casts on `consider_float_unary_j2`.
+            #[cfg(not(target_arch = "x86_64"))]
+            OpCode::CastFloatToSinglefloat | OpCode::CastSinglefloatToFloat if !args.is_empty() => {
+                self.consider_float_unary_j2(dst.unwrap_or(op.pos().get()), args[0], i, output);
+            }
+            // x86/regalloc.py `consider_cast_float_to_singlefloat`.
+            #[cfg(target_arch = "x86_64")]
+            OpCode::CastFloatToSinglefloat if !args.is_empty() => {
+                self.consider_cast_float_to_singlefloat_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
+            }
+            // x86/regalloc.py `consider_cast_singlefloat_to_float`,
+            // an alias of `consider_cast_int_to_float`.
+            #[cfg(target_arch = "x86_64")]
+            OpCode::CastSinglefloatToFloat if !args.is_empty() => {
+                self.consider_cast_int_to_float_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
             }
             OpCode::FloatLt
             | OpCode::FloatLe
@@ -4221,6 +4242,12 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
+        // x86 `_consider_guard_cc` passes `self.loc(arg)` into
+        // `load_condition_into_cc` → `test_location`, which emits
+        // `CMP [mem], 0` for a frame location. aarch64 still forces a register.
+        #[cfg(target_arch = "x86_64")]
+        let loc = self.loc(arg, self.tp(arg));
+        #[cfg(not(target_arch = "x86_64"))]
         let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
         self.perform_guard_j2(fail_args, i, [loc], None, output);
     }
@@ -4873,6 +4900,37 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, [loc0], Some(result_loc), output);
     }
 
+    /// x86/regalloc.py `consider_cast_float_to_singlefloat`.
+    ///
+    /// The arg stays in an xmm, the result is a GPR (the f32 bits in the
+    /// low 32), and an xmm temp is allocated after the result. The temp
+    /// may alias the arg, so the forbidden list is empty.
+    #[cfg(target_arch = "x86_64")]
+    fn consider_cast_float_to_singlefloat_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc0 = self.make_sure_var_in_reg(arg, Type::Float, &[], None, false);
+        let loc1 = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        let loctmp = Loc::Reg(self.xrm.force_allocate_reg(
+            tmp,
+            &[],
+            None,
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        ));
+        self.xrm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Float);
+        self.perform(i, [loc0, loctmp], Some(loc1), output);
+    }
+
     /// Memory load: getfield pattern (1 arg → result)
     #[allow(dead_code)] // x86/regalloc.py consider_getfield
     fn consider_getfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
@@ -4962,7 +5020,15 @@ impl<'a> RegAlloc<'a> {
     }
 
     fn gc_offset_loc(&mut self, ofs: i64) -> Loc {
-        if check_imm_arg(ofs) {
+        // x86 `AddressLoc` keeps any displacement that `fits_in_32bits`,
+        // including negatives and values past `DEFAULT_IMM_SIZE`. aarch64
+        // stays on `check_imm_arg` (`0..DEFAULT_IMM_SIZE`).
+        let fits = if cfg!(target_arch = "x86_64") {
+            fits_in_32bits(ofs)
+        } else {
+            check_imm_arg(ofs)
+        };
+        if fits {
             Loc::immed(ofs)
         } else {
             self.pending_moves
@@ -5297,8 +5363,11 @@ impl<'a> RegAlloc<'a> {
         let size = size.map(|arg| self.const_value(arg)).unwrap_or(8);
         let ofs = self.const_value(offset);
         // pyre's GC header sits at `obj - HDR_SIZE`, so `gen_initialize_tid`
-        // stores at a small negative offset. Both store emitters take it as
-        // an immediate (STUR's signed 9-bit range on aarch64, disp32 on x86).
+        // stores at a small negative offset. Both store emitters take that
+        // window as an immediate (STUR's signed 9-bit range on aarch64,
+        // disp8/disp32 on x86). Wider x86 displacements, including other
+        // negatives and offsets >= 4096, stay immediate via `gc_offset_loc`
+        // when `fits_in_32bits` (`AddressLoc`).
         let ofs_loc = if (-256..0).contains(&ofs) {
             Loc::immed(ofs)
         } else {
