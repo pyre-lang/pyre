@@ -140,8 +140,8 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     `EnvironmentError.__init__` stores `errno` / `strerror` /
 ///     `filename` through `InstanceRepr::setfield`.
 ///     `WindowsError.__init__` stores `winerror` the same way.
-///   * rbuiltin.py — `objectmodel.hlinvoke` registered
-///     (`rtype_hlinvoke`).
+///   * rbuiltin.py — `objectmodel.hlinvoke` landed (`rtype_hlinvoke`
+///     plus `robjmodel_hlinvoke`).
 ///   * rbuiltin.py — `range` / `xrange` / `enumerate`
 ///     (delegate to ported `rrange.py`)
 ///   * rbuiltin.py — `lltype.malloc` / `free` family fully
@@ -6746,6 +6746,15 @@ mod tests {
         rtyper: &std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
         with_signature: bool,
     ) -> std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> {
+        hlinvoke_function_n_args(ann, rtyper, with_signature, 0)
+    }
+
+    fn hlinvoke_function_n_args(
+        ann: &std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        rtyper: &std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        with_signature: bool,
+        n_args: usize,
+    ) -> std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> {
         use crate::annotator::description::{CallTableRow, DescEntry, FunctionDesc};
         use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
         use crate::flowspace::argument::Signature;
@@ -6756,18 +6765,27 @@ mod tests {
         use std::cell::{Cell, RefCell};
         use std::rc::Rc;
 
+        let arg_names: Vec<String> = (0..n_args).map(|i| format!("a{i}")).collect();
         let fd = Rc::new(RefCell::new(FunctionDesc::new(
             ann.bookkeeper.clone(),
             None,
             "f",
-            Signature::new(Vec::new(), None, None),
+            Signature::new(arg_names.clone(), None, None),
             None,
             None,
         )));
         if with_signature {
             let family = fd.borrow().base.getcallfamily().expect("callfamily");
             let func = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
-            let graph = FunctionGraph::new("f", Block::shared(Vec::new()));
+            let inputs: Vec<crate::flowspace::model::Hlvalue> = (0..n_args)
+                .map(|i| {
+                    let v = crate::flowspace::model::Variable::named(format!("a{i}"));
+                    *v.annotation.borrow_mut() =
+                        Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::default())));
+                    crate::flowspace::model::Hlvalue::Variable(v)
+                })
+                .collect();
+            let graph = FunctionGraph::new("f", Block::shared(inputs));
             {
                 let block = graph.returnblock.borrow();
                 let crate::flowspace::model::Hlvalue::Variable(ret) = &block.inputargs[0] else {
@@ -6779,7 +6797,7 @@ mod tests {
             let py = Rc::new(PyGraph {
                 graph: Rc::new(RefCell::new(graph)),
                 func,
-                signature: RefCell::new(Signature::new(Vec::new(), None, None)),
+                signature: RefCell::new(Signature::new(arg_names, None, None)),
                 defaults: RefCell::new(None),
                 access_directly: Cell::new(false),
             });
@@ -6791,7 +6809,7 @@ mod tests {
             );
             family.borrow_mut().calltables.insert(
                 crate::flowspace::argument::CallShape {
-                    shape_cnt: 0,
+                    shape_cnt: n_args,
                     shape_keys: Vec::new(),
                     shape_star: false,
                 },
@@ -6873,6 +6891,96 @@ mod tests {
                 .iter()
                 .map(|op| op.opname.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_hlinvoke_from_objectmodel_module() {
+        // rbuiltin.py — `@typer_for(objectmodel.hlinvoke)`.
+        let host = HOST_ENV
+            .import_module("rpython.rlib.objectmodel")
+            .and_then(|m| m.module_get("hlinvoke"))
+            .expect("HOST_ENV missing objectmodel.hlinvoke");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `objectmodel.hlinvoke`"
+        );
+    }
+
+    #[test]
+    fn hlinvoke_annotates_and_rtypes_through_the_pipeline() {
+        // Upstream `test_hlinvoke_simple` (`rtyper/test/test_rpbc.py`):
+        // annotate `ll_h(R, f, x): return hlinvoke(R, f, x, 2)` then
+        // `specialize_more_blocks`. The graph is a `simple_call` of the
+        // HOST_ENV `objectmodel.hlinvoke` HostObject — not a hand-built
+        // HighLevelOp.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
+            Variable,
+        };
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let r_fn = hlinvoke_function_n_args(&ann, &rtyper, true, 2);
+
+        let hlinvoke = HOST_ENV
+            .import_module("rpython.rlib.objectmodel")
+            .and_then(|m| m.module_get("hlinvoke"))
+            .expect("HOST_ENV missing objectmodel.hlinvoke");
+
+        let x = Variable::named("x");
+        let startblock = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let graph = FunctionGraph::new("ll_h", startblock.clone());
+        let result = Variable::named("r");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "simple_call",
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(hlinvoke))),
+                Hlvalue::Constant(Constant::new(repr_const(std::sync::Arc::clone(&r_fn)))),
+                Hlvalue::Constant(Constant::new(ConstValue::None)),
+                Hlvalue::Variable(x),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(2))),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(result)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let graph = graph.into_ref();
+
+        let annotated = ann
+            .build_graph_types(
+                &graph,
+                &[Some(SomeValue::Integer(SomeInteger::default()))],
+                true,
+            )
+            .expect("hlinvoke call must annotate");
+        assert!(
+            matches!(annotated, Some(SomeValue::Integer(_))),
+            "robjmodel_hlinvoke result is lltype_to_annotation of the callable return, got {annotated:?}"
+        );
+
+        rtyper
+            .specialize_more_blocks()
+            .expect("hlinvoke call must rtype");
+        let startblock = graph.borrow().startblock.clone();
+        let ops = startblock.borrow().operations.clone();
+        assert!(
+            ops.iter().any(|op| op.opname == "direct_call"),
+            "rtype_hlinvoke dispatch of a constant function emits direct_call, ops={:?}",
+            ops.iter().map(|op| op.opname.as_str()).collect::<Vec<_>>()
         );
     }
 }

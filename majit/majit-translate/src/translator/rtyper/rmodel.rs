@@ -644,6 +644,13 @@ pub trait Repr: Debug + std::any::Any {
         )))
     }
 
+    /// RPython `Repr.rtyper` (`rmodel.py`). Function-PBC reprs store the
+    /// creating typer on `FunctionReprBase.rtyper`; `robjmodel_hlinvoke`
+    /// reads `r_func.rtyper.getrepr(s_ret)`.
+    fn rtyper(&self) -> Option<std::rc::Rc<RPythonTyper>> {
+        None
+    }
+
     /// RPython `FunctionReprBase.s_pbc` (`rpbc.py`) read accessor.
     ///
     /// In upstream Python `r_func.s_pbc` is a plain attribute access on

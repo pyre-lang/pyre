@@ -2311,6 +2311,12 @@ impl Repr for FunctionRepr {
         Ok((arc, 0))
     }
 
+    /// RPython `FunctionReprBase.rtyper` (`rpbc.py`) — `robjmodel_hlinvoke`
+    /// reads `r_func.rtyper.getrepr(s_ret)`.
+    fn rtyper(&self) -> Option<Rc<RPythonTyper>> {
+        self.base.rtyper.upgrade()
+    }
+
     /// RPython `FunctionReprBase.s_pbc` (rpbc.py) — exposed via the
     /// trait so `MethodsPBCRepr.redispatch_call` (rpbc.py) can
     /// supply `subset_of=r_func.s_pbc` when narrowing per-call SomePBC.
@@ -2659,6 +2665,12 @@ impl Repr for FunctionsPBCRepr {
             TyperError::message("FunctionsPBCRepr.get_r_implfunc: repr Arc was dropped")
         })?;
         Ok((arc, 0))
+    }
+
+    /// RPython `FunctionReprBase.rtyper` (`rpbc.py`) — `robjmodel_hlinvoke`
+    /// reads `r_func.rtyper.getrepr(s_ret)`.
+    fn rtyper(&self) -> Option<Rc<RPythonTyper>> {
+        self.base.rtyper.upgrade()
     }
 
     /// RPython `FunctionReprBase.s_pbc` (rpbc.py) — exposed via the
@@ -4231,6 +4243,12 @@ impl Repr for SmallFunctionSetPBCRepr {
             TyperError::message("SmallFunctionSetPBCRepr.get_r_implfunc: repr Arc was dropped")
         })?;
         Ok((arc, 0))
+    }
+
+    /// RPython `FunctionReprBase.rtyper` (`rpbc.py`) — `robjmodel_hlinvoke`
+    /// reads `r_func.rtyper.getrepr(s_ret)`.
+    fn rtyper(&self) -> Option<Rc<RPythonTyper>> {
+        self.base.rtyper.upgrade()
     }
 
     /// RPython `SmallFunctionSetPBCRepr.rtype_simple_call(self, hop)`
