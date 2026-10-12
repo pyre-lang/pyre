@@ -7904,19 +7904,25 @@ pub struct FunctionGraph {
     /// and all `FunctionGraph::new` fixtures).
     pub hints: Vec<String>,
     /// RPython `graph.access_directly`. `specialize.py default_specialize`
-    /// writes it on the `(AccessDirect, key)` graph. Pyre keeps one
-    /// `FunctionGraph` for both specializations, so `find_all_graphs` stamps
-    /// this field when its BFS reaches the AccessDirect specialization, right
-    /// before `look_inside_graph` reads it. An AccessDirect graph the final
-    /// call graph never reaches is never stamped.
+    /// writes it on the `(AccessDirect, key)` graph `cachedgraph` builds
+    /// under alt_name `{name}__AccessDirect_None`. That copy is a distinct
+    /// `FunctionGraph`; the regular graph is never stamped.
     pub access_directly: bool,
-    /// Formals of the AccessDirect specialization whose binding still carries
-    /// the flag. `None` means that specialization was never bound
-    /// (`default_specialize` never built the `(AccessDirect, key)` graph /
-    /// `bindinputargs` never ran on its startblock). `Some(ids)` is the
-    /// startblock binding after the annotator fixpoint (`bindinputargs` then
-    /// `mergeinputargs` / `unionof`); ids only ever shrink.
+    /// Formals of the AccessDirect copy whose binding still carries the
+    /// flag. `None` on the regular graph, and on a copy that was never
+    /// bound (`bindinputargs` never ran on its startblock). `Some(ids)` is
+    /// the startblock binding after the annotator fixpoint (`bindinputargs`
+    /// then `mergeinputargs` / `unionof`); ids only ever shrink. Lives on
+    /// the AccessDirect copy only.
     pub access_directly_inputs: Option<Vec<u64>>,
+    /// Call-result Variable ids whose annotation carries `access_directly`.
+    /// `annrpython.py binding(op.result)` after `recursivecall` returns
+    /// `binding(graph.getreturnvar())`. Empty until a call's callee return
+    /// is flagged.
+    pub access_directly_call_results: Vec<u64>,
+    /// Whether `binding(graph.getreturnvar())` carries `access_directly`.
+    /// `annrpython.py recursivecall` reads this to flag the caller's result.
+    pub access_directly_return: bool,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
     /// (all unset) for `FunctionGraph::new` fixtures; production
@@ -7939,7 +7945,14 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
 
     let mut varmap: HashMap<Variable, Variable> = HashMap::new();
     let mut intern = |var: &Variable| {
-        varmap.entry(var.clone()).or_insert_with(|| var.copy());
+        varmap.entry(var.clone()).or_insert_with(|| {
+            let copied = var.copy();
+            // `copygraph` copyvar (`model.py`): `Variable(v)` then
+            // `concretetype` only. `Variable.copy` also clones
+            // `annotation`; a lifted clone must not inherit it.
+            *copied.annotation.borrow_mut() = None;
+            copied
+        });
     };
     for block in &graph.blocks {
         for var in &block.inputargs {
@@ -8040,6 +8053,17 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
                 })
                 .collect()
         }),
+        access_directly_call_results: graph
+            .access_directly_call_results
+            .iter()
+            .filter_map(|id| {
+                varmap
+                    .iter()
+                    .find(|(var, _)| var.id() == *id)
+                    .map(|(_, copied)| copied.id())
+            })
+            .collect(),
+        access_directly_return: graph.access_directly_return,
         func: graph.func.clone(),
     }
 }
@@ -8123,6 +8147,8 @@ impl FunctionGraph {
             hints: Vec::new(),
             access_directly: false,
             access_directly_inputs: None,
+            access_directly_call_results: Vec::new(),
+            access_directly_return: false,
             func: FuncEffects::default(),
         }
     }

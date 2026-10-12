@@ -2193,6 +2193,22 @@ impl HostEnv {
             "we_are_jitted",
             HostObject::new_builtin_callable("majit_metainterp.jit.we_are_jitted"),
         );
+        // `rlib/jit.py` `hint` ExtRegistryEntry. Pyre's front lowers each
+        // kwarg spelling to `OpKind::Hint`; the adapter reifies these as
+        // `simple_call` of the matching builtin so `compute_result_annotation`
+        // mints `access_directly` (`specialize.py default_specialize`).
+        majit_metainterp_jit.module_set(
+            "hint_access_directly",
+            HostObject::new_builtin_callable("majit_metainterp.jit.hint_access_directly"),
+        );
+        majit_metainterp_jit.module_set(
+            "hint_fresh_virtualizable",
+            HostObject::new_builtin_callable("majit_metainterp.jit.hint_fresh_virtualizable"),
+        );
+        majit_metainterp_jit.module_set(
+            "hint_no_access_directly",
+            HostObject::new_builtin_callable("majit_metainterp.jit.hint_no_access_directly"),
+        );
         let majit_rlib_jit = HostObject::new_module("majit_rlib.jit");
         majit_rlib_jit.module_set(
             "we_are_jitted",

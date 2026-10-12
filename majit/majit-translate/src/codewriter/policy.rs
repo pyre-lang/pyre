@@ -188,22 +188,16 @@ pub trait JitPolicy {
         //     part of the JIT-visible graph set),
         //   - `res` is False (loops or unsupported types mean
         //     `look_inside_graph` decided not to trace into it),
-        //   - `graph.access_directly` is True (annotator set this because
-        //     an ARGUMENT carried the `access_directly` flag, see
-        //     `default_specialize` in `rpython/annotator/specialize.py`).
+        //   - `graph.access_directly` is True (`specialize.py
+        //     default_specialize` set this on the `(AccessDirect, key)`
+        //     copy `cachedgraph` built for a flagged argument).
         //
         // Turning the call into a residual call while the function
         // accesses a virtualizable would silently desynchronise the
         // virtualizable from the JIT's view; upstream therefore aborts
-        // translation loudly. Pyre carries the same flag where upstream
-        // does, on the graph: `FunctionGraph::access_directly`, beside
-        // `hints`.
-        //
-        // `find_all_graphs` stamps the flag on a callee that receives the
-        // result of `hint_access_directly` before this gate, which is the
-        // read `default_specialize` performs on the argument annotation.
-        // The prepass annotator still runs after the BFS and writes
-        // `PyGraph.access_directly`; `cutover::check_access_directly_sanity`
+        // translation loudly. The flag lives only on that copy; a regular
+        // graph of the same function that `look_inside_graph` declines
+        // stays residual without panicking. `cutover::check_access_directly_sanity`
         // asserts that no graph outside the JIT graph set carries the flag.
         if see_function && !res && graph.access_directly {
             panic!(

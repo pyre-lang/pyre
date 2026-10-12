@@ -26,8 +26,8 @@
 # leaves the result box virtualizable.
 #
 #   sqrt         `__majit_wrap_math_sqrt` descent — `x >= 0` and `isfinite(x)`
-#                pin the two `ll_math_sqrt` branches, then `_float_sqrt`
-#                (`sqrt_nonneg`) with no result guard.
+#                pin the two `ll_math_sqrt` branches, then `_float_pos`
+#                boxing the result with no result guard.
 #   log/cos/sin  `__majit_wrap_math_{log,cos,sin}` descent — one domain guard
 #                each (`x > 0` for `log`, `isfinite` for `cos`/`sin`), then
 #                `_float_log` / `_float_cos` / `_float_sin`.
