@@ -9229,10 +9229,10 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // longer reaches them, so ConstPtr gcrefs are forwarded below.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
-        for slot in latched.miframe.ref_regs.iter_mut() {
-            if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
-            }
+        // `ConstPtr` in `ref_regs` is a table index. This latch is the
+        // holder while `walk_active_trace_refs` cannot see the frame.
+        for slot in latched.miframe.ref_regs.iter().flatten() {
+            slot.trace_const_ptr(visitor);
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
@@ -9252,10 +9252,9 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     let multi_frame_blackhole = unsafe { &mut *(*area.multi_frame_blackhole).as_ptr() };
     if let Some(latched) = multi_frame_blackhole.as_mut() {
         for frame in latched.framestack.frames.iter_mut() {
-            for slot in frame.ref_regs.iter_mut() {
-                if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                    visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
-                }
+            // Both halves, for the reason the single-frame arm gives.
+            for slot in frame.ref_regs.iter().flatten() {
+                slot.trace_const_ptr(visitor);
             }
         }
         if latched.last_exc_value != 0 {

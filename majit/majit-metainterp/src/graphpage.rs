@@ -577,7 +577,7 @@ fn const_value_of(r: OpRef) -> Option<Value> {
     match r {
         OpRef::ConstInt(v) => Some(Value::Int(v)),
         OpRef::ConstFloat(v) => Some(Value::Float(v)),
-        OpRef::ConstPtr(v) => Some(Value::Ref(v)),
+        OpRef::ConstPtr(v) => Some(Value::Ref(majit_ir::const_ptr_table::resolve(v))),
         _ => None,
     }
 }

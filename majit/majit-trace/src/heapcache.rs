@@ -120,11 +120,9 @@ pub struct HeapcRecord {
 impl HeapcRecord {
     /// Forward ConstPtrs stored in `_heapc_deps`.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        if let Some(deps) = &mut self.deps {
-            for slot in deps.iter_mut().flatten() {
-                if let OpRef::ConstPtr(gcref) = slot {
-                    visitor(gcref);
-                }
+        if let Some(deps) = &self.deps {
+            for slot in deps.iter().flatten() {
+                slot.trace_const_ptr(visitor);
             }
         }
     }
@@ -1084,11 +1082,14 @@ impl HeapCache {
 
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let OpRef::ConstPtr(gcref) = slot {
-                visitor(gcref);
-            }
+            slot.trace_const_ptr(visitor);
         }
         fn forward_entry(entry: &mut CacheEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
+            for map in [&entry.cache_anything, &entry.cache_seen_allocation] {
+                for key in map.keys() {
+                    key.trace_const_ptr(visitor);
+                }
+            }
             for value in entry.cache_anything.values_mut() {
                 forward(value, visitor);
             }

@@ -4038,7 +4038,7 @@ where
                     && let Some(majit_ir::OpRef::ConstPtr(v)) =
                         frame.ref_regs.get(reg_idx).copied().flatten()
                 {
-                    mp_green_refs.push(v.0 as i64);
+                    mp_green_refs.push(majit_ir::const_ptr_table::resolve(v).0 as i64);
                 }
                 if slot == 2
                     && let Some(majit_ir::OpRef::ConstFloat(v)) =

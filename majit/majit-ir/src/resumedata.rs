@@ -382,7 +382,7 @@ pub fn decode_tagged_value(
         TAGCONST => {
             if tagged == NULLREF {
                 // history.py CONST_NULL = ConstPtr(null).
-                RebuiltValue::Const(crate::Const::Ref(crate::GcRef::NULL))
+                RebuiltValue::Const(crate::Const::from_gcref(crate::GcRef::NULL))
             } else if tagged == UNINITIALIZED_TAG {
                 RebuiltValue::Unassigned
             } else {

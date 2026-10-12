@@ -142,12 +142,10 @@ impl Forwarded {
                     cell.set(v);
                 }
             }
+            // Wide `ConstPtr` stores a table index. This holder traces it.
             Forwarded::SmallWide(id) => {
-                let cell = crate::operand::wide_slot(*id as u32);
-                let mut v = cell.get();
-                if let Value::Ref(gcref) = &mut v {
-                    visitor(gcref);
-                    cell.set(v);
+                if let Some(index) = crate::operand::wide_ref_index(*id) {
+                    crate::const_ptr_table::trace_index(index, visitor);
                 }
             }
             _ => {}
@@ -161,9 +159,8 @@ impl Forwarded {
                 cell.set(Value::Ref(updated));
             }
             Forwarded::SmallWide(id) => {
-                let cell = crate::operand::wide_slot(*id as u32);
-                if matches!(cell.get(), Value::Ref(_)) {
-                    cell.set(Value::Ref(updated));
+                if let Some(index) = crate::operand::wide_ref_index(*id) {
+                    crate::const_ptr_table::set_slot(index, updated);
                 }
             }
             _ => {}

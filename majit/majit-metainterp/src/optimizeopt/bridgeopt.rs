@@ -357,7 +357,9 @@ fn decoded_box_to_opref(decoded: &crate::resume::DecodedBox, ctx: &mut OptContex
     match decoded {
         DecodedBox::LiveBox(opref) => *opref,
         DecodedBox::Const(Const::Int(v)) => ctx.make_constant_int(*v),
-        DecodedBox::Const(Const::Ref(r)) => ctx.make_constant_ref(*r),
+        DecodedBox::Const(Const::Ref(r)) => {
+            ctx.make_constant_ref(majit_ir::const_ptr_table::resolve(*r))
+        }
         DecodedBox::Const(Const::Float(f)) => ctx.make_constant_float(*f),
     }
 }

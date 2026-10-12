@@ -11378,7 +11378,7 @@ impl JitState for PyreJitState {
                 // the frame's `locals_cells_stack_w` array (the vable image) is the
                 // authoritative post-guard source for the frame's locals. At an
                 // arbitrary interior resume pc a local slot's jitcode color may hold
-                // a dead temp that decodes to a NULL constant (`ConstPtr(GcRef(0))`);
+                // a dead temp that decodes to a NULL constant (`ConstPtr(0)`);
                 // such a dead-temp NULL must not shadow the vable's live local, so for
                 // local slots prefer the vable array item over a NONE/null-const value.
                 // Stack slots keep the NONE-only fallback (a real stack value must not
@@ -11396,7 +11396,7 @@ impl JitState for PyreJitState {
                     &vable_array_values,
                 );
                 let mut overlay_local = |slot: &mut OpRef, s: usize| {
-                    let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                    let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v == 0);
                     if slot.is_none() || slot_is_null_const {
                         if let Some(v) = vable_array_items.get(s).copied() {
                             if !v.is_none() {
@@ -11448,7 +11448,7 @@ impl JitState for PyreJitState {
                         .enumerate()
                         .take(semantic_prefix_len)
                     {
-                        let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                        let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v == 0);
                         let want_vable = slot.is_none() || slot_is_null_const;
                         if want_vable {
                             if let Some(v) = vable_array_items.get(idx).copied() {
@@ -11538,8 +11538,7 @@ impl JitState for PyreJitState {
                     // carry that NULL into the closing JUMP's label argument and hand
                     // it back to the interpreter on the next guard failure.
                     for s in nlocals..semantic_prefix_len.min(mirror.len()) {
-                        let slot_is_null_const =
-                            matches!(mirror[s], OpRef::ConstPtr(v) if v.0 == 0);
+                        let slot_is_null_const = matches!(mirror[s], OpRef::ConstPtr(v) if v == 0);
                         if mirror[s].is_none() || slot_is_null_const {
                             if let Some(v) = vable_array_items.get(s).copied() {
                                 if !v.is_none() {
@@ -15277,7 +15276,7 @@ mod tests {
                 jitcode_index,
                 pc: 0,
                 values: vec![
-                    RebuiltValue::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
+                    RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
                     RebuiltValue::Box(7, Type::Ref),
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(0, Type::Ref),

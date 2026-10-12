@@ -4,6 +4,19 @@ pub use header::{
     GC_FLAG_SHIFT, GC_HEADER_WORD_SIZE, GC_IMMORTAL_LEAF_HEADER, GC_TYPE_ID_BITS,
     GCFLAG_NO_HEAP_PTRS, GCFLAG_TRACK_YOUNG_PTRS, GCREF, GCREFOpaque, GcType,
 };
+
+/// `history.py` `ConstPtr` is rooted by the holder that stores the box
+/// (`trace_index`), not by every slot `intern` has ever recorded.
+/// The registration stays so a collector still has a named walker; it
+/// does not keep dead trace constants alive. Compiled-code constants
+/// use `gcreftracer.GcTable`.
+/// Idempotent: `register_extra_root_walker` dedups by function address.
+pub fn install_const_ptr_table_walker() {
+    shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
+}
+
+fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
+
 /// GC traits and interfaces for the JIT.
 ///
 /// The GC subsystem provides:

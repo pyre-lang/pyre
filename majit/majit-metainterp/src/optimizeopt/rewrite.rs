@@ -3272,7 +3272,7 @@ mod tests {
         let input =
             majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
         let arg = Operand::from_bound_inputarg(&input);
-        arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
+        arg.set_forwarded_const(majit_ir::Const::from_gcref(majit_ir::GcRef(0)));
         let mut guard = Op::new(OpCode::GuardIsnull, std::slice::from_ref(&arg));
         guard.pos().set(OpRef::void_op(0));
         let guard_rc = OpRc::new(guard.clone());
@@ -3289,7 +3289,7 @@ mod tests {
             majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
         let arg = Operand::from_bound_inputarg(&input);
         let value = majit_ir::GcRef(42);
-        arg.set_forwarded_const(majit_ir::Const::Ref(value));
+        arg.set_forwarded_const(majit_ir::Const::from_gcref(value));
         let mut guard = Op::new(
             OpCode::GuardValue,
             &[arg, Operand::const_from_value(majit_ir::Value::Ref(value))],

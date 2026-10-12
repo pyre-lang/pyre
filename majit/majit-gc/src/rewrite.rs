@@ -3846,7 +3846,7 @@ mod tests {
         // rewrite.py `remove_constptr` sees the Const after get_box_replacement.
         let ia = InputArg::new_ref_rc(99);
         let operand = Operand::from_bound_inputarg(&ia);
-        operand.set_forwarded_const(Const::Ref(GcRef(0x1000)));
+        operand.set_forwarded_const(Const::from_gcref(GcRef(0x1000)));
         let label = Op::new(OpCode::Label, &[operand]);
         let (out, gcrefs) = remove_ref_constants(&[label], 0);
         assert_eq!(gcrefs, vec![GcRef(0x1000)]);
@@ -3891,7 +3891,7 @@ mod tests {
         // deopt would then call consume_vable_info with identity 0.
         let ia = InputArg::new_ref_rc(0);
         let operand = Operand::from_bound_inputarg(&ia);
-        operand.set_forwarded_const(Const::Ref(GcRef(0)));
+        operand.set_forwarded_const(Const::from_gcref(GcRef(0)));
         let guard = Op::new(OpCode::GuardTrue, &[operand.clone()]);
         guard.setfailargs(vec![operand].into());
         let (out, gcrefs) = remove_ref_constants_for_inputs(&[guard], 1, &[0]);

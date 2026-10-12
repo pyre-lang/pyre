@@ -1645,7 +1645,7 @@ fn jit_state_restore_guard_failure_restores_from_reconstructed_resume_frame() {
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 444);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr)));
+    resume.set_slot_constant(0, majit_ir::Const::from_gcref(GcRef(frame_ptr)));
     resume.map_slot(1, 0);
     resume.set_slot_constant(2, majit_ir::Const::Int(99));
     let reconstructed_state = resume.build().reconstruct_state(&[2]);
@@ -1833,14 +1833,14 @@ fn jit_state_restore_guard_failure_replays_pending_field_writes() {
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 666);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(cell_ptr)));
+    resume.set_slot_constant(0, majit_ir::Const::from_gcref(GcRef(cell_ptr)));
     resume.map_slot(1, 0);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
         majit_ir::descr::SimpleFieldDescr::new(9, 0, 8, Type::Int, false),
     );
     resume.add_pending_field_write(
         Some(pending_descr),
-        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
+        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::from_gcref(GcRef(
             cell_ptr,
         ))),
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
@@ -1869,14 +1869,14 @@ fn jit_state_restore_guard_failure_replays_pending_array_writes_via_layout_hook(
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 888);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(array_ptr)));
+    resume.set_slot_constant(0, majit_ir::Const::from_gcref(GcRef(array_ptr)));
     resume.map_slot(1, 0);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
         majit_ir::descr::SimpleArrayDescr::new(12, 0, std::mem::size_of::<i64>(), 0, Type::Int),
     );
     resume.add_pending_arrayitem_write(
         Some(pending_descr),
-        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
+        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::from_gcref(GcRef(
             array_ptr,
         ))),
         1,
@@ -1909,10 +1909,10 @@ fn jit_state_restore_guard_failure_can_restore_multi_frame_resume_state() {
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 100);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr)));
+    resume.set_slot_constant(0, majit_ir::Const::from_gcref(GcRef(frame_ptr)));
     resume.set_slot_constant(1, majit_ir::Const::Int(1));
     resume.push_frame(0, 200);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr)));
+    resume.set_slot_constant(0, majit_ir::Const::from_gcref(GcRef(frame_ptr)));
     resume.map_slot(1, 0);
     let reconstructed_state = resume.build().reconstruct_state(&[2]);
 

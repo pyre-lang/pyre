@@ -656,8 +656,8 @@ impl UnrollOptimizer {
         for map in maps {
             for boxes in map.iter_mut().flatten() {
                 for sb in boxes {
-                    if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref
-                        && !gcref.is_null()
+                    if let majit_ir::OpRef::ConstPtr(index) = sb.opref
+                        && index != 0
                     {
                         slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
                     }
@@ -2664,9 +2664,7 @@ impl ExportedState {
     /// expose their actual mutable storage.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_opref(opref: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let OpRef::ConstPtr(gcref) = opref {
-                visitor(gcref);
-            }
+            opref.trace_const_ptr(visitor);
         }
 
         fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
@@ -2917,7 +2915,7 @@ impl ExportedState {
         keys.sort_by_key(|k| match k.to_opref() {
             OpRef::ConstInt(v) => (1u8, v as u64),
             OpRef::ConstFloat(v) => (1u8, v.to_bits()),
-            OpRef::ConstPtr(v) => (1u8, v.0 as u64),
+            OpRef::ConstPtr(v) => (1u8, v as u64),
             other => (0u8, other.raw() as u64),
         });
         for key in keys {
@@ -6878,14 +6876,13 @@ mod tests {
         let old = GcRef(0x1111_0000);
         let new = GcRef(0x2222_0000);
         let old_ref = OpRef::const_ptr(old);
-        let new_ref = OpRef::const_ptr(new);
         let mut exported_infos = indexmap::IndexMap::new();
         exported_infos.insert(
             Operand::from_opref(old_ref),
             OpInfo::ptr(PtrInfo::Constant(old)),
         );
         let mut constants = majit_ir::ConstMap::default();
-        constants.insert(0, majit_ir::Const::Ref(old));
+        constants.insert(0, majit_ir::Const::from_gcref(old));
 
         let mut state = ExportedState::new(
             vec![old_ref],
@@ -6962,46 +6959,49 @@ mod tests {
                 *slot = new;
             }
         });
+        // `ConstPtr` names a `const_ptr_table` slot. The index does not
+        // move; `as_const_ptr` reads the forwarded address.
+        assert_eq!(old_ref.as_const_ptr(), Some(new));
 
-        assert_eq!(state.end_args[0], new_ref);
-        assert_eq!(state.next_iteration_args[0].to_opref(), new_ref);
-        assert_eq!(state.renamed_inputargs[0], new_ref);
-        assert_eq!(state.short_inputargs[0], new_ref);
-        assert_eq!(state.runtime_boxes[0], new_ref);
-        assert!(state.exported_infos.keys().any(|k| k.to_opref() == new_ref));
-        assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), new_ref);
+        assert_eq!(state.end_args[0], old_ref);
+        assert_eq!(state.next_iteration_args[0].to_opref(), old_ref);
+        assert_eq!(state.renamed_inputargs[0], old_ref);
+        assert_eq!(state.short_inputargs[0], old_ref);
+        assert_eq!(state.runtime_boxes[0], old_ref);
+        assert!(state.exported_infos.keys().any(|k| k.to_opref() == old_ref));
+        assert_eq!(state.exported_short_boxes[0].op.arg(0).to_opref(), old_ref);
         assert_eq!(
             state.exported_short_boxes[0]
                 .same_as_source
                 .as_ref()
                 .map(|b| b.to_opref()),
-            Some(new_ref)
+            Some(old_ref)
         );
-        assert_eq!(state.const_short_boxes[0].op.arg(0).to_opref(), new_ref);
+        assert_eq!(state.const_short_boxes[0].op.arg(0).to_opref(), old_ref);
         let produced = state
             .short_boxes
             .iter()
-            .find_map(|(key, produced)| (*key == new_ref).then_some(produced))
+            .find_map(|(key, produced)| (*key == old_ref).then_some(produced))
             .expect("short_boxes key must be forwarded");
-        assert_eq!(produced.preamble_op.arg(0).to_opref(), new_ref);
+        assert_eq!(produced.preamble_op.arg(0).to_opref(), old_ref);
         assert_eq!(
             produced.same_as_source.as_ref().map(|b| b.to_opref()),
-            Some(new_ref)
+            Some(old_ref)
         );
         assert_eq!(
             state.patchguardop.as_ref().map(|op| op.arg(0).to_opref()),
-            Some(new_ref)
+            Some(old_ref)
         );
         match &state.virtual_state.state[0].info {
             VirtualStateInfo::Constant(Value::Ref(gcref)) => assert_eq!(*gcref, new),
             other => panic!("unexpected virtual state after walk: {other:?}"),
         }
         let short = state.short_preamble.as_ref().unwrap();
-        assert_eq!(short.ops[0].op.arg(0).to_opref(), new_ref);
-        assert_eq!(short.inputargs[0], new_ref);
-        assert_eq!(short.used_boxes[0], new_ref);
-        assert_eq!(short.jump_args[0], new_ref);
-        assert_eq!(short.constants.get(&0), Some(&majit_ir::Const::Ref(new)));
+        assert_eq!(short.ops[0].op.arg(0).to_opref(), old_ref);
+        assert_eq!(short.inputargs[0], old_ref);
+        assert_eq!(short.used_boxes[0], old_ref);
+        assert_eq!(short.jump_args[0], old_ref);
+        assert_eq!(short.constants.get(&0).map(|c| c.getref_base()), Some(new));
     }
 
     #[test]

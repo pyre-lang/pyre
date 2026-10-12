@@ -104,7 +104,9 @@ impl RawBuffer {
         &self.values
     }
 
-    /// Forward each stored value's inline `ConstPtr` gcref in place.
+    /// `values` holds boxes. A `ConstPtr` names a
+    /// [`crate::const_ptr_table`] slot. This buffer is the holder, so
+    /// trace the slot. The index stored here does not move.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         for value in &self.values {
             value.walk_const_ptr_refs(visitor);
@@ -497,24 +499,20 @@ mod tests {
     fn rawbuffer_walk_const_ptr_refs_forwards_value() {
         let mut buf = make_buf(16);
         let d = int_descr();
-        buf.write_value(
-            0,
-            8,
-            d.clone(),
-            Operand::bound_from_opref(OpRef::const_ptr(GcRef(0x10))),
-        )
-        .unwrap();
+        let stored = OpRef::const_ptr(GcRef(0x91_0000_0010));
+        buf.write_value(0, 8, d.clone(), Operand::bound_from_opref(stored))
+            .unwrap();
 
+        // The buffer is the holder. Its walk traces the table slot.
         buf.walk_const_ptr_refs(&mut |gcref| {
-            if *gcref == GcRef(0x10) {
-                *gcref = GcRef(0x20);
+            if *gcref == GcRef(0x91_0000_0010) {
+                *gcref = GcRef(0x91_0000_0020);
             }
         });
 
-        assert_eq!(
-            buf.read_value(0, 8, &d).unwrap().to_opref(),
-            OpRef::const_ptr(GcRef(0x20))
-        );
+        let got = buf.read_value(0, 8, &d).unwrap();
+        assert_eq!(got.to_opref(), stored);
+        assert_eq!(got.to_opref().as_const_ptr(), Some(GcRef(0x91_0000_0020)));
     }
 
     /// test_rawbuffer.py test_unpack_descrs

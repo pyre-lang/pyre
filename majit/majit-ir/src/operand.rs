@@ -59,25 +59,36 @@ pub(crate) fn small_int_value(encoded: u64) -> i64 {
     (encoded as u32 as i32) as i64
 }
 
+/// What a wide constant stores. `Ref` is a [`crate::const_ptr_table`]
+/// index (`history.py` `ConstPtr`), not the referent address: the
+/// collector writes the table, and [`wide_value`] reads it.
+#[derive(Clone, Copy)]
+enum WideStored {
+    Int(i64),
+    Float(f64),
+    Ref(u32),
+    Void,
+}
+
 /// Allocation-free identity for `ConstFloat` / `ConstPtr` / out-of-i32
 /// `ConstInt`. The token is the slab index; a clone keeps it, a fresh mint
 /// gets a new one — the same `is` identity `SmallInt` keeps, without an
-/// `Rc<Cell<Value>>` (32 B). Values live in leaked chunks so a GC walk can
-/// forward a `ConstPtr` in place. Not a value intern: two mints of the same
-/// bits are unequal.
+/// `Rc<Cell<Value>>` (32 B). Not a value intern: two mints of the same
+/// bits are unequal. A `Ref` payload is a table index, so a minor does
+/// not stale the slot.
 const WIDE_CHUNK: usize = 512;
 const WIDE_MAX_CHUNKS: usize = 8192;
 
 static NEXT_WIDE_ID: AtomicU32 = AtomicU32::new(1);
-static WIDE_CHUNKS: [AtomicPtr<Cell<Value>>; WIDE_MAX_CHUNKS] =
+static WIDE_CHUNKS: [AtomicPtr<Cell<WideStored>>; WIDE_MAX_CHUNKS] =
     [const { AtomicPtr::new(ptr::null_mut()) }; WIDE_MAX_CHUNKS];
 
-fn init_wide_chunk(chunk_i: usize) -> *mut Cell<Value> {
-    let boxed: Box<[Cell<Value>]> = (0..WIDE_CHUNK)
-        .map(|_| Cell::new(Value::Void))
+fn init_wide_chunk(chunk_i: usize) -> *mut Cell<WideStored> {
+    let boxed: Box<[Cell<WideStored>]> = (0..WIDE_CHUNK)
+        .map(|_| Cell::new(WideStored::Void))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let raw = Box::into_raw(boxed) as *mut Cell<Value>;
+    let raw = Box::into_raw(boxed) as *mut Cell<WideStored>;
     match WIDE_CHUNKS[chunk_i].compare_exchange(
         ptr::null_mut(),
         raw,
@@ -96,7 +107,7 @@ fn init_wide_chunk(chunk_i: usize) -> *mut Cell<Value> {
     }
 }
 
-pub(crate) fn wide_slot(id: u32) -> &'static Cell<Value> {
+fn wide_slot(id: u32) -> &'static Cell<WideStored> {
     let idx = id as usize;
     let chunk_i = idx / WIDE_CHUNK;
     assert!(
@@ -113,16 +124,38 @@ pub(crate) fn wide_slot(id: u32) -> &'static Cell<Value> {
     unsafe { &*p.add(off) }
 }
 
+fn store_wide(value: Value) -> WideStored {
+    match value {
+        Value::Int(v) => WideStored::Int(v),
+        Value::Float(v) => WideStored::Float(v),
+        Value::Ref(r) => WideStored::Ref(crate::const_ptr_table::intern(r)),
+        Value::Void => WideStored::Void,
+    }
+}
+
 pub(crate) fn fresh_wide(value: Value) -> u64 {
     let id = NEXT_WIDE_ID
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
-    wide_slot(id).set(value);
+    wide_slot(id).set(store_wide(value));
     u64::from(id)
 }
 
 pub(crate) fn wide_value(id: u64) -> Value {
-    wide_slot(id as u32).get()
+    match wide_slot(id as u32).get() {
+        WideStored::Int(v) => Value::Int(v),
+        WideStored::Float(v) => Value::Float(v),
+        WideStored::Ref(index) => Value::Ref(crate::const_ptr_table::resolve(index)),
+        WideStored::Void => Value::Void,
+    }
+}
+
+/// Table index stored for a wide `ConstPtr`, if this slot is a ref.
+pub(crate) fn wide_ref_index(id: u64) -> Option<u32> {
+    match wide_slot(id as u32).get() {
+        WideStored::Ref(index) => Some(index),
+        _ => None,
+    }
 }
 
 /// An operand stored in `Op.args` / `Op.fail_args`.
@@ -400,8 +433,10 @@ impl Operand {
             OpRef::None => Operand::None,
             OpRef::ConstInt(v) => Self::fresh_const_value(Value::Int(v)),
             OpRef::ConstFloat(v) => Self::fresh_const_value(Value::Float(v)),
-            OpRef::ConstPtr(v) if v.is_null() => Operand::NullRef,
-            OpRef::ConstPtr(v) => Self::fresh_const_value(Value::Ref(v)),
+            OpRef::ConstPtr(0) => Operand::NullRef,
+            OpRef::ConstPtr(v) => {
+                Self::fresh_const_value(Value::Ref(crate::const_ptr_table::resolve(v)))
+            }
             _ => panic!(
                 "from_opref: position-only ref {r:?} has no producer to bind — \
                  every operand source must carry a bound producer or a const (#9)"
@@ -461,11 +496,11 @@ impl Operand {
             Opnd::Op(op) => op.pos().get(),
             Opnd::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp.get()),
             Opnd::SmallInt(encoded) => OpRef::const_int(small_int_value(encoded)),
-            Opnd::SmallWide(id) => match wide_value(id) {
-                Value::Int(v) => OpRef::const_int(v),
-                Value::Float(v) => OpRef::const_float(v),
-                Value::Ref(v) => OpRef::const_ptr(v),
-                Value::Void => OpRef::NONE,
+            Opnd::SmallWide(id) => match wide_slot(id as u32).get() {
+                WideStored::Int(v) => OpRef::const_int(v),
+                WideStored::Float(v) => OpRef::const_float(v),
+                WideStored::Ref(index) => OpRef::ConstPtr(index),
+                WideStored::Void => OpRef::NONE,
             },
             Opnd::NullRef => OpRef::const_ptr(GcRef::NULL),
             Opnd::Const(cell) => match cell.get() {
@@ -849,22 +884,22 @@ impl Operand {
     }
 
     /// GC walk over any inline `ConstPtr` reachable from this operand
-    /// (`resoperation.py` `walk_const_ptr_refs`). A `Const` operand is held
-    /// `Cell`-backed in its box, so its `GcRef` updates in place; pure `Op` /
-    /// `InputArg` carry no inline const (their own `value` slot is walked at
-    /// the producer).
+    /// (`resoperation.py` `walk_const_ptr_refs`). A wide `Ref` stores a
+    /// [`crate::const_ptr_table`] index; tracing that index forwards
+    /// `ConstPtr.value` while this operand is live. The legacy `OP_CONST`
+    /// cell still carries a `Value::Ref` address and is forwarded here.
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        if self.packed == 0 {
+        if self.packed != 0 && self.packed & OP_TAG == OP_SMALLWIDE {
+            let id = self.packed >> 3;
+            if let Some(index) = wide_ref_index(id) {
+                crate::const_ptr_table::trace_index(index, visitor);
+            }
             return;
         }
-        let cell = match self.packed & OP_TAG {
-            // Forward an inline `ConstPtr` `GcRef` in place through the cell's
-            // get/visit/set cycle (forwarding.rs parity) — no `&mut self`
-            // needed, so `Op.args` GC walks keep their shared `borrow()`.
-            OP_CONST => unsafe { &*((self.packed & !OP_TAG) as *const Cell<Value>) },
-            OP_SMALLWIDE => wide_slot((self.packed >> 3) as u32),
-            _ => return,
-        };
+        if self.packed == 0 || self.packed & OP_TAG != OP_CONST {
+            return;
+        }
+        let cell = unsafe { &*((self.packed & !OP_TAG) as *const Cell<Value>) };
         let mut v = cell.get();
         if let Value::Ref(gcref) = &mut v {
             visitor(gcref);
@@ -1330,8 +1365,8 @@ mod tests {
         assert_eq!(f1, f1.clone(), "cloning preserves ConstFloat identity");
         assert!(f1.same_box(&f2), "ConstFloat.same_box compares bits");
 
-        let p1 = Operand::const_(Const::Ref(GcRef(0x1000)));
-        let p2 = Operand::const_(Const::Ref(GcRef(0x1000)));
+        let p1 = Operand::const_(Const::from_gcref(GcRef(0x1000)));
+        let p2 = Operand::const_(Const::from_gcref(GcRef(0x1000)));
         assert!(p1.is_small_wide());
         assert_ne!(p1, p2, "fresh ConstPtr objects have distinct identity");
         assert_eq!(p1, p1.clone());
@@ -1345,7 +1380,7 @@ mod tests {
     #[test]
     fn set_forwarded_const_wide_keeps_token_identity() {
         let host = Operand::from_bound_op(&op_at(0, Type::Ref));
-        host.set_forwarded_const(Const::Ref(GcRef(0x1000)));
+        host.set_forwarded_const(Const::from_gcref(GcRef(0x1000)));
         let first = host.get_box_replacement(false);
         let second = host.get_box_replacement(false);
         assert!(first.is_small_wide());
@@ -1364,7 +1399,7 @@ mod tests {
         assert_eq!(null.type_(), Type::Ref);
         assert_eq!(null.const_value(), Some(Value::Ref(GcRef::NULL)));
         assert_eq!(null.to_opref(), OpRef::const_ptr(GcRef::NULL));
-        assert!(null.same_box(&Operand::const_(Const::Ref(GcRef::NULL))));
+        assert!(null.same_box(&Operand::const_(Const::from_gcref(GcRef::NULL))));
 
         #[cfg(target_pointer_width = "64")]
         assert_eq!(std::mem::size_of::<Operand>(), 8);

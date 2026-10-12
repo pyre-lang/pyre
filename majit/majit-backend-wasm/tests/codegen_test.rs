@@ -4044,7 +4044,7 @@ fn test_folded_producer_ref_is_interned() {
     let producer = OpRc::new(Op::new(OpCode::SameAsR, &[]));
     producer.pos().set(OpRef::ref_op(99));
     let folded = Operand::from_bound_op(&producer);
-    folded.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0x1000)));
+    folded.set_forwarded_const(majit_ir::Const::from_gcref(majit_ir::GcRef(0x1000)));
 
     let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
     let same = Op::new(OpCode::SameAsR, &[folded]);
