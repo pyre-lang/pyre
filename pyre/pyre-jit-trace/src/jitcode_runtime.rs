@@ -1578,9 +1578,15 @@ fn register_synthetic_struct_tids() {
     if !majit_gc::gc_sync::is_initialized() {
         return;
     }
-    // One registration per collector. `reset_gc_fresh_for_test` installs a
-    // new `MiniMarkGC`; a process-wide `Once` would leave that registry
-    // without the tids already stamped on the shared size descriptors.
+    // No caller re-registers these tids onto a fresh collector.
+    // `store_singleton` keeps the first box, and `build_gc` in
+    // `test_gc_rebuild_verifies_published_subclass_ranges` is not installed,
+    // so `gc_op` never sees a second `MiniMarkGC` and
+    // `replay_synthetic_struct_tids` does not run. The address is recorded
+    // so a later call on the same still-open registry can stamp tids minted
+    // after the first pass (`rehydrate_build_descr_raw_sets` after its
+    // EffectInfo mints). A process-wide `Once` would skip that stamp. The
+    // same address returns once `types_frozen`.
     static LAST_GC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     majit_gc::gc_sync::gc_op(|gc| {
         use majit_gc::GcAllocator;
