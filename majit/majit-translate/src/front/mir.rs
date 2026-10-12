@@ -22962,7 +22962,9 @@ impl<'a> Lowering<'a> {
     /// makes about the read half: the translated graph already carries that
     /// reference in a slot the backend root map rewrites when the object
     /// moves.  `get(base + k)` / `get(len + k)` answers with the value the
-    /// `k`-th pin published, for the same reason.
+    /// `k`-th pin published, for the same reason. A [`RootSlotGetter`]
+    /// closure is that read with the callee as the closure `call`:
+    /// `get_sites` names the pin, and the capture temps bind no Variable.
     fn lower_erased_root_bracket_call(
         &mut self,
         mir_bb: usize,
@@ -22980,7 +22982,28 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         };
         if !path.split("::").any(|s| s == "gc_roots") {
-            return Ok(false);
+            // A RootSlotGetter closure: `analyze_root_brackets` records the
+            // call in `get_sites` and the capture temps bind no Variable.
+            // The callee is the closure `call`, so the gc_roots leaf match
+            // below would miss it and the skipped receiver would read as an
+            // uninitialised local.
+            let Some(value) = self.root_bracket.get_answer(mir_bb) else {
+                return Ok(false);
+            };
+            let bound = self.local_var[value]
+                .as_ref()
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
+                    ))
+                })?
+                .one()?;
+            self.local_var[dest_local] = Some(LocalValue::One(bound));
+            let bb_id = self.emit_bb(mir_bb);
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
         }
         let leaf = path.rsplit("::").next().unwrap_or("");
         let receiver_scope = operand_local(call.args.first())
@@ -93960,6 +93983,10 @@ mod tests {
         );
         assert_eq!(plan.pins.get(&3), Some(&vec![1]));
         assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
+        // Callee 9 is `fixture::len_reload::call`, not a `gc_roots` leaf.
+        // `lower_erased_root_bracket_call` answers that block through
+        // `get_answer` so the skipped capture temps are never resolved.
+        assert_eq!(plan.get_answer(3), Some(1usize));
         assert_eq!(plan.slot_temps.get(&4), Some(&3), "the len result");
         assert!(
             plan.slot_temps.get(&5).is_none(),
