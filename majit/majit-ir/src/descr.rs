@@ -7049,6 +7049,45 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     field_specs: &[SimpleFieldDescrSpec],
     extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
 ) -> SimpleDescrGroup {
+    make_simple_descr_group_keyed_with_inlined_parent(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        headerless,
+        field_specs,
+        extra_gc_fielddescrs,
+        &[],
+    )
+}
+
+/// [`make_simple_descr_group_keyed_with_headerless`] for a STRUCT whose first
+/// field is an inlined parent STRUCT.
+///
+/// `heaptracker.py all_fielddescrs` recurses into an inlined `lltype.Struct`
+/// with `get_field_descr(gccache, INNER, name)`, so an inherited field is the
+/// parent STRUCT's own FieldDescr object, and `get_fielddescr_index_in` gives
+/// it the same index in both. `inlined_parent` is that parent's positional
+/// list without its header leaf; the rows keep their parent SizeDescr and
+/// precede this STRUCT's own fields in the returned `field_descrs`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+)]
+pub fn make_simple_descr_group_keyed_with_inlined_parent(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    field_specs: &[SimpleFieldDescrSpec],
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    inlined_parent: &[Arc<SimpleFieldDescr>],
+) -> SimpleDescrGroup {
     let struct_key = LLType::struct_key(cache_key);
     // Before `get_field_descr` below can normalise anything: the producer's own
     // `index_in_parent` against the position it hands the field in.
@@ -7075,10 +7114,17 @@ pub fn make_simple_descr_group_keyed_with_headerless(
             gc_only.push(fd.clone());
         }
     }
-    let leading_len = leading.len();
+    let leading_len = leading.len() + inlined_parent.len();
+    debug_assert!(
+        inlined_parent
+            .iter()
+            .enumerate()
+            .all(|(i, fd)| fd.index_in_parent() == leading.len() + i),
+        "an inlined parent field keeps its parent index"
+    );
     // descr.py — cache-or-mint each FieldDescr by
     // `(STRUCT, fieldname)` before freezing this producer's positional list.
-    let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
+    let own_field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
         .iter()
         .map(|spec| {
             gc.get_field_descr_declaring(
@@ -7105,6 +7151,11 @@ pub fn make_simple_descr_group_keyed_with_headerless(
                 spec.is_class_word,
             )
         })
+        .collect();
+    let field_descrs: Vec<Arc<SimpleFieldDescr>> = inlined_parent
+        .iter()
+        .chain(own_field_descrs.iter())
+        .cloned()
         .collect();
     let mut all_fielddescrs: Vec<Arc<dyn FieldDescr>> = leading.iter().cloned().collect();
     all_fielddescrs.extend(
@@ -7134,7 +7185,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
         .cloned()
         .unwrap_or_else(|| size_descr.clone() as DescrRef);
     // descr.py — each shared field reports the current cached SizeDescr.
-    for fd in &field_descrs {
+    for fd in &own_field_descrs {
         fd.set_parent_descr(&parent);
     }
     // The cache keeps one SizeDescr per struct key. Several classes share
@@ -7212,6 +7263,42 @@ pub fn publish_borrowed_struct_layout(
         extra_gc_fielddescrs,
         fields,
         false,
+        &[],
+    )
+    .expect("unconditional borrowed layout mint")
+}
+
+/// [`publish_borrowed_struct_layout`] for a STRUCT whose first field is an
+/// inlined parent STRUCT. See
+/// [`make_simple_descr_group_keyed_with_inlined_parent`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+)]
+pub fn publish_borrowed_struct_layout_with_inlined_parent(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    fields: Vec<BorrowedField>,
+    inlined_parent: &[Arc<SimpleFieldDescr>],
+) -> SimpleDescrGroup {
+    publish_borrowed_struct_layout_inner(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        headerless,
+        extra_gc_fielddescrs,
+        fields,
+        false,
+        inlined_parent,
     )
     .expect("unconditional borrowed layout mint")
 }
@@ -7240,6 +7327,7 @@ pub fn publish_borrowed_struct_layout_if_absent(
         extra_gc_fielddescrs,
         fields,
         true,
+        &[],
     )
 }
 
@@ -7254,6 +7342,7 @@ fn publish_borrowed_struct_layout_inner(
     extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
     fields: Vec<BorrowedField>,
     only_if_absent: bool,
+    inlined_parent: &[Arc<SimpleFieldDescr>],
 ) -> Option<SimpleDescrGroup> {
     let struct_key = LLType::struct_key(cache_key);
     let mut gc = gc_cache().lock();
@@ -7288,10 +7377,17 @@ fn publish_borrowed_struct_layout_inner(
             gc_only.push(fd.clone());
         }
     }
-    let leading_len = leading.len();
+    let leading_len = leading.len() + inlined_parent.len();
+    debug_assert!(
+        inlined_parent
+            .iter()
+            .enumerate()
+            .all(|(i, fd)| fd.index_in_parent() == leading.len() + i),
+        "an inlined parent field keeps its parent index"
+    );
     // descr.py `get_field_descr` fills `cache[STRUCT][fieldname]` on the miss
     // that mints the field. Kind-0 bake is that miss: one complete layout.
-    let field_descrs: Vec<Arc<SimpleFieldDescr>> = fields
+    let own_field_descrs: Vec<Arc<SimpleFieldDescr>> = fields
         .iter()
         .map(|spec| {
             let field_key: &str = if spec.field_key.is_empty() {
@@ -7342,6 +7438,11 @@ fn publish_borrowed_struct_layout_inner(
             }
         })
         .collect();
+    let field_descrs: Vec<Arc<SimpleFieldDescr>> = inlined_parent
+        .iter()
+        .chain(own_field_descrs.iter())
+        .cloned()
+        .collect();
     let mut all_fielddescrs = leading;
     all_fielddescrs.extend(
         field_descrs
@@ -7365,7 +7466,7 @@ fn publish_borrowed_struct_layout_inner(
         .get(&struct_key)
         .cloned()
         .unwrap_or_else(|| size_descr.clone() as DescrRef);
-    for fd in &field_descrs {
+    for fd in &own_field_descrs {
         fd.set_parent_descr(&parent);
     }
     let built = size_descr;

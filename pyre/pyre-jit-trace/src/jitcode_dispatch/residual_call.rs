@@ -3379,17 +3379,39 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
         // pure shapes — skip the stamp for void.
         majit_ir::Type::Void => return recorded,
     };
-    // `pyjitpl.py:1945` follows the executed pure call with
-    // `record_result_of_call_pure`: an all-`Const` argument list cuts the call
-    // back out of the trace and hands the result back as a constant, and any
-    // other argument list populates `call_pure_results` so a later call with
-    // the same arguments reuses the value.  Executing the helper without that
-    // step leaves a `CallPure*` standing on constants, which is not what an
-    // elidable leaf over an immutable block is supposed to record.
+    record_executed_pure_call_result(
+        ctx,
+        call_opcode,
+        allboxes,
+        &arg_values,
+        descr,
+        patch_pos,
+        recorded,
+        result_value,
+    )
+}
+
+/// `record_result_of_call_pure` as `MIFrame.execute_varargs` reaches it:
+/// the pure call has been executed and raised nothing.  An all-`Const`
+/// argument list cuts the call back out of the trace and hands the result
+/// back as a constant; any other argument list populates `call_pure_results`
+/// so a later call with the same arguments reuses the value.  Returns the
+/// OpRef that carries the result afterwards.
+#[allow(clippy::too_many_arguments)]
+fn record_executed_pure_call_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    call_opcode: OpCode,
+    allboxes: &[OpRef],
+    arg_values: &[majit_ir::Value],
+    descr: majit_ir::DescrRef,
+    patch_pos: majit_metainterp::recorder::TracePosition,
+    recorded: OpRef,
+    result_value: majit_ir::Value,
+) -> OpRef {
     let folded = ctx.trace_ctx.record_result_of_call_pure(
         recorded,
         allboxes,
-        &arg_values,
+        arg_values,
         descr,
         patch_pos,
         call_opcode,
@@ -3406,6 +3428,59 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
         ctx.trace_ctx.try_set_opref_concrete(folded, result_value);
     }
     folded
+}
+
+/// The `pure and not last_exc_value and op` step of `MIFrame.execute_varargs`
+/// for an elidable call that may raise.  Such a call is executed by
+/// [`try_execute_residual_call_via_executor`] so a raise is transcribed; when
+/// it returned normally, `record_result_of_call_pure` runs on it exactly as it
+/// does for the cannot-raise half.  The caller reads the returned OpRef for
+/// `exc = exc and not isinstance(op, Const)`: a result folded to a constant
+/// takes no `GUARD_NO_EXCEPTION`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_result_of_executed_pure_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    call_opcode: OpCode,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    descr: majit_ir::DescrRef,
+    patch_pos: majit_metainterp::recorder::TracePosition,
+    recorded: OpRef,
+    exec: ResidualExecOutcome,
+) -> OpRef {
+    if !matches!(
+        call_opcode,
+        OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN
+    ) {
+        return recorded;
+    }
+    let ResidualExecOutcome::Executed(Ok(result_i64)) = exec else {
+        return recorded;
+    };
+    let result_value = match call_descr.result_type() {
+        majit_ir::Type::Int => majit_ir::Value::Int(result_i64),
+        majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
+        majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
+        // `if pure and not last_exc_value and op`: a void call has no `op`.
+        majit_ir::Type::Void => return recorded,
+    };
+    let mut arg_values = Vec::with_capacity(allboxes.len());
+    for &arg in allboxes {
+        let Some(value) = ctx.trace_ctx.box_value(arg) else {
+            return recorded;
+        };
+        arg_values.push(value);
+    }
+    record_executed_pure_call_result(
+        ctx,
+        call_opcode,
+        allboxes,
+        &arg_values,
+        descr,
+        patch_pos,
+        recorded,
+        result_value,
+    )
 }
 
 /// Whether Ref argument `arg_index` of a may-force CALL to `helper` is a
@@ -8485,6 +8560,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    // The construct fold declined: an exception class whose `__new__` and
+    // `__init__` are both builtin gateways descends `descr_call` like any
+    // other class.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && let Some(inlined) = try_walker_inline_exception_type_call(
+            ctx, op, code, funcptr, 1, &r_args, call_descr, dst_bank, dst,
+        )?
+    {
+        return Ok(inlined);
+    }
     // `BaseException___reduce___impl`: `(cls, args)` when `w_dict` is
     // NULL, `(cls, args, dict)` when the pointer is set. Residual
     // `bh_call_fn(__reduce__)` otherwise forces the virtual exception
@@ -8819,6 +8904,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             Some((op.next_pc, dst_bank, dst)),
             namespace_write_journaled,
         )?;
+        // `execute_varargs`: `if pure and not last_exc_value and op:
+        // op = record_result_of_call_pure(...)`, then
+        // `exc = exc and not isinstance(op, Const)`.
+        let recorded = record_result_of_executed_pure_call(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            descr.clone(),
+            patch_pos,
+            recorded,
+            resid_exec,
+        );
+        let can_raise = can_raise && recorded.inline_const_to_value().is_none();
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
@@ -10318,6 +10417,20 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             Some((op.next_pc, dst_bank, dst)),
             namespace_write_journaled,
         )?;
+        // `execute_varargs`: `if pure and not last_exc_value and op:
+        // op = record_result_of_call_pure(...)`, then
+        // `exc = exc and not isinstance(op, Const)`.
+        let recorded = record_result_of_executed_pure_call(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            descr.clone(),
+            patch_pos,
+            recorded,
+            resid_exec,
+        );
+        let can_raise = can_raise && recorded.inline_const_to_value().is_none();
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
@@ -10638,6 +10751,20 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             Some((op.next_pc, dst_bank, dst)),
             namespace_write_journaled,
         )?;
+        // `execute_varargs`: `if pure and not last_exc_value and op:
+        // op = record_result_of_call_pure(...)`, then
+        // `exc = exc and not isinstance(op, Const)`.
+        let recorded = record_result_of_executed_pure_call(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            descr.clone(),
+            patch_pos,
+            recorded,
+            resid_exec,
+        );
+        let can_raise = can_raise && recorded.inline_const_to_value().is_none();
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see

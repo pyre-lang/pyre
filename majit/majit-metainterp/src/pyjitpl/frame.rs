@@ -700,8 +700,15 @@ impl MIFrame {
     }
 
     /// pyjitpl.py `MIFrame.setup_resume_at_op(pc)`.
+    ///
+    /// `last_opcode_position` follows `pc`, the way `setup` seats both and
+    /// `BlackholeInterpreter::reset_position_state` does for a resumed
+    /// blackhole frame. `prepare_resume_from_failure` runs
+    /// `finishframe_exception` on the rebuilt frame before any opcode has
+    /// dispatched, and the traceback node it attaches reads this cursor.
     pub fn setup_resume_at_op(&mut self, pc: usize) {
         self.pc = pc;
+        self.last_opcode_position = pc;
     }
 
     /// pyjitpl.py `MIFrame.handle_rvmprof_enter_on_resume`.

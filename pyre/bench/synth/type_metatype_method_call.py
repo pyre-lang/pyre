@@ -1,9 +1,10 @@
-# pyre-check: max-pypy-ratio=9
+# pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # The loop count is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At
 # 200000 iterations pypy exec is under `EXEC_TIME_FLOOR_S` and the ratio
 # prints with a `~`, so no ceiling is applied.  320000000 iterations land
-# pypy near 0.13s.  Local dynasm reads 4.2x; 9 leaves room for cranelift
+# pypy near 0.18s.  Local dynasm reads 1.1x with the `name == 'ping'`
+# `jit_ll_streq` folded on constant arguments; 3 leaves room for cranelift
 # and a slower host.  cpython cannot run this many inside the reference
 # timeout.
 # A metaclass resolves `Cls.name()` before the class's own MRO does:

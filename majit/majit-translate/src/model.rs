@@ -5084,6 +5084,71 @@ pub(crate) fn fuse_boxing_alloc_with(
         registered_struct_layout(&owner, struct_field_attrs)
             .map(|rows| rows.iter().any(|(name, _)| name == field_name))
     }
+    /// The aggregates from `agg` down to the one that stores the header, each
+    /// paired with its struct owner.
+    ///
+    /// `heaptracker.py _has_gcstruct_a_vtable`: `while not
+    /// GCSTRUCT._hints.get('typeptr'): _, GCSTRUCT = GCSTRUCT._first_struct()`.
+    /// A level that writes `ob_header` / `ob` ends the chain; any other level
+    /// must hold exactly one constructed parent struct in field zero.  A
+    /// struct whose field-zero chain reaches no header is the chain of length
+    /// one, which leaves the plain `new` decision to `resolve_header_plan`.
+    fn first_struct_chain(
+        graph: &FunctionGraph,
+        agg: &Variable,
+        owner: &str,
+        site: (usize, usize),
+        struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+        expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+    ) -> Vec<(Variable, String)> {
+        let own = || vec![(agg.clone(), owner.to_string())];
+        let mut chain = own();
+        for _ in 0..8 {
+            let (level, level_owner) = chain.last().expect("chain starts non-empty");
+            if any_store(graph, level, "ob_header") || any_store(graph, level, "ob") {
+                return chain;
+            }
+            let Some((first, _)) = registered_struct_layout(level_owner, struct_field_attrs)
+                .and_then(|layout| layout.first())
+            else {
+                return own();
+            };
+            // `_first_struct` answers only for a field zero that is itself an
+            // `lltype.Struct`; a pointer to a constructed struct is one word.
+            if expand_inline_struct(level_owner, first).is_none() {
+                return own();
+            }
+            let Some(parent) = store_value(graph, level, first, site) else {
+                return own();
+            };
+            let mut roots = Vec::new();
+            if !store_roots(graph, &parent, 8, &mut roots) {
+                return own();
+            }
+            let Some((root, others)) = roots.split_first() else {
+                return own();
+            };
+            if others.iter().any(|other| other != root) {
+                return own();
+            }
+            let parent_owner =
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .find_map(|op| match (&op.result, &op.kind) {
+                        (Some(r), OpKind::Call { target, .. }) if r == root => {
+                            synthetic_transparent_ctor_owner(target, graph.name.split("::").next())
+                        }
+                        _ => None,
+                    });
+            let Some(parent_owner) = parent_owner else {
+                return own();
+            };
+            chain.push((root.clone(), parent_owner));
+        }
+        own()
+    }
     struct Payload {
         field: FieldDescriptor,
         value: LinkArg,
@@ -5476,7 +5541,82 @@ pub(crate) fn fuse_boxing_alloc_with(
                 );
                 continue;
             };
-            let Some(fields) = payload_fields(&owner, struct_field_attrs) else {
+            // `heaptracker.py _has_gcstruct_a_vtable` walks
+            // `GCSTRUCT._first_struct()` until it reaches the struct whose
+            // hints carry `typeptr`.  A boxing struct that inlines its parent
+            // as field zero (`W_ExceptionExtended { base: W_BaseException {
+            // ob_header, .. }, .. }`) is that chain: resolve it down to the
+            // aggregate that stores the header, innermost last.
+            let chain = first_struct_chain(
+                graph,
+                agg,
+                &owner,
+                (rewrite_bi, rewrite_oi),
+                struct_field_attrs,
+                expand_inline_struct,
+            );
+            // Resolve every payload field's store: `FieldWrite { base: %agg,
+            // field.name == payload }`.  A malformed cluster missing any payload
+            // store is left untouched so the annotate wall still flags it.
+            // Conflicting stores also decline: no reaching write is known.
+            //
+            // `heaptracker.py all_fielddescrs` recurses into an inlined struct
+            // and numbers its leaves through the inner struct's own
+            // descriptors, parent first.  Each level's stores keep the
+            // descriptor the front end gave them, so the innermost aggregate's
+            // fields come first and each enclosing level follows, skipping
+            // the field-zero parent it has just been flattened from.
+            let mut payloads = Vec::new();
+            let mut complete = true;
+            let mut layout_known = true;
+            'levels: for (depth, (level, level_owner)) in chain.iter().enumerate().rev() {
+                let Some(fields) = payload_fields(level_owner, struct_field_attrs) else {
+                    layout_known = false;
+                    break;
+                };
+                // Every level but the innermost stores its parent in field
+                // zero; `payload_fields` already dropped the header there.
+                let skip = usize::from(depth + 1 != chain.len());
+                for (field_name, payload_ty) in fields.iter().skip(skip) {
+                    // Inlined nested structs (`W_ListObject.int_items: IntArray`)
+                    // are not payload setfields of the boxing cluster.
+                    // `NewWithVtable` zero-fills them (`clear_gc_fields`); the
+                    // owner then stores dotted leaves (`int_items.block`)
+                    // through `list.int_set_items` / `heaptracker.py
+                    // all_fielddescrs`. A by-value store of the nested struct
+                    // would apply the inner offsets to the outer object and
+                    // overlay `ob_header`.
+                    if expand_inline_struct(level_owner, field_name).is_some() {
+                        continue;
+                    }
+                    let found = unique_store(graph, level, field_name.as_str()).and_then(|store| {
+                        store
+                            .locations
+                            .iter()
+                            .any(|&(block, op)| {
+                                store_dominates_site(
+                                    graph,
+                                    level,
+                                    (block, op),
+                                    (rewrite_bi, rewrite_oi),
+                                )
+                            })
+                            .then(|| (store.field.clone(), store.value.clone()))
+                    });
+                    match found {
+                        Some((field, value)) => payloads.push(Payload {
+                            field,
+                            value,
+                            ty: payload_ty.clone(),
+                        }),
+                        None => {
+                            complete = false;
+                            break 'levels;
+                        }
+                    }
+                }
+            }
+            if !layout_known {
                 // Either the struct has no registered field layout at all,
                 // or its leaf name is ambiguous across the layout map.  Both
                 // leave `malloc_typed` residual; `registered_layout` is where
@@ -5487,45 +5627,6 @@ pub(crate) fn fuse_boxing_alloc_with(
                     format_args!("{owner} in {}", graph.name),
                 );
                 continue;
-            };
-            // Resolve every payload field's store: `FieldWrite { base: %agg,
-            // field.name == payload }`.  A malformed cluster missing any payload
-            // store is left untouched so the annotate wall still flags it.
-            // Conflicting stores also decline: no reaching write is known.
-            let mut payloads = Vec::with_capacity(fields.len());
-            let mut complete = true;
-            for (field_name, payload_ty) in &fields {
-                // Inlined nested structs (`W_ListObject.int_items: IntArray`)
-                // are not payload setfields of the boxing cluster.
-                // `NewWithVtable` zero-fills them (`clear_gc_fields`); the
-                // owner then stores dotted leaves (`int_items.block`)
-                // through `list.int_set_items` / `heaptracker.py
-                // all_fielddescrs`. A by-value store of the nested struct
-                // would apply the inner offsets to the outer object and
-                // overlay `ob_header`.
-                if expand_inline_struct(&owner, field_name).is_some() {
-                    continue;
-                }
-                let found = unique_store(graph, agg, field_name.as_str()).and_then(|store| {
-                    store
-                        .locations
-                        .iter()
-                        .any(|&(block, op)| {
-                            store_dominates_site(graph, agg, (block, op), (rewrite_bi, rewrite_oi))
-                        })
-                        .then(|| (store.field.clone(), store.value.clone()))
-                });
-                match found {
-                    Some((field, value)) => payloads.push(Payload {
-                        field,
-                        value,
-                        ty: payload_ty.clone(),
-                    }),
-                    None => {
-                        complete = false;
-                        break;
-                    }
-                }
             }
             if !complete {
                 crate::decline::record(
@@ -5535,6 +5636,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                 );
                 continue;
             }
+            let (header_agg, _) = chain.last().expect("the chain holds the aggregate itself");
             // Leave the cluster unfused when the `ob_header.ob_type` store
             // carries no resolvable constant type-pointer.  A `NewWithVtable`
             // requires a non-zero type pointer — a zero vtable would stamp a
@@ -5554,7 +5656,8 @@ pub(crate) fn fuse_boxing_alloc_with(
             // `model::resolve_header_plan` rows are where that is recorded,
             // and this row is the count of clusters the fuse gave up on for
             // any header reason at all.
-            let Some(header) = resolve_header_plan(graph, agg, (rewrite_bi, rewrite_oi)) else {
+            let Some(header) = resolve_header_plan(graph, header_agg, (rewrite_bi, rewrite_oi))
+            else {
                 crate::decline::record(
                     FUSE_GATE,
                     "vtable-unresolved",
@@ -13374,6 +13477,155 @@ mod tests {
             "the live return cast must survive"
         );
         let _ = ret;
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_flattens_a_first_struct_parent_chain() {
+        // `Derived { base: Base { ob_header: PyObject { .. }, args }, extra }`:
+        // the header sits one struct down the field-zero chain
+        // (`heaptracker.py _has_gcstruct_a_vtable`).  The allocation takes the
+        // outer owner and the header's type word, and every leaf arrives as a
+        // store through its own struct's descriptor, parent fields first
+        // (`heaptracker.py all_fielddescrs`).  `w_class` is an operand, not
+        // `get_instantiate` of the type word, so it is kept as a store too.
+        type Var = crate::flowspace::model::Variable;
+        let cast_instance = |to: &str, arg: &Var| crate::model::cast_instance_call(to, arg.clone());
+        let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor::new(name, Some(owner.to_string())),
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let ctor = |name: &str| OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor(name),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some(name.into())),
+        };
+        let mut attrs = numeric_boxing_attrs();
+        attrs.insert(
+            "Base".to_string(),
+            vec![
+                ("ob_header".to_string(), ValueType::Ref(None)),
+                ("args".to_string(), ValueType::Ref(None)),
+            ],
+        );
+        attrs.insert(
+            "Derived".to_string(),
+            vec![
+                ("base".to_string(), ValueType::Ref(Some("Base".into()))),
+                ("extra".to_string(), ValueType::Ref(None)),
+            ],
+        );
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let w_class = graph.alloc_value_var();
+        let args = graph.alloc_value_var();
+        let extra = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![w_class.clone(), args.clone(), extra.clone()];
+        let ty_addr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        let ob_type = graph
+            .push_op_var(entry, cast_instance("PyType", &ty_addr), true)
+            .unwrap();
+        let header = graph.push_op_var(entry, ctor("PyObject"), true).unwrap();
+        graph.push_op_var(
+            entry,
+            field(&header, "ob_type", "PyObject", &ob_type),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&header, "w_class", "PyObject", &w_class),
+            false,
+        );
+        let base = graph.push_op_var(entry, ctor("Base"), true).unwrap();
+        graph.push_op_var(entry, field(&base, "ob_header", "Base", &header), false);
+        graph.push_op_var(entry, field(&base, "args", "Base", &args), false);
+        let agg = graph.push_op_var(entry, ctor("Derived"), true).unwrap();
+        graph.push_op_var(entry, field(&agg, "base", "Derived", &base), false);
+        graph.push_op_var(entry, field(&agg, "extra", "Derived", &extra), false);
+        let raw = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("Derived".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(raw.clone()));
+
+        // A field zero declared as a pointer word is not a `_first_struct`
+        // parent: the chain stops at `Derived`, which stores no header.
+        let mut pointer_parent = graph.clone();
+        fuse_boxing_alloc(&mut pointer_parent, &attrs);
+        assert!(
+            !pointer_parent
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
+            "a pointer field zero must not lend its header to the outer owner"
+        );
+
+        let base_is_inlined =
+            |owner: &str, field: &str| (owner == "Derived" && field == "base").then(Vec::new);
+        assert_eq!(
+            fuse_boxing_alloc_with(&mut graph, &attrs, &base_is_inlined),
+            1
+        );
+        prune_dead_boxing_remnants(&mut graph);
+
+        let ops = &graph.block(entry).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewWithVtable { owner, vtable }
+                    if owner == "Derived" && *vtable == 4357049520
+            )),
+            "the outer owner allocates with the chain's type word: {:#?}",
+            ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
+        );
+        let stores: Vec<(&str, Option<&str>, &LinkArg)> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    base, field, value, ..
+                } if base == &raw => {
+                    Some((field.name.as_str(), field.owner_root.as_deref(), value))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stores,
+            vec![
+                ("w_class", Some("PyObject"), &LinkArg::Value(w_class)),
+                ("args", Some("Base"), &LinkArg::Value(args)),
+                ("extra", Some("Derived"), &LinkArg::Value(extra)),
+            ],
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            )),
+            "every level of the dead aggregate chain must be swept: {:#?}",
+            ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
+        );
     }
 
     #[test]

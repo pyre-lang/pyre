@@ -4206,8 +4206,8 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_exc_type_with_init(
             "UnicodeDecodeError",
             Some("Unicode decoding error."),
-            exc_unicode_decode_error_new,
-            Some(exc_unicode_decode_error_init),
+            __majit_wrap_exc_unicode_decode_error_descr_new,
+            Some(__majit_wrap_exc_unicode_decode_error_descr_init),
             unicode_error,
         )
     );
@@ -4218,8 +4218,8 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_exc_type_with_init(
             "UnicodeEncodeError",
             Some("Unicode encoding error."),
-            exc_unicode_encode_error_new,
-            Some(exc_unicode_encode_error_init),
+            __majit_wrap_exc_unicode_encode_error_descr_new,
+            Some(__majit_wrap_exc_unicode_encode_error_descr_init),
             unicode_error,
         )
     );
@@ -4229,8 +4229,8 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error, unicode_error => make_exc_type_with_init(
             "UnicodeTranslateError",
             Some("Unicode translation error."),
-            exc_unicode_translate_error_new,
-            Some(exc_unicode_translate_error_init),
+            __majit_wrap_exc_unicode_translate_error_descr_new,
+            Some(__majit_wrap_exc_unicode_translate_error_descr_init),
             unicode_error,
         )
     );
@@ -10232,6 +10232,469 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         pyre_object::interp_exceptions::w_exception_set_reason(slot(0), slot(5));
     }
     Ok(pyre_object::w_none())
+}
+
+/// The fixed `args_w` list of five positionals: `ll_newlist` and one
+/// `setarrayitem` per item, the array `Arguments.__init__` fixes with
+/// `make_sure_not_resized`.  [`pyre_object::interp_exceptions::rlist_new`]
+/// builds the same block from a `Vec`, which a traced body cannot record.
+#[inline(never)]
+unsafe fn exc_args_w_of_five(
+    a1: PyObjectRef,
+    a2: PyObjectRef,
+    a3: PyObjectRef,
+    a4: PyObjectRef,
+    a5: PyObjectRef,
+) -> PyObjectRef {
+    // The block malloc can collect; the items are read back from their slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot1 = pyre_object::gc_roots::pin_roots(&[a1, a2, a3, a4, a5]);
+    let (slot2, slot3, slot4, slot5) = (slot1 + 1, slot1 + 2, slot1 + 3, slot1 + 4);
+    let block = crate::baseobjspace::tuple_ll_newlist(5);
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        0,
+        pyre_object::gc_roots::shadow_stack_get(slot1),
+    );
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        1,
+        pyre_object::gc_roots::shadow_stack_get(slot2),
+    );
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        2,
+        pyre_object::gc_roots::shadow_stack_get(slot3),
+    );
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        3,
+        pyre_object::gc_roots::shadow_stack_get(slot4),
+    );
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        4,
+        pyre_object::gc_roots::shadow_stack_get(slot5),
+    );
+    // The cast is its own local so the return is the block reference.
+    let args_w = block as PyObjectRef;
+    args_w
+}
+
+/// The fixed `args_w` list of four positionals; see [`exc_args_w_of_five`].
+#[inline(never)]
+unsafe fn exc_args_w_of_four(
+    a1: PyObjectRef,
+    a2: PyObjectRef,
+    a3: PyObjectRef,
+    a4: PyObjectRef,
+) -> PyObjectRef {
+    // The block malloc can collect; the items are read back from their slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot1 = pyre_object::gc_roots::pin_roots(&[a1, a2, a3, a4]);
+    let (slot2, slot3, slot4) = (slot1 + 1, slot1 + 2, slot1 + 3);
+    let block = crate::baseobjspace::tuple_ll_newlist(4);
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        0,
+        pyre_object::gc_roots::shadow_stack_get(slot1),
+    );
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        1,
+        pyre_object::gc_roots::shadow_stack_get(slot2),
+    );
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        2,
+        pyre_object::gc_roots::shadow_stack_get(slot3),
+    );
+    pyre_object::object_array::items_block_set_ref(
+        block,
+        3,
+        pyre_object::gc_roots::shadow_stack_get(slot4),
+    );
+    // The cast is its own local so the return is the block reference.
+    let args_w = block as PyObjectRef;
+    args_w
+}
+
+// `descr_new_base_exception(space, w_subtype, __args__)` as the gateway the
+// tracer enters for one Unicode error class: `exc =
+// space.allocate_instance(W_Unicode*Error, w_subtype)` then `exc.args_w =
+// args_w`, without validating — type checks live in `descr_init`.
+//
+// The looked-inside arm is the exact class called with exactly the
+// positionals its `descr_init` takes, the last of which is not the trailing
+// `__pyre_kw__` marker.  The canonical class is immortal, so only the items
+// cross the block malloc; the instance malloc after it does not collect, and
+// the instance is a `new_with_vtable` the optimizer can keep virtual.
+//
+// Every other shape — another arity, keywords, a subclass and its
+// `_getusercls` layout — runs the `exc_new_wrapper!` constructor through the
+// word ABI, for the reason [`__majit_wrap_exc_value_error_descr_new`] gives.
+// The `$slow` residual cannot see a tail longer than its words, so `$long`
+// hands the real slice over rather than shortening it; it is a residual for
+// the same reason as [`exc_value_error_new_long`].
+macro_rules! unicode_error_descr_new_gateway {
+    (
+        wrapper = $wrapper:ident,
+        target = $target:ident,
+        exact = $exact:ident,
+        body = $body:ident,
+        slow = $slow:ident,
+        long = $long:ident,
+        ctor = $ctor:ident,
+        kind = $kind:ident,
+        allocate = $allocate:ident,
+        args_w = $args_w:ident,
+        words = $words:literal,
+        last = $last:literal,
+        items = [$($index:literal => $item:ident),+]
+    ) => {
+        /// True for the canonical class, whose instances take the realbase
+        /// layout.  A subclass allocates `_getusercls` instead.
+        #[inline]
+        fn $exact(w_subtype: PyObjectRef) -> bool {
+            std::ptr::eq(
+                w_subtype,
+                pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+                    pyre_object::interp_exceptions::ExcKind::$kind,
+                ),
+            )
+        }
+
+        pub fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if args.len() == $words
+                && !args[0].is_null()
+                && !builtin_kwargs_marker_tail(args[$last])
+                && $exact(args[0])
+            {
+                return Ok(unsafe { $body(args[0], $(args[$index]),+) });
+            }
+            if args.len() > $words {
+                return $long(args);
+            }
+            $slow(
+                args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                $(args.get($index).copied().unwrap_or(pyre_object::PY_NULL),)+
+                args.len() as i64,
+            )
+        }
+
+        #[inline(never)]
+        unsafe fn $body(w_subtype: PyObjectRef, $($item: PyObjectRef),+) -> PyObjectRef {
+            let args_w = $args_w($($item),+);
+            pyre_object::interp_exceptions::$allocate(w_subtype, args_w)
+        }
+
+        #[majit_macros::dont_look_inside]
+        fn $slow(
+            a0: PyObjectRef,
+            $($item: PyObjectRef,)+
+            n: i64,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let buf = [a0, $($item),+];
+            // A count that does not match the words cannot be reconstructed.
+            if !(0..=buf.len() as i64).contains(&n) {
+                return Err(crate::PyError::type_error(
+                    "exception constructor argument count exceeds the values received",
+                ));
+            }
+            $ctor(&buf[..n as usize])
+        }
+
+        #[majit_macros::dont_look_inside]
+        fn $long(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            $ctor(args)
+        }
+
+        crate::builtin_wrapper_descriptor!($target, $wrapper);
+    };
+}
+
+unicode_error_descr_new_gateway!(
+    wrapper = __majit_wrap_exc_unicode_encode_error_descr_new,
+    target = __majit_wrap_exc_unicode_encode_error_descr_new_target,
+    exact = is_exact_unicode_encode_error_class,
+    body = unicode_encode_error_descr_new,
+    slow = exc_unicode_encode_error_new_slow,
+    long = exc_unicode_encode_error_new_long,
+    ctor = exc_unicode_encode_error_new,
+    kind = UnicodeEncodeError,
+    allocate = w_unicode_encode_error_allocate,
+    args_w = exc_args_w_of_five,
+    words = 6,
+    last = 5,
+    items = [1 => a1, 2 => a2, 3 => a3, 4 => a4, 5 => a5]
+);
+unicode_error_descr_new_gateway!(
+    wrapper = __majit_wrap_exc_unicode_decode_error_descr_new,
+    target = __majit_wrap_exc_unicode_decode_error_descr_new_target,
+    exact = is_exact_unicode_decode_error_class,
+    body = unicode_decode_error_descr_new,
+    slow = exc_unicode_decode_error_new_slow,
+    long = exc_unicode_decode_error_new_long,
+    ctor = exc_unicode_decode_error_new,
+    kind = UnicodeDecodeError,
+    allocate = w_unicode_decode_error_allocate,
+    args_w = exc_args_w_of_five,
+    words = 6,
+    last = 5,
+    items = [1 => a1, 2 => a2, 3 => a3, 4 => a4, 5 => a5]
+);
+unicode_error_descr_new_gateway!(
+    wrapper = __majit_wrap_exc_unicode_translate_error_descr_new,
+    target = __majit_wrap_exc_unicode_translate_error_descr_new_target,
+    exact = is_exact_unicode_translate_error_class,
+    body = unicode_translate_error_descr_new,
+    slow = exc_unicode_translate_error_new_slow,
+    long = exc_unicode_translate_error_new_long,
+    ctor = exc_unicode_translate_error_new,
+    kind = UnicodeTranslateError,
+    allocate = w_unicode_translate_error_allocate,
+    args_w = exc_args_w_of_four,
+    words = 5,
+    last = 4,
+    items = [1 => a1, 2 => a2, 3 => a3, 4 => a4]
+);
+
+/// An exact `int` (or `bool`) whose value is in `Py_ssize_t` range: the bound
+/// `unicode_error_index_w` returns without a Python-level `__index__`.
+#[inline]
+unsafe fn unicode_error_index_is_plain(w_value: PyObjectRef) -> bool {
+    if !(is_exact_builtin_instance(w_value) && is_int(w_value)) {
+        return false;
+    }
+    let value = w_int_get_value(w_value);
+    (value as isize) as i64 == value
+}
+
+// `W_Unicode*Error.descr_init` as the gateway the tracer enters.  The
+// looked-inside arm is the call whose every argument is already of the type
+// `descr_init` stores, which `$exact_shape` tests: nothing in that shape can
+// raise, so the checks run before the first store and `$body` is the
+// initializer without its error arms.
+//
+// Every other shape — another arity, keywords, a bound that needs
+// `__index__`, an argument the checks reject or coerce — runs `$init` from
+// the start through the word ABI, for the reason
+// [`__majit_wrap_base_exception_descr_init`] gives.  `$long` is a residual
+// for the same reason as [`exc_base_exception_init_long`].
+macro_rules! unicode_error_descr_init_gateway {
+    (
+        wrapper = $wrapper:ident,
+        target = $target:ident,
+        body = $body:ident,
+        slow = $slow:ident,
+        long = $long:ident,
+        init = $init:ident,
+        words = $words:literal,
+        last = $last:literal,
+        exact_shape = |$args:ident| $exact_shape:expr,
+        items = [$($index:literal => $item:ident),+]
+    ) => {
+        pub fn $wrapper($args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            if $args.len() == $words
+                && !$args[0].is_null()
+                && !builtin_kwargs_marker_tail($args[$last])
+                && unsafe { $exact_shape }
+            {
+                unsafe {
+                    $body($args[0], $($args[$index]),+);
+                }
+                return Ok(pyre_object::w_none());
+            }
+            if $args.len() > $words {
+                return $long($args);
+            }
+            $slow(
+                $args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                $($args.get($index).copied().unwrap_or(pyre_object::PY_NULL),)+
+                $args.len() as i64,
+            )
+        }
+
+        #[majit_macros::dont_look_inside]
+        fn $slow(
+            a0: PyObjectRef,
+            $($item: PyObjectRef,)+
+            n: i64,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let buf = [a0, $($item),+];
+            // A count that does not match the words cannot be reconstructed.
+            if !(0..=buf.len() as i64).contains(&n) {
+                return Err(crate::PyError::type_error(
+                    "exception initializer argument count exceeds the values received",
+                ));
+            }
+            $init(&buf[..n as usize])
+        }
+
+        #[majit_macros::dont_look_inside]
+        fn $long(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            $init(args)
+        }
+
+        crate::builtin_wrapper_descriptor!($target, $wrapper);
+    };
+}
+
+// `UnicodeEncodeError.__init__(self, encoding, object, start, end, reason)`:
+// three `str` (a subclass included) and two plain integer bounds.
+unicode_error_descr_init_gateway!(
+    wrapper = __majit_wrap_exc_unicode_encode_error_descr_init,
+    target = __majit_wrap_exc_unicode_encode_error_descr_init_target,
+    body = unicode_error_descr_init_five,
+    slow = exc_unicode_encode_error_init_slow,
+    long = exc_unicode_encode_error_init_long,
+    init = exc_unicode_encode_error_init,
+    words = 6,
+    last = 5,
+    exact_shape = |args| crate::baseobjspace::isinstance_str_w(args[1])
+        && crate::baseobjspace::isinstance_str_w(args[2])
+        && unicode_error_index_is_plain(args[3])
+        && unicode_error_index_is_plain(args[4])
+        && crate::baseobjspace::isinstance_str_w(args[5]),
+    items = [1 => a1, 2 => a2, 3 => a3, 4 => a4, 5 => a5]
+);
+// `UnicodeDecodeError.__init__(self, encoding, object, start, end, reason)`
+// with `object` already `bytes` (a subclass included), which `descr_init`
+// stores as it is.  A `bytearray` or another buffer export is copied by the
+// residual.
+unicode_error_descr_init_gateway!(
+    wrapper = __majit_wrap_exc_unicode_decode_error_descr_init,
+    target = __majit_wrap_exc_unicode_decode_error_descr_init_target,
+    body = unicode_error_descr_init_five,
+    slow = exc_unicode_decode_error_init_slow,
+    long = exc_unicode_decode_error_init_long,
+    init = exc_unicode_decode_error_init,
+    words = 6,
+    last = 5,
+    exact_shape = |args| crate::baseobjspace::isinstance_str_w(args[1])
+        && crate::baseobjspace::isinstance_bytes_w(args[2])
+        && unicode_error_index_is_plain(args[3])
+        && unicode_error_index_is_plain(args[4])
+        && crate::baseobjspace::isinstance_str_w(args[5]),
+    items = [1 => a1, 2 => a2, 3 => a3, 4 => a4, 5 => a5]
+);
+// `UnicodeTranslateError.__init__(self, object, start, end, reason)`.
+unicode_error_descr_init_gateway!(
+    wrapper = __majit_wrap_exc_unicode_translate_error_descr_init,
+    target = __majit_wrap_exc_unicode_translate_error_descr_init_target,
+    body = unicode_translate_error_descr_init,
+    slow = exc_unicode_translate_error_init_slow,
+    long = exc_unicode_translate_error_init_long,
+    init = exc_unicode_translate_error_init,
+    words = 5,
+    last = 4,
+    exact_shape = |args| crate::baseobjspace::isinstance_str_w(args[1])
+        && unicode_error_index_is_plain(args[2])
+        && unicode_error_index_is_plain(args[3])
+        && crate::baseobjspace::isinstance_str_w(args[4]),
+    items = [1 => a1, 2 => a2, 3 => a3, 4 => a4]
+);
+
+/// `W_UnicodeEncodeError.descr_init` / `W_UnicodeDecodeError.descr_init`
+/// after their checks passed: `W_BaseException.descr_init` stores `args_w`,
+/// then the five slots.  The start and end slots are the reboxed integers;
+/// `args` keeps the originals.
+#[inline(never)]
+unsafe fn unicode_error_descr_init_five(
+    w_self: PyObjectRef,
+    w_encoding: PyObjectRef,
+    w_object: PyObjectRef,
+    w_start: PyObjectRef,
+    w_end: PyObjectRef,
+    w_reason: PyObjectRef,
+) {
+    let start = w_int_get_value(w_start);
+    let end = w_int_get_value(w_end);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot =
+        pyre_object::gc_roots::pin_roots(&[w_self, w_encoding, w_object, w_reason, w_start, w_end]);
+    let (encoding_slot, object_slot, reason_slot) = (self_slot + 1, self_slot + 2, self_slot + 3);
+    let args_w = exc_args_w_of_five(
+        pyre_object::gc_roots::shadow_stack_get(encoding_slot),
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+        pyre_object::gc_roots::shadow_stack_get(self_slot + 4),
+        pyre_object::gc_roots::shadow_stack_get(self_slot + 5),
+        pyre_object::gc_roots::shadow_stack_get(reason_slot),
+    );
+    pyre_object::interp_exceptions::w_exception_set_args(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        args_w,
+    );
+    // The second allocation can move the first one's result.
+    let w_start = pyre_object::w_int_new(start);
+    let start_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_start);
+    let w_end = pyre_object::w_int_new(end);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
+    pyre_object::interp_exceptions::w_exception_set_encoding(
+        w_self,
+        pyre_object::gc_roots::shadow_stack_get(encoding_slot),
+    );
+    pyre_object::interp_exceptions::w_exception_set_object(
+        w_self,
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+    );
+    pyre_object::interp_exceptions::w_exception_set_start(
+        w_self,
+        pyre_object::gc_roots::shadow_stack_get(start_slot),
+    );
+    pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+    pyre_object::interp_exceptions::w_exception_set_reason(
+        w_self,
+        pyre_object::gc_roots::shadow_stack_get(reason_slot),
+    );
+}
+
+/// `W_UnicodeTranslateError.descr_init` after its checks passed:
+/// `W_BaseException.descr_init` stores `args_w`, then the four slots.  The
+/// start and end slots are the reboxed integers; `args` keeps the originals.
+#[inline(never)]
+unsafe fn unicode_translate_error_descr_init(
+    w_self: PyObjectRef,
+    w_object: PyObjectRef,
+    w_start: PyObjectRef,
+    w_end: PyObjectRef,
+    w_reason: PyObjectRef,
+) {
+    let start = w_int_get_value(w_start);
+    let end = w_int_get_value(w_end);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[w_self, w_object, w_reason, w_start, w_end]);
+    let (object_slot, reason_slot) = (self_slot + 1, self_slot + 2);
+    let args_w = exc_args_w_of_four(
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+        pyre_object::gc_roots::shadow_stack_get(self_slot + 3),
+        pyre_object::gc_roots::shadow_stack_get(self_slot + 4),
+        pyre_object::gc_roots::shadow_stack_get(reason_slot),
+    );
+    pyre_object::interp_exceptions::w_exception_set_args(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        args_w,
+    );
+    // The second allocation can move the first one's result.
+    let w_start = pyre_object::w_int_new(start);
+    let start_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_start);
+    let w_end = pyre_object::w_int_new(end);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
+    pyre_object::interp_exceptions::w_exception_set_object(
+        w_self,
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+    );
+    pyre_object::interp_exceptions::w_exception_set_start(
+        w_self,
+        pyre_object::gc_roots::shadow_stack_get(start_slot),
+    );
+    pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+    pyre_object::interp_exceptions::w_exception_set_reason(
+        w_self,
+        pyre_object::gc_roots::shadow_stack_get(reason_slot),
+    );
 }
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.

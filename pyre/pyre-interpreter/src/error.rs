@@ -589,6 +589,15 @@ impl std::fmt::Debug for PyError {
     }
 }
 
+/// `space.newtext(name)` for [`PyError::enrich_attribute_error_str`], which
+/// wraps the attribute name only once an un-enriched AttributeError escapes.
+/// The `&str -> W_UnicodeObject` construction is host plumbing, as in
+/// [`pyre_object::w_str_new`]; the result is a collectable `str`.
+#[majit_macros::dont_look_inside]
+fn attribute_error_name_new(name: &str) -> PyObjectRef {
+    pyre_object::w_str_new_managed(name)
+}
+
 /// The STR allocation and the byte copy are host plumbing. Callers keep
 /// the pointer result; the body is not a flow graph.
 #[majit_macros::dont_look_inside]
@@ -1344,7 +1353,7 @@ impl PyError {
         };
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
-        let w_name = pyre_object::w_str_new_managed(name);
+        let w_name = attribute_error_name_new(name);
         self.reload(&_roots, handle_slot);
         if let Some(slot) = exc_slot {
             self.set_exc_object(pyre_object::gc_roots::shadow_stack_get(slot));
