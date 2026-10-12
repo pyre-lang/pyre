@@ -50,7 +50,7 @@ use majit_translate::front::mir::{
     harvest_published_structs, lower_fun_decl, lower_fun_decl_with_root_stack,
     lower_fun_decl_with_static_addrs,
 };
-use majit_translate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind};
+use majit_translate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, ValueType};
 
 fn fun_decl_named<'a>(llbc: &'a Llbc, leaf: &str) -> &'a majit_charon_reader::FunDecl {
     let suffix = format!("::{leaf}");
