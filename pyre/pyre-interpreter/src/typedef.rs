@@ -8619,19 +8619,9 @@ fn dict_or_new(base: PyObjectRef, overlay: PyObjectRef) -> PyObjectRef {
     pyre_object::gc_roots::shadow_stack_get(dst_slot)
 }
 
-/// dictmultiobject.py `descr_fromkeys`, exposed through `interp2app`
-/// (`as_classmethod=True`).
-///
-/// Named `__majit_wrap_*` and published below because `BuiltinCode.func` is a
-/// PBC whose family `builtin_wrapper_indirect_graphs` builds out of exactly the
-/// wrapper paths that carry a registered graph. A method registered under any
-/// other name has no member in it, so `bytecode_for_address` finds no jitcode
-/// for its address and a traced `dict.fromkeys` declines
-/// `try_walker_inline_builtin_call` with `no jitcode for address` — it stays a
-/// `bh_call_fn` blackhole residual, and the `listview`+`setitem` loop never
-/// reaches the trace. Upstream has no such split: `interp2app` turns every
-/// builtin method into one of these graphs.
-pub fn __majit_wrap_dict_descr_fromkeys(args: &[PyObjectRef]) -> crate::PyResult {
+/// dictmultiobject.py `descr_fromkeys` gateway. Named so the CALL has
+/// jitcode; a closure gateway is not a named `descr_fromkeys`.
+fn descr_fromkeys(args: &[PyObjectRef]) -> crate::PyResult {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     crate::type_methods::arity_at_most(args, "fromkeys", 2)?;
     let (iterable, value) = if args.len() >= 3 {
@@ -8646,47 +8636,8 @@ pub fn __majit_wrap_dict_descr_fromkeys(args: &[PyObjectRef]) -> crate::PyResult
     dict_fromkeys_impl(cls, iterable, value)
 }
 
-crate::builtin_wrapper_descriptor!(
-    __majit_builtin_wrapper_target_dict_descr_fromkeys,
-    __majit_wrap_dict_descr_fromkeys
-);
-
-/// Exact-set/frozenset hashed fill, the reverse of
-/// `set_update_dict_lock_held`. Split out of `dict_fromkeys_impl` so
-/// `look_inside_graph` still records `descr_fromkeys`'s `listview`+
-/// `setitem` loop; the set-table walk is loopy and residualizes.
-#[inline(never)]
-fn dict_fromkeys_from_exact_set(
-    d: PyObjectRef,
-    iterable: PyObjectRef,
-    value: PyObjectRef,
-) -> crate::PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::pin_roots(&[d, value, iterable]);
-    let mut index = 0usize;
-    loop {
-        let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
-        let Some(slot) = (unsafe { pyre_object::w_set_next_slot(iterable, index) }) else {
-            break;
-        };
-        let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, slot) }) else {
-            break;
-        };
-        let d = pyre_object::gc_roots::shadow_stack_get(sp);
-        let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-        unsafe { pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash) }
-            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key.obj))?;
-        index = slot + 1;
-    }
-    Ok(pyre_object::gc_roots::shadow_stack_get(sp))
-}
-
-/// dictmultiobject.py `descr_fromkeys`. Upstream is only `@staticmethod`;
-/// the 3.14 set-table walk lives in [`dict_fromkeys_from_exact_set`] so
-/// this graph is the `listview`+`setitem` loop. `unroll_safe` is what
-/// `look_inside_graph` needs for that loop (`policy.py` `contains_loop`).
-#[inline(never)]
-#[majit_macros::unroll_safe]
+/// dictmultiobject.py `descr_fromkeys`. No JIT hint: upstream is only
+/// `@staticmethod`, so `codewriter/policy.py` `look_inside_graph` decides.
 fn dict_fromkeys_impl(
     mut cls: PyObjectRef,
     mut iterable: PyObjectRef,
@@ -8703,13 +8654,33 @@ fn dict_fromkeys_impl(
         || pyre_object::with_roots!(cls, iterable, value => crate::baseobjspace::is_w(cls, w_dict_type))
     {
         let mut d = pyre_object::w_dict_new();
-        // Exact set/frozenset skip a second `__hash__`; the walk itself
-        // is [`dict_fromkeys_from_exact_set`], outside this graph.
+        // Python 3.14's exact-set/frozenset fast path carries each
+        // entry's cached hash into the new exact dict.  This is the
+        // reverse of `set_update_dict_lock_held` and avoids a
+        // second observable `__hash__` call.  Subclasses still go
+        // through their iterator below.
         if unsafe {
             pyre_object::is_exact_type(iterable, &pyre_object::setobject::SET_TYPE)
                 || pyre_object::is_exact_type(iterable, &pyre_object::setobject::FROZENSET_TYPE)
         } {
-            return dict_fromkeys_from_exact_set(d, iterable, value);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::pin_roots(&[d, value, iterable]);
+            let mut index = 0usize;
+            loop {
+                let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+                let Some(slot) = (unsafe { pyre_object::w_set_next_slot(iterable, index) }) else {
+                    break;
+                };
+                let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, slot) }) else {
+                    break;
+                };
+                let d = pyre_object::gc_roots::shadow_stack_get(sp);
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                unsafe { pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash) }
+                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key.obj))?;
+                index = slot + 1;
+            }
+            return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
         }
         let items = {
             // descr_fromkeys: `for w_key in space.listview(w_keys)`.
@@ -9432,7 +9403,7 @@ fn init_dict_type(ns: PyObjectRef) {
     // dict.fromkeys(iterable, value=None) — classmethod
     let fromkeys = crate::gateway::make_builtin_function_with_text_signature(
         "fromkeys",
-        __majit_wrap_dict_descr_fromkeys,
+        descr_fromkeys,
         "($type, iterable, value=None, /)",
     );
     let fromkeys_slot = pyre_object::gc_roots::shadow_stack_len();

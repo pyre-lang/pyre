@@ -5629,7 +5629,9 @@ impl OpcodeStepExecutor for PyFrame {
     /// 0, then `dropvalues` / `pushvalue`.
     #[majit_macros::unroll_safe]
     fn build_set(&mut self, count: usize) -> Result<(), PyError> {
-        let count = majit_metainterp::jit::promote(count);
+        // The allocation and each `add` (user `__hash__`) may relocate a
+        // nursery frame; reread it through the anchor after every one.
+        let anchor = FrameAnchor::new(self);
         let set_obj = pyre_object::w_set_new();
         let _roots = pyre_object::gc_roots::push_roots();
         let set_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5637,14 +5639,15 @@ impl OpcodeStepExecutor for PyFrame {
         let mut i = count;
         while i > 0 {
             i -= 1;
-            let w_item = PyFrame::peek_at(self, i);
+            let w_item = PyFrame::peek_at(unsafe { &mut *anchor.live() }, i);
             crate::opcode_ops::set_add_value(
                 pyre_object::gc_roots::shadow_stack_get(set_slot),
                 w_item,
             )?;
         }
-        self.dropvalues(count);
-        self.push(pyre_object::gc_roots::shadow_stack_get(set_slot));
+        let frame = unsafe { &mut *anchor.live() };
+        frame.dropvalues(count);
+        frame.push(pyre_object::gc_roots::shadow_stack_get(set_slot));
         Ok(())
     }
 
