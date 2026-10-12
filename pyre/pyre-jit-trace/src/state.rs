@@ -10417,11 +10417,11 @@ fn materialize_concrete_virtual_int(
 /// ResumeGuardExcDescr analog for bridge walks.
 ///
 /// `setup_bridge_sym` runs after guard-failure resume has rebuilt the live
-/// frame. Per `pyjitpl.py _prepare_exception_resumption`, only a
-/// ResumeGuardExcDescr/ResumeGuardCopiedExcDescr source guard carries the
-/// pending exception into bridge tracing. Non-exception guards do not seed
-/// standing exception state, and operand-stack values are never scanned to
-/// infer one.
+/// frame. `pyjitpl.py _prepare_exception_resumption` takes the exception
+/// only from `cpu.grab_exc_value(deadframe)`. A null grab means
+/// `clear_exception()` and the normal continuation (`GUARD_NO_EXCEPTION`).
+/// Non-exception guards do not seed standing exception state, and
+/// operand-stack values are never scanned to infer one.
 fn seed_bridge_standing_exception_from_current(
     sym: &mut PyreSym,
     ctx: &mut majit_metainterp::TraceCtx,
@@ -10449,20 +10449,21 @@ fn seed_bridge_standing_exception_from_current(
         return;
     }
 
-    let mut exc = sym.current_exc_value.get();
+    // `cpu.grab_exc_value(deadframe)` is parked in `GUARD_EXC_VALUE`.
+    // `current_exc_value` is initialized from `get_current_exception()`
+    // (`ec.sys_exc_value`, the exception the application is handling) and
+    // is not that grab: a `GuardException` failure with a null grab must
+    // not inherit it.
+    let grab = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
+    let exc = sym.current_exc_value.get();
     let exc_box = sym.current_exc_box;
-    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
-        let current = pyre_interpreter::eval::get_current_exception();
-        if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
-            exc = current;
-        } else {
-            sym.current_exc_value.set(std::ptr::null_mut());
-            sym.current_exc_box = OpRef::NONE;
-            sym.last_exc_value.set(std::ptr::null_mut());
-            sym.last_exc_box = OpRef::NONE;
-            sym.class_of_last_exc_is_const = false;
-            return;
-        }
+    if grab == 0 || exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        sym.current_exc_value.set(std::ptr::null_mut());
+        sym.current_exc_box = OpRef::NONE;
+        sym.last_exc_value.set(std::ptr::null_mut());
+        sym.last_exc_box = OpRef::NONE;
+        sym.class_of_last_exc_is_const = false;
+        return;
     }
 
     let exc_box = if exc_box.is_none() {
