@@ -74,12 +74,13 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `pyopcode.py BUILD_SET` is `@jit.unroll_safe`: the per-item `add` loop
     // runs the opcode's constant item count.
     ("builtin_set_add_items_impl", "pyopcode.py BUILD_SET"),
+    // `pyframe.py popvalues` / `peekvalues` are `@jit.unroll_safe`: the count
+    // is an opcode argument.
+    ("popvalues", "pyframe.py popvalues"),
+    ("peekvalues", "pyframe.py peekvalues"),
     // `pyopcode.py UNPACK_SEQUENCE` pushes through `pyframe.py
     // pushrevvalues`, `@jit.unroll_safe`.
     ("opcode_unpack_sequence", "pyframe.py pushrevvalues"),
-    // `pyopcode.py CALL_FUNCTION_KW` is `@jit.unroll_safe`; the keyword
-    // split and the kwnames walk live in this helper.
-    ("call_kw_in_ctx_impl", "pyopcode.py CALL_FUNCTION_KW"),
     // The frame builders `function.py _flat_pycall` fills: the argument copy
     // and cell setup of `pyframe.py initialize_frame_scopes`, both
     // `@jit.unroll_safe`, over a code object's constant counts.
@@ -382,8 +383,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `pyframe.py` stack helpers and scope init are `@jit.unroll_safe`.
     // Each has a loop over n / cells; without the hint `look_inside_graph`
     // residualizes the whole helper. Descent-scope change matching upstream.
-    ("popvalues", "pyframe.py popvalues"),
-    ("peekvalues", "pyframe.py peekvalues"),
+    // popvalues / peekvalues return Vec (two residual words). The hint
+    // stays off until that ABI exists; otherwise look_inside residualizes
+    // a one-slot pointer and the length is garbage (Linux test_uuid
+    // type_id OOB).
     ("dropvalues", "pyframe.py dropvalues"),
     ("pushrevvalues", "pyframe.py pushrevvalues"),
     ("dupvalues", "pyframe.py dupvalues"),

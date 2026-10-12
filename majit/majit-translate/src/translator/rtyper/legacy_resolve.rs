@@ -136,11 +136,40 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // with `ty: Unknown` (path references not yet bound by the annotator);
     // without this pass they end up defaulted to `GcRef` by the backfill
     // below and produce pyre-only `int_*/{ri,ir,rr,r}` keys. Upgrade
-    // Unknown/Void operands of pure integer ops to `Signed`, matching
-    // RPython's mandatory kind assignment (`rint.py IntegerRepr`
-    // `hop.inputargs(self, self)`).  `ptr_eq` / `ptr_ne` remain
+    // Unknown operands of pure integer ops to `Signed`, matching
+    // RPython's mandatory kind assignment.  `ptr_eq` / `ptr_ne` remain
     // Ref-Ref (rewritten in `jtransform` per `rpython/jit/codewriter/
     // jtransform.py _rewrite_cmp_ptrs`) and are skipped.
+    /// Operations whose RPython decorator requires integer operands on
+    /// both sides (`blackhole.py+ @arguments("i", "i", returns="i")`).
+    /// Unlike the comparison ops `lt`/`le`/`gt`/`ge`, no ptr-specific
+    /// variant exists in RPython — these must see Signed operands.
+    fn canonical_int_binop(op: &str) -> Option<&'static str> {
+        match op {
+            "add" | "add_assign" => Some("add"),
+            "sub" | "sub_assign" => Some("sub"),
+            "mul" | "mul_assign" => Some("mul"),
+            "div" | "div_assign" => Some("div"),
+            "mod" | "mod_assign" => Some("mod"),
+            "and" | "bitand" | "bitand_assign" => Some("and"),
+            "or" | "bitor" | "bitor_assign" => Some("or"),
+            "xor" | "bitxor" | "bitxor_assign" => Some("xor"),
+            "rshift" | "shr" | "rshift_assign" => Some("rshift"),
+            "lshift" | "shl" | "lshift_assign" => Some("lshift"),
+            // `_int_to_int_cast` narrow signed target. Both operands are
+            // signed words (`int_signext(v, nbytes)`).
+            "signext" => Some("signext"),
+            "lt" => Some("lt"),
+            "le" => Some("le"),
+            "gt" => Some("gt"),
+            "ge" => Some("ge"),
+            _ => None,
+        }
+    }
+    /// `eq`/`ne` may still be rewritten to `ptr_eq`/`ptr_ne` in
+    /// `jtransform.rs` when both operands are Ref (RPython
+    /// `_rewrite_cmp_ptrs`). Skip them here so the jtransform pass
+    /// observes the original Ref-Ref shape.
     fn is_int_unop(op: &str) -> bool {
         matches!(op, "neg" | "invert" | "not")
     }
@@ -164,7 +193,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                         rhs,
                         ..
                     } if canonical_int_binop(opname).is_some() => {
-                        // Only upgrade Unknown/Void operands.  Forcing
+                        // Only upgrade Unknown operands.  Forcing
                         // GcRef → Signed here is unsound: a value
                         // classified Ref may alias with pointer uses
                         // elsewhere in the graph, and demoting it to
@@ -174,11 +203,9 @@ pub fn resolve_types(graph: &FunctionGraph) {
                         // The remaining pyre-only `int_*/{ri,ir,rr}`
                         // keys need `cast_ptr_to_int` insertion in
                         // jtransform, not a type override in the
-                        // rtyper. Void is the None/Impossible leftover
-                        // `convert_link` writes; `IntegerRepr` still
-                        // occupies the integer bank.
-                        changed |= maybe_seed_int_operand(lhs);
-                        changed |= maybe_seed_int_operand(rhs);
+                        // rtyper.
+                        changed |= maybe_seed_concrete_type(lhs, ConcreteType::Signed);
+                        changed |= maybe_seed_concrete_type(rhs, ConcreteType::Signed);
                         if let Some(result) = op.result.as_ref() {
                             // RPython rtyper resolves an `add` whose
                             // operands are both `lltype.Float` to
@@ -226,7 +253,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                                     changed = true;
                                 }
                             } else if !any_float || !both_numeric {
-                                changed |= maybe_seed_int_operand(result);
+                                changed |= maybe_seed_concrete_type(result, ConcreteType::Signed);
                             }
                         }
                     }
@@ -235,7 +262,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                         operand,
                         ..
                     } if is_int_unop(opname) => {
-                        changed |= maybe_seed_int_operand(operand);
+                        changed |= maybe_seed_concrete_type(operand, ConcreteType::Signed);
                         if let Some(result) = op.result.as_ref() {
                             // Same Float-operand override as the BinOp
                             // arm above.  Unary `neg` on a Float
@@ -251,7 +278,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                                     changed = true;
                                 }
                             } else {
-                                changed |= maybe_seed_int_operand(result);
+                                changed |= maybe_seed_concrete_type(result, ConcreteType::Signed);
                             }
                         }
                     }
@@ -275,7 +302,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                         // would surface as `cast_int_to_float/r>f`
                         // at the assembler.  Re-seed Signed here so
                         // pass 2 converges to the same operand kind.
-                        changed |= maybe_seed_int_operand(operand);
+                        changed |= maybe_seed_concrete_type(operand, ConcreteType::Signed);
                     }
                     OpKind::UnaryOp {
                         op: opname,
@@ -415,17 +442,7 @@ fn convert_link(graph: &FunctionGraph, link: &Link) {
         if let LinkArg::Const(value) = src
             && let Some(lltype) = value.concretetype.as_ref()
         {
-            let incoming = crate::model::getkind(lltype);
-            // `_convert_link` `inputconst(r_to, value)` converts INTO
-            // the destination repr. `IntegerRepr.convert_const`
-            // (`rint.py`) refuses None, so a Void Const must not smash
-            // an already-Signed dest (`hop.inputarg(Signed)`).
-            if incoming == ConcreteType::Void
-                && FunctionGraph::concretetype_of(dst) == ConcreteType::Signed
-            {
-                continue;
-            }
-            FunctionGraph::set_concretetype_of_inline(dst, incoming);
+            FunctionGraph::set_concretetype_of_inline(dst, crate::model::getkind(lltype));
             continue;
         }
         let _ = maybe_seed_concrete_type(dst, link_arg_concrete_type(src));
@@ -545,50 +562,6 @@ fn commit_concretetype(var: &Variable, concrete: ConcreteType) {
         return;
     }
     FunctionGraph::set_concretetype_of_inline(var, concrete);
-}
-
-/// Operations whose RPython decorator requires integer operands on
-/// both sides (`blackhole.py+ @arguments("i", "i", returns="i")`).
-/// Unlike the comparison ops `lt`/`le`/`gt`/`ge`, no ptr-specific
-/// variant exists in RPython — these must see Signed operands.
-/// `eq`/`ne` may still be rewritten to `ptr_eq`/`ptr_ne` in
-/// `jtransform.rs` when both operands are Ref (`_rewrite_cmp_ptrs`);
-/// they are omitted so that pass observes the original Ref-Ref shape.
-pub(crate) fn canonical_int_binop(op: &str) -> Option<&'static str> {
-    match op {
-        "add" | "add_assign" => Some("add"),
-        "sub" | "sub_assign" => Some("sub"),
-        "mul" | "mul_assign" => Some("mul"),
-        "div" | "div_assign" => Some("div"),
-        "mod" | "mod_assign" => Some("mod"),
-        "and" | "bitand" | "bitand_assign" => Some("and"),
-        "or" | "bitor" | "bitor_assign" => Some("or"),
-        "xor" | "bitxor" | "bitxor_assign" => Some("xor"),
-        "rshift" | "shr" | "rshift_assign" => Some("rshift"),
-        "lshift" | "shl" | "lshift_assign" => Some("lshift"),
-        // `_int_to_int_cast` narrow signed target. Both operands are
-        // signed words (`int_signext(v, nbytes)`).
-        "signext" => Some("signext"),
-        "lt" => Some("lt"),
-        "le" => Some("le"),
-        "gt" => Some("gt"),
-        "ge" => Some("ge"),
-        _ => None,
-    }
-}
-
-/// `rint.py IntegerRepr` `hop.inputarg(self)` types the operand Signed.
-/// Void is the None/Impossible leftover `convert_link` writes on an
-/// AccessDirect copy; IntegerRepr still occupies the integer bank.
-/// GcRef/Float stay put: demoting a Ref is unsound.
-fn maybe_seed_int_operand(dst: &Variable) -> bool {
-    match FunctionGraph::concretetype_of(dst) {
-        ConcreteType::Unknown | ConcreteType::Void => {
-            FunctionGraph::set_concretetype_of_inline(dst, ConcreteType::Signed);
-            true
-        }
-        _ => false,
-    }
 }
 
 fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
@@ -849,67 +822,6 @@ mod tests {
                 "case {name} result"
             );
         }
-    }
-
-    #[test]
-    fn integer_repr_upgrades_a_void_int_sub_operand() {
-        let mut graph = FunctionGraph::new("int_sub_void_rhs");
-        let entry = graph.startblock;
-        let lhs = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "lhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let rhs = graph.alloc_value_var();
-        FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::Void);
-        let result = graph
-            .push_op_var(
-                entry,
-                OpKind::BinOp {
-                    op: "sub".into(),
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(entry, Some(result.clone()));
-
-        annotate::annotate(&graph);
-        resolve_types(&graph);
-        assert_eq!(FunctionGraph::concretetype_of(&lhs), ConcreteType::Signed);
-        assert_eq!(FunctionGraph::concretetype_of(&rhs), ConcreteType::Signed);
-        assert_eq!(
-            FunctionGraph::concretetype_of(&result),
-            ConcreteType::Signed
-        );
-    }
-
-    #[test]
-    fn convert_link_does_not_smash_signed_dest_with_void_const() {
-        let mut graph = FunctionGraph::new("signed_phi_void_const");
-        let entry = graph.startblock;
-        let (target, phi_args) = graph.create_block_with_arg_vars(1);
-        let phi = phi_args[0].clone();
-        FunctionGraph::set_concretetype_of_inline(&phi, ConcreteType::Signed);
-        let void_none = crate::flowspace::model::Constant::with_concretetype(
-            crate::flowspace::model::ConstValue::None,
-            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
-        );
-        graph.blocks[entry.0].exits.push(Link::new_mixed(
-            vec![LinkArg::Const(void_none)],
-            target,
-            None,
-        ));
-        convert_link(&graph, &graph.blocks[entry.0].exits[0]);
-        assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::Signed);
     }
 
     #[test]
