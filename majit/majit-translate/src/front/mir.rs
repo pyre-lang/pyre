@@ -73247,7 +73247,7 @@ mod tests {
     /// instantiated `Entry` alignment (`array_items_base`). `Entry`
     /// always contains `f_hash: u64`, so that offset is 8.
     #[test]
-    fn entries_item_ptr_gcentries_i64_pyobjectref_items_offset_is_8() {
+    fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
         use crate::model::{CallTarget, OpKind};
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
@@ -73256,17 +73256,17 @@ mod tests {
             .iter_local_fns()
             .find(|fd| fd.item_meta.name_path() == name_path)
             .unwrap_or_else(|| panic!("{name_path} in pyre-object LLBC"));
-        let pyobject_id = llbc
+        let gcref_id = llbc
             .iter_type_decls()
             .find(|td| td.item_meta.name_path() == "pyre_object::pyobject::PyObject")
             .unwrap_or_else(|| panic!("PyObject in pyre-object LLBC"))
             .def_id;
         let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
-        let pyobject_ref_ty = serde_json::json!({
+        let gcref_ty = serde_json::json!({
             "RawPtr": [
                 {
                     "Adt": {
-                        "id": pyobject_id,
+                        "id": gcref_id,
                         "generics": {
                             "regions": [],
                             "types": [],
@@ -73283,7 +73283,7 @@ mod tests {
             fd,
             &llbc,
             &[],
-            &[i64_ty, pyobject_ref_ty],
+            &[i64_ty, gcref_ty],
             &[],
         )
         .expect("substituted entries_item_ptr body");
