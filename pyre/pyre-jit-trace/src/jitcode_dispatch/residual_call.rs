@@ -9149,6 +9149,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iRd_kind",
         )? {
             LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
@@ -9171,6 +9172,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iRd_kind",
         )? {
             return Ok((outcome, op.next_pc));
@@ -10725,6 +10727,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iIRd_kind",
         )? {
             LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
@@ -10747,6 +10750,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iIRd_kind",
         )? {
             return Ok((outcome, op.next_pc));
@@ -11054,6 +11058,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iIRFd_kind",
         )? {
             LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
@@ -11076,6 +11081,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iIRFd_kind",
         )? {
             return Ok((outcome, op.next_pc));

@@ -4392,7 +4392,9 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         call_descr,
         OpRef::NONE,
         op.pc,
-        None,
+        // Same coordinate as `dispatch_recursive_call`'s
+        // `assembler_call=False` arm.
+        Some((op.next_pc, dst_bank, dst)),
         false,
     )?;
     let (concrete, raised) = match exec {
@@ -10084,6 +10086,8 @@ fn direct_libffi_call<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
     pc: usize,
+    // The pc behind the residual-call op at `pc`.
+    next_pc: usize,
     caller: &'static str,
 ) -> Result<LibffiCallOutcome, DispatchError> {
     // pyjitpl.py: box_cif_description = argboxes[1]; if not ConstInt: return None
@@ -10185,7 +10189,7 @@ fn direct_libffi_call<Sym: WalkSym>(
         call_descr,
         recorded,
         pc,
-        None,
+        Some((next_pc, dst_bank, dst)),
         false,
     )?;
     let resid_raised = match resid_exec {
@@ -10339,6 +10343,8 @@ fn direct_call_release_gil<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
     pc: usize,
+    // The pc behind the residual-call op at `pc`.
+    next_pc: usize,
     caller: &'static str,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     // pyjitpl.py `vable_and_vrefs_before_residual_call` —
@@ -10428,7 +10434,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
         call_descr,
         recorded,
         pc,
-        None,
+        Some((next_pc, dst_bank, dst)),
         false,
     )?;
     // A decline leaves the call recorded symbolically WITHOUT running it, so

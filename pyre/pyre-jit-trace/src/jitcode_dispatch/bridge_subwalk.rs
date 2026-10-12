@@ -1251,6 +1251,7 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         ctx,
         cont_pc,
         None,
+        None,
         portal_frame_box,
         portal_ec_box,
         token,

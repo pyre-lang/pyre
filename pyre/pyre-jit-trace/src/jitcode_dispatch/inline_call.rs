@@ -3080,7 +3080,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             call_descr,
             OpRef::NONE,
             op.pc,
-            None,
+            // `vable_after_residual_call`: an escape goes on behind this
+            // CALL with the executed result in its `>r` register.
+            Some((op.next_pc, dst_bank, dst)),
             false,
         )?
     };
@@ -3331,6 +3333,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         ctx,
         op.pc,
         Some((dst_bank, dst)),
+        Some(op.next_pc),
         callee_frame,
         callee_ec,
         Some(token),
@@ -3372,6 +3375,10 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     dst: Option<(char, usize)>,
+    // The pc behind the caller's CALL op, when `ctx` walks that caller and
+    // `dst` is the CALL's result register. `None` when `ctx` walks the
+    // callee itself, whose jitcode has no op the result is written by.
+    resume_pc: Option<usize>,
     callee_frame: OpRef,
     callee_ec: OpRef,
     token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
@@ -3579,6 +3586,12 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         callee_frame,
         callee_ec,
     ];
+    // The prologue the sub-walk ran plus this portal run are the whole
+    // CALL, so an escape (`vable_after_residual_call`) continues the caller
+    // behind it with the executed result in the CALL's register.
+    let blackhole_result = resume_pc
+        .zip(dst)
+        .map(|(next_pc, (bank, color))| (next_pc, bank, color));
     let exec = try_execute_residual_call_via_executor(
         ctx,
         OpCode::CallMayForceR,
@@ -3586,7 +3599,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         portal_view,
         OpRef::NONE,
         pc,
-        None,
+        blackhole_result,
         false,
     )?;
     // `pyjitpl.py:2049-2079` records a forced VIRTUAL_REF_FINISH before the
@@ -15702,7 +15715,9 @@ fn descend_generatorentry<Sym: WalkSym>(
         call_descr,
         OpRef::NONE,
         op.pc,
-        None,
+        // `vable_after_residual_call`: an escape goes on behind this call
+        // with `jit_next`'s result in its `>r` register.
+        Some((op.next_pc, 'r', dst)),
         false,
     )?;
     // `execute_residual_call` consumes `BH_LAST_EXC_VALUE` and returns the

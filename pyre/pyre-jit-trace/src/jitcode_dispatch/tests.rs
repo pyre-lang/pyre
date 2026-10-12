@@ -1547,6 +1547,7 @@ fn portal_may_force_records_the_callee_execution_context() {
         &mut wc,
         0,
         None,
+        None,
         callee_frame,
         callee_ec,
         None,
