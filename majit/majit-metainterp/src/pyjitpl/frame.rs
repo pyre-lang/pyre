@@ -184,13 +184,20 @@ impl MIFrame {
     /// Non-constant boxes are rewritten to `ConstPtr` at abort
     /// (`freeze_values_into_const_boxes`) so this read does not need the
     /// recorder after `abort_trace`.
+    /// `history.py AbstractValue.getint()` / `blackhole.py`
+    /// `_copy_data_from_miframe` `box.getint()`. A `ConstInt` is inline.
+    /// A live `IntOp` is frozen to `ConstInt` by
+    /// `freeze_values_into_const_boxes`; an unfrozen live box defaults to
+    /// 0 as `IntOp.getint` does for an unstamped `_resint`.
     pub fn int_value_for_blackhole(&self, index: usize) -> Option<i64> {
-        self.int_regs
-            .get(index)
-            .copied()
-            .flatten()
-            .and_then(|op| op.inline_const_to_value())
-            .map(|v| v.as_raw_i64())
+        match self.int_regs.get(index).copied().flatten() {
+            Some(op) => Some(
+                op.inline_const_to_value()
+                    .map(|v| v.as_raw_i64())
+                    .unwrap_or(0),
+            ),
+            None => None,
+        }
     }
 
     pub fn ref_value_for_blackhole(&self, index: usize) -> Option<i64> {
@@ -202,13 +209,18 @@ impl MIFrame {
             .map(|v| v.as_raw_i64())
     }
 
+    /// `history.py AbstractValue.getfloatstorage()` /
+    /// `_copy_data_from_miframe` `box.getfloatstorage()`. Same box-owner
+    /// rule as [`Self::int_value_for_blackhole`].
     pub fn float_value_for_blackhole(&self, index: usize) -> Option<i64> {
-        self.float_regs
-            .get(index)
-            .copied()
-            .flatten()
-            .and_then(|op| op.inline_const_to_value())
-            .map(|v| v.as_raw_i64())
+        match self.float_regs.get(index).copied().flatten() {
+            Some(op) => Some(
+                op.inline_const_to_value()
+                    .map(|v| v.as_raw_i64())
+                    .unwrap_or(0),
+            ),
+            None => None,
+        }
     }
 
     /// Publish a forwarding update into a Ref register's ConstPtr box.
@@ -1552,6 +1564,31 @@ mod tests {
         let mut jitcode = builder.finish();
         jitcode.body_mut().resulttypes = Some([(0, 'i'), (1, 'r'), (2, 'f')].into_iter().collect());
         Arc::new(jitcode)
+    }
+
+    #[test]
+    fn int_value_for_blackhole_reads_constint() {
+        let jitcode = make_jitcode_with_regs(2, 0, 0);
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.int_regs[0] = Some(OpRef::const_int(42));
+        frame.int_regs[1] = Some(OpRef::int_op(7));
+
+        assert_eq!(frame.int_value_for_blackhole(0), Some(42));
+        assert_eq!(frame.int_value_for_blackhole(1), Some(0));
+        assert_eq!(frame.int_value_for_blackhole(2), None);
+    }
+
+    #[test]
+    fn float_value_for_blackhole_reads_constfloat() {
+        let jitcode = make_jitcode_with_regs(0, 0, 2);
+        let mut frame = MIFrame::new(jitcode, 0);
+        let bits = 1.5f64.to_bits() as i64;
+        frame.float_regs[0] = Some(OpRef::const_float(1.5));
+        frame.float_regs[1] = Some(OpRef::float_op(7));
+
+        assert_eq!(frame.float_value_for_blackhole(0), Some(bits));
+        assert_eq!(frame.float_value_for_blackhole(1), Some(0));
+        assert_eq!(frame.float_value_for_blackhole(2), None);
     }
 
     #[test]
