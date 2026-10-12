@@ -910,10 +910,10 @@ impl Drop for JitlogAbortGuard {
 
 /// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
 /// must number as TAGBOX. `make_constant_box` already refuses that fold
-/// in the optimizer; the tracer can still snapshot the concrete address
-/// as `SnapshotTagged::Const`. Resume then TAGCONSTs it and the next
-/// `Vm::new` has no failarg to rebind. Map the address back to the
-/// InputArg that already carries those bits.
+/// in the optimizer; the tracer can still snapshot the table index as
+/// `SnapshotTagged::Const`. Resume then TAGCONSTs the resolved address
+/// and the next `Vm::new` has no failarg to rebind. Resolve the index
+/// then map the address back to the InputArg that already carries those bits.
 fn snapshot_inputarg_for_stack_ptr(
     inputargs: &[majit_ir::InputArgRc],
     addr: usize,
@@ -943,12 +943,18 @@ pub(crate) fn snapshot_tagged_to_box(
             SnapshotBox::typed(*opref, tp)
         }
         crate::recorder::SnapshotTagged::Const(val, tp) => {
+            // `Type::Ref` stores a const_ptr_table index. Resolve at the use.
+            let bits = if *tp == majit_ir::Type::Ref {
+                majit_ir::const_ptr_table::resolve(*val as u32).0 as i64
+            } else {
+                *val
+            };
             if *tp == majit_ir::Type::Ref
-                && let Some(ia) = snapshot_inputarg_for_stack_ptr(inputargs, *val as usize)
+                && let Some(ia) = snapshot_inputarg_for_stack_ptr(inputargs, bits as usize)
             {
                 return SnapshotBox::typed(ia, *tp);
             }
-            let value = heap_value_for(*tp, *val);
+            let value = heap_value_for(*tp, bits);
             let opref = majit_ir::OpRef::const_inline_from_value(&value);
             SnapshotBox::typed(opref, *tp)
         }
@@ -30207,10 +30213,10 @@ mod tests {
 
     #[test]
     fn walk_active_trace_refs_forwards_snapshot_const_ptr() {
-        // `get_list_of_active_snapshot_boxes` copies a constant ref register's
-        // gcref into a raw `SnapshotTagged::Const` word, and the vable / vref
-        // lists can hold an inline `ConstPtr` operand. Both accumulate across
-        // the whole trace, so a collection during tracing must forward them.
+        // `get_list_of_active_snapshot_boxes` stores a constant ref
+        // register as a `const_ptr_table` index in `SnapshotTagged::Const`.
+        // The vable / vref lists can hold an inline `ConstPtr` operand.
+        // A collection during tracing must forward the table slot.
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
         let index = majit_ir::const_ptr_table::intern(GcRef(0x91_0000_A000));
@@ -30224,7 +30230,7 @@ mod tests {
                 jitcode_index: 0,
                 pc: 4,
                 boxes: vec![
-                    crate::recorder::SnapshotTagged::Const(0x91_0000_A000, Type::Ref),
+                    crate::recorder::SnapshotTagged::Const(i64::from(index), Type::Ref),
                     // Same bits, non-Ref type: an integer, not an address.
                     crate::recorder::SnapshotTagged::Const(0xA000, Type::Int),
                 ],
@@ -30247,9 +30253,10 @@ mod tests {
         });
 
         let snapshot = &meta.tracing.as_ref().unwrap().snapshots[0];
+        // The index does not move. The table slot does.
         assert_eq!(
             snapshot.frames[0].boxes[0],
-            crate::recorder::SnapshotTagged::Const(0x91_0000_B000, Type::Ref)
+            crate::recorder::SnapshotTagged::Const(i64::from(index), Type::Ref)
         );
         assert_eq!(
             majit_ir::const_ptr_table::resolve(index),

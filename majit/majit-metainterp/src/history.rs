@@ -2883,10 +2883,17 @@ impl TraceCtx {
                     )
                 });
                 if opref.is_constant() {
-                    let value = self.constant_value(*opref).expect(
-                        "capture_snapshot_for_last_guard: constant OpRef missing recorded value",
-                    );
-                    crate::recorder::SnapshotTagged::Const(value, tp)
+                    if let Some(index) = opref.const_ptr_index() {
+                        crate::recorder::SnapshotTagged::Const(
+                            i64::from(index),
+                            majit_ir::Type::Ref,
+                        )
+                    } else {
+                        let value = self.constant_value(*opref).expect(
+                            "capture_snapshot_for_last_guard: constant OpRef missing recorded value",
+                        );
+                        crate::recorder::SnapshotTagged::Const(value, tp)
+                    }
                 } else {
                     crate::recorder::SnapshotTagged::Box(*opref, tp)
                 }
