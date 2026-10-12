@@ -7,14 +7,16 @@
 //! `_build_failure_recovery`, `malloc_cond`,
 //! `malloc_cond_varsize_frame`, `malloc_cond_varsize`,
 //! `_binaryop_or_lea`, `flush_cc`, `addr_add_const`, `genop_finish`,
-//! `closing_jump`.
+//! `closing_jump`, `genop_discard_gc_store_indexed` / `save_into_mem`,
+//! `test_location`, `AddressLoc`, `genop_cast_float_to_singlefloat`,
+//! `genop_cast_singlefloat_to_float`.
 
 #![cfg(target_arch = "x86_64")]
 
 use std::arch::naked_asm;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use majit_backend::{Backend, JitCellToken, make_resume_guard_descr_typed};
@@ -1201,6 +1203,383 @@ fn cond_call_live_callee_saved_survives() {
     }
 }
 
+const LIVE_ADD_COUNT: u32 = 16;
+const EXTRA_ADD_NS: [u32; 3] = [14, 15, 16];
+const COND_CALL_EXTRA_HELPER_RESULT: i64 = 0x5A5A_5A5A_5A5A_5A5A_u64 as i64;
+
+static COND_CALL_EXTRA0: AtomicI64 = AtomicI64::new(0);
+static COND_CALL_EXTRA1: AtomicI64 = AtomicI64::new(0);
+static COND_CALL_EXTRA2: AtomicI64 = AtomicI64::new(0);
+static COND_CALL_EXTRA_HITS: AtomicUsize = AtomicUsize::new(0);
+static COND_CALL_VALUE_EXTRA_HITS: AtomicUsize = AtomicUsize::new(0);
+static EAX_LIVE_HITS: AtomicUsize = AtomicUsize::new(0);
+
+fn reset_cond_call_extras() {
+    COND_CALL_EXTRA0.store(0, Ordering::SeqCst);
+    COND_CALL_EXTRA1.store(0, Ordering::SeqCst);
+    COND_CALL_EXTRA2.store(0, Ordering::SeqCst);
+    COND_CALL_EXTRA_HITS.store(0, Ordering::SeqCst);
+    COND_CALL_VALUE_EXTRA_HITS.store(0, Ordering::SeqCst);
+}
+
+fn live_add_ops(base: OpRef) -> (Vec<Op>, Vec<Operand>) {
+    let mut ops = Vec::new();
+    let mut live = Vec::new();
+    for n in 1..=LIVE_ADD_COUNT {
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[rb(base), rb(OpRef::const_int(i64::from(n)))],
+        );
+        add.pos().set(OpRef::int_op(n));
+        ops.push(add);
+        live.push(rb(OpRef::int_op(n)));
+    }
+    (ops, live)
+}
+
+fn extra_operands() -> [Operand; 3] {
+    EXTRA_ADD_NS.map(|n| rb(OpRef::int_op(n)))
+}
+
+fn extra_expected(base: i64) -> [i64; 3] {
+    EXTRA_ADD_NS.map(|n| base + i64::from(n))
+}
+
+fn failing_guard_with_lives(
+    lives: Vec<Operand>,
+    types: Vec<Type>,
+    pos_eq: u32,
+    pos_guard: u32,
+) -> [Op; 2] {
+    let eq = Op::new(
+        OpCode::IntEq,
+        &[rb(OpRef::int_op(1)), rb(OpRef::const_int(0))],
+    );
+    eq.pos().set(OpRef::int_op(pos_eq));
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(pos_eq))]);
+    guard.pos().set(OpRef::void_op(pos_guard));
+    guard.setdescr(make_resume_guard_descr_typed(types.clone()));
+    guard.set_fail_arg_types(types);
+    guard.setfailargs(lives.into());
+    [eq, guard]
+}
+
+fn assert_live_adds(
+    backend: &DynasmBackend,
+    frame: &majit_backend::DeadFrame,
+    base: i64,
+    offset: usize,
+) {
+    for n in 1..=LIVE_ADD_COUNT {
+        assert_eq!(
+            backend.get_int_value(frame, offset + (n as usize - 1)),
+            base + i64::from(n),
+            "live add {n}"
+        );
+    }
+}
+
+fn assert_recorded_extras(expected: [i64; 3]) {
+    assert_eq!(COND_CALL_EXTRA0.load(Ordering::SeqCst), expected[0]);
+    assert_eq!(COND_CALL_EXTRA1.load(Ordering::SeqCst), expected[1]);
+    assert_eq!(COND_CALL_EXTRA2.load(Ordering::SeqCst), expected[2]);
+}
+
+/// Record the three extra arguments, then clobber every managed register.
+/// Extra args live in non-ABI registers / frame slots, so the taken path
+/// must remap them (`CondCallSlowPath.generate_body`).
+#[cfg(not(target_os = "windows"))]
+#[unsafe(naked)]
+extern "C" fn cond_call_extra_clobber() {
+    naked_asm!(
+        "lock inc qword ptr [rip + {hits}]",
+        "mov qword ptr [rip + {e0}], rdi",
+        "mov qword ptr [rip + {e1}], rsi",
+        "mov qword ptr [rip + {e2}], rdx",
+        "xor eax, eax",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor ebx, ebx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r14, r14",
+        "xor r15, r15",
+        "ret",
+        hits = sym COND_CALL_EXTRA_HITS,
+        e0 = sym COND_CALL_EXTRA0,
+        e1 = sym COND_CALL_EXTRA1,
+        e2 = sym COND_CALL_EXTRA2,
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[unsafe(naked)]
+extern "C" fn cond_call_extra_clobber() {
+    naked_asm!(
+        "lock inc qword ptr [rip + {hits}]",
+        "mov qword ptr [rip + {e0}], rcx",
+        "mov qword ptr [rip + {e1}], rdx",
+        "mov qword ptr [rip + {e2}], r8",
+        "xor eax, eax",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor ebx, ebx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r14, r14",
+        "xor r15, r15",
+        "ret",
+        hits = sym COND_CALL_EXTRA_HITS,
+        e0 = sym COND_CALL_EXTRA0,
+        e1 = sym COND_CALL_EXTRA1,
+        e2 = sym COND_CALL_EXTRA2,
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[unsafe(naked)]
+extern "C" fn cond_call_value_extra_clobber() {
+    naked_asm!(
+        "lock inc qword ptr [rip + {hits}]",
+        "mov qword ptr [rip + {e0}], rdi",
+        "mov qword ptr [rip + {e1}], rsi",
+        "mov qword ptr [rip + {e2}], rdx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor ebx, ebx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r14, r14",
+        "xor r15, r15",
+        "mov rax, 0x5A5A5A5A5A5A5A5A",
+        "ret",
+        hits = sym COND_CALL_VALUE_EXTRA_HITS,
+        e0 = sym COND_CALL_EXTRA0,
+        e1 = sym COND_CALL_EXTRA1,
+        e2 = sym COND_CALL_EXTRA2,
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[unsafe(naked)]
+extern "C" fn cond_call_value_extra_clobber() {
+    naked_asm!(
+        "lock inc qword ptr [rip + {hits}]",
+        "mov qword ptr [rip + {e0}], rcx",
+        "mov qword ptr [rip + {e1}], rdx",
+        "mov qword ptr [rip + {e2}], r8",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor ebx, ebx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r14, r14",
+        "xor r15, r15",
+        "mov rax, 0x5A5A5A5A5A5A5A5A",
+        "ret",
+        hits = sym COND_CALL_VALUE_EXTRA_HITS,
+        e0 = sym COND_CALL_EXTRA0,
+        e1 = sym COND_CALL_EXTRA1,
+        e2 = sym COND_CALL_EXTRA2,
+    );
+}
+
+clobber_hits!(cond_call_eax_live_hit, EAX_LIVE_HITS);
+
+fn compile_cond_call_three_extras(predicate: i64, func: i64) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let base = inputargs[0].opref();
+    let (mut ops, lives) = live_add_ops(base);
+    let [e0, e1, e2] = extra_operands();
+    let call = Op::new(
+        OpCode::CondCallN,
+        &[
+            rb(OpRef::const_int(predicate)),
+            rb(OpRef::const_int(func)),
+            e0,
+            e1,
+            e2,
+        ],
+    );
+    call.pos().set(OpRef::void_op(0));
+    ops.push(call);
+    let types = vec![Type::Int; LIVE_ADD_COUNT as usize];
+    ops.extend(failing_guard_with_lives(
+        lives,
+        types,
+        LIVE_ADD_COUNT + 1,
+        LIVE_ADD_COUNT + 2,
+    ));
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile COND_CALL extras: {err:?}"));
+    (backend, token)
+}
+
+fn compile_cond_call_value_three_extras(func: i64) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let value = inputargs[0].opref();
+    let base = inputargs[1].opref();
+    let (mut ops, mut lives) = live_add_ops(base);
+    let [e0, e1, e2] = extra_operands();
+    let result = OpRef::int_op(LIVE_ADD_COUNT + 1);
+    let call = Op::new(
+        OpCode::CondCallValueI,
+        &[rb(value), rb(OpRef::const_int(func)), e0, e1, e2],
+    );
+    call.pos().set(result);
+    call.setdescr(call_descr(
+        vec![Type::Int, Type::Int, Type::Int],
+        Type::Int,
+        true,
+        8,
+    ));
+    ops.push(call);
+    let mut failargs = vec![rb(result)];
+    failargs.append(&mut lives);
+    let types = vec![Type::Int; LIVE_ADD_COUNT as usize + 1];
+    ops.extend(failing_guard_with_lives(
+        failargs,
+        types,
+        LIVE_ADD_COUNT + 2,
+        LIVE_ADD_COUNT + 3,
+    ));
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile COND_CALL_VALUE extras: {err:?}"));
+    (backend, token)
+}
+
+#[test]
+fn cond_call_three_extras_remap_on_taken_path() {
+    // Sixteen live adds fill the GPR pool, so extras 14..=16 sit in frame
+    // slots. `consider_cond_call` keeps those locations; the taken path
+    // remaps them into `cond_call_register_arguments`.
+    let func = cond_call_extra_clobber as *const () as usize as i64;
+    let base = 10i64;
+    let expected = extra_expected(base);
+
+    reset_cond_call_extras();
+    let (backend, token) = compile_cond_call_three_extras(0, func);
+    let frame = backend.execute_token(&token, &[Value::Int(base)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COND_CALL_EXTRA_HITS.load(Ordering::SeqCst), 0);
+    assert_live_adds(&backend, &frame, base, 0);
+
+    reset_cond_call_extras();
+    let (backend, token) = compile_cond_call_three_extras(1, func);
+    let frame = backend.execute_token(&token, &[Value::Int(base)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COND_CALL_EXTRA_HITS.load(Ordering::SeqCst), 1);
+    assert_recorded_extras(expected);
+    assert_live_adds(&backend, &frame, base, 0);
+}
+
+#[test]
+fn cond_call_value_i_three_extras_taken_and_not_taken() {
+    // Same spilled extras as the void form. Not-taken keeps `args[0]`;
+    // taken remaps extras and writes the helper word into `resloc`.
+    let func = cond_call_value_extra_clobber as *const () as usize as i64;
+    let base = 10i64;
+    let expected = extra_expected(base);
+    let live_value = 0x1111_2222_3333_4444i64;
+
+    reset_cond_call_extras();
+    let (backend, token) = compile_cond_call_value_three_extras(func);
+    let frame = backend.execute_token(&token, &[Value::Int(live_value), Value::Int(base)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COND_CALL_VALUE_EXTRA_HITS.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.get_int_value(&frame, 0), live_value);
+    assert_live_adds(&backend, &frame, base, 1);
+
+    reset_cond_call_extras();
+    let (backend, token) = compile_cond_call_value_three_extras(func);
+    let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(base)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COND_CALL_VALUE_EXTRA_HITS.load(Ordering::SeqCst), 1);
+    assert_recorded_extras(expected);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        COND_CALL_EXTRA_HELPER_RESULT
+    );
+    assert_live_adds(&backend, &frame, base, 1);
+}
+
+extern "C" fn eax_live_return() -> i64 {
+    0x1111_2222_3333_4444
+}
+
+fn compile_eax_live_across_cond_call(func: i64) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let call = Op::new(
+        OpCode::CallI,
+        &[rb(OpRef::const_int(
+            eax_live_return as *const () as usize as i64,
+        ))],
+    );
+    call.pos().set(OpRef::int_op(1));
+    call.setdescr(call_descr(vec![], Type::Int, true, 8));
+    let cond = Op::new(
+        OpCode::CondCallN,
+        &[rb(OpRef::const_int(1)), rb(OpRef::const_int(func))],
+    );
+    cond.pos().set(OpRef::void_op(0));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(cond),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile eax-live COND_CALL: {err:?}"));
+    (backend, token)
+}
+
+#[test]
+fn cond_call_taken_restores_live_eax() {
+    // `after_call` leaves the CALL_I result in eax. That value is not the
+    // cond-call result (`resloc` is None). `CondCallSlowPath.generate_body`
+    // saves eax because it is in `should_be_saved`, then restores it after
+    // the helper (`restore_eax`).
+    let func = cond_call_eax_live_hit as *const () as usize as i64;
+    EAX_LIVE_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_eax_live_across_cond_call(func);
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(EAX_LIVE_HITS.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.get_int_value(&frame, 0), 0x1111_2222_3333_4444);
+}
+
 fn loop_code(token: &JitCellToken, code_size: usize) -> &[u8] {
     unsafe { std::slice::from_raw_parts(token.ll_raw_start() as *const u8, code_size) }
 }
@@ -1364,6 +1743,96 @@ fn failure_recovery_captures_a_pending_exception() {
         GcRef(EXC_OBJ.as_ptr() as usize)
     );
     assert!(!majit_backend_dynasm::jit_exc_is_pending());
+}
+
+/// A box whose `pos` is the constant (`pack_op_pos`, shortpreamble /
+/// heap-const). `compute_vars_longevity` rejects a Const fail-arg
+/// (`assert not isinstance(arg, Const)`). `locs_for_fail` still lowers
+/// this box through `convert_to_imm`, and `generate_quick_failure`
+/// reloads the bits through r11.
+fn heap_const_failarg(value: i64) -> Operand {
+    let op = OpRc::new(Op::new(OpCode::SameAsI, &[]));
+    op.pos().set(OpRef::const_int(value));
+    Operand::from_bound_op(&op)
+}
+
+/// `INT_ADD` of a constant that does not fit imm32 loads it into r11
+/// (`_load_scratch`). The failing guard's recovery then reloads that
+/// same word and a word 40 bytes away (`restore_scratch_register_known_value`
+/// plus `LEA`). A far constant still takes `MOV_ri`.
+#[test]
+fn guard_recovery_reuses_known_scratch_value() {
+    const SCRATCH_BASE: i64 = 1i64 << 32;
+    const NEAR: i64 = SCRATCH_BASE + 40;
+    const FAR: i64 = SCRATCH_BASE + (1i64 << 40);
+
+    let _lock = lock_exception_cells();
+    let _clear = ClearExc;
+    majit_backend_dynasm::jit_exc_clear();
+
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[rb(i0), rb(OpRef::const_int(SCRATCH_BASE))],
+    );
+    add.pos().set(OpRef::int_op(1));
+    let eq = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(0))]);
+    eq.pos().set(OpRef::int_op(2));
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+    guard.pos().set(OpRef::void_op(3));
+    guard.setdescr(make_resume_guard_descr_typed(vec![
+        Type::Int,
+        Type::Int,
+        Type::Int,
+        Type::Int,
+    ]));
+    guard.set_fail_arg_types(vec![Type::Int, Type::Int, Type::Int, Type::Int]);
+    guard.setfailargs(
+        vec![
+            rb(OpRef::int_op(1)),
+            heap_const_failarg(SCRATCH_BASE),
+            heap_const_failarg(NEAR),
+            heap_const_failarg(FAR),
+        ]
+        .into(),
+    );
+    let ops = vec![
+        OpRc::new(add),
+        OpRc::new(eq),
+        OpRc::new(guard),
+        OpRc::new(finish(4)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile scratch guard: {err:?}"));
+
+    let mut mov_r11 = [0u8; 10];
+    mov_r11[0] = 0x49;
+    mov_r11[1] = 0xBB;
+    mov_r11[2..].copy_from_slice(&SCRATCH_BASE.to_le_bytes());
+    let code = compiled_bytes(&token);
+    let movs = code
+        .windows(mov_r11.len())
+        .filter(|w| *w == mov_r11)
+        .count();
+    assert_eq!(
+        movs, 1,
+        "recovery must reuse r11 instead of reloading {SCRATCH_BASE:#x}"
+    );
+    assert!(
+        code.windows(4).any(|w| w == [0x4D, 0x8D, 0x5B, 0x28]),
+        "recovery must lea r11, [r11+40] for the near constant"
+    );
+
+    let frame = backend.execute_token(&token, &[Value::Int(7)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 7 + SCRATCH_BASE);
+    assert_eq!(backend.get_int_value(&frame, 1), SCRATCH_BASE);
+    assert_eq!(backend.get_int_value(&frame, 2), NEAR);
+    assert_eq!(backend.get_int_value(&frame, 3), FAR);
 }
 
 fn no_collect_effect() -> EffectInfo {
@@ -1723,6 +2192,44 @@ fn call_release_gil_round_trips_errno() {
         *errno_ptr() = 3;
     }
     assert_eq!(run_errno_swap(errno_save_flags(2), 0), 9);
+}
+
+#[cfg(target_os = "windows")]
+extern "C" fn set_last_error_and_return(code: i64) -> i64 {
+    unsafe { majit_rlib::rwin32::_SetLastError(code as u32) };
+    code + 1000
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn call_release_gil_saves_last_error() {
+    // `read_real_errno` with `RFFI_SAVE_LASTERROR`: after
+    // `restore_stack_pointer`, `GetLastError` runs below a fresh shadow
+    // area and rax survives around it.
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let call = Op::new(
+        OpCode::CallReleaseGilI,
+        &[
+            rb(OpRef::const_int(majit_jitcode::rffi::RFFI_SAVE_LASTERROR)),
+            rb(OpRef::const_int(set_last_error_and_return as usize as i64)),
+            rb(OpRef::const_int(123)),
+        ],
+    );
+    call.pos().set(OpRef::int_op(1));
+    call.setdescr(call_descr(vec![Type::Int], Type::Int, true, 8));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile CALL_RELEASE_GIL: {err:?}"));
+    majit_rlib::rwin32::SetLastError_saved(0);
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 1123);
+    assert_eq!(majit_rlib::rwin32::GetLastError_saved(), 123);
 }
 
 fn op_at(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
@@ -2407,9 +2914,10 @@ fn run_bridged(backend: &mut DynasmBackend, token: &JitCellToken) -> (usize, usi
     (seen, tip)
 }
 
-/// `[rsp+8]` is a prologue spill (`_call_header` has no `PASS_ON_MY_FRAME`
-/// scratch). The realloc body parks that word; these callee-saves come
-/// back only when the park is restored before the footer.
+/// `_call_footer` restores the callee-saves `_call_header` spilled.
+/// Win64 reserves 32 bytes before the direct `call`: the prologue writes
+/// `THREADLOCAL_OFS` and `SHADOWSTORE2_OFS` / `SHADOWSTORE3_OFS` into
+/// that shadow.
 fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
     let clt = token.compiled_loop_token().expect("compiled loop token");
     let bytes = majit_backend::jitframe::JitFrame::alloc_size(depth);
@@ -2446,7 +2954,8 @@ fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
     let head_addr = head as usize;
     // LLVM reserves rbx as an asm operand on this target. Save and restore
     // the prologue spills around the call and read them back from memory.
-    // slots: saved rbx, saved [rsp+8] reg, saved r12, got rbx, got [rsp+8], got r12.
+    // slots: saved rbx, saved rsi (Win64) or r12, saved r12, then the
+    // values those registers hold after `_call_footer`.
     let mut slots = [0u64; 6];
     let slots_ptr = slots.as_mut_ptr() as usize;
     unsafe {
@@ -2463,7 +2972,9 @@ fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
             "mov r12, 0x3333333333333333",
             "mov rcx, r13",
             "xor edx, edx",
+            "sub rsp, 32",
             "call r14",
+            "add rsp, 32",
             "mov rax, rbx",
             "mov [r15 + 24], rax",
             "mov rax, rsi",
@@ -2509,11 +3020,11 @@ fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
     assert_eq!(slots[3], 0x1111_1111_1111_1111, "rbx prologue spill");
     #[cfg(target_os = "windows")]
     {
-        assert_eq!(slots[4], 0x2222_2222_2222_2222, "rsi at [rsp+8]");
+        assert_eq!(slots[4], 0x2222_2222_2222_2222, "rsi");
         assert_eq!(slots[5], 0x3333_3333_3333_3333, "r12");
     }
     #[cfg(not(target_os = "windows"))]
-    assert_eq!(slots[4], 0x3333_3333_3333_3333, "r12 at [rsp+8]");
+    assert_eq!(slots[4], 0x3333_3333_3333_3333, "r12");
 }
 
 #[test]
@@ -2566,6 +3077,208 @@ fn bridge_frame_depth_skips_when_deep() {
         "jl is not taken when the entry frame is already deep enough"
     );
     call_entry_check_spills(&token, loop_depth as usize, 7);
+}
+
+/// Enter a finish loop from inline asm and check every callee-saved GPR
+/// `_call_header` / `_call_footer` own. Win64 includes r13 (`SAVED_R13_OFS`).
+/// The 32-byte shadow is inside the `sub rsp, 128` area.
+fn call_finish_preserves_callee_saves(token: &JitCellToken, depth: usize, input: i64) {
+    let clt = token.compiled_loop_token().expect("compiled loop token");
+    let bytes = majit_backend::jitframe::JitFrame::alloc_size(depth);
+    let head = majit_backend::llmodel::take_or_alloc_parked_entry_frame(token, bytes);
+    let info = clt.frame_info.data_ptr();
+    unsafe {
+        majit_backend::jitframe::JitFrame::init(head, info, depth);
+        majit_backend::llmodel::set_int_value(head, 0, -1);
+        majit_backend::llmodel::set_int_value(
+            head,
+            majit_backend_dynasm::arch::JITFRAME_FIXED_SIZE,
+            input as isize,
+        );
+    }
+    struct FreeHead<'a> {
+        token: &'a JitCellToken,
+        head: *mut majit_backend::jitframe::JitFrame,
+    }
+    impl Drop for FreeHead<'_> {
+        fn drop(&mut self) {
+            if self.head.is_null() {
+                return;
+            }
+            majit_backend::llmodel::park_or_free_done_entry_frame(
+                self.token,
+                self.head,
+                std::ptr::null_mut(),
+                false,
+            );
+            self.head = std::ptr::null_mut();
+        }
+    }
+    let _free = FreeHead { token, head };
+    let entry = token.ll_function_addr();
+    let head_addr = head as usize;
+    #[cfg(target_os = "windows")]
+    let mut got = [0u64; 9];
+    #[cfg(not(target_os = "windows"))]
+    let mut got = [0u64; 7];
+    let got_ptr = got.as_mut_ptr() as usize;
+    unsafe {
+        #[cfg(target_os = "windows")]
+        std::arch::asm!(
+            "sub rsp, 128",
+            "mov [rsp + 32], r13",
+            "mov [rsp + 40], r14",
+            "mov [rsp + 48], r15",
+            "mov rax, rbx",
+            "mov [rsp + 64], rax",
+            "mov rax, rsi",
+            "mov [rsp + 72], rax",
+            "mov rax, rdi",
+            "mov [rsp + 80], rax",
+            "mov rax, rbp",
+            "mov [rsp + 88], rax",
+            "mov rax, r12",
+            "mov [rsp + 96], rax",
+            "mov rax, r13",
+            "mov [rsp + 104], rax",
+            "mov rax, r14",
+            "mov [rsp + 112], rax",
+            "mov rax, r15",
+            "mov [rsp + 120], rax",
+            "mov rbx, 0x1111111111111111",
+            "mov rsi, 0x2222222222222222",
+            "mov rdi, 0x3333333333333333",
+            "mov rbp, 0x4444444444444444",
+            "mov r12, 0x5555555555555555",
+            "mov r13, 0x6666666666666666",
+            "mov r14, 0x7777777777777777",
+            "mov r15, 0x8888888888888888",
+            "mov rcx, [rsp + 32]",
+            "xor edx, edx",
+            "mov rax, [rsp + 40]",
+            "call rax",
+            "mov r11, [rsp + 48]",
+            "mov [r11], rbx",
+            "mov [r11 + 8], rsi",
+            "mov [r11 + 16], rdi",
+            "mov [r11 + 24], rbp",
+            "mov [r11 + 32], r12",
+            "mov [r11 + 40], r13",
+            "mov [r11 + 48], r14",
+            "mov [r11 + 56], r15",
+            "mov [r11 + 64], rax",
+            "mov rax, [rsp + 64]",
+            "mov rbx, rax",
+            "mov rax, [rsp + 72]",
+            "mov rsi, rax",
+            "mov rax, [rsp + 80]",
+            "mov rdi, rax",
+            "mov rax, [rsp + 88]",
+            "mov rbp, rax",
+            "mov rax, [rsp + 96]",
+            "mov r12, rax",
+            "mov rax, [rsp + 104]",
+            "mov r13, rax",
+            "mov rax, [rsp + 112]",
+            "mov r14, rax",
+            "mov rax, [rsp + 120]",
+            "mov r15, rax",
+            "add rsp, 128",
+            in("r13") head_addr,
+            in("r14") entry,
+            in("r15") got_ptr,
+            clobber_abi("win64"),
+        );
+        #[cfg(not(target_os = "windows"))]
+        std::arch::asm!(
+            "sub rsp, 128",
+            "mov [rsp + 32], r13",
+            "mov [rsp + 40], r14",
+            "mov [rsp + 48], r15",
+            "mov rax, rbx",
+            "mov [rsp + 64], rax",
+            "mov rax, rbp",
+            "mov [rsp + 72], rax",
+            "mov rax, r12",
+            "mov [rsp + 80], rax",
+            "mov rax, r13",
+            "mov [rsp + 88], rax",
+            "mov rax, r14",
+            "mov [rsp + 96], rax",
+            "mov rax, r15",
+            "mov [rsp + 104], rax",
+            "mov rbx, 0x1111111111111111",
+            "mov rbp, 0x4444444444444444",
+            "mov r12, 0x5555555555555555",
+            "mov r13, 0x6666666666666666",
+            "mov r14, 0x7777777777777777",
+            "mov r15, 0x8888888888888888",
+            "mov rdi, [rsp + 32]",
+            "xor esi, esi",
+            "mov rax, [rsp + 40]",
+            "call rax",
+            "mov r11, [rsp + 48]",
+            "mov [r11], rbx",
+            "mov [r11 + 8], rbp",
+            "mov [r11 + 16], r12",
+            "mov [r11 + 24], r13",
+            "mov [r11 + 32], r14",
+            "mov [r11 + 40], r15",
+            "mov [r11 + 48], rax",
+            "mov rax, [rsp + 64]",
+            "mov rbx, rax",
+            "mov rax, [rsp + 72]",
+            "mov rbp, rax",
+            "mov rax, [rsp + 80]",
+            "mov r12, rax",
+            "mov rax, [rsp + 88]",
+            "mov r13, rax",
+            "mov rax, [rsp + 96]",
+            "mov r14, rax",
+            "mov rax, [rsp + 104]",
+            "mov r15, rax",
+            "add rsp, 128",
+            in("r13") head_addr,
+            in("r14") entry,
+            in("r15") got_ptr,
+            clobber_abi("sysv64"),
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(got[0], 0x1111_1111_1111_1111, "rbx");
+        assert_eq!(got[1], 0x2222_2222_2222_2222, "rsi");
+        assert_eq!(got[2], 0x3333_3333_3333_3333, "rdi");
+        assert_eq!(got[3], 0x4444_4444_4444_4444, "rbp");
+        assert_eq!(got[4], 0x5555_5555_5555_5555, "r12");
+        assert_eq!(got[5], 0x6666_6666_6666_6666, "r13");
+        assert_eq!(got[6], 0x7777_7777_7777_7777, "r14");
+        assert_eq!(got[7], 0x8888_8888_8888_8888, "r15");
+        assert_eq!(got[8] as usize, head_addr, "footer returns the jitframe");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert_eq!(got[0], 0x1111_1111_1111_1111, "rbx");
+        assert_eq!(got[1], 0x4444_4444_4444_4444, "rbp");
+        assert_eq!(got[2], 0x5555_5555_5555_5555, "r12");
+        assert_eq!(got[3], 0x6666_6666_6666_6666, "r13");
+        assert_eq!(got[4], 0x7777_7777_7777_7777, "r14");
+        assert_eq!(got[5], 0x8888_8888_8888_8888, "r15");
+        assert_eq!(got[6] as usize, head_addr, "footer returns the jitframe");
+    }
+    assert_eq!(
+        majit_backend::llmodel::done_int_slot0(head),
+        input,
+        "finish stores the result at jf_frame[0]"
+    );
+}
+
+#[test]
+fn finish_loop_preserves_callee_saves() {
+    let mut backend = fresh_backend();
+    let token = compile_input_finish(&mut backend);
+    let (depth, _) = frame_info_words(&token);
+    call_finish_preserves_callee_saves(&token, depth as usize, 41);
 }
 
 fn compile_input_finish(backend: &mut DynasmBackend) -> JitCellToken {
@@ -2866,6 +3579,102 @@ fn call_malloc_nursery_varsize_small_and_large() {
     assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
 }
 
+/// `consider_call_malloc_nursery_varsize`: the length is an `INT_ADD`
+/// result, so it lives in a register. When that box dies at the alloc,
+/// `spill_or_move_registers_before_call` must not run — it would unbind
+/// the length with no stack sync. When a later store keeps it alive, the
+/// spill is legal and `loc` still sees the value.
+fn run_varsize_from_add(length_lives: bool, len_a: i64, len_b: i64) -> (majit_ir::GcRef, u32, i64) {
+    let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size: 1 << 20,
+        large_object_threshold: 4096,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    let array_tid = gc.register_type(majit_gc::TypeInfo::varsize(8, 8, 0, false, Vec::new()));
+    let mut backend = wb_backend(gc);
+    let a = OpRef::input_arg_int(0);
+    let b = OpRef::input_arg_int(1);
+    let n = OpRef::input_arg_int(2);
+    let k = OpRef::input_arg_int(3);
+    let sum = OpRef::int_op(4);
+    let len = OpRef::int_op(5);
+    let obj = OpRef::ref_op(6);
+    let alloc = op_at(
+        OpCode::CallMallocNurseryVarsize,
+        &[OpRef::const_int(0), OpRef::const_int(8), len],
+        obj,
+    );
+    alloc.setdescr(Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        8,
+        8,
+        array_tid,
+        Type::Int,
+    )));
+    let mut ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        op_at(OpCode::IntAdd, &[n, k], len),
+        alloc,
+    ];
+    let mut pos = 7u32;
+    if length_lives {
+        ops.push(gc_store(obj, 0, len, 8, pos));
+        pos += 1;
+    }
+    ops.push(gc_store(obj, 8, sum, 8, pos));
+    ops.push(finish_ref(obj, pos + 1));
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+        InputArg::from_type_rc(Type::Int, 3),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(
+        &token,
+        &[
+            Value::Int(20),
+            Value::Int(22),
+            Value::Int(len_a),
+            Value::Int(len_b),
+        ],
+    );
+    let ptr = finished_ref(&backend, &frame);
+    (ptr, array_tid, len_a.wrapping_add(len_b))
+}
+
+#[test]
+fn call_malloc_nursery_varsize_length_dies_and_stays() {
+    let (ptr, array_tid, _len) = run_varsize_from_add(false, 1, 2);
+    assert!(!ptr.is_null());
+    assert!(majit_gc::can_move(ptr), "length 3 stays in the nursery");
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+
+    let (ptr, array_tid, len) = run_varsize_from_add(false, 100_000, 40_000);
+    assert!(!ptr.is_null());
+    assert!(
+        !majit_gc::can_move(ptr),
+        "length {len} must take the non-moving path"
+    );
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+
+    let (ptr, array_tid, len) = run_varsize_from_add(true, 1, 2);
+    assert!(!ptr.is_null());
+    assert!(majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, len);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+
+    let (ptr, array_tid, len) = run_varsize_from_add(true, 100_000, 40_000);
+    assert!(!ptr.is_null());
+    assert!(!majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, len);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+}
+
 fn run_varsize_frame(nursery_size: usize, alloc_size: i64) -> majit_ir::GcRef {
     let mut backend = nursery_backend(nursery_size, 1 << 20);
     let size = OpRef::input_arg_int(0);
@@ -3091,6 +3900,13 @@ fn zero_array_descr() -> DescrRef {
 }
 
 fn run_zero_array(nbytes: i64, start: i64, start_in_reg: bool) {
+    run_zero_array_at(nbytes, start, start_in_reg, false, 0);
+}
+
+/// `base_const` passes the array as an immediate base. `bias` moves the
+/// base down and an immediate start up by the same amount, so the stores
+/// land on the same bytes through a larger displacement.
+fn run_zero_array_at(nbytes: i64, start: i64, start_in_reg: bool, base_const: bool, bias: i64) {
     let prefix = ZERO_ARRAY_BASEOFS + start as usize;
     let total = prefix + nbytes as usize + 8;
     let mut buf = vec![0xAAu8; total];
@@ -3100,14 +3916,18 @@ fn run_zero_array(nbytes: i64, start: i64, start_in_reg: bool) {
     let ptr = buf.as_mut_ptr() as usize;
     let mut backend = fresh_backend();
     let token = JitCellToken::new(next_token_id());
+    let base_value = (ptr as i64).wrapping_sub(bias);
     let mut inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
     let mut zero_args = vec![
         rb(OpRef::input_arg_ref(0)),
-        rb(OpRef::const_int(start)),
+        rb(OpRef::const_int(start + bias)),
         rb(OpRef::const_int(nbytes)),
         rb(OpRef::const_int(1)),
         rb(OpRef::const_int(1)),
     ];
+    if base_const {
+        zero_args[0] = rb(OpRef::const_int(base_value));
+    }
     if start_in_reg {
         inputargs.push(InputArg::from_type_rc(Type::Int, 1));
         zero_args[1] = rb(OpRef::input_arg_int(1));
@@ -3119,9 +3939,9 @@ fn run_zero_array(nbytes: i64, start: i64, start_in_reg: bool) {
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile ZERO_ARRAY nbytes={nbytes}: {err:?}"));
-    let mut values = vec![Value::Ref(GcRef(ptr))];
+    let mut values = vec![Value::Ref(GcRef(base_value as usize))];
     if start_in_reg {
-        values.push(Value::Int(start));
+        values.push(Value::Int(start + bias));
     }
     let frame = backend.execute_token(&token, &values);
     assert!(
@@ -3153,6 +3973,26 @@ fn zero_array_unroll_and_memset_leave_neighbors() {
         run_zero_array(nbytes, 0, false);
     }
     run_zero_array(16, 4, true);
+}
+
+#[test]
+fn zero_array_immediate_base() {
+    // `addr_add` with an `ImmedLoc` base: inline stores and the memset
+    // destination, with an immediate and a register start.
+    for nbytes in [24, ZERO_ARRAY_UNROLL_LIMIT + 16] {
+        run_zero_array_at(nbytes, 0, false, true, 0);
+        run_zero_array_at(nbytes, 4, true, true, 0);
+    }
+}
+
+#[test]
+fn zero_array_displacement_crosses_i32() {
+    // The first 16-byte store sits just below `i32::MAX`; the second is
+    // above it and must go through the scratch register
+    // (`_fix_static_offset_64_m`), not wrap to a negative displacement.
+    let bias = i64::from(i32::MAX) - 8 - ZERO_ARRAY_BASEOFS as i64;
+    run_zero_array_at(32, 0, false, false, bias);
+    run_zero_array_at(ZERO_ARRAY_UNROLL_LIMIT + 16, 0, false, false, bias);
 }
 
 static CALL_ENTRY_RSP: AtomicUsize = AtomicUsize::new(0);
@@ -3228,6 +4068,29 @@ aligned_int_callee!(
     a7: i64 = 8,
     a8: i64 = 9
 );
+aligned_int_callee!(
+    call_align_19,
+    call_align_19_real,
+    a0: i64 = 1,
+    a1: i64 = 2,
+    a2: i64 = 3,
+    a3: i64 = 4,
+    a4: i64 = 5,
+    a5: i64 = 6,
+    a6: i64 = 7,
+    a7: i64 = 8,
+    a8: i64 = 9,
+    a9: i64 = 10,
+    a10: i64 = 11,
+    a11: i64 = 12,
+    a12: i64 = 13,
+    a13: i64 = 14,
+    a14: i64 = 15,
+    a15: i64 = 16,
+    a16: i64 = 17,
+    a17: i64 = 18,
+    a18: i64 = 19
+);
 
 #[unsafe(naked)]
 extern "C" fn call_align_float() {
@@ -3282,6 +4145,10 @@ fn call_subtract_esp_aligned_passes_args() {
     run_aligned_call(call_align_7 as usize as i64, &args, types);
     let (args, types) = int_args(9);
     run_aligned_call(call_align_9 as usize as i64, &args, types);
+    // 19 ints: SysV puts 13 words on the stack, Win64's `on_stack` is 19.
+    // Both exceed `PASS_ON_MY_FRAME`, so the call subtracts.
+    let (args, types) = int_args(19);
+    run_aligned_call(call_align_19 as usize as i64, &args, types);
     run_aligned_call(
         call_align_float as usize as i64,
         &[rb(OpRef::const_float(1.5)), rb(OpRef::const_float(2.25))],
@@ -3537,4 +4404,279 @@ fn jump_to_another_loop_target_token() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     // Keep the target buffer mapped across the jump.
     drop(target);
+}
+
+fn read_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len) };
+    out
+}
+
+fn read_i64_unaligned(ptr: *const u8) -> i64 {
+    i64::from_le_bytes(read_bytes(ptr, 8).try_into().unwrap())
+}
+
+/// `save_into_mem`: constants 0 and -1 fit every width (`MOV*_ai`);
+/// `0x7fff_ffff` fits 4 and 8; `0x1_0000_0000` fits none and is staged
+/// through the scratch register. The index is an input, not a constant.
+#[test]
+fn gc_store_indexed_immediate_values_round_trip_memory() {
+    let values = [0i64, -1, 0x7fff_ffff, 0x1_0000_0000];
+    let sizes = [1i64, 2, 4, 8];
+    let factors = [1i64, 8];
+    let mut slots = Vec::new();
+    let mut slot = 0i64;
+    for &value in &values {
+        for &size in &sizes {
+            for &factor in &factors {
+                slots.push((slot * 16, factor, size, value));
+                slot += 1;
+            }
+        }
+    }
+    let bytes = (slot as usize) * 16 + 16;
+    let mut storage = vec![0xA5u8; bytes];
+    let base_ptr = storage.as_mut_ptr();
+
+    let mut backend = fresh_backend();
+    let base = OpRef::input_arg_ref(0);
+    let index = OpRef::input_arg_int(1);
+    let mut ops = Vec::new();
+    for (n, &(static_ofs, factor, size, value)) in slots.iter().enumerate() {
+        ops.push(op_at(
+            OpCode::GcStoreIndexed,
+            &[
+                base,
+                index,
+                OpRef::const_int(value),
+                OpRef::const_int(factor),
+                OpRef::const_int(static_ofs),
+                OpRef::const_int(size),
+            ],
+            OpRef::void_op(n as u32 + 1),
+        ));
+    }
+    ops.push(finish_int(index, slots.len() as u32 + 1));
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Ref(GcRef(base_ptr as usize)), Value::Int(1)],
+    );
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 1);
+
+    for &(static_ofs, factor, size, value) in &slots {
+        let at = unsafe { base_ptr.add((static_ofs + factor) as usize) };
+        let size = size as usize;
+        assert_eq!(
+            unsafe { *at.sub(1) },
+            0xA5,
+            "byte before value {value:#x} size {size} factor {factor}"
+        );
+        assert_eq!(
+            read_bytes(at, size),
+            &value.to_le_bytes()[..size],
+            "value {value:#x} size {size} factor {factor} ofs {static_ofs}"
+        );
+        assert_eq!(
+            unsafe { *at.add(size) },
+            0xA5,
+            "byte after value {value:#x} size {size} factor {factor}"
+        );
+    }
+}
+
+extern "C" fn spilled_guard_nop() {}
+
+/// `test_location` on a frame slot: `CMP [rbp+disp], 0`.
+///
+/// The first results land in callee-saved registers, which a
+/// non-collecting call leaves alone. `GUARDED` is past that pool, so
+/// `before_call` spills it once every callee-saved register is live.
+fn spilled_guard_trace(opcode: OpCode, input: i64) -> (bool, i64, Vec<u8>) {
+    const LIVE: u32 = 13;
+    const GUARDED: u32 = 7;
+    let mut backend = fresh_backend();
+    let base = OpRef::input_arg_int(0);
+    let mut ops = Vec::new();
+    let mut lives = vec![rb(OpRef::int_op(GUARDED))];
+    for n in 1..=LIVE {
+        ops.push(op_at(
+            OpCode::IntAdd,
+            &[base, OpRef::const_int(i64::from(n))],
+            OpRef::int_op(n),
+        ));
+        if n != GUARDED {
+            lives.push(rb(OpRef::int_op(n)));
+        }
+    }
+    let func = spilled_guard_nop as *const () as usize as i64;
+    let call = op_at(OpCode::CallN, &[OpRef::const_int(func)], OpRef::void_op(20));
+    call.setdescr(call_descr(vec![], Type::Void, false, 0));
+    ops.push(call);
+    let guarded = OpRef::int_op(GUARDED);
+    let guard = Op::new(opcode, &[rb(guarded)]);
+    guard.pos().set(OpRef::void_op(21));
+    let types = vec![Type::Int; LIVE as usize];
+    guard.setdescr(make_resume_guard_descr_typed(types.clone()));
+    guard.set_fail_arg_types(types);
+    guard.setfailargs(lives.into());
+    ops.push(guard);
+    ops.push(finish_int(guarded, 22));
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let code = compiled_bytes(&token).to_vec();
+    let frame = backend.execute_token(&token, &[Value::Int(input)]);
+    let finished = backend.get_latest_descr(&frame).is_finish();
+    let value = backend.get_int_value(&frame, 0);
+    (finished, value, code)
+}
+
+fn has_cmp_frame_imm0(code: &[u8]) -> bool {
+    // `cmp_bi(..., 0)`: `48 83 7D disp8 00` or `48 83 BD disp32 00`.
+    code.windows(5)
+        .any(|w| w[0] == 0x48 && w[1] == 0x83 && w[2] == 0x7D && w[4] == 0x00)
+        || code
+            .windows(8)
+            .any(|w| w[0] == 0x48 && w[1] == 0x83 && w[2] == 0xBD && w[7] == 0x00)
+}
+
+#[test]
+fn spilled_guard_true_and_false_read_frame() {
+    // The guarded box is input + 7.
+    let (pass, value, code) = spilled_guard_trace(OpCode::GuardTrue, 0);
+    assert!(pass, "GUARD_TRUE of 7 must finish");
+    assert_eq!(value, 7);
+    assert!(
+        has_cmp_frame_imm0(&code),
+        "unfused guard must CMP the spilled box, not TEST a register"
+    );
+
+    let (pass, value, _) = spilled_guard_trace(OpCode::GuardTrue, -7);
+    assert!(!pass, "GUARD_TRUE of 0 must fail");
+    assert_eq!(value, 0);
+
+    let (pass, value, code) = spilled_guard_trace(OpCode::GuardFalse, -7);
+    assert!(pass, "GUARD_FALSE of 0 must finish");
+    assert_eq!(value, 0);
+    assert!(has_cmp_frame_imm0(&code));
+
+    let (pass, value, _) = spilled_guard_trace(OpCode::GuardFalse, 0);
+    assert!(!pass, "GUARD_FALSE of 7 must fail");
+    assert_eq!(value, 7);
+}
+
+/// x86 displacements are the full `fits_in_32bits` range. A 12-bit mask
+/// would send 4096 and 0x10000 to offset 0, which stays poisoned.
+#[test]
+fn gc_load_store_negative_and_large_displacements() {
+    let offsets = [-8i64, 4096, 0x10000];
+    let values = [0x1111i64, 0x2222, 0x3333];
+    let mut storage = vec![0xA5u8; 8 + 0x10000 + 8];
+    let base_ptr = unsafe { storage.as_mut_ptr().add(8) };
+
+    let mut backend = fresh_backend();
+    let base = OpRef::input_arg_ref(0);
+    let mut ops = Vec::new();
+    for (n, (&ofs, &value)) in offsets.iter().zip(values.iter()).enumerate() {
+        ops.push(gc_store(
+            base,
+            ofs,
+            OpRef::const_int(value),
+            8,
+            n as u32 + 1,
+        ));
+    }
+    let loaded = [OpRef::int_op(10), OpRef::int_op(11), OpRef::int_op(12)];
+    for (n, (&ofs, dst)) in offsets.iter().zip(loaded).enumerate() {
+        ops.push(op_at(
+            OpCode::GcLoadI,
+            &[base, OpRef::const_int(ofs), OpRef::const_int(8)],
+            dst,
+        ));
+        let _ = n;
+    }
+    let sum = OpRef::int_op(13);
+    let total = OpRef::int_op(14);
+    ops.push(op_at(OpCode::IntAdd, &[loaded[0], loaded[1]], sum));
+    ops.push(op_at(OpCode::IntAdd, &[sum, loaded[2]], total));
+    ops.push(finish_int(total, 20));
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(base_ptr as usize))]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), values.iter().sum::<i64>());
+    for (&ofs, &value) in offsets.iter().zip(values.iter()) {
+        let at = unsafe { base_ptr.offset(ofs as isize) };
+        assert_eq!(read_i64_unaligned(at), value, "offset {ofs}");
+    }
+    assert_eq!(
+        read_bytes(base_ptr, 8),
+        [0xA5u8; 8],
+        "offset 0 must stay untouched"
+    );
+}
+
+fn singlefloat_bits(input: f64) -> i64 {
+    let mut backend = fresh_backend();
+    let src = OpRef::input_arg_float(0);
+    let bits = OpRef::int_op(1);
+    let ops = vec![
+        op_at(OpCode::CastFloatToSinglefloat, &[src], bits),
+        finish_int(bits, 2),
+    ];
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Float(input)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    backend.get_int_value(&frame, 0)
+}
+
+fn singlefloat_roundtrip(input: f64) -> f64 {
+    let mut backend = fresh_backend();
+    let src = OpRef::input_arg_float(0);
+    let bits = OpRef::int_op(1);
+    let back = OpRef::float_op(2);
+    let ops = vec![
+        op_at(OpCode::CastFloatToSinglefloat, &[src], bits),
+        op_at(OpCode::CastSinglefloatToFloat, &[bits], back),
+        finish_of(back, Type::Float, 3),
+    ];
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Float(input)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    backend.get_float_value(&frame, 0)
+}
+
+/// `genop_cast_float_to_singlefloat` / `genop_cast_singlefloat_to_float`.
+/// The int result holds the f32 bits in the low 32. 0.1 rounds; -0.0
+/// keeps its sign bit.
+#[test]
+fn singlefloat_casts_round_trip_bits() {
+    let cases = [1.5f64, 0.1, -0.0];
+    for input in cases {
+        let expect_bits = i64::from((input as f32).to_bits());
+        assert_eq!(
+            singlefloat_bits(input),
+            expect_bits,
+            "f32 bits of {input:?}"
+        );
+        let got = singlefloat_roundtrip(input);
+        let expect = f64::from(input as f32);
+        assert_eq!(
+            got.to_bits(),
+            expect.to_bits(),
+            "round-trip {input:?} -> {got:?}"
+        );
+    }
+    assert_ne!(
+        singlefloat_roundtrip(0.1).to_bits(),
+        0.1f64.to_bits(),
+        "0.1 must take the f32 rounding, not pass the f64 through"
+    );
 }

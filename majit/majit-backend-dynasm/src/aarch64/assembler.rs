@@ -3053,6 +3053,46 @@ impl<'a> AssemblerARM64<'a> {
                     dynasm!(self.mc ; .arch aarch64 ; fcvtzs X(dst.value), D(src.value));
                 }
             }
+            // `emit_op_cast_float_to_singlefloat`: FCVT the source double
+            // into `vfp_ip`, then FMOV those f32 bits into the GPR result.
+            OpCode::CastFloatToSinglefloat => {
+                if let (Some(src_loc), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    let src_reg = match src_loc {
+                        Loc::Reg(r) => *r,
+                        _ => {
+                            let scratch = crate::aarch64::registers::VFP_IP;
+                            self.regalloc_mov(src_loc, &Loc::Reg(scratch));
+                            scratch
+                        }
+                    };
+                    let tmp = crate::aarch64::registers::VFP_IP.value;
+                    dynasm!(self.mc ; .arch aarch64
+                        ; fcvt S(tmp), D(src_reg.value)
+                        ; fmov W(dst.value), S(tmp)
+                    );
+                }
+            }
+            // `emit_op_cast_singlefloat_to_float`: FMOV the f32 bits into
+            // `vfp_ip`, then FCVT to the double result.
+            OpCode::CastSinglefloatToFloat => {
+                if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    let sr = match src {
+                        Loc::Reg(s) => s.value,
+                        _ => {
+                            self.regalloc_mov(
+                                src,
+                                &Loc::Reg(crate::regloc::RegLoc::new(16, false)),
+                            );
+                            16
+                        }
+                    };
+                    let tmp = crate::aarch64::registers::VFP_IP.value;
+                    dynasm!(self.mc ; .arch aarch64
+                        ; fmov S(tmp), W(sr)
+                        ; fcvt D(dst.value), S(tmp)
+                    );
+                }
+            }
             // ── Same-as / identity ──
             OpCode::SameAsI
             | OpCode::SameAsR
@@ -7591,28 +7631,6 @@ impl<'a> AssemblerARM64<'a> {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
             ; fabs d0, d0
-        );
-        self.store_d0_to_result(op.pos().get());
-    }
-
-    /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
-    #[allow(dead_code)]
-    fn genop_cast_float_to_singlefloat(&mut self, op: &Op) {
-        self.load_float_arg_to_d0(op.arg(0).to_opref());
-        dynasm!(self.mc ; .arch aarch64
-            ; fcvt s0, d0
-            ; fmov w0, s0
-        );
-        self.store_rax_to_result(op.pos().get());
-    }
-
-    /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
-    #[allow(dead_code)]
-    fn genop_cast_singlefloat_to_float(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        dynasm!(self.mc ; .arch aarch64
-            ; fmov s0, w0
-            ; fcvt d0, s0
         );
         self.store_d0_to_result(op.pos().get());
     }

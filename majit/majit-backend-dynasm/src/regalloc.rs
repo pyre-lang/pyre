@@ -34,6 +34,16 @@ pub const SAVE_DEFAULT_REGS: u8 = 0;
 pub const SAVE_GCREF_REGS: u8 = 1;
 pub const SAVE_ALL_REGS: u8 = 2;
 
+/// `save_all_regs` for the CALL_MALLOC_NURSERY_VARSIZE spill. x86
+/// `consider_call_malloc_nursery_varsize` uses the default: the
+/// `malloc_slowpath_varsize` helper saves every register but ecx/edx into
+/// the jitframe. The aarch64 emitter still expects a live length in its
+/// frame slot, so it keeps spilling every binding.
+#[cfg(target_arch = "x86_64")]
+const VARSIZE_MALLOC_SAVE_REGS: u8 = SAVE_DEFAULT_REGS;
+#[cfg(not(target_arch = "x86_64"))]
+const VARSIZE_MALLOC_SAVE_REGS: u8 = SAVE_ALL_REGS;
+
 /// `guard.getfailargs()` as OpRefs. Sixteen stay on the stack so a
 /// regex-shaped guard does not mint the 128 B SmallVec spill that
 /// `lower_op` used to allocate per guard.
@@ -747,9 +757,12 @@ use crate::x86::regalloc as arch_regalloc;
 
 use arch_regalloc::{
     MALLOC_NURSERY_CLOBBER, MALLOC_NURSERY_RESULT, all_core_regs, all_float_regs, call_result_fpr,
-    call_result_gpr, cond_call_argument_regs, core_reg_index, frame_reg,
-    save_around_call_core_regs,
+    call_result_gpr, core_reg_index, frame_reg, save_around_call_core_regs,
 };
+// aarch64 `_prepare_op_cond_call` forces extras into `argument_regs`.
+// x86 `consider_cond_call` captures current locations instead.
+#[cfg(target_arch = "aarch64")]
+use arch_regalloc::cond_call_argument_regs;
 
 // Per-arch reghint pass.  Upstream RPython ships reghint only under
 // `rpython/jit/backend/x86/`; there is no AArch64 counterpart here.
@@ -3294,13 +3307,53 @@ impl<'a> RegAlloc<'a> {
                     output,
                 );
             }
-            OpCode::FloatNeg
-            | OpCode::FloatAbs
-            | OpCode::CastFloatToSinglefloat
-            | OpCode::CastSinglefloatToFloat
-                if !args.is_empty() =>
-            {
+            OpCode::FloatNeg | OpCode::FloatAbs if !args.is_empty() => {
                 self.consider_float_unary_j2(dst.unwrap_or(op.pos().get()), args[0], i, output);
+            }
+            // aarch64/regalloc.py `prepare_op_cast_float_to_singlefloat` and
+            // `prepare_op_cast_singlefloat_to_float` are both `prepare_unary`:
+            // the arg in a register of its own kind, then
+            // `force_allocate_reg(op)` in a register of the result's kind.
+            // CAST_FLOAT_TO_SINGLEFLOAT is ('f','i'); CAST_SINGLEFLOAT_TO_FLOAT
+            // is ('i','f') (`resoperation.py` CastOp.cast_types).
+            #[cfg(not(target_arch = "x86_64"))]
+            OpCode::CastFloatToSinglefloat if !args.is_empty() => {
+                self.consider_cast_float_to_int_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            OpCode::CastSinglefloatToFloat if !args.is_empty() => {
+                self.consider_cast_int_to_float_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
+            }
+            // x86/regalloc.py `consider_cast_float_to_singlefloat`.
+            #[cfg(target_arch = "x86_64")]
+            OpCode::CastFloatToSinglefloat if !args.is_empty() => {
+                self.consider_cast_float_to_singlefloat_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
+            }
+            // x86/regalloc.py `consider_cast_singlefloat_to_float`,
+            // an alias of `consider_cast_int_to_float`.
+            #[cfg(target_arch = "x86_64")]
+            OpCode::CastSinglefloatToFloat if !args.is_empty() => {
+                self.consider_cast_int_to_float_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
             }
             OpCode::FloatLt
             | OpCode::FloatLe
@@ -4208,6 +4261,12 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
+        // x86 `_consider_guard_cc` passes `self.loc(arg)` into
+        // `load_condition_into_cc` → `test_location`, which emits
+        // `CMP [mem], 0` for a frame location. aarch64 still forces a register.
+        #[cfg(target_arch = "x86_64")]
+        let loc = self.loc(arg, self.tp(arg));
+        #[cfg(not(target_arch = "x86_64"))]
         let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
         self.perform_guard_j2(fail_args, i, [loc], None, output);
     }
@@ -4860,6 +4919,37 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, [loc0], Some(result_loc), output);
     }
 
+    /// x86/regalloc.py `consider_cast_float_to_singlefloat`.
+    ///
+    /// The arg stays in an xmm, the result is a GPR (the f32 bits in the
+    /// low 32), and an xmm temp is allocated after the result. The temp
+    /// may alias the arg, so the forbidden list is empty.
+    #[cfg(target_arch = "x86_64")]
+    fn consider_cast_float_to_singlefloat_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc0 = self.make_sure_var_in_reg(arg, Type::Float, &[], None, false);
+        let loc1 = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        let loctmp = Loc::Reg(self.xrm.force_allocate_reg(
+            tmp,
+            &[],
+            None,
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        ));
+        self.xrm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Float);
+        self.perform(i, [loc0, loctmp], Some(loc1), output);
+    }
+
     /// Memory load: getfield pattern (1 arg → result)
     #[allow(dead_code)] // x86/regalloc.py consider_getfield
     fn consider_getfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
@@ -4949,7 +5039,15 @@ impl<'a> RegAlloc<'a> {
     }
 
     fn gc_offset_loc(&mut self, ofs: i64) -> Loc {
-        if check_imm_arg(ofs) {
+        // x86 `AddressLoc` keeps any displacement that `fits_in_32bits`,
+        // including negatives and values past `DEFAULT_IMM_SIZE`. aarch64
+        // stays on `check_imm_arg` (`0..DEFAULT_IMM_SIZE`).
+        let fits = if cfg!(target_arch = "x86_64") {
+            fits_in_32bits(ofs)
+        } else {
+            check_imm_arg(ofs)
+        };
+        if fits {
             Loc::immed(ofs)
         } else {
             self.pending_moves
@@ -5284,8 +5382,11 @@ impl<'a> RegAlloc<'a> {
         let size = size.map(|arg| self.const_value(arg)).unwrap_or(8);
         let ofs = self.const_value(offset);
         // pyre's GC header sits at `obj - HDR_SIZE`, so `gen_initialize_tid`
-        // stores at a small negative offset. Both store emitters take it as
-        // an immediate (STUR's signed 9-bit range on aarch64, disp32 on x86).
+        // stores at a small negative offset. Both store emitters take that
+        // window as an immediate (STUR's signed 9-bit range on aarch64,
+        // disp8/disp32 on x86). Wider x86 displacements, including other
+        // negatives and offsets >= 4096, stay immediate via `gc_offset_loc`
+        // when `fits_in_32bits` (`AddressLoc`).
         let ofs_loc = if (-256..0).contains(&ofs) {
             Loc::immed(ofs)
         } else {
@@ -6215,22 +6316,28 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.inputarg_pos,
-            &self.op_pos,
-        );
-        // aarch64/regalloc.py:1016
-        self.rm.spill_or_move_registers_before_call(
-            &MALLOC_NURSERY_CLOBBER,
-            &[],
-            SAVE_ALL_REGS,
-            &mut self.longevity,
-            &mut self.fm,
-            &mut self.pending_moves,
-            &type_index,
-        );
+        // `consider_call_malloc_nursery_varsize` /
+        // `prepare_op_call_malloc_nursery_varsize`: spill only when
+        // `stays_alive(length_box)`. A length that dies here is unbound
+        // with no stack sync, and `loc` would then allocate an empty slot.
+        let length_box = op.arg(2).to_opref();
+        if self.rm.stays_alive(length_box, &self.longevity) {
+            let type_index = OpTypeIndex::from_parts(
+                self.inputargs,
+                self.operations,
+                &self.inputarg_pos,
+                &self.op_pos,
+            );
+            self.rm.spill_or_move_registers_before_call(
+                &MALLOC_NURSERY_CLOBBER,
+                &[],
+                VARSIZE_MALLOC_SAVE_REGS,
+                &mut self.longevity,
+                &mut self.fm,
+                &mut self.pending_moves,
+                &type_index,
+            );
+        }
         // aarch64/regalloc.py:1018
         let result_reg = self.rm.force_allocate_reg(
             op.pos().get(),
@@ -6262,7 +6369,7 @@ impl<'a> RegAlloc<'a> {
         self.rm
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         // aarch64/regalloc.py: lengthloc = self.rm.loc(length_box)
-        let lengthloc = self.loc(op.arg(2).to_opref(), Type::Int);
+        let lengthloc = self.loc(length_box, Type::Int);
         // aarch64/regalloc.py:1030: itemsize = op.getarg(1).getint()
         let itemsize = self.const_value(op.arg(1).to_opref());
         // aarch64/regalloc.py:1033: kind = op.getarg(0).getint()
@@ -6282,21 +6389,28 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.inputarg_pos,
-            &self.op_pos,
-        );
-        self.rm.spill_or_move_registers_before_call(
-            &MALLOC_NURSERY_CLOBBER,
-            &[],
-            SAVE_ALL_REGS,
-            &mut self.longevity,
-            &mut self.fm,
-            &mut self.pending_moves,
-            &type_index,
-        );
+        // `consider_call_malloc_nursery_varsize` /
+        // `prepare_op_call_malloc_nursery_varsize`: spill only when
+        // `stays_alive(length_box)`. See `consider_call_malloc_nursery_varsize`.
+        if let Some(&length_box) = args.get(2)
+            && self.rm.stays_alive(length_box, &self.longevity)
+        {
+            let type_index = OpTypeIndex::from_parts(
+                self.inputargs,
+                self.operations,
+                &self.inputarg_pos,
+                &self.op_pos,
+            );
+            self.rm.spill_or_move_registers_before_call(
+                &MALLOC_NURSERY_CLOBBER,
+                &[],
+                VARSIZE_MALLOC_SAVE_REGS,
+                &mut self.longevity,
+                &mut self.fm,
+                &mut self.pending_moves,
+                &type_index,
+            );
+        }
         let result_reg = self.rm.force_allocate_reg(
             dst.unwrap_or(OpRef::NONE),
             &[],
@@ -6715,9 +6829,8 @@ impl<'a> RegAlloc<'a> {
     /// (`prepare_op_cond_call_value_r` is the same) and x86/regalloc.py
     /// `consider_cond_call` (aliased as `consider_cond_call_value_i` / `_r`).
     ///
-    /// Extra args (from index 2) go into `argument_regs`. The result shares
-    /// args[0]'s register via `force_result_in_reg` (`forbidden_vars=args[2:]`).
-    /// Arglocs are `[argloc, resloc]`; the callee address stays an Immed on
+    /// The result shares args[0]'s register via `force_result_in_reg`
+    /// (`forbidden_vars=args[2:]`). The callee address stays an Immed on
     /// the op. The helper returns a plain word — no `before_call` / raw-call
     /// result-in-x0 rewrite.
     fn consider_cond_call_value_j2(
@@ -6733,6 +6846,78 @@ impl<'a> RegAlloc<'a> {
             (2..=6).contains(&args.len()),
             "COND_CALL_VALUE takes 0..=4 extra arguments (aarch64/regalloc.py _prepare_op_cond_call)"
         );
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.consider_cond_call_value_x86(dst, args, op, i, output);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.consider_cond_call_value_aarch64(dst, args, op, i, output);
+        }
+    }
+
+    /// x86/regalloc.py `consider_cond_call` COND_CALL_VALUE arm.
+    /// Extra-arg locations are captured before `force_result_in_reg`;
+    /// `CondCallSlowPath.generate_body` remaps them into
+    /// `cond_call_register_arguments` on the taken path only.
+    /// `cond_call` then snapshots `rm.reg_bindings` for the save mask.
+    #[cfg(target_arch = "x86_64")]
+    fn consider_cond_call_value_x86(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let extra_locs: Vec<Loc> = args[2..]
+            .iter()
+            .map(|&arg| self.loc(arg, self.tp(arg)))
+            .collect();
+        let value = args[0];
+        let result_v = dst.unwrap_or(op.pos().get());
+        let forbidden: Vec<OpRef> = args[2..].to_vec();
+        let resloc = self.rm.force_result_in_reg(
+            result_v,
+            value,
+            self.tp(value),
+            &forbidden,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        let res_reg = match resloc {
+            Loc::Reg(r) => r,
+            other => panic!(
+                "force_result_in_reg must return a register (consider_cond_call), got {other:?}"
+            ),
+        };
+        let gcmap = self.get_gcmap(&[res_reg], false) as usize;
+        // Assembler prefix stays `[argloc, resloc]`; x86 tests `resloc`.
+        // Trailing immediates are `cond_call`'s `variant_num` and
+        // `should_be_saved` bitmask over GPR numbers, captured after
+        // `force_result_in_reg` while the bindings are still live.
+        let mut locs = Vec::with_capacity(extra_locs.len() + 4);
+        locs.push(resloc);
+        locs.push(resloc);
+        locs.extend(extra_locs);
+        locs.push(Loc::immed(self.cond_call_slowpath_variant()));
+        locs.push(Loc::immed(self.cond_call_should_be_saved()));
+        self.perform_with_gcmap_ptr(i, locs, Some(resloc), gcmap, output);
+    }
+
+    /// aarch64/regalloc.py `_prepare_op_cond_call`: extra args (from index 2)
+    /// go into `argument_regs`. Arglocs are `[argloc, resloc]`.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn consider_cond_call_value_aarch64(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
         let argument_regs = cond_call_argument_regs();
         let mut args_so_far: Vec<OpRef> = Vec::new();
         for (j, &arg) in args.iter().enumerate().skip(2) {
@@ -6764,18 +6949,6 @@ impl<'a> RegAlloc<'a> {
         // `gcmap = self._regalloc.get_gcmap([res_loc])` — exclude the result
         // register; on the miss path it is overwritten with the helper word.
         let gcmap = self.get_gcmap(&[res_reg], false) as usize;
-        // `cond_call` reads `rm.reg_bindings` / `xrm.reg_bindings` here,
-        // after `force_result_in_reg` and before `possibly_free_vars_for_op`.
-        // The walk frees those bindings before emit, so the
-        // `floats * 2 + callee_only` index travels as a trailing immediate.
-        // aarch64 has one slow path and does not read it.
-        #[cfg(target_arch = "x86_64")]
-        let locs = {
-            let mut locs = vec![argloc, resloc];
-            locs.push(Loc::immed(self.cond_call_slowpath_variant()));
-            locs
-        };
-        #[cfg(not(target_arch = "x86_64"))]
         let locs = [argloc, resloc];
         self.perform_with_gcmap_ptr(i, locs, Some(resloc), gcmap, output);
     }
@@ -6785,9 +6958,14 @@ impl<'a> RegAlloc<'a> {
     /// result. aarch64 spills every register into the jitframe on the
     /// taken path and publishes this map so `force_now` allocations
     /// forward those slots. x86 `cond_call` instead calls
-    /// `cond_call_slowpath[floats * 2 + callee_only]`; that index is the
-    /// trailing immediate, captured while the bindings are still live.
+    /// `cond_call_slowpath[floats * 2 + callee_only]`; that index is a
+    /// trailing immediate, captured while the bindings are still live,
+    /// next to the `should_be_saved` GPR bitmask (`cond_call`).
     fn consider_cond_call_n(&mut self, args: &[OpRef], i: usize, output: &mut Vec<RegAllocOp>) {
+        // x86/regalloc.py `consider_cond_call`: extra-arg locations first
+        // (`self.loc` of args[2:]), then the gcmap. The predicate and func
+        // sit in the assembler prefix; extras are remapped on the taken
+        // path only (`CondCallSlowPath.generate_body`).
         let mut locs = Vec::new();
         for &arg in args {
             let tp = self.tp(arg);
@@ -6795,7 +6973,10 @@ impl<'a> RegAlloc<'a> {
         }
         let gcmap = self.get_gcmap(&[], false) as usize;
         #[cfg(target_arch = "x86_64")]
-        locs.push(Loc::immed(self.cond_call_slowpath_variant()));
+        {
+            locs.push(Loc::immed(self.cond_call_slowpath_variant()));
+            locs.push(Loc::immed(self.cond_call_should_be_saved()));
+        }
         self.perform_with_gcmap_ptr(i, locs, None, gcmap, output);
     }
 
@@ -6814,6 +6995,18 @@ impl<'a> RegAlloc<'a> {
         }
         let floats = self.xrm.reg_bindings_len() > 0;
         (usize::from(floats) * 2 + usize::from(callee_only)) as i64
+    }
+
+    /// `cond_call`: `should_be_saved = rm.reg_bindings.values()`, encoded
+    /// as a bitmask over GPR numbers (`1 << gpr.value`). Travels as the
+    /// trailing immediate next to `variant_num`.
+    #[cfg(target_arch = "x86_64")]
+    fn cond_call_should_be_saved(&self) -> i64 {
+        let mut mask = 0i64;
+        for (_, reg) in self.rm.reg_bindings_iter() {
+            mask |= 1i64 << reg.value;
+        }
+        mask
     }
 
     /// Generic discard with N args

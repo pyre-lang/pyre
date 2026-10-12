@@ -74,8 +74,9 @@ pub fn call_result_gpr() -> RegLoc {
 }
 
 /// x86/assembler.py `cond_call_register_arguments` —
-/// `CallBuilder64.ARGUMENTS_GPR[:4]`. Extra COND_CALL_VALUE arguments
-/// land here so the miss path can `CALL` without remapping.
+/// `CallBuilder64.ARGUMENTS_GPR[:4]`. `CondCallSlowPath.generate_body`
+/// remaps extra COND_CALL / COND_CALL_VALUE arguments into these
+/// registers on the taken path only.
 pub fn cond_call_argument_regs() -> &'static [RegLoc] {
     let regs = crate::x86::callbuilder::ARGUMENTS_GPR;
     &regs[..4]
