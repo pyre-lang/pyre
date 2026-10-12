@@ -4352,15 +4352,8 @@ where
                 // can answer yes for a loop stored under a key nothing
                 // enters, auto-stamp here, and close with nothing but
                 // the green-promotion ops recorded.
-                let has_targets = mp_green_pc
-                    .and_then(|pc| {
-                        ctx.merge_point_green_key_hash(
-                            pc,
-                            &mp_green_ints,
-                            &mp_green_refs,
-                            &mp_green_floats,
-                        )
-                    })
+                let has_targets = ctx
+                    .merge_point_green_key_hash(&mp_green_ints, &mp_green_refs, &mp_green_floats)
                     .zip(ctx.has_compiled_targets_fn.as_ref())
                     .is_some_and(|(key, f)| f(key));
                 depth_zero && has_targets
@@ -4809,7 +4802,7 @@ where
                 // segmenting consumers, which install cell flags and
                 // so need a key a chain walk can match, not a bucket.
                 let Some(inner_key_typed) =
-                    ctx.merge_point_green_key(pc, &mp_green_ints, &mp_green_refs, &mp_green_floats)
+                    ctx.merge_point_green_key(&mp_green_ints, &mp_green_refs, &mp_green_floats)
                 else {
                     return TraceAction::Continue;
                 };

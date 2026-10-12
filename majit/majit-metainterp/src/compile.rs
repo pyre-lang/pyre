@@ -6083,12 +6083,11 @@ impl TraceCtx {
     /// num_green_args)` — the loop header the trace is closing ON, read from
     /// the greens it closes WITH.
     ///
-    /// The guest pc is `close_green_pc`, the same value
-    /// `close_green_key` hashes. It is not `close_greens.0[0]` (that bank
-    /// is the remaining int greens) and not the trace-start `header_pc`,
-    /// which a close on another loop leaves stale. `same_greenkey` always
-    /// reads the closing boxes; slot 56 counts a close that never recorded
-    /// a pc, where the session header is the only value left.
+    /// The guest pc is `close_green_pc`. It is not the trace-start
+    /// `header_pc`, which a close on another loop leaves stale.
+    /// `same_greenkey` always reads the closing boxes; slot 56 counts a
+    /// close that never recorded a pc, where the session header is the
+    /// only value left.
     pub fn close_header_pc(&self) -> usize {
         // A negative pc is not a jitcode position. `as usize` would wrap it
         // into a huge header and file the merge point on the wrong loop.
