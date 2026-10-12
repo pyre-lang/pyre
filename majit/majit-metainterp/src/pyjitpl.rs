@@ -12374,12 +12374,6 @@ impl<M: Clone> MetaInterp<M> {
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 {
                     let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                    let ft = self
-                        .compiled_entry(green_key)
-                        .and_then(|c| c.live_token())
-                        .map(|live| crate::history::target_tokens_of(&live))
-                        .unwrap_or_default();
-                    let _had_old = self.has_compiled_loop_entry(green_key);
                     // Carried forward for the same reason as the compile_loop site.
                     let mut carried_loop_header_pc = None;
                     if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
@@ -12418,10 +12412,6 @@ impl<M: Clone> MetaInterp<M> {
                     // real `ll_loop_code`; synthesising a code-less one here let
                     // a later guard-failure bridge close with a JUMP whose
                     // backend target is `ll_loop_code == 0` (`br 0` → PC=0).
-                    for target_token in &ft {
-                        token.record_target_token(target_token.as_jump_target_descr());
-                    }
-                    let front_entry_index = Self::front_entry_index_for(&ft);
                     self.note_compiled_loops_changed();
                     self.insert_compiled_loop_on_driver(
                         compiling_jd,
@@ -12429,7 +12419,7 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledEntry {
                             token: Arc::downgrade(&token),
                             meta: Arc::new(meta),
-                            front_entry_index,
+                            front_entry_index: None,
                             front_target_source_positions: None,
                             root_trace_id: trace_id,
                             loop_header_pc: carried_loop_header_pc,
