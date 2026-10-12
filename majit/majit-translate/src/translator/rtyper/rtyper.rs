@@ -2355,12 +2355,13 @@ impl RPythonTyper {
                     .ok_or_else(|| TyperError::message("raw_store: missing value repr"))?;
                 let v_value = hop.inputarg(&r_value, 2)?;
                 hop.exception_cannot_occur()?;
-                // `_LLOpEntry.specialize_call` passes
-                // `resulttype=hop.r_result.lowleveltype`. For Void that
-                // is still a typed result (`lltype_to_annotation(Void)`
-                // is `s_None`), so `genop` returns a Variable — not
-                // `resulttype=None`, which would hit
-                // `translate_no_return_value` and reject `s_None`.
+                // `Entry.specialize_call` passes
+                // `resulttype=hop.r_result.lowleveltype`.  For `raw_store`
+                // that type is `Void` (`lltype_to_annotation(Void)` is
+                // `s_None`), and `genop` then returns the result Variable.
+                // `resulttype=None` (`GenopResult::Void`) returns no
+                // Variable, and `translate_no_return_value` rejects every
+                // result that is not `s_ImpossibleValue`.
                 let result_lltype = hop
                     .r_result
                     .borrow()
