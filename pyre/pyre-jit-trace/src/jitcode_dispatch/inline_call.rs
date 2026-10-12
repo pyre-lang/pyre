@@ -18471,21 +18471,26 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
 /// `CALL_FUNCTION_EX` unpack miss the extra positional. Same contract as
 /// `finish_recorded_list_append`.
 fn sync_recorded_list_extend(
-    list: pyre_object::PyObjectRef,
-    iterable: pyre_object::PyObjectRef,
+    roots_base: usize,
     len_before: usize,
     allocated_before: isize,
-) {
+) -> bool {
+    // The sub-walk and the extend below can both collect; `roots_base` and
+    // `roots_base + 1` are the rooted list and iterable.
+    let list = pyre_object::gc_roots::shadow_stack_get(roots_base);
     if unsafe { pyre_object::w_list_len(list) } != len_before {
-        return;
+        return true;
     }
-    if pyre_interpreter::opcode_ops::list_extend_value(list, iterable).is_err() {
-        return;
-    }
+    let iterable = pyre_object::gc_roots::shadow_stack_get(roots_base + 1);
+    let extended = pyre_interpreter::opcode_ops::list_extend_value(list, iterable).is_ok();
+    // Journal whatever was appended, a failed extend's partial prefix
+    // included, so a walk that does not commit rewinds it.
+    let list = pyre_object::gc_roots::shadow_stack_get(roots_base);
     let len_after = unsafe { pyre_object::w_list_len(list) };
     for i in len_before..len_after {
         fbw_list_journal_push_append(list, i, allocated_before);
     }
+    extended
 }
 
 fn list_extend_value_jitcode_matches(name: &str) -> bool {
@@ -18645,6 +18650,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
+    let _list_extend_roots = pyre_object::gc_roots::push_roots();
     let list_extend_sync = if ctx.is_authoritative_executor
         && dst_bank == 'v'
         && args.len() == 2
@@ -18660,8 +18666,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     && unsafe { pyre_object::is_list(*list) } =>
             {
                 Some((
-                    *list,
-                    *iterable,
+                    pyre_object::gc_roots::pin_roots(&[*list, *iterable]),
                     unsafe { pyre_object::w_list_len(*list) },
                     unsafe { pyre_object::listobject::w_list_allocated(*list) },
                 ))
@@ -18729,8 +18734,13 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 if dst_bank == 'v' {
                     // `inline_call_r_v/dR` expects exactly this — callee
                     // exits via `void_return/`, no SubReturn writeback.
-                    if let Some((list, iterable, len_before, allocated_before)) = list_extend_sync {
-                        sync_recorded_list_extend(list, iterable, len_before, allocated_before);
+                    if let Some((roots_base, len_before, allocated_before)) = list_extend_sync {
+                        // A failed extend leaves the walk uncommitted: the
+                        // journal rewinds the prefix and the interpreter
+                        // raises from its own `LIST_EXTEND`.
+                        if !sync_recorded_list_extend(roots_base, len_before, allocated_before) {
+                            return Err(DispatchError::callee_inline_unsupported(op.pc));
+                        }
                     }
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
