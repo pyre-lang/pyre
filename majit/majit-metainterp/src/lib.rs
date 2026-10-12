@@ -595,12 +595,57 @@ pub fn diag_enabled() -> bool {
 thread_local! {
     static PORTAL_CRN_HOOK: std::cell::Cell<Option<fn(usize, usize) -> bool>> =
         const { std::cell::Cell::new(None) };
-    /// Host callback that forwards `RefFrontendOp._resref` for one live Box.
-    /// `MIFrame.registers_r` holds that Box; pyre's register extra areas store
-    /// an `OpRef` index and reach the recorder's `value_slots` through this.
-    static FRONTEND_RESREF_FORWARDER: std::cell::Cell<
-        Option<fn(OpRef, &mut dyn FnMut(&mut GcRef))>,
-    > = const { std::cell::Cell::new(None) };
+}
+
+/// Handle to the MetaInterp whose recorder owns `history.py RefFrontendOp._resref`.
+///
+/// Captured on the tracing thread when a translated `MIFrame.registers_r` extra
+/// area is published, then stored in that area's `data`. The walker uses this
+/// pointer, never TLS: a foreign collector under STW walks another mutator's
+/// areas (`shadow_stack::walk_all_extra_areas`) and must not look up the
+/// collecting thread's driver.
+#[derive(Clone, Copy)]
+pub struct FrontendResrefOwner {
+    meta: *const (),
+    forward: fn(*const (), OpRef, &mut dyn FnMut(&mut GcRef)),
+}
+
+fn forward_frontend_resref_none(_: *const (), _: OpRef, _: &mut dyn FnMut(&mut GcRef)) {}
+
+fn forward_frontend_resref_via_meta<M: Clone>(
+    meta: *const (),
+    opref: OpRef,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    // SAFETY: `from_metainterp` captured a MetaInterp that outlives the extra
+    // area (the owning mutator's JIT_DRIVER cell). STW has quiesced that
+    // mutator, so this read does not race with tracing.
+    unsafe {
+        (*meta.cast::<crate::pyjitpl::MetaInterp<M>>()).forward_frontend_resref(opref, visitor)
+    }
+}
+
+impl FrontendResrefOwner {
+    pub const NONE: Self = Self {
+        meta: std::ptr::null(),
+        forward: forward_frontend_resref_none,
+    };
+
+    pub fn from_metainterp<M: Clone>(meta: &crate::pyjitpl::MetaInterp<M>) -> Self {
+        Self {
+            meta: std::ptr::from_ref(meta).cast(),
+            forward: forward_frontend_resref_via_meta::<M>,
+        }
+    }
+
+    /// history.py `RefFrontendOp._resref` of one live FrontendOp / InputArg.
+    /// Constants carry their gcref on the `OpRef` itself.
+    pub fn forward(self, opref: OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if self.meta.is_null() || opref.is_constant() || opref.is_none() {
+            return;
+        }
+        (self.forward)(self.meta, opref, visitor);
+    }
 }
 
 /// Install a thread-local hook called when blackhole resume reaches
@@ -608,27 +653,6 @@ thread_local! {
 /// returns true if the portal host handled the CRN itself.
 pub fn set_portal_crn_hook(hook: Option<fn(usize, usize) -> bool>) {
     PORTAL_CRN_HOOK.with(|cell| cell.set(hook));
-}
-
-/// Install the host callback that forwards `history.py RefFrontendOp._resref`
-/// for a Box still reachable from a translated `MIFrame.registers_r`.
-pub fn set_frontend_resref_forwarder(hook: Option<fn(OpRef, &mut dyn FnMut(&mut GcRef))>) {
-    FRONTEND_RESREF_FORWARDER.with(|cell| cell.set(hook));
-}
-
-/// history.py `RefFrontendOp._resref` of one live FrontendOp / InputArg.
-///
-/// No-op until [`set_frontend_resref_forwarder`] runs. Constants carry their
-/// gcref on the `OpRef` itself and are walked by `walk_const_ptr_refs_mut`.
-pub fn forward_live_frontend_resref(opref: OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-    if opref.is_constant() || opref.is_none() {
-        return;
-    }
-    FRONTEND_RESREF_FORWARDER.with(|cell| {
-        if let Some(hook) = cell.get() {
-            hook(opref, visitor);
-        }
-    });
 }
 
 pub(crate) fn handle_portal_crn_hook(target_pc: usize, green_pc: usize) -> bool {

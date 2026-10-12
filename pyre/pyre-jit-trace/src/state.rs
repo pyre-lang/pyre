@@ -3155,7 +3155,12 @@ pub trait WalkSym {
     fn owns_virtualizable_shadow(&self) -> bool;
     /// Publish independently owned tracing roots for the duration of this
     /// attempt, as translated roots keep the MIFrame and its lists alive.
-    fn enter_trace_roots(&self) -> Option<crate::trace::TraceRoots> {
+    /// `resref` is copied into each extra area so a foreign collector can
+    /// forward `RefFrontendOp._resref` without TLS.
+    fn enter_trace_roots(
+        &self,
+        _resref: majit_metainterp::FrontendResrefOwner,
+    ) -> Option<crate::trace::TraceRoots> {
         None
     }
     fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize);
@@ -3356,8 +3361,11 @@ impl WalkSym for PyreSym {
     }
 
     #[inline]
-    fn enter_trace_roots(&self) -> Option<crate::trace::TraceRoots> {
-        Some(crate::trace::TraceRoots::enter(self))
+    fn enter_trace_roots(
+        &self,
+        resref: majit_metainterp::FrontendResrefOwner,
+    ) -> Option<crate::trace::TraceRoots> {
+        Some(crate::trace::TraceRoots::enter_with(self, resref))
     }
 
     #[inline]

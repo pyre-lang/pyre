@@ -57,22 +57,52 @@ impl std::ops::Deref for RegisterSlots {
     }
 }
 
+/// Extra-area payload: the box storage plus the MetaInterp that owns
+/// `value_slots`. Captured when the area is published; the walker reads
+/// this, never TLS (`shadow_stack::register_mutator_extra_area`).
+pub(crate) struct FrontendBoxArea {
+    pub storage: *const (),
+    pub owner: majit_metainterp::FrontendResrefOwner,
+}
+
+impl FrontendBoxArea {
+    pub(crate) fn new<T>(
+        storage: *const T,
+        owner: majit_metainterp::FrontendResrefOwner,
+    ) -> Box<Self> {
+        Box::new(Self {
+            storage: storage.cast(),
+            owner,
+        })
+    }
+}
+
+pub(crate) fn walk_frontend_box(
+    op: &mut majit_ir::OpRef,
+    owner: majit_metainterp::FrontendResrefOwner,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    op.walk_const_ptr_refs_mut(visitor);
+    owner.forward(*op, visitor);
+}
+
 /// The translated stack root for MIFrame's register list. Publication owns
 /// the same list as execution, not a pointer into a borrowed PyreSym.
 pub(crate) struct RegisterBankRoot {
     // Retire the area before releasing its owner (field drop order).
     _area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
+    _payload: Option<Box<FrontendBoxArea>>,
     _owner: RegisterBank,
 }
 
 unsafe fn walk_register_slots(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let slots = unsafe { &*(data as *const RegisterSlots) };
+    let area = unsafe { &*(data as *const FrontendBoxArea) };
+    let slots = unsafe { &*(area.storage as *const RegisterSlots) };
     for slot in slots.iter() {
         let mut value = slot.get();
         // history.py `ConstPtr.value` is inline on the Box; `RefFrontendOp._resref`
         // is a field of that same Box in `MIFrame.registers_r`.
-        value.walk_const_ptr_refs_mut(visitor);
-        majit_metainterp::forward_live_frontend_resref(value, visitor);
+        walk_frontend_box(&mut value, area.owner, visitor);
         slot.set(value);
     }
 }
@@ -118,19 +148,31 @@ impl RegisterBank {
     }
 
     pub(crate) fn root(&self) -> RegisterBankRoot {
-        let area = self.0.as_ref().map(|slots| unsafe {
+        self.root_with(majit_metainterp::FrontendResrefOwner::NONE)
+    }
+
+    pub(crate) fn root_with(
+        &self,
+        owner: majit_metainterp::FrontendResrefOwner,
+    ) -> RegisterBankRoot {
+        let payload = self
+            .0
+            .as_ref()
+            .map(|slots| FrontendBoxArea::new(Rc::as_ptr(slots), owner));
+        let area = payload.as_ref().map(|payload| unsafe {
             // The Rc allocation is stable and the returned guard retains it.
             // The collector accesses only shared Cell slots, never a frame's
             // exclusive borrow or Rc's reference count. Registry walks run
             // synchronously on the owner or under foreign-mutator STW.
             majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
                 walk_register_slots,
-                Rc::as_ptr(slots).cast(),
+                std::ptr::from_ref(payload.as_ref()).cast(),
                 "miframe_registers",
             )
         });
         RegisterBankRoot {
             _area: area,
+            _payload: payload,
             _owner: self.clone(),
         }
     }

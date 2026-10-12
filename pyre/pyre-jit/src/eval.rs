@@ -5931,10 +5931,6 @@ fn load_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp::JitCode>
 
 fn build_jit_driver_pair() -> JitDriverPair {
     crate::call_jit::publish_pyre_host_hooks();
-    // `MIFrame.registers_r` holds the Box whose `_resref` the collector
-    // traces; pyre's register extra areas store an `OpRef` and reach the
-    // recorder through this callback (`history.py` `RefFrontendOp._resref`).
-    majit_metainterp::set_frontend_resref_forwarder(Some(forward_frontend_resref_via_driver));
     // `warmspot.py` `WarmRunnerDesc.make_virtualizable_infos` builds this
     // before the entry function and `finish_setup`.
     let info = build_pyframe_virtualizable_info();
@@ -6525,15 +6521,6 @@ unsafe fn compile_snapshot_root_walker_area(
 unsafe fn jit_driver_pair_from_root_area(data: *const ()) -> Option<&'static mut JitDriverPair> {
     let cell = unsafe { &*(data as *const UnsafeCell<Option<JitDriverPair>>) };
     unsafe { (&mut *cell.get()).as_mut() }
-}
-
-fn forward_frontend_resref_via_driver(
-    opref: majit_ir::OpRef,
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    if let Some(pair) = existing_driver_pair() {
-        pair.0.forward_frontend_resref(opref, visitor);
-    }
 }
 
 /// `framework.shadowstack walk_stack_root` adapter — walk every

@@ -237,15 +237,24 @@ impl WalkFrameState {
     }
 
     pub(crate) fn root(&self) -> WalkFrameStateRoot {
+        self.root_with(majit_metainterp::FrontendResrefOwner::NONE)
+    }
+
+    pub(crate) fn root_with(
+        &self,
+        owner: majit_metainterp::FrontendResrefOwner,
+    ) -> WalkFrameStateRoot {
+        let payload = super::FrontendBoxArea::new(Rc::as_ptr(&self.0), owner);
         let area = unsafe {
             majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
                 walk_frame_state_roots,
-                Rc::as_ptr(&self.0).cast(),
+                std::ptr::from_ref(payload.as_ref()).cast(),
                 "miframe_state",
             )
         };
         WalkFrameStateRoot {
             _area: area,
+            _payload: payload,
             _owner: self.clone(),
         }
     }
@@ -253,19 +262,20 @@ impl WalkFrameState {
 
 pub(crate) struct WalkFrameStateRoot {
     _area: majit_gc::shadow_stack::MutatorExtraAreaGuard,
+    _payload: Box<super::FrontendBoxArea>,
     _owner: WalkFrameState,
 }
 
-fn walk_frame_box(op: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-    op.walk_const_ptr_refs_mut(visitor);
-    majit_metainterp::forward_live_frontend_resref(*op, visitor);
-}
-
 unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
-    let cell = unsafe { &*(data as *const RefCell<WalkFrameStateData>) };
+    let area = unsafe { &*(data as *const super::FrontendBoxArea) };
+    let owner = area.owner;
+    let cell = unsafe { &*(area.storage as *const RefCell<WalkFrameStateData>) };
     let mut data = cell
         .try_borrow_mut()
         .expect("walk frame state borrow held across collection");
+    let walk_frame_box = |op: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)| {
+        super::walk_frontend_box(op, owner, visitor);
+    };
     for value in &mut data.outer_active_boxes {
         walk_frame_box(value, visitor);
     }
@@ -515,9 +525,13 @@ mod tests {
     fn collecting_with_a_live_field_borrow_is_rejected() {
         let state = WalkFrameState::default();
         let _borrow = state.borrow();
+        let payload = super::FrontendBoxArea::new(
+            Rc::as_ptr(&state.0),
+            majit_metainterp::FrontendResrefOwner::NONE,
+        );
         // Direct invocation keeps the expected panic outside the global root
         // traversal; no registry borrow is poisoned by this diagnostic.
-        unsafe { walk_frame_state_roots(Rc::as_ptr(&state.0).cast(), &mut |_| {}) };
+        unsafe { walk_frame_state_roots(std::ptr::from_ref(payload.as_ref()).cast(), &mut |_| {}) };
     }
 
     #[test]

@@ -3819,6 +3819,22 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         trace_ctx.walk_virtualizable_value_refs(&mut visitor);
+        // pyjitpl.py `MetaInterp.virtualref_boxes`: each pair is
+        // `[virtualbox, vrefbox]`. The OpRef is the Box; the `usize` is
+        // `box.getref_base()` for the concrete `JitVirtualRef*`.
+        for (op, ptr) in &mut trace_ctx.virtualref_boxes {
+            if !op.is_constant() {
+                live_boxes.push(*op);
+            }
+            if let OpRef::ConstPtr(gcref) = op {
+                visitor(gcref);
+            }
+            if *ptr != 0 {
+                let mut gcref = GcRef(*ptr);
+                visitor(&mut gcref);
+                *ptr = gcref.0;
+            }
+        }
         // heapcache.py CacheEntry — the heapcache caches field values /
         // replacements / loop-invariant results as `OpRef`. With inline
         // consts (history.py `ConstPtr.value`) those value slots can be
@@ -30114,6 +30130,35 @@ mod tests {
             snapshot.vref_boxes[0],
             crate::recorder::SnapshotTagged::Box(OpRef::input_arg_ref(0), Type::Ref)
         );
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_virtualref_boxes() {
+        // pyjitpl.py `MetaInterp.virtualref_boxes` holds `[virtualbox, vrefbox]`
+        // Box pairs; the `.1` word is `getref_base()` of the concrete vref.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let input = trace_ctx.recorder.inputargs()[0].opref();
+        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
+        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (OpRef::const_ptr(GcRef(0xA000)), 0)];
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x7000 {
+                slot.0 = 0x8000;
+            }
+            if slot.0 == 0x9000 {
+                slot.0 = 0x9100;
+            }
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(input), Some(0x8000));
+        let boxes = &meta.tracing.as_ref().unwrap().virtualref_boxes;
+        assert_eq!(boxes[0].1, 0x9100);
+        assert_eq!(boxes[1].0, OpRef::const_ptr(GcRef(0xB000)));
     }
 
     #[test]
