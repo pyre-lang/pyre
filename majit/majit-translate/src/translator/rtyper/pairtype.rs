@@ -178,6 +178,10 @@ pub enum ReprClassId {
     /// iterator over a list/slice (`GcStruct("listiter", ("list", LIST),
     /// ("index", Signed))`).
     ListIteratorRepr,
+    /// `lltypesystem/rlist.py ReversedListIteratorRepr(AbstractListIteratorRepr)`
+    /// — `reversed(lst)` (`GcStruct("revlistiter", ("list", LIST),
+    /// ("index", Signed))`).
+    ReversedListIteratorRepr,
     /// `rrange.py AbstractRangeIteratorRepr(IteratorRepr)` — the
     /// iterator over a `range()` list (`GcStruct("range", ("next",
     /// Signed), ("stop", Signed))`). Distinct from `RangeRepr`: an
@@ -254,6 +258,7 @@ impl ReprClassId {
             // → Repr`; the abstract bases carry no pairtype entries, so
             // the resolution chain collapses to `Self → Repr`.
             ListIteratorRepr => &[ListIteratorRepr, Repr],
+            ReversedListIteratorRepr => &[ReversedListIteratorRepr, Repr],
             RangeIteratorRepr => &[RangeIteratorRepr, Repr],
             EnumerateIteratorRepr => &[EnumerateIteratorRepr, Repr],
         }
