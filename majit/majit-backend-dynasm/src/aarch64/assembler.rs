@@ -6319,7 +6319,6 @@ impl<'a> AssemblerARM64<'a> {
         func_index: usize,
         save_err: i64,
         arg_classes: &str,
-        ref_result: bool,
     ) {
         let arg_count = arglocs.len();
 
@@ -6520,18 +6519,7 @@ impl<'a> AssemblerARM64<'a> {
             self.write_real_errno(save_err, current_sp);
             dynasm!(self.mc ; .arch aarch64 ; blr x8);
         }
-        // `Option<*mut T>` returns the discriminant in x0 and the pointer
-        // in x1. Discriminant 1 is not an aligned pointer; a one-word
-        // pointer return leaves its address in x0.
-        if ref_result {
-            let keep = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch aarch64
-                ; cmp x0, #1
-                ; b.ne =>keep
-                ; mov x0, x1
-                ; =>keep
-            );
-        }
+        // `CallBuilderARM64.load_result` reads the one return word in x0.
         self.read_real_errno(save_err, current_sp);
 
         if stack_bytes != 0 {
@@ -6586,8 +6574,7 @@ impl<'a> AssemblerARM64<'a> {
             .getdescr()
             .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
             .unwrap_or_default();
-        let ref_result = op.opcode.result_type() == Type::Ref;
-        self.emit_call_from_arglocs(arglocs, func_index, save_err, &arg_classes, ref_result);
+        self.emit_call_from_arglocs(arglocs, func_index, save_err, &arg_classes);
         // Result `'S'` returns in s0. `fmov w0, s0` puts those bits in x0.
         if op.opcode.result_type() == Type::Int
             && op.getdescr().is_some_and(|descr| {
@@ -7740,7 +7727,7 @@ impl<'a> AssemblerARM64<'a> {
             .getdescr()
             .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
             .unwrap_or_default();
-        self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes, false);
+        self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes);
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         self.pop_all_regs_from_jitframe(&[], true);
 
@@ -7773,8 +7760,8 @@ impl<'a> AssemblerARM64<'a> {
     /// (`_r` is the same). Arglocs are `[argloc, resloc]` from
     /// `_prepare_op_cond_call`; extra args already sit in `argument_regs`.
     /// `CMP argloc, 0` then `B.NE` over the slow path; on miss the helper
-    /// returns a plain word that is moved into `res_loc`. No `ref_result`
-    /// Option rewrite and no `store_rax_to_result`.
+    /// returns a plain word that is moved into `res_loc`. No
+    /// `store_rax_to_result`.
     fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc]) {
         let (argloc, resloc) = match arglocs {
             [argloc, resloc, ..] => (*argloc, *resloc),

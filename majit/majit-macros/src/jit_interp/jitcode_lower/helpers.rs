@@ -996,6 +996,41 @@ pub(super) fn opcode_for_assign_binop_f(op: &BinOp) -> Option<Ident> {
     Some(Ident::new(name, proc_macro2::Span::call_site()))
 }
 
+/// Reject a raw Ref residual target whose return is not one pointer word.
+///
+/// `CallBuilderX86.load_result`, `CallBuilder64.load_result`,
+/// `CallBuilderARM64.load_result`, and `llmodel.py bh_call_r` read that
+/// word. `Option<*mut T>` is two words — a raw pointer has no niche — and
+/// fails this assert. The closure is monomorphized so the check runs, and
+/// it is not called.
+pub(super) fn assert_ref_result_one_word(func: &impl ToTokens, arity: usize) -> TokenStream {
+    let args: Vec<TokenStream> = (0..arity)
+        .map(|_| quote! { __majit_ref_word_arg() })
+        .collect();
+    quote! {
+        {
+            fn __majit_ref_word_arg<T>() -> T {
+                unsafe { ::core::mem::MaybeUninit::<T>::uninit().assume_init() }
+            }
+            fn __majit_assert_ref_result_one_word<R, F>(_: F)
+            where
+                F: FnOnce() -> R,
+            {
+                const {
+                    assert!(
+                        ::core::mem::size_of::<R>() == ::core::mem::size_of::<usize>(),
+                        "a Ref residual call target must return one pointer word"
+                    );
+                }
+            }
+            __majit_assert_ref_result_one_word(|| {
+                #[allow(unused_unsafe)]
+                unsafe { #func(#(#args),*) }
+            });
+        }
+    }
+}
+
 /// The address of a shim that returns `func`'s result as a machine word.
 ///
 /// Registered addresses are dispatched through

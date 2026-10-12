@@ -9106,18 +9106,7 @@ impl<'a> Assembler386<'a> {
         }
         dynasm!(self.mc ; .arch x64 ; call rax);
         self.forget_after_call_or_jmp();
-        // `Option<*mut T>` returns the discriminant in rax and the pointer
-        // in rdx. Discriminant 1 is not an aligned pointer; a one-word
-        // pointer return leaves its address in rax.
-        if op.opcode.result_type() == Type::Ref {
-            let keep = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch x64
-                ; cmp rax, 1
-                ; jne =>keep
-                ; mov rax, rdx
-                ; =>keep
-            );
-        }
+        // `CallBuilderX86.load_result` reads the one return word in rax.
 
         self.restore_stack_pointer(call_area_adjust);
         self.read_real_errno(save_err, 0, &mut tlofs_loaded);

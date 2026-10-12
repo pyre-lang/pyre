@@ -680,6 +680,7 @@ impl<'c> Lowerer<'c> {
         is_inferred: bool,
         inferred_policy_check: Option<TokenStream>,
         word_result_addr: Option<TokenStream>,
+        func_arity: usize,
     ) -> TokenStream {
         let static_slot_token = slot.token();
         // For `Infer` mode, the helper's `_jit_helper_policy` byte is
@@ -783,10 +784,21 @@ impl<'c> Lowerer<'c> {
                     let __fn_idx =
                         __builder.add_word_abi_fn_ptr_with_slot(#shim_addr, #slot_expr);
                 },
-                None => quote! {
-                    let __fn_idx =
-                        __builder.add_fn_ptr_with_slot(#func as *const (), #slot_expr);
-                },
+                None => {
+                    // A Ref target registered here is the raw function.
+                    // `llmodel.py bh_call_r` reads one pointer word, so the
+                    // return must be that wide. Void has no result word.
+                    let ref_word = if call_policy_result_kind(kind) == Some(CallResultKind::Ref) {
+                        assert_ref_result_one_word(func, func_arity)
+                    } else {
+                        quote! {}
+                    };
+                    quote! {
+                        #ref_word
+                        let __fn_idx =
+                            __builder.add_fn_ptr_with_slot(#func as *const (), #slot_expr);
+                    }
+                }
             }
         }
     }

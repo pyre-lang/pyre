@@ -125,6 +125,84 @@ extern "C" fn w_str_getitem_word(
     unsafe { pyre_object::unicodeobject::w_str_getitem(obj, index) }.unwrap_or(pyre_object::PY_NULL)
 }
 
+/// One-word residual ABI for `w_dict_lookup_int_strategy`. A miss is NULL.
+/// `Option<PyObjectRef>` is two words with no pointer niche, so the Rust
+/// item would return the `Some` discriminant; `llmodel.py bh_call_r` reads
+/// one word.
+extern "C" fn w_dict_lookup_int_strategy_word(
+    obj: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::dictmultiobject::w_dict_lookup_int_strategy(obj, key) }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// One-word residual ABI for `w_dict_lookup_identity_strategy`.
+extern "C" fn w_dict_lookup_identity_strategy_word(
+    obj: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::identitydict::w_dict_lookup_identity_strategy(obj, key) }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// One-word residual ABI for `w_module_dict_lookup_object_entries`.
+extern "C" fn w_module_dict_lookup_object_entries_word(
+    obj: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::dictmultiobject::w_module_dict_lookup_object_entries(obj, key) }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// One-word residual ABI for `w_dict_lookup_bytes_strategy`.
+extern "C" fn w_dict_lookup_bytes_strategy_word(
+    obj: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy(obj, key) }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// One-word residual ABI for `dict_entries_probe_object`.
+fn dict_entries_probe_object_word(
+    entries: &pyre_object::ObjectDictStorage,
+    key: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::dictmultiobject::dict_entries_probe_object(entries, key) }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// One-word residual ABI for `dict_entries_probe_hashed`.
+fn dict_entries_probe_hashed_word(
+    entries: &pyre_object::ObjectDictStorage,
+    hash: i64,
+    obj: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::dictmultiobject::dict_entries_probe_hashed(entries, hash, obj) }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// One-word residual ABI for `dict_entries_insert_hashed`.
+fn dict_entries_insert_hashed_word(
+    entries: &mut pyre_object::ObjectDictStorage,
+    hash: i64,
+    obj: pyre_object::PyObjectRef,
+    value: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::dictmultiobject::dict_entries_insert_hashed(entries, hash, obj, value) }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// One-word residual ABI for `dict_entries_key_obj_at`.
+fn dict_entries_key_obj_at_word(
+    entries: &pyre_object::ObjectDictStorage,
+    index: usize,
+) -> pyre_object::PyObjectRef {
+    unsafe { pyre_object::dictmultiobject::dict_entries_key_obj_at(entries, index) }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
 /// `extern "C"` bridge for the scalar bytecode read used by translated
 /// residual calls: the raw Rust function takes `&CodeObject` and returns
 /// `u16`, which this widens to a word.
@@ -2049,26 +2127,25 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_dict_store_int_strategy",
         pyre_object::dictmultiobject::w_dict_store_int_strategy,
     );
-    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    // Residual calls read one pointer word (`llmodel.py bh_call_r`).
+    // The bridge maps None to NULL; the Option body stays for a traced call.
+    cpa2(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_lookup_int_strategy",
         "pyre_object::w_dict_lookup_int_strategy",
-        pyre_object::dictmultiobject::w_dict_lookup_int_strategy as *const (),
+        w_dict_lookup_int_strategy_word,
     );
-    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::identitydict::w_dict_lookup_identity_strategy",
         "pyre_object::w_dict_lookup_identity_strategy",
-        pyre_object::identitydict::w_dict_lookup_identity_strategy as *const (),
+        w_dict_lookup_identity_strategy_word,
     );
-    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::dictmultiobject::w_module_dict_lookup_object_entries",
         "pyre_object::w_module_dict_lookup_object_entries",
-        pyre_object::dictmultiobject::w_module_dict_lookup_object_entries as *const (),
+        w_module_dict_lookup_object_entries_word,
     );
     upa3(
         &mut entries,
@@ -2076,12 +2153,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_dict_store_bytes_strategy",
         pyre_object::dictmultiobject::w_dict_store_bytes_strategy,
     );
-    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy",
         "pyre_object::w_dict_lookup_bytes_strategy",
-        pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy as *const (),
+        w_dict_lookup_bytes_strategy_word,
     );
     pa0(
         &mut entries,
@@ -4031,17 +4107,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::hash_str_hooked",
         pyre_object::dict_eq_hook::hash_str_hooked,
     );
-    /*
-     * Fat-pointer arguments (`&str`, `&[u8]`, `&Wtf8`) are two words, but the
-     * residual-call ABI passes one register per argument slot; publishing these
-     * addresses would pass one word where the callee reads two.
-     */
-    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    // Residual calls read one pointer word (`llmodel.py bh_call_r`).
+    // The bridge maps None to NULL; the Option body stays for a traced call.
+    pa2(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_probe_object",
         "pyre_object::dict_entries_probe_object",
-        pyre_object::dictmultiobject::dict_entries_probe_object as *const (),
+        dict_entries_probe_object_word,
     );
     upa2(
         &mut entries,
@@ -4050,19 +4122,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::dictmultiobject::dict_entries_remove_object,
     );
     // The checked probe / store pair, keyed on an already-hashed key.
-    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    pa3(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_probe_hashed",
         "pyre_object::dict_entries_probe_hashed",
-        pyre_object::dictmultiobject::dict_entries_probe_hashed as *const (),
+        dict_entries_probe_hashed_word,
     );
-    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    pa4(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_insert_hashed",
         "pyre_object::dict_entries_insert_hashed",
-        pyre_object::dictmultiobject::dict_entries_insert_hashed as *const (),
+        dict_entries_insert_hashed_word,
     );
     upa1(
         &mut entries,
@@ -4079,12 +4149,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dict_entries_value_at",
         pyre_object::dictmultiobject::dict_entries_value_at,
     );
-    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    pa2(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_key_obj_at",
         "pyre_object::dict_entries_key_obj_at",
-        pyre_object::dictmultiobject::dict_entries_key_obj_at as *const (),
+        dict_entries_key_obj_at_word,
     );
     upa2(
         &mut entries,
@@ -6089,11 +6158,15 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 #[cfg(test)]
 mod tests {
     use super::{
+        dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
+        dict_entries_probe_hashed_word, dict_entries_probe_object_word,
         is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
         jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        w_list_pop_end_inner_word, w_list_pop_end_word, w_str_getitem_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_pop_end_inner_word, w_list_pop_end_word,
+        w_module_dict_lookup_object_entries_word, w_str_getitem_word,
     };
     use std::collections::HashMap;
 
@@ -6401,6 +6474,85 @@ mod tests {
         );
         assert_ne!(
             bindings["pyre_object::listobject::w_list_pop_end"], raw_end,
+            "must not publish the Option-returning Rust item"
+        );
+    }
+
+    #[test]
+    fn dict_lookup_fnaddrs_are_the_one_word_bridges() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for (path, expected) in [
+            (
+                "pyre_object::dictmultiobject::w_dict_lookup_int_strategy",
+                w_dict_lookup_int_strategy_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::w_dict_lookup_int_strategy",
+                w_dict_lookup_int_strategy_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::identitydict::w_dict_lookup_identity_strategy",
+                w_dict_lookup_identity_strategy_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::w_dict_lookup_identity_strategy",
+                w_dict_lookup_identity_strategy_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dictmultiobject::w_module_dict_lookup_object_entries",
+                w_module_dict_lookup_object_entries_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::w_module_dict_lookup_object_entries",
+                w_module_dict_lookup_object_entries_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy",
+                w_dict_lookup_bytes_strategy_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::w_dict_lookup_bytes_strategy",
+                w_dict_lookup_bytes_strategy_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dictmultiobject::dict_entries_probe_object",
+                dict_entries_probe_object_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dict_entries_probe_object",
+                dict_entries_probe_object_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dictmultiobject::dict_entries_probe_hashed",
+                dict_entries_probe_hashed_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dict_entries_probe_hashed",
+                dict_entries_probe_hashed_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dictmultiobject::dict_entries_insert_hashed",
+                dict_entries_insert_hashed_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dict_entries_insert_hashed",
+                dict_entries_insert_hashed_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dictmultiobject::dict_entries_key_obj_at",
+                dict_entries_key_obj_at_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dict_entries_key_obj_at",
+                dict_entries_key_obj_at_word as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
+        let raw_lookup =
+            pyre_object::dictmultiobject::w_dict_lookup_int_strategy as *const () as usize as i64;
+        assert_ne!(
+            bindings["pyre_object::dictmultiobject::w_dict_lookup_int_strategy"], raw_lookup,
             "must not publish the Option-returning Rust item"
         );
     }

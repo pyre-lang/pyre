@@ -61596,6 +61596,9 @@ fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
 ///
 /// Everything else — `Vec<T>`, `String`, tuples, `Option<T>`, a named ADT by
 /// value — is declined, and its callers keep their "not registered" Skip.
+/// A raw pointer has no niche, so `Option<*mut T>` and `Option<PyObjectRef>`
+/// are two words. `residual_return_shell` stamps a one-word shell and does
+/// not convert, so those returns stay declined.
 /// `Option<&Sized>` is one nullable pointer. `tyref_to_ast_string`
 /// strips the reference, so the string form cannot tell it from a
 /// by-value `Option<Struct>`.
@@ -61639,16 +61642,6 @@ fn ref_return_is_single_word(ast: &str) -> bool {
     let ast = ast.trim();
     if ast.starts_with("*mut ") || ast.starts_with("*const ") {
         return true;
-    }
-    // `Option<*mut T>` / `Option<PyObjectRef>` is the null niche: one
-    // pointer word. A by-value `Option<Struct>` stays declined.
-    if let Some(inner) = ast
-        .strip_prefix("Option<")
-        .and_then(|s| s.strip_suffix('>'))
-    {
-        return inner.starts_with("*mut ")
-            || inner.starts_with("*const ")
-            || inner == "PyObjectRef";
     }
     // `Result<T,PyError>` — `tyref_to_ast_string` comma-joins type args
     // without spaces, so split the payload off the trailing `,PyError>`.

@@ -281,18 +281,6 @@ macro_rules! invoke_stub {
     }};
 }
 
-/// Same argument slots as [`invoke_stub`], but the Rust ABI. A two-word
-/// return such as `Option<*mut T>` is a scalar pair in registers on SysV
-/// and on Win64. `extern "C"` `(i64, i64)` is a hidden return buffer on
-/// Win64 and would shift the callee's arguments.
-macro_rules! invoke_stub_rust {
-    ($func:ident, $args:ident, $ret:ty $(, $class:ident)*) => {{
-        let f: unsafe extern "Rust" fn($(invoke_ty!($class)),*) -> $ret =
-            std::mem::transmute($func);
-        invoke_with_idx!(f, $args $(, $class)*)
-    }};
-}
-
 /// `longlong.singlefloat2int`: `rffi.cast(Signed, uint32)` via `intmask`.
 fn singlefloat2int(value: f32) -> i64 {
     let bits = value.to_bits();
@@ -446,23 +434,6 @@ macro_rules! define_call_sig_stubs {
                 classes => lookup_single_s(classes),
             }
         }
-
-        /// Both return words. `Option<*mut T>` puts the discriminant in the
-        /// first and the pointer in the second; a one-word return leaves the
-        /// value in the first.
-        unsafe fn call_pair(func: usize, classes: &[ArgClass], args: &[i64]) -> (i64, i64) {
-            match classes {
-                $(
-                    [$(ArgClass::$class),*] => {
-                        unsafe { invoke_stub_rust!(func, args, (i64, i64) $(, $class)*) }
-                    }
-                )*
-                other => {
-                    let word = unsafe { (lookup_stub_i(other))(func, args) };
-                    (word, 0)
-                }
-            }
-        }
     };
 }
 
@@ -546,24 +517,14 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
     unsafe { dispatch_word_stub(func, classes, args, 'i') }
 }
 
-/// `llmodel.py bh_call_r`. The staged wrapper returns the pointer as an `i64`
-/// word. A table type that is a real `i32` is host-reflected.
+/// `llmodel.py bh_call_r`. The target returns one pointer word; a missing
+/// value is the null word. Shares `dispatch_word_stub` with `bh_call_i`.
+/// A wasm32 table type that is a real `i32` is host-reflected.
 ///
 /// # Safety
-/// `func` must match `classes`, and its result must be a GCREF.
+/// `func` must match `classes` and return one pointer word.
 pub unsafe fn bh_call_r_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
-    if let Some(value) = wasm_residual_host_call(func, args, classes, 'r', false, 8) {
-        return value;
-    }
-    let (first, second) = unsafe { call_pair(func, classes, args) };
-    ref_word_from_return_pair(first, second)
-}
-
-/// A one-word pointer, and a niche `Option<&T>`, is the first return word.
-/// `Option<*mut T>` is the discriminant then the pointer; discriminant 1 is
-/// not an aligned address.
-fn ref_word_from_return_pair(first: i64, second: i64) -> i64 {
-    if first == 1 { second } else { first }
+    unsafe { dispatch_word_stub(func, classes, args, 'r') }
 }
 
 /// llmodel.py bh_call_v: void-typed parallel of `bh_call_i_dispatch`.
