@@ -5000,7 +5000,9 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
-    lock_dict_refs!(_dict_guard, obj);
+    // `W_DictMultiObject.length` → `self.get_strategy().length(self)`.
+    // `length` does not hash or compare keys, so there is no
+    // `DictOperationGuard` (`lock_dict_refs!`).
     w_dict_get_strategy(obj).length(obj)
 }
 
@@ -5011,11 +5013,15 @@ pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
+#[inline]
 pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
-    lock_dict_refs!(_dict_guard, obj);
+    // `AbstractTypedStrategy.length`: `len(self.unerase(w_dict.dstorage))`.
+    // `rordereddict.rtype_len` is `getfield num_live_items` (no custom eq/hash
+    // on the typed tables; object-strategy `ll_dict_len` is the same field).
+    // Two field reads, same shape as `w_list_len`: a getter call would
+    // residualize and the walker would execute the 2-arg rustc vtable item.
     let dict = &*(obj as *const W_DictObject);
-    let entries = &*(dict.dstorage as *const ObjectDictStorage);
-    entries.len()
+    (*(dict.dstorage as *const ObjectDictStorage)).num_live_items
 }
 
 /// Iterate over all (key, value) pairs without type assumptions.
@@ -5371,9 +5377,12 @@ pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) ->
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::INT_DICT_STRATEGY`].
+#[inline]
 pub unsafe fn w_dict_length_int_strategy(obj: PyObjectRef) -> usize {
-    lock_dict_refs!(_dict_guard, obj);
-    w_dict_int_storage(obj).len()
+    // `AbstractTypedStrategy.length` / `IntDictStrategy`:
+    // `len(self.unerase(w_dict.dstorage))` → `getfield num_live_items`.
+    let dict = &*(obj as *const W_DictObject);
+    (*(dict.dstorage as *const IntDictStorage)).num_live_items
 }
 
 /// Internal helper: `IntDictStrategy::items` body —
@@ -5583,9 +5592,12 @@ pub unsafe fn w_dict_delitem_bytes_strategy(obj: PyObjectRef, key: PyObjectRef) 
 ///
 /// # Safety
 /// Same as [`w_dict_bytes_storage`].
+#[inline]
 pub unsafe fn w_dict_length_bytes_strategy(obj: PyObjectRef) -> usize {
-    lock_dict_refs!(_dict_guard, obj);
-    w_dict_bytes_storage(obj).len()
+    // `AbstractTypedStrategy.length` / `BytesDictStrategy`:
+    // `len(self.unerase(w_dict.dstorage))` → `getfield num_live_items`.
+    let dict = &*(obj as *const W_DictObject);
+    (*(dict.dstorage as *const BytesDictStorage)).num_live_items
 }
 
 /// Internal helper: `BytesDictStrategy::items` body —
