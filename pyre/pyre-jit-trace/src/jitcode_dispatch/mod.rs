@@ -6027,6 +6027,20 @@ unsafe fn raw_store_float(addr: *mut u8, itemsize: usize, value: f64) {
     }
 }
 
+/// Float-valued load counterpart of [`raw_load_int`] —
+/// `bhimpl_getarrayitem_raw_f` / `bh_getarrayitem_gc_f`.
+///
+/// # Safety
+/// `addr` must name readable memory of at least `itemsize` bytes.
+unsafe fn raw_load_float(addr: *const u8, itemsize: usize) -> f64 {
+    unsafe {
+        match itemsize {
+            8 => addr.cast::<f64>().read_unaligned(),
+            _ => panic!("raw_load_f descr itemsize {itemsize} is not a minted width"),
+        }
+    }
+}
+
 /// Int-bank twin of [`write_ref_reg`] (Int-bank concrete shadow).  Writes an Int
 /// register and its concrete shadow in lock-step.  Mirrors the
 /// Ref-bank contract: every walker handler that writes
@@ -14588,48 +14602,160 @@ fn handle<Sym: WalkSym>(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
-        // pyjitpl.py `_opimpl_setarrayitem_raw_any` /
-        // `opimpl_setarrayitem_raw_i`:
-        // `execute_with_descr(rop.SETARRAYITEM_RAW, arraydescr, arraybox,
-        // indexbox, itembox)`. `blackhole.py bhimpl_setarrayitem_raw_i`
-        // (`iiid`); `llmodel.py bh_setarrayitem_raw_i = bh_setarrayitem_gc_i`.
-        // `setarrayitem_raw_i` is not in `USE_C_FORM` (`assembler.py`), so
-        // the encoding is always registers. The walk is the execution,
-        // same as `raw_store_i`: a non-concrete operand declines rather
-        // than continue past a lost write. No heapcache.setarrayitem —
-        // `_record_helper` `invalidate_caches` is a no-op via
-        // `heapcache.py clear_caches_not_necessary` for SETARRAYITEM_RAW.
-        "setarrayitem_raw_i/iiid" => {
+        // pyjitpl.py `opimpl_getarrayitem_raw_i` / `opimpl_getarrayitem_raw_f`:
+        // `execute_with_descr(rop.GETARRAYITEM_RAW_{I,F}, arraydescr,
+        // arraybox, indexbox)`. `blackhole.py bhimpl_getarrayitem_raw_{i,f}`
+        // (`iid>i` / `iid>f`); `llmodel.py bh_getarrayitem_raw_i =
+        // bh_getarrayitem_gc_i`. The item address is `array + base_size +
+        // index * item_size`; the load uses the descr's item size, sign and
+        // float-ness, unaligned (`trace_getarrayitem_raw`). The walk is the
+        // execution, same as `raw_load_i`: a missing concrete leaves the
+        // result `Null` rather than declining.
+        "getarrayitem_raw_i/iid>i" | "getarrayitem_raw_f/iid>f" => {
+            let is_float = op.key == "getarrayitem_raw_f/iid>f";
+            let opcode = if is_float {
+                OpCode::GetarrayitemRawF
+            } else {
+                OpCode::GetarrayitemRawI
+            };
             let array = read_int_reg(code, op, 0, ctx)?;
             let index = read_int_reg(code, op, 1, ctx)?;
-            let value = read_int_reg(code, op, 2, ctx)?;
-            let descr = read_descr(code, op, 3, ctx)?;
-            match (
+            let descr = read_descr(code, op, 2, ctx)?;
+            let concrete = match (
                 read_int_reg_concrete(code, op, 0, ctx),
                 read_int_reg_concrete(code, op, 1, ctx),
-                read_int_reg_concrete(code, op, 2, ctx),
                 descr.as_array_descr(),
             ) {
-                (
-                    ConcreteValue::Int(array_ptr),
-                    ConcreteValue::Int(idx),
-                    ConcreteValue::Int(v),
-                    Some(ad),
-                ) => {
+                (ConcreteValue::Int(array_ptr), ConcreteValue::Int(idx), Some(ad)) => {
                     let item_addr = (array_ptr as usize)
                         .wrapping_add(ad.base_size())
                         .wrapping_add((idx as usize).wrapping_mul(ad.item_size()));
-                    // SAFETY: same contract as the raw_store arm — the walk
+                    // SAFETY: same contract as the raw_load arm — the walk
                     // executed the residuals that produced `array_ptr`;
-                    // `base_size` / `item_size` are the array descr
-                    // (`bhimpl_setarrayitem_raw_i` /
-                    // `bh_setarrayitem_gc_i`).
-                    unsafe { raw_store_int(item_addr as *mut u8, ad.item_size(), v) };
+                    // `base_size` / `item_size` / signedness are the array
+                    // descr (`bhimpl_getarrayitem_raw_{i,f}`).
+                    if is_float {
+                        ConcreteValue::Float(unsafe {
+                            raw_load_float(item_addr as *const u8, ad.item_size())
+                        })
+                    } else {
+                        ConcreteValue::Int(unsafe {
+                            raw_load_int(
+                                item_addr as *const u8,
+                                ad.item_size(),
+                                ad.is_item_signed(),
+                            )
+                        })
+                    }
+                }
+                _ => ConcreteValue::Null,
+            };
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(opcode, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+            let result = ctx
+                .trace_ctx
+                .record_op_with_descr(opcode, &[array, index], descr);
+            match concrete {
+                ConcreteValue::Int(value) => {
+                    ctx.trace_ctx.set_opref_concrete(result, Value::Int(value));
+                }
+                ConcreteValue::Float(value) => {
+                    ctx.trace_ctx
+                        .set_opref_concrete(result, Value::Float(value));
+                }
+                _ => {}
+            }
+            let dst = code[op.pc + 5] as usize;
+            if is_float {
+                let len = ctx.registers_f.len();
+                let _ = ctx
+                    .registers_f
+                    .get(dst)
+                    .ok_or(DispatchError::RegisterOutOfRange {
+                        pc: op.pc,
+                        reg: dst,
+                        len,
+                        bank: "f",
+                    })?;
+                ctx.registers_f.set(dst, result);
+            } else {
+                write_int_reg(ctx, op.pc, dst, result, concrete)?;
+            }
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // pyjitpl.py `_opimpl_setarrayitem_raw_any` /
+        // `opimpl_setarrayitem_raw_i` / `opimpl_setarrayitem_raw_f`:
+        // `execute_with_descr(rop.SETARRAYITEM_RAW, arraydescr, arraybox,
+        // indexbox, itembox)`. `blackhole.py bhimpl_setarrayitem_raw_{i,f}`
+        // (`iiid` / `iifd`); `llmodel.py bh_setarrayitem_raw_i = bh_setarrayitem_gc_i`.
+        // Neither is in `USE_C_FORM` (`assembler.py`), so the encoding is
+        // always registers. The walk is the execution, same as
+        // `raw_store_{i,f}`: a non-concrete operand declines rather
+        // than continue past a lost write. No heapcache.setarrayitem —
+        // `_record_helper` `invalidate_caches` is a no-op via
+        // `heapcache.py clear_caches_not_necessary` for SETARRAYITEM_RAW.
+        "setarrayitem_raw_i/iiid" | "setarrayitem_raw_f/iifd" => {
+            let is_float = op.key == "setarrayitem_raw_f/iifd";
+            let array = read_int_reg(code, op, 0, ctx)?;
+            let index = read_int_reg(code, op, 1, ctx)?;
+            let value = if is_float {
+                read_float_reg(code, op, 2, ctx)?
+            } else {
+                read_int_reg(code, op, 2, ctx)?
+            };
+            let descr = read_descr(code, op, 3, ctx)?;
+            let non_concrete_key = if is_float {
+                "setarrayitem_raw_f/iifd non-concrete operand"
+            } else {
+                "setarrayitem_raw_i/iiid non-concrete operand"
+            };
+            match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                descr.as_array_descr(),
+            ) {
+                (ConcreteValue::Int(array_ptr), ConcreteValue::Int(idx), Some(ad)) => {
+                    let item_addr = (array_ptr as usize)
+                        .wrapping_add(ad.base_size())
+                        .wrapping_add((idx as usize).wrapping_mul(ad.item_size()));
+                    let value_concrete = if is_float {
+                        read_float_reg_concrete(code, op, 2, ctx)
+                    } else {
+                        read_int_reg_concrete(code, op, 2, ctx)
+                    };
+                    match (is_float, value_concrete) {
+                        (false, ConcreteValue::Int(v)) => {
+                            // SAFETY: same contract as the raw_store arm —
+                            // the walk executed the residuals that produced
+                            // `array_ptr`; `base_size` / `item_size` are
+                            // the array descr (`bhimpl_setarrayitem_raw_i` /
+                            // `bh_setarrayitem_gc_i`).
+                            unsafe { raw_store_int(item_addr as *mut u8, ad.item_size(), v) };
+                        }
+                        (true, ConcreteValue::Float(v)) => {
+                            // SAFETY: same contract as the raw_store arm —
+                            // the walk executed the residuals that produced
+                            // `array_ptr`; `base_size` / `item_size` are
+                            // the array descr (`bhimpl_setarrayitem_raw_f` /
+                            // `bh_setarrayitem_gc_f`).
+                            unsafe { raw_store_float(item_addr as *mut u8, ad.item_size(), v) };
+                        }
+                        _ => {
+                            return Err(DispatchError::UnsupportedOpname {
+                                pc: op.pc,
+                                key: non_concrete_key,
+                            });
+                        }
+                    }
                 }
                 _ => {
                     return Err(DispatchError::UnsupportedOpname {
                         pc: op.pc,
-                        key: "setarrayitem_raw_i/iiid non-concrete operand",
+                        key: non_concrete_key,
                     });
                 }
             }

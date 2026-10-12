@@ -257,14 +257,14 @@ const MAJIT_ONLY: &[&str] = &[
     "record_known_result_ref_ext/P",
     // Singles.  `goto_if_not_int_is_true/iL` left this list when #1679
     // re-landed the fusion with the walker arm it needs, which is the move
-    // this file exists to make visible.
+    // this file exists to make visible. The three raw-array keys
+    // (`getarrayitem_raw_{i,f}`, `setarrayitem_raw_f`) left when the
+    // walker gained the arms `pyjitpl.py` `opimpl_getarrayitem_raw_{i,f}`
+    // / `opimpl_setarrayitem_raw_f` already named.
     "arraybase_vable/rdd>i",
-    "getarrayitem_raw_f/iid>f",
-    "getarrayitem_raw_i/iid>i",
     "goto_if_exception_mismatch/iL",
     "newlist_clear/idddd>r",
     "rvmprof_code/ii",
-    "setarrayitem_raw_f/iifd",
     // `opimpl_unreachable` aborts the walk instead of panicking.
     "unreachable/",
 ];
