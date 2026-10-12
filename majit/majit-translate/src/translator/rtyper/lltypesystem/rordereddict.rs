@@ -693,6 +693,39 @@ impl OrderedDictRepr {
         )
     }
 
+    /// Mint `ll_dict_insert`: `ll_dict_lookup(FLAG_STORE)` then
+    /// `_ll_dict_setitem_lookup_done`, returning the displaced value.
+    ///
+    /// The same pieces `ll_dict_setitem_with_hash` (`rordereddict.py`)
+    /// composes, plus the value-or-None read `ll_dict_get` produces.
+    fn ll_dict_insert_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
+        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let rtyper = &hop.rtyper;
+        let dict_ptr = self.lowleveltype.clone();
+        let entries_ptr = self.entries_ptr_lltype();
+        let key_lltype = self.DICTKEY.clone();
+        let value_lltype = self.DICTVALUE.clone();
+        let lookup_done_fn = self.ll_dict_setitem_lookup_done_helper(hop)?;
+        let lookup_done_const = sub_helper_funcptr_constant(rtyper, &lookup_done_fn)?;
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_insert",
+            vec![dict_ptr.clone(), key_lltype.clone(), value_lltype.clone()],
+            value_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_dict_insert_helper_graph(
+                    "ll_dict_insert",
+                    dict_ptr.clone(),
+                    entries_ptr.clone(),
+                    key_lltype.clone(),
+                    value_lltype.clone(),
+                    hash_fn_const.clone(),
+                    call_lookup_const.clone(),
+                    lookup_done_const.clone(),
+                )
+            },
+        )
+    }
+
     /// Mint `ll_dict_delitem` (fused with `ll_dict_delitem_with_hash`) and its
     /// deletion tail: `ll_call_delete_by_entry_index` ->
     /// `ll_dict_delete_by_entry_index` -> `_ll_dict_del_entry`, with
@@ -1230,7 +1263,8 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.rtype_method_get` / `rtype_method_setdefault`
-    /// (`rordereddict.py`).
+    /// (`rordereddict.py`), plus `insert` (`ll_dict_lookup(FLAG_STORE)` +
+    /// `_ll_dict_setitem_lookup_done`).
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             // `is_null` is the lltype `_ptr` nullity probe on the dict
@@ -1290,6 +1324,35 @@ impl Repr for OrderedDictRepr {
                 let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
                     TyperError::message(
                         "rtype_method_setdefault: ll_dict_setdefault call produced no value",
+                    )
+                })?;
+                let (value_repr, external_value_repr) = self.base.recast_value();
+                let recast = hop.llops.borrow_mut().convertvar(
+                    v_res,
+                    value_repr.as_ref(),
+                    external_value_repr.as_ref(),
+                )?;
+                Ok(Some(recast))
+            }
+            // `RDict::insert(key, value)` — `ll_dict_lookup(FLAG_STORE)` +
+            // `_ll_dict_setitem_lookup_done` (`ll_dict_setitem_with_hash`),
+            // returning the displaced value. `custom_eq_hash` can raise
+            // from the key comparison, same policy as `rtype_setitem`.
+            "insert" => {
+                let args = hop.inputargs(vec![
+                    ConvertedTo::Repr(self),
+                    ConvertedTo::Repr(self.base.key_repr.as_ref()),
+                    ConvertedTo::Repr(self.base.value_repr.as_ref()),
+                ])?;
+                if self.base.custom_eq_hash {
+                    hop.exception_is_here()?;
+                } else {
+                    hop.exception_cannot_occur()?;
+                }
+                let helper = self.ll_dict_insert_helper(hop)?;
+                let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
+                    TyperError::message(
+                        "rtype_method_insert: ll_dict_insert call produced no value",
                     )
                 })?;
                 let (value_repr, external_value_repr) = self.base.recast_value();
@@ -7437,6 +7500,189 @@ pub(crate) fn build_ll_dict_setitem_helper_graph(
     ))
 }
 
+/// Synthesise `ll_dict_insert(d, key, value)` — one FLAG_STORE probe
+/// returning the displaced value.
+///
+/// Composition of `ll_dict_lookup` (`FLAG_STORE`) +
+/// `_ll_dict_setitem_lookup_done`, the same pieces
+/// `ll_dict_setitem_with_hash` (`rordereddict.py`) composes. The
+/// value-or-None read is the result `ll_dict_get` produces: when
+/// `index >= 0`, `d.entries[index].value`; otherwise `None`. Then
+/// `_ll_dict_setitem_lookup_done(d, key, value, hash, index)` writes
+/// the new value (overwrite or insert).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
+pub(crate) fn build_ll_dict_insert_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    value_lltype: LowLevelType,
+    hash_fn: Constant,
+    call_lookup_fn: Constant,
+    lookup_done_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let sig = || LowLevelType::Signed;
+
+    let d = new_var("dict", dict_ptr_lltype.clone());
+    let key = new_var("key", key_lltype.clone());
+    let value = new_var("value", value_lltype.clone());
+    let startblock = Block::shared(vec![var(&d), var(&key), var(&value)]);
+    let return_var = new_var("result", value_lltype.clone());
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let hash = new_var("hash", sig());
+    push(
+        &startblock,
+        "direct_call",
+        vec![Hlvalue::Constant(hash_fn), var(&key)],
+        &hash,
+    );
+    let index = new_var("index", sig());
+    push(
+        &startblock,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(call_lookup_fn),
+            var(&d),
+            var(&key),
+            var(&hash),
+            signed(FLAG_STORE),
+        ],
+        &index,
+    );
+    let missing = new_var("missing", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_lt",
+        vec![var(&index), signed(0)],
+        &missing,
+    );
+    startblock.borrow_mut().exitswitch = Some(var(&missing));
+
+    let fd = new_var("dict", dict_ptr_lltype.clone());
+    let fk = new_var("key", key_lltype.clone());
+    let fv = new_var("value", value_lltype.clone());
+    let fh = new_var("hash", sig());
+    let fi = new_var("index", sig());
+    let block_found = Block::shared(vec![var(&fd), var(&fk), var(&fv), var(&fh), var(&fi)]);
+
+    let sd = new_var("dict", dict_ptr_lltype);
+    let sk = new_var("key", key_lltype);
+    let sv = new_var("value", value_lltype.clone());
+    let sh = new_var("hash", sig());
+    let si = new_var("index", sig());
+    let sdisplaced = new_var("displaced", value_lltype.clone());
+    let block_store = Block::shared(vec![
+        var(&sd),
+        var(&sk),
+        var(&sv),
+        var(&sh),
+        var(&si),
+        var(&sdisplaced),
+    ]);
+
+    let none_value = constant_with_lltype(ConstValue::None, value_lltype.clone());
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                var(&d),
+                var(&key),
+                var(&value),
+                var(&hash),
+                var(&index),
+                none_value,
+            ],
+            Some(block_store.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&d), var(&key), var(&value), var(&hash), var(&index)],
+            Some(block_found.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let entries = new_var("entries", entries_ptr_lltype);
+    push(
+        &block_found,
+        "getfield",
+        vec![var(&fd), void_field_const("entries")],
+        &entries,
+    );
+    let displaced = new_var("displaced", value_lltype);
+    push(
+        &block_found,
+        "getinteriorfield",
+        vec![var(&entries), var(&fi), void_field_const("value")],
+        &displaced,
+    );
+    block_found.closeblock(vec![
+        Link::new(
+            vec![
+                var(&fd),
+                var(&fk),
+                var(&fv),
+                var(&fh),
+                var(&fi),
+                var(&displaced),
+            ],
+            Some(block_store.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    push(
+        &block_store,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(lookup_done_fn),
+            var(&sd),
+            var(&sk),
+            var(&sv),
+            var(&sh),
+            var(&si),
+        ],
+        &new_var("v", LowLevelType::Void),
+    );
+    block_store.closeblock(vec![
+        Link::new(
+            vec![var(&sdisplaced)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["dict".to_string(), "key".to_string(), "value".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise `_ll_dictnext(iter) -> Signed` (`rordereddict.py`),
 /// the forward dict-iterator step shared by keys/values/items iteration.
 ///
@@ -10559,6 +10805,90 @@ mod tests {
             ops.iter().any(|o| o == "direct_call"),
             "missing arm calls _ll_dict_setitem_lookup_done"
         );
+        assert!(
+            ops.iter().any(|o| o == "getinteriorfield"),
+            "found arm reads entries[index].value"
+        );
+    }
+
+    /// `ll_dict_insert` is one `FLAG_STORE` lookup plus one
+    /// `_ll_dict_setitem_lookup_done` (`ll_dict_setitem_with_hash`),
+    /// reading the displaced value the way `ll_dict_get` does.
+    #[test]
+    fn build_ll_dict_insert_has_one_lookup_and_one_lookup_done() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_insert_helper_graph(
+            "ll_dict_insert",
+            dict_ptr,
+            entries_ptr,
+            key_lltype,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_dict_insert_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_insert");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["direct_call", "direct_call", "int_lt"]);
+        let lookup = startblock
+            .operations
+            .iter()
+            .find(|op| {
+                op.opname == "direct_call"
+                    && op.args.len() == 5
+                    && matches!(
+                        &op.args[4],
+                        Hlvalue::Constant(c) if c.value == ConstValue::Int(FLAG_STORE)
+                    )
+            })
+            .expect("startblock FLAG_STORE lookup");
+        assert_eq!(lookup.args.len(), 5);
+        drop(startblock);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![inner.startblock.clone()];
+        let mut lookup_calls = 0usize;
+        let mut lookup_done_calls = 0usize;
+        while let Some(b) = stack.pop() {
+            if !seen.insert(Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            let bb = b.borrow();
+            for op in &bb.operations {
+                if op.opname != "direct_call" {
+                    continue;
+                }
+                if op.args.len() == 5
+                    && matches!(
+                        &op.args[4],
+                        Hlvalue::Constant(c) if c.value == ConstValue::Int(FLAG_STORE)
+                    )
+                {
+                    lookup_calls += 1;
+                }
+                if op.args.len() == 6 {
+                    lookup_done_calls += 1;
+                }
+            }
+            for link in &bb.exits {
+                if let Some(t) = link.borrow().target.clone() {
+                    stack.push(t);
+                }
+            }
+        }
+        assert_eq!(lookup_calls, 1, "exactly one FLAG_STORE lookup");
+        assert_eq!(
+            lookup_done_calls, 1,
+            "exactly one _ll_dict_setitem_lookup_done"
+        );
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
         assert!(
             ops.iter().any(|o| o == "getinteriorfield"),
             "found arm reads entries[index].value"
