@@ -24,7 +24,7 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TypeDeclKind;
 
 use crate::flowspace::model::Variable;
-use crate::front::mir::{cast_int_to_ptr_call, tyref_is_fat_dyn};
+use crate::front::mir::tyref_is_fat_dyn;
 use crate::inline::splice_direct_call;
 use crate::model::{
     BlockId, ConcreteType, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation,
@@ -633,10 +633,14 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
                 }
                 _ => None,
             };
-            if result_ty.is_some() {
+            if let Some(result_ty) = result_ty {
                 // Same metadata word: keep the Ref users on a cast of
                 // the Int load instead of a second getfield.
-                block.operations[index].kind = cast_int_to_ptr_call(meta.clone());
+                block.operations[index].kind = OpKind::UnaryOp {
+                    op: "cast_int_to_ptr".into(),
+                    operand: meta.clone(),
+                    result_ty,
+                };
                 block.operations.insert(index, op);
             } else {
                 block.operations.insert(index + 1, op);

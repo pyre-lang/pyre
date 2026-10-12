@@ -933,37 +933,11 @@ pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
     majit_gc::shadow_stack::top_ref().0 as PyObjectRef
 }
 
-/// Same top-root read as [`reload_top_root`], through a slot resolved once
-/// for this activation. `root` names the value the slot was published with
-/// (first argument, matching [`reload_top_root`]); the runtime read ignores
-/// that copy and answers the slot, which a collection forwards in place.
-///
-/// The gctransformer inserts these reloads after the codewriter
-/// (`rpython/memory/gctransform/shadowstack.py`, `framework.py
-/// push_roots/pop_roots`); pyre writes them in source, so `is_gc_root_reload`
-/// treats this as the same GC-erasure identity.
-#[inline]
-#[must_use = "a top root may have moved; use the reloaded live word"]
-#[majit_macros::dont_look_inside_cannot_raise]
-pub fn reload_top_root_at(
-    root: PyObjectRef,
-    slot: majit_gc::shadow_stack::ShadowStackSlot,
-) -> PyObjectRef {
-    let _ = root;
-    unsafe { majit_gc::shadow_stack::slot_top_ref(slot).0 as PyObjectRef }
-}
-
 /// `extern "C"` residual entry for [`reload_top_root`], with the same
 /// exception effect: the body only reads the shadow-stack top.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn reload_top_root_jit_abi(root: PyObjectRef) -> PyObjectRef {
     reload_top_root(root)
-}
-
-/// `extern "C"` residual entry for [`reload_top_root_at`].
-#[majit_macros::dont_look_inside_cannot_raise]
-pub extern "C" fn reload_top_root_at_jit_abi(root: PyObjectRef, slot: usize) -> PyObjectRef {
-    reload_top_root_at(root, majit_gc::shadow_stack::slot_from_cached(slot))
 }
 
 /// Publish a complete translated livevar set before performing any

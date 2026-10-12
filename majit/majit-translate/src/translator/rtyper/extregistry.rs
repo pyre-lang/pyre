@@ -229,20 +229,6 @@ pub enum ExtRegistryEntry {
     /// `longlong2float.longlong2float(i64) -> f64` — RPython
     /// `LongLong2FloatEntry`, the inverse bit reinterpretation.
     LongLong2Float,
-    /// `rlib/jit.py class Entry(ExtRegistryEntry): _about_ = hint`
-    /// for `access_directly=True`. Pyre splits the kwargs into one
-    /// host callable per spelling; this is the minting form.
-    HintAccessDirectly,
-    /// Same `hint` Entry, `fresh_virtualizable=True` (which also
-    /// requires `access_directly=True`).
-    HintFreshVirtualizable,
-    /// Same `hint` Entry, `access_directly=False` — the strip form.
-    HintNoAccessDirectly,
-    /// Identity of `reload_top_root` / `reload_top_root_at`. Upstream
-    /// `gctransform` inserts those after annotate and rtype; pyre
-    /// spells them in source, so specialize_call is the
-    /// `EntryNonConstant` identity (`return hop.inputarg(arg=0)`).
-    GcRootReload,
 }
 
 /// Small Send-able annotation payload for static HostObject type
@@ -363,10 +349,6 @@ pub enum ExtRegistryEntryKey {
     /// Singleton key for the `NonConstant` `_about_` entry
     /// (rlib/nonconst.py). No per-instance identity.
     NonConstant,
-    HintAccessDirectly,
-    HintFreshVirtualizable,
-    HintNoAccessDirectly,
-    GcRootReload,
 }
 
 impl ExtRegistryEntry {
@@ -412,10 +394,6 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::Float2LongLong => ExtRegistryEntryKey::Float2LongLong,
             ExtRegistryEntry::LongLong2Float => ExtRegistryEntryKey::LongLong2Float,
             ExtRegistryEntry::NonConstant => ExtRegistryEntryKey::NonConstant,
-            ExtRegistryEntry::HintAccessDirectly => ExtRegistryEntryKey::HintAccessDirectly,
-            ExtRegistryEntry::HintFreshVirtualizable => ExtRegistryEntryKey::HintFreshVirtualizable,
-            ExtRegistryEntry::HintNoAccessDirectly => ExtRegistryEntryKey::HintNoAccessDirectly,
-            ExtRegistryEntry::GcRootReload => ExtRegistryEntryKey::GcRootReload,
         }
     }
 
@@ -588,28 +566,6 @@ impl ExtRegistryEntry {
                 None,
                 Some("non_constant".to_string()),
             ))),
-            // Annotation half is `BUILTIN_ANALYZERS`
-            // (`jit_hint_access_directly` / `gc_root_reload_identity`).
-            ExtRegistryEntry::HintAccessDirectly => Ok(SomeValue::Builtin(SomeBuiltin::new(
-                "majit_metainterp.jit.hint_access_directly",
-                None,
-                Some("hint_access_directly".to_string()),
-            ))),
-            ExtRegistryEntry::HintFreshVirtualizable => Ok(SomeValue::Builtin(SomeBuiltin::new(
-                "majit_metainterp.jit.hint_fresh_virtualizable",
-                None,
-                Some("hint_fresh_virtualizable".to_string()),
-            ))),
-            ExtRegistryEntry::HintNoAccessDirectly => Ok(SomeValue::Builtin(SomeBuiltin::new(
-                "majit_metainterp.jit.hint_no_access_directly",
-                None,
-                Some("hint_no_access_directly".to_string()),
-            ))),
-            ExtRegistryEntry::GcRootReload => Ok(SomeValue::Builtin(SomeBuiltin::new(
-                "pyre_object.gc_roots.reload_top_root",
-                None,
-                Some("reload_top_root".to_string()),
-            ))),
         }
     }
 
@@ -773,21 +729,6 @@ impl ExtRegistryEntry {
             // `rlib/longlong2float.py` — inverse bitcast.
             ExtRegistryEntry::LongLong2Float => {
                 Ok(super::rbuiltin::rtype_longlong2float as BuiltinTyperFn)
-            }
-            // rlib/jit.py `Entry(_about_=hint).specialize_call` —
-            // `hop.genop('hint', [v, c_hint], resulttype=v.concretetype)`.
-            ExtRegistryEntry::HintAccessDirectly => {
-                Ok(super::rbuiltin::rtype_hint_access_directly as BuiltinTyperFn)
-            }
-            ExtRegistryEntry::HintFreshVirtualizable => {
-                Ok(super::rbuiltin::rtype_hint_fresh_virtualizable as BuiltinTyperFn)
-            }
-            ExtRegistryEntry::HintNoAccessDirectly => {
-                Ok(super::rbuiltin::rtype_hint_no_access_directly as BuiltinTyperFn)
-            }
-            // gctransform insert after rtype: identity of the root.
-            ExtRegistryEntry::GcRootReload => {
-                Ok(super::rbuiltin::rtype_non_constant as BuiltinTyperFn)
             }
         }
     }
@@ -1051,21 +992,6 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     if host.qualname() == "majit_rlib.nonconst.non_constant" {
         return Some(ExtRegistryEntry::NonConstant);
     }
-    if host.qualname() == "majit_metainterp.jit.hint_access_directly" {
-        return Some(ExtRegistryEntry::HintAccessDirectly);
-    }
-    if host.qualname() == "majit_metainterp.jit.hint_fresh_virtualizable" {
-        return Some(ExtRegistryEntry::HintFreshVirtualizable);
-    }
-    if host.qualname() == "majit_metainterp.jit.hint_no_access_directly" {
-        return Some(ExtRegistryEntry::HintNoAccessDirectly);
-    }
-    if matches!(
-        host.qualname(),
-        "pyre_object.gc_roots.reload_top_root" | "pyre_object.gc_roots.reload_top_root_at"
-    ) {
-        return Some(ExtRegistryEntry::GcRootReload);
-    }
     // `BigInt.from` residual external — keyed by the qualname the
     // `BigInt.from` `BUILTIN_ANALYZERS` annotation entry uses, so the
     // rtyper's `findbltintyper` → `extregistry.lookup` resolves the same
@@ -1252,31 +1178,6 @@ mod tests {
         assert!(matches!(entry, ExtRegistryEntry::WeAreJitted));
         assert!(entry.specialize_call().is_ok());
         assert!(matches!(entry.compute_annotation(), Ok(SomeValue::Bool(_))));
-    }
-
-    #[test]
-    fn hint_access_directly_resolves_specialize_call() {
-        let host = HostObject::new_builtin_callable("majit_metainterp.jit.hint_access_directly");
-        let cv = ConstValue::HostObject(host);
-        assert!(is_registered(&cv));
-        let entry = lookup(&cv).expect("hint_access_directly must surface an entry");
-        assert!(matches!(entry, ExtRegistryEntry::HintAccessDirectly));
-        assert!(entry.specialize_call().is_ok());
-    }
-
-    #[test]
-    fn gc_root_reload_resolves_to_identity_specializer() {
-        let host = HostObject::new_builtin_callable("pyre_object.gc_roots.reload_top_root");
-        let cv = ConstValue::HostObject(host);
-        assert!(is_registered(&cv));
-        let entry = lookup(&cv).expect("reload_top_root must surface an entry");
-        assert!(matches!(entry, ExtRegistryEntry::GcRootReload));
-        assert!(entry.specialize_call().is_ok());
-        let at = HostObject::new_builtin_callable("pyre_object.gc_roots.reload_top_root_at");
-        assert!(matches!(
-            lookup(&ConstValue::HostObject(at)),
-            Some(ExtRegistryEntry::GcRootReload)
-        ));
     }
 
     /// rlib/jit.py `ConditionalCallEntry._about_ =
