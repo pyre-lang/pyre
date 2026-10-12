@@ -1902,8 +1902,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // (`pyjitpl.py`): a null `cpu.grab_exc_value(deadframe)` records
     // `GUARD_NO_EXCEPTION` and continues at the resume pc. `Restored` is
     // the ChangeFrame into the catching frame, which only happens when
-    // that grab was non-null. Restored on the no-exception arm would
-    // GETFIELD SAVE_EXCEPTION (NULL at runtime) as the caught exception.
+    // that grab was non-null.
     let grabbed = ctx.bridge_grab_seeded()
         || majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get()) != 0;
     let handler_entry = (ctx.is_bridge_trace
