@@ -4283,14 +4283,13 @@ fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::va
 /// prepass, so `size_of::<usize>()` here would bake the *host's* 8 into a
 /// wasm32 descr.
 ///
-/// The two deliberately still differ on `f32`.  `get_type_flag` follows
-/// `descr.py` and lands SingleFloat int-banked
-/// (`ArrayFlag::Unsigned` / `Type::Int`), then restores the `'f'` width
-/// marker via `concrete_type` on the ArrayDescr it builds
-/// (`call.rs` `elem_ref == Some("f32")`).  `BhDescr::Array` carries no
-/// `concrete_type` field to restore it with, so adopting the int-banked
-/// answer here would lose the f32-ness outright.  Merging the two is
-/// blocked on `BhDescr::Array` gaining that marker.
+/// `f32` matches `get_type_flag`: `lltype.SingleFloat` is not `lltype.Float`
+/// and fails the signed `rffi.cast` test, so the flag is `FLAG_UNSIGNED`
+/// (int kind, size 4).  `get_array_descr` keeps that flag and sets
+/// `concrete_type = 'f'` (`arraydescrof_concrete`, when the element spelling
+/// is `"f32"`).  `BhDescr::Array` has no `concrete_type` slot, so the
+/// codewriter-less `arraydescrof` fallback records the int-kind size-4
+/// descr only.
 fn type_flag_from_str(
     type_str: &str,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
@@ -4321,7 +4320,8 @@ fn type_flag_from_str(
         // `{cap, ptr, len}` inline. Same arm as `get_type_flag`.
         s if s.starts_with("Vec<") => (ArrayFlag::Struct, majit_ir::value::Type::Ref, 3 * word),
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
-        "f32" => (ArrayFlag::Float, majit_ir::value::Type::Float, 4),
+        // `get_type_flag`: SingleFloat → FLAG_UNSIGNED, int kind, size 4.
+        "f32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         "i64" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
         "isize" => (ArrayFlag::Signed, majit_ir::value::Type::Int, word),
         "i32" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 4),
@@ -5621,6 +5621,13 @@ fn arraydescrof(
 
     // Primary path: extract element type from the array type identity
     // (our equivalent of `ARRAY.OF` in RPython).
+    //
+    // `get_array_descr` keeps `get_type_flag`'s flag and, when OF is
+    // SingleFloat or Float, sets `concrete_type = 'f'`.
+    // `arraydescrof_concrete` does that on the CallControl path above.
+    // `BhDescr::Array` has no `concrete_type` slot, so this fallback
+    // records only the flag from `type_flag_from_str`: an `f32` element
+    // is int-kind, unsigned, size 4 — the same shape as `u32`.
     let (flag, item_type, itemsize) = if let Some(elem) = array_type_id
         .as_deref()
         .and_then(extract_element_type_from_str)
@@ -6154,6 +6161,45 @@ mod tests {
         let expected = (ArrayFlag::Unsigned, Type::Int, word);
         for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
             assert_eq!(type_flag_from_str(spelling), expected, "{spelling}");
+        }
+    }
+
+    /// `get_type_flag`: `f32` is `FLAG_UNSIGNED` / Int / 4; `f64` stays float.
+    /// The codewriter-less `arraydescrof` fallback has no `concrete_type`
+    /// slot, so `[f32]` is that int-kind descr (`arraydescrof_concrete`
+    /// sets `'f'` on the CallControl path).
+    #[test]
+    fn f32_type_flag_is_unsigned_int_of_four_bytes() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        assert_eq!(
+            type_flag_from_str("f32"),
+            (ArrayFlag::Unsigned, Type::Int, 4)
+        );
+        assert_eq!(
+            type_flag_from_str("f64"),
+            (ArrayFlag::Float, Type::Float, 8)
+        );
+
+        let descr = arraydescrof(
+            &crate::model::ValueType::Float,
+            &Some("[f32]".to_string()),
+            None,
+            None,
+        );
+        match descr {
+            crate::jitcode::BhDescr::Array {
+                itemsize,
+                item_type,
+                is_item_signed,
+                ..
+            } => {
+                assert_eq!(itemsize, 4);
+                assert_eq!(item_type, Type::Int);
+                assert!(!is_item_signed);
+            }
+            _ => panic!("arraydescrof([f32]) must be an array descr"),
         }
     }
 

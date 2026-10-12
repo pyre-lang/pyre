@@ -1500,20 +1500,14 @@ fn emit_float_store(
     offset: u64,
     size: usize,
 ) -> Result<(), BackendError> {
-    match size {
-        4 => {
-            sink.f32_demote_f64();
-            sink.f32_store(mem32(offset));
-        }
-        8 => {
-            sink.f64_store(mem64(offset));
-        }
-        other => {
-            return Err(BackendError::Unsupported(format!(
-                "wasm codegen: float store has size {other}"
-            )));
-        }
+    // `get_type_flag`: only `lltype.Float` is FLAG_FLOAT, and it is 8 bytes.
+    // A singlefloat store is an integer store, not `f32.demote` + `f32.store`.
+    if size != 8 {
+        return Err(BackendError::Unsupported(format!(
+            "wasm codegen: float store has size {size} (get_type_flag: lltype.Float is 8 bytes)"
+        )));
     }
+    sink.f64_store(mem64(offset));
     Ok(())
 }
 
@@ -8434,20 +8428,14 @@ fn build_function(
                     let (size, signed) = gc_rewrite_access_size(op, constants, 4)?;
                     let size = wasm_ref_access_size(op.opcode == OpCode::GcLoadIndexedR, size);
                     if op.opcode == OpCode::GcLoadIndexedF {
-                        match size {
-                            4 => {
-                                sink.f32_load(mem32(offset));
-                                sink.f64_promote_f32();
-                            }
-                            8 => {
-                                sink.f64_load(mem64(offset));
-                            }
-                            _ => {
-                                return Err(BackendError::Unsupported(format!(
-                                    "wasm codegen: {:?} float load has size {size}",
-                                    op.opcode
-                                )));
-                            }
+                        // `get_type_flag`: a float-kind load is 8 bytes.
+                        if size == 8 {
+                            sink.f64_load(mem64(offset));
+                        } else {
+                            return Err(BackendError::Unsupported(format!(
+                                "wasm codegen: {:?} float load has size {size} (get_type_flag: lltype.Float is 8 bytes)",
+                                op.opcode
+                            )));
                         }
                     } else {
                         emit_sized_int_load(&mut sink, offset, size, signed);
@@ -8474,20 +8462,14 @@ fn build_function(
                     let (size, signed) = gc_rewrite_access_size(op, constants, 2)?;
                     let size = wasm_ref_access_size(op.opcode == OpCode::GcLoadR, size);
                     if op.opcode == OpCode::GcLoadF {
-                        match size {
-                            4 => {
-                                sink.f32_load(mem32(offset));
-                                sink.f64_promote_f32();
-                            }
-                            8 => {
-                                sink.f64_load(mem64(offset));
-                            }
-                            _ => {
-                                return Err(BackendError::Unsupported(format!(
-                                    "wasm codegen: {:?} float load has size {size}",
-                                    op.opcode
-                                )));
-                            }
+                        // `get_type_flag`: a float-kind load is 8 bytes.
+                        if size == 8 {
+                            sink.f64_load(mem64(offset));
+                        } else {
+                            return Err(BackendError::Unsupported(format!(
+                                "wasm codegen: {:?} float load has size {size} (get_type_flag: lltype.Float is 8 bytes)",
+                                op.opcode
+                            )));
                         }
                     } else {
                         emit_sized_int_load(&mut sink, offset, size, signed);
@@ -8511,13 +8493,15 @@ fn build_function(
                 let (size, _) = gc_rewrite_access_size(op, constants, 3)?;
                 let val = op.arg(2).to_opref();
                 let size = wasm_ref_access_size(val.ty() == Some(Type::Ref), size);
-                if size == 4 && value_is_f64(value_types, val) {
-                    emit_resolve_f64(&mut sink, constants, value_types, val);
-                    emit_float_store(&mut sink, offset, size)?;
-                } else {
-                    emit_resolve(&mut sink, constants, value_types, val);
-                    emit_sized_int_store(&mut sink, offset, size);
+                // Size 8 stays the bit-preserving integer store below.
+                // `get_type_flag` never pairs a float value with another width.
+                if value_is_f64(value_types, val) && size != 8 {
+                    return Err(BackendError::Unsupported(format!(
+                        "wasm codegen: float memory store has size {size} (get_type_flag: lltype.Float is 8 bytes)"
+                    )));
                 }
+                emit_resolve(&mut sink, constants, value_types, val);
+                emit_sized_int_store(&mut sink, offset, size);
             }
             OpCode::GcStoreIndexed => {
                 if op.num_args() < 6 {
@@ -8531,13 +8515,15 @@ fn build_function(
                 let (size, _) = gc_rewrite_access_size(op, constants, 5)?;
                 let val = op.arg(2).to_opref();
                 let size = wasm_ref_access_size(val.ty() == Some(Type::Ref), size);
-                if size == 4 && value_is_f64(value_types, val) {
-                    emit_resolve_f64(&mut sink, constants, value_types, val);
-                    emit_float_store(&mut sink, offset, size)?;
-                } else {
-                    emit_resolve(&mut sink, constants, value_types, val);
-                    emit_sized_int_store(&mut sink, offset, size);
+                // Size 8 stays the bit-preserving integer store below.
+                // `get_type_flag` never pairs a float value with another width.
+                if value_is_f64(value_types, val) && size != 8 {
+                    return Err(BackendError::Unsupported(format!(
+                        "wasm codegen: float memory store has size {size} (get_type_flag: lltype.Float is 8 bytes)"
+                    )));
                 }
+                emit_resolve(&mut sink, constants, value_types, val);
+                emit_sized_int_store(&mut sink, offset, size);
             }
 
             // ── Exception handling ──
@@ -14214,20 +14200,14 @@ fn emit_float_load(
     offset: u64,
     size: usize,
 ) -> Result<(), BackendError> {
-    match size {
-        4 => {
-            sink.f32_load(mem32(offset));
-            sink.f64_promote_f32();
-        }
-        8 => {
-            sink.f64_load(mem64(offset));
-        }
-        other => {
-            return Err(BackendError::Unsupported(format!(
-                "wasm codegen: float load has size {other}"
-            )));
-        }
+    // `get_type_flag`: only `lltype.Float` is FLAG_FLOAT, and it is 8 bytes.
+    // A singlefloat load is an integer load, not `f32.load` + `f64.promote`.
+    if size != 8 {
+        return Err(BackendError::Unsupported(format!(
+            "wasm codegen: float load has size {size} (get_type_flag: lltype.Float is 8 bytes)"
+        )));
     }
+    sink.f64_load(mem64(offset));
     Ok(())
 }
 

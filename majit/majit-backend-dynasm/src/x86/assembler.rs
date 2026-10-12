@@ -5145,14 +5145,9 @@ impl<'a> Assembler386<'a> {
                     Loc::Reg(val) => {
                         self.emit_op_gcstore_regalloc(base, ofs_loc, val, size);
                     }
-                    Loc::ImmedFloat(val_imm) if size == 4 => {
-                        let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
-                        let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG;
-                        self.forget_if_scratch_written(gpr);
-                        rx86::mov_ri(&mut self.mc, gpr, val_imm.value);
-                        rx86::movdq_xr(&mut self.mc, xmm.value, gpr);
-                        self.emit_op_gcstore_regalloc(base, ofs_loc, &xmm, size);
-                    }
+                    // `save_into_mem` stores an immediate as an integer move.
+                    // A singlefloat bit pattern is int-kind (`get_type_flag`
+                    // → FLAG_UNSIGNED), not an xmm `MOVSS`.
                     Loc::Immed(val_imm) | Loc::ImmedFloat(val_imm) => {
                         self.emit_op_gcstore_imm_regalloc(base, ofs_loc, val_imm.value, size);
                     }
@@ -5200,12 +5195,13 @@ impl<'a> Assembler386<'a> {
                                 offset,
                             );
                             match value_loc {
-                                Loc::Reg(val) if val.is_xmm && size == 4 => {
-                                    let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                                    rx86::cvtsd2ss_xx(&mut self.mc, scratch, val.value);
-                                    rx86::movss_ax(&mut self.mc, addr, scratch);
-                                }
                                 Loc::Reg(val) if val.is_xmm => {
+                                    // `save_into_mem`: an xmm store is `MOVSD`.
+                                    // `get_type_flag` banks only `lltype.Float`.
+                                    debug_assert_eq!(
+                                        size, 8,
+                                        "save_into_mem: float-kind access is 8 bytes"
+                                    );
                                     rx86::movsd_ax(&mut self.mc, addr, val.value);
                                 }
                                 Loc::Reg(val) => match size {
@@ -5214,15 +5210,6 @@ impl<'a> Assembler386<'a> {
                                     4 => rx86::mov32_ar(&mut self.mc, addr, val.value),
                                     _ => rx86::mov_ar(&mut self.mc, addr, val.value),
                                 },
-                                Loc::ImmedFloat(i) if size == 4 => {
-                                    let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
-                                    let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                                    self.forget_if_scratch_written(gpr);
-                                    rx86::mov_ri(&mut self.mc, gpr, i.value);
-                                    rx86::movdq_xr(&mut self.mc, xmm, gpr);
-                                    rx86::cvtsd2ss_xx(&mut self.mc, xmm, xmm);
-                                    rx86::movss_ax(&mut self.mc, addr, xmm);
-                                }
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                                     self.emit_indexed_imm_store(addr, i.value, size);
                                 }
@@ -5238,6 +5225,10 @@ impl<'a> Assembler386<'a> {
                             let addr = (i16::from(base.value), ofs_reg.value, 0, offset);
                             match value_loc {
                                 Loc::Reg(val) if val.is_xmm => {
+                                    debug_assert_eq!(
+                                        size, 8,
+                                        "save_into_mem: float-kind access is 8 bytes"
+                                    );
                                     rx86::movsd_ax(&mut self.mc, addr, val.value);
                                 }
                                 Loc::Reg(val) => match size {
@@ -8387,6 +8378,9 @@ impl<'a> Assembler386<'a> {
         if let Loc::Reg(v) = val_loc
             && v.is_xmm
         {
+            // `save_into_mem`: an xmm store is `MOVSD`. `get_type_flag`
+            // banks only `lltype.Float` (8 bytes).
+            debug_assert_eq!(field_size, 8, "save_into_mem: float-kind access is 8 bytes");
             rx86::movsd_mx(&mut self.mc, (base.value, ofs), v.value);
             return;
         }
@@ -8443,18 +8437,10 @@ impl<'a> Assembler386<'a> {
         signed: bool,
     ) {
         if dst.is_xmm {
-            if size == 4 {
-                if let Some(r) = ofs_reg {
-                    rx86::movss_xa(
-                        &mut self.mc,
-                        dst.value,
-                        (i16::from(base.value), r.value, 0, 0),
-                    );
-                } else {
-                    rx86::movss_xm(&mut self.mc, dst.value, (base.value, ofs));
-                }
-                rx86::cvtss2sd_xx(&mut self.mc, dst.value, dst.value);
-            } else if let Some(r) = ofs_reg {
+            // `load_from_mem`: an xmm location is `MOVSD`. `get_type_flag`
+            // banks `lltype.Float` only; a singlefloat access is int-kind.
+            debug_assert_eq!(size, 8, "load_from_mem: float-kind access is 8 bytes");
+            if let Some(r) = ofs_reg {
                 rx86::movsd_xa(
                     &mut self.mc,
                     dst.value,
@@ -8704,19 +8690,10 @@ impl<'a> Assembler386<'a> {
         size: usize,
     ) {
         if val.is_xmm {
-            if size == 4 {
-                let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                rx86::cvtsd2ss_xx(&mut self.mc, scratch, val.value);
-                if let Some(r) = ofs_reg {
-                    rx86::movss_ax(
-                        &mut self.mc,
-                        (i16::from(base.value), r.value, 0, 0),
-                        scratch,
-                    );
-                } else {
-                    rx86::movss_mx(&mut self.mc, (base.value, ofs), scratch);
-                }
-            } else if let Some(r) = ofs_reg {
+            // `save_into_mem`: an xmm location is `MOVSD`. `get_type_flag`
+            // banks `lltype.Float` only; a singlefloat access is int-kind.
+            debug_assert_eq!(size, 8, "save_into_mem: float-kind access is 8 bytes");
+            if let Some(r) = ofs_reg {
                 rx86::movsd_ax(
                     &mut self.mc,
                     (i16::from(base.value), r.value, 0, 0),

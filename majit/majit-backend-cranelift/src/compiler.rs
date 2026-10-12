@@ -6743,22 +6743,19 @@ fn emit_load_from_addr(
     let heap_flags = heap_mem_flags(opcode);
     match value_type {
         Type::Float => {
-            match size {
-                4 => {
-                    let raw = builder.ins().load(cl_types::F32, heap_flags, addr, offset);
-                    Ok(builder.ins().fpromote(cl_types::F64, raw))
-                }
-                8 => {
-                    // Return the natural F64 so a Float-result variable (declared
-                    // F64) receives it without a GPR round-trip; callers feeding a
-                    // boxed I64 slot coerce at their own boundary.
-                    Ok(builder.ins().load(cl_types::F64, heap_flags, addr, offset))
-                }
-                _ => Err(unsupported_semantics(
+            // `get_type_flag`: only `lltype.Float` is FLAG_FLOAT, and it is
+            // 8 bytes. A singlefloat access is int-kind (`FLAG_UNSIGNED`),
+            // not an F32 load promoted to F64.
+            if size != 8 {
+                return Err(unsupported_semantics(
                     opcode,
-                    "float memory operations require 4- or 8-byte values",
-                )),
+                    "float memory operations require 8-byte values",
+                ));
             }
+            // Return the natural F64 so a Float-result variable (declared
+            // F64) receives it without a GPR round-trip; callers feeding a
+            // boxed I64 slot coerce at their own boundary.
+            Ok(builder.ins().load(cl_types::F64, heap_flags, addr, offset))
         }
         Type::Int | Type::Ref => {
             // Adaptation, not parity.  Upstream's reference bank is one word by
@@ -6815,22 +6812,17 @@ fn emit_store_to_addr(
     let heap_flags = heap_mem_flags(opcode);
     match value_type {
         Type::Float => {
-            let fval = coerce_ty(builder, value, cl_types::F64);
-            match size {
-                4 => {
-                    let f32val = builder.ins().fdemote(cl_types::F32, fval);
-                    builder.ins().store(heap_flags, f32val, addr, offset);
-                }
-                8 => {
-                    builder.ins().store(heap_flags, fval, addr, offset);
-                }
-                _ => {
-                    return Err(unsupported_semantics(
-                        opcode,
-                        "float memory operations require 4- or 8-byte values",
-                    ));
-                }
+            // `get_type_flag`: only `lltype.Float` is FLAG_FLOAT, and it is
+            // 8 bytes. A singlefloat access is int-kind (`FLAG_UNSIGNED`),
+            // not an F64 demoted to an F32 store.
+            if size != 8 {
+                return Err(unsupported_semantics(
+                    opcode,
+                    "float memory operations require 8-byte values",
+                ));
             }
+            let fval = coerce_ty(builder, value, cl_types::F64);
+            builder.ins().store(heap_flags, fval, addr, offset);
         }
         Type::Int | Type::Ref => {
             // Same adaptation as the load path above, and for the same reason.

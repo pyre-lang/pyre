@@ -3447,11 +3447,9 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 let val_reg = match value_loc {
                     Loc::Reg(r) => *r,
-                    Loc::ImmedFloat(i) if size == 4 => {
-                        self.emit_mov_imm64(16, i.value);
-                        dynasm!(self.mc ; .arch aarch64 ; fmov D(14), X(16));
-                        crate::regloc::RegLoc::new(14, true)
-                    }
+                    // An immediate, including a singlefloat bit pattern, is
+                    // an integer store. `get_type_flag` banks SingleFloat as
+                    // FLAG_UNSIGNED; only `lltype.Float` is an 8-byte xmm.
                     Loc::Immed(i) | Loc::ImmedFloat(i) => {
                         self.emit_mov_imm64(16, i.value);
                         crate::regloc::RegLoc::new(16, false)
