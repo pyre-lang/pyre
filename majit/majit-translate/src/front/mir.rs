@@ -8353,6 +8353,10 @@ struct IndexElemAlias {
     /// does not read as a list, so `getitem` would stay on the
     /// classdef-less pointer.
     list_root: Option<String>,
+    /// `BytesArray` / `UnicodeArray` when the paired read substituted
+    /// `ll_items` (`block`) for the `{ block, len }` wrapper. The write
+    /// repeats that FieldRead off the remapped wrapper (`ll_setitem_fast`).
+    items_owner: Option<&'static str>,
 }
 
 /// Header of a `(*p.add(i)).field` access.
@@ -8695,6 +8699,11 @@ struct Lowering<'a> {
     /// these locals answers with the recorded length, never with `__len` of
     /// the header, which is the CAPACITY.
     string_array_view_locals: Vec<(usize, Variable)>,
+    /// Twin of [`Self::string_array_view_locals`] for `IntArray` /
+    /// `FloatArray` slice views. Float pair slices are outside
+    /// [`PAIR_SLICE_ITEM_KINDS`], so a length read of the `[f64]` view
+    /// would otherwise be `ll_fixed_length` of the items block.
+    numeric_array_view_locals: Vec<(usize, Variable)>,
     /// Result `Variable`s of calls to callees whose declared result is
     /// `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
@@ -9603,6 +9612,7 @@ impl<'a> Lowering<'a> {
             dyn_return_calls: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
+            numeric_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
             result_map_err_sites: Vec::new(),
@@ -10693,8 +10703,12 @@ impl<'a> Lowering<'a> {
                 // A single-assignment copy of a multi-field integer NamedConst
                 // keeps the field literals. The struct itself is not a flow
                 // value: emitting the const's nullary call leaves that path
-                // unregistered.
+                // unregistered. `fold_op_list` keeps any operation it cannot
+                // prove safe, so a projected store, address-taking, or
+                // whole-value consumer leaves the aggregate.
                 if !self.multi_assigned_locals.contains(&dest_local)
+                    && !self.local_has_projected_store(dest_local)
+                    && const_struct_uses_are_field_reads(self.llbc, self.body, dest_local)
                     && let Some(fields) = self.take_const_struct_fields(&rvalue)
                 {
                     self.const_struct_fields[dest_local] = Some(fields);
@@ -10970,6 +10984,7 @@ impl<'a> Lowering<'a> {
                 array_type_id: None,
                 rust_vec: None,
                 list_root: None,
+                items_owner: None,
             },
         );
         self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -11515,8 +11530,16 @@ impl<'a> Lowering<'a> {
                     // `local_var` by their source local and fall back
                     // to the recorded Variable for a constant operand.
                     let base_var = alias.base_var.clone();
-                    let arr = self.realias_operand(alias.base_local, alias.base_var);
+                    let mut arr = self.realias_operand(alias.base_local, alias.base_var);
                     let idx = self.realias_operand(alias.index_local, alias.index_var);
+                    // The read already used `ll_items` (`block`). Preferring
+                    // the wrapper local here would cast `BytesArray` to
+                    // `[str]` without that field (`ll_setitem_fast`).
+                    if let Some(owner) = alias.items_owner
+                        && alias.base_local.is_some()
+                    {
+                        arr = self.emit_string_array_items_read(bb_id, arr, owner);
+                    }
                     if let Some(kind) = alias.rust_vec {
                         let op = OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -14690,17 +14713,14 @@ impl<'a> Lowering<'a> {
                 if let Some(seq) = self.item_seq_of_place(&place) {
                     return Ok((None, self.item_seq_len(mir_bb, seq)?));
                 }
-                // A string-list items view is one word — the `GcArray` header
-                // — so `__len` over it is `ll_fixed_length` / `arraylen_gc`,
-                // the CAPACITY.  `ll_length` reads the list's own `l.length`
-                // (`rlist.py:365-366`), which the fold recorded; answer with
-                // that, and keep the two apart exactly as upstream does.
-                if let Some((_, logical_len)) = self
-                    .string_array_view_locals
-                    .iter()
-                    .find(|(local, _)| place_references_local(&place, *local))
-                {
-                    return Ok((None, logical_len.clone()));
+                // A string-list or numeric-list items view is one word — the
+                // `GcArray` header — so `__len` over it is `ll_fixed_length`
+                // / `arraylen_gc`, the CAPACITY.  `ll_length` reads the
+                // list's own `l.length` (`ll_length`), which the fold
+                // recorded; answer with that, and keep the two apart
+                // exactly as upstream does.
+                if let Some(logical_len) = self.array_view_logical_len_for_place(&place) {
+                    return Ok((None, logical_len));
                 }
                 let len_leaf = if self
                     .string_byte_view_locals
@@ -16237,6 +16257,11 @@ impl<'a> Lowering<'a> {
             .map(|id| remap.get(&id).map(Variable::id).unwrap_or(id))
             .collect();
         for (_, var) in &mut self.string_array_view_locals {
+            if let Some(copy) = remap.get(&var.id()) {
+                *var = copy.clone();
+            }
+        }
+        for (_, var) in &mut self.numeric_array_view_locals {
             if let Some(copy) = remap.get(&var.id()) {
                 *var = copy.clone();
             }
@@ -19795,18 +19820,16 @@ impl<'a> Lowering<'a> {
                     } else {
                         base
                     };
-                    // `kwargs_at`'s `items[i]` is `ll_getitem_fast` on a list
+                    // An object-pointer index is `ll_getitem_fast` on a list
                     // of `PyObject`. That slice arrives as a classdef-less
                     // instance, and `getitem_SomeInstance` rewrites the
                     // index to `getattr("__getitem__")`. `[PyObject]` is
                     // the spelling `project_struct_field_type` projects to
-                    // `SomeList`. Other object-pointer indexes keep the
-                    // receiver their signature seeded: casting those makes
-                    // `len_SomeInstance` look up `__len__` on the list
-                    // (`call_function_impl_result`'s `args.len()`).
+                    // `SomeList` (`rtyper_makerepr`). The ARRAY identity
+                    // already names that list; every graph with this type
+                    // takes the same path.
                     let base = if !string_byte_view
                         && array_type_id.as_deref() == Some(OBJECT_REF_GCARRAY_TYPE_ID)
-                        && self.graph.name.contains("kwargsdict::")
                     {
                         self.narrow_value_to_instance_root(
                             bb_id,
@@ -24813,6 +24836,7 @@ impl<'a> Lowering<'a> {
                             array_type_id,
                             rust_vec: rust_vec_header,
                             list_root: None,
+                            items_owner: string_index_owner,
                         },
                     );
                     // This intercept returns before the generic call-result
@@ -25040,6 +25064,7 @@ impl<'a> Lowering<'a> {
                             array_type_id: Some(array_type_id),
                             rust_vec: None,
                             list_root: None,
+                            items_owner: None,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -25099,6 +25124,7 @@ impl<'a> Lowering<'a> {
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             rust_vec: None,
                             list_root,
+                            items_owner: None,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -25158,6 +25184,7 @@ impl<'a> Lowering<'a> {
                             array_type_id: Some(array_type_id),
                             rust_vec: None,
                             list_root: None,
+                            items_owner: None,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -25919,14 +25946,27 @@ impl<'a> Lowering<'a> {
                     ));
                     // The dropped second word IS `l.length`; keep it so a
                     // `Rvalue::Len` over the view answers with it.
-                    if !self
-                        .string_array_view_locals
-                        .iter()
-                        .any(|(local, _)| *local == dest_local)
-                    {
-                        self.string_array_view_locals
-                            .push((dest_local, args[1].clone()));
-                    }
+                    self.record_string_array_view_len(dest_local, args[1].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Body-side twin of [`Self::numeric_array_slice_view_owner`]:
+                // `from_raw_parts(self.base(), self.len())` inside
+                // `IntArray` / `FloatArray` `as_slice`. The second word is
+                // `l.length` (`ll_length`).
+                if args.len() == 2
+                    && let Some(root) = self.numeric_array_view_from_raw_parts_root(&reg)
+                {
+                    let view =
+                        self.narrow_value_to_instance_root(bb_id, args[0].clone().into(), root);
+                    self.local_var[dest_local] = Some(LocalValue::One(
+                        view.as_variable()
+                            .expect("a numeric-items view stays a Variable")
+                            .clone(),
+                    ));
+                    self.record_numeric_array_view_len(dest_local, args[1].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -26445,7 +26485,9 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
                     };
-                    let len = if let Some(len_var) = fat_len {
+                    let len = if let Some(len_var) = self.array_view_logical_len_for_var(&args[0]) {
+                        len_var
+                    } else if let Some(len_var) = fat_len {
                         len_var
                     } else {
                         let len = self
@@ -26515,7 +26557,9 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
                     };
-                    let res = if let Some(len_var) = fat_len {
+                    let res = if let Some(len_var) = self.array_view_logical_len_for_var(&args[0]) {
+                        len_var
+                    } else if let Some(len_var) = fat_len {
                         len_var
                     } else {
                         // `.len()` of a declared virtualizable array is
@@ -26807,14 +26851,7 @@ impl<'a> Lowering<'a> {
                     ));
                     // Same pairing as the `from_raw_parts` fold above: the
                     // view is the header, `l.length` is its own field.
-                    if !self
-                        .string_array_view_locals
-                        .iter()
-                        .any(|(local, _)| *local == dest_local)
-                    {
-                        self.string_array_view_locals
-                            .push((dest_local, logical_len));
-                    }
+                    self.record_string_array_view_len(dest_local, logical_len);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -26825,14 +26862,15 @@ impl<'a> Lowering<'a> {
                 // is the `{ block, len }` struct, so aliasing it makes the
                 // following index `getitem_SomeInstance`. Read `block` and
                 // narrow it to `[i64]` / `[f64]`, the GcArray the
-                // unwrapped push sites write. This is not a string-items
-                // view: that local forces `Str` and answers `Rvalue::Len`
-                // with the recorded length. The live length stays the
-                // struct field (`typed_array_len_owner`).
+                // unwrapped push sites write. Record `l.length` so a
+                // length read of the view is `ll_length`, not
+                // `ll_fixed_length` of the items block.
                 if args.len() == 1
                     && let Some((owner, root)) = self.numeric_array_slice_view_owner(&reg)
                 {
                     let block = self.emit_numeric_array_items_read(bb_id, args[0].clone(), owner);
+                    let logical_len =
+                        self.emit_numeric_array_len_read(bb_id, args[0].clone(), owner);
                     let view =
                         self.narrow_value_to_instance_root(bb_id, LinkArg::Value(block), root);
                     self.local_var[dest_local] = Some(LocalValue::One(
@@ -26840,6 +26878,7 @@ impl<'a> Lowering<'a> {
                             .expect("a numeric-items view stays a Variable")
                             .clone(),
                     ));
+                    self.record_numeric_array_view_len(dest_local, logical_len);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -33896,6 +33935,71 @@ impl<'a> Lowering<'a> {
         result
     }
 
+    fn record_string_array_view_len(&mut self, dest_local: usize, logical_len: Variable) {
+        if !self
+            .string_array_view_locals
+            .iter()
+            .any(|(local, _)| *local == dest_local)
+        {
+            self.string_array_view_locals
+                .push((dest_local, logical_len));
+        }
+    }
+
+    fn record_numeric_array_view_len(&mut self, dest_local: usize, logical_len: Variable) {
+        if !self
+            .numeric_array_view_locals
+            .iter()
+            .any(|(local, _)| *local == dest_local)
+        {
+            self.numeric_array_view_locals
+                .push((dest_local, logical_len));
+        }
+    }
+
+    fn array_view_logical_len_for_place(&self, place: &Place) -> Option<Variable> {
+        self.string_array_view_locals
+            .iter()
+            .chain(self.numeric_array_view_locals.iter())
+            .find(|(local, _)| place_references_local(place, *local))
+            .map(|(_, len)| len.clone())
+    }
+
+    fn array_view_logical_len_for_var(&self, arg: &Variable) -> Option<Variable> {
+        self.string_array_view_locals
+            .iter()
+            .chain(self.numeric_array_view_locals.iter())
+            .find(|(local, _)| {
+                self.local_var
+                    .get(*local)
+                    .and_then(Option::as_ref)
+                    .and_then(|current| current.one().ok())
+                    .is_some_and(|current| current == *arg)
+            })
+            .map(|(_, len)| len.clone())
+    }
+
+    /// Body-side `from_raw_parts` of [`Self::numeric_array_slice_view_owner`].
+    fn numeric_array_view_from_raw_parts_root(&self, reg: &RegularCall) -> Option<&'static str> {
+        if !self.is_from_raw_parts_call(reg) {
+            return None;
+        }
+        if self.graph.name.ends_with("int_array::<Impl>::as_slice")
+            || self.graph.name.ends_with("int_array::<Impl>::as_mut_slice")
+        {
+            Some("[i64]")
+        } else if self.graph.name.ends_with("float_array::<Impl>::as_slice")
+            || self
+                .graph
+                .name
+                .ends_with("float_array::<Impl>::as_mut_slice")
+        {
+            Some("[f64]")
+        } else {
+            None
+        }
+    }
+
     /// `IntArray` / `FloatArray` items pointer. Same `block` field as
     /// [`Self::emit_string_array_items_read`].
     fn emit_numeric_array_items_read(
@@ -33920,6 +34024,37 @@ impl<'a> Lowering<'a> {
                     majit_ir::descr::StructId::from_canonical(canonical_owner),
                 )),
                 ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        result
+    }
+
+    /// The logical `l.length` of an `IntArray` / `FloatArray` storage
+    /// record. Upstream reads it as the list's own field (`ll_length`),
+    /// strictly apart from `ll_fixed_length` / `arraylen_gc`.
+    fn emit_numeric_array_len_read(
+        &mut self,
+        bb_id: BlockId,
+        base: Variable,
+        owner: &str,
+    ) -> Variable {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let canonical_owner = match owner {
+            "IntArray" => "int_array::IntArray",
+            "FloatArray" => "float_array::FloatArray",
+            _ => unreachable!("numeric array owner is closed"),
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("len", Some(owner.to_string())).with_owner_id(Some(
+                    majit_ir::descr::StructId::from_canonical(canonical_owner),
+                )),
+                ty: ValueType::Int,
                 pure: false,
             },
         });
@@ -64887,6 +65022,162 @@ fn arr_as_i64(val: &ArrVal) -> Option<i64> {
         ArrVal::Lit(ConstLit::UInt(n)) => i64::try_from(*n).ok(),
         _ => None,
     }
+}
+
+fn projection_is_named_field(elem: &ProjectionElem) -> bool {
+    matches!(
+        elem,
+        ProjectionElem::Tagged(payload)
+            if payload.as_object().is_some_and(|map| map.contains_key("Field"))
+    )
+}
+
+/// `local.field` or a nested field of it, without a deref in the chain.
+fn place_is_field_projection_of_local(place: &Place, dest: usize) -> bool {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return false;
+    };
+    if !projection_is_named_field(elem) {
+        return false;
+    }
+    match &inner.kind {
+        PlaceKind::Local(i) => *i as usize == dest,
+        PlaceKind::Projection(_, _) => place_is_field_projection_of_local(inner, dest),
+        _ => false,
+    }
+}
+
+enum ConstStructUse {
+    None,
+    FieldRead,
+    Other,
+}
+
+fn operand_const_struct_use(op: &Operand, dest: usize) -> ConstStructUse {
+    let (Operand::Copy(place) | Operand::Move(place)) = op else {
+        return ConstStructUse::None;
+    };
+    if place_is_field_projection_of_local(place, dest) {
+        ConstStructUse::FieldRead
+    } else if place_references_local(place, dest) {
+        ConstStructUse::Other
+    } else {
+        ConstStructUse::None
+    }
+}
+
+fn bump_const_struct_use(use_kind: ConstStructUse, fields: &mut usize, other: &mut usize) {
+    match use_kind {
+        ConstStructUse::FieldRead => *fields += 1,
+        ConstStructUse::Other => *other += 1,
+        ConstStructUse::None => {}
+    }
+}
+
+fn scan_rvalue_const_struct(rvalue: &Rvalue, dest: usize, fields: &mut usize, other: &mut usize) {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::ShallowInitBox(op, _) => {
+            bump_const_struct_use(operand_const_struct_use(op, dest), fields, other);
+        }
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            bump_const_struct_use(operand_const_struct_use(lhs, dest), fields, other);
+            bump_const_struct_use(operand_const_struct_use(rhs, dest), fields, other);
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Len(place) | Rvalue::Discriminant(place) => {
+            if place_is_field_projection_of_local(place, dest) {
+                *fields += 1;
+            } else if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                bump_const_struct_use(operand_const_struct_use(op, dest), fields, other);
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+    }
+}
+
+/// `fold_op_list` keeps any operation it cannot prove safe. Fold a
+/// const-struct local only when every use is a field read: a projected
+/// store, address-taking, or whole-value consumer leaves the aggregate.
+fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
+    if dest == 0 {
+        return false;
+    }
+    let mut fields = 0usize;
+    let mut other = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    scan_rvalue_const_struct(&rvalue, dest, &mut fields, &mut other);
+                    if matches!(place.kind, PlaceKind::Local(i) if i as usize == dest) {
+                    } else if place_is_field_projection_of_local(&place, dest)
+                        || place_references_local(&place, dest)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(assert)) => bump_const_struct_use(
+                    operand_const_struct_use(&assert.cond, dest),
+                    &mut fields,
+                    &mut other,
+                ),
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. }) => bump_const_struct_use(
+                operand_const_struct_use(&discr, dest),
+                &mut fields,
+                &mut other,
+            ),
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func {
+                    bump_const_struct_use(
+                        operand_const_struct_use(op, dest),
+                        &mut fields,
+                        &mut other,
+                    );
+                }
+                for arg in &call.args {
+                    bump_const_struct_use(
+                        operand_const_struct_use(arg, dest),
+                        &mut fields,
+                        &mut other,
+                    );
+                }
+                if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
+                } else if place_is_field_projection_of_local(&call.dest, dest)
+                    || place_references_local(&call.dest, dest)
+                {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => bump_const_struct_use(
+                operand_const_struct_use(&assert.cond, dest),
+                &mut fields,
+                &mut other,
+            ),
+            _ => {}
+        }
+    }
+    other == 0
 }
 
 /// Integer fields of a `NamedConst` whose initializer builds one
@@ -104358,5 +104649,185 @@ mod tests {
             !link_carries(&graph, field),
             "the ItemsBlock header must not replace the call; ops={ops:?}"
         );
+    }
+
+    /// `float_to_int_or_float` is `source = float_items.as_slice();
+    /// Vec::with_capacity(source.len())`. The as_slice fold used to keep
+    /// only `block` (`ll_items`); `source.len()` then became
+    /// `ll_fixed_length`. Record `l.length` (`ll_length`).
+    #[test]
+    fn float_array_slice_len_reads_logical_len() {
+        let graph = lower_object_fn("pyre_object::listobject::float_to_int_or_float");
+        let ops = graph_ops(&graph);
+        let has_len = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty: ValueType::Int, .. }
+                    if field.name == "len"
+                        && field.owner_root.as_deref() == Some("FloatArray")
+            )
+        });
+        let has_block = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "block"
+                        && field.owner_root.as_deref() == Some("FloatArray")
+            )
+        });
+        let has_arraylen = ops
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. }));
+        assert!(
+            has_len,
+            "as_slice().len() must read FloatArray.len (ll_length); ops={ops:?}"
+        );
+        assert!(
+            has_block,
+            "as_slice must read FloatArray.block (ll_items); ops={ops:?}"
+        );
+        assert!(
+            !has_arraylen,
+            "view length is ll_length, not ll_fixed_length; ops={ops:?}"
+        );
+    }
+
+    /// `[PyObject]` narrowing follows the ARRAY identity
+    /// (`SomeList.rtyper_makerepr`), not a graph-name test. `kwargs_at`
+    /// and `w_tuple_new_from_slice` share `&[PyObjectRef]`.
+    #[test]
+    fn object_array_index_narrows_from_the_array_type() {
+        for name in [
+            "pyre_object::kwargsdict::kwargs_at",
+            "pyre_object::tupleobject::w_tuple_new_from_slice",
+        ] {
+            let graph = lower_object_fn(name);
+            let ops = graph_ops(&graph);
+            assert!(
+                ops.iter()
+                    .any(|op| crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")),
+                "{name} must narrow the object-array index through [PyObject]; ops={ops:?}"
+            );
+        }
+    }
+
+    /// `fold_op_list` keeps any operation it cannot prove safe. Fold a
+    /// const-struct local only when every use is a field read.
+    #[test]
+    fn const_struct_fold_requires_field_reads_only() {
+        use majit_charon_reader::ullbc::Unstructured;
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let field_place = |i: u64, idx: u64| {
+            serde_json::json!({
+                "kind": {"Projection": [place_local(i), {"Field": [null, idx]}]},
+                "ty": ty()
+            })
+        };
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let body_of = |extra: Vec<serde_json::Value>| -> Unstructured {
+            let mut statements = vec![stmt(serde_json::json!({
+                "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
+            }))];
+            statements.extend(extra);
+            let body_json = serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 0, "locals": [local(0), local(1), local(2)]},
+                "body": [{
+                    "statements": statements,
+                    "terminator": {"kind": "Return"}
+                }]
+            });
+            serde_json::from_value(body_json).expect("fixture Unstructured parses")
+        };
+        let llbc = fixture_llbc();
+        let accepts = |body: &Unstructured, dest: usize| {
+            super::const_struct_uses_are_field_reads(&llbc, body, dest)
+        };
+
+        let reads = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(2), {"Use": [{"Copy": field_place(1, 0)}, "No"]}]
+        }))]);
+        assert!(accepts(&reads, 1), "field reads only");
+
+        let store = body_of(vec![stmt(serde_json::json!({
+            "Assign": [field_place(1, 0), {"Use": [{"Copy": place_local(2)}, "No"]}]
+        }))]);
+        assert!(!accepts(&store, 1), "projected store");
+
+        let address = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(2), {
+                "Ref": {"place": place_local(1), "kind": "Shared", "ptr_metadata": null}
+            }]
+        }))]);
+        assert!(!accepts(&address, 1), "address-taking");
+
+        let whole = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+        }))]);
+        assert!(!accepts(&whole, 1), "whole-value consumer");
+
+        assert!(
+            !accepts(&reads, 0),
+            "return place is a whole-value consumer"
+        );
+    }
+
+    /// `ll_list_ascii_setitem_fast` is `l.ascii_items[index] = item`.
+    /// The write must use `ll_items` (`block`), the same base the paired
+    /// read uses (`ll_setitem_fast`).
+    #[test]
+    fn ascii_setitem_writes_items_block() {
+        let graph = lower_object_fn("pyre_object::listobject::ll_list_ascii_setitem_fast");
+        let ops = graph_ops(&graph);
+        let write = ops.iter().find_map(|op| match &op.kind {
+            OpKind::ArrayWrite {
+                base,
+                array_type_id: Some(array_type_id),
+                ..
+            } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID => Some(base),
+            _ => None,
+        });
+        let Some(base) = write else {
+            panic!("ascii_setitem must emit setarrayitem on [str]; ops={ops:?}");
+        };
+        let producer = ops
+            .iter()
+            .find(|op| op.result.as_ref() == Some(base))
+            .unwrap_or_else(|| panic!("ArrayWrite base must be defined; ops={ops:?}"));
+        let items = if crate::model::cast_instance_root(&producer.kind) == Some("[str]") {
+            match &producer.kind {
+                OpKind::Call { args, .. } => args
+                    .first()
+                    .and_then(LinkArg::as_variable)
+                    .unwrap_or_else(|| panic!("[str] cast needs a value arg; ops={ops:?}")),
+                other => panic!("[str] narrow is a call, got {other:?}"),
+            }
+        } else {
+            base
+        };
+        let items_op = ops
+            .iter()
+            .find(|op| op.result.as_ref() == Some(items))
+            .unwrap_or_else(|| panic!("write base must be a FieldRead of block; ops={ops:?}"));
+        match &items_op.kind {
+            OpKind::FieldRead { field, .. } => {
+                assert_eq!(field.name, "block", "write base is ll_items; ops={ops:?}");
+                assert_eq!(
+                    field.owner_root.as_deref(),
+                    Some("UnicodeArray"),
+                    "ascii items live in UnicodeArray; ops={ops:?}"
+                );
+            }
+            other => panic!("write base must be FieldRead block, got {other:?}"),
+        }
     }
 }
