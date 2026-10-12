@@ -737,10 +737,17 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
         let Some(body) = fd.unstructured() else {
             continue;
         };
+        // Cleanup reached only through `on_unwind` is outside the flow
+        // graph (`forward_reachable_mask`); a drop-glue call there is
+        // not a definition this walk should chase.
+        let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
         let mut defs: HashMap<u64, Rvalue> = HashMap::new();
         let mut from_call: HashMap<u64, String> = HashMap::new();
         let mut projected: HashMap<u64, String> = HashMap::new();
-        for bb in &body.body {
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward[bb_idx] {
+                continue;
+            }
             for st in &bb.statements {
                 if let Ok(StmtKind::Assign(p, rv)) = st.stmt_kind()
                     && let Some(l) = root(&p)
@@ -765,7 +772,10 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                 from_call.insert(l, name.rsplit("::").take(2).collect::<Vec<_>>().join("::"));
             }
         }
-        for bb in &body.body {
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward[bb_idx] {
+                continue;
+            }
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
@@ -900,7 +910,15 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
         let Some(body) = fd.unstructured() else {
             continue;
         };
-        for bb in &body.body {
+        // A Call that lives only on an `on_unwind` cleanup chain is not a
+        // call-graph edge: the flow graph never carries that edge, so
+        // `strip_cleanup_blocks` dropped the block. `forward_reachable_mask`
+        // is that set without copying the body.
+        let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward[bb_idx] {
+                continue;
+            }
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
@@ -1323,5 +1341,172 @@ mod tests {
             joined.project(1, &HashSet::from([node])),
             HashSet::from([5])
         );
+    }
+
+    fn item_meta(path: &[&str]) -> serde_json::Value {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    }
+
+    /// Body whose only Call to `cleanup_only` (id 2) sits in a cleanup
+    /// block reached through `on_unwind`.
+    fn llbc_with_cleanup_only_call() -> majit_charon_reader::Llbc {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let gens = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let call_bb = |fun: u64, target: u64, on_unwind: u64, is_cleanup: bool| {
+            serde_json::json!({
+                "statements": [],
+                "is_cleanup": is_cleanup,
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
+                        "args": [],
+                        "dest": place(0)
+                    },
+                    "target": target,
+                    "on_unwind": on_unwind
+                }}}
+            })
+        };
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "holder"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span.clone(), "ty": scalar.clone()}
+                ]},
+                "body": [
+                    call_bb(1, 1, 2, false),
+                    {"statements": [], "is_cleanup": false, "terminator": {
+                        "span": span.clone(), "kind": "Return"
+                    }},
+                    call_bb(2, 3, 3, true),
+                    {"statements": [], "is_cleanup": true, "terminator": {
+                        "span": span.clone(), "kind": "UnwindResume"
+                    }}
+                ]
+            }}
+        });
+        let opaque = |id: u64, name: &str| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", name]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": "Opaque"
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [holder, opaque(1, "normal_callee"), opaque(2, "cleanup_only")],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("cleanup-call fixture parses")
+    }
+
+    /// Regular and trait-default callees of every Call terminator in `body`.
+    /// The oracle iterates every block, matching `build` before cleanup
+    /// blocks were kept.
+    fn all_block_callees(
+        llbc: &majit_charon_reader::Llbc,
+        body: &majit_charon_reader::ullbc::Unstructured,
+    ) -> HashSet<u64> {
+        use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
+        let mut entry = HashSet::new();
+        for bb in &body.body {
+            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+                continue;
+            };
+            match &call.func {
+                CallFunc::Regular(reg) => match &reg.kind {
+                    CallKind::Fun(FunId::Regular { id }) => {
+                        entry.insert(*id);
+                    }
+                    CallKind::Trait(v) => {
+                        if let Some(c) = v.get(2).and_then(|x| x.as_u64())
+                            && llbc.fn_by_id(c).and_then(|f| f.unstructured()).is_some()
+                        {
+                            entry.insert(c);
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        entry
+    }
+
+    /// A Call that exists only on the `on_unwind` cleanup chain is not a
+    /// call-graph edge, matching `strip_cleanup_blocks` of the same body.
+    #[test]
+    fn cleanup_only_call_is_not_a_call_graph_edge() {
+        use majit_charon_reader::ullbc::strip_cleanup_blocks;
+
+        let llbc = llbc_with_cleanup_only_call();
+        let cg = build(&llbc);
+        let holder = cg.callees.get(&0).expect("holder is a local fn");
+        assert!(holder.contains(&1), "forward Call to normal_callee");
+        assert!(
+            !holder.contains(&2),
+            "cleanup-only Call must not be an edge: {holder:?}"
+        );
+
+        let fd = llbc.fn_by_id(0).expect("holder decl");
+        let stripped = strip_cleanup_blocks(fd.unstructured().expect("Unstructured body"));
+        assert_eq!(
+            holder,
+            &all_block_callees(&llbc, &stripped),
+            "retained-body edges must equal strip_cleanup_blocks"
+        );
+    }
+
+    /// Every Unstructured body in pyre-object yields the same call-graph
+    /// edges as `strip_cleanup_blocks` of that body.
+    #[test]
+    fn object_ullbc_call_graph_matches_strip_cleanup_blocks() {
+        use majit_charon_reader::ullbc::strip_cleanup_blocks;
+
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-object LLBC");
+        let cg = build(&llbc);
+        for fd in llbc.iter_fun_decls() {
+            let Some(body) = fd.unstructured() else {
+                continue;
+            };
+            let stripped = strip_cleanup_blocks(body);
+            let got = cg.callees.get(&fd.def_id).cloned().unwrap_or_default();
+            let want = all_block_callees(&llbc, &stripped);
+            assert_eq!(
+                got,
+                want,
+                "call-graph edges of {} (id {}) must equal strip_cleanup_blocks",
+                fd.item_meta.name_path(),
+                fd.def_id
+            );
+        }
     }
 }

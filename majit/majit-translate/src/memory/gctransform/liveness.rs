@@ -633,7 +633,7 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
 ///
 /// Only the shapes `pin_roots(&[a, b])` lowers to are followed; anything else
 /// leaves the pinned set unread rather than guessed at.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PinSrc {
     /// `_t = [a, b, c]` -- the pinned set itself.
     Aggregate(Vec<u64>),
@@ -796,10 +796,13 @@ fn chase_handle_local(
 /// Copying one of these copies the address of the stack slot, not the GC
 /// word. `PyError::reload` is lowered as `_t = &mut err` followed by the
 /// call, and that borrow is not a read of the carrier.
-fn address_bearing_locals(blocks: &[BasicBlock]) -> HashSet<u64> {
+fn address_bearing_locals(blocks: &[BasicBlock], forward: &[bool]) -> HashSet<u64> {
     let mut defined = HashSet::new();
     let mut out = HashSet::new();
-    for blk in blocks {
+    for (b, blk) in blocks.iter().enumerate() {
+        if !is_forward(forward, b) {
+            continue;
+        }
         for st in &blk.statements {
             let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
                 continue;
@@ -965,6 +968,7 @@ fn pyerror_stale_after_collect(
     address_locals: &HashSet<u64>,
     origin: usize,
     watched: &HashSet<u64>,
+    forward: &[bool],
 ) -> HashSet<u64> {
     let Some(term) = terms.get(origin).and_then(|term| term.as_ref()) else {
         return HashSet::new();
@@ -973,7 +977,7 @@ fn pyerror_stale_after_collect(
     let mut stale_in: Vec<HashSet<u64>> = vec![HashSet::new(); n];
     let mut queued = vec![false; n];
     let mut queue = VecDeque::new();
-    for succ in successors(term) {
+    for succ in successors(term, forward) {
         let succ = succ as usize;
         if succ >= n {
             continue;
@@ -1009,7 +1013,7 @@ fn pyerror_stale_after_collect(
                 defs,
                 mut_borrow_of,
             );
-            for succ in successors(term) {
+            for succ in successors(term, forward) {
                 let succ = succ as usize;
                 if succ >= n {
                     continue;
@@ -1307,7 +1311,7 @@ struct PinHelperSummary {
 }
 
 /// One resolved call, reduced to the locals its arguments name.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct HelperCallFact {
     callee: u64,
     callee_name: String,
@@ -1353,7 +1357,11 @@ struct PinAssignIndex {
 /// A local assigned twice is not a chain worth following. Call destinations
 /// are marked assigned so a later statement does not alias them, and they are
 /// not given a [`PinSrc`]: the value came from the callee.
-fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAssignIndex {
+fn index_pin_assigns(
+    blocks: &[BasicBlock],
+    terms: &[Option<TermKind>],
+    forward: &[bool],
+) -> PinAssignIndex {
     let mut defs: HashMap<u64, PinSrc> = HashMap::new();
     let mut defined: HashSet<u64> = HashSet::new();
     // `_t = &mut _l`: a callee handed `_t` owns keeping `_l` current, the
@@ -1362,6 +1370,9 @@ fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAs
     let mut mut_borrow_of: HashMap<u64, u64> = HashMap::new();
     let mut call_dests: HashSet<u64> = HashSet::new();
     for (b, blk) in blocks.iter().enumerate() {
+        if !is_forward(forward, b) {
+            continue;
+        }
         for st in &blk.statements {
             let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
                 continue;
@@ -1873,22 +1884,24 @@ fn assigned_at_block_entry(
 
 fn helper_body_fact(
     llbc: &majit_charon_reader::Llbc,
-    fd: &majit_charon_reader::ullbc::FunDecl,
+    body: &Unstructured,
     push_roots: &HashSet<u64>,
     names: &HashMap<u64, String>,
 ) -> Option<HelperBodyFact> {
-    let body = fd.unstructured()?;
+    let forward = crate::front::mir::forward_reachable_mask(llbc, body);
     let terms: Vec<Option<TermKind>> = body.body.iter().map(|blk| blk.term(llbc).ok()).collect();
     // A terminator this reader cannot classify may be the `push_roots` that
     // disqualifies the helper, or the only pin. Either misread is worse than
-    // leaving the caller unread.
+    // leaving the caller unread. Cleanup reached only through `on_unwind`
+    // is outside the flow graph, matching `strip_cleanup_blocks`.
     if terms
         .iter()
-        .any(|term| matches!(term, None | Some(TermKind::Unknown)))
+        .enumerate()
+        .any(|(b, term)| is_forward(&forward, b) && matches!(term, None | Some(TermKind::Unknown)))
     {
         return None;
     }
-    let index = index_pin_assigns(&body.body, &terms);
+    let index = index_pin_assigns(&body.body, &terms, &forward);
     let mut has_push_roots = false;
     let mut calls = Vec::new();
     let mut pin_result_locals = HashSet::new();
@@ -1897,12 +1910,20 @@ fn helper_body_fact(
     let mut succ = vec![Vec::new(); n];
     let mut call_dests = vec![HashSet::new(); n];
     for (b, term) in terms.iter().enumerate() {
+        if !is_forward(&forward, b) {
+            continue;
+        }
         if let Some(t) = term {
+            // `Call.target` only: `on_unwind` is the `UnwindResume` stub
+            // `strip_cleanup_blocks` would have substituted.
             succ[b] = match t {
                 TermKind::Call { target, .. }
                 | TermKind::Assert { target, .. }
                 | TermKind::Drop { target, .. } => vec![*target as usize],
-                other => successors(other).into_iter().map(|s| s as usize).collect(),
+                other => successors(other, &forward)
+                    .into_iter()
+                    .map(|s| s as usize)
+                    .collect(),
             };
         }
         let Some(TermKind::Call { call, .. }) = term else {
@@ -1941,6 +1962,9 @@ fn helper_body_fact(
     }
     let mut assigns = vec![HashSet::new(); n];
     for (b, blk) in body.body.iter().enumerate() {
+        if !is_forward(&forward, b) {
+            continue;
+        }
         for st in &blk.statements {
             if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
                 && let Some(d) = bare_local(&place)
@@ -1987,7 +2011,10 @@ fn pin_helper_summaries(
         let Some(fd) = llbc.fn_by_id(id) else {
             continue;
         };
-        let Some(fact) = helper_body_fact(llbc, fd, push_roots, &cg.names) else {
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        let Some(fact) = helper_body_fact(llbc, &body, push_roots, &cg.names) else {
             continue;
         };
         bodies.insert(id, fact);
@@ -2018,7 +2045,10 @@ fn pin_helper_summaries(
                 let Some(fd) = dllbc.fn_by_id(id) else {
                     continue;
                 };
-                let Some(fact) = helper_body_fact(dllbc, fd, &push, &dcg.names) else {
+                let Some(body) = fd.unstructured() else {
+                    continue;
+                };
+                let Some(fact) = helper_body_fact(dllbc, &body, &push, &dcg.names) else {
                     continue;
                 };
                 // Only a helper whose return place is the pinned word. Importing
@@ -2062,7 +2092,20 @@ fn collecting_for_pin_summaries(cg: &super::framework::CallGraph) -> HashSet<u64
     cg.reaching(&seeds)
 }
 
-fn successors(t: &TermKind) -> Vec<u64> {
+/// True when `b` is in [`crate::front::mir::forward_reachable_mask`].
+/// An `on_unwind`-only cleanup block is not.
+fn is_forward(forward: &[bool], b: usize) -> bool {
+    forward.get(b).copied().unwrap_or(false)
+}
+
+/// CFG successors of `t` as the flow graph sees them.
+///
+/// `Call` / `Assert` / `Drop` keep `target`. `on_unwind` is kept only when
+/// that block is already forward-reachable — a normal edge also lands
+/// there, the case `strip_cleanup_blocks` left unchanged. An unwind-only
+/// cleanup is the terminal `UnwindResume` stub the stripped body had: no
+/// statements, no calls, no further successors.
+fn successors(t: &TermKind, forward: &[bool]) -> Vec<u64> {
     match t {
         TermKind::Goto { target } => vec![*target],
         TermKind::Switch { targets, .. } => match targets {
@@ -2081,7 +2124,13 @@ fn successors(t: &TermKind) -> Vec<u64> {
         }
         | TermKind::Drop {
             target, on_unwind, ..
-        } => vec![*target, *on_unwind],
+        } => {
+            let mut v = vec![*target];
+            if is_forward(forward, *on_unwind as usize) && *on_unwind != *target {
+                v.push(*on_unwind);
+            }
+            v
+        }
         _ => vec![],
     }
 }
@@ -2167,20 +2216,25 @@ pub fn scan(
 
         stats.bodies_scanned += 1;
         let n = body.body.len();
+        // Cleanup reached only through `on_unwind` is outside the flow
+        // graph. One mask per body; walks below reuse it.
+        let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
         let terms: Vec<Option<TermKind>> = body.body.iter().map(|b| b.term(llbc).ok()).collect();
-        let unparsed_terms = terms
-            .iter()
-            .any(|t| t.is_none() || matches!(t, Some(TermKind::Unknown)));
+        let unparsed_terms = terms.iter().enumerate().any(|(b, t)| {
+            is_forward(&forward, b) && (t.is_none() || matches!(t, Some(TermKind::Unknown)))
+        });
         if unparsed_terms {
             // Successors are unknown for that block, so every live set derived
             // from it is a lower bound.  Count the body; do not pretend it is
             // clean.
             stats.unparsed_terminator_bodies += 1;
         }
-        let unparsed_stmts = body.body.iter().any(|blk| {
-            blk.statements
-                .iter()
-                .any(|st| matches!(st.stmt_kind(), Err(_) | Ok(StmtKind::Unknown)))
+        let unparsed_stmts = body.body.iter().enumerate().any(|(b, blk)| {
+            is_forward(&forward, b)
+                && blk
+                    .statements
+                    .iter()
+                    .any(|st| matches!(st.stmt_kind(), Err(_) | Ok(StmtKind::Unknown)))
         });
         if unparsed_stmts {
             // `transfer_stmt` reads no uses out of either shape, so the live
@@ -2192,9 +2246,14 @@ pub fn scan(
         // still reachable from entry without them — those are the ones no
         // bracket can dominate.
         let bracket_blocks: HashSet<usize> = (0..n)
-            .filter(|&b| match &terms[b] {
-                Some(TermKind::Call { call, .. }) => opens_root_scope(&call.func, push_roots),
-                _ => false,
+            .filter(|&b| {
+                is_forward(&forward, b)
+                    && match &terms[b] {
+                        Some(TermKind::Call { call, .. }) => {
+                            opens_root_scope(&call.func, push_roots)
+                        }
+                        _ => false,
+                    }
             })
             .collect();
         // Active root-scope locals at each block entry, one sorted set per
@@ -2236,8 +2295,12 @@ pub fn scan(
                             normal.push(scope);
                         }
                         for (succ, next) in [(*target, normal), (*on_unwind, unwind)] {
-                            if (succ as usize) < n && active_at[succ as usize].insert(next) {
-                                scope_work.push(succ as usize);
+                            let s = succ as usize;
+                            // Unwind-only cleanup is the stripped body's
+                            // `UnwindResume` stub: no statements, no further
+                            // successors, so it is not entered.
+                            if s < n && is_forward(&forward, s) && active_at[s].insert(next) {
+                                scope_work.push(s);
                             }
                         }
                         continue;
@@ -2262,9 +2325,10 @@ pub fn scan(
                     }
                     _ => {}
                 }
-                for succ in successors(term) {
-                    if (succ as usize) < n && active_at[succ as usize].insert(normal.clone()) {
-                        scope_work.push(succ as usize);
+                for succ in successors(term, &forward) {
+                    let s = succ as usize;
+                    if s < n && is_forward(&forward, s) && active_at[s].insert(normal.clone()) {
+                        scope_work.push(s);
                     }
                 }
             }
@@ -2304,14 +2368,19 @@ pub fn scan(
         // The scope local a scope-closing Drop names, so the dataflow can
         // retire that guard's pins and leave an enclosing guard's alone.
         let closed_scope: Vec<Option<u64>> = (0..n)
-            .map(|b| match &terms[b] {
-                Some(TermKind::Drop { place, .. })
-                    if drop_of_root_scope(place, &root_scope_tys) =>
-                {
-                    place_local(place)
-                        .filter(|scope| active_at[b].iter().any(|a| a.contains(scope)))
+            .map(|b| {
+                if !is_forward(&forward, b) {
+                    return None;
                 }
-                _ => None,
+                match &terms[b] {
+                    Some(TermKind::Drop { place, .. })
+                        if drop_of_root_scope(place, &root_scope_tys) =>
+                    {
+                        place_local(place)
+                            .filter(|scope| active_at[b].iter().any(|a| a.contains(scope)))
+                    }
+                    _ => None,
+                }
             })
             .collect();
         let has_nested_scopes = active_at
@@ -2319,37 +2388,24 @@ pub fn scan(
             .flat_map(HashSet::iter)
             .any(|scopes| scopes.len() > 1);
         let term_closes_root_scope: Vec<bool> = (0..n)
-            .map(|b| match &terms[b] {
-                Some(TermKind::Drop { place, .. })
-                    if drop_of_root_scope(place, &root_scope_tys) =>
-                {
-                    place_local(place)
-                        .is_some_and(|scope| active_at[b].iter().any(|a| a.contains(&scope)))
+            .map(|b| {
+                if !is_forward(&forward, b) {
+                    return false;
                 }
-                _ => false,
+                match &terms[b] {
+                    Some(TermKind::Drop { place, .. })
+                        if drop_of_root_scope(place, &root_scope_tys) =>
+                    {
+                        place_local(place)
+                            .is_some_and(|scope| active_at[b].iter().any(|a| a.contains(&scope)))
+                    }
+                    _ => false,
+                }
             })
             .collect();
-        // Reachable from entry, brackets and all.  A block no path reaches
-        // has no meet to take, and a must-analysis would hand it the universe
-        // and read every root as pinned; it is also not a block whose bracket
-        // anyone runs.
-        let reachable: HashSet<usize> = {
-            let mut seen: HashSet<usize> = HashSet::new();
-            let mut work = vec![0usize];
-            while let Some(cur) = work.pop() {
-                if !seen.insert(cur) {
-                    continue;
-                }
-                if let Some(t) = &terms[cur] {
-                    for s in successors(t) {
-                        if (s as usize) < n {
-                            work.push(s as usize);
-                        }
-                    }
-                }
-            }
-            seen
-        };
+        // Reachable from entry, brackets and all. `forward_reachable_mask`
+        // is that set: `on_unwind` is not an edge.
+        let reachable: HashSet<usize> = (0..n).filter(|&b| is_forward(&forward, b)).collect();
 
         // What each pin call names.  `bracket_blocks` says a scope is open; it
         // does not say what is in it, and a scope that pins the wrong set
@@ -2362,7 +2418,7 @@ pub fn scan(
             defs,
             mut_borrow_of,
             ..
-        } = index_pin_assigns(&body.body, &terms);
+        } = index_pin_assigns(&body.body, &terms, &forward);
 
         // A body whose pinned set cannot be read is not a body with an empty
         // one: grading it would turn "not understood" into "root missing".
@@ -2392,6 +2448,9 @@ pub fn scan(
         let mut term_pin_args: Vec<HashSet<u64>> = vec![HashSet::new(); n];
         let mut term_pin_names: Vec<String> = vec![String::new(); n];
         for b in 0..n {
+            if !is_forward(&forward, b) {
+                continue;
+            }
             let Some(TermKind::Call { call, .. }) = &terms[b] else {
                 continue;
             };
@@ -2527,7 +2586,7 @@ pub fn scan(
         // `framework.py push_roots` / `pop_roots` reloads every live variable;
         // the original local is not that reloaded word.
         let pin_arg_union: HashSet<u64> = term_pin_args.iter().flatten().copied().collect();
-        let address_of_local = address_bearing_locals(&body.body);
+        let address_of_local = address_bearing_locals(&body.body, &forward);
         let pyerror_locals: HashSet<u64> = body
             .locals
             .locals
@@ -2540,8 +2599,10 @@ pub fn scan(
         // owner.  Either would let one guard's Drop release another's pins.
         // Blocks that neither pin nor close a scope need no owner.
         if (0..n).any(|b| {
-            (term_closes_root_scope[b] && (closed_scope[b].is_none() || stack_at[b].is_none()))
-                || (!term_pins[b].is_empty() && owner_at[b].is_none())
+            is_forward(&forward, b)
+                && ((term_closes_root_scope[b]
+                    && (closed_scope[b].is_none() || stack_at[b].is_none()))
+                    || (!term_pins[b].is_empty() && owner_at[b].is_none()))
         }) {
             opaque_reason.get_or_insert("scope-owner-ambiguous");
         }
@@ -2559,7 +2620,7 @@ pub fn scan(
                 continue;
             }
             if let Some(t) = &terms[b] {
-                for s in successors(t) {
+                for s in successors(t, &forward) {
                     if (s as usize) < n {
                         preds[s as usize].push(b);
                     }
@@ -2579,6 +2640,9 @@ pub fn scan(
         }
         let mut stmt_xfers: Vec<Vec<RawPinXfer>> = (0..n).map(|_| Vec::new()).collect();
         for (b, blk) in body.body.iter().enumerate() {
+            if !is_forward(&forward, b) {
+                continue;
+            }
             for st in &blk.statements {
                 match st.stmt_kind() {
                     Ok(StmtKind::Assign(place, rvalue)) => {
@@ -2829,9 +2893,12 @@ pub fn scan(
         while changed {
             changed = false;
             for b in (0..n).rev() {
+                if !is_forward(&forward, b) {
+                    continue;
+                }
                 let Some(t) = &terms[b] else { continue };
                 let mut live: HashSet<u64> = HashSet::new();
-                for s in successors(t) {
+                for s in successors(t, &forward) {
                     if let Some(sl) = live_in.get(s as usize) {
                         live.extend(sl.iter().copied());
                     }
@@ -2862,7 +2929,10 @@ pub fn scan(
         // being judged, so a local that reaches such a callee anywhere in the
         // body is in the set for every call the body makes.
         let mut movable_args: HashSet<u64> = HashSet::new();
-        for other in &body.body {
+        for (b, other) in body.body.iter().enumerate() {
+            if !is_forward(&forward, b) {
+                continue;
+            }
             let Ok(TermKind::Call { call: c2, .. }) = other.term(llbc) else {
                 continue;
             };
@@ -2902,6 +2972,9 @@ pub fn scan(
         // use the returned word, or write `let _ =` and thereby claim the kind
         // never moves.  That claim is what this checks.
         for b in 0..n {
+            if !is_forward(&forward, b) {
+                continue;
+            }
             if term_pin_args[b].is_empty() {
                 continue;
             }
@@ -2913,7 +2986,11 @@ pub fn scan(
             };
             let mut after: HashSet<u64> = HashSet::new();
             for s in [*target, *on_unwind] {
-                if let Some(sl) = live_in.get(s as usize) {
+                let s = s as usize;
+                if !is_forward(&forward, s) {
+                    continue;
+                }
+                if let Some(sl) = live_in.get(s) {
                     after.extend(sl.iter().copied());
                 }
             }
@@ -2950,6 +3027,9 @@ pub fn scan(
 
         // Now re-walk, and at every collecting Call read the live-after set.
         for (b, bb) in body.body.iter().enumerate() {
+            if !is_forward(&forward, b) {
+                continue;
+            }
             let Some(TermKind::Call {
                 call,
                 target,
@@ -2969,7 +3049,11 @@ pub fn scan(
             }
             let mut after: HashSet<u64> = HashSet::new();
             for s in [*target, *on_unwind] {
-                if let Some(sl) = live_in.get(s as usize) {
+                let s = s as usize;
+                if !is_forward(&forward, s) {
+                    continue;
+                }
+                if let Some(sl) = live_in.get(s) {
                     after.extend(sl.iter().copied());
                 }
             }
@@ -3060,6 +3144,7 @@ pub fn scan(
                         &address_of_local,
                         b,
                         &watched,
+                        &forward,
                     );
                     if !flagged.is_empty() {
                         stats.pin_arg_read_after += 1;
@@ -4494,5 +4579,207 @@ mod tests {
         let entry = assigned_at_block_entry(&assigns, &dests, &succ);
         assert!(!entry[0].contains(&4));
         assert!(entry[1].contains(&4));
+    }
+
+    /// Body whose only Call to `cleanup_only` (id 2) sits in a cleanup
+    /// block reached through `on_unwind`.
+    fn llbc_with_cleanup_only_call() -> majit_charon_reader::Llbc {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let gc_ty = serde_json::json!({"Deduplicated": 100});
+        let gens = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place =
+            |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let call_bb = |fun: u64,
+                       dest: u64,
+                       dest_ty: &serde_json::Value,
+                       target: u64,
+                       on_unwind: u64,
+                       is_cleanup: bool| {
+            serde_json::json!({
+                "statements": [],
+                "is_cleanup": is_cleanup,
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
+                        "args": [],
+                        "dest": place(dest, dest_ty)
+                    },
+                    "target": target,
+                    "on_unwind": on_unwind
+                }}}
+            })
+        };
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "holder"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span.clone(), "ty": scalar.clone()},
+                    {"index": 1, "name": "payload", "span": span.clone(), "ty": gc_ty.clone()}
+                ]},
+                "body": [
+                    call_bb(1, 0, &scalar, 1, 2, false),
+                    {"statements": [], "is_cleanup": false, "terminator": {
+                        "span": span.clone(), "kind": "Return"
+                    }},
+                    call_bb(2, 0, &scalar, 3, 3, true),
+                    {"statements": [], "is_cleanup": true, "terminator": {
+                        "span": span.clone(), "kind": "UnwindResume"
+                    }}
+                ]
+            }}
+        });
+        let opaque = |id: u64, name: &str| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", name]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": "Opaque"
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [holder, opaque(1, "normal_callee"), opaque(2, "cleanup_only")],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("cleanup-call fixture parses")
+    }
+
+    fn pin_facts(
+        fact: &HelperBodyFact,
+    ) -> (
+        bool,
+        u64,
+        HashMap<u64, PinSrc>,
+        HashSet<u64>,
+        Vec<HelperCallFact>,
+    ) {
+        (
+            fact.has_push_roots,
+            fact.arg_count,
+            fact.defs.clone(),
+            fact.pin_result_locals.clone(),
+            fact.calls.clone(),
+        )
+    }
+
+    /// A Call that exists only on the `on_unwind` cleanup chain is not a
+    /// pin/liveness fact, matching `strip_cleanup_blocks` of the same body.
+    #[test]
+    fn cleanup_only_call_is_absent_from_pin_facts_and_scan() {
+        use majit_charon_reader::ullbc::strip_cleanup_blocks;
+
+        let llbc = llbc_with_cleanup_only_call();
+        let cg = super::super::framework::build(&llbc);
+        let holder = cg.callees.get(&0).expect("holder is a local fn");
+        assert!(holder.contains(&1), "forward Call to normal_callee");
+        assert!(
+            !holder.contains(&2),
+            "cleanup-only Call must not be an edge: {holder:?}"
+        );
+
+        let fd = llbc.fn_by_id(0).expect("holder decl");
+        let body = fd.unstructured().expect("Unstructured body");
+        let stripped = strip_cleanup_blocks(fd.unstructured().expect("Unstructured body"));
+        let names = &cg.names;
+        let push = HashSet::new();
+        let retained = helper_body_fact(&llbc, &body, &push, names).expect("retained fact");
+        let stripped_fact =
+            helper_body_fact(&llbc, &stripped, &push, names).expect("stripped fact");
+        assert_eq!(
+            pin_facts(&retained),
+            pin_facts(&stripped_fact),
+            "pin facts must equal strip_cleanup_blocks"
+        );
+        assert!(
+            retained.calls.iter().all(|c| c.callee != 2),
+            "cleanup-only callee must not appear in pin facts: {:?}",
+            retained.calls.iter().map(|c| c.callee).collect::<Vec<_>>()
+        );
+
+        let mut reach = HashSet::new();
+        reach.insert(0);
+        reach.insert(1);
+        reach.insert(2);
+        let mut gc_tys = HashSet::new();
+        gc_tys.insert(100);
+        let (findings, stats) = scan(
+            &llbc,
+            &cg,
+            &reach,
+            &HashSet::new(),
+            &gc_tys,
+            &HashSet::new(),
+            &[],
+        );
+        assert_eq!(stats.unparsed_terminator_bodies, 0);
+        assert!(
+            findings.iter().all(|f| f.callee_id != 2),
+            "scan must not report the cleanup-only callee: {:?}",
+            findings
+                .iter()
+                .map(|f| (f.callee_id, &f.callee_name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Pin facts of every Unstructured body in pyre-object equal those of
+    /// `strip_cleanup_blocks` of that body. Call lists are the liveness
+    /// scan's per-body input at reasonable cost.
+    #[test]
+    fn object_ullbc_pin_facts_match_strip_cleanup_blocks() {
+        use majit_charon_reader::ullbc::strip_cleanup_blocks;
+
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-object LLBC");
+        let cg = super::super::framework::build(&llbc);
+        let push: HashSet<u64> = cg
+            .names
+            .iter()
+            .filter(|(_, n)| n.ends_with("gc_roots::push_roots"))
+            .map(|(&id, _)| id)
+            .collect();
+        for fd in llbc.iter_fun_decls() {
+            let Some(body) = fd.unstructured() else {
+                continue;
+            };
+            let stripped = strip_cleanup_blocks(fd.unstructured().expect("Unstructured body"));
+            let retained = helper_body_fact(&llbc, &body, &push, &cg.names);
+            let stripped_fact = helper_body_fact(&llbc, &stripped, &push, &cg.names);
+            match (retained, stripped_fact) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    assert_eq!(
+                        pin_facts(&a),
+                        pin_facts(&b),
+                        "pin facts of {} (id {}) must equal strip_cleanup_blocks",
+                        fd.item_meta.name_path(),
+                        fd.def_id
+                    );
+                }
+                (a, b) => panic!(
+                    "pin-fact presence of {} (id {}) diverged from strip_cleanup_blocks: retained={} stripped={}",
+                    fd.item_meta.name_path(),
+                    fd.def_id,
+                    a.is_some(),
+                    b.is_some()
+                ),
+            }
+        }
     }
 }
