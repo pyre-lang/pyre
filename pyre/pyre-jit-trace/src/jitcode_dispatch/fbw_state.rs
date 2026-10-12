@@ -1708,7 +1708,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
             || stack[at].body_completed
             || fbw_store_journal_len() != 0
             || FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) != 0
-            || FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) != 0
+            || fbw_cell_store_effect_len() != 0
             || fbw_has_unjournaled_effect()
         {
             return None;
@@ -1744,7 +1744,7 @@ pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usiz
             && !stack[at].body_effect_since_consume
             && fbw_store_journal_len() == 0
             && FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) == 0
-            && FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) == 0
+            && fbw_cell_store_effect_len() == 0
             && !fbw_has_unjournaled_effect()
     })
 }
@@ -1784,7 +1784,7 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
     fbw_foriter_body_effect_since_consume()
         || fbw_store_journal_len() != 0
         || FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) != 0
-        || FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) != 0
+        || fbw_cell_store_effect_len() != 0
 }
 
 /// Take the in-flight FOR_ITER continuation for delivery on a trace abort
@@ -1992,7 +1992,7 @@ pub fn fbw_foriter_inflight_take(
     };
     let store_len = fbw_store_journal_len();
     let append_len = FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len());
-    let cell_store_len = FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len());
+    let cell_store_len = fbw_cell_store_effect_len();
     let unjournaled = fbw_has_unjournaled_effect();
     // A rolled-back namespace binding the delivery cannot re-apply: the
     // reposition runs the FOR_ITER body, not the region ahead of it, so a
@@ -2741,6 +2741,18 @@ pub(crate) fn fbw_store_journal_rollback() {
 }
 
 /// Current journal length (commit-point diagnostics).
+/// The cell-store journal entries that are executed effects: every entry
+/// but a store into an object the walk allocated
+/// ([`fbw_gc_store_journal_push_fresh`]), which no replay can observe.
+fn fbw_cell_store_effect_len() -> usize {
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        j.borrow()
+            .iter()
+            .filter(|entry| !matches!(entry, FbwCellStore::Gc { counted: false, .. }))
+            .count()
+    })
+}
+
 pub(crate) fn fbw_store_journal_len() -> usize {
     FBW_STORE_JOURNAL.with(|j| j.borrow().len())
 }
@@ -2749,12 +2761,13 @@ pub(crate) fn fbw_store_journal_len() -> usize {
 /// `(stores, appends, cell_stores)`.  Read at the walk-end epilogue before the
 /// commit/rollback, their sum is the number of executed effects
 /// [`fbw_store_journal_rollback`] is about to undo.  The traceback journal is
-/// absent because its push bumps nothing.
+/// absent because its push bumps nothing, and so is a store into an object
+/// the walk allocated ([`fbw_gc_store_journal_push_fresh`]).
 pub(crate) fn fbw_journaled_effect_lens() -> (usize, usize, usize) {
     (
         fbw_store_journal_len(),
         FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()),
-        FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()),
+        fbw_cell_store_effect_len(),
     )
 }
 
