@@ -1093,8 +1093,12 @@ pub(crate) fn fbw_gc_store_journal_push(
     fbw_bump_executed_effect("gc_store_journal");
 }
 
-/// [`fbw_gc_store_journal_push`] for an object the walk allocated: the same
-/// undo entry, off the executed-effect odometer.
+/// [`fbw_gc_store_journal_push`] for an object the walk allocated.  The entry
+/// exists for the descent cut alone ([`fbw_gc_store_journal_cut`], the mark
+/// rewind): the residual that replaces a cut descent re-executes the store
+/// against the object as it stood before the descent.  The whole-walk
+/// rollback skips it, and it stays off the executed-effect odometer and out
+/// of the journal-presence checks, as a store that was never journaled.
 pub(crate) fn fbw_gc_store_journal_push_fresh(
     obj: pyre_object::PyObjectRef,
     offset: usize,
@@ -2684,6 +2688,13 @@ pub(crate) fn fbw_store_journal_rollback() {
     FBW_CELL_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some(entry) = entries.pop() {
+            // A store into an object the walk allocated stands: the object
+            // is either unreachable or was handed to executed code, which
+            // keeps the initialized object it was given.  Only a descent cut
+            // ([`fbw_gc_store_journal_cut`]) puts such a store back.
+            if matches!(entry, FbwCellStore::Gc { counted: false, .. }) {
+                continue;
+            }
             undo_cell_store_entry(entry);
         }
     });
@@ -2740,10 +2751,9 @@ pub(crate) fn fbw_store_journal_rollback() {
     });
 }
 
-/// Current journal length (commit-point diagnostics).
-/// The cell-store journal entries that are executed effects: every entry
-/// but a store into an object the walk allocated
-/// ([`fbw_gc_store_journal_push_fresh`]), which no replay can observe.
+/// The cell-store journal entries the whole-walk rollback undoes: every
+/// entry but a store into an object the walk allocated
+/// ([`fbw_gc_store_journal_push_fresh`]).
 fn fbw_cell_store_effect_len() -> usize {
     FBW_CELL_STORE_JOURNAL.with(|j| {
         j.borrow()
@@ -2753,6 +2763,7 @@ fn fbw_cell_store_effect_len() -> usize {
     })
 }
 
+/// Current journal length (commit-point diagnostics).
 pub(crate) fn fbw_store_journal_len() -> usize {
     FBW_STORE_JOURNAL.with(|j| j.borrow().len())
 }

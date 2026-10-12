@@ -159,12 +159,11 @@ fn walker_execute_gc_store<Sym: WalkSym>(
 
 /// Journal an executed store into an object this walk allocated.
 ///
-/// The walk-end rollback has nothing to restore in an allocation it
-/// abandons, but a cut does: a descent that declines after storing into a
-/// block allocated before it hands the call to a residual, which executes
-/// the same body against that block ([`fbw_gc_store_journal_cut`]).  The
-/// entry stays off the executed-effect odometer, since nothing outside the
-/// walk observes the store.
+/// The walk-end rollback leaves such a store in place, but a cut does not:
+/// a descent that declines after storing into a block allocated before it
+/// hands the call to a residual, which executes the same body against that
+/// block ([`fbw_gc_store_journal_cut`]).  The entry stays off the
+/// executed-effect odometer, as these stores were before they had an entry.
 fn walker_journal_fresh_gc_store<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     obj_ptr: i64,
@@ -1266,12 +1265,13 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
         //
         // A box this walk allocated (`heapcache.new`'s HF_SEEN_ALLOCATION,
         // set by `new/d>r` and `new_with_vtable/d>r` right after
-        // `execute_new_allocation` hands back a real, zeroed object) is held
-        // by nothing outside the walk, so a non-commit rollback has nothing
-        // to restore for it — the abandoned allocation goes with it.  A cut
-        // still has: [`walker_journal_fresh_gc_store`].  A store into a
-        // pre-existing object is observable, so [`walker_execute_gc_store`]
-        // journals what it displaces.
+        // `execute_new_allocation` hands back a real, zeroed object) keeps
+        // its executed stores through a non-commit rollback: the object is
+        // abandoned with the walk, or was handed to executed code that keeps
+        // it as initialized.  A cut puts the store back for the residual
+        // that re-executes it: [`walker_journal_fresh_gc_store`].  A store
+        // into a pre-existing object is one the replay re-applies, so
+        // [`walker_execute_gc_store`] journals what it displaces.
         if ctx.trace_ctx.heap_cache().saw_allocation(obj) {
             if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj)
                 && let Some(value) = ctx.trace_ctx.box_value(valuebox)
