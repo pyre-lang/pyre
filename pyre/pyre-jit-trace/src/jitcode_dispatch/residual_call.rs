@@ -508,6 +508,22 @@ pub(crate) fn reset_single_frame_blackhole() {
     });
 }
 
+/// Discard a staged abort that will not be adopted: the latched image and
+/// the session's coordinate claim together.
+///
+/// `claim_abort_coordinate` is one-shot. Dropping only the image leaves
+/// `WalkSession::abort_in_subwalk` set, so a later abort in the same walk
+/// cannot latch and falls back to entry replay. `convert_and_run_from_pyjitpl`
+/// (`blackhole.py`) never replays; the claim has to die with the image.
+pub(crate) fn discard_staged_abort(session: &std::cell::RefCell<WalkSession>) {
+    reset_single_frame_blackhole();
+    session.borrow_mut().abort_in_subwalk = false;
+    census_record("DiscardStagedAbort");
+    if fbw_debug_abort_enabled() {
+        eprintln!("[discard-staged-abort] image+claim");
+    }
+}
+
 /// Name each decline under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_
 /// miframe`'s `s2dbg!` and `try_adopt_multi_frame_blackhole`'s `mfdbg!` name
 /// theirs: an unlatched abort and a latch that was never reached both end in the
@@ -859,9 +875,9 @@ fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
     resume_pc: usize,
 ) {
     if ctx.fbw_mode.inline_subwalk {
-        // This is a new unwind, so a retained image from a recovered sub-walk
-        // must not replace its coordinate.
-        reset_single_frame_blackhole();
+        // This is a new unwind, so a retained image and claim from a
+        // recovered sub-walk must not replace its coordinate.
+        discard_staged_abort(ctx.session);
         let _ = latch_abort_blackhole(ctx, resume_pc, "force-qmut");
     } else if ctx.vstack_valid && !ctx.trace_ctx.is_bridge_trace {
         fbw_qmut_abort_stack_latch(
@@ -926,8 +942,15 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
         };
         let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
         if frame_reg == u16::MAX {
-            latchdbg!("origin={origin} pf-frame-reg-none");
-            return false;
+            // Codeless continuation (`ctor_continuation`, `OperatorTail`):
+            // `PyJitCode::from_core_degenerate` leaves `portal_frame_reg` at
+            // `u16::MAX`. Skip PyFrame / virtualizable validation; keep the
+            // MIFrame so `_setup_return_value_r` (`blackhole.py`) lands the
+            // callee return in this level. `convert_and_run_from_pyjitpl`
+            // copies every framestack level, including one without a
+            // virtualizable.
+            latchdbg!("origin={origin} pf-codeless-continuation index={index}");
+            continue;
         }
         let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
             latchdbg!(
@@ -960,6 +983,10 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             return false;
         }
         seen.push(frame_ptr);
+    }
+    if seen.is_empty() {
+        latchdbg!("origin={origin} pf-all-codeless");
+        return false;
     }
     true
 }
@@ -1391,8 +1418,10 @@ fn build_parent_miframe<Sym: WalkSym>(
 }
 
 /// `descr_call` / operator tails: jitcode and resume pc only, no live banks.
-/// `ctor_continuation` keeps the instance in `INSTANCE_REG`; operator tails
-/// have nothing live (`get_list_of_active_boxes(in_a_call=True)`).
+/// `ctor_continuation` keeps the instance in `INSTANCE_REG`. Operator tails
+/// stamp `boxes[0]` into r0: a post-return guard carries the dunder result
+/// already there, and `_setup_return_value_r` still writes that slot after
+/// an in-dunder abort.
 fn build_codeless_continuation_parent<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     parent: &InlineParentFrame,
@@ -1443,6 +1472,79 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
         miframe.ref_regs[color] = Some(OpRef::const_ptr(gc));
     }
     Some(miframe)
+}
+
+/// Latch caller + operator tail after the dunder has already returned.
+///
+/// `_inline_frame` has dropped, so the session framestack no longer holds
+/// the tail. The convert image is the same one a post-return guard
+/// snapshots: the paused caller plus the tail with the returned box in r0.
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) continues in the tail,
+/// which runs the operator's post-call check and never re-enters the dunder.
+pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    caller: &InlineParentFrame,
+    tail: crate::operator_continuation::OperatorTail,
+    result: OpRef,
+) -> bool {
+    let origin = "operator-tail-return";
+    let Some(caller_mf) = build_parent_miframe(ctx, caller, origin, 0) else {
+        latchdbg!("origin={origin} caller");
+        return false;
+    };
+    let Some(mut tail_parent) = super::operator_continuation_parent_frame(tail) else {
+        latchdbg!("origin={origin} tail-parent");
+        return false;
+    };
+    let stamped = match ctx.trace_ctx.concrete_of_opref(result) {
+        Some(majit_ir::Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => {
+            OpRef::const_ptr(gc)
+        }
+        Some(majit_ir::Value::Int(i)) => {
+            let boxed = pyre_object::w_int_new(i);
+            OpRef::const_ptr(majit_ir::GcRef(boxed as usize))
+        }
+        _ => {
+            latchdbg!("origin={origin} result-concrete");
+            return false;
+        }
+    };
+    tail_parent.boxes = vec![stamped];
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(tail_parent.jitcode_index as i32)
+    else {
+        latchdbg!("origin={origin} tail-pjc");
+        return false;
+    };
+    let Some(tail_mf) = build_codeless_continuation_parent(ctx, &tail_parent, &pjc, origin, 1)
+    else {
+        latchdbg!("origin={origin} tail-miframe");
+        return false;
+    };
+    let mut framestack = majit_metainterp::MIFrameStack::empty();
+    framestack.push(caller_mf);
+    framestack.push(tail_mf);
+    if !multi_frame_blackhole_preflight(ctx, &framestack, origin) {
+        return false;
+    }
+    let last_exc_value = match ctx.last_exc_value_concrete() {
+        ConcreteValue::Ref(value) => value as i64,
+        _ => 0,
+    };
+    let mirror_stack = capture_vstack_mirror_image(ctx, origin);
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+            framestack,
+            last_exc_value,
+            raising_exception: false,
+            mirror_stack,
+            origin,
+        });
+    });
+    census_record("OperatorTailReturnLatched");
+    if fbw_debug_abort_enabled() {
+        eprintln!("[operator-tail-return-latched] tail={}", tail.name());
+    }
+    true
 }
 
 fn copy_captured_parent_blackhole<Sym: WalkSym>(

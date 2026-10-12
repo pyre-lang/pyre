@@ -3241,6 +3241,58 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     Ok(())
 }
 
+/// A post-return guard on an inlined operator dunder's result.
+///
+/// `descroperation.py` checks the box AFTER the call, in the caller
+/// level (`format` `isinstance_w`, `len` `_check_len_result`, `is_true`
+/// bool-ness). The compiled pin must resume in `OperatorTail` with the
+/// result as the tail's pending return (`_setup_return_value_r`), not at
+/// the caller's CALL / FORMAT_WITH_SPEC `op.pc` — that coordinate re-runs
+/// the dunder. Every guard on the dunder result before the destination
+/// write goes through this helper.
+pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    tail: crate::operator_continuation::OperatorTail,
+    caller: &InlineParentFrame,
+    result: OpRef,
+    opcode: OpCode,
+    args: &[OpRef],
+) -> Result<(), DispatchError> {
+    let subject = args.first().copied();
+    if subject.is_some_and(|arg| arg.is_constant()) {
+        if opcode == OpCode::GuardClass
+            && let Some(subject) = subject
+        {
+            ctx.trace_ctx.heap_cache_mut().class_now_known(subject);
+        }
+        return Ok(());
+    }
+    stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
+    ctx.trace_ctx.record_guard(opcode, args, 0);
+    if opcode == OpCode::GuardClass
+        && let Some(subject) = subject
+    {
+        ctx.trace_ctx.heap_cache_mut().class_now_known(subject);
+    }
+    census_record("OperatorTailResultGuard");
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[operator-tail-result-guard] tail={} opcode={opcode:?}",
+            tail.name()
+        );
+    }
+    let mut tail_frame = super::operator_continuation_parent_frame(tail)
+        .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
+    tail_frame.boxes = vec![result];
+    walker_capture_transparent_helper_snapshot(
+        ctx,
+        op_pc,
+        vec![caller.clone(), tail_frame],
+        GuardStampTarget::LastOp,
+    )
+}
+
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
 /// (top/innermost) frame built from the live sub-walk register banks, plus the
 /// pre-computed paused caller frame(s) on the walk framestack. Frame
