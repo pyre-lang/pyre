@@ -4594,15 +4594,16 @@ impl Backend for DynasmBackend {
         fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
-        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
-        // llmodel.py `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
-        // write barrier is implied by the framework GC transformer around the
-        // ref store, identical to the array ref setters. The blackhole has no
-        // inline TRACK_YOUNG_PTRS test, so use the managed-guarded
-        // flag-checking barrier (see bh_setarrayitem_gc_r). Without it, a
-        // young value stored into an old managed struct is not remembered and
-        // the next minor collection can free it while still referenced.
+        // llmodel.py `bh_setfield_gc_r` → `write_ref_at_mem`: the write
+        // barrier is implied by the framework GC transformer around the ref
+        // store (`transform_generic_set`, before the bare store), identical
+        // to the array ref setters. The blackhole has no inline
+        // TRACK_YOUNG_PTRS test, so use the managed-guarded flag-checking
+        // barrier (see bh_setarrayitem_gc_r). Without it, a young value
+        // stored into an old managed struct is not remembered and the next
+        // minor collection can free it while still referenced.
         dynasm_write_barrier_if_managed(struct_ptr as u64);
+        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
     }
 
     /// llmodel.py bh_getarrayitem_gc_i: ofs=base_size, size+sign
@@ -4682,17 +4683,17 @@ impl Backend for DynasmBackend {
     ) {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
-        unsafe {
-            *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
-        }
-        // llmodel.py `bh_setarrayitem_gc_r`: store + the generic
-        // flag-checking `do_write_barrier`. The blackhole has no inline
+        // llmodel.py `bh_setarrayitem_gc_r`: the generic flag-checking
+        // barrier, then the store. The blackhole has no inline
         // TRACK_YOUNG_PTRS test ahead of the call, so it must not reuse the
         // JIT-only `jit_remember_young_pointer_from_array` (which assumes the
         // flag was already tested and would unconditionally remember an
         // untracked target — e.g. a reconstructed frame array outside the GC
         // heap — corrupting the remembered set).
         dynasm_write_barrier_if_managed(array_ptr as u64);
+        unsafe {
+            *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
+        }
     }
 
     /// llmodel.py bh_setarrayitem_gc_f.
