@@ -8442,7 +8442,6 @@ mod tests {
             _inputargs: &[majit_ir::InputArgRc],
             _ops: &[majit_ir::OpRc],
             _original_token: &majit_backend::JitCellToken,
-            _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
             _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
         ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
             unimplemented!("RecordingGetfieldCpu::compile_bridge")

@@ -299,6 +299,7 @@ fn jit_inline_ref_param_field_access_lowers_to_native_field_ops() {
     let mut top = majit_metainterp::JitCodeBuilder::new();
     let sub_idx = top.add_sub_jitcode(caller);
     top.inline_call_r_i(sub_idx, &[(0, 0)], Some(0));
+    top.void_return();
     let top = top.finish();
 
     let mut bh_insns: indexmap::IndexMap<String, u8> =
@@ -427,6 +428,7 @@ fn jit_inline_void_ref_param_field_swap_lowers_to_native_field_ops() {
     let mut top = majit_metainterp::JitCodeBuilder::new();
     let sub_idx = top.add_sub_jitcode(caller);
     top.inline_call_r_v(sub_idx, &[(0, 0)], None);
+    top.void_return();
     let top = top.finish();
 
     let mut bh_insns: indexmap::IndexMap<String, u8> =
@@ -692,6 +694,7 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     jc_builder.load_const_f_value(0, f64::to_bits(3.5) as i64);
     let sub_idx = jc_builder.add_sub_jitcode(sub_jitcode);
     jc_builder.inline_call_irf_i(sub_idx, &[(0, 0)], &[(0, 0)], &[(0, 0)], Some(1));
+    jc_builder.void_return();
     let jitcode = jc_builder.finish();
 
     // Canonical `inline_call_irf_i/dIRF>i` (`bhimpl_inline_call_irf_i`).
