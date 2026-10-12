@@ -184,10 +184,7 @@ pub extern "C" fn bh_format_tail(w_res: pyre_object::PyObjectRef) -> i64 {
     if !w_res.is_null() && unsafe { pyre_object::is_str(w_res) } {
         return w_res as i64;
     }
-    let err = pyre_interpreter::PyError::type_error(format!(
-        "__format__ must return a str, not {}",
-        pyre_interpreter::type_methods::arg_type_name(w_res),
-    ));
+    let err = pyre_interpreter::type_methods::format_must_return_str(w_res);
     use majit_ir::helper_fnaddr::ResidualError;
     err.publish_residual();
     0

@@ -3927,6 +3927,9 @@ fn try_adopt_multi_frame_blackhole(
     // `enter`: publish `ec.topframeref = <this level's frame>` before it runs.
     let set_topframeref = |frame_ptr: i64| {
         if frame_ptr == 0 {
+            // Codeless continuation: no PyFrame to publish. `finish_level`
+            // already restored `topframeref` to the leaving callee's
+            // `f_backref` (`executioncontext.py leave`).
             return;
         }
         unsafe {
@@ -3967,6 +3970,16 @@ fn try_adopt_multi_frame_blackhole(
         // they were taken, reversed. A codeless continuation has no PyFrame
         // and was never charged.
         if frame_ptr != 0 {
+            // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
+            // before the caller's residuals run. Entering the next real frame
+            // republishes it through `set_topframeref`; a codeless
+            // continuation's enter is a no-op, so the tail would otherwise
+            // keep the finished callee published. A Len tail that then calls
+            // `__index__` (or a Format tail that raises) would see that
+            // callee as `f_back`.
+            unsafe {
+                (*ec).topframeref = (*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref;
+            }
             level_recursion.borrow_mut().pop();
         }
     };
