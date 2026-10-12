@@ -4014,8 +4014,15 @@ fn build_ll_newlist_helper_graph_inner(
 ///
 /// The `check`/`not check` shape is realised per element type: a Char/UniChar
 /// is cast to int then `int_is_true` (matching `not ord(item)`); an integer
-/// is tested with `<prefix>is_true` directly (`not widen(item)`); a Float with
-/// `float_is_true`; a Ptr with `ptr_nonzero`.  Every arm produces the
+/// is tested with `<prefix>is_true` directly (`not widen(item)`); a Ptr with
+/// `ptr_nonzero`.  `_ll_zero_or_null` on a Float/SingleFloat Primitive is
+/// also `not item` (`float_is_true`), so `-0.0` would clear to `+0.0`; these
+/// graphs lower Rust `vec![x; n]` / `[x; N]`, which store the fill's bit
+/// pattern, so the Float arm compares bits (`convert_float_bytes_to_longlong`)
+/// and only `+0.0` takes the cleared arm.  SingleFloat widens first with
+/// `cast_singlefloat_to_float` (`bhimpl_cast_singlefloat_to_float`), which
+/// keeps `-0.0`, then uses the same bit compare.  LongFloat has no Rust
+/// source type and stays on `float_is_true`.  Every arm produces the
 /// "nonzero" boolean, which is then negated with `bool_not` to yield the
 /// "zero/null" result the caller branches on.
 fn emit_zero_or_null(block: &BlockRef, item_lltype: &LowLevelType, item: Hlvalue) -> Variable {
@@ -4038,9 +4045,37 @@ fn emit_zero_or_null(block: &BlockRef, item_lltype: &LowLevelType, item: Hlvalue
             ));
             ("int_is_true", Hlvalue::Variable(as_int))
         }
-        LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
-            ("float_is_true", item)
+        LowLevelType::Float => {
+            // `_ll_zero_or_null` (`rlist.py`): Float is a Primitive, so
+            // `not item`. IEEE `not -0.0` is true and would take the
+            // cleared arm (`+0.0`); compare bits so only `+0.0` clears.
+            let bits = variable_with_lltype("check", LowLevelType::SignedLongLong);
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "convert_float_bytes_to_longlong",
+                vec![item],
+                Hlvalue::Variable(bits.clone()),
+            ));
+            ("llong_is_true", Hlvalue::Variable(bits))
         }
+        LowLevelType::SingleFloat => {
+            // Same bit test as Float. `cast_singlefloat_to_float`
+            // (`bhimpl_cast_singlefloat_to_float`) widens f32→f64 and
+            // keeps `-0.0`; rtyper has no single-float bits llop.
+            let as_float = variable_with_lltype("check", LowLevelType::Float);
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "cast_singlefloat_to_float",
+                vec![item],
+                Hlvalue::Variable(as_float.clone()),
+            ));
+            let bits = variable_with_lltype("check", LowLevelType::SignedLongLong);
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "convert_float_bytes_to_longlong",
+                vec![Hlvalue::Variable(as_float)],
+                Hlvalue::Variable(bits.clone()),
+            ));
+            ("llong_is_true", Hlvalue::Variable(bits))
+        }
+        LowLevelType::LongFloat => ("float_is_true", item),
         LowLevelType::Ptr(_) | LowLevelType::Address => ("ptr_nonzero", item),
         // Signed/Unsigned/LongLong/etc.: `not widen(item)` — the widened
         // integer is-true test.  `int_is_true` covers the machine-word ints
@@ -10797,7 +10832,8 @@ mod tests {
     }
 
     /// Char-element zero test uses `cast_char_to_int` then `int_is_true`;
-    /// UniChar uses `cast_unichar_to_int`; Float uses `float_is_true`.
+    /// UniChar uses `cast_unichar_to_int`; Float compares bits;
+    /// SingleFloat widens then compares bits.
     #[test]
     fn emit_zero_or_null_op_chain_per_element_type() {
         let probe = |lltype: LowLevelType| -> Vec<String> {
@@ -10821,12 +10857,77 @@ mod tests {
         );
         assert_eq!(
             probe(LowLevelType::Float),
+            vec![
+                "convert_float_bytes_to_longlong",
+                "llong_is_true",
+                "bool_not"
+            ]
+        );
+        assert_eq!(
+            probe(LowLevelType::SingleFloat),
+            vec![
+                "cast_singlefloat_to_float",
+                "convert_float_bytes_to_longlong",
+                "llong_is_true",
+                "bool_not"
+            ]
+        );
+        assert_eq!(
+            probe(LowLevelType::LongFloat),
             vec!["float_is_true", "bool_not"]
         );
         assert_eq!(probe(LowLevelType::Signed), vec!["int_is_true", "bool_not"]);
         assert_eq!(
             probe(items_array_ptr_lltype(&LowLevelType::Signed)),
             vec!["ptr_nonzero", "bool_not"]
+        );
+    }
+
+    /// Fold the Float/SingleFloat `_ll_zero_or_null` chain: only `+0.0`
+    /// has bits 0 and takes the cleared arm; `-0.0` fills.
+    #[test]
+    fn emit_zero_or_null_float_neg_zero_does_not_clear() {
+        use crate::translator::rtyper::lltypesystem::opimpl::get_op_impl;
+
+        let fold_ops = |ops: &[SpaceOperation], mut current: ConstValue| -> bool {
+            for op in ops {
+                let fold_op =
+                    get_op_impl(&op.opname).unwrap_or_else(|| panic!("no fold for {}", op.opname));
+                current = fold_op(std::slice::from_ref(&current))
+                    .unwrap_or_else(|| panic!("fold {} failed", op.opname));
+            }
+            match current {
+                ConstValue::Bool(is_zero) => is_zero,
+                other => panic!("expected Bool, got {other:?}"),
+            }
+        };
+
+        let fold_float = |item: f64| -> bool {
+            let item_var = variable_with_lltype("item", LowLevelType::Float);
+            let block = Block::shared(vec![Hlvalue::Variable(item_var.clone())]);
+            emit_zero_or_null(&block, &LowLevelType::Float, Hlvalue::Variable(item_var));
+            fold_ops(&block.borrow().operations, ConstValue::float(item))
+        };
+        assert!(fold_float(0.0), "+0.0 takes the cleared arm");
+        assert!(!fold_float(-0.0), "-0.0 does not take the cleared arm");
+
+        let fold_single = |item: f32| -> bool {
+            let item_var = variable_with_lltype("item", LowLevelType::SingleFloat);
+            let block = Block::shared(vec![Hlvalue::Variable(item_var.clone())]);
+            emit_zero_or_null(
+                &block,
+                &LowLevelType::SingleFloat,
+                Hlvalue::Variable(item_var),
+            );
+            let ops = &block.borrow().operations;
+            assert_eq!(ops[0].opname, "cast_singlefloat_to_float");
+            // `bhimpl_cast_singlefloat_to_float`: `f32 as f64` keeps `-0.0`.
+            fold_ops(&ops[1..], ConstValue::float(item as f64))
+        };
+        assert!(fold_single(0.0), "SingleFloat +0.0 takes the cleared arm");
+        assert!(
+            !fold_single(-0.0),
+            "SingleFloat -0.0 does not take the cleared arm"
         );
     }
 }
