@@ -833,8 +833,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { #idx => { self.#fname = value as #rust_ty; } }
         })
         .collect();
-    // Skip ptr then len — compiled code does not store into a
-    // plain `[int]` (`validate_state_fields`); the Vec owns its storage.
+    // Skip ptr then len. Stores write the native buffer in place
+    // (`setarrayitem_raw_i`), so identity reds are not written back.
     let restore_array_parts: Vec<TokenStream> = arrays
         .iter()
         .map(|_| {

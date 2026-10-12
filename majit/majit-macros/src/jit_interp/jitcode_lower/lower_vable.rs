@@ -992,9 +992,14 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes `state.array[index] = expr` for array state fields.
-    /// Virtualizable arrays bail to the standard vable path. A store to a
-    /// plain `[int]` is refused at expansion (`validate_state_fields`);
-    /// a mutated loop-carried array is `[int; virt]`.
+    /// Virtualizable arrays bail to the standard vable path. A plain `[int]`
+    /// store is `setarrayitem_raw_i` off the ptr identity, the store
+    /// counterpart of [`Self::lower_state_array_read`]. `rlist.py`
+    /// `rtype_setitem` takes `dum_nocheck` when there is no IndexError
+    /// handler; majit-translate strips the bounds `Assert`
+    /// (`removeassert.py`). The store writes the native buffer in place
+    /// (`jtransform.py` `rewrite_op_setarrayitem` raw arm), so no writeback
+    /// is needed on exit or abort.
     pub(super) fn lower_state_array_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
         let assign = match expr {
@@ -1022,7 +1027,44 @@ impl<'c> Lowerer<'c> {
         if config.state_virt_arrays.contains_key(&member_name) {
             return None;
         }
-        None
+        let &array_index = config.state_arrays.get(&member_name)?;
+        // Assignment evaluates the RHS first, then the place (index).
+        let value = self.lower_value_expr(&assign.right)?;
+        if !matches!(value.kind, BindingKind::Int) {
+            return None;
+        }
+        let idx_binding = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(idx_binding.kind, BindingKind::Int) {
+            return None;
+        }
+        let idx_reg = idx_binding.reg;
+        let value_reg = value.reg;
+        // Identity reds are the `{ptr, len}` pair; this op is the
+        // `dum_nocheck` item store off the pointer.
+        let base_reg = config
+            .int_identity_base()
+            .saturating_add(config.plain_int_scalar_count())
+            .saturating_add((array_index as u16).saturating_mul(2));
+
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::StateField,
+                vec![
+                    Register::int(base_reg),
+                    Register::int(idx_reg),
+                    Register::int(value_reg),
+                ],
+                vec![],
+            ),
+            quote! {
+                let __descr_idx = __builder.add_raw_int_array_descr_signed(
+                    ::core::mem::size_of::<i64>(),
+                    true,
+                );
+                __builder.setarrayitem_raw_i(#base_reg, #idx_reg, #value_reg, __descr_idx);
+            },
+        );
+        Some(())
     }
 
     /// RPython jtransform.py `hint_force_virtualizable`.
@@ -3459,6 +3501,62 @@ mod tests {
                     || matches!(m.control, ControlFlowClass::ConditionalGuard)
             }),
             "plain [int] read must not emit a compare or guard: {:?}",
+            lowerer
+                .op_metadata
+                .iter()
+                .map(|m| format!("{:?}", m.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A plain `[int]` store is the bare `setarrayitem_raw_i` item store.
+    /// `rlist.py` `rtype_setitem` takes `dum_nocheck`; `ll_setitem_nonneg`'s
+    /// only check is `ll_assert`, which translation removes.
+    #[test]
+    fn plain_int_array_write_is_bare_setarrayitem_raw_i() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_arrays.insert("cells".into(), 0);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        lowerer.bindings.insert(
+            "v".to_string(),
+            Binding {
+                reg: 3,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: Expr = syn::parse_quote!(state.cells[i] = v);
+        lowerer
+            .lower_state_array_write(&expr)
+            .expect("plain [int] store lowers");
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("setarrayitem_raw_i"), "{emitted}");
+        assert!(
+            !emitted.contains("goto_if")
+                && !emitted.contains("UintLt")
+                && !emitted.contains("int_lt"),
+            "plain [int] store must not emit a compare or guard: {emitted}"
+        );
+        assert!(
+            !lowerer.op_metadata.iter().any(|m| {
+                matches!(m.kind, OpKind::BinopI | OpKind::GotoIfNot)
+                    || matches!(m.control, ControlFlowClass::ConditionalGuard)
+            }),
+            "plain [int] store must not emit a compare or guard: {:?}",
             lowerer
                 .op_metadata
                 .iter()

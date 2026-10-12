@@ -480,7 +480,8 @@ fn non_register_positions(method: &str) -> &'static [usize] {
         | "raw_load_i"
         | "raw_load_f"
         | "raw_store_i"
-        | "getarrayitem_raw_i" => &[3],
+        | "getarrayitem_raw_i"
+        | "setarrayitem_raw_i" => &[3],
         "getfield_gc_i" | "getfield_gc_r" | "getfield_gc_f" | "setfield_gc_i" | "setfield_gc_r"
         | "setfield_gc_f" => &[2, 3, 4],
         "new_struct" => &[1, 2, 3, 4, 5],

@@ -2156,6 +2156,26 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_raw_i dst");
     }
 
+    /// `blackhole.py` `bhimpl_setarrayitem_raw_i`: `[array_reg][index_reg][value_reg][descr]`,
+    /// `setarrayitem_raw_i/iiid`. Int-bank base (raw address).
+    /// `jtransform.py` `rewrite_op_setarrayitem` raw arm.
+    pub fn setarrayitem_raw_i(
+        &mut self,
+        array_reg: u16,
+        index_reg: u16,
+        value_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_reg(value_reg);
+        self.write_insn("setarrayitem_raw_i/iiid");
+        self.push_reg_u8(array_reg, "setarrayitem_raw_i array");
+        self.push_reg_u8(index_reg, "setarrayitem_raw_i index");
+        self.push_reg_u8(value_reg, "setarrayitem_raw_i value");
+        self.push_u16(descr_idx);
+    }
+
     /// The always-pure spelling of [`Self::getarrayitem_gc_i`], for an array
     /// whose elements never change after it is built.
     ///

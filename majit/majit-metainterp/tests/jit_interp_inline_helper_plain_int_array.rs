@@ -141,7 +141,7 @@ fn blackhole_inline_call_passes_cells_ptr_as_int_args() {
     let cpu = TestBackend::new();
     let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&[(
         "recursive_call_v/iIRFIRF",
-        34,
+        majit_metainterp::jitcode::insns::BC_RECURSIVE_CALL_VOID,
     )]);
     bh_builder.set_cpu(&cpu);
     bh_builder.setup_insns(&bh_insns);
