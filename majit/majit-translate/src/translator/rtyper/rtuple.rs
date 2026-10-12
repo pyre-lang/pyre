@@ -1151,20 +1151,6 @@ pub fn pair_tuple_int_rtype_getitem(
     r_tup.rtype_pair_getitem(hop)
 }
 
-/// Write half of [`pair_tuple_int_rtype_getitem`]. RPython has no
-/// `pairtype(TupleRepr, IntegerRepr).rtype_setitem` (`TUPLE_TYPE` is
-/// immutable); a Rust tuple field store is `setfield itemN`.
-pub fn pair_tuple_int_rtype_setitem(
-    r_tup: &dyn Repr,
-    hop: &crate::translator::rtyper::rtyper::HighLevelOp,
-) -> crate::translator::rtyper::rmodel::RTypeResult {
-    let any_r: &dyn std::any::Any = r_tup;
-    let r_tup = any_r.downcast_ref::<TupleRepr>().ok_or_else(|| {
-        TyperError::message("pair_tuple_int_rtype_setitem: receiver is not a TupleRepr")
-    })?;
-    r_tup.rtype_pair_setitem(hop)
-}
-
 /// RPython `class AbstractTupleIteratorRepr(IteratorRepr)` (rtuple.py).
 ///
 /// The generic iterator protocol (`newiter` / `rtype_next`) is kept as
@@ -1763,52 +1749,6 @@ impl TupleRepr {
         llops.convertvar(Hlvalue::Variable(v), r_item.as_ref(), r_external.as_ref())
     }
 
-    /// Write counterpart of [`Self::getitem_internal`]: `setfield` of
-    /// `itemN`. RPython has no `TupleRepr.setitem` (`TUPLE_TYPE` hints
-    /// `immutable=True`); a Rust tuple field store is this `setfield`.
-    pub fn setitem_internal(
-        &self,
-        llops: &mut LowLevelOpList,
-        v_tuple: Hlvalue,
-        index: usize,
-        v_item: Hlvalue,
-    ) -> Result<(), TyperError> {
-        let name = self.fieldnames.get(index).ok_or_else(|| {
-            TyperError::message(format!(
-                "TupleRepr.setitem_internal: index {index} out of range \
-                 (len={})",
-                self.fieldnames.len()
-            ))
-        })?;
-        let cname = Constant::with_concretetype(ConstValue::byte_str(name), LowLevelType::Void);
-        llops.genop(
-            "setfield",
-            vec![v_tuple, Hlvalue::Constant(cname), v_item],
-            GenopResult::Void,
-        );
-        Ok(())
-    }
-
-    /// Write counterpart of [`Self::getitem`]: convert the stored value
-    /// from the external item repr, then [`Self::setitem_internal`].
-    pub fn setitem(
-        &self,
-        llops: &mut LowLevelOpList,
-        v_tuple: Hlvalue,
-        index: usize,
-        v_item: Hlvalue,
-    ) -> Result<(), TyperError> {
-        let r_item = self.items_r.get(index).cloned().ok_or_else(|| {
-            TyperError::message(format!(
-                "TupleRepr.setitem: index {index} out of range (len={})",
-                self.items_r.len()
-            ))
-        })?;
-        let r_external = self.external_items_r[index].clone();
-        let v = llops.convertvar(v_item, r_external.as_ref(), r_item.as_ref())?;
-        self.setitem_internal(llops, v_tuple, index, v)
-    }
-
     /// RPython `TupleRepr.newtuple(cls, llops, r_tuple, items_v)`
     /// (rtuple.py):
     ///
@@ -2013,55 +1953,6 @@ impl TupleRepr {
         }
         let v = self.getitem(&mut hop.llops.borrow_mut(), v_tuple, normalized as usize)?;
         Ok(Some(v))
-    }
-
-    /// Write half of [`Self::rtype_pair_getitem`]: constant index, then
-    /// `setfield itemN`. RPython has no `rtype_setitem` on this pair.
-    fn rtype_pair_setitem(
-        &self,
-        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
-    ) -> crate::translator::rtyper::rmodel::RTypeResult {
-        use crate::translator::rtyper::rtyper::ConvertedTo;
-        let idx = {
-            let args_v = hop.args_v.borrow();
-            let v_index = args_v.get(1).ok_or_else(|| {
-                TyperError::message("pair(TupleRepr, IntegerRepr).rtype_setitem: missing index arg")
-            })?;
-            let Hlvalue::Constant(idx_const) = v_index else {
-                return Err(TyperError::message(
-                    "pair(TupleRepr, IntegerRepr).rtype_setitem: non-constant tuple index",
-                ));
-            };
-            let ConstValue::Int(idx) = idx_const.value else {
-                return Err(TyperError::message(format!(
-                    "pair(TupleRepr, IntegerRepr).rtype_setitem: tuple index must be Int, got {:?}",
-                    idx_const.value
-                )));
-            };
-            idx
-        };
-        let len = self.items_r.len() as i64;
-        let normalized = if idx < 0 { idx + len } else { idx };
-        if normalized < 0 || normalized >= len {
-            return Err(TyperError::message(format!(
-                "pair(TupleRepr, IntegerRepr).rtype_setitem: index {idx} out of \
-                 range (len={len})"
-            )));
-        }
-        let index = normalized as usize;
-        if hop.has_implicit_exception("IndexError") {
-            hop.exception_cannot_occur()?;
-        }
-        let r_item = self.items_r[index].clone();
-        let v_args = hop.inputargs(vec![
-            ConvertedTo::Repr(self),
-            ConvertedTo::LowLevelType(&LowLevelType::Signed),
-            ConvertedTo::Repr(r_item.as_ref()),
-        ])?;
-        let v_tuple = v_args[0].clone();
-        let v_item = v_args[2].clone();
-        self.setitem(&mut hop.llops.borrow_mut(), v_tuple, index, v_item)?;
-        Ok(None)
     }
 
     /// RPython `TupleRepr.newtuple_cached(cls, hop, items_v)`
@@ -2843,62 +2734,6 @@ mod tests {
         assert!(
             ops.ops.iter().any(|op| op.opname == "getfield"),
             "expected at least one getfield op, got {:?}",
-            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn pair_tuple_int_rtype_setitem_emits_setfield_for_constant_index() {
-        use crate::flowspace::model::SpaceOperation;
-        use crate::flowspace::operation::OpKind;
-        use crate::translator::rtyper::rint::IntegerRepr;
-        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
-        use std::cell::RefCell as StdRef;
-        let rtyper = fresh_rtyper();
-        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
-        let r_tup_arc: Arc<dyn Repr> =
-            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
-        let v_tuple = Variable::new();
-        v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
-        let v_tuple_h = Hlvalue::Variable(v_tuple);
-        let v_idx_h = Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::Int(1),
-            LowLevelType::Signed,
-        ));
-        let v_item = Variable::new();
-        v_item.set_concretetype(Some(LowLevelType::Signed));
-        let v_item_h = Hlvalue::Variable(v_item);
-        let result_var = Variable::new();
-        let spaceop = SpaceOperation::new(
-            OpKind::SetItem.opname(),
-            vec![v_tuple_h.clone(), v_idx_h.clone(), v_item_h.clone()],
-            Hlvalue::Variable(result_var),
-        );
-        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
-        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
-        hop.args_v.borrow_mut().push(v_tuple_h);
-        hop.args_s
-            .borrow_mut()
-            .push(crate::annotator::model::SomeValue::Impossible);
-        hop.args_r.borrow_mut().push(Some(r_tup_arc.clone()));
-        hop.args_v.borrow_mut().push(v_idx_h);
-        hop.args_s
-            .borrow_mut()
-            .push(crate::annotator::model::SomeValue::Impossible);
-        hop.args_r.borrow_mut().push(Some(r_int.clone()));
-        hop.args_v.borrow_mut().push(v_item_h);
-        hop.args_s
-            .borrow_mut()
-            .push(crate::annotator::model::SomeValue::Impossible);
-        hop.args_r.borrow_mut().push(Some(r_int.clone()));
-
-        let out = pair_tuple_int_rtype_setitem(r_tup_arc.as_ref(), &hop)
-            .expect("pair_tuple_int_rtype_setitem");
-        assert!(out.is_none(), "setitem is void, got {out:?}");
-        let ops = hop.llops.borrow();
-        assert!(
-            ops.ops.iter().any(|op| op.opname == "setfield"),
-            "expected at least one setfield op, got {:?}",
             ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );
     }
