@@ -10052,7 +10052,8 @@ pub(crate) fn object_getattr_miss(
                     return Ok(code);
                 }
                 "__name__" => {
-                    return Ok(w_str_new_managed(crate::function_get_name(obj)));
+                    let name = crate::function_get_name(obj).to_string();
+                    return Ok(w_str_new_managed(&name));
                 }
                 "__closure__" => {
                     let closure = crate::function_get_closure(obj);

@@ -24054,6 +24054,24 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `utf8_payload_wtf8` / `utf8_payload_bytes` are views of an
+                // rstr `STR` header (`Function.name`, `W_UnicodeObject._utf8`).
+                // Alias dest to that STR so `from_utf8_unchecked` /
+                // `as_str_unchecked` keep `SomeString` instead of a byte list.
+                if args.len() == 1 && self.is_utf8_payload_wtf8_identity(&reg) {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), false);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() == 1 && self.is_utf8_payload_bytes_identity(&reg) {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `String|str|Wtf8|Wtf8Buf::as_bytes` — the UTF-8 / WTF-8
                 // byte view of a string.  A string IS its byte sequence in
                 // the lifted value model (the immutable `rpy_string`), so
@@ -33084,6 +33102,30 @@ impl<'a> Lowering<'a> {
             return false;
         };
         fd.item_meta.name_path().rsplit("::").next() == Some("w_str_get_wtf8")
+    }
+
+    /// `utf8_payload_wtf8(*const UnicodeValueStorage) -> &Wtf8` — the STR
+    /// header is already the string value (`Utf8Str` maps to `ValueType::Str`).
+    fn is_utf8_payload_wtf8_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().rsplit("::").next() == Some("utf8_payload_wtf8")
+    }
+
+    /// `utf8_payload_bytes(*const UnicodeValueStorage) -> &[u8]` — byte view
+    /// of the same rstr `STR` header.
+    fn is_utf8_payload_bytes_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().rsplit("::").next() == Some("utf8_payload_bytes")
     }
 
     /// `String::as_bytes` / `<str>::as_bytes` / `Wtf8::as_bytes` /

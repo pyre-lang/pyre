@@ -1,4 +1,5 @@
 # pyre-check: spec-folds=make_function
+# pyre-check: requires-modules=gc
 # A function built by MAKE_FUNCTION in a hot loop reports its name through
 # the `__code__` setter's free-variable error, which reads `Function.name`
 # rather than the wrapped `__name__`. The name must be the code object's

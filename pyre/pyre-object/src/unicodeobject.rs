@@ -68,6 +68,11 @@ pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStora
     p as *mut UnicodeValueStorage
 }
 
+/// `rutf8.codepoints_in_utf8` over a whole buffer (`objspace.py` `newtext`).
+fn utf8_codepoint_len(value: &Wtf8) -> usize {
+    crate::rutf8::codepoints_in_utf8(value, 0, value.len())
+}
+
 fn alloc_raw_utf8_payload(len: usize) -> i64 {
     let Some(total) = LOWLEVEL_STR_BASE_SIZE.checked_add(len) else {
         return 0;
@@ -285,14 +290,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
     let value = alloc_utf8_payload(s.as_bytes(), false);
     let byte_len = s.len();
     // `objspace.py` `newtext` stores `rutf8.codepoints_in_utf8`.
-    // `W_UnicodeObject.is_ascii` is `_length == len(_utf8)`, so an ASCII
-    // payload's code-point length is the byte length. Non-ASCII keeps the
-    // SIMD `chars` count.
-    let char_len = if s.is_ascii() {
-        byte_len
-    } else {
-        s.chars().count()
-    };
+    let char_len = utf8_codepoint_len(Wtf8::new(s));
     crate::lltype::malloc_typed(W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
@@ -390,13 +388,8 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
 
 fn w_str_from_wtf8_ref(value: &Wtf8) -> PyObjectRef {
     let byte_len = value.len();
-    // Same length rule as `w_str_new`: `codepoints_in_utf8` equals `len`
-    // when every byte is ASCII (`W_UnicodeObject.is_ascii`).
-    let char_len = if value.as_bytes().is_ascii() {
-        byte_len
-    } else {
-        value.code_points().count()
-    };
+    // `objspace.py` `newtext` stores `rutf8.codepoints_in_utf8`.
+    let char_len = utf8_codepoint_len(value);
     let value = alloc_utf8_payload(value.as_bytes(), false);
     crate::lltype::malloc_typed(W_UnicodeObject {
         ob_header: PyObject {
@@ -513,13 +506,8 @@ pub fn w_str_from_wtf8_managed_borrowed(value: &Wtf8) -> PyObjectRef {
         return w_str_from_wtf8_ref(value);
     }
     let byte_len = value.len();
-    // `codepoints_in_utf8` equals `len` when every byte is ASCII
-    // (`W_UnicodeObject.is_ascii`), same as `w_str_from_wtf8_ref`.
-    let char_len = if value.as_bytes().is_ascii() {
-        byte_len
-    } else {
-        value.code_points().count()
-    };
+    // `objspace.py` `newtext` stores `rutf8.codepoints_in_utf8`.
+    let char_len = utf8_codepoint_len(value);
     // The STR payload is a live GC child with no heap edge until the header
     // is written.  Pin it (and the class word `get_instantiate` may allocate)
     // across the header malloc, then remember the old-to-young edge — the
@@ -578,11 +566,7 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
         return w_str_from_wtf8_immortal(value);
     }
     let byte_len = value.len();
-    let char_len = if value.as_bytes().is_ascii() {
-        byte_len
-    } else {
-        value.code_points().count()
-    };
+    let char_len = utf8_codepoint_len(&value);
     let value = alloc_utf8_payload(value.as_bytes(), true);
     let mut unicode = W_UnicodeObject {
         ob_header: PyObject {
@@ -716,11 +700,7 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
 /// and app-level finalization require collector ownership.
 pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjectRef {
     let byte_len = value.len();
-    let char_len = if value.as_bytes().is_ascii() {
-        byte_len
-    } else {
-        value.code_points().count()
-    };
+    let char_len = utf8_codepoint_len(&value);
     // Mortal (subclass) holder: the value buffer lives in a GC-managed box so
     // the sweep reclaims it through the box tid's drop glue, and the holder's
     // `value` gc-pointer edge greys it. Falls back to `malloc_raw` when no GC

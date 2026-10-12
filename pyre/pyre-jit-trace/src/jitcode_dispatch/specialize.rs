@@ -6056,6 +6056,11 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     if w_name.is_null() {
         return Ok(None);
     }
+    // `function_new_from_code` allocates an owned UTF-8 mirror when `co_name`
+    // is not valid UTF-8; decline so the fold and the residual agree.
+    if !unsafe { pyre_object::unicodeobject::w_str_is_utf8(w_name) } {
+        return Ok(None);
+    }
     let w_qualname =
         unsafe { pyre_interpreter::pycode::w_code_qualname_obj(code_roots.get(code_slot)) };
     if w_qualname.is_null() {
@@ -6101,6 +6106,9 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     let w_code = code_roots.get(code_slot);
     let w_name = unsafe { pyre_interpreter::pycode::w_code_name_obj(w_code) };
     if w_name.is_null() {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::unicodeobject::w_str_is_utf8(w_name) } {
         return Ok(None);
     }
     let w_qualname = unsafe { pyre_interpreter::pycode::w_code_qualname_obj(w_code) };
@@ -8488,15 +8496,15 @@ pub(crate) fn try_walker_inline_float_slot<Sym: WalkSym>(
     if !concrete_is_exact_slot_wrapper(callable) {
         return Ok(None);
     }
-    let name = unsafe { pyre_interpreter::function_get_name(callable) };
-    let Some(leaf) = float_slot_leaf(name) else {
+    let name = unsafe { pyre_interpreter::function_get_name(callable) }.to_string();
+    let Some(leaf) = float_slot_leaf(&name) else {
         return Ok(None);
     };
     let float_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::FLOAT_TYPE);
     if float_type.is_null() {
         return Ok(None);
     }
-    if unsafe { pyre_interpreter::lookup_in_type(float_type, name) } != Some(callable) {
+    if unsafe { pyre_interpreter::lookup_in_type(float_type, &name) } != Some(callable) {
         return Ok(None);
     }
     let decline = |why: &str| {

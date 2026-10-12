@@ -30,4 +30,11 @@ surrogate_generator = items()
 assert surrogate_generator.__name__ is surrogate
 assert surrogate_generator.__qualname__ is surrogate
 
+import types
+
+code = (lambda: None).__code__.replace(co_name="\ud800x")
+f = types.FunctionType(code, {})
+assert f.__name__ == "\ud800x"
+repr(f)
+
 print("OK")

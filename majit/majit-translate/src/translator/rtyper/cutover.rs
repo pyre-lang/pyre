@@ -2279,13 +2279,6 @@ fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
     if is_varsize_gc_header_alloc(canonical_strip) {
         return Some(SKIP_VARSIZE_GC_HEADER_ALLOC);
     }
-    // `core::slice::ascii::<Impl>::is_ascii` / `core::str::<Impl>::is_ascii`
-    // are opaque std scans (`FOREIGN_STDLIB_EXTERNALS` Bool residual). A
-    // harvested user graph would beat that stub and re-skip every
-    // `W_UnicodeObject.is_ascii` constructor (`w_str_new`).
-    if is_str_or_slice_is_ascii(canonical_strip) {
-        return Some(SKIP_STR_OR_SLICE_IS_ASCII);
-    }
     None
 }
 
@@ -2294,9 +2287,6 @@ const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
 
 /// [`registration_decline`] reason for `rlib/jit.py ConditionalCallEntry`.
 const SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY: &str = "skip-jit-conditional-call-extregistry";
-
-/// [`registration_decline`] reason for `slice::ascii` / `str` `is_ascii`.
-const SKIP_STR_OR_SLICE_IS_ASCII: &str = "skip-str-or-slice-is-ascii";
 
 /// [`registration_decline`] reason for `majit_gc::header` varsize immortal
 /// allocators (`malloc_varsize` / `init_gc_object_immortal`).
@@ -2324,30 +2314,6 @@ fn is_jit_conditional_call_residual(canonical_strip: &[String]) -> bool {
             | "conditional_call4"
             | "conditional_call_elidable1"
     )
-}
-
-/// Residual `core::slice::ascii::<Impl>::is_ascii` / `core::str::<Impl>::is_ascii`.
-fn is_str_or_slice_is_ascii(canonical_strip: &[String]) -> bool {
-    match canonical_strip {
-        [crate_name, module, ascii, impl_seg, leaf]
-            if (crate_name == "core" || crate_name == "std")
-                && module == "slice"
-                && ascii == "ascii"
-                && impl_seg == "<Impl>"
-                && leaf == "is_ascii" =>
-        {
-            true
-        }
-        [crate_name, module, impl_seg, leaf]
-            if (crate_name == "core" || crate_name == "std")
-                && ((module == "str" && impl_seg == "<Impl>")
-                    || (module == "slice" && impl_seg == "<Impl>"))
-                && leaf == "is_ascii" =>
-        {
-            true
-        }
-        _ => false,
-    }
 }
 
 /// Residual `majit_gc::header::alloc_varsize_with_gc_header_immortal*` /
@@ -3532,25 +3498,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (
         &["core", "slice", "<Impl>", "contains"],
         &["self", "x"],
-        LowLevelType::Bool,
-    ),
-    // `[u8]::is_ascii` / `str::is_ascii` — word-at-a-time std scans. Opaque
-    // residual Bool, same fidelity as `slice::<Impl>::is_empty`. Charon's
-    // extracted body (SIMD / arch tables) is not a graph; Layer-1 would
-    // otherwise skip every `W_UnicodeObject.is_ascii` constructor.
-    (
-        &["core", "slice", "ascii", "<Impl>", "is_ascii"],
-        &["self"],
-        LowLevelType::Bool,
-    ),
-    (
-        &["core", "slice", "<Impl>", "is_ascii"],
-        &["self"],
-        LowLevelType::Bool,
-    ),
-    (
-        &["core", "str", "<Impl>", "is_ascii"],
-        &["self"],
         LowLevelType::Bool,
     ),
     (
@@ -5798,25 +5745,6 @@ mod tests {
         assert_eq!(
             registration_decline(&["majit_gc".into(), "header".into(), "header_of".into()]),
             None
-        );
-        assert_eq!(
-            registration_decline(&[
-                "core".into(),
-                "slice".into(),
-                "ascii".into(),
-                "<Impl>".into(),
-                "is_ascii".into()
-            ]),
-            Some(SKIP_STR_OR_SLICE_IS_ASCII)
-        );
-        assert_eq!(
-            registration_decline(&[
-                "core".into(),
-                "str".into(),
-                "<Impl>".into(),
-                "is_ascii".into()
-            ]),
-            Some(SKIP_STR_OR_SLICE_IS_ASCII)
         );
 
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);

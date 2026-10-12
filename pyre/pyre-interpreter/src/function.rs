@@ -9,7 +9,8 @@
 use pyre_object::pyobject::*;
 use pyre_object::quasiimmut::QuasiImmutField;
 use pyre_object::unicodeobject::{
-    UnicodeValueStorage, alloc_utf8_payload, utf8_payload_bytes, w_str_storage,
+    UnicodeValueStorage, alloc_utf8_payload, as_str_unchecked, utf8_payload_wtf8, w_str_is_utf8,
+    w_str_storage,
 };
 use rustpython_wtf8::Wtf8Buf;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -648,10 +649,16 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     unsafe { crate::pycode::w_code_qualname_obj(roots.get(root_base)) };
     let w_code = roots.get(root_base);
     let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
+    // `Function.name` is an rstr `STR` and `function_get_name` hands it out as
+    // `&str`, so the payload must be valid UTF-8 (`function_set_func_name`
+    // keeps the same invariant through `name_utf8_mirror`). A `co_name` that
+    // carries a lone surrogate stays on `w_name` as the exact wrapper.
     let name = if w_name.is_null() {
         FunctionName::Owned(String::new())
-    } else {
+    } else if unsafe { w_str_is_utf8(w_name) } {
         FunctionName::Borrowed(w_name)
+    } else {
+        FunctionName::Owned(unsafe { name_utf8_mirror(w_name) })
     };
     let func = function_new_impl(
         &FUNCTION_TYPE,
@@ -758,6 +765,16 @@ pub(crate) fn function_new_impl(
     // object directly as the function's sole globals carrier.
     let globals_slot = pyre_object::gc_roots::shadow_stack_len();
     let w_func_globals_obj = pyre_object::gc_roots::pin_root(w_func_globals_obj);
+    // Pin a Borrowed `co_name` wrapper with the other live refs. Builtins
+    // resolution can run user `__eq__` and collect (`gct_fv_gc_malloc`).
+    let name_slot = match &name {
+        FunctionName::Borrowed(w_name) => {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(*w_name);
+            slot
+        }
+        FunctionName::Owned(_) => usize::MAX,
+    };
     // CPython 3.14 `_PyDict_LoadBuiltinsFromGlobals` at function construction:
     // retain the selected mapping identity even if the globals entry changes
     // later.  Its `_Py_dict_lookup_threadsafe_stackref` reads the native dict
@@ -797,14 +814,6 @@ pub(crate) fn function_new_impl(
     };
     let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_builtins);
-    let name_slot = match name {
-        FunctionName::Borrowed(w_name) => {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_name);
-            slot
-        }
-        FunctionName::Owned(_) => usize::MAX,
-    };
 
     // `function.py self.name = forcename or code.co_name`. Allocate the
     // name `STR` before the Function so a collection at `mallocstr` cannot
@@ -1416,6 +1425,9 @@ pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// `w_self` must be null or a valid object pointer.
 pub unsafe fn builtin_function_repr_text(name: &str, w_self: PyObjectRef) -> String {
+    // A managed `Function.name` `STR` is nursery-born and moves; copy before
+    // `r#type` which can collect.
+    let name = name.to_string();
     let bound = !w_self.is_null()
         && !unsafe { pyre_object::is_none(w_self) }
         && !unsafe { pyre_object::is_module(w_self) };
@@ -1456,9 +1468,8 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
         let self_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_self);
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(unsafe {
-            crate::function_get_name(obj())
-        }));
+        let name = unsafe { crate::function_get_name(obj()) }.to_string();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&name));
         let args = pyre_object::w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(self_slot),
             pyre_object::gc_roots::shadow_stack_get(name_slot),
@@ -1492,7 +1503,8 @@ pub unsafe fn descr_fixed_code_reduce(obj: PyObjectRef) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(owner);
-    let name = pyre_object::w_str_new_managed(unsafe { function_get_name(obj) });
+    let name = unsafe { function_get_name(obj) }.to_string();
+    let name = pyre_object::w_str_new_managed(&name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(name);
     let getattr = crate::baseobjspace::builtin_callable("getattr");
@@ -1616,13 +1628,10 @@ pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
 /// `obj` must point to a valid `Function`.
 #[inline]
 pub unsafe fn function_get_name(obj: PyObjectRef) -> &'static str {
-    unsafe {
-        let name = (*(obj as *const Function)).name;
-        if name.is_null() {
-            return "";
-        }
-        std::str::from_utf8_unchecked(utf8_payload_bytes(name))
-    }
+    // `W_UnicodeObject._utf8` readers (`w_str_get_wtf8` / `w_str_get_value_opt`)
+    // go through `utf8_payload_wtf8` + `as_str_unchecked` so the result is the
+    // rstr `STR` itself (`Function.name`), not a byte-list view of it.
+    unsafe { as_str_unchecked(utf8_payload_wtf8((*(obj as *const Function)).name)) }
 }
 
 /// `function.py fset_func_qualname` parity:
@@ -1754,12 +1763,13 @@ pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
             return (*(obj as *const Function)).w_qualname;
         }
         // `w_str_new` is a collection point that can relocate the function, so
-        // pin the receiver and reload it before storing through it.  The name
-        // `STR` is a leaf and does not move while this reads it.
+        // pin the receiver and reload it before storing through it.  Copy the
+        // name first: a managed `STR` is nursery-born and moves.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let obj = pyre_object::gc_roots::pin_root(obj);
-        let w_qualname = pyre_object::w_str_new_managed(function_get_name(obj));
+        let name = function_get_name(obj).to_string();
+        let w_qualname = pyre_object::w_str_new_managed(&name);
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_write_barrier(obj);
         function_notify_quasi_immut(obj, QuasiImmutSlot::WQualname);
@@ -1819,12 +1829,13 @@ pub unsafe fn function_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
             return (*(obj as *const Function)).w_name;
         }
         // `w_str_new` is a collection point that can relocate the function, so
-        // pin the receiver and reload it before storing through it.  The raw
-        // name itself lives in off-GC storage and does not move.
+        // pin the receiver and reload it before storing through it.  Copy the
+        // name first: a managed `STR` is nursery-born and moves.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let obj = pyre_object::gc_roots::pin_root(obj);
-        let w_name = pyre_object::w_str_new_managed(function_get_name(obj));
+        let name = function_get_name(obj).to_string();
+        let w_name = pyre_object::w_str_new_managed(&name);
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_set_name_obj(obj, w_name);
         w_name
@@ -2589,21 +2600,23 @@ pub unsafe fn function_get_func_name(obj: PyObjectRef) -> &'static str {
     unsafe { function_get_name(obj) }
 }
 
-/// The UTF-8 mirror a `Function`'s raw `name` `STR` holds.
+/// The UTF-8 mirror a `Function`'s raw `name` `STR` holds (`function.py self.name`).
 ///
 /// A name carrying a lone surrogate — which `surrogateescape` puts there for
 /// any byte an operating-system name failed to decode — has no exact form in
 /// a UTF-8 `STR`. The `w_name` slot keeps the object the caller supplied and
 /// is what `__name__` reads, so the stored value survives; this is the `&str`
-/// view `repr` and the `__qualname__` default consume, and it renders the
-/// surrogate rather than aborting the process on it.
+/// view `repr` and the `__qualname__` default consume. `Wtf8::to_string_lossy`
+/// writes U+FFFD for the surrogate, then `.as_ref().to_string()` copies the
+/// `&str`. `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
+/// the lossy copy is encoding, the same class of body `w_str_new` residualises.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
 unsafe fn name_utf8_mirror(w_name: PyObjectRef) -> String {
-    match unsafe { pyre_object::w_str_get_value_opt(w_name) } {
-        Some(value) => value.to_string(),
-        None => unsafe { pyre_object::w_str_get_wtf8(w_name) }
-            .to_string_lossy()
-            .into_owned(),
-    }
+    unsafe { pyre_object::w_str_get_wtf8(w_name) }
+        .to_string_lossy()
+        .as_ref()
+        .to_string()
 }
 
 /// PyPy-compatible `__name__` setter.
@@ -2622,13 +2635,30 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
         if !crate::baseobjspace::isinstance_str_w(name) {
             return;
         }
-        function_write_barrier(obj);
-        (*(obj as *mut Function)).w_name = name;
+        // Host `String` first (`name_utf8_mirror`), then root live refs across
+        // `alloc_utf8_payload` (`FrameworkGCTransformer.gct_fv_gc_malloc`).
+        // `function_notify_quasi_immut` can collect (`QuasiImmutField.invalidate`);
+        // run it before the barrier. `transform_generic_set` puts the barrier
+        // at the pointer store, with no collecting call between barrier and stores.
         let raw_name = name_utf8_mirror(name);
         let managed = pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF);
-        let raw_name = alloc_utf8_payload(raw_name.as_bytes(), managed);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(name);
+        let payload = alloc_utf8_payload(raw_name.as_bytes(), managed);
+        let payload_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(payload as PyObjectRef);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_notify_quasi_immut(obj, QuasiImmutSlot::Name);
-        (*(obj as *mut Function)).name = raw_name;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+        let payload =
+            pyre_object::gc_roots::shadow_stack_get(payload_slot) as *mut UnicodeValueStorage;
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_name = name;
+        (*(obj as *mut Function)).name = payload;
     }
 }
 

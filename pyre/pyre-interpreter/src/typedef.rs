@@ -16548,7 +16548,7 @@ fn classmethod_descriptor_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
     // class itself, and it is validated by binding it through
     // `classmethod_get` before the wrapped callable runs.
     let Some(&cls) = args.get(1) else {
-        let name = unsafe { crate::function::function_get_name(function) };
+        let name = unsafe { crate::function::function_get_name(function) }.to_string();
         let owner_name =
             unsafe { pyre_object::w_type_get_name(crate::function::fget_func_objclass(function)?) };
         return Err(crate::PyError::type_error(format!(
@@ -16565,7 +16565,7 @@ fn classmethod_descriptor_descr_call_args(
 ) -> crate::PyResult {
     let function = classmethod_descriptor_function(descr, "__call__")?;
     let Some(&cls) = args.arguments_w.first() else {
-        let name = unsafe { crate::function::function_get_name(function) };
+        let name = unsafe { crate::function::function_get_name(function) }.to_string();
         let owner_name =
             unsafe { pyre_object::w_type_get_name(crate::function::fget_func_objclass(function)?) };
         return Err(crate::PyError::type_error(format!(
@@ -17943,14 +17943,14 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                         "__repr__",
                     )?;
                     let carrier = unsafe { builtin_function_carrier(func) };
-                    let name = unsafe { crate::function_get_name(carrier) };
+                    let name = unsafe { crate::function_get_name(carrier) }.to_string();
                     let w_self = if is_bound_builtin_method(func) {
                         unsafe { pyre_object::w_method_get_self(func) }
                     } else {
                         unsafe { crate::function::function_get_self_or_none(carrier) }
                     };
                     Ok(pyre_object::w_str_new_managed(&unsafe {
-                        crate::function::builtin_function_repr_text(name, w_self)
+                        crate::function::builtin_function_repr_text(&name, w_self)
                     }))
                 },
                 1,
@@ -18405,7 +18405,7 @@ pub(crate) fn slot_wrapper_check_instance(
     if applies {
         return Ok(());
     }
-    let name = unsafe { crate::function::function_get_name(descr) };
+    let name = unsafe { crate::function::function_get_name(descr) }.to_string();
     let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
     let received = crate::typedef::r#type(obj)
         .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
@@ -18429,9 +18429,11 @@ fn descr_reduce(descr: PyObjectRef) -> crate::PyResult {
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(owner);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(unsafe {
+    let name = unsafe {
         crate::function::function_get_name(pyre_object::gc_roots::shadow_stack_get(descr_slot))
-    }));
+    }
+    .to_string();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&name));
     let args = pyre_object::w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(owner_slot),
         pyre_object::gc_roots::shadow_stack_get(name_slot),
@@ -18583,7 +18585,7 @@ fn method_descriptor_check_instance(
     if applies {
         return Ok(());
     }
-    let name = unsafe { crate::function::function_get_name(descr) };
+    let name = unsafe { crate::function::function_get_name(descr) }.to_string();
     let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
     let received = crate::typedef::r#type(obj)
         .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
@@ -18783,7 +18785,7 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         "__repr__",
                     )?;
-                    let name = unsafe { crate::function_get_name(descr_of(obj)) };
+                    let name = unsafe { crate::function_get_name(descr_of(obj)) }.to_string();
                     let w_self = unsafe { pyre_object::w_method_get_self(obj) };
                     let _roots = pyre_object::gc_roots::push_roots();
                     let self_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -18973,7 +18975,7 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
                 "__repr__",
                 |args| {
                     let descr = method_descriptor_receiver(args[0], "__repr__")?;
-                    let name = crate::function::function_get_name(descr);
+                    let name = crate::function::function_get_name(descr).to_string();
                     let owner = crate::function::fget_func_objclass(descr)?;
                     let owner_name = pyre_object::w_type_get_name(owner);
                     Ok(pyre_object::w_str_new_managed(&format!(
@@ -19015,7 +19017,7 @@ fn classmethod_descriptor_check_owner(
     function: PyObjectRef,
     w_klass: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    let name = unsafe { crate::function::function_get_name(function) };
+    let name = unsafe { crate::function::function_get_name(function) }.to_string();
     let owner = unsafe { crate::function::fget_func_objclass(function)? };
     let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
     if w_klass.is_null() || !unsafe { pyre_object::is_type(w_klass) } {
@@ -19121,7 +19123,7 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
                 "__repr__",
                 |args| {
                     let function = classmethod_descriptor_function(args[0], "__repr__")?;
-                    let name = crate::function::function_get_name(function);
+                    let name = crate::function::function_get_name(function).to_string();
                     let owner = crate::function::fget_func_objclass(function)?;
                     let owner_name = pyre_object::w_type_get_name(owner);
                     Ok(pyre_object::w_str_new_managed(&format!(
