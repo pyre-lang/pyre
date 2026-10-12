@@ -33,12 +33,18 @@ mod ll {
         compilation_info = ECI,
         releasegil = false
     );
+    // `syslog(3)` is variadic (`int, const char *format, ...`).  A
+    // three-argument `extern "C"` call puts the message in a fixed
+    // register; Apple ARM64 reads variadic arguments from the stack, so
+    // libc `syslog` then `strlen`s a NULL.  `natural_arity = 2` is the
+    // same stand-in `rposix.c_open` / `c_ioctl_voidp` use on darwin.
     majit_rlib::rffi::llexternal!(
         pub(super) c_syslog = "syslog",
         [INT, CCHARP, CCHARP],
         (),
         compilation_info = ECI,
-        releasegil = false
+        releasegil = false,
+        natural_arity = 2
     );
     majit_rlib::rffi::llexternal!(
         pub(super) c_closelog = "closelog",
@@ -119,18 +125,22 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     pyre_interpreter::__pyre_store!(ns, "syslog", pyre_interpreter::make_builtin_function("syslog", |args| {
             #[cfg(feature = "host_env")]
             {
+                // `args` is the gateway's native copy; a collection in
+                // `str_utf8_w` does not forward it.  Same pin as `openlog`.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let args_base = _roots.pin_roots(args);
                 let (priority, mut w_msg) = if args.len() >= 2 {
-                    if !unsafe { pyre_object::is_int(args[0]) } {
+                    if !unsafe { pyre_object::is_int(_roots.get(args_base)) } {
                         return Err(pyre_interpreter::PyError::type_error(
                             "syslog(): priority must be an integer",
                         ));
                     }
                     (
-                        unsafe { pyre_object::w_int_get_value(args[0]) as i32 },
-                        args[1],
+                        unsafe { pyre_object::w_int_get_value(_roots.get(args_base)) as i32 },
+                        _roots.get(args_base + 1),
                     )
                 } else if args.len() == 1 {
-                    (libc::LOG_INFO, args[0])
+                    (libc::LOG_INFO, _roots.get(args_base))
                 } else {
                     return Err(pyre_interpreter::PyError::type_error(
                         "syslog() requires a message",
@@ -145,25 +155,25 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     pyre_interpreter::baseobjspace::str_utf8_w(w_msg)
                 })?;
                 if let Ok(cmsg) = std::ffi::CString::new(msg) {
-                    // `lib_pypy/syslog.py` — auto-call openlog() with
-                    // a NULL ident (libc falls back to argv[0]) so the
-                    // first syslog() call delivers correctly even when the
-                    // caller skipped openlog().
+                    // `lib_pypy/syslog.py` — `if not _S_log_open: openlog()`.
+                    // Same libc call as the `openlog` builtin (NULL ident,
+                    // option 0, LOG_USER), not a second copy wrapped in
+                    // `with_roots`.
                     if !SYSLOG_OPENED.load(std::sync::atomic::Ordering::Relaxed) {
                         let mut held = S_IDENT_O.lock().unwrap();
                         *held = None;
-                        pyre_object::with_roots!(w_msg => unsafe {
+                        unsafe {
                             ll::c_openlog(std::ptr::null_mut(), 0, libc::LOG_USER);
-                        });
+                        }
                         SYSLOG_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    pyre_object::with_roots!(w_msg => unsafe {
+                    unsafe {
                         ll::c_syslog(
                             priority,
-                            "%s\0".as_ptr() as majit_rlib::rffi::CCHARP,
+                            c"%s".as_ptr() as majit_rlib::rffi::CCHARP,
                             cmsg.as_ptr() as majit_rlib::rffi::CCHARP,
                         );
-                    });
+                    }
                 }
                 Ok(pyre_object::w_none())
             }

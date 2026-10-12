@@ -470,10 +470,15 @@ fn simple_namespace_init_args(
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = _roots.pin_roots(&[self_obj]);
-    let (rest, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
-    let rest_slot = _roots.pin_roots(&rest);
-    let kwargs_slot = _roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    if rest.len() == 1 {
+    let (nrest, had_kwargs, rest_slot, kwargs_slot) = {
+        let (rest, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+        let nrest = rest.len();
+        let had_kwargs = kwargs.is_some();
+        let rest_slot = _roots.pin_roots(&rest);
+        let kwargs_slot = _roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+        (nrest, had_kwargs, rest_slot, kwargs_slot)
+    };
+    if nrest == 1 {
         let temporary = w_dict_new();
         let _ = pyre_object::gc_roots::pin_root(temporary);
         let temporary_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -487,7 +492,7 @@ fn simple_namespace_init_args(
             false,
         )?;
     }
-    let w_kwargs = if kwargs.is_some() {
+    let w_kwargs = if had_kwargs {
         Some(_roots.get(kwargs_slot))
     } else {
         None
@@ -1440,11 +1445,12 @@ fn sys_breakpointhook_args(args: &crate::argument::Arguments) -> crate::PyResult
         )?;
         return Ok(w_none());
     };
+    let hook_slot = _roots.pin_roots(&[hook]);
     let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| _roots.get(pos_base + i)).collect();
     let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| _roots.get(names_base + i)).collect();
     let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| _roots.get(values_base + i)).collect();
     let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
-    crate::call::call_args(hook, &forwarded)
+    crate::call::call_args(_roots.get(hook_slot), &forwarded)
 }
 
 /// `sys._baserepl` — `PyRun_AnyFileExFlags(stdin, "<stdin>", 0, &cf)`: read

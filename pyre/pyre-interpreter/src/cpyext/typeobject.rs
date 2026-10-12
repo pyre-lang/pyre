@@ -3587,13 +3587,13 @@ fn ternary_args(positional: &[PyObjectRef], keywords: &[(String, PyObjectRef)]) 
 fn split_call(args: &[PyObjectRef]) -> (Vec<PyObjectRef>, Vec<(String, PyObjectRef)>) {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let keywords: Vec<(String, PyObjectRef)> = match kwargs {
-        Some(dict) if crate::builtins::has_real_kwargs(kwargs) => unsafe {
+        Some(dict) => unsafe {
             pyre_object::w_dict_str_entries(dict)
                 .into_iter()
-                .filter(|(key, _)| key != "__pyre_kw__")
+                .filter(|(_, value)| !pyre_object::kw_marker::is_kw_marker_sentinel(*value))
                 .collect()
         },
-        _ => Vec::new(),
+        None => Vec::new(),
     };
     (positional.to_vec(), keywords)
 }

@@ -3852,46 +3852,44 @@ fn float_descr_new_from(
 fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = new_descr_class(args, "complex")?;
     let (value_positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    complex_descr_new_from(
-        cls,
-        value_positional,
-        crate::builtins::has_real_kwargs(kwargs),
-    )
+    complex_descr_new_from(cls, value_positional, kwargs)
 }
 
 fn complex_descr_new_args(
-    w_type: PyObjectRef,
+    mut w_type: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, crate::PyError> {
-    complex_descr_new_from(
-        w_type,
-        &args.arguments_w,
-        crate::builtins::arguments_has_keywords(args),
-    )
+    // `arguments_pos_and_kwargs` allocates the kwargs dict (`w_dict_new`).
+    // `complexobject.py descr__new__` still needs `w_complextype` after the bind.
+    let (value_positional, kwargs) = pyre_object::with_roots!(w_type => {
+        crate::builtins::arguments_pos_and_kwargs(args)
+    })?;
+    complex_descr_new_from(w_type, &value_positional, kwargs)
 }
 
 fn complex_descr_new_from(
     mut cls: PyObjectRef,
     value_positional: &[PyObjectRef],
-    has_keywords: bool,
+    kwargs: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
     // complexobject.py descr__new__(space, w_complextype, w_real, w_imag=None)
     // with `@unwrap_spec(w_real=WrappedDefault(0.0))` — one to three positionals
     // counting the class.  The gateway rejects a surplus before any subtype
     // __init__ can absorb it, so this check is unconditional.
-    if has_keywords {
-        return Err(crate::PyError::type_error(
-            "complex() takes no keyword arguments",
-        ));
-    }
     if value_positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "complex.__new__() takes from 1 to 3 positional arguments but {} were given",
             value_positional.len() + 1
         )));
     }
-    let value =
-        pyre_object::with_roots!(cls => crate::builtins::builtin_complex(value_positional))?;
+    let value = match kwargs {
+        Some(mut kw) => pyre_object::with_roots!(
+            cls, kw => crate::builtins::builtin_complex_bound(value_positional, Some(kw))
+        )?,
+        None => pyre_object::with_roots!(
+            cls => crate::builtins::builtin_complex_bound(value_positional, None)
+        )?,
+    };
     let sub = match subclass_to_tag(cls, &pyre_object::COMPLEX_TYPE)? {
         Some(sub) => sub,
         None => return Ok(value),
@@ -4013,6 +4011,19 @@ pub fn make_new_descr_with_signature(
     signature: crate::gateway::Signature,
 ) -> PyObjectRef {
     crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature)
+}
+
+/// [`make_new_descr_with_signature`] that keeps `arity` as
+/// `fast_natural_arity` so a matching positional call stays on
+/// `fastcall_N`.  Used for `int.__new__` (`arity` 2: `cls`, `x`).
+pub fn make_new_descr_with_fast_arity_and_signature(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    arity: u16,
+    signature: crate::gateway::Signature,
+) -> PyObjectRef {
+    crate::make_builtin_function_as_builtin_with_fast_arity_and_signature(
+        "__new__", func, arity, signature,
+    )
 }
 
 /// Positional-only [`make_new_descr_with_signature`].  Keywords are refused
@@ -22695,8 +22706,12 @@ fn init_int_type(ns: PyObjectRef) {
             "__new__",
             // intobject.py descr_new(space, w_inttype, w_x, __posonly__,
             // w_base=None) — `x` positional-only, `base` positional-or-keyword.
-            make_new_descr_with_signature(
+            // fast_natural_arity=2 so `int(x)` stays on fastcall_2
+            // (`function.py` nargs == fast_natural_arity); `int()` and
+            // `int(x, base)` still bind through `_match_signature`.
+            make_new_descr_with_fast_arity_and_signature(
                 int_descr_new,
+                2,
                 crate::gateway::Signature::new(vec!["cls", "x", "base"], None, None, 0, 2),
             )
         )
@@ -24600,7 +24615,10 @@ fn init_bool_type(ns: PyObjectRef) {
 /// `object.__new__(cls)` — allocate a bare instance of cls.
 ///
 /// PyPy: objectobject.py descr__new__
-/// objectobject.py _abstract_method_error (CPython 3.12+ message form).
+/// objectobject.py `_abstract_method_error` is an `app.interphook`, so the
+/// formatter is never looked inside.  Residualise the same way: the body
+/// calls `sorted` (`alloc::slice::sort`) which is not in CallRegistry.
+#[majit_macros::dont_look_inside]
 fn abstract_instantiation_error(cls: PyObjectRef) -> crate::PyError {
     let type_name = unsafe { pyre_object::w_type_get_name(cls) };
     // The setter marks any truthy value abstract without enforcing a set, and
@@ -24661,17 +24679,85 @@ pub fn object_descr_new_args(
     object_descr_new_from(&flat, crate::builtins::arguments_has_keywords(args))
 }
 
+#[majit_macros::dont_look_inside]
+fn object_new_not_enough_args() -> crate::PyError {
+    crate::PyError::type_error("object.__new__(): not enough arguments".to_string())
+}
+
+#[majit_macros::dont_look_inside]
+fn object_new_x_is_not_a_type(cls: PyObjectRef) -> crate::PyError {
+    let name = crate::typedef::r#type(cls)
+        .map(|t| unsafe { pyre_object::w_type_get_name(t.as_ptr()) })
+        .unwrap_or("object");
+    crate::PyError::type_error(format!(
+        "object.__new__(X): X is not a type object ({name})"
+    ))
+}
+
+#[majit_macros::dont_look_inside]
+fn object_new_takes_exactly_one_arg() -> crate::PyError {
+    crate::PyError::type_error(
+        "object.__new__() takes exactly one argument (the type to instantiate)".to_string(),
+    )
+}
+
+#[majit_macros::dont_look_inside]
+fn object_new_type_takes_no_arguments(cls: PyObjectRef) -> crate::PyError {
+    let name = unsafe { pyre_object::w_type_get_name(cls) };
+    crate::PyError::type_error(format!("{name}() takes no arguments"))
+}
+
+/// objectobject.py descr__new__ checks before `allocate_instance`.
+/// Error arms format `TypeError` strings (`oefmt` / `_abstract_method_error`
+/// interphook); residual so the allocator graph does not merge String with
+/// the instance pointer.
+#[majit_macros::dont_look_inside]
+fn object_new_validate(
+    cls: PyObjectRef,
+    w_object: PyObjectRef,
+    has_surplus: bool,
+) -> Result<(), crate::PyError> {
+    // `_precheck_for_new` (typeobject.py): a non-type first argument is a
+    // `TypeError`, not a silent bare instance.  `%T` names the Python type of
+    // `cls` (tag-safe via `r#type`), not its raw C layout.
+    if !unsafe { is_type(cls) } {
+        return Err(object_new_x_is_not_a_type(cls));
+    }
+    crate::call::check_type_instantiable(cls)?;
+    // objectobject.py descr__new__ — surplus arguments are accepted only
+    // when __new__ or __init__ is overridden; the bare object() takes none.
+    if has_surplus {
+        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
+        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+        if !same_inherited_slot(tp_new, obj_new) {
+            return Err(object_new_takes_exactly_one_arg());
+        }
+        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
+        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+        if same_inherited_slot(tp_init, obj_init) {
+            return Err(object_new_type_takes_no_arguments(cls));
+        }
+    }
+    // objectobject.py descr__new__ — abstract classes refuse instantiation,
+    // checked after the excess-args gate and before allocating.
+    if unsafe { pyre_object::w_type_is_abstract(cls) } {
+        return Err(abstract_instantiation_error(cls));
+    }
+    // `descr__new__` allocates through `allocate_instance(W_ObjectObject, ...)`,
+    // whose `check_user_subclass` refuses a type laid out by something other
+    // than `object`.
+    check_user_subclass(w_object, cls)
+}
+
 fn object_descr_new_from(
     positional: &[PyObjectRef],
     has_keywords: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     let w_object = w_object();
     let Some(&w_type_arg) = positional.first() else {
-        return Err(crate::PyError::type_error(
-            "object.__new__(): not enough arguments".to_string(),
-        ));
+        return Err(object_new_not_enough_args());
     };
-    let cls = w_type_arg;
+    let mut cls = w_type_arg;
     // Bootstrap: before `object` is installed the slot lookups below cannot
     // run, and no excess-args call reaches here that early.
     if w_object.is_null() {
@@ -24681,54 +24767,11 @@ fn object_descr_new_from(
             w_instance_new(PY_NULL)
         });
     }
-    // `_precheck_for_new` (typeobject.py): a non-type first
-    // argument is a `TypeError`, not a silent bare instance.  `%T` names the
-    // Python type of `cls` (tag-safe via `r#type`), not its raw C layout.
-    if !unsafe { is_type(cls) } {
-        let name = crate::typedef::r#type(cls)
-            .map(|t| unsafe { pyre_object::w_type_get_name(t.as_ptr()) })
-            .unwrap_or("object");
-        return Err(crate::PyError::type_error(format!(
-            "object.__new__(X): X is not a type object ({name})"
-        )));
-    }
-    // CPython 3.14 `object_new`: calling `object.__new__(type)` cannot bypass
-    // a NULL `tp_new` / `Py_TPFLAGS_DISALLOW_INSTANTIATION`.  `type_call`
-    // performs the same check for ordinary `type()`, but the descriptor is
-    // independently callable as `type.__new__(type)`.
-    crate::call::check_type_instantiable(cls)?;
-    // objectobject.py descr__new__ — surplus arguments are accepted only
-    // when __new__ or __init__ is overridden; the bare object() takes
-    // none.  A type that overrides __new__ but forwards excess args to
-    // object.__new__ hits the first error.
-    if positional.len() > 1 || has_keywords {
-        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
-        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
-        if !same_inherited_slot(tp_new, obj_new) {
-            return Err(crate::PyError::type_error(
-                "object.__new__() takes exactly one argument (the type to instantiate)",
-            ));
-        }
-        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
-        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
-        if same_inherited_slot(tp_init, obj_init) {
-            let name = unsafe { pyre_object::w_type_get_name(cls) };
-            return Err(crate::PyError::type_error(format!(
-                "{name}() takes no arguments"
-            )));
-        }
-    }
-    // objectobject.py descr__new__ — abstract classes refuse instantiation,
-    // checked after the excess-args gate and before allocating.
-    if unsafe { pyre_object::w_type_is_abstract(cls) } {
-        return Err(abstract_instantiation_error(cls));
-    }
-    // `descr__new__` allocates through `allocate_instance(W_ObjectObject, ...)`
-    // (objspace.py:511), whose `check_user_subclass` is what refuses a type
-    // laid out by something other than `object` — `object.__new__(int)`, and a
-    // user subclass of one, which the bare allocator would leave without the
-    // fields its own methods then read.
-    check_user_subclass(w_object, cls)?;
+    // `object_new_validate` residualises TypeError formatting
+    // (`objectobject.py descr__new__`).  Reload `cls` for `allocate_instance`.
+    pyre_object::with_roots!(cls => {
+        object_new_validate(cls, w_object, positional.len() > 1 || has_keywords)
+    })?;
     Ok(w_instance_new(cls))
 }
 

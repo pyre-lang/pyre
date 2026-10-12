@@ -120,18 +120,24 @@ pyre_interpreter::py_module! {
         pyre_interpreter::__pyre_store!(
             ns,
             "isclose",
-            pyre_interpreter::make_module_builtin_function_with_fast_arity_and_sig(
-                "isclose",
-                m::__majit_wrap_math_isclose,
-                2,
-                pyre_interpreter::Signature::new(
-                    vec!["a", "b", "rel_tol", "abs_tol"],
-                    None,
-                    None,
+            pyre_interpreter::function_set_kwonly_default_pairs(
+                pyre_interpreter::make_module_builtin_function_with_fast_arity_and_sig(
+                    "isclose",
+                    m::__majit_wrap_math_isclose,
                     2,
-                    2,
+                    pyre_interpreter::Signature::new(
+                        vec!["a", "b", "rel_tol", "abs_tol"],
+                        None,
+                        None,
+                        2,
+                        2,
+                    ),
                 ),
-            )
+                &[
+                    ("rel_tol", pyre_object::floatobject::w_float_new(1e-9)),
+                    ("abs_tol", pyre_object::floatobject::w_float_new(0.0)),
+                ],
+            ),
         );
         let install2 = |mut ns: pyre_object::PyObjectRef,
                         name: &'static str,

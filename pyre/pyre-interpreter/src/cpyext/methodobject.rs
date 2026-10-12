@@ -952,14 +952,17 @@ pub(super) fn call_method_def_in_class(
     let name = text_or_empty(unsafe { (*method).ml_name });
     let flags = unsafe { (*method).ml_flags }
         & !(MethFlags::METH_CLASS | MethFlags::METH_STATIC | MethFlags::METH_COEXIST);
+    // `arguments_pos_and_kwargs` builds a real dict; leftover packed
+    // marker dicts still carry the sentinel as a value. Skip that
+    // identity so a caller keyword spelled `__pyre_kw__` stays.
     let keywords: Vec<(String, PyObjectRef)> = match kwargs {
-        Some(dict) if crate::builtins::has_real_kwargs(kwargs) => unsafe {
+        Some(dict) => unsafe {
             pyre_object::w_dict_str_entries(dict)
                 .into_iter()
-                .filter(|(key, _)| key != "__pyre_kw__")
+                .filter(|(_, value)| !pyre_object::kw_marker::is_kw_marker_sentinel(*value))
                 .collect()
         },
-        _ => Vec::new(),
+        None => Vec::new(),
     };
     if !keywords.is_empty() && !flags.contains(MethFlags::METH_KEYWORDS) {
         return Err(crate::PyError::type_error(format!(

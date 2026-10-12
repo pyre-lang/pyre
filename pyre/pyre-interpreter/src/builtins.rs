@@ -5893,9 +5893,21 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // form at the call site, so a single positional argument is `val` (even a
     // dict holding the marker key); index it directly and route a wrong
     // positional count through the gateway for the `_match_signature` arity error.
+    // A PY_NULL slot is an omitted required `val`: `parse_builtin_signature`
+    // still pads empty `defs_w` so optional constructors keep working
+    // (`bind_kwargs_to_signature`), and that pad must not be read as an object
+    // (`argument.py` `ArgErrMissing` for a required name).
     let obj = match args {
-        [val] => *val,
-        _ => parse_single_required(args, "val", "abs")?,
+        [val] if !val.is_null() => *val,
+        _ => parse_single_required(
+            if matches!(args, [val] if val.is_null()) {
+                &[]
+            } else {
+                args
+            },
+            "val",
+            "abs",
+        )?,
     };
     builtin_abs_obj(obj)
 }
@@ -6079,7 +6091,7 @@ fn builtin_abs_complex(w_val: PyObjectRef) -> Result<PyObjectRef, crate::PyError
 /// are `malloc_typed_managed` in this trace so `fuse_boxing_alloc` can keep
 /// them virtual.  An exact complex and every other shape run `builtin_abs`.
 pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 1 {
+    if args.len() == 1 && !args[0].is_null() {
         let w_val = args[0];
         unsafe {
             if is_exact_builtin_instance(w_val) && is_int(w_val) {
@@ -27364,10 +27376,35 @@ fn complex_from_real_and_imag(
 /// keyword builds the sum of the components.
 pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, kwargs) = split_builtin_kwargs(args);
+    builtin_complex_bound(pos, kwargs)
+}
+
+/// `complexobject.py descr__new__` after the gateway has bound `w_real` /
+/// `w_imag`.  `kwargs` is a real dict or a marker dict; omitted slots stay
+/// `None` so `complex()` is `0j` and `complex(real=z)` copies `z`.
+pub(crate) fn builtin_complex_bound(
+    pos: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
     let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
     let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
-    if w_imag.is_none() && !has_real_kwargs(kwargs) {
+    // One positional and no keywords copies an exact complex (`complex(z)`).
+    // `real=z` is still the two-component constructor: CPython 3.14 warns
+    // that a complex `real` is not a real number.  `has_real_kwargs` subtracts
+    // the marker slot, so a passthrough dict that never packed the marker
+    // (`arguments_pos_and_kwargs`) of size 1 would look empty.
+    let has_keywords = match kwargs {
+        None => false,
+        Some(mut dict) => pyre_object::with_roots!(dict => {
+            if builtin_kwargs_marker_dict(dict) {
+                has_real_kwargs(Some(dict))
+            } else {
+                unsafe { pyre_object::w_dict_len(dict) > 0 }
+            }
+        }),
+    };
+    if w_imag.is_none() && !has_keywords {
         return match w_real {
             Some(mut real) => pyre_object::with_roots!(real => complex_one_argument(Some(real))),
             None => complex_one_argument(None),
@@ -27479,11 +27516,12 @@ fn builtin_breakpoint_args(
     let Ok(hook) = crate::baseobjspace::getattr_str(sys, "breakpointhook") else {
         return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
     };
+    let hook_slot = roots.pin_roots(&[hook]);
     let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
     let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(names_base + i)).collect();
     let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(values_base + i)).collect();
     let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
-    crate::call::call_args(hook, &forwarded)
+    crate::call::call_args(roots.get(hook_slot), &forwarded)
 }
 
 /// — PyPy: `_frozen_importlib/interp_import.py:interp___import__`.

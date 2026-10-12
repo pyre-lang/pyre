@@ -194,12 +194,31 @@ fn op_call_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate:
             "call expected at least 1 argument, got 0",
         ));
     };
-    let forwarded = crate::argument::Arguments::with_kw(
-        rest,
-        args.keyword_names_w.as_deref().unwrap_or(&[]),
-        args.keywords_w.as_deref().unwrap_or(&[]),
-    );
-    crate::call::call_args(callable, &forwarded)
+    // `Arguments::with_kw` copies the lists; pin the callable and the
+    // slices first so `call_args` never sees a pre-collection pointer.
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let nrest = rest.len();
+    let nnames = names.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let call_slot = pyre_object::gc_roots::pin_roots(&[callable]);
+    let rest_base = pyre_object::gc_roots::pin_roots(rest);
+    let names_base = pyre_object::gc_roots::pin_roots(names);
+    let values_base = pyre_object::gc_roots::pin_roots(values);
+    let rest_now: Vec<PyObjectRef> = (0..nrest)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(rest_base + i))
+        .collect();
+    let names_now: Vec<PyObjectRef> = (0..nnames)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+        .collect();
+    let values_now: Vec<PyObjectRef> = (0..nnames)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
+        .collect();
+    let forwarded = crate::argument::Arguments::with_kw(&rest_now, &names_now, &values_now);
+    crate::call::call_args(
+        pyre_object::gc_roots::shadow_stack_get(call_slot),
+        &forwarded,
+    )
 }
 
 // Binary arithmetic / comparison thunks share one shape — call

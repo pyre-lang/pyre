@@ -4472,9 +4472,22 @@ pub fn funccall_valuestack(
     // function.py:201-203 — fallback: build Arguments via make_arguments
     // (carries methodcall + w_function for diagnostics) and dispatch through
     // call_args.
-    let args = frame.make_arguments(nargs, methodcall, func);
+    //
+    // Pin off the still-live frame slots, then dropvalues.  Copying into a
+    // native Vec first (`make_arguments` / `peekvalues`) leaves a window
+    // where a collection forwards the frame slots but not the copy, and
+    // HOPELESS builtins (`make_builtin_function`, arity 0x400) always land
+    // here because `nargs == 0x400` never matches `fastcall_N`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.base();
+    let _ = _roots.pin_root(func);
+    for i in 0..nargs {
+        let _ = _roots.pin_root(frame.peekvalue(nargs - 1 - i));
+    }
     unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-    funccall(func, &args)
+    let func_now = _roots.get(root_base);
+    let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
+    funccall(func_now, &args_w)
 }
 
 /// function.py `_flat_pycall` — create frame directly from stack.

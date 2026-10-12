@@ -1128,7 +1128,9 @@ pub fn with_module(module: &'static str, func: PyObjectRef) -> PyObjectRef {
 /// object has no Drop obligation, matching the `func`/`name` convention.
 /// `fast_natural_arity` is `HOPELESS`: a builtin with a declared
 /// signature takes the keyword-binding slow path, not the fixed-arity
-/// fast path.
+/// fast path.  Callers that need both (a matching positional slice on
+/// `fastcall_N`, keywords through `parse_obj`) pass an explicit arity
+/// through [`builtin_code_new_full`].
 pub fn builtin_code_new_with_signature(
     name: &'static str,
     func: BuiltinCodeFn,
@@ -1977,6 +1979,73 @@ pub fn make_builtin_function_as_builtin_with_doc(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `interp2app._getdefaults` / `GatewayCache.build`: copy keyword-only
+/// defaults onto `Function.w_kw_defs` at registration.  Names without a
+/// recorded default map to `None`.  A non-None default is installed later
+/// through [`function_set_kwonly_default_pairs`].
+fn with_registered_kwonly_defaults(function: PyObjectRef) -> PyObjectRef {
+    let code = unsafe { crate::function::getcode(function) };
+    let Some(sig) = (unsafe { builtin_code_get_signature(code) }) else {
+        return function;
+    };
+    if sig.num_kwonlyargnames() == 0 {
+        return function;
+    }
+    let n_pos = sig.num_argnames();
+    let n_kwonly = sig.num_kwonlyargnames();
+    let roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = roots.publish(&[function]);
+    let dict_slot = roots.publish(&[pyre_object::w_dict_new()]);
+    for i in 0..n_kwonly {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(dict_slot),
+                sig.argnames[n_pos + i],
+                pyre_object::w_none(),
+            );
+        }
+    }
+    unsafe {
+        crate::function::function_set_kwdefaults_from_definition(
+            roots.get(fn_slot),
+            roots.get(dict_slot),
+        );
+    }
+    roots.get(fn_slot)
+}
+
+/// Replace `Function.w_kw_defs` with `pairs` (`init_kwdefaults_dict`).
+/// Used when a kw-only default is not `None` (`isclose` `rel_tol=1e-09`).
+pub fn function_set_kwonly_default_pairs(
+    function: PyObjectRef,
+    pairs: &[(&'static str, PyObjectRef)],
+) -> PyObjectRef {
+    if pairs.is_empty() {
+        return function;
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = roots.publish(&[function]);
+    let values: Vec<PyObjectRef> = pairs.iter().map(|(_, value)| *value).collect();
+    let val_base = roots.publish(&values);
+    let dict_slot = roots.publish(&[pyre_object::w_dict_new()]);
+    for (i, (name, _)) in pairs.iter().enumerate() {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(dict_slot),
+                name,
+                roots.get(val_base + i),
+            );
+        }
+    }
+    unsafe {
+        crate::function::function_set_kwdefaults_from_definition(
+            roots.get(fn_slot),
+            roots.get(dict_slot),
+        );
+    }
+    roots.get(fn_slot)
+}
+
 /// Signature-aware [`make_builtin_function_as_builtin`].  Builtin `__new__`
 /// descriptors need the builtin-function carrier for `copyreg` parity while
 /// still routing keyword-only arguments through the gateway binder.
@@ -1986,7 +2055,33 @@ pub fn make_builtin_function_as_builtin_with_signature(
     signature: Signature,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_signature(name, func, None, signature);
-    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
+}
+
+/// Like [`make_builtin_function_as_builtin_with_signature`], but keep
+/// `arity` as `fast_natural_arity`.  A no-keyword call of exactly that
+/// many positionals stays on `fastcall_N` (`function.py`
+/// `nargs == fast_natural_arity`); other counts and keywords still bind
+/// through `parse_obj`.  `int.__new__(cls, x, /, base=None)` is that
+/// shape: two positionals, optional `base`, and `int(x)` must not enter
+/// `parse_obj`.
+pub fn make_builtin_function_as_builtin_with_fast_arity_and_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    signature: Signature,
+) -> PyObjectRef {
+    let sig: *const Signature = Box::into_raw(Box::new(signature));
+    let code = builtin_code_new_full(name, func, None, arity, sig);
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// `make_builtin_function` for a builtin with a declared argument
@@ -1998,7 +2093,11 @@ pub fn make_builtin_function_with_signature(
     signature: Signature,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_signature(name, func, None, signature);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_with_fixed_code(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// `make_builtin_function`, optionally carrying a `Signature`.  `Some`
@@ -2044,7 +2143,11 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
         None => std::ptr::null(),
     };
     let code = builtin_code_new_full(name, func, None, arity, sig);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_with_fixed_code(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// `gateway.py BuiltinCode.funcrun` reaches the unwrapped body through
@@ -2370,7 +2473,11 @@ pub fn make_module_builtin_function_with_arity_and_sig(
         };
     let sig: *const Signature = Box::into_raw(Box::new(signature));
     let code = builtin_code_new_full(name, func, None, arity, sig);
-    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// Like [`make_module_builtin_function_with_arity_and_sig`], but keep
@@ -2388,7 +2495,11 @@ pub fn make_module_builtin_function_with_fast_arity_and_sig(
 ) -> PyObjectRef {
     let sig: *const Signature = Box::into_raw(Box::new(signature));
     let code = builtin_code_new_full(name, func, None, arity, sig);
-    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// Non-binding (`BuiltinFunction`) twin of
@@ -2416,7 +2527,11 @@ pub fn make_module_builtin_function_with_arity_and_maybe_sig(
         None => std::ptr::null(),
     };
     let code = builtin_code_new_full(name, func, None, arity, sig);
-    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 // ── fsencode_bytes_w ─────────────────────────────────────────────────

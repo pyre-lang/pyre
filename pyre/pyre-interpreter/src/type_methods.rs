@@ -4599,11 +4599,11 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         let w = reload(1);
         if w.is_null() { None } else { Some(w) }
     };
+    let encoding = str_arg("encoding", encoding_arg, "utf-8")?;
     let errors_arg = {
         let w = reload(2);
         if w.is_null() { None } else { Some(w) }
     };
-    let encoding = str_arg("encoding", encoding_arg, "utf-8")?;
     let errors = str_arg("errors", errors_arg, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(
         reload(0),

@@ -828,17 +828,23 @@ pyre_interpreter::builtin_wrapper_descriptor!(
     __majit_wrap_int_abs
 );
 
-/// Keyword tolerances stay in `isclose`. This residual is the original body.
+/// Keyword tolerances stay in `isclose`. This residual takes four words
+/// rather than the wrapper's args slice so the traced two-arg arm does
+/// not forward a `Vec`.
 #[majit_macros::dont_look_inside]
-fn isclose_slow(args: &[PyObjectRef]) -> PyResult {
-    isclose(args)
+fn isclose_slow(
+    w_a: PyObjectRef,
+    w_b: PyObjectRef,
+    w_rel: PyObjectRef,
+    w_abs: PyObjectRef,
+) -> PyResult {
+    isclose(&[w_a, w_b, w_rel, w_abs])
 }
 
 /// interp_math.py `isclose` with both tolerances defaulted, on two finite
 /// exact floats or machine ints.
 pub fn __majit_wrap_math_isclose(args: &[PyObjectRef]) -> PyResult {
-    let omitted = |i: usize| args.get(i).is_none_or(|value| value.is_null());
-    if args.len() >= 2 && omitted(2) && omitted(3) {
+    if args.len() == 2 {
         let w_a = args[0];
         let w_b = args[1];
         let a =
@@ -871,8 +877,13 @@ pub fn __majit_wrap_math_isclose(args: &[PyObjectRef]) -> PyResult {
         {
             return _float_isclose(a, b);
         }
+        return isclose_slow(w_a, w_b, pyre_object::PY_NULL, pyre_object::PY_NULL);
     }
-    isclose_slow(args)
+    let w_a = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let w_b = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let w_rel = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let w_abs = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+    isclose_slow(w_a, w_b, w_rel, w_abs)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(

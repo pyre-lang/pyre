@@ -1416,12 +1416,15 @@ pub fn builtin_code_call_positional(
     current_args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code) } {
-        // Every HOPELESS signature needs `_match_signature`, not only
-        // *args/**kwargs/kw-only shapes.  A plain optional positional
-        // parameter also has HOPELESS fast arity; bypassing the binder let
+        // `function.py` `nargs == fast_natural_arity` then `fastcall_N`.
+        // A matching positional slice is already the bound scope.  Any other
+        // count (optional trailing slots, `*args`/`**kwargs`/kw-only
+        // `HOPELESS`) goes through `_match_signature`; bypassing it let
         // excess positionals reach the typed wrapper, which consumes its
         // declared prefix and silently ignores the rest.
-        if unsafe { crate::builtin_code_get_fast_natural_arity(current_code) } == crate::HOPELESS {
+        let arity = unsafe { crate::builtin_code_get_fast_natural_arity(current_code) };
+        let needs_bind = arity == crate::HOPELESS || current_args.len() != arity as usize;
+        if needs_bind {
             // `descr_check` before the binder: binding reports a surplus
             // positional or an unknown keyword, and upstream reaches neither
             // until the receiver has answered for itself.
@@ -3210,23 +3213,59 @@ pub fn parse_builtin_signature(
     defaults_w: Option<&[PyObjectRef]>,
     w_kw_defs: PyObjectRef,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    let arguments = crate::argument::Arguments::with_kw(pos_args, keyword_names_w, keywords_w);
+    // `Arguments::with_kw` allocates. Pin the binder inputs first and
+    // reload them afterwards so `_parse` never sees pre-collection
+    // pointers (`argument.py` stores the same lists on `Arguments`,
+    // which is traced).  `w_kw_defs` is already on the Function
+    // (`interp2app` `_getdefaults`).
+    let npos = pos_args.len();
+    let nkw = keyword_names_w.len();
+    let ndef = defaults_w.map(|d| d.len()).unwrap_or(0);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pos_base = pyre_object::gc_roots::pin_roots(pos_args);
+    let names_base = pyre_object::gc_roots::pin_roots(keyword_names_w);
+    let values_base = pyre_object::gc_roots::pin_roots(keywords_w);
+    let defaults_base = defaults_w.map(|d| pyre_object::gc_roots::pin_roots(d));
+    let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_kw_defs);
+    // `builtin_code_call_positional` has the BuiltinCode, not the Function,
+    // so `w_kw_defs` is null there.  Fill the same None dict
+    // `with_registered_kwonly_defaults` stores on the Function
+    // (`interp2app` `_getdefaults`).
+    let synthesized = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot).is_null()
+        && sig.num_kwonlyargnames() > 0;
+    if synthesized {
+        let synthesized_defs = synthesize_kwonly_none_defaults(sig);
+        let _ = pyre_object::gc_roots::pin_root(synthesized_defs);
+    }
+    let w_kw_defs = if synthesized {
+        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1)
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(kw_defs_slot)
+    };
+    let pos_now: Vec<PyObjectRef> = (0..npos)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
+        .collect();
+    let names_now: Vec<PyObjectRef> = (0..nkw)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+        .collect();
+    let values_now: Vec<PyObjectRef> = (0..nkw)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
+        .collect();
+    let defaults_now: Option<Vec<PyObjectRef>> = defaults_base.map(|base| {
+        (0..ndef)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect()
+    });
+    let arguments = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
     let pad;
-    let defaults = match defaults_w {
+    let defaults = match defaults_now.as_deref() {
         Some(d) => Some(d),
         None => {
             pad = vec![pyre_object::PY_NULL; sig.num_argnames()];
             Some(pad.as_slice())
         }
     };
-    let synthesized = w_kw_defs.is_null() && sig.num_kwonlyargnames() > 0;
-    let w_kw_defs = if synthesized {
-        synthesize_kwonly_none_defaults(sig)
-    } else {
-        w_kw_defs
-    };
-    let npos = pos_args.len();
-    let nkw = keyword_names_w.len();
     // [3.14-spec] clinic counts nargs+nkwargs against the declared
     // parameter total when the signature accepts keywords.  parse_obj
     // reports UnknownKwds / TooMany instead (`argument.py`).  Measured
@@ -3258,18 +3297,17 @@ pub fn parse_builtin_signature(
     let mut scope_w = match arguments._parse(pyre_object::PY_NULL, sig, defaults, w_kw_defs, 0) {
         Ok(scope) => scope,
         Err(crate::argument::MatchSignatureError::Shape(err)) => {
-            return Err(rewrite_builtin_keyword_error(
-                sig,
-                fname,
-                keyword_names_w,
-                err,
-            ));
+            let names_now: Vec<PyObjectRef> = (0..nkw)
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+                .collect();
+            return Err(rewrite_builtin_keyword_error(sig, fname, &names_now, err));
         }
         Err(crate::argument::MatchSignatureError::Py(err)) => return Err(err),
     };
-    if synthesized {
-        rewrite_omitted_kwonly_none_to_null(sig, &mut scope_w, keyword_names_w);
-    }
+    let names_now: Vec<PyObjectRef> = (0..nkw)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+        .collect();
+    rewrite_omitted_kwonly_none_to_null(sig, &mut scope_w, &names_now);
     Ok(scope_w)
 }
 
@@ -3367,10 +3405,9 @@ fn first_unexpected_keyword_name(
     None
 }
 
-/// `interp2app._getdefaults` stand-in: every kw-only name maps to `None` so
-/// `parse_obj` fills the slot rather than raising `ArgErrMissing`.  Callers
-/// that have not yet copied real `w_kw_defs` rewrite omitted `None`s back to
-/// `PY_NULL` for wrappers that still treat a null slot as omitted.
+/// Stand-in for `Function.w_kw_defs` when the binder has only a BuiltinCode
+/// (`builtin_code_call_positional`).  Every kw-only name maps to `None` so
+/// `parse_obj` fills the slot rather than raising `ArgErrMissing`.
 fn synthesize_kwonly_none_defaults(sig: &crate::Signature) -> PyObjectRef {
     let n_pos = sig.num_argnames();
     let n_kwonly = sig.num_kwonlyargnames();
@@ -3408,6 +3445,64 @@ fn call_passthrough1(
     func_args(w_obj, arguments)
 }
 
+/// `baseobjspace.py call_args_and_c_profile` around a passthrough body.
+/// Keyword passthrough used to return from `funcrun` without the `c_call`
+/// the positional slice ABI still emits, so `profile.Profile` never saw
+/// `max([0], key=int)` as `:0(max)`.
+fn call_passthrough_maybe_profile(
+    profile_frame: *mut PyFrame,
+    current_callable: impl Fn() -> PyObjectRef,
+    make_args: impl Fn() -> crate::argument::Arguments,
+    body: impl FnOnce(&crate::argument::Arguments) -> PyResult,
+) -> PyResult {
+    let frame_ptr = c_profile_frame(profile_frame);
+    if frame_ptr.is_null() {
+        let arguments = make_args();
+        return body(&arguments);
+    }
+    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
+    let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
+    let arguments = make_args();
+    if !ec.is_null() {
+        unsafe {
+            (*ec).c_call_trace(frame_anchor.live(), current_callable(), Some(&arguments))?;
+        }
+    }
+    let arguments = make_args();
+    match body(&arguments) {
+        Ok(w_res) => {
+            let result_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_res);
+            if !ec.is_null() {
+                let arguments = make_args();
+                unsafe {
+                    (*ec).c_return_trace(
+                        frame_anchor.live(),
+                        current_callable(),
+                        Some(&arguments),
+                    )?;
+                }
+            }
+            Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
+        }
+        Err(err) => {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut err = err;
+            let err_slot = err.pin(&_roots);
+            if !ec.is_null() {
+                unsafe {
+                    (*ec).c_exception_trace(frame_anchor.live(), current_callable())?;
+                }
+            }
+            err.reload(&_roots, err_slot);
+            Err(err)
+        }
+    }
+}
+
+/// Wrappers that still test `is_null()` for an omitted kw-only slot get
+/// `PY_NULL` when `_match_signature` filled the registered `None` default.
+/// A non-None `w_kw_defs` entry (`isclose` `rel_tol=1e-09`) is left alone.
 fn rewrite_omitted_kwonly_none_to_null(
     sig: &crate::Signature,
     scope_w: &mut [PyObjectRef],
@@ -3692,12 +3787,17 @@ fn call_with_kwargs_in_ctx_impl(
             let code_obj = code as pyre_object::PyObjectRef;
             if let Some(func_args) = unsafe { crate::gateway::builtin_code_passthrough0(code_obj) }
             {
-                let pos_now = rooted_pos();
-                let names_now = rooted_names();
-                let values_now = rooted_values();
-                let arguments =
-                    crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
-                return call_passthrough0(func_args, &arguments);
+                return call_passthrough_maybe_profile(
+                    profile_anchor.live(),
+                    current_callable,
+                    || {
+                        let pos_now = rooted_pos();
+                        let names_now = rooted_names();
+                        let values_now = rooted_values();
+                        crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)
+                    },
+                    |arguments| call_passthrough0(func_args, arguments),
+                );
             }
             if let Some(func_args) = unsafe { crate::gateway::builtin_code_passthrough1(code_obj) }
             {
@@ -3707,12 +3807,17 @@ fn call_with_kwargs_in_ctx_impl(
                         unsafe { crate::gateway::builtin_code_name(code_obj) }
                     )));
                 }
-                let w_obj = current_pos_arg(0);
-                let rest: Vec<PyObjectRef> = (1..npos).map(current_pos_arg).collect();
-                let names_now = rooted_names();
-                let values_now = rooted_values();
-                let arguments = crate::argument::Arguments::with_kw(&rest, &names_now, &values_now);
-                return call_passthrough1(func_args, w_obj, &arguments);
+                return call_passthrough_maybe_profile(
+                    profile_anchor.live(),
+                    current_callable,
+                    || {
+                        let rest: Vec<PyObjectRef> = (1..npos).map(current_pos_arg).collect();
+                        let names_now = rooted_names();
+                        let values_now = rooted_values();
+                        crate::argument::Arguments::with_kw(&rest, &names_now, &values_now)
+                    },
+                    |arguments| call_passthrough1(func_args, current_pos_arg(0), arguments),
+                );
             }
             // Signature-bearing builtins bind keywords into positional
             // order via their declared Signature instead of receiving a
