@@ -16,8 +16,6 @@
 //! derived from the struct and the mutate field descr — so majit computes the
 //! address and the host performs the pair.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 /// `quasiimmut.py`'s
 /// ```python
 /// cpu.bh_setfield_gc_r(p, ConstPtr.value, mutatefielddescr)
@@ -26,14 +24,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// ```
 /// as one host call taking the address of the hidden mutate field.
 pub type ForceQuasiImmutable = extern "C" fn(field_addr: i64);
-
-static FORCE_QUASI_IMMUTABLE: AtomicUsize = AtomicUsize::new(0);
-
-/// Install the host's invalidation routine.  A frontend whose codewriter
-/// never emits `jit_force_quasi_immutable` needs none.
-pub fn set_force_quasi_immutable_hook(hook: Option<ForceQuasiImmutable>) {
-    FORCE_QUASI_IMMUTABLE.store(hook.map_or(0, |f| f as usize), Ordering::Release);
-}
 
 /// `quasiimmut.py`:
 /// ```python
@@ -55,22 +45,17 @@ pub fn do_force_quasi_immutable(
     if struct_ptr == 0 {
         return;
     }
-    let hook = FORCE_QUASI_IMMUTABLE.load(Ordering::Acquire);
+    let hook = crate::pyjitpl::host_hooks().force_quasi_immutable;
     // Reaching here means the codewriter emitted `jit_force_quasi_immutable`
     // and the blackhole executed it, so the frontend is one that needs the
     // hook.  Returning quietly would skip the invalidation upstream always
     // performs, leaving every loop that folded a read of this field compiled
     // against a value the store just changed — a wrong answer with nothing to
     // trace it back to.
-    assert!(
-        hook != 0,
+    let hook = hook.expect(
         "jit_force_quasi_immutable executed with no host invalidation routine: \
-         call `set_force_quasi_immutable_hook` before running a jitcode that \
-         emits it",
+         call `publish_host_hooks` before running a jitcode that emits it",
     );
     let field_addr = struct_ptr.wrapping_add(mutatefielddescr.as_offset() as i64);
-    // Safety: the only stored values come from a `ForceQuasiImmutable`
-    // function pointer in `set_force_quasi_immutable_hook`.
-    let hook: ForceQuasiImmutable = unsafe { std::mem::transmute(hook) };
     hook(field_addr);
 }

@@ -134,13 +134,13 @@ pub mod optimize;
 pub mod optimizeopt;
 pub(crate) mod parity;
 mod pyjitpl;
+pub use pyjitpl::{HostHooks, host_hooks, publish_host_hooks};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pyjitpl::{
     active_backend_jit_exc_value_forward, active_backend_jit_exc_value_peek,
     install_active_backend_gc_standalone, register_active_backend_jitframe_gc_type,
 };
 pub mod quasiimmut;
-pub use quasiimmut::set_force_quasi_immutable_hook;
 pub mod recorder;
 pub mod resoperation;
 pub mod resume;
@@ -255,11 +255,9 @@ pub use pyjitpl::{
     record_inline_application_traceback_for_recording,
     record_inline_application_traceback_hook_address, residual_write_effect_info,
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,
-    resolve_symbolic_fnaddr_path, set_record_application_traceback_hook,
-    set_record_discarded_level_traceback_hook, set_record_inline_application_traceback_hook,
-    set_resolve_exception_context_hook, set_symbolic_fnaddr_path_resolver,
-    setup_frame_from_merge_point, trace_jitcode, trace_jitcode_at_resume_framestack,
-    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    resolve_symbolic_fnaddr_path, setup_frame_from_merge_point, trace_jitcode,
+    trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
     BridgeVirtualCache, PendingRefArrayWrite, decode_fieldnum, default_bridge_array_descr,
@@ -1521,28 +1519,8 @@ pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
 // The actual implementation lives in pyre-interpreter (the interpreter
 // owns the rpy_stacktoobig struct). majit-metainterp cannot depend on
 // pyre-interpreter directly — pyre depends on majit, not the other way
-// — so the interpreter registers the two hooks at startup.
-use std::sync::OnceLock;
-
-static CRITICALCODE_START_FN: OnceLock<fn()> = OnceLock::new();
-static CRITICALCODE_STOP_FN: OnceLock<fn()> = OnceLock::new();
-static STACK_ALMOST_FULL_FN: OnceLock<fn() -> bool> = OnceLock::new();
-
-/// Register the `_stack_criticalcode_start` / `_stack_criticalcode_stop`
-/// hooks the interpreter implements. Called once at JIT install time.
-pub fn register_criticalcode_hooks(start: fn(), stop: fn()) {
-    let _ = CRITICALCODE_START_FN.set(start);
-    let _ = CRITICALCODE_STOP_FN.set(stop);
-}
-
-/// Register the `rstack.stack_almost_full` hook the interpreter
-/// implements against its `PYRE_STACKTOOBIG` budget. Called once at
-/// JIT install time. When no hook is registered, [`stack_almost_full`]
-/// returns `false` — matching RPython's untranslated fallback in
-/// `rpython/rlib/rstack.py`.
-pub fn register_stack_almost_full_hook(f: fn() -> bool) {
-    let _ = STACK_ALMOST_FULL_FN.set(f);
-}
+// — so the interpreter publishes the two hooks on [`HostHooks`] at
+// setup (`warmspot.py` fills `MetaInterpStaticData` once).
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -2158,7 +2136,7 @@ pub fn mc_diag_bump(i: usize) {
 /// False`).
 #[inline]
 pub fn stack_almost_full() -> bool {
-    if let Some(f) = STACK_ALMOST_FULL_FN.get() {
+    if let Some(f) = crate::pyjitpl::host_hooks().stack_almost_full {
         let r = f();
         if r {
             mc_diag_bump(5); // stack_almost_full returned true
@@ -2174,7 +2152,7 @@ pub fn stack_almost_full() -> bool {
 /// that don't install the interpreter's stack-check layer).
 #[inline]
 pub fn criticalcode_start() {
-    if let Some(f) = CRITICALCODE_START_FN.get() {
+    if let Some(f) = crate::pyjitpl::host_hooks().criticalcode_start {
         f();
     }
 }
@@ -2182,7 +2160,7 @@ pub fn criticalcode_start() {
 /// rpython/translator/c/src/stack.h:43 `LL_stack_criticalcode_stop`.
 #[inline]
 pub fn criticalcode_stop() {
-    if let Some(f) = CRITICALCODE_STOP_FN.get() {
+    if let Some(f) = crate::pyjitpl::host_hooks().criticalcode_stop {
         f();
     }
 }

@@ -3243,70 +3243,58 @@ pub type ResolveExceptionContext = extern "C" fn(i64) -> i64;
 /// from any tracing thread after the hook is installed.
 pub type SymbolicFnaddrPathResolver = fn(i64) -> Option<&'static str>;
 
-static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static RECORD_INLINE_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static RECORD_DISCARDED_LEVEL_TRACEBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static RESOLVE_EXCEPTION_CONTEXT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static SYMBOLIC_FNADDR_PATH_RESOLVER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_record_application_traceback_hook(hook: Option<RecordApplicationTraceback>) {
-    RECORD_APPLICATION_TRACEBACK.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
+/// Interpreter-owned callbacks `warmspot.py` would put on
+/// `MetaInterpStaticData` at setup. Folded from the process-global
+/// `register_*` / `set_*` OnceLocks: one struct, filled once, read
+/// through [`host_hooks`] / `self.staticdata.host`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostHooks {
+    pub stack_almost_full: Option<fn() -> bool>,
+    pub criticalcode_start: Option<fn()>,
+    pub criticalcode_stop: Option<fn()>,
+    pub record_application_traceback: Option<RecordApplicationTraceback>,
+    pub record_inline_application_traceback: Option<RecordInlineApplicationTraceback>,
+    pub record_discarded_level_traceback: Option<RecordDiscardedLevelTraceback>,
+    pub resolve_exception_context: Option<ResolveExceptionContext>,
+    pub force_quasi_immutable: Option<crate::quasiimmut::ForceQuasiImmutable>,
+    pub symbolic_fnaddr_path_resolver: Option<SymbolicFnaddrPathResolver>,
 }
 
-pub fn set_record_inline_application_traceback_hook(
-    hook: Option<RecordInlineApplicationTraceback>,
-) {
-    RECORD_INLINE_APPLICATION_TRACEBACK.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
+static HOST_HOOKS: parking_lot::Mutex<HostHooks> = parking_lot::const_mutex(HostHooks {
+    stack_almost_full: None,
+    criticalcode_start: None,
+    criticalcode_stop: None,
+    record_application_traceback: None,
+    record_inline_application_traceback: None,
+    record_discarded_level_traceback: None,
+    resolve_exception_context: None,
+    force_quasi_immutable: None,
+    symbolic_fnaddr_path_resolver: None,
+});
+
+/// Published copy of [`MetaInterpStaticData::host`]. Readers that do
+/// not hold `staticdata` go through here — one slot, not one
+/// OnceLock per hook.
+pub fn host_hooks() -> HostHooks {
+    *HOST_HOOKS.lock()
 }
 
-pub fn set_record_discarded_level_traceback_hook(hook: Option<RecordDiscardedLevelTraceback>) {
-    RECORD_DISCARDED_LEVEL_TRACEBACK.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
-}
-
-pub fn set_resolve_exception_context_hook(hook: Option<ResolveExceptionContext>) {
-    RESOLVE_EXCEPTION_CONTEXT.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
-}
-
-/// Install the host-owned lookup for symbolic residual-call addresses.
-///
-/// `None` preserves the standalone metainterpreter's hash-only diagnostic.
-pub fn set_symbolic_fnaddr_path_resolver(hook: Option<SymbolicFnaddrPathResolver>) {
-    SYMBOLIC_FNADDR_PATH_RESOLVER.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
+/// Install the host hook table. Called once from the driver constructor
+/// (`eval.rs` / `call_jit.rs`).
+pub fn publish_host_hooks(hooks: HostHooks) {
+    *HOST_HOOKS.lock() = hooks;
 }
 
 pub fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
-    let hook = SYMBOLIC_FNADDR_PATH_RESOLVER.load(std::sync::atomic::Ordering::Acquire);
-    if hook == 0 {
-        return None;
-    }
-    // SAFETY: the stored address is a `SymbolicFnaddrPathResolver` published
-    // by `set_symbolic_fnaddr_path_resolver`.
-    let callback: SymbolicFnaddrPathResolver = unsafe { std::mem::transmute(hook) };
-    callback(fnaddr)
+    host_hooks()
+        .symbolic_fnaddr_path_resolver
+        .and_then(|f| f(fnaddr))
 }
 
 pub fn resolve_exception_context_hook_address() -> *const () {
-    RESOLVE_EXCEPTION_CONTEXT.load(std::sync::atomic::Ordering::Acquire) as *const ()
+    host_hooks()
+        .resolve_exception_context
+        .map_or(std::ptr::null(), |f| f as *const ())
 }
 
 /// Chain `exc_value` through the same host hook the compiled run calls, so the
@@ -3316,26 +3304,27 @@ pub fn resolve_exception_context_for_recording(exc_value: i64) -> i64 {
     if exc_value == 0 {
         return 0;
     }
-    let hook = RESOLVE_EXCEPTION_CONTEXT.load(std::sync::atomic::Ordering::Acquire);
-    if hook == 0 {
-        return 0;
-    }
-    // SAFETY: the stored address is a `ResolveExceptionContext` published by
-    // `set_resolve_exception_context_hook`.
-    let callback: ResolveExceptionContext = unsafe { std::mem::transmute(hook) };
-    callback(exc_value)
+    host_hooks()
+        .resolve_exception_context
+        .map_or(0, |f| f(exc_value))
 }
 
 pub fn record_application_traceback_hook_address() -> *const () {
-    RECORD_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
+    host_hooks()
+        .record_application_traceback
+        .map_or(std::ptr::null(), |f| f as *const ())
 }
 
 pub fn record_inline_application_traceback_hook_address() -> *const () {
-    RECORD_INLINE_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
+    host_hooks()
+        .record_inline_application_traceback
+        .map_or(std::ptr::null(), |f| f as *const ())
 }
 
 pub fn record_discarded_level_traceback_hook_address() -> *const () {
-    RECORD_DISCARDED_LEVEL_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
+    host_hooks()
+        .record_discarded_level_traceback
+        .map_or(std::ptr::null(), |f| f as *const ())
 }
 
 fn record_application_traceback(exc_value: i64, frame_ptr: *const u8, frame: &MIFrame) {
@@ -3361,13 +3350,9 @@ pub fn record_application_traceback_for_recording(
     if exc_value == 0 || frame_ptr == 0 {
         return;
     }
-    let callback = RECORD_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
-    if callback == 0 {
+    let Some(callback) = host_hooks().record_application_traceback else {
         return;
-    }
-    // Safety: the only stored values come from a RecordApplicationTraceback
-    // function pointer in set_record_application_traceback_hook.
-    let callback: RecordApplicationTraceback = unsafe { std::mem::transmute(callback) };
+    };
     callback(
         exc_value,
         frame_ptr,
@@ -3388,13 +3373,9 @@ pub fn record_inline_application_traceback_for_recording(
     if exc_value == 0 || w_code == 0 {
         return;
     }
-    let callback = RECORD_INLINE_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
-    if callback == 0 {
+    let Some(callback) = host_hooks().record_inline_application_traceback else {
         return;
-    }
-    // Safety: the only stored values come from a
-    // RecordInlineApplicationTraceback function pointer.
-    let callback: RecordInlineApplicationTraceback = unsafe { std::mem::transmute(callback) };
+    };
     callback(
         exc_value,
         w_code,
@@ -3416,13 +3397,9 @@ pub fn record_discarded_level_traceback_for_recording(exc_value: i64, w_code: i6
     if exc_value == 0 || w_code == 0 {
         return;
     }
-    let callback = RECORD_DISCARDED_LEVEL_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
-    if callback == 0 {
+    let Some(callback) = host_hooks().record_discarded_level_traceback else {
         return;
-    }
-    // Safety: the only stored values come from a RecordDiscardedLevelTraceback
-    // function pointer in set_record_discarded_level_traceback_hook.
-    let callback: RecordDiscardedLevelTraceback = unsafe { std::mem::transmute(callback) };
+    };
     callback(exc_value, w_code, py_pc);
 }
 
@@ -4235,7 +4212,11 @@ impl<M: Clone> MetaInterp<M> {
             pending_frontend_box_types: None,
             cpu: crate::cpu::default_cpu(),
             issubclass: Some(default_issubclass),
-            staticdata: std::sync::Arc::new(MetaInterpStaticData::new()),
+            staticdata: {
+                let mut sd = MetaInterpStaticData::new();
+                sd.host = host_hooks();
+                std::sync::Arc::new(sd)
+            },
             framestack: crate::pyjitpl::MIFrameStack::empty(),
             free_frames_list: Vec::new(),
             portal_call_depth: 0,
@@ -14497,8 +14478,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// rpython/rlib/rstack.py `stack_almost_full` — delegates to
-    /// the interpreter-registered hook (see
-    /// `majit_metainterp::register_stack_almost_full_hook`) which reads
+    /// the interpreter-registered hook (see [`host_hooks`]) which reads
     /// `PYRE_STACKTOOBIG.stack_end` / `stack_length` and tracks
     /// `sys.setrecursionlimit`. Without a registered hook (tests),
     /// returns `false` matching `if not we_are_translated: return False`
@@ -22624,6 +22604,10 @@ pub struct MetaInterpStaticData {
     /// the backend exists, instead of deriving it by Python module
     /// reflection.
     pub jit_starting_line: String,
+    /// Interpreter-owned setup hooks. `warmspot.py` fills
+    /// `MetaInterpStaticData` once; pyre used to scatter the same
+    /// pointers across process-global OnceLocks / atomics.
+    pub host: HostHooks,
 }
 
 /// pyjitpl.py `class MetaInterpGlobalData`.
