@@ -6997,10 +6997,24 @@ fn build_class_inner(
             pyre_object::gc_roots::shadow_stack_get(bases_root),
             dict_obj as pyre_object::gc_hook::GCREF,
         );
-        let w = pyre_object::gc_roots::pin_root(w);
-        crate::builtins::type_new_take_qualname(w, dict_obj)?;
+        let _ = pyre_object::gc_roots::pin_root(w);
+        // `w_type_new` allocates the name-storage box
+        // (`gc_alloc_young_storage_box`) and may spill the header to old-gen
+        // when the nursery is full. Either collect. The namespace is a
+        // nursery dict; the pre-alloc local is then recycled poison.
+        // `_create_new_type` reloads both words from their slots
+        // (`type_new_take_qualname(w_type(), shadow_stack_get(dict_root))`).
+        crate::builtins::type_new_take_qualname(
+            pyre_object::gc_roots::shadow_stack_get(w_root),
+            pyre_object::gc_roots::shadow_stack_get(dict_root),
+        )?;
         // typeobject.py create_all_slots parity.
-        unsafe { create_all_slots(w, pyre_object::gc_roots::shadow_stack_get(bases_root))? };
+        unsafe {
+            create_all_slots(
+                pyre_object::gc_roots::shadow_stack_get(w_root),
+                pyre_object::gc_roots::shadow_stack_get(bases_root),
+            )?
+        };
         // `type_ready_fill_dict` defaults the doc entry once the slot and
         // instance descriptors own their names.
         crate::builtins::type_dict_set_doc(pyre_object::gc_roots::shadow_stack_get(w_root));

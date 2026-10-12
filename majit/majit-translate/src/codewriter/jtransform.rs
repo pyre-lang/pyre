@@ -13825,9 +13825,16 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
 
 /// The rtyper op `jit_force_virtualizable`, not `hint_force_virtualizable`.
 /// A method with the same name is not the rtyper primitive.
+///
+/// Residual graphs keep `force_virtualizable_if_necessary` after
+/// `replace_force_virtualizable_with_call`; looked-inside graphs delete
+/// that Call the same way they delete the marker (`jtransform.py
+/// rewrite_op_jit_force_virtualizable` `return []`).
 fn is_jit_force_virtualizable_target(target: &CallTarget) -> bool {
     matches!(target, CallTarget::FunctionPath { segments, .. }
-        if segments.last().is_some_and(|name| name == "jit_force_virtualizable"))
+    if segments.last().is_some_and(|name| {
+        name == "jit_force_virtualizable" || name == "force_virtualizable_if_necessary"
+    }))
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.
@@ -20625,6 +20632,9 @@ mod tests {
         assert!(is_jit_force_virtualizable_target(
             &CallTarget::function_path(["executioncontext", "jit_force_virtualizable",])
         ));
+        assert!(is_jit_force_virtualizable_target(
+            &CallTarget::function_path(["executioncontext", "force_virtualizable_if_necessary",])
+        ));
     }
 
     #[test]
@@ -20675,6 +20685,59 @@ mod tests {
             matches!(ops[0].kind, OpKind::Live),
             "virtualizable read must be led by -live-, got {:?}",
             ops[0].kind
+        );
+        assert!(matches!(
+            ops[1].kind,
+            OpKind::VableFieldRead { field_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn transform_graph_deletes_force_virtualizable_if_necessary() {
+        let mut graph = FunctionGraph::new("demo");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path([
+                    "executioncontext",
+                    "force_virtualizable_if_necessary",
+                ]),
+                args: crate::model::call_args(vec![frame_var.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: frame_var,
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        );
+
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OpKind::Call { .. } | OpKind::VableForce { .. })),
+            "force_virtualizable_if_necessary must be deleted, not residualized: {ops:?}"
         );
         assert!(matches!(
             ops[1].kind,

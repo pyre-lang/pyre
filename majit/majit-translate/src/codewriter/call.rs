@@ -2358,7 +2358,9 @@ impl std::fmt::Display for UnknownCalleeCensus {
 /// resolution reached.
 fn is_residual_jit_force_virtualizable(target: &CallTarget) -> bool {
     matches!(target, CallTarget::FunctionPath { segments, .. }
-        if segments.last().is_some_and(|name| name == "jit_force_virtualizable"))
+    if segments.last().is_some_and(|name| {
+        name == "jit_force_virtualizable" || name == "force_virtualizable_if_necessary"
+    }))
 }
 
 fn link_arg_access_directly(arg: &LinkArg) -> bool {
