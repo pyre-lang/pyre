@@ -43081,11 +43081,11 @@ fn base_traces_to_items_block_accessor_matching(
     matches_accessor: fn(&RegularCall, &Llbc) -> bool,
 ) -> bool {
     let mut cur = base;
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for _ in 0..32 {
         let mut producers = 0usize;
         let mut copy_src: Option<usize> = None;
         let mut is_accessor = false;
-        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -45488,12 +45488,11 @@ fn mentions_local(v: &serde_json::Value, wanted: &bit_set::BitSet) -> bool {
 /// has to be assigned exactly once, and each element a plain local, or the
 /// pin is not one this pass can answer a read-back for.
 fn pin_roots_slice_values(
-    llbc: &Llbc,
     body: &Unstructured,
     slice: usize,
     assigned: &std::collections::HashMap<usize, usize>,
+    forward_blocks: &[bool],
 ) -> Option<(Vec<usize>, Vec<usize>)> {
-    let forward_blocks = forward_reachable_mask(llbc, body);
     let definition = |local: usize| -> Option<Rvalue> {
         if assigned.get(&local) != Some(&1) {
             return None;
@@ -45558,15 +45557,14 @@ fn pin_roots_slice_values(
 /// `get(base + k)` is `getarrayitem` of that list (`W_CData.call` /
 /// `cdataobj.py descr_call` passes `args_w` through).
 fn pin_roots_incoming_slice(
-    llbc: &Llbc,
     body: &Unstructured,
     slice: usize,
     assigned: &std::collections::HashMap<usize, usize>,
+    forward_blocks: &[bool],
 ) -> Option<(usize, Vec<usize>)> {
     let arg_count = body.locals.arg_count as usize;
     // `assigned` counts forward blocks only. A cleanup assign must not be
-    // read as that one definition (`forward_reachable_mask`).
-    let forward_blocks = forward_reachable_mask(llbc, body);
+    // read as that one definition.
     let definition = |local: usize| -> Option<Rvalue> {
         if assigned.get(&local) != Some(&1) {
             return None;
@@ -45722,7 +45720,8 @@ fn place_incoming_slice_elem(
     let PlaceKind::Local(slice) = slice_place.kind else {
         return None;
     };
-    pin_roots_incoming_slice(llbc, body, slice as usize, assigned).map(|(slice, _)| (slice, k))
+    pin_roots_incoming_slice(body, slice as usize, assigned, forward_blocks)
+        .map(|(slice, _)| (slice, k))
 }
 
 /// `pin_root(args_w[k])` / `pin_root(w_arg)` when `w_arg` was loaded from an
@@ -46977,9 +46976,11 @@ fn analyze_root_brackets_with(
             let Some(scope) = open_scope_at(bb_idx) else {
                 continue;
             };
-            if let Some(run) = pin_roots_slice_values(llbc, body, slice, &assigned) {
+            if let Some(run) = pin_roots_slice_values(body, slice, &assigned, &forward_blocks) {
                 pin_runs.insert(bb_idx, (scope, run.0, run.1));
-            } else if let Some(run) = pin_roots_incoming_slice(llbc, body, slice, &assigned) {
+            } else if let Some(run) =
+                pin_roots_incoming_slice(body, slice, &assigned, &forward_blocks)
+            {
                 slice_runs.insert(bb_idx, (scope, run.0, run.1));
             } else {
                 continue;
@@ -47051,9 +47052,11 @@ fn analyze_root_brackets_with(
             let Some(slice) = operand_local(call.args.get(1)) else {
                 continue;
             };
-            if let Some(run) = pin_roots_slice_values(llbc, body, slice, &assigned) {
+            if let Some(run) = pin_roots_slice_values(body, slice, &assigned, &forward_blocks) {
                 pin_runs.insert(bb_idx, (scope, run.0, run.1));
-            } else if let Some(run) = pin_roots_incoming_slice(llbc, body, slice, &assigned) {
+            } else if let Some(run) =
+                pin_roots_incoming_slice(body, slice, &assigned, &forward_blocks)
+            {
                 slice_runs.insert(bb_idx, (scope, run.0, run.1));
             } else {
                 continue;

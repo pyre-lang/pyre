@@ -249,8 +249,9 @@ fn ref_kind_mutates(kind: &Value) -> bool {
 
 /// Assignments of each local: `Assign` destinations, call destinations,
 /// and `&mut` / `*mut` borrows of a local. `StorageLive` / `StorageDead`
-/// are not definitions.
-fn local_def_counts(body: &Unstructured, llbc: &Llbc) -> Vec<u32> {
+/// are not definitions. Only blocks in `forward_blocks` are counted: an
+/// `on_unwind` cleanup block is still in the body.
+fn local_def_counts(body: &Unstructured, llbc: &Llbc, forward_blocks: &[bool]) -> Vec<u32> {
     let n = body.locals.locals.len();
     let mut counts = vec![0u32; n];
     let bump = |counts: &mut [u32], l: Option<usize>| {
@@ -260,7 +261,10 @@ fn local_def_counts(body: &Unstructured, llbc: &Llbc) -> Vec<u32> {
             *c = c.saturating_add(1);
         }
     };
-    for block in &body.body {
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
         for stmt in &block.statements {
             let Ok(kind) = stmt.stmt_kind_ref() else {
                 continue;
@@ -581,7 +585,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         };
     let slot_local = |k: usize| n_locals + k;
 
-    let def_counts = local_def_counts(body, llbc);
+    let def_counts = local_def_counts(body, llbc, &forward_blocks);
     let single_def = |dest: usize| def_counts.get(dest).copied() == Some(1);
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
@@ -3028,6 +3032,27 @@ mod tests {
 
     fn usize_lit(k: u64) -> Value {
         json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]})
+    }
+
+    /// A cleanup block that reassigns a local is not a second definition.
+    #[test]
+    fn local_def_counts_skips_cleanup_reassign() {
+        let llbc = fixture_llbc();
+        let use_copy0 = json!({"Use": [{"Copy": place(0)}, "Yes"]});
+        let body = body_of(
+            2,
+            vec![
+                bb_stmts(vec![assign_local(1, use_copy0.clone())], json!("Return")),
+                json!({
+                    "statements": [assign_local(1, use_copy0)],
+                    "terminator": {"span": span(), "kind": "UnwindResume"},
+                    "is_cleanup": true
+                }),
+            ],
+        );
+        let forward_blocks = super::super::forward_reachable_mask(&llbc, &body);
+        let counts = local_def_counts(&body, &llbc, &forward_blocks);
+        assert_eq!(counts.get(1).copied(), Some(1));
     }
 
     /// `zip_two_tuple_next` / `tuple_iter_descr_next`: pin, then name the
