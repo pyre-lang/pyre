@@ -329,10 +329,14 @@ impl LowererConfig {
 
     /// First ref-bank register available for ref-scalar identity slots.
     /// `MIFrame::setup_call` packs the dispatch JitCode's ref args densely;
-    /// the virtualizable, when present, follows the explicit portal greens.
+    /// a `[.. ; virt]` identity follows the portal greens. A
+    /// `virtualizable_fields` heap object is already a `ref(_)` scalar
+    /// and is that named red (`make_virtualizable_infos`
+    /// `index_of_virtualizable`), so its slot is the vable input
+    /// register itself.
     pub(super) fn ref_identity_base(&self) -> u16 {
         let (_, refs, _) = self.portal_input_kind_counts();
-        refs + u16::from(self.vable_var.is_some())
+        refs + u16::from(self.vable_var.is_some() && !self.heap_vable_is_ref_scalar())
     }
 
     /// First int-bank register available for scalar/array identity
@@ -366,6 +370,17 @@ impl LowererConfig {
 
     pub(super) fn is_state_vable_field(&self, name: &str) -> bool {
         self.vable_var.as_deref() == Some("state") && self.vable_fields.contains_key(name)
+    }
+
+    /// A `virtualizable_fields` object that is already a `ref(_)` state
+    /// field. `make_virtualizable_infos` finds that name in the declared
+    /// red list (`index_of_virtualizable`); `identity_slot_registers`
+    /// must not list it again or the merge-point payload would carry
+    /// the object twice.
+    pub(super) fn heap_vable_is_ref_scalar(&self) -> bool {
+        self.vable_var
+            .as_ref()
+            .is_some_and(|name| self.state_ref_scalars.contains_key(name))
     }
 
     /// Int scalars that keep an independent identity slot (not redirected
@@ -477,7 +492,14 @@ impl LowererConfig {
         let mut ref_scalars: Vec<(usize, &str)> = self
             .state_ref_scalars
             .iter()
-            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .filter(|(name, _)| {
+                // The heap virtualizable object is the named red
+                // `make_virtualizable_infos` indexes; listing it here
+                // as well duplicates it in the merge-point payload.
+                !self.is_state_vable_field(name)
+                    && !(self.heap_vable_is_ref_scalar()
+                        && self.vable_var.as_deref() == Some(name.as_str()))
+            })
             .map(|(name, (index, _))| (*index, name.as_str()))
             .collect();
         ref_scalars.sort_by_key(|(index, _)| *index);
@@ -2573,6 +2595,32 @@ mod tests {
             regs,
             vec![Register::int(base), Register::int(base + 1)],
             "a plain [int] is items-pointer then length after the int scalars"
+        );
+    }
+
+    #[test]
+    fn heap_vable_ref_scalar_shares_the_vable_input_register() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("frame".into());
+        config
+            .state_ref_scalars
+            .insert("frame".into(), (0, syn::parse_quote!(Frame)));
+        config.state_arrays.insert("cells".into(), 0);
+        assert!(config.heap_vable_is_ref_scalar());
+        assert_eq!(
+            config.ref_identity_base(),
+            config.portal_input_kind_counts().1,
+            "make_virtualizable_infos names the object in the red list, so \
+             its ref-bank slot is the vable input register"
+        );
+        let mut regs = config.identity_slot_registers();
+        regs.sort();
+        let base = config.int_identity_base();
+        assert_eq!(
+            regs,
+            vec![Register::int(base), Register::int(base + 1)],
+            "the named red already carries the object; identity slots are \
+             ptr then len only"
         );
     }
 

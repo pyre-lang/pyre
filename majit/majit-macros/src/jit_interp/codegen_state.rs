@@ -385,30 +385,22 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .iter()
         .filter(|(_, kind)| matches!(kind, super::jitcode_lower::ValueKind::Float))
         .count();
-    // First ref-bank register available for ref-scalar identity slots.
-    // `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
-    // from r0 (`program` at r0, the virtualizable identity at r1 when
-    // present — `with_vable_input_ref_reg(1)` in codegen_trace), and the
-    // blackhole re-executes ops reading those argument registers, so the
-    // identity slots start past them.  Mirrors
-    // `LowererConfig::ref_identity_base`; the vable-presence condition
-    // matches the lowerer's `vable_var` synthesis (an explicit
-    // `virtualizable` decl or any `[int; virt]` state array).
-    let ref_identity_base: usize = 1
-        + portal_ref_greens
-        + carried_ref_greens
-        + usize::from(config.virtualizable_decl.is_some() || num_virt_arrays > 0);
     // A `virtualizable_fields` object that is a `ref` state field, not the
     // state struct. `[.. ; virt]` already makes the state itself the
     // virtualizable; the two do not combine.
+    //
+    // `make_virtualizable_infos` finds that object in the declared red
+    // list (`index_of_virtualizable`). Each plain `[int]` contributes two
+    // INT identity slots (items pointer, then length), so the object's
+    // position in the live-value vector is a compile-time function of the
+    // declared layout: int scalars, then ptr then len per `[int]`, then
+    // the ref scalars among which the object sits. `extract_live`,
+    // `live_value_types`, and `restore` emit that same order; the object
+    // is a ref scalar, so `num_vable_identity_slots` stays 0. Restore
+    // reads it from the ref bank at `ref_pos`; that bank starts at the
+    // vable input register because the object IS that named red.
     let heap_vable_index: Option<usize> = if num_virt_arrays == 0 {
         config.virtualizable_decl.as_ref().map(|decl| {
-            if !arrays.is_empty() {
-                panic!(
-                    "virtualizable_fields cannot share a state with a fixed-length array; \
-                     the object's live index would depend on that array's runtime length"
-                );
-            }
             let name = decl.var_name.to_string();
             let ref_pos = ref_scalars
                 .iter()
@@ -416,12 +408,27 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 .unwrap_or_else(|| {
                     panic!("virtualizable_fields var `{name}` must be a `ref(_)` state field")
                 });
-            num_scalars + ref_pos
+            num_int_identity + ref_pos
         })
     } else {
         None
     };
     let carry_vable_boxes = num_virt_arrays >= 1 || heap_vable_index.is_some();
+    // First ref-bank register available for ref-scalar identity slots.
+    // `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
+    // from r0 (`program` at r0, the virtualizable identity at r1 when
+    // present — `with_vable_input_ref_reg(1)` in codegen_trace). A
+    // `[.. ; virt]` identity is that extra argument, so ref scalars start
+    // one past it. A `virtualizable_fields` heap object is already a
+    // `ref(_)` scalar and is that same named red (`make_virtualizable_infos`
+    // `index_of_virtualizable`), so its slot IS the vable input register
+    // and later ref scalars follow. Mirrors `LowererConfig::ref_identity_base`.
+    let vable_input_ref_reg: usize = 1 + portal_ref_greens + carried_ref_greens;
+    let ref_identity_base: usize = vable_input_ref_reg
+        + usize::from(
+            (config.virtualizable_decl.is_some() || num_virt_arrays > 0)
+                && heap_vable_index.is_none(),
+        );
     // First int-bank register available for scalar/array identity slots —
     // the int-bank mirror of `ref_identity_base`. `pc` is i0; portal
     // greens and loop-carried greens follow. An identity slot aliasing
@@ -1353,12 +1360,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // count (the whole state is a single red in the merge-point payload), and an
     // index into one picks out a different value than the same index into the
     // other. That prefix is `num_int_identity + num_vable_identity_slots +
-    // num_ref_scalars + num_float_scalars` with the identity at flat index
-    // `num_int_identity` — the order `extract_live` emits. A plain `[int]`
+    // num_ref_scalars + num_float_scalars`. A `[.. ; virt]` state's identity
+    // sits at `num_int_identity`; a `virtualizable_fields` heap object sits
+    // at `heap_vable_index` (int scalars, then ptr then len per `[int]`,
+    // then its `ref(_)` slot). Both are compile-time functions of the
+    // declared layout, matching `make_virtualizable_infos`. A plain `[int]`
     // is ptr then len (`jtransform.py` `rewrite_op_getarrayitem` raw arm:
-    // the Vec / slice element buffer is a raw `{ptr, len}` view), so the
-    // identity index is a compile-time constant
-    // (`warmspot.py` `index_of_virtualizable`).
+    // the Vec / slice element buffer is a raw `{ptr, len}` view).
     //
     // Whether the contract CAN be declared at all is the declared field type's
     // answer, not this expansion's: `compile.py:441-457`'s reconstruction
@@ -1697,10 +1705,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 decl.var_name
             );
         };
-        // The vable base register follows the portal's ref greens
-        // (`with_vable_input_ref_reg` in codegen_trace). `ref_identity_base`
-        // is the first state ref scalar, one past that register.
-        let identity_ref_bank_index = ref_identity_base.saturating_sub(1);
+        // The object is the named red at the vable input register
+        // (`with_vable_input_ref_reg` in codegen_trace), which is also
+        // `ref_identity_base` so restore reads it from the same slot
+        // `make_virtualizable_infos` indexes.
+        let identity_ref_bank_index = ref_identity_base;
         heap_frame_virtualizable_methods(decl, struct_path, index, identity_ref_bank_index)
     } else {
         quote! {}
