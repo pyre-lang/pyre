@@ -12677,6 +12677,102 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
 }
 
 #[test]
+fn extra_info_rewindable_allocation_includes_can_raise_with_empty_writes() {
+    // Constructors that allocate and raise-consume the result are CanRaise
+    // with a known-empty write set: rewindable, not identity-elidable.
+    let can_raise_empty = majit_ir::EffectInfo::default();
+    assert_eq!(can_raise_empty.extraeffect, majit_ir::ExtraEffect::CanRaise);
+    assert!(super::inline_call::extra_info_is_rewindable_allocation(
+        &can_raise_empty
+    ));
+
+    assert!(!super::inline_call::extra_info_is_rewindable_allocation(
+        &majit_ir::EffectInfo::MOST_GENERAL
+    ));
+
+    let mut elidable = majit_ir::EffectInfo::default();
+    elidable.extraeffect = majit_ir::ExtraEffect::ElidableCanRaise;
+    assert!(super::inline_call::extra_info_is_rewindable_allocation(
+        &elidable
+    ));
+}
+
+#[test]
+fn walker_record_guard_exception_last_exc_is_guard_op_when_class_is_not_const() {
+    // `pyjitpl.py handle_possible_exception` after
+    // `execute_raised(..., constant=False)`: last_exc_box is the
+    // GUARD_EXCEPTION result, not ConstPtr of the recording-time instance.
+    use crate::state::ConcreteValue;
+    use pyre_object::interp_exceptions::{ExcKind, w_exception_new};
+
+    let mut tc = fresh_trace_ctx();
+    let live = w_exception_new(ExcKind::ValueError, "boom");
+    let seed = tc.const_ref(live as i64);
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+    wc.outer_resume_marker_jit_pc = Some(0);
+    wc.set_last_exc_value(seed, ConcreteValue::Ref(live));
+    wc.fbw_mode.class_of_last_exc_is_const = false;
+    super::walker_record_guard_exception(&mut wc, 0)
+        .expect("GUARD_EXCEPTION records with a live exception");
+    let last = wc
+        .last_exc_value()
+        .expect("handle_possible_exception keeps last_exc_box");
+    assert!(
+        !last.is_constant(),
+        "last_exc_box is the GUARD_EXCEPTION op, not ConstPtr of the recording instance"
+    );
+    assert_eq!(
+        wc.trace_ctx.opcode_of(last),
+        Some(majit_ir::OpCode::GuardException)
+    );
+    assert!(wc.fbw_mode.class_of_last_exc_is_const);
+    drop(wc);
+}
+
+#[test]
 fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
     // EF_CANNOT_RAISE: `pure=False` + `exc=False` — bare CallR,
     // no GUARD_NO_EXCEPTION.

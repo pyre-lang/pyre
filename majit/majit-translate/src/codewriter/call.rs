@@ -9994,13 +9994,16 @@ impl CallControl {
         //
         // Exception-object materialisers (`pyerror_*_to_exc_object`) are the
         // fused residual of `PyError::<kind>(msg)` + `to_exc_object`. They
-        // allocate the exception instance the raise consumes, which is the
-        // same contract `residual_call_is_effect_free` gives an elidable
-        // residual: a rewind discards the allocation, and the raise uses the
-        // result so the call is not dropped. `RandomEffectsAnalyzer` of the
-        // `dont_look_inside` stub, or a top write set, would otherwise force
-        // `EF_RANDOM_EFFECTS` and the descent scan would treat the fused
-        // residual as an effect (`inline_call.rs residual_call_is_effect_free`).
+        // allocate a fresh exception instance the raise consumes. A rewind
+        // discards the allocation, and the raise uses the result so the call
+        // is not dropped — the rewindable-allocation contract
+        // `residual_call_is_effect_free` gives a CanRaise residual with a
+        // known-empty write set. They are not identity-elidable: folding
+        // them to ConstPtr reuses the recording-time instance across
+        // compiled iterations (`history.rs record_result_of_call_pure`).
+        // `RandomEffectsAnalyzer` of the `dont_look_inside` stub, or a top
+        // write set, would otherwise force `EF_RANDOM_EFFECTS` and the
+        // descent scan would treat the fused residual as an effect.
         let materializer = match shape {
             CallShape::Direct(target) => self.target_is_exception_object_materializer(target),
             CallShape::Indirect(_) => false,
@@ -10018,7 +10021,7 @@ impl CallControl {
             extraeffect = Some(ExtraEffect::RandomEffects);
         }
         if materializer && extraeffect.is_none() {
-            extraeffect = Some(ExtraEffect::ElidableCanRaise);
+            extraeffect = Some(ExtraEffect::CanRaise);
         }
         let can_invalidate = random_effects
             || match shape {
@@ -10165,7 +10168,7 @@ impl CallControl {
         };
         let effects = if materializer {
             // Empty write set: a top image would force `EF_RANDOM_EFFECTS`
-            // in `effectinfo_from_writeanalyze` and undo the elidable mark.
+            // in `effectinfo_from_writeanalyze` and undo the CanRaise mark.
             ReadWriteEffects::bottom_result()
         } else {
             match shape {
@@ -16293,9 +16296,10 @@ mod tests {
 
     /// Fused `pyerror_*_to_exc_object` residuals are rewindable allocations
     /// (`residual_call_is_effect_free`): `getcalldescr` must not collapse
-    /// them to `EF_RANDOM_EFFECTS`.
+    /// them to `EF_RANDOM_EFFECTS`, and must not mark them identity-elidable
+    /// (`record_result_of_call_pure` would ConstPtr-fold the recording instance).
     #[test]
-    fn exception_object_materializer_is_elidable_can_raise() {
+    fn exception_object_materializer_is_can_raise() {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments([
             "pyre_interpreter",
@@ -16320,12 +16324,15 @@ mod tests {
             &mut cache,
             None,
         );
-        assert_eq!(
-            descriptor.extra_info.extraeffect,
-            ExtraEffect::ElidableCanRaise
-        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
         assert!(descriptor.extra_info.can_collect);
-        assert!(descriptor.extra_info._write_descrs_fields.is_some());
+        assert!(!descriptor.extra_info.can_invalidate);
+        let writes = descriptor
+            .extra_info
+            ._write_descrs_fields
+            .as_ref()
+            .expect("materializer write set is known, not the random-effects wildcard");
+        assert!(writes.is_empty());
     }
 
     #[test]

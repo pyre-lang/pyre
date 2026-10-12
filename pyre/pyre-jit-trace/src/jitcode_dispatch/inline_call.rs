@@ -1568,6 +1568,13 @@ fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> O
 /// callee, `ensure_object_subclass_ranges_initialized`, is a `OnceLock`
 /// initializer, which is that property in its strongest form.
 ///
+/// A `CanRaise` residual with a known-empty write set is a rewindable
+/// allocation: the call may allocate (and the raise consumes the result) but
+/// it does not mutate existing heap, so a rewind discards the object.
+/// Identity-elidable folding is a separate property (`EF_ELIDABLE_*`);
+/// constructors stay `CanRaise` so `record_result_of_call_pure` cannot
+/// ConstPtr-fold the recording-time instance.
+///
 /// Anything else keeps the scan's conservative reading of an executed
 /// residual call as effectful.
 fn residual_call_is_effect_free(descr_index: usize) -> bool {
@@ -1578,7 +1585,12 @@ fn residual_call_is_effect_free(descr_index: usize) -> bool {
     let Some(call) = descr.as_call_descr() else {
         return false;
     };
-    let info = call.get_extra_info();
+    extra_info_is_rewindable_allocation(call.get_extra_info())
+}
+
+/// Effectinfo shape of a residual the descent scan may rewind: elidable /
+/// loop-invariant / `not_in_trace`, or `CanRaise` with known-empty writes.
+pub(crate) fn extra_info_is_rewindable_allocation(info: &majit_ir::EffectInfo) -> bool {
     info.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace
         || matches!(
             info.extraeffect,
@@ -1587,6 +1599,18 @@ fn residual_call_is_effect_free(descr_index: usize) -> bool {
                 | majit_ir::ExtraEffect::ElidableOrMemoryError
                 | majit_ir::ExtraEffect::LoopInvariant
         )
+        || (info.extraeffect == majit_ir::ExtraEffect::CanRaise
+            && !info.can_invalidate
+            && write_descr_sets_known_empty(info))
+}
+
+fn write_descr_sets_known_empty(info: &majit_ir::EffectInfo) -> bool {
+    fn known_empty(set: &Option<Vec<majit_ir::DescrRef>>) -> bool {
+        matches!(set, Some(v) if v.is_empty())
+    }
+    known_empty(&info._write_descrs_fields)
+        && known_empty(&info._write_descrs_arrays)
+        && known_empty(&info._write_descrs_interiorfields)
 }
 
 /// The arm targets of the `switch/id` whose descr is `descr_index`, in key
@@ -15010,10 +15034,18 @@ fn descend_generatorentry<Sym: WalkSym>(
     if raised != 0 {
         // A returning generator raises `StopIteration` out of `send_ex`.
         // The executor already returned that exception word.
+        // `execute_raised(..., constant=False)` then
+        // `handle_possible_exception`: SubRaise carries the GUARD_EXCEPTION
+        // result, not ConstPtr of the recording-time instance.
         let exc = ctx.trace_ctx.const_ref(raised);
         let exc_concrete = ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
         ctx.set_last_exc_value(exc, exc_concrete);
+        ctx.fbw_mode.class_of_last_exc_is_const = false;
         walker_record_guard_exception(ctx, op.pc)?;
+        let exc = ctx
+            .last_exc_value()
+            .expect("walker_record_guard_exception seeds last_exc_value");
+        let exc_concrete = ctx.last_exc_value_concrete();
         return Ok(Some((
             DispatchOutcome::SubRaise { exc, exc_concrete },
             op.next_pc,
