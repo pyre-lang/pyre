@@ -183,16 +183,6 @@ pub struct BhJitDriverSd {
 /// normal return while letting everything else through.  So upstream has three
 /// exits, and each one leaves different state behind for `_resume_mainloop` to
 /// read.  Naming them keeps the caller from having to infer which happened.
-///
-/// The fourth, [`Self::EndOfCode`], has no upstream counterpart: reading past
-/// the last byte is an `IndexError` there.  It exists here because pyre's unit
-/// builders emit jitcodes that simply end, and it is a distinct variant rather
-/// than a synonym for [`Self::LeaveFrame`] because the two differ in exactly
-/// the state a caller goes on to publish — `return_type` and `tmpreg_*` are
-/// written by a `*_return` handler and cleared by neither `cleanup_registers`
-/// (upstream has no such slot to clear) nor `release_interp`, so a frame that
-/// merely ran out of bytes carries the previous occupant of its pooled
-/// interpreter to the caller's result register.
 #[derive(Debug)]
 pub enum BhRunOutcome {
     /// A `*_return` handler raised `LeaveFrame`: `return_type` and the matching
@@ -203,9 +193,6 @@ pub enum BhRunOutcome {
     Exception,
     /// `blackhole.py:1068` `raise ContinueRunningNormally(*args)`.
     ContinueRunningNormally(Box<MergePointArgs>),
-    /// The dispatch loop ran out of bytecode without returning.  No upstream
-    /// counterpart — see the type's own docs.
-    EndOfCode,
 }
 
 /// Signal raised by handlers and propagated up through `dispatch_step` to `run`.
@@ -1275,18 +1262,6 @@ impl BlackholeInterpreter {
             BhRunOutcome::ContinueRunningNormally(args) => {
                 return Err(JitException::ContinueRunningNormally(args));
             }
-            // `blackhole.py:1633` reads `self._return_type` next, and it only
-            // gets there because `dispatch_loop` raised `LeaveFrame` from a
-            // `*_return` handler that had just written it.  Nothing writes it
-            // on the way out of a frame that merely ran out of bytecode, and
-            // nothing clears it either, so the read below would publish the
-            // result of whatever ran on this pooled interpreter last.
-            BhRunOutcome::EndOfCode => panic!(
-                "resume_mainloop: jitcode {:?} index {:?} ended without a return \
-                 opcode, so there is no result to pass to the caller",
-                self.jitcode.name,
-                self.jitcode.try_index(),
-            ),
             BhRunOutcome::LeaveFrame | BhRunOutcome::Exception => {}
         }
 
@@ -2011,17 +1986,15 @@ impl BlackholeInterpreter {
         let mut regs_i = self.registers_i.as_mut_ptr();
         let mut regs_r = self.registers_r.as_mut_ptr();
         loop {
-            if position >= code.len() {
-                self.position = position;
-                if trace {
-                    eprintln!(
-                        "[bh-trace] finished at pos={} reg0={}",
-                        position,
-                        self.registers_i.first().copied().unwrap_or(-1)
-                    );
-                }
-                return BhRunOutcome::EndOfCode;
-            }
+            // `dispatch_loop` is `while True:` over `ord(code[position])`:
+            // a jitcode leaves through a `*_return` handler or an exception,
+            // and reading past its last byte is an error.
+            assert!(
+                position < code.len(),
+                "dispatch_loop: position {position} is past the end of jitcode {:?} index {:?}",
+                self.jitcode.name,
+                self.jitcode.try_index(),
+            );
             if check_startpoints && let Some(startpoints) = self.jitcode.startpoints.as_ref() {
                 assert!(
                     startpoints.contains(&position),
@@ -4625,6 +4598,7 @@ mod tests {
                 "goto_if_not_ptr_nonzero/rL".to_string(),
                 insns::BC_GOTO_IF_NOT_PTR_NONZERO,
             );
+            entries.insert("void_return/".to_string(), insns::BC_VOID_RETURN);
             builder.setup_insns(&entries);
             wire_bhimpl_handlers(&mut builder);
             builder
@@ -4942,6 +4916,7 @@ mod tests {
             b.load_const_i_value(0, 10);
             b.load_const_i_value(1, 20);
             b.record_binop_i(2, OpCode::IntAdd, 0, 1);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -4962,6 +4937,7 @@ mod tests {
             b.load_const_i_value(1, 42); // should be skipped
             b.mark_label(lbl);
             b.load_const_i_value(2, 99);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -4982,6 +4958,7 @@ mod tests {
             b.load_const_i_value(1, 42); // NOT skipped
             b.mark_label(lbl);
             b.load_const_i_value(2, 99);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -5001,6 +4978,7 @@ mod tests {
             b.load_const_i_value(0, 42); // skipped
             b.mark_label(lbl);
             b.load_const_i_value(1, 99);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -5017,6 +4995,7 @@ mod tests {
             let mut b = JitCodeBuilder::default();
             b.load_const_i_value(0, 42);
             b.move_i(1, 0);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -5197,6 +5176,7 @@ mod tests {
             let mut b = JitCodeBuilder::default();
             b.load_const_i_value(0, 42);
             b.record_unary_i(1, OpCode::IntNeg, 0);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -5212,6 +5192,7 @@ mod tests {
             let mut b = JitCodeBuilder::default();
             b.load_const_r_value(0, 0x1234);
             b.ptr_nonzero(1, 0);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -5231,6 +5212,7 @@ mod tests {
             b.load_const_i_value(1, 42); // should be skipped
             b.mark_label(lbl);
             b.load_const_i_value(2, 99);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -5247,6 +5229,7 @@ mod tests {
             let mut b = JitCodeBuilder::default();
             // Just record a binop to read r0 + r1
             b.record_binop_i(2, OpCode::IntMul, 0, 1);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder = build_test_bh_builder();
@@ -5748,6 +5731,7 @@ mod tests {
             b.load_const_i_value(0, 21);
             let sub_idx = b.add_sub_jitcode(sub_jitcode);
             b.inline_call_ir_i(sub_idx, &[(0, 0)], &[], Some(1));
+            b.void_return();
             let jitcode = b.finish();
 
             // route through `handler_inline_call_nested_ext`
@@ -6211,6 +6195,7 @@ mod tests {
             b.load_const_r_value(0, 0xDEAD_BEEF);
             let sub_idx = b.add_sub_jitcode(sub_jitcode);
             b.inline_call_ir_r(sub_idx, &[], &[(0, 0)], Some(1));
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder =
@@ -6236,6 +6221,7 @@ mod tests {
             b.load_const_f_value(0, bits);
             let sub_idx = b.add_sub_jitcode(sub_jitcode);
             b.inline_call_irf_f(sub_idx, &[], &[], &[(0, 0)], Some(1));
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder =
@@ -6266,6 +6252,7 @@ mod tests {
             b.load_const_i_value(0, 99);
             let sub_idx = b.add_sub_jitcode(sub_jitcode);
             b.inline_call_ir_v(sub_idx, &[], &[], None);
+            b.void_return();
             let jitcode = b.finish();
 
             let mut builder =
@@ -13846,12 +13833,6 @@ fn interpret_unresolved_inline_call(
                 bh.position = post_p;
                 break 'callee Err(DispatchError::ContinueRunningNormally(args));
             }
-            BhRunOutcome::EndOfCode => panic!(
-                "inline_call: callee jitcode {:?} index {:?} ended without a \
-                 return opcode, so there is no result for the caller",
-                callee.jitcode.name,
-                callee.jitcode.try_index(),
-            ),
             BhRunOutcome::LeaveFrame | BhRunOutcome::Exception => {}
         }
         if callee.aborted {
@@ -14335,15 +14316,6 @@ fn handler_inline_call_nested_ext(
                 bh.position = p;
                 break 'callee Err(DispatchError::ContinueRunningNormally(args));
             }
-            // Same reason as `resume_mainloop`: the caller copies the callee's
-            // `return_type` / `tmpreg_*` into its own result register below,
-            // and a callee that ran out of bytecode never wrote either.
-            BhRunOutcome::EndOfCode => panic!(
-                "inline_call: callee jitcode {:?} index {:?} ended without a \
-                 return opcode, so there is no result for the caller",
-                callee.jitcode.name,
-                callee.jitcode.try_index(),
-            ),
             BhRunOutcome::LeaveFrame | BhRunOutcome::Exception => {}
         }
 

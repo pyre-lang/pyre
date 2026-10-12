@@ -3101,24 +3101,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         // Running even one opcode first consumes that garbage as a successful
         // return and replaces the real exception with a secondary TypeError.
         let run_outcome = (!bh.got_exception).then(|| bh.run());
-        // A frame that ran out of bytecode never reached a `*_return` handler,
-        // so `return_type` and `tmpreg_*` still hold whatever the previous
-        // occupant of this pooled interpreter left there — and the tail of this
-        // loop publishes exactly those two to the caller.  `blackhole.py`'s
-        // `dispatch_loop` cannot reach that state at all: it is `while True:`
-        // over `ord(code[position])`, so reading past the end raises.
-        if matches!(
-            run_outcome,
-            Some(majit_metainterp::blackhole::BhRunOutcome::EndOfCode)
-        ) {
-            let name = bh.jitcode.name().to_string();
-            let index = bh.jitcode.try_index();
-            release_bh_rd(bh);
-            panic!(
-                "blackhole_resume_via_rd_numb: jitcode {name:?} index {index:?} ended \
-                 without a return opcode, so there is no result to pass to the caller"
-            );
-        }
         if let Some(majit_metainterp::blackhole::BhRunOutcome::ContinueRunningNormally(args)) =
             run_outcome
         {
