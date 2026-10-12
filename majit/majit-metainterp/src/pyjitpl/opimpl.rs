@@ -1203,18 +1203,16 @@ where
                 Some(Value::Ref(r)) => Some(r.0 as i64),
                 _ => None,
             };
-            let executed = if is_ref {
-                ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Ref)
+            let kind = if is_ref { Type::Ref } else { Type::Int };
+            let executed = if struct_ptr != 0 {
+                ctx.field_sanity_load(struct_ptr, &fielddescr, kind)
                     .and_then(|v| match v {
                         Value::Ref(r) => Some(r.0 as i64),
-                        _ => None,
-                    })
-            } else {
-                ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Int)
-                    .and_then(|v| match v {
                         Value::Int(n) => Some(n),
                         _ => None,
                     })
+            } else {
+                None
             };
             let compare = executed.unwrap_or(loaded);
             assert!(
