@@ -728,6 +728,25 @@ impl DescEntry {
         }
     }
 
+    /// Upstream `desc.pyobj` as a [`ConstValue`], the value
+    /// `SomePBC.__init__` stores on `self.const` when the PBC has a
+    /// single description (`model.py`). HostObject descs wrap
+    /// [`Self::pyobj`]; a Repr frozen desc answers with the stored
+    /// `ConstValue::Repr`.
+    pub(crate) fn pyobj_const(&self) -> Option<ConstValue> {
+        match self {
+            DescEntry::Frozen(rc) => {
+                let fd = rc.borrow();
+                if let Some(value) = fd.const_value.clone() {
+                    Some(value)
+                } else {
+                    fd.base.pyobj.clone().map(ConstValue::HostObject)
+                }
+            }
+            _ => self.pyobj().map(ConstValue::HostObject),
+        }
+    }
+
     /// RPython `type(desc)` classifier — maps enum variants back to
     /// the [`super::model::DescKind`] used by
     /// [`super::model::SomePBC::getKind`] (model.py).
@@ -3087,6 +3106,10 @@ pub struct FrozenDesc {
     pub attrcache: RefCell<HashMap<String, ConstValue>>,
     /// RPython `self.knowntype = new_or_old_class(pyobj)` (description.py).
     pub knowntype: Option<HostObject>,
+    /// Upstream `FrozenDesc.pyobj` when the frozen object is not a
+    /// HostObject (`ConstValue::Repr`). HostObject frozen PBCs keep
+    /// `base.pyobj`.
+    const_value: Option<ConstValue>,
     /// RPython `self._read_attribute` (description.py:533-534) — the
     /// caller-supplied attribute-source closure, or the
     /// `lambda attr: getattr(pyobj, attr)` default when none is
@@ -3101,6 +3124,7 @@ impl std::fmt::Debug for FrozenDesc {
             .field("base", &self.base)
             .field("attrcache", &self.attrcache)
             .field("knowntype", &self.knowntype)
+            .field("const_value", &self.const_value)
             .field("_read_attribute", &"<closure>")
             .finish()
     }
@@ -3135,17 +3159,20 @@ impl FrozenDesc {
             base: Desc::new(bookkeeper, Some(pyobj)),
             attrcache: RefCell::new(HashMap::new()),
             knowntype,
+            const_value: None,
             _read_attribute: read_attribute,
         })
     }
 
-    /// A frozen description with no host object. `Repr._freeze_` is true
-    /// and has no attributes; attribute reads miss.
-    pub fn prebuilt(bookkeeper: Rc<Bookkeeper>) -> Self {
+    /// A frozen description for a non-HostObject prebuilt constant.
+    /// `Repr._freeze_` is true and has no attributes; attribute reads
+    /// miss. `const_value` is upstream `FrozenDesc.pyobj`.
+    pub fn prebuilt(bookkeeper: Rc<Bookkeeper>, const_value: ConstValue) -> Self {
         FrozenDesc {
             base: Desc::new(bookkeeper, None),
             attrcache: RefCell::new(HashMap::new()),
             knowntype: None,
+            const_value: Some(const_value),
             _read_attribute: Box::new(|_attr: &str| {
                 Err(crate::flowspace::model::HostGetAttrError::Missing)
             }),
