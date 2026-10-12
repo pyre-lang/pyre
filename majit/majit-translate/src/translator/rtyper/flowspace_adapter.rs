@@ -2293,6 +2293,29 @@ pub fn translate_op(
             };
             let result = resolve_result_hlvalue(op, value_map)?;
             let name = Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name)));
+            // `t.N = v` of a Rust tuple is `setitem(t, N, v)` on the
+            // `SomeTuple` (`rtuple.py` `rtype_getitem` is the read half;
+            // construction `__pos_i` writes are rebuilt as `newtuple`
+            // above and never reach here).
+            if field
+                .owner_root
+                .as_deref()
+                .is_some_and(majit_ir::descr::is_shaped_tuple_name)
+                && let Some(index) = field
+                    .name
+                    .strip_prefix("__pos_")
+                    .and_then(|n| n.parse::<i64>().ok())
+            {
+                return Ok(vec![FlowspaceOp::new(
+                    "setitem",
+                    vec![
+                        base_hl,
+                        Hlvalue::Constant(Constant::new(ConstValue::Int(index))),
+                        value_hl,
+                    ],
+                    result,
+                )]);
+            }
             let variant_owner = field.owner_root.as_deref().filter(|root| {
                 let Some((parent, _)) = root.rsplit_once("::") else {
                     return false;
@@ -10477,6 +10500,57 @@ mod tests {
         assert!(matches!(
             &startblock.operations[1].args[1],
             Hlvalue::Constant(c) if c.value == ConstValue::Int(1)
+        ));
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_tuple_field_write_becomes_setitem() {
+        let mut graph = LegacyGraph::new("tuple_setitem");
+        let vars = mint_vars(&mut graph, 4);
+        let owner = "Tuple<i64,i64>".to_string();
+        let pos0 = crate::model::FieldDescriptor::new("__pos_0", Some(owner));
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: vars[1].clone(),
+                    field: pos0,
+                    value: LinkArg::Const(Constant::new(ConstValue::Int(0))),
+                    ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("tuple field write must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        assert_eq!(startblock.operations.len(), 1);
+        let op = &startblock.operations[0];
+        assert_eq!(op.opname, "setitem");
+        assert_eq!(op.args.len(), 3);
+        assert!(matches!(
+            &op.args[1],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(0)
         ));
     }
 

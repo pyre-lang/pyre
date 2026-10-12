@@ -1718,11 +1718,14 @@ fn cast_instance_intrinsic(
         }
     };
     let operand = arg_at(args_s, 0, crate::runtime_names::shims::CAST_INSTANCE);
-    let projected = if root == "GCREF" {
+    let projected = if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
         // RPython GC-transform root slots are llmemory.GCREF.  Rust spells
-        // the helper parameter/return as PyObjectRef, but that carrier must
-        // not mint a W_Root instance annotation: every concrete GC pointer
-        // is cast_opaque_ptr'd into this slot and restored afterward.
+        // the helper parameter/return as PyObjectRef / `*mut GCREFOpaque`,
+        // but that carrier must not mint a classdef instance: every concrete
+        // GC pointer is cast_opaque_ptr'd into this slot and restored
+        // afterward.  `pairtype(SomePtr, SomeObject).union` (`llannotation.py`)
+        // refuses Instance ∪ Ptr, so a GCREFOpaque classdef cannot share a
+        // `dstorage` / `frame_ptr` attr with the SomePtr field projection.
         crate::translator::rtyper::llannotation::lltype_to_annotation(
             crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
         )
@@ -1776,7 +1779,7 @@ fn cast_instance_intrinsic(
             ))),
         };
     }
-    if root == "GCREF" {
+    if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
         return match operand {
             SomeValue::String(_)
             | SomeValue::Instance(_)
@@ -3378,6 +3381,33 @@ mod tests {
             matches!(out, SomeValue::String(_)),
             "BytesBlock root must project dest as SomeString, got {out:?}"
         );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_gcrefopaque_root_is_someptr() {
+        // `W_DictObject.dstorage` / `GeneratorIterator.frame_ptr` are GCREF
+        // fields (`lltype.GCREF`). A `__cast_instance_intrinsic` onto the
+        // Rust pointee `GCREFOpaque` must return that SomePtr, not mint a
+        // classdef — `pairtype(SomePtr, SomeObject).union` refuses
+        // Instance ∪ Ptr (`llannotation.py`).
+        let bk = bk();
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        for root in ["GCREF", "GCREFOpaque", "gc_hook::GCREFOpaque"] {
+            let s_root = bk
+                .immutablevalue(&ConstValue::byte_str(root))
+                .expect("gcref root constant");
+            let out = call_builtin(
+                &bk,
+                crate::runtime_names::shims::CAST_INSTANCE,
+                &[Some(s_ptr.clone()), Some(s_root)],
+                &no_kwds(),
+            )
+            .unwrap_or_else(|e| panic!("{root} cast_instance_intrinsic: {e}"));
+            assert!(
+                matches!(out, SomeValue::Ptr(_)),
+                "{root} must project dest as SomePtr(GCREF), got {out:?}"
+            );
+        }
     }
 
     #[test]

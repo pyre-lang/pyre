@@ -11510,6 +11510,28 @@ impl<'a> Lowering<'a> {
         // `[variant, index]`). The read side resolves that index through
         // the base type; capture the type before `inner` is consumed.
         let field_base_ty = clone_tyref(&inner.ty);
+        // A Field write of a genuine Ref tuple (`(*p).N = v` / `t.N = v`)
+        // is the write half of the FieldRead `__pos_N` arm (`place_is_tuple`).
+        // Charon tuples are not `TypeDeclKind::Struct`, so `resolve_adt_field`
+        // returns None and the fallback names the field `Field_0` typed Int —
+        // `SomeInstance.setattr("Field_0")` on the classdef-less GCREF
+        // (`unaryop.py` setattr).  Narrow a deref base to `Tuple{suffix}`
+        // first (same `__cast_instance_intrinsic` the read uses) and keep
+        // `__pos_N` so the adapter emits `setitem`.
+        let tuple_field_write = if self.place_is_tuple(&inner) {
+            let suffix = tyref_tuple_suffix(&inner.ty, self.llbc);
+            if suffix.is_empty() {
+                None
+            } else {
+                let deref = matches!(
+                    &inner.kind,
+                    PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
+                );
+                Some((suffix, deref))
+            }
+        } else {
+            None
+        };
         let base = self.resolve_place(mir_bb, inner)?;
         let bb_id = self.emit_bb(mir_bb);
         let op = match &elem {
@@ -11798,6 +11820,39 @@ impl<'a> Lowering<'a> {
                             ))
                         })?;
                         self.emit_inlined_struct_leaf_copy(mir_bb, &base, &src, nested);
+                        return Ok(());
+                    }
+                    if let Some((suffix, deref)) = &tuple_field_write
+                        && let Some(idx) = self.positional_field_index(field_payload)
+                    {
+                        let owner = format!("Tuple{suffix}");
+                        let base = if *deref {
+                            let narrowed = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(narrowed.clone()),
+                                kind: crate::model::cast_instance_call(owner.clone(), base),
+                            });
+                            narrowed
+                        } else {
+                            base
+                        };
+                        let ty = tyref_to_value_type_with(
+                            dest_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        );
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: None,
+                            kind: OpKind::FieldWrite {
+                                base,
+                                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner)),
+                                value,
+                                ty,
+                            },
+                        });
                         return Ok(());
                     }
                     // Resolve the field through its TypeDecl exactly

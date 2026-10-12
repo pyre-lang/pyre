@@ -631,6 +631,12 @@ fn dispatch_rtype_op(
         (TupleRepr, IntegerRepr, "getitem") => {
             committed(super::rtuple::pair_tuple_int_rtype_getitem(r1, hop))
         }
+        // Write half of `rtype_getitem`. RPython has no
+        // `pairtype(TupleRepr, IntegerRepr).rtype_setitem` (`TUPLE_TYPE`
+        // is immutable); a Rust tuple field store is `setfield itemN`.
+        (TupleRepr, IntegerRepr, "setitem") => {
+            committed(super::rtuple::pair_tuple_int_rtype_setitem(r1, hop))
+        }
         // rstr.py — `pair(AbstractStringRepr, IntegerRepr).rtype_getitem`.
         // Pyre handles the nonneg + checkidx=False branch; other
         // branches (negative-index ll_stritem, checkidx

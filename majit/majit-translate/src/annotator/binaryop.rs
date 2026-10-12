@@ -1926,6 +1926,22 @@ fn init_tuple_integer_pairtype(
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
         },
     );
+    // Write half of `getitem((tup1, int2))`. RPython tuples are immutable
+    // (`SomeTuple.immutable`, `TUPLE_TYPE` hints `immutable=True`) so
+    // `binaryop.py` has no `setitem` on `pairtype(SomeTuple, SomeInteger)`.
+    // A Rust tuple field store (`t.N = v`, `mem::take` of a storage pair)
+    // is that `setitem`; a constant index unions that item, otherwise
+    // every item. `can_only_throw = [IndexError]` matches getitem.
+    register(
+        reg,
+        OpKind::SetItem,
+        SomeValueTag::Tuple,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: Box::new(tuple_integer_setitem),
+            can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
+        },
+    );
 }
 
 fn tuple_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
@@ -1956,6 +1972,60 @@ fn tuple_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
         return s_impossible_value();
     }
     unionof(tup1.items.iter()).expect("tuple_int_getitem: unionof failed")
+}
+
+fn tuple_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
+    let tup1 = match ann.annotation(&hl.args[0]) {
+        Some(SomeValue::Tuple(t)) => t,
+        _ => panic!("tuple_int_setitem: arg 0 not SomeTuple"),
+    };
+    let int2 = match ann.annotation(&hl.args[1]) {
+        Some(SomeValue::Integer(i)) => i,
+        _ => panic!("tuple_int_setitem: arg 1 not SomeInteger"),
+    };
+    let s_value = ann
+        .annotation(&hl.args[2])
+        .expect("tuple_int_setitem: missing value arg");
+    let mut items = tup1.items;
+    let indices: Vec<usize> = if int2.is_immutable_constant()
+        && let Some(c) = &int2.base.const_box
+        && let ConstValue::Int(idx) = c.value
+    {
+        let idx_usize = if idx < 0 {
+            let adj = items.len() as i64 + idx;
+            if adj < 0 {
+                return None;
+            }
+            adj as usize
+        } else {
+            idx as usize
+        };
+        if idx_usize >= items.len() {
+            return None;
+        }
+        vec![idx_usize]
+    } else {
+        (0..items.len()).collect()
+    };
+    for idx in indices {
+        match model::union(&items[idx], &s_value) {
+            Ok(joined) => items[idx] = joined,
+            // A one-word `Vec` slot is `RustVecRepr` (kind `int`):
+            // `Default` / inlined `mem::take` writes Signed 0 as the null
+            // header address and does not generalize the item.
+            Err(_)
+                if matches!(
+                    (&items[idx], &s_value),
+                    (SomeValue::RustVec(_), SomeValue::Integer(_))
+                ) => {}
+            Err(e) => panic!("tuple_int_setitem: UnionError: {e}"),
+        }
+    }
+    if let Hlvalue::Variable(v) = &hl.args[0] {
+        let mut v = v.clone();
+        ann.setbinding(&mut v, SomeValue::Tuple(SomeTuple::new(items)));
+    }
+    None
 }
 
 // binaryop.py __extend__ — pairtype(SomeList, SomeInteger)
@@ -3395,6 +3465,83 @@ mod tests {
         );
         let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_tuple_integer_setitem_unions_constant_item() {
+        let ann = mk_ann();
+        let mut v0 = Variable::named("t");
+        let mut v1 = Variable::named("i");
+        let mut v2 = Variable::named("x");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::Tuple(SomeTuple::new(vec![
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::String(SomeString::new(false, false)),
+            ])),
+        );
+        let mut const_idx = SomeInteger::default();
+        const_idx.base.const_box = Some(Constant::new(ConstValue::Int(0)));
+        ann.setbinding(&mut v1, SomeValue::Integer(const_idx));
+        ann.setbinding(&mut v2, SomeValue::Integer(SomeInteger::default()));
+        let hl = HLOperation::new(
+            OpKind::SetItem,
+            vec![
+                Hlvalue::Variable(v0.clone()),
+                Hlvalue::Variable(v1),
+                Hlvalue::Variable(v2),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap();
+        assert!(r.is_none(), "setitem is void, got {r:?}");
+        match ann.annotation(&Hlvalue::Variable(v0)) {
+            Some(SomeValue::Tuple(t)) => {
+                assert!(matches!(t.items[0], SomeValue::Integer(_)));
+                assert!(matches!(t.items[1], SomeValue::String(_)));
+            }
+            other => panic!("tuple annotation lost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consider_tuple_integer_setitem_null_header_keeps_rustvec() {
+        use super::model::SomeRustVec;
+        let ann = mk_ann();
+        let mut v0 = Variable::named("t");
+        let mut v1 = Variable::named("i");
+        let mut v2 = Variable::named("z");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::Tuple(SomeTuple::new(vec![SomeValue::RustVec(
+                SomeRustVec::for_kind(majit_ir::rvec::VecItemKind::Ref),
+            )])),
+        );
+        let mut const_idx = SomeInteger::default();
+        const_idx.base.const_box = Some(Constant::new(ConstValue::Int(0)));
+        ann.setbinding(&mut v1, SomeValue::Integer(const_idx));
+        let mut zero = SomeInteger::default();
+        zero.base.const_box = Some(Constant::new(ConstValue::Int(0)));
+        ann.setbinding(&mut v2, SomeValue::Integer(zero));
+        let hl = HLOperation::new(
+            OpKind::SetItem,
+            vec![
+                Hlvalue::Variable(v0.clone()),
+                Hlvalue::Variable(v1),
+                Hlvalue::Variable(v2),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap();
+        assert!(r.is_none(), "setitem is void, got {r:?}");
+        match ann.annotation(&Hlvalue::Variable(v0)) {
+            Some(SomeValue::Tuple(t)) => {
+                assert!(
+                    matches!(t.items[0], SomeValue::RustVec(_)),
+                    "null header write must keep SomeRustVec, got {:?}",
+                    t.items[0]
+                );
+            }
+            other => panic!("tuple annotation lost, got {other:?}"),
+        }
     }
 
     #[test]
