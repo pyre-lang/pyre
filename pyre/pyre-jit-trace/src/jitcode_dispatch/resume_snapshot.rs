@@ -3285,12 +3285,23 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     let mut tail_frame = super::operator_continuation_parent_frame(tail)
         .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
     tail_frame.boxes = vec![result];
-    walker_capture_transparent_helper_snapshot(
-        ctx,
-        op_pc,
-        vec![caller.clone(), tail_frame],
-        GuardStampTarget::LastOp,
-    )
+    // `capture_resumedata` walks every `MetaInterp.framestack` entry.
+    // `walker_capture_transparent_helper_snapshot` takes the same
+    // outermost-first chain: enclosing paused parents, then the immediate
+    // caller, then the operator tail. When FORMAT_WITH_SPEC / len / bool
+    // sits inside an already-inlined Python callee, dropping the portal
+    // and other ancestors would resume without that callee's caller.
+    let mut parent_frames = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .flat_map(|frame| frame.parents.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    parent_frames.push(caller.clone());
+    parent_frames.push(tail_frame);
+    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
 }
 
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN

@@ -1474,13 +1474,17 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
     Some(miframe)
 }
 
-/// Latch caller + operator tail after the dunder has already returned.
+/// Latch the enclosing frames, the immediate caller, and the operator tail
+/// after the dunder has already returned.
 ///
 /// `_inline_frame` has dropped, so the session framestack no longer holds
-/// the tail. The convert image is the same one a post-return guard
-/// snapshots: the paused caller plus the tail with the returned box in r0.
-/// `convert_and_run_from_pyjitpl` (`blackhole.py`) continues in the tail,
-/// which runs the operator's post-call check and never re-enters the dunder.
+/// the tail. `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`
+/// (`blackhole.py`) copy every frame, and `multi_frame_blackhole_preflight`
+/// requires frame 0 to be the walked portal, so start from every existing
+/// paused parent, outermost first — the same walk as
+/// `build_multi_frame_miframe`. Then the immediate caller and the tail with
+/// the returned box in r0. The convert continues in the tail, which runs
+/// the operator's post-call check and never re-enters the dunder.
 pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     caller: &InlineParentFrame,
@@ -1488,7 +1492,24 @@ pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
     result: OpRef,
 ) -> bool {
     let origin = "operator-tail-return";
-    let Some(caller_mf) = build_parent_miframe(ctx, caller, origin, 0) else {
+    let mut framestack = majit_metainterp::MIFrameStack::empty();
+    {
+        let session = ctx.session.borrow();
+        for (index, parent) in session
+            .framestack
+            .iter()
+            .flat_map(|inline| inline.parents.iter())
+            .enumerate()
+        {
+            let Some(miframe) = build_parent_miframe(ctx, parent, origin, index) else {
+                latchdbg!("origin={origin} enclosing index={index}");
+                return false;
+            };
+            framestack.push(miframe);
+        }
+    }
+    let enclosing = framestack.frames.len();
+    let Some(caller_mf) = build_parent_miframe(ctx, caller, origin, enclosing) else {
         latchdbg!("origin={origin} caller");
         return false;
     };
@@ -1515,12 +1536,12 @@ pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
         latchdbg!("origin={origin} tail-pjc");
         return false;
     };
-    let Some(tail_mf) = build_codeless_continuation_parent(ctx, &tail_parent, &pjc, origin, 1)
+    let Some(tail_mf) =
+        build_codeless_continuation_parent(ctx, &tail_parent, &pjc, origin, enclosing + 1)
     else {
         latchdbg!("origin={origin} tail-miframe");
         return false;
     };
-    let mut framestack = majit_metainterp::MIFrameStack::empty();
     framestack.push(caller_mf);
     framestack.push(tail_mf);
     if !multi_frame_blackhole_preflight(ctx, &framestack, origin) {
@@ -1530,7 +1551,15 @@ pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
         ConcreteValue::Ref(value) => value as i64,
         _ => 0,
     };
-    let mirror_stack = capture_vstack_mirror_image(ctx, origin);
+    let mirror_stack = if ctx.fbw_mode.inline_subwalk {
+        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
+            latchdbg!("origin={origin} mf-root-parent-stack");
+            return false;
+        };
+        Some(mirror_stack)
+    } else {
+        capture_vstack_mirror_image(ctx, origin)
+    };
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
         *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
             framestack,

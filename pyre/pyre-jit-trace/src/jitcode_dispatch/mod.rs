@@ -8200,6 +8200,21 @@ impl<'a> InlineFrameGuard<'a> {
         }
         InlineFrameGuard(session)
     }
+
+    /// Immediate paused caller stored on this level, taken from the rooted
+    /// session copy after the callee has returned.
+    ///
+    /// `walk_session_roots` updates `framestack` parents in place.
+    /// `MetaInterp.capture_resumedata` / `_copy_data_from_miframe` read the
+    /// live frames. A clone taken before the callee ran would be stale after
+    /// a moving collection inside the body.
+    fn rooted_immediate_caller(&self) -> Option<InlineParentFrame> {
+        self.0
+            .borrow()
+            .framestack
+            .last()
+            .and_then(|frame| frame.parents.first().cloned())
+    }
 }
 
 impl Drop for InlineFrameGuard<'_> {

@@ -9375,11 +9375,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // a paused caller image.  `compute_inline_caller_frame` failures were
     // residualized before the seed, so there is no caller-boundary collapse.
     let parent_frame = precomputed_parent_frame;
-    // Cloned before the sub-walk moves `parent_frame` into the inline
-    // frame guard. After the dunder returns, a post-return guard or a
-    // post-return abort snapshots the caller plus the operator tail, and
-    // `_inline_frame` has already dropped.
-    let operator_tail_caller = operator_tail.is_some().then(|| parent_frame.clone());
     let callee_frame_materialized_has_resume = callee_frame_seeded;
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
@@ -9568,7 +9563,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // return only reads as a raise when the callee installed the exception.
     // Nothing between here and the sub-walk writes the slot.
     let exc_before_subwalk = ctx.last_exc_value();
-    let (mut callee_outcome, callee_class_of_last_exc_is_const) = {
+    let (mut callee_outcome, callee_class_of_last_exc_is_const, operator_tail_caller) = {
         {
             let parent_state = ctx.frame_state.borrow();
             let mut state = callee_state.borrow_mut();
@@ -10145,7 +10140,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
-        (result, class_of_last_exc_is_const)
+        // After the dunder returns, take the caller from the rooted
+        // session framestack entry. `_inline_frame` still holds this
+        // level; a pre-call clone of `InlineParentFrame` is unrooted.
+        let operator_tail_caller =
+            operator_tail.and_then(|_| _inline_frame.rooted_immediate_caller());
+        (result, class_of_last_exc_is_const, operator_tail_caller)
     };
     // `executioncontext.py leave`, in the original's `finally`
     // position: the sub-walk block above is an expression that always
@@ -13441,9 +13441,6 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     receiver_op: OpRef,
     concrete_receiver: pyre_object::PyObjectRef,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(None);
-    }
     let Some((w_type, version_tag, w_len, attr_cell)) =
         (unsafe { pyre_interpreter::baseobjspace::len_fast_path(concrete_receiver) })
     else {
@@ -13610,7 +13607,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if ctx.fbw_mode.inline_subwalk || !ctx.is_authoritative_executor || r_args.len() != 1 {
+    if !ctx.is_authoritative_executor || r_args.len() != 1 {
         return Ok(None);
     }
 

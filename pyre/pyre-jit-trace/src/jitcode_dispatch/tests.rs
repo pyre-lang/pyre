@@ -75,6 +75,58 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
 }
 
 #[test]
+fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let roots = WalkSessionRoots::new(&session);
+    let parent = |word: usize| InlineParentFrame {
+        jitcode_index: 0,
+        call_jitcode_pc: None,
+        call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
+        blackhole: Some(InlineParentBlackhole {
+            resume_pc: 0,
+            int_values: Vec::new(),
+            ref_values: vec![(0, (word + 0x10) as pyre_object::PyObjectRef)],
+            float_values: Vec::new(),
+        }),
+        resume_coord: ParentResumeCoord::Backxlat(0),
+        resume_marker_jit_pc: None,
+        boxes: vec![OpRef::const_ptr(majit_ir::GcRef(word + 0x20))],
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+    };
+    let pre_call = parent(0x1000);
+    let stale = pre_call.clone();
+    let frame = InlineFrameGuard::enter(&session, 0, false, vec![pre_call]);
+    majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+        if (0x1000..0x2000).contains(&root.0) {
+            root.0 += 0x80;
+        }
+    });
+    assert_eq!(stale.call_stack_overrides[0].1 as usize, 0x1000);
+    assert_eq!(
+        stale.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
+        0x1010
+    );
+    assert_eq!(stale.boxes[0], OpRef::const_ptr(majit_ir::GcRef(0x1020)));
+    let live = frame
+        .rooted_immediate_caller()
+        .expect("the level stores the immediate caller");
+    assert_eq!(live.call_stack_overrides[0].1 as usize, 0x1080);
+    assert_eq!(
+        live.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
+        0x1090
+    );
+    assert_eq!(live.boxes[0], OpRef::const_ptr(majit_ir::GcRef(0x10a0)));
+    drop(frame);
+    drop(roots);
+}
+
+#[test]
 fn session_root_callback_rejects_a_borrow_across_collection() {
     let session = std::cell::RefCell::new(WalkSession::default());
     let held = session.borrow();
