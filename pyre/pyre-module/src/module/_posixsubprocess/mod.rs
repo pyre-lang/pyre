@@ -240,12 +240,17 @@ mod imp {
             if bytes <= 0 {
                 break;
             }
+            let bytes = bytes as isize;
             let mut offset = 0isize;
             while offset < bytes {
+                // Records are variable length: only `d_reclen` bytes of each
+                // exist, so fields are read through the raw pointer and no
+                // `&LinuxDirent64` is formed.
                 let entry = unsafe {
-                    &*((buffer.as_ptr() as *const u8).offset(offset) as *const LinuxDirent64)
+                    (buffer.as_ptr() as *const u8).offset(offset) as *const LinuxDirent64
                 };
-                let name = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) };
+                let d_reclen = unsafe { std::ptr::addr_of!((*entry).d_reclen).read_unaligned() };
+                let name = unsafe { CStr::from_ptr(std::ptr::addr_of!((*entry).d_name).cast()) };
                 if let Some(fd) = pos_int_from_ascii(name.to_bytes())
                     && fd != fd_dir_fd
                     && fd >= start_fd
@@ -253,7 +258,7 @@ mod imp {
                 {
                     let _ = unsafe { libc::close(fd) };
                 }
-                offset += entry.d_reclen as isize;
+                offset += d_reclen as isize;
             }
         }
         let _ = unsafe { libc::close(fd_dir_fd) };

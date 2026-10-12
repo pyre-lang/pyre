@@ -135,9 +135,7 @@ mod ll {
         target_os = "macos",
         target_os = "ios",
         target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
+        target_os = "dragonfly"
     ))]
     majit_rlib::rffi::llexternal!(
         pub(super) c_errno_location = "__error",
@@ -221,17 +219,10 @@ fn faulthandler_nsignals() -> usize {
     unsafe { FAULTHANDLER_HANDLERS.len() }
 }
 
-/// `NSIG` in `faulthandler.c`: `_NSIG` / `_SIGMAX` / `SIGMAX`, else 64.
-/// libc does not export the header's `NSIG`; these match `<signal.h>`.
-#[cfg(target_vendor = "apple")]
-const NSIG: usize = 32;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const NSIG: usize = 65;
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-const NSIG: usize = 64;
-
+/// `NSIG` in `faulthandler.c`: the host `<signal.h>` value, which the
+/// signal module already spells per platform.
 fn nsig() -> usize {
-    NSIG
+    crate::module::signal::signalstate::NSIG as usize
 }
 
 /// `user_signal_t`.
@@ -276,9 +267,6 @@ pub fn pypy_faulthandler_write(fd: INT, buf: &[u8]) {
                 return;
             }
             continue;
-        }
-        if n == 0 {
-            return;
         }
         remaining = &remaining[n as usize..];
     }
@@ -482,10 +470,10 @@ fn faulthandler_register(signum: INT, chain: INT, p_previous: *mut libc::sigacti
     unsafe {
         ll::c_sigemptyset(&mut action.sa_mask);
     }
-    // `faulthandler_register` assigns `SA_NODEFER` over `SA_RESTART|SA_SIGINFO`
-    // when `chain` is set. The handler is `sa_sigaction`, so `SA_SIGINFO` stays.
+    // `chain` replaces `SA_RESTART | SA_SIGINFO`: the signal must stay
+    // deliverable inside its own handler, which re-raises it.
     action.sa_flags = if chain != 0 {
-        libc::SA_NODEFER | libc::SA_SIGINFO
+        libc::SA_NODEFER
     } else {
         libc::SA_RESTART | libc::SA_SIGINFO
     };
@@ -604,6 +592,11 @@ pub fn pypy_faulthandler_unregister(signum: INT) -> INT {
 }
 
 /// `faulthandler_suppress_crash_report` Unix half: disable core dumps.
+///
+/// [3.14-spec] `getrlimit(...) == 0` ↔ pypy `faulthandler.c` tests `!= 0`,
+/// lowering the limit only when the lookup failed. `Modules/faulthandler.c
+/// faulthandler_suppress_crash_report` at v3.14.6 tests `== 0`; a crashing
+/// child then leaves no core file.
 pub fn faulthandler_suppress_crash_report() {
     let mut rl = unsafe { std::mem::zeroed::<libc::rlimit>() };
     if unsafe { ll::c_getrlimit(libc::RLIMIT_CORE as INT, &mut rl) } == 0 {

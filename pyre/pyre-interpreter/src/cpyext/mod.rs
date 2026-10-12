@@ -523,12 +523,12 @@ pub fn load_extension_module(
                     name,
                     path,
                 ),
+                // `_retry_as_ldscript` lets `OSError` escape `load_extension_module`,
+                // which catches `DLOpenError` alone.
                 majit_rlib::rdynload::DLOpenError::OsError(errno) => {
-                    let path_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = spec_roots.pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
-                    crate::PyError::os_error_syscall(
-                        errno,
-                        pyre_object::gc_roots::shadow_stack_get(path_slot),
+                    crate::error::get_converted_unexpected_exception(
+                        pyre_object::PY_NULL,
+                        &std::io::Error::from_raw_os_error(errno),
                     )
                 }
             }

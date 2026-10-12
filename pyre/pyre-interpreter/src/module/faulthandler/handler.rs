@@ -505,9 +505,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // first.
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
-                    let (fd, w_file) = faulthandler_get_fileno_and_file(
-                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    )?;
                     let all_threads = args
                         .get(1)
                         .copied()
@@ -515,6 +512,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         .map(pyre_interpreter::baseobjspace::gateway_int_w)
                         .transpose()?
                         .unwrap_or(1);
+                    let (fd, w_file) = faulthandler_get_fileno_and_file(
+                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                    )?;
                     // Nothing else names the resolved file between here and the
                     // owner store below, so keep it rooted across the install.
                     let _roots = pyre_object::gc_roots::push_roots();
@@ -662,9 +662,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // resolves the file and writes a placeholder.
                 #[cfg(all(unix, feature = "host_env"))]
                 {
-                    let (fd, w_file) = faulthandler_get_fileno_and_file(
-                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    )?;
                     let all_threads = args
                         .get(1)
                         .copied()
@@ -672,6 +669,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         .map(pyre_interpreter::baseobjspace::gateway_int_w)
                         .transpose()?
                         .unwrap_or(1);
+                    let (fd, w_file) = faulthandler_get_fileno_and_file(
+                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                    )?;
                     let _roots = pyre_object::gc_roots::push_roots();
                     if !w_file.is_null() {
                         let _ = pyre_object::gc_roots::pin_root(w_file);

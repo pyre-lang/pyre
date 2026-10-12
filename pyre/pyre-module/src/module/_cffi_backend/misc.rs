@@ -659,8 +659,13 @@ fn open_library(
                 "cannot load library {fname}: {}",
                 String::from_utf8_lossy(&msg)
             )),
+            // `_retry_as_ldscript` lets `OSError` escape `dlopen_w`, which
+            // catches `DLOpenError` alone.
             majit_rlib::rdynload::DLOpenError::OsError(errno) => {
-                PyError::os_error_with_errno(errno, "")
+                pyre_interpreter::error::get_converted_unexpected_exception(
+                    pyre_object::PY_NULL,
+                    &std::io::Error::from_raw_os_error(errno),
+                )
             }
         })
 }
