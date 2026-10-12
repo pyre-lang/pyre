@@ -15975,8 +15975,11 @@ fn handle<Sym: WalkSym>(
 
             // pyjitpl.py self.heapcache.reset()
             // The walker's cached sys_exc_value box is a heap-field cache too
-            // and is dropped with it.
+            // and is dropped with it. The prepared SAVE_EXCEPTION box is a
+            // pre-cut producer: `reached_loop_header` keeps only
+            // `live_arg_boxes`, so consume it with the seed.
             ctx.trace_ctx.heap_cache_mut().reset();
+            ctx.trace_ctx.consume_bridge_exception_resume();
             {
                 let mut state = ctx.frame_state.borrow_mut();
                 state.current_exception_seed = None;

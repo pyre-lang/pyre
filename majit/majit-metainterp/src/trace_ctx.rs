@@ -835,6 +835,8 @@ pub struct TraceCtx {
     /// and `handle_possible_exception`. The walker must not emit that
     /// sequence again. The walk of the framestack-top jitcode starts at
     /// `bridge_exception_resume_pc` and stamps that guard.
+    /// `reached_loop_header` consumes this with
+    /// [`Self::consume_bridge_exception_resume`].
     pub(crate) bridge_exception_resume_prepared: bool,
     /// Top `MIFrame.pc` before `handle_possible_exception`. The guard's
     /// resume snapshot is this coordinate; `finishframe_exception` may
@@ -851,7 +853,9 @@ pub struct TraceCtx {
     pub(crate) bridge_exception_resume_jitcode: Option<i32>,
     /// `SAVE_EXCEPTION` op from `_prepare_exception_resumption`. The
     /// walker reads it as the handler's exception box when the guard
-    /// was already recorded.
+    /// was already recorded. `reached_loop_header` consumes it with
+    /// [`Self::consume_bridge_exception_resume`]: the op is a pre-cut
+    /// producer, and only `live_arg_boxes` survive `cut_trace_from`.
     pub(crate) bridge_saved_exc_op: Option<OpRef>,
     /// Set when a bridge-entry resume replay ran as the applying reader and
     /// met a write it could not apply. The trace then holds recorded writes
@@ -2537,6 +2541,35 @@ impl TraceCtx {
         self.bridge_saved_exc_op
     }
 
+    /// Drop the exception-guard resume `_prepare_exception_resumption`
+    /// stored on this ctx.
+    ///
+    /// `pyjitpl.py MetaInterp.reached_loop_header` starts with
+    /// `heapcache.reset()`. `prepare_resume_from_failure` has already
+    /// consumed the exception at bridge start (`handle_possible_exception`),
+    /// and only `live_arg_boxes` survive a later `compile.py compile_loop`
+    /// `cut_trace_from`. A later walk must not name the pre-cut
+    /// `SAVE_EXCEPTION` producer.
+    pub fn consume_bridge_exception_resume(&mut self) {
+        self.bridge_exception_resume_prepared = false;
+        self.bridge_saved_exc_op = None;
+        self.bridge_exception_resume_pc = None;
+        self.bridge_exception_resume_jitcode = None;
+        self.bridge_exception_source_pc = None;
+        self.bridge_exception_source_jitcode = None;
+    }
+
+    /// Stand in for `prepare_resume_from_failure` in tests that then drive
+    /// `reached_loop_header`.
+    pub fn seed_bridge_exception_resume(&mut self, saved_exc: OpRef) {
+        self.bridge_exception_resume_prepared = true;
+        self.bridge_saved_exc_op = Some(saved_exc);
+        self.bridge_exception_resume_pc = Some(0);
+        self.bridge_exception_resume_jitcode = Some(0);
+        self.bridge_exception_source_pc = Some(0);
+        self.bridge_exception_source_jitcode = Some(0);
+    }
+
     /// Get or create a constant OpRef for a given i64 value.
     ///
     /// history.py `ConstInt(value).value` is inline on the Box;
@@ -3174,6 +3207,7 @@ impl TraceCtx {
         dead_array_tail_from: Option<usize>,
     ) -> Vec<(OpRef, Type)> {
         self.heap_cache_mut().reset();
+        self.consume_bridge_exception_resume();
         self.fill_virtualizable_boxes_to_declared_layout(dead_array_tail_from);
         let mut duplicates: indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher> =
             indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
@@ -10412,6 +10446,27 @@ mod tests {
             0,
         );
         assert!(!len.is_constant());
+    }
+
+    /// `reached_loop_header` starts with `heapcache.reset()` and drops the
+    /// prepared SAVE_EXCEPTION box. A later `cut_trace_from` must not see
+    /// that pre-cut producer through `bridge_saved_exc_op`.
+    #[test]
+    fn reached_loop_header_consumes_prepared_bridge_exception_resume() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let saved = ctx.save_exception();
+        ctx.seed_bridge_exception_resume(saved);
+        assert!(ctx.bridge_exception_resume_prepared());
+        assert_eq!(ctx.bridge_saved_exc_op(), Some(saved));
+        assert_eq!(ctx.bridge_exception_resume_pc(), Some(0));
+        let mut redboxes = [(OpRef::input_arg_ref(0), Type::Ref)];
+        let _ = ctx.reached_loop_header_live_arg_boxes(&mut redboxes, None);
+        assert!(!ctx.bridge_exception_resume_prepared());
+        assert_eq!(ctx.bridge_saved_exc_op(), None);
+        assert_eq!(ctx.bridge_exception_resume_pc(), None);
+        assert_eq!(ctx.bridge_exception_resume_jitcode(), None);
+        assert_eq!(ctx.bridge_exception_source_pc(), None);
+        assert_eq!(ctx.bridge_exception_source_jitcode(), None);
     }
 }
 
