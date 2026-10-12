@@ -30,28 +30,33 @@ function jitCallTrampoline(framePtr, callAreaOfs = CALL_RESULT_OFS) {
   const funcPtrLo = view.getUint32(framePtr + callAreaOfs + 8, true);
   const numArgs = Number(view.getBigInt64(framePtr + callAreaOfs + 16, true));
 
-  // Read args from call area
+  // Descr word ABI: each argument slot is an i64 word.
   const args = [];
   for (let i = 0; i < numArgs; i++) {
-    // On wasm32, values are i32 (pointers/ints). Read low 32 bits of each i64 slot.
-    args.push(view.getInt32(framePtr + callAreaOfs + 24 + i * 8, true));
+    args.push(view.getBigInt64(framePtr + callAreaOfs + 24 + i * 8, true));
   }
 
   // Call via the main module's function table
-  let result = 0;
+  let result;
   if (mainTable) {
     try {
       const fn = mainTable.get(funcPtrLo);
-      result = fn(...args) ?? 0;
+      result = fn(...args);
     } catch (e) {
       console.error('[jit_call] trampoline error:', e);
-      result = 0;
+      result = 0n;
     }
   }
 
-  // Write result to call area (as i64: low 32 bits = result, high 32 bits = 0)
-  view.setInt32(framePtr + callAreaOfs, result, true);
-  view.setInt32(framePtr + callAreaOfs + 4, 0, true);
+  // Write result to the call-area i64 slot.
+  if (typeof result === "bigint") {
+    view.setBigInt64(framePtr + callAreaOfs, result, true);
+  } else if (typeof result === "number") {
+    view.setInt32(framePtr + callAreaOfs, result, true);
+    view.setInt32(framePtr + callAreaOfs + 4, 0, true);
+  } else {
+    view.setBigInt64(framePtr + callAreaOfs, 0n, true);
+  }
 }
 
 // JS cannot reflect a table entry's type portably.

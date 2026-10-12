@@ -3617,8 +3617,10 @@ fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
 
 /// `_genop_call` emits `CallDescr.get_arg_types` / `get_result_type` /
 /// `get_result_size`. The descr is the call type. A constant callee whose
-/// table type differs, or whose table type is unknown on wasm32, keeps
-/// `jit_call`.
+/// table type differs keeps `jit_call`. An unknown table type keeps
+/// `jit_call` only when the host reflects table types (`host-import` on
+/// wasm32); everywhere else the descr FUNC is the type, the same call the
+/// native backends emit.
 fn residual_callee_direct_emit_sig_at(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3651,7 +3653,7 @@ fn residual_callee_direct_emit_sig_at(
                 None
             }
         }
-        None if cfg!(target_arch = "wasm32") => None,
+        None if cfg!(all(target_arch = "wasm32", feature = "host-import")) => None,
         None => Some(expected.clone()),
     }
 }

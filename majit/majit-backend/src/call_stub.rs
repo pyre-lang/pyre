@@ -1190,6 +1190,7 @@ mod tests {
     /// `descr.py` result `'S'`: `singlefloat2int` of the callee's `float`.
     #[test]
     fn call_stub_result_singlefloat_returns_f32_bits() {
+        let _hook_test = hold_hook_test_lock();
         let stub = create_call_stub("S", 'S');
         let bits = 1.5f32.to_bits() as i64;
         let result =
