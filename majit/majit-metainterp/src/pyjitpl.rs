@@ -2321,9 +2321,8 @@ impl<M> CompiledEntry<M> {
 /// These two are carried at **all five** replace paths. They are deliberately
 /// the *only* members: the label list is `JitCellToken.target_tokens`
 /// (`history.py`), and a token minted by `make_jitcell_token` starts with
-/// none, so no replace path inherits the displaced loop's labels. Likewise
-/// `migrate_bridges` is called at three of the five and must stay at the call
-/// sites. Adding a field here that is not universal re-introduces exactly the
+/// none, so no replace path inherits the displaced loop's labels. Adding a
+/// field here that is not universal re-introduces exactly the
 /// bug this type exists to prevent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CarriedFields {
@@ -9719,12 +9718,6 @@ impl<M: Clone> MetaInterp<M> {
                 // that aims its closing JUMP at it.
                 let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
-                    // Cranelift workaround (no RPython counterpart): copy
-                    // bridges from old token to new, since Cranelift cannot
-                    // patch machine code in-place. No-op for dynasm.
-                    if let Some(old_tok) = old_entry.live_token() {
-                        self.backend.migrate_bridges(&old_tok, token.as_ref());
-                    }
                     // Box Identity Phase E.2b parity: preserve old entry's
                     // high-water so previously stored bridges' OpRefs stay
                     // disjoint from any future bridge.
@@ -10019,11 +10012,11 @@ impl<M: Clone> MetaInterp<M> {
     /// compiler and to the suite alike.
     ///
     /// This does **not** mean the replace paths are tested. It removes one
-    /// class of omission; everything else those paths do (bridge migration,
-    /// label minting, retirement, snapshot handling) remains uncovered, because
-    /// nothing in this crate can drive a production compile path.
-    /// The caller still performs `retire_compiled_entry`, `migrate_bridges` and
-    /// any label carry itself, deliberately: those vary per site and flattening
+    /// class of omission; everything else those paths do (label minting,
+    /// retirement, snapshot handling) remains uncovered, because nothing in
+    /// this crate can drive a production compile path.
+    /// The caller still performs `retire_compiled_entry` and any label carry
+    /// itself, deliberately: those vary per site and flattening
     /// them into here would change behaviour at the sites that omit them.
     pub(crate) fn take_entry_for_replace(
         &mut self,
@@ -11279,12 +11272,6 @@ impl<M: Clone> MetaInterp<M> {
                 // Carried forward for the same reason as the compile_loop site.
                 let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
-                    // Cranelift workaround (no RPython counterpart): copy
-                    // bridges from old token to new, since Cranelift cannot
-                    // patch machine code in-place. No-op for dynasm.
-                    if let Some(old_tok) = old_entry.live_token() {
-                        self.backend.migrate_bridges(&old_tok, token.as_ref());
-                    }
                     // Box Identity Phase E.2b parity: see compile_loop site.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
                     carried_loop_header_pc = carried.loop_header_pc;
@@ -16174,9 +16161,6 @@ impl<M: Clone> MetaInterp<M> {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
                     carried_loop_header_pc = carried.loop_header_pc;
-                    if let Some(old_tok) = old_entry.live_token() {
-                        self.backend.migrate_bridges(&old_tok, token.as_ref());
-                    }
                     previous_tokens =
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }

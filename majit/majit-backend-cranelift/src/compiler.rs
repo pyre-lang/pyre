@@ -9211,14 +9211,6 @@ fn retained_merge_source(inputargs: &[InputArgRc], ops: &[OpRc]) -> MergeSource 
     }
 }
 
-fn clone_merge_source(src: &MergeSource) -> MergeSource {
-    MergeSource {
-        trace_id: src.trace_id,
-        inputargs: snapshot_inputargs(&src.inputargs),
-        ops: snapshot_ops(&src.ops),
-    }
-}
-
 /// A value position a merged bridge op may take. Void results occupy no
 /// position (`GcRewriterImpl::rewrite_for_gc_segments` skips them for the
 /// same reason), and the `VoidOp(u32::MAX)` sentinel would otherwise pin the
@@ -10118,6 +10110,7 @@ pub(crate) fn fail_descr_attach_bridge(fd: &dyn FailDescr, bridge: BridgeData) {
 /// Whether a bridge has been attached to this descr.  Helper around
 /// `FailDescr::bridge_code_ptr` so callers do not have to know the 0
 /// sentinel.
+#[cfg(test)]
 pub(crate) fn fail_descr_has_bridge(fd: &dyn FailDescr) -> bool {
     fd.bridge_code_ptr() != 0
 }
@@ -22096,65 +22089,6 @@ impl majit_backend::Backend for CraneliftBackend {
     /// attached; `patch_jump_for_descr` installs it.
     fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> Option<bool> {
         Some(fail_descr_bridge_ref(descr).is_some())
-    }
-
-    fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
-        let old_compiled = old_token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current);
-        let new_compiled = new_token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current);
-        let (Some(old), Some(new)) = (old_compiled, new_compiled) else {
-            return;
-        };
-        for old_fd in &old.fail_descrs {
-            let Some(b) = fail_descr_bridge_ref(as_fd(old_fd)) else {
-                continue;
-            };
-            // Match by (trace_id, fail_index) — same key used by
-            // find_fail_descr_in_fail_descrs and BridgeData.source_guard.
-            let target = find_fail_descr_in_fail_descrs(
-                &new.fail_descrs,
-                as_fd(old_fd).trace_id(),
-                as_fd(old_fd).fail_index_per_trace(),
-            );
-            if let Some(new_fd) = target
-                && !fail_descr_has_bridge(as_fd(&new_fd))
-            {
-                // Clone the bridge (don't take_bridge — old code may
-                // still reference old_fd and needs bridge dispatch).
-                fail_descr_attach_bridge(
-                    as_fd(&new_fd),
-                    BridgeData {
-                        trace_id: b.trace_id,
-                        input_types: b.input_types.clone(),
-                        header_pc: b.header_pc,
-                        source_guard: b.source_guard,
-                        caller_prefix_layout: b.caller_prefix_layout.clone(),
-                        code_ptr: b.code_ptr,
-                        body_ptr: b.body_ptr,
-                        fail_descrs: b.fail_descrs.clone(),
-                        fail_descr_cells: b.fail_descr_cells.clone(),
-                        num_inputs: b.num_inputs,
-                        num_ref_roots: b.num_ref_roots,
-                        max_output_slots: b.max_output_slots,
-
-                        terminal_exit_layouts: UnsafeCell::new(
-                            unsafe { &*b.terminal_exit_layouts.get() }.clone(),
-                        ),
-                        loop_reentry: b.loop_reentry,
-                        invalidated_arc: b.invalidated_arc.clone(),
-                        gc_table: b.gc_table.clone(),
-                        merge_source: b.merge_source.as_ref().map(clone_merge_source),
-                    },
-                );
-            }
-        }
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {

@@ -4295,8 +4295,6 @@ impl Backend for DynasmBackend {
         Ok(())
     }
 
-    // No migrate_bridges — we patch in place.
-
     fn bridge_was_compiled(
         &self,
         token: &JitCellToken,
