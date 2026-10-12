@@ -8375,6 +8375,28 @@ fn reconstruct_inline_recipe(
     // `capture_resumedata` keeps `operation.py len` on the framestack. This
     // level is that tail: no code object, applied after `__len__` returns.
     if crate::operator_continuation::is_installed_level(frame.jitcode_index) {
+        // `resume.py rebuild_from_resumedata` fills this level's registers
+        // from its section like any other frame's. The resume `-live-` names
+        // r0 alone, the pending dunder result, so a `capture_resumedata`
+        // through the level hands that box back (`get_list_of_active_boxes`).
+        let mut registers_r = Vec::with_capacity(frame.values.len());
+        for value in &frame.values {
+            let (boxed, _) = bridge_decode_box(
+                ctx,
+                value,
+                Type::Ref,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
+            if boxed.is_none() {
+                decline!("OperatorTailBox");
+            }
+            registers_r.push(boxed);
+        }
         return Some(ReconstructRecipe {
             code_ptr: std::ptr::null(),
             jitcode_index: frame.jitcode_index,
@@ -8382,7 +8404,7 @@ fn reconstruct_inline_recipe(
             nlocals: 0,
             valuestackdepth: 0,
             registers_i: Vec::new(),
-            registers_r: Vec::new(),
+            registers_r,
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
             frame: OpRef::NONE,
