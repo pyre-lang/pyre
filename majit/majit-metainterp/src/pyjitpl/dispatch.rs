@@ -8433,6 +8433,165 @@ mod tests {
         );
     }
 
+    /// Test-side `self.metainterp.cpu` analog: records every
+    /// `bh_getfield_gc_*` struct pointer and does not dereference it.
+    /// Compilation/execution methods panic; this test only exercises the
+    /// cache-hit sanity load.
+    struct RecordingGetfieldCpu {
+        loads: std::cell::RefCell<Vec<i64>>,
+    }
+    impl majit_backend::Backend for RecordingGetfieldCpu {
+        fn compile_loop(
+            &mut self,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _token: &majit_backend::JitCellToken,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("RecordingGetfieldCpu::compile_loop")
+        }
+        fn compile_bridge(
+            &mut self,
+            _fail_descr: &dyn majit_ir::FailDescr,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _original_token: &majit_backend::JitCellToken,
+            _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
+            _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("RecordingGetfieldCpu::compile_bridge")
+        }
+        fn execute_token(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            _args: &[majit_ir::Value],
+        ) -> majit_backend::DeadFrame {
+            unimplemented!("RecordingGetfieldCpu::execute_token")
+        }
+        fn get_latest_descr<'a>(
+            &'a self,
+            _frame: &'a majit_backend::DeadFrame,
+        ) -> &'a dyn majit_ir::FailDescr {
+            unimplemented!("RecordingGetfieldCpu::get_latest_descr")
+        }
+        fn get_latest_descr_arc(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+        ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+            unimplemented!("RecordingGetfieldCpu::get_latest_descr_arc")
+        }
+        fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+            unimplemented!("RecordingGetfieldCpu::get_int_value")
+        }
+        fn get_value_direct(&self, frame: &majit_backend::DeadFrame, slot: usize) -> i64 {
+            self.get_int_value(frame, slot)
+        }
+        fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+            unimplemented!("RecordingGetfieldCpu::get_float_value")
+        }
+        fn get_ref_value(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+            _index: usize,
+        ) -> majit_ir::GcRef {
+            unimplemented!("RecordingGetfieldCpu::get_ref_value")
+        }
+        fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+            unimplemented!("RecordingGetfieldCpu::invalidate_loop")
+        }
+        fn bh_getfield_gc_i(
+            &self,
+            struct_ptr: i64,
+            _fielddescr: &majit_jitcode::jitcode::BhDescr,
+        ) -> i64 {
+            self.loads.borrow_mut().push(struct_ptr);
+            0
+        }
+        fn bh_getfield_gc_r(
+            &self,
+            struct_ptr: i64,
+            _fielddescr: &majit_jitcode::jitcode::BhDescr,
+        ) -> majit_ir::GcRef {
+            self.loads.borrow_mut().push(struct_ptr);
+            majit_ir::GcRef(0)
+        }
+        fn bh_getfield_gc_f(
+            &self,
+            struct_ptr: i64,
+            _fielddescr: &majit_jitcode::jitcode::BhDescr,
+        ) -> f64 {
+            self.loads.borrow_mut().push(struct_ptr);
+            0.0
+        }
+    }
+
+    /// A heapcache hit on a null struct must not ask the executor to
+    /// load from address 0. `_opimpl_getfield_gc_any_pureornot`
+    /// fabricated `loaded = 0` on that leg; `field_sanity_load` would
+    /// dispatch to `bh_getfield_gc_i` and dereference it.
+    #[test]
+    fn heapcache_hit_on_a_null_struct_skips_the_executor_sanity_load() {
+        let mut builder = JitCodeBuilder::new();
+        // Register the layout without allocating: `field_descr_ref_from_bh`
+        // keys `_cache_field` by `(type_id, fieldname)`, so the store and
+        // the load share one heapcache slot. A scalar fallback mint would
+        // give each access its own identity and miss.
+        builder.register_struct_layout(
+            8,
+            0xD5,
+            true,
+            false,
+            &[(0, false, "null_cached_i", 8, true, false)],
+            "",
+        );
+        builder.load_const_r_value(0, 0);
+        builder.load_const_i_value(0, 99);
+        builder.setfield_gc_i(0, 0, 0, 0xD5, "null_cached_i");
+        builder.getfield_gc_i(1, 0, 0, 0xD5, "null_cached_i");
+        let jitcode = builder.finish();
+        number_the_descrs(&jitcode);
+
+        let cpu = RecordingGetfieldCpu {
+            loads: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_cpu(Some(&cpu));
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
+        assert!(matches!(action, TraceAction::Continue));
+        assert!(
+            !cpu.loads.borrow().iter().any(|&p| p == 0),
+            "heapcache-hit getfield must not field_sanity_load a null struct, got {:?}",
+            cpu.loads.borrow()
+        );
+
+        // The SETFIELD descr converts and a wired cpu dispatches through
+        // it, so an empty recording above is the null-struct guard rather
+        // than a descr `field_sanity_load` cannot consume.
+        let descr = ctx
+            .ops()
+            .iter()
+            .find(|o| o.opcode == OpCode::SetfieldGc)
+            .and_then(|o| o.getdescr())
+            .expect("setfield recorded a field descr")
+            .clone();
+        cpu.loads.borrow_mut().clear();
+        assert!(
+            ctx.field_sanity_load(0, &descr, Type::Int).is_some(),
+            "the recorded descr must convert so a skipped load is the null guard"
+        );
+        assert!(
+            cpu.loads.borrow().contains(&0),
+            "direct field_sanity_load(0) must dispatch so the empty recording above is the guard"
+        );
+
+        let opcodes: Vec<_> = ctx.into_recorder().ops().iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![OpCode::SetfieldGc],
+            "GETFIELD_GC must have come from the heapcache",
+        );
+    }
+
     /// A hand-assembled jitcode never numbers its descr pool.  Two fields of
     /// one box must still be distinct heapcache keys: a store answers a later
     /// load of the same field, a sibling field of the same box records once
