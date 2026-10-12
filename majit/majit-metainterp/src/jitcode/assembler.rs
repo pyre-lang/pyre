@@ -790,7 +790,7 @@ impl JitCodeBuilder {
                 return;
             }
         }
-        let new_fields = Self::field_specs_from_layout(fields, &ranks);
+        let new_fields = Self::field_specs_from_layout(type_id, fields, &ranks);
         // Merge into existing spec if present — each getfield/setfield
         // site registers only the field it accesses, so the complete
         // layout accumulates across multiple register_struct_layout
@@ -808,12 +808,11 @@ impl JitCodeBuilder {
                     existing.all_fielddescrs.push(nf);
                 }
             }
-            // Re-sort by offset and re-index so index_in_parent stays
-            // deterministic (same as field_specs_from_layout).
-            existing.all_fielddescrs.sort_by_key(|f| f.offset);
-            for (idx, f) in existing.all_fielddescrs.iter_mut().enumerate() {
-                f.index_in_parent = idx;
-            }
+            // `descr.py get_size_descr` is one ranking per STRUCT. Reuse
+            // the published SizeDescr's `all_fielddescrs` order when it
+            // is already in `gc_cache`; otherwise rank by offset so a
+            // struct with no published group stays deterministic.
+            Self::rank_field_specs(type_id, &mut existing.all_fielddescrs);
         } else {
             self.struct_size_specs.insert(
                 type_id,
@@ -986,16 +985,14 @@ impl JitCodeBuilder {
     }
 
     fn field_specs_from_layout(
+        type_id: u64,
         fields: &[(usize, bool, &str, usize, bool, bool)],
         ranks: &[(String, ImmutableRank)],
     ) -> Vec<BhFieldSpec> {
-        let mut ordered: Vec<(usize, bool, &str, usize, bool, bool)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _, _, _, _)| offset);
-        ordered
+        let mut specs: Vec<BhFieldSpec> = fields
             .iter()
-            .enumerate()
             .map(
-                |(idx, &(offset, is_ref, name, decl_size, decl_signed, is_float))| {
+                |&(offset, is_ref, name, decl_size, decl_signed, is_float)| {
                     // descr.py `get_field_descr` reads FIELDTYPE once and
                     // `get_type_flag` picks the flag: pointer, FLOAT, signed, or
                     // unsigned. The emit site supplies that kind; nothing retags
@@ -1038,7 +1035,7 @@ impl JitCodeBuilder {
                             .is_some_and(ImmutableRank::is_immutable),
                         is_quasi_immutable: Self::rank_of(ranks, name)
                             .is_some_and(ImmutableRank::is_quasi_immutable),
-                        index_in_parent: idx,
+                        index_in_parent: 0,
                         // The emit-site layout table names fields but declares no
                         // header row, so the rebuilding side falls back to the
                         // name.
@@ -1046,7 +1043,59 @@ impl JitCodeBuilder {
                     }
                 },
             )
-            .collect()
+            .collect();
+        Self::rank_field_specs(type_id, &mut specs);
+        specs
+    }
+
+    /// Rank `specs` with the published SizeDescr's `all_fielddescrs` order
+    /// (`descr.py get_size_descr` / `heaptracker.all_fielddescrs`) when that
+    /// STRUCT is already in `gc_cache`. Otherwise rank by offset, the
+    /// deterministic merge used when no group has published yet.
+    fn rank_field_specs(type_id: u64, specs: &mut [BhFieldSpec]) {
+        if let Some(ranks) = Self::cached_parent_ranks(type_id) {
+            for spec in specs.iter_mut() {
+                spec.index_in_parent = ranks
+                    .iter()
+                    .position(|(key, offset)| key == &spec.field_key || *offset == spec.offset)
+                    .unwrap_or(ranks.len());
+            }
+            specs.sort_by_key(|spec| (spec.index_in_parent, spec.offset));
+            let n_cached = ranks.len();
+            let mut next_extra = n_cached;
+            for spec in specs.iter_mut() {
+                if spec.index_in_parent >= n_cached {
+                    spec.index_in_parent = next_extra;
+                    next_extra += 1;
+                }
+            }
+        } else {
+            specs.sort_by_key(|spec| spec.offset);
+            for (idx, spec) in specs.iter_mut().enumerate() {
+                spec.index_in_parent = idx;
+            }
+        }
+    }
+
+    fn cached_parent_ranks(type_id: u64) -> Option<Vec<(String, usize)>> {
+        if type_id == 0 {
+            return None;
+        }
+        let gc = majit_ir::descr::gc_cache().lock();
+        let descr = gc
+            ._cache_size
+            .get(&majit_ir::descr::LLType::Struct(type_id))?;
+        let size = descr.as_size_descr()?;
+        let fields = size.all_fielddescrs();
+        if fields.is_empty() {
+            return None;
+        }
+        Some(
+            fields
+                .iter()
+                .map(|field| (field.field_key().to_string(), field.offset()))
+                .collect(),
+        )
     }
 
     /// Build a scalar `Field` descr (one machine word) for a plain
@@ -7638,7 +7687,7 @@ mod tests {
         ];
         assert_eq!(
             super::field_slot_in(
-                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                &JitCodeBuilder::field_specs_from_layout(0, &fields, &[]),
                 "leaf",
                 8,
             ),
@@ -7647,7 +7696,7 @@ mod tests {
         );
         assert_eq!(
             super::field_slot_in(
-                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                &JitCodeBuilder::field_specs_from_layout(0, &fields, &[]),
                 "",
                 8
             ),
@@ -7656,7 +7705,7 @@ mod tests {
         );
         assert_eq!(
             super::field_slot_in(
-                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                &JitCodeBuilder::field_specs_from_layout(0, &fields, &[]),
                 "",
                 0
             ),

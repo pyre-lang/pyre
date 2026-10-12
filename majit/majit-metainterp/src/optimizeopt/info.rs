@@ -14,11 +14,39 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
+/// `info.py _force_elements` walks `descr.get_all_fielddescrs()` by
+/// enumerate index. A leftover sparse key is a numbering that is not
+/// that list; name both the leftover and the list it failed to index.
+fn force_box_field_keys(field_descrs: &[DescrRef]) -> Vec<(String, usize, u32)> {
+    field_descrs
+        .iter()
+        .map(|d| {
+            d.as_field_descr()
+                .map(|f| (f.field_key().to_string(), f.index_in_parent(), d.index()))
+                .unwrap_or_else(|| ("?".to_string(), 0, d.index()))
+        })
+        .collect()
+}
+
+fn force_box_size_identity(descr: &DescrRef) -> String {
+    match descr.as_size_descr() {
+        Some(sd) => format!(
+            "index={} cache_key={} type_id={} size={} nfields={}",
+            descr.index(),
+            sd.cache_key(),
+            sd.type_id(),
+            sd.size(),
+            sd.all_fielddescrs().len(),
+        ),
+        None => format!("index={} not-size", descr.index()),
+    }
+}
+
 /// The dense runtime type id a `GUARD_GC_TYPE` may be built against, or `None`
 /// when the descr cannot name one.
 ///
 /// A stamped 0 is never a legitimate tid: the allocator hands out identities
-/// starting at 1 (`descr.rs` `next_type_id`, `gctypelayout.py:328-331`), so 0
+/// starting at 1 (`gctypelayout.py` "don't use typeid 0"), so 0
 /// means this descr was rehydrated from a serialized form and never stamped.
 /// It is, however, a live value in a runtime header — the `rclass.OBJECT` root
 /// — which makes `GUARD_GC_TYPE(x, 0)` wrong in both directions: it fails on
@@ -709,9 +737,8 @@ impl PtrInfoExt for PtrInfo {
                 // force path hands its descr to `handle_new`, which unwraps a
                 // `SizeDescr` (`majit-gc/src/rewrite.rs`).  A tid may
                 // not be invented for a descr that cannot name one: the
-                // allocator never mints 0 (`majit-ir/src/descr.rs`'s
-                // `GcCache::next_type_id` starts at 1,
-                // `gctypelayout.py`) while the
+                // allocator never mints 0 (`gctypelayout.py` DUMMY at
+                // index 0) while the
                 // runtime header tid 0 is the live `rclass.OBJECT` root
                 // (`pyre-jit-trace/src/descr.rs`'s `OBJECT_GC_TYPE_ID`), so a
                 // fabricated 0 would pass on any plain `object` instance and
@@ -1297,27 +1324,36 @@ fn force_box_impl(
                     opref, ctx.in_final_emission, ctx.current_pass_idx
                 );
             }
-            for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
+            // info.py _force_elements:
+            //   for i, fielddescr in enumerate(descr.get_all_fielddescrs()):
+            //       fld = self._fields[i]
+            let mut leftover = std::mem::take(&mut vinfo.fields);
+            for (i, descr) in cached_fielddescrs.iter().enumerate() {
+                let field_idx = i as u32;
+                let Some(pos) = leftover.iter().position(|(idx, _)| *idx == field_idx) else {
+                    continue;
+                };
+                let (_, value_ref) = leftover.swap_remove(pos);
                 let value_ref = force_child(&value_ref, ctx);
-                let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
-                debug_assert!(
-                    descr.is_some(),
-                    "force_box: field_idx={} has value but no descriptor \
-                     — field_descrs out of sync with fields",
-                    field_idx,
-                );
-                let descr = descr.expect(
-                    "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
-                );
-                if w_class_store_is_covered_by_alloc(&vinfo.descr, &descr, &value_ref, ctx) {
+                if w_class_store_is_covered_by_alloc(&vinfo.descr, descr, &value_ref, ctx) {
                     continue;
                 }
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_value = ctx.resolve_operand_operand(&value_ref);
                 let mut set_op =
                     Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
-                set_op.setdescr(descr);
+                set_op.setdescr(descr.clone());
                 emit_op(ctx, set_op);
+            }
+            if !leftover.is_empty() {
+                panic!(
+                    "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i] \
+                     (leftover={:?} len={} keys={:?} {})",
+                    leftover.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                    cached_fielddescrs.len(),
+                    force_box_field_keys(&cached_fielddescrs),
+                    force_box_size_identity(&vinfo.descr),
+                );
             }
             Operand::from_bound_op(&alloc_rc)
         }
@@ -1348,35 +1384,34 @@ fn force_box_impl(
                     opref, ctx.in_final_emission, ctx.current_pass_idx
                 );
             }
-            for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
+            // info.py _force_elements — same enumerate walk as VirtualStruct.
+            let mut leftover = std::mem::take(&mut vinfo.fields);
+            for (i, descr) in cached_fielddescrs.iter().enumerate() {
+                let field_idx = i as u32;
+                let Some(pos) = leftover.iter().position(|(idx, _)| *idx == field_idx) else {
+                    continue;
+                };
+                let (_, value_ref) = leftover.swap_remove(pos);
                 let value_ref = force_child(&value_ref, ctx);
-                let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
-                // The key that failed to resolve is the whole diagnosis, and
-                // the list it was looked up in says which numbering it came
-                // from, so name both rather than only the rule they broke.
-                let descr = descr.unwrap_or_else(|| {
-                    panic!(
-                        "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i] \
-                         (field_idx={field_idx} len={} keys={:?})",
-                        cached_fielddescrs.len(),
-                        cached_fielddescrs
-                            .iter()
-                            .map(|d| d
-                                .as_field_descr()
-                                .map(|f| (f.field_key().to_string(), f.index_in_parent()))
-                                .unwrap_or_else(|| ("?".to_string(), 0)))
-                            .collect::<Vec<_>>(),
-                    )
-                });
-                if w_class_store_is_covered_by_alloc(&vinfo.descr, &descr, &value_ref, ctx) {
+                if w_class_store_is_covered_by_alloc(&vinfo.descr, descr, &value_ref, ctx) {
                     continue;
                 }
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_value = ctx.resolve_operand_operand(&value_ref);
                 let mut set_op =
                     Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
-                set_op.setdescr(descr);
+                set_op.setdescr(descr.clone());
                 emit_op(ctx, set_op);
+            }
+            if !leftover.is_empty() {
+                panic!(
+                    "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i] \
+                     (leftover={:?} len={} keys={:?} {})",
+                    leftover.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                    cached_fielddescrs.len(),
+                    force_box_field_keys(&cached_fielddescrs),
+                    force_box_size_identity(&vinfo.descr),
+                );
             }
             Operand::from_bound_op(&alloc_rc)
         }

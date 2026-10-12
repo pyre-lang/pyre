@@ -110,16 +110,17 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 #( #field_names ),*
             ];
 
-            /// descr.py get_size_descr + :218-239 auto-discovery.
+            /// descr.py get_size_descr + heaptracker.all_fielddescrs auto-discovery.
             ///
             /// Registers this struct's SizeDescr plus one FieldDescr per named
             /// field into `gc_cache`. Idempotent via the `_cache_size` /
             /// `_cache_field` cache hits. Returns the SizeDescr.
             ///
-            /// The cache key is derived from the Rust `TypeId` hashed to u64;
-            /// that is the cache-lookup identity only. The numeric GC tid
-            /// (FLAG_POINTER target for `guard_class`) is allocated densely
-            /// by `GcCache::get_size_descr` itself, so the u64 hash collision
+            /// The cache key is derived from the crate-stripped module path
+            /// hashed to u64; that is the cache-lookup identity only. The
+            /// numeric GC tid is stamped later by
+            /// `register_unresolved_struct_tids` (`gc.py init_size_descr` /
+            /// `gctypelayout.py get_type_id`), so the u64 hash collision
             /// risk does not translate into a tid collision.
             pub fn __majit_register_descrs(
                 gc_cache: &mut ::majit_ir::descr::GcCache,
