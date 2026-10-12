@@ -225,6 +225,7 @@ pub fn ll_slice_len_slot_take(slot: usize) -> usize {
 
 /// `lltype.free(buf, flavor='raw')` of an `ll_slice_buffer_new_*` buffer when
 /// the array's storage ends.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn ll_slice_buffer_free(items: usize) {
     raw_free(items)
 }
@@ -232,10 +233,13 @@ pub fn ll_slice_buffer_free(items: usize) {
 // ── opaque buffer allocation ────────────────────────────────────────────
 
 fn vec_buf_layout(allocated: usize, itemsize: usize, align: usize) -> Layout {
-    allocated
-        .checked_mul(itemsize)
+    item_bytes(allocated, itemsize)
         .and_then(|size| Layout::from_size_align(size, align).ok())
         .unwrap_or_else(|| panic!("Vec capacity overflow"))
+}
+
+fn item_bytes(count: usize, itemsize: usize) -> Option<usize> {
+    count.checked_mul(itemsize)
 }
 
 /// A buffer for `allocated` items. An empty buffer is the dangling address
@@ -317,12 +321,16 @@ pub fn ll_vec_newlist_hint_i(lengthhint: usize) -> Vec<usize> {
     Vec::with_capacity(lengthhint)
 }
 
-/// `lltypesystem/rlist.py ll_newlist`: `length` slots, items not initialised.
-/// Callers fill every slot before the list is read.
-#[majit_macros::oopspec("newlist(length)")]
+/// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is zero
+/// until the caller writes it, and `length` is already the list length.
+/// No `newlist(length)` oopspec: the result is a raw `Vec` header (kind
+/// int), and that rewrite emits GC `new_array_clear` into a ref bank.
 pub fn ll_vec_newlist_i(length: usize) -> Vec<usize> {
     let mut l = Vec::with_capacity(length);
-    unsafe { l.set_len(length) };
+    unsafe {
+        l.set_len(length);
+    }
+    ll_vec_arrayclear_i(&mut l, length);
     l
 }
 
@@ -331,8 +339,8 @@ fn ll_vec_zero_or_null_i(item: usize) -> bool {
     item == 0
 }
 
-/// `rgc.ll_arrayclear` of a freshly allocated word buffer. Raw `alloc` memory
-/// is not zero-filled (`malloc_zero_filled` is false).
+/// `rgc.ll_arrayclear`. Writes zero into each of the `count` slots.
+#[majit_macros::dont_look_inside_cannot_raise]
 fn ll_vec_arrayclear_i(l: &mut Vec<usize>, count: usize) {
     let mut i = 0;
     while i < count {
@@ -342,7 +350,7 @@ fn ll_vec_arrayclear_i(l: &mut Vec<usize>, count: usize) {
 }
 
 /// `rlist.py _ll_alloc_and_clear`.
-#[majit_macros::oopspec("newlist_clear(count)")]
+/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
 pub fn ll_vec_alloc_and_clear_i(count: usize) -> Vec<usize> {
     let mut l = ll_vec_newlist_i(count);
     ll_vec_arrayclear_i(&mut l, count);
@@ -389,13 +397,6 @@ fn ll_vec_alloc_and_set_jit_i(count: usize, item: usize) -> Vec<usize> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual for now: upstream traces into this body, but these helper graphs
-/// are never prepass subjects, so the calls inside carry no `RustVec` result
-/// type and the list-oopspec rewrite cannot tell their header from a GC
-/// list.  Tracing it waits on rtyping the helper bodies the way
-/// `annlowlevel` annotates low-level helpers.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_i(count: usize, item: usize) -> Vec<usize> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_i(count, item)
@@ -508,12 +509,19 @@ pub fn ll_vec_items_i(l: &mut Vec<usize>) -> usize {
     vec_header_word(vec_header_i(l), VEC_PTR_WORD)
 }
 
-/// `ll_extend` from the `(items, length)` slice: `_ll_resize_ge` to the
-/// summed length, then `ll_arraycopy` of the items.
+/// `ll_extend` from the `(items, length)` slice. `ovfcheck` on `len1 + len2`
+/// rejects a wrapping sum, then `_ll_resize_ge` and `ll_arraycopy`.
 pub fn ll_vec_extend_from_slice_i(l: &mut Vec<usize>, items: usize, length: usize) {
     let len1 = ll_vec_length_i(l);
-    ll_vec_resize_ge_i(l, len1 + length);
+    let newlen = len1.checked_add(length).expect("Vec capacity overflow");
+    ll_vec_resize_ge_i(l, newlen);
     ll_slice_arraycopy_i(items, ll_vec_items_i(l), 0, len1, length);
+}
+
+/// Panic for a pair-slice index or `copy_from_slice` length mismatch.
+#[majit_macros::dont_look_inside]
+pub fn ll_slice_bounds_panic() {
+    panic!("slice index out of bounds");
 }
 
 /// `rgc.ll_arraycopy` over raw items. The items hold no GC pointer, so the
@@ -527,11 +535,12 @@ pub fn ll_slice_arraycopy_i(
     dest_start: usize,
     length: usize,
 ) {
+    let nbytes = item_bytes(length, ITEM_SIZE_I).expect("Vec capacity overflow");
     unsafe {
         std::ptr::copy_nonoverlapping(
             slice_item_addr(source, source_start, ITEM_SIZE_I) as *const u8,
             slice_item_addr(dest, dest_start, ITEM_SIZE_I) as *mut u8,
-            length * ITEM_SIZE_I,
+            nbytes,
         );
     }
 }
@@ -598,8 +607,12 @@ pub fn ll_slice_get_addr_i(items: usize, length: usize, index: usize) -> usize {
 
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
+/// Opaque like [`vec_buf_alloc`]. `checked_mul` overflow stays in this
+/// residual; `raw_malloc_varsize_char` is already dont_look_inside.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn ll_slice_buffer_new_i(length: usize) -> usize {
-    raw_malloc_varsize_char(length * ITEM_SIZE_I)
+    let size = item_bytes(length, ITEM_SIZE_I).expect("Vec capacity overflow");
+    raw_malloc_varsize_char(size)
 }
 
 /// `[item; length]` into the buffer at `items`.
@@ -655,11 +668,16 @@ pub fn ll_vec_newemptylist_r() -> Vec<*mut u8> {
     Vec::new()
 }
 
-/// `lltypesystem/rlist.py ll_newlist`: `length` slots, items not initialised.
-#[majit_macros::oopspec("newlist(length)")]
+/// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is null
+/// until the caller writes it, and `length` is already the list length.
+/// No `newlist(length)` oopspec: the result is a raw `Vec` header (kind
+/// int), and that rewrite emits GC `new_array_clear` into a ref bank.
 pub fn ll_vec_newlist_r(length: usize) -> Vec<*mut u8> {
     let mut l = Vec::with_capacity(length);
-    unsafe { l.set_len(length) };
+    unsafe {
+        l.set_len(length);
+    }
+    ll_vec_arrayclear_r(&mut l, length);
     l
 }
 
@@ -668,10 +686,8 @@ fn ll_vec_zero_or_null_r(item: *mut u8) -> bool {
     item.is_null()
 }
 
-/// `rgc.ll_arrayclear`. Raw memory is not zero-filled. Upstream skips this
-/// for a `Ptr` item because `ll_newlist` already ran
-/// `zero_gc_pointers_inside`; this raw header does not, so null slots are
-/// cleared here too.
+/// `rgc.ll_arrayclear`. Writes null into each of the `count` slots.
+#[majit_macros::dont_look_inside_cannot_raise]
 fn ll_vec_arrayclear_r(l: &mut Vec<*mut u8>, count: usize) {
     let mut i = 0;
     while i < count {
@@ -681,7 +697,7 @@ fn ll_vec_arrayclear_r(l: &mut Vec<*mut u8>, count: usize) {
 }
 
 /// `rlist.py _ll_alloc_and_clear`.
-#[majit_macros::oopspec("newlist_clear(count)")]
+/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
 pub fn ll_vec_alloc_and_clear_r(count: usize) -> Vec<*mut u8> {
     let mut l = ll_vec_newlist_r(count);
     ll_vec_arrayclear_r(&mut l, count);
@@ -727,13 +743,6 @@ fn ll_vec_alloc_and_set_jit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual for now: upstream traces into this body, but these helper graphs
-/// are never prepass subjects, so the calls inside carry no `RustVec` result
-/// type and the list-oopspec rewrite cannot tell their header from a GC
-/// list.  Tracing it waits on rtyping the helper bodies the way
-/// `annlowlevel` annotates low-level helpers.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_r(count, item)
@@ -855,11 +864,12 @@ pub fn ll_vec_items_r(l: &mut Vec<*mut u8>) -> usize {
     vec_header_word(vec_header_r(l), VEC_PTR_WORD)
 }
 
-/// `ll_extend` from the `(items, length)` slice: `_ll_resize_ge` to the
-/// summed length, then `ll_arraycopy` of the items.
+/// `ll_extend` from the `(items, length)` slice. `ovfcheck` on `len1 + len2`
+/// rejects a wrapping sum, then `_ll_resize_ge` and `ll_arraycopy`.
 pub fn ll_vec_extend_from_slice_r(l: &mut Vec<*mut u8>, items: usize, length: usize) {
     let len1 = ll_vec_length_r(l);
-    ll_vec_resize_ge_r(l, len1 + length);
+    let newlen = len1.checked_add(length).expect("Vec capacity overflow");
+    ll_vec_resize_ge_r(l, newlen);
     ll_slice_arraycopy_r(items, ll_vec_items_r(l), 0, len1, length);
 }
 
@@ -917,7 +927,7 @@ pub fn ll_slice_arraycopy_r(
         std::ptr::copy_nonoverlapping(
             slice_item_addr(source, source_start, ITEM_SIZE_R) as *const u8,
             slice_item_addr(dest, dest_start, ITEM_SIZE_R) as *mut u8,
-            length * ITEM_SIZE_R,
+            item_bytes(length, ITEM_SIZE_R).expect("Vec capacity overflow"),
         );
     }
 }
@@ -987,8 +997,12 @@ pub fn ll_slice_get_addr_r(items: usize, length: usize, index: usize) -> usize {
 
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
+/// Opaque like [`vec_buf_alloc`]. `checked_mul` overflow stays in this
+/// residual; `raw_malloc_varsize_char` is already dont_look_inside.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn ll_slice_buffer_new_r(length: usize) -> usize {
-    raw_malloc_varsize_char(length * ITEM_SIZE_R)
+    let size = item_bytes(length, ITEM_SIZE_R).expect("Vec capacity overflow");
+    raw_malloc_varsize_char(size)
 }
 
 /// `[item; length]` into the buffer at `items`.
@@ -1044,21 +1058,27 @@ pub fn ll_vec_newemptylist_f() -> Vec<f64> {
     Vec::new()
 }
 
-/// `lltypesystem/rlist.py ll_newlist`: `length` slots, items not initialised.
-#[majit_macros::oopspec("newlist(length)")]
+/// `lltypesystem/rlist.py ll_newlist`: `length` slots. Each slot is `0.0`
+/// until the caller writes it, and `length` is already the list length.
+/// No `newlist(length)` oopspec: the result is a raw `Vec` header (kind
+/// int), and that rewrite emits GC `new_array_clear` into a ref bank.
 pub fn ll_vec_newlist_f(length: usize) -> Vec<f64> {
     let mut l = Vec::with_capacity(length);
-    unsafe { l.set_len(length) };
+    unsafe {
+        l.set_len(length);
+    }
+    ll_vec_arrayclear_f(&mut l, length);
     l
 }
 
-/// `rlist.py _ll_zero_or_null`: a float is zero when its bits are `0.0`
-/// (`not` of the widened number). `-0.0` has a different bit pattern.
+/// `rlist.py _ll_zero_or_null`: `not` of the widened number.
+/// Both `0.0` and `-0.0` are zero.
 fn ll_vec_zero_or_null_f(item: f64) -> bool {
-    item.to_bits() == 0
+    item == 0.0
 }
 
-/// `rgc.ll_arrayclear` of a freshly allocated float buffer.
+/// `rgc.ll_arrayclear`. Writes `0.0` into each of the `count` slots.
+#[majit_macros::dont_look_inside_cannot_raise]
 fn ll_vec_arrayclear_f(l: &mut Vec<f64>, count: usize) {
     let mut i = 0;
     while i < count {
@@ -1068,7 +1088,7 @@ fn ll_vec_arrayclear_f(l: &mut Vec<f64>, count: usize) {
 }
 
 /// `rlist.py _ll_alloc_and_clear`.
-#[majit_macros::oopspec("newlist_clear(count)")]
+/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
 pub fn ll_vec_alloc_and_clear_f(count: usize) -> Vec<f64> {
     let mut l = ll_vec_newlist_f(count);
     ll_vec_arrayclear_f(&mut l, count);
@@ -1114,13 +1134,6 @@ fn ll_vec_alloc_and_set_jit_f(count: usize, item: f64) -> Vec<f64> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-///
-/// Residual for now: upstream traces into this body, but these helper graphs
-/// are never prepass subjects, so the calls inside carry no `RustVec` result
-/// type and the list-oopspec rewrite cannot tell their header from a GC
-/// list.  Tracing it waits on rtyping the helper bodies the way
-/// `annlowlevel` annotates low-level helpers.
-#[majit_macros::dont_look_inside]
 pub fn ll_vec_alloc_and_set_f(count: usize, item: f64) -> Vec<f64> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_f(count, item)
@@ -1235,11 +1248,12 @@ pub fn ll_vec_items_f(l: &mut Vec<f64>) -> usize {
     vec_header_word(vec_header_f(l), VEC_PTR_WORD)
 }
 
-/// `ll_extend` from the `(items, length)` slice: `_ll_resize_ge` to the
-/// summed length, then `ll_arraycopy` of the items.
+/// `ll_extend` from the `(items, length)` slice. `ovfcheck` on `len1 + len2`
+/// rejects a wrapping sum, then `_ll_resize_ge` and `ll_arraycopy`.
 pub fn ll_vec_extend_from_slice_f(l: &mut Vec<f64>, items: usize, length: usize) {
     let len1 = ll_vec_length_f(l);
-    ll_vec_resize_ge_f(l, len1 + length);
+    let newlen = len1.checked_add(length).expect("Vec capacity overflow");
+    ll_vec_resize_ge_f(l, newlen);
     ll_slice_arraycopy_f(items, ll_vec_items_f(l), 0, len1, length);
 }
 
@@ -1258,7 +1272,7 @@ pub fn ll_slice_arraycopy_f(
         std::ptr::copy_nonoverlapping(
             slice_item_addr(source, source_start, ITEM_SIZE_F) as *const u8,
             slice_item_addr(dest, dest_start, ITEM_SIZE_F) as *mut u8,
-            length * ITEM_SIZE_F,
+            item_bytes(length, ITEM_SIZE_F).expect("Vec capacity overflow"),
         );
     }
 }
@@ -1325,8 +1339,12 @@ pub fn ll_slice_get_addr_f(items: usize, length: usize, index: usize) -> usize {
 
 /// `lltype.malloc(Array(ITEM), length, flavor='raw')`: the item buffer of an
 /// array the lowering keeps in raw memory because it is borrowed as a slice.
+/// Opaque like [`vec_buf_alloc`]. `checked_mul` overflow stays in this
+/// residual; `raw_malloc_varsize_char` is already dont_look_inside.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn ll_slice_buffer_new_f(length: usize) -> usize {
-    raw_malloc_varsize_char(length * ITEM_SIZE_F)
+    let size = item_bytes(length, ITEM_SIZE_F).expect("Vec capacity overflow");
+    raw_malloc_varsize_char(size)
 }
 
 /// `[item; length]` into the buffer at `items`.
@@ -1393,6 +1411,19 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Vec capacity overflow")]
+    fn slice_buffer_new_rejects_a_wrapping_length() {
+        let _ = ll_slice_buffer_new_i(usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "Vec capacity overflow")]
+    fn extend_from_slice_rejects_a_wrapping_length() {
+        let mut l = ll_vec_newlist_i(1);
+        ll_vec_extend_from_slice_i(&mut l, 0, usize::MAX);
+    }
+
+    #[test]
     fn allocator_paths_name_these_functions() {
         let module = module_path!().trim_end_matches("::tests");
         assert_eq!(
@@ -1436,6 +1467,11 @@ mod tests {
         assert_eq!(ll_vec_alloc_and_set_f(0, 0.0), Vec::<f64>::new());
         assert_eq!(ll_vec_alloc_and_set_f(0, 1.5), Vec::<f64>::new());
         assert_eq!(ll_vec_alloc_and_set_f(3, 0.0), vec![0.0; 3]);
+        assert!(
+            ll_vec_alloc_and_set_f(2, -0.0)
+                .iter()
+                .all(|item| item.to_bits() == 0)
+        );
         assert_eq!(ll_vec_alloc_and_set_f(3, 1.5), vec![1.5; 3]);
         assert_eq!(ll_vec_alloc_and_clear_f(0), Vec::<f64>::new());
         assert_eq!(ll_vec_alloc_and_clear_f(3), vec![0.0; 3]);
@@ -1615,6 +1651,7 @@ mod tests {
             "ll_slice_rotate_left_i",
             "ll_slice_rotate_right_r",
             "ll_slice_rotate_left_f",
+            "ll_slice_bounds_panic",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(

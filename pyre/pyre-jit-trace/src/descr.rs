@@ -10628,6 +10628,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn descr_from_set_member_bridges_gil_ready() {
+        let canonical = gil_ready_descr();
+        let lookup = descr_from_set_member(&majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: majit_ir::descr::path_hash("pyre_object::gil_ready::GilReadyState"),
+            field_name: "gil_ready".into(),
+        });
+        let SetMemberLookup::Resolved(descr) = lookup else {
+            panic!("gil_ready Field member must resolve");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&descr, &canonical),
+            "gil_ready Field member must bridge to the quasi descr",
+        );
+    }
+
     /// The hand-lowered handler ops and translated execution-context helpers
     /// address the same three words through the same descriptor objects.
     /// `pypy/jit/backend/llsupport/descr.py GcCache.get_field_descr` has no
@@ -11294,6 +11310,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("interp_exceptions::W_ExceptionExtendedUser", || {
         let _ = w_exception_descrs_for(ExcKind::FileNotFoundError, true);
+    }),
+    ("gil_ready::GilReadyState", || {
+        LazyLock::force(&GIL_READY_DESCR_GROUP);
+    }),
+    ("pyre_object::gil_ready::GilReadyState", || {
+        LazyLock::force(&GIL_READY_DESCR_GROUP);
     }),
 ];
 
@@ -13125,6 +13147,10 @@ fn mint_field(
     else {
         return None;
     };
+    if field_name == "gil_ready" {
+        return Some(GIL_READY_DESCR_GROUP.field_descrs[0].clone()
+            as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+    }
     // PyPy's single GcCache sees the runtime declaration at the same
     // `cpu.fielddescrof` request that creates this slot. At pyre's AOT
     // boundary, restore that order for this exact STRUCT only: its declaration

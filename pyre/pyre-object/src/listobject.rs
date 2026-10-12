@@ -5535,6 +5535,47 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
     Some(w_item)
 }
 
+/// `SimpleRangeListStrategy.pop` (listobject.py).
+unsafe fn pop_end_simple_range(obj: PyObjectRef) -> PyObjectRef {
+    let list = &mut *(obj as *mut W_ListObject);
+    let length = range_list_length(list);
+    let roots = crate::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let _ = roots.pin_root(obj);
+    let result = w_int_new((length - 1) as i64);
+    let result_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(result);
+    let obj = roots.get(obj_slot);
+    if length > 1 {
+        let _ = install_range_state(obj, ListStrategy::SimpleRange, &[(length - 1) as i64]);
+    } else {
+        let list = &mut *(obj as *mut W_ListObject);
+        list.items = std::ptr::null_mut();
+        list.strategy = ListStrategy::Empty;
+    }
+    crate::gc_roots::shadow_stack_get(result_slot)
+}
+
+/// `RangeListStrategy.pop` (listobject.py).
+unsafe fn pop_end_range(obj: PyObjectRef) -> PyObjectRef {
+    let list = &mut *(obj as *mut W_ListObject);
+    let length = range_list_length(list);
+    let (start, step) = range_list_start_step(list);
+    let roots = crate::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let _ = roots.pin_root(obj);
+    let result = w_int_new(start + ((length - 1) as i64) * step);
+    let result_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(result);
+    let obj = roots.get(obj_slot);
+    let _ = install_range_state(
+        obj,
+        ListStrategy::Range,
+        &[start, step, (length - 1) as i64],
+    );
+    crate::gc_roots::shadow_stack_get(result_slot)
+}
+
 /// [`w_list_pop_end`]'s checked body, run with the list's guard already held.
 ///
 /// The generated pop descent must include `W_ListObject.descr_pop`'s empty
@@ -5564,43 +5605,11 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
         // EmptyListStrategy.pop is unreachable after descr_pop's length check
         // (pypy/objspace/std/listobject.py).
         ListStrategy::Empty | ListStrategy::Size => PY_NULL,
-        ListStrategy::SimpleRange => {
-            let length = range_list_length(list);
-            // The list is a livevar across the `w_int_new` malloc.
-            let roots = crate::gc_roots::push_roots();
-            let obj_slot = roots.base();
-            let _ = roots.pin_root(obj);
-            let result = w_int_new((length - 1) as i64);
-            let result_slot = crate::gc_roots::shadow_stack_len();
-            let _ = crate::gc_roots::pin_root(result);
-            let obj = roots.get(obj_slot);
-            if length > 1 {
-                let _ = install_range_state(obj, ListStrategy::SimpleRange, &[(length - 1) as i64]);
-            } else {
-                let list = &mut *(obj as *mut W_ListObject);
-                list.items = std::ptr::null_mut();
-                list.strategy = ListStrategy::Empty;
-            }
-            crate::gc_roots::shadow_stack_get(result_slot)
-        }
-        ListStrategy::Range => {
-            let length = range_list_length(list);
-            let (start, step) = range_list_start_step(list);
-            // The list is a livevar across the `w_int_new` malloc.
-            let roots = crate::gc_roots::push_roots();
-            let obj_slot = roots.base();
-            let _ = roots.pin_root(obj);
-            let result = w_int_new(start + ((length - 1) as i64) * step);
-            let result_slot = crate::gc_roots::shadow_stack_len();
-            let _ = crate::gc_roots::pin_root(result);
-            let obj = roots.get(obj_slot);
-            let _ = install_range_state(
-                obj,
-                ListStrategy::Range,
-                &[start, step, (length - 1) as i64],
-            );
-            crate::gc_roots::shadow_stack_get(result_slot)
-        }
+        // `SimpleRangeListStrategy.pop` / `RangeListStrategy.pop` live in
+        // their own helpers so the `[i64; 1]` / `[i64; 3]` slice buffers
+        // stay off `w_list_pop_end_inner`'s Integer path.
+        ListStrategy::SimpleRange => pop_end_simple_range(obj),
+        ListStrategy::Range => pop_end_range(obj),
         ListStrategy::Integer => {
             let length = ll_list_int_length(list);
             // rpython/rtyper/rlist.py ll_pop_default's internal precondition,
