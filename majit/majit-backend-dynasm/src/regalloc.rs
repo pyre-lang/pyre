@@ -3310,10 +3310,29 @@ impl<'a> RegAlloc<'a> {
             OpCode::FloatNeg | OpCode::FloatAbs if !args.is_empty() => {
                 self.consider_float_unary_j2(dst.unwrap_or(op.pos().get()), args[0], i, output);
             }
-            // aarch64 keeps both casts on `consider_float_unary_j2`.
+            // aarch64/regalloc.py `prepare_op_cast_float_to_singlefloat` and
+            // `prepare_op_cast_singlefloat_to_float` are both `prepare_unary`:
+            // the arg in a register of its own kind, then
+            // `force_allocate_reg(op)` in a register of the result's kind.
+            // CAST_FLOAT_TO_SINGLEFLOAT is ('f','i'); CAST_SINGLEFLOAT_TO_FLOAT
+            // is ('i','f') (`resoperation.py` CastOp.cast_types).
             #[cfg(not(target_arch = "x86_64"))]
-            OpCode::CastFloatToSinglefloat | OpCode::CastSinglefloatToFloat if !args.is_empty() => {
-                self.consider_float_unary_j2(dst.unwrap_or(op.pos().get()), args[0], i, output);
+            OpCode::CastFloatToSinglefloat if !args.is_empty() => {
+                self.consider_cast_float_to_int_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            OpCode::CastSinglefloatToFloat if !args.is_empty() => {
+                self.consider_cast_int_to_float_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
             }
             // x86/regalloc.py `consider_cast_float_to_singlefloat`.
             #[cfg(target_arch = "x86_64")]
