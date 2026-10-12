@@ -5490,6 +5490,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 Some((ctx.frame_state.clone(), frame_reg))
             });
         let _frame_chain = ResidualFrameChainGuard::enter(concrete_inline_frame, published_shadow);
+        // `pyframe.py execute_frame`'s `ec.enter(self)` for the frame a
+        // portal call runs: the portal runner continues a frame its caller
+        // entered, and here the caller is this residual.  After the guard
+        // above, so the frame chains onto the level that calls it.
+        let portal_call_frame = ctx.session.borrow().portal_call_frame;
+        let _portal_frame_chain = portal_call_frame
+            .and_then(|frame| match ctx.trace_ctx.concrete_of_opref(frame) {
+                Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0),
+                _ => None,
+            })
+            .and_then(|frame| ResidualFrameChainGuard::enter(frame, None));
         let live_py_pc = if ctx.fbw_mode.inline_subwalk {
             ctx.vstack_cur_pypc
         } else {
@@ -8748,20 +8759,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && list_append_inline_ok
         && dst_bank == 'r'
         && try_walker_orthodox_proxy_list_append(ctx, code, op, funcptr, &r_args, dst)?.is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // Exact `dict.get(identity_key)` follows the promoted strategy-entry
-    // shape produced by tracing `DictStrategy.getitem`: pin the key-set
-    // iterator state and read the resolved entry value live.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::BuiltinDictGet, || {
-            try_walker_specialize_builtin_dict_get(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

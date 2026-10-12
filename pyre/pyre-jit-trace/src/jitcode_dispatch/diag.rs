@@ -365,7 +365,6 @@ spec_folds! {
     Newlist              => ("newlist",                  "residual_call", "-"),
     BuiltinLenDescent    => ("builtin_len_descent",      "inline_call",   "-"),
     BuiltinIsinstance    => ("builtin_isinstance",       "residual_call", "-"),
-    BuiltinDictGet       => ("builtin_dict_get",         "residual_call", "-"),
     BuiltinTypeGetattr   => ("builtin_type_getattr",     "residual_call", "-"),
     BuiltinGetattr       => ("builtin_getattr",          "residual_call", "-"),
     BuiltinRange         => ("builtin_range",            "residual_call", "-"),

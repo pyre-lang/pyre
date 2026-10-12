@@ -3499,6 +3499,16 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         .trace_ctx
         .const_int(i64::from(open_inline_activations(ctx.session) + 1));
     let activation = record_activation_charge(ctx, pc, callee_ec, callee_frame, units)?;
+    // `pyframe.py execute_frame`'s `ec.enter(self)`, as in
+    // [`try_walker_call_assembler_self_recursive`]: the sub-walk's
+    // `walker_ec_leave` has already taken the callee off the chain, and the
+    // portal call that runs its loop belongs inside that bracket.  A
+    // reconstructed callee (`dst` is None) is still inside its carrier
+    // scope, which `carrier_ec_leave` closes when the frame returns.
+    let enters_frame_chain = dst.is_some();
+    if enters_frame_chain {
+        record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, callee_ec);
+    }
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -3592,6 +3602,13 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     let blackhole_result = resume_pc
         .zip(dst)
         .map(|(next_pc, (bank, color))| (next_pc, bank, color));
+    // The concrete half of the enter recorded above, scoped to the call.
+    let displaced_portal_call_frame = enters_frame_chain.then(|| {
+        ctx.session
+            .borrow_mut()
+            .portal_call_frame
+            .replace(callee_frame)
+    });
     let exec = try_execute_residual_call_via_executor(
         ctx,
         OpCode::CallMayForceR,
@@ -3601,7 +3618,11 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         pc,
         blackhole_result,
         false,
-    )?;
+    );
+    if let Some(displaced) = displaced_portal_call_frame {
+        ctx.session.borrow_mut().portal_call_frame = displaced;
+    }
+    let exec = exec?;
     // `pyjitpl.py:2049-2079` records a forced VIRTUAL_REF_FINISH before the
     // selected CALL_ASSEMBLER, followed immediately by GUARD_NOT_FORCED.
     // `direct_assembler_call` records CALL_ASSEMBLER on the portal reds.
@@ -3656,6 +3677,9 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
+    if enters_frame_chain {
+        record_ec_leave_frame_chain(ctx.trace_ctx, callee_frame, callee_ec);
+    }
     // Restore before either exception arm leaves the compiled caller.  Put
     // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
     // an emitted call-adjacent operation even when the restore stores fold.

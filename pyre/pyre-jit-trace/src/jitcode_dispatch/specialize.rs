@@ -10807,24 +10807,6 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     Ok(Some(result))
 }
 
-/// Whether `callable` is the `dict.get` method object.
-///
-/// The typedef registers the slot as
-/// `make_builtin_function("get", __majit_wrap_dict_descr_get)`, so that leaf
-/// is what `BuiltinCode.func` holds. Naming the `dict_method_get` body it
-/// forwards to instead compares two different functions, and answered true
-/// only while a build happened to give them one address.
-fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
-    if callable.is_null() || !unsafe { pyre_interpreter::is_function(callable) } {
-        return false;
-    }
-    let code = unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
-    !code.is_null()
-        && unsafe { pyre_interpreter::is_builtin_code(code) }
-        && unsafe { pyre_interpreter::builtin_code_get(code) as usize }
-            == pyre_interpreter::type_methods::__majit_wrap_dict_descr_get as *const () as usize
-}
-
 #[derive(Clone, Copy)]
 enum DictFoldKeyProbe {
     Int,
@@ -11196,87 +11178,6 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
         exc: raised,
         exc_concrete: ConcreteValue::Ref(concrete),
     }))
-}
-
-/// `dict.get` on an exact dictionary and an Int/Unicode strategy hit.
-///
-/// `dictmultiobject.py getitem` probes an Int strategy with the unboxed key
-/// value, and `dictmultiobject.py getitem_str` probes a Unicode strategy with
-/// exact-str bytes. The trace guards the exact dict, strategy vtable, and exact
-/// key type, then performs a live strategy-specific lookup and guards that it
-/// hit. Misses and object/identity strategy keys remain residual so their
-/// hash/equality effects stay observable (`rdict.py:576`).
-pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    if !(r_args.len() == 3 || r_args.len() == 4) {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(callable_operand),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(key),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
-    else {
-        return Ok(None);
-    };
-    if callable_operand.is_null() || key.is_null() {
-        return Ok(None);
-    }
-    // LOAD_ATTR's generic method path produces `[Method, PY_NULL, key]`;
-    // LOAD_METHOD's split path produces `[Function, receiver, key]`.
-    // `_Method._immutable_fields_` lets both converge on the same live
-    // function/receiver reads.
-    let bound_method =
-        null_or_self.is_null() && unsafe { pyre_object::is_method(callable_operand) };
-    let (callable, dict) = if bound_method {
-        (
-            unsafe { pyre_object::w_method_get_func(callable_operand) },
-            unsafe { pyre_object::w_method_get_self(callable_operand) },
-        )
-    } else {
-        (callable_operand, null_or_self)
-    };
-    if callable.is_null() || dict.is_null() || !is_builtin_dict_get_function(callable) {
-        return Ok(None);
-    }
-    let Some(hit) = walker_probe_exact_dict_hit(dict, key)? else {
-        return Ok(None);
-    };
-
-    let mut callable_op = r_args[0];
-    let dict_op;
-    if bound_method {
-        walker_guard_class(
-            ctx,
-            op.pc,
-            r_args[0],
-            &pyre_object::function::METHOD_TYPE as *const _ as i64,
-        )?;
-        callable_op = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            r_args[0],
-            crate::descr::method_w_function_descr(),
-        );
-        dict_op = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            r_args[0],
-            crate::descr::method_w_self_descr(),
-        );
-        ctx.trace_ctx.try_set_opref_concrete(
-            dict_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(dict as usize)),
-        );
-    } else {
-        dict_op = r_args[1];
-    }
-    walker_guard_stamped_ref(ctx, op.pc, callable_op, callable)?;
-    walker_emit_exact_dict_hit(ctx, op.pc, dict_op, r_args[2], dict, hit, dst, 'r')
 }
 
 /// `isinstance(x, C)` for an ordinary class `C` — the trace shape of
