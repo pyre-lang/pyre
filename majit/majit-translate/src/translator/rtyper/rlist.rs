@@ -26,7 +26,7 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    Array, LowLevelType, Ptr, PtrTarget, Struct,
+    Array, FuncType, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -840,9 +840,10 @@ fn build_alloc_and_set_family(
         )?
     };
 
-    // `rlib/jit.py isconstant` interpreter fallback (`NonConstant(False)`).
-    // Both layouts share one graph: the `(name, args, result)` cache hits
-    // on the second layout. The traced path is the rich-spine oopspec.
+    // `rlib/jit.py isconstant`. Both layouts share one graph: the
+    // `(name, args, result)` cache hits on the second layout. The
+    // helper body calls the marked `majit_rlib::jit::isconstant`
+    // intrinsic so the codewriter rewrites the call to `int_isconstant`.
     let isconstant = rtyper.lowlevel_helper_function_with_builder(
         "_ll_alloc_and_set_isconstant".to_string(),
         vec![LowLevelType::Signed],
@@ -4709,10 +4710,14 @@ fn build_ll_alloc_and_set_nonnull_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `look_inside_iff` (`rlib/jit.py`): `unroll_safe(func)` then
+    // `func._annspecialcase_ = "specialize:call_location"`.
+    func._jit_unroll_safe_ = true;
+    func.annspecialcase = Some("specialize:call_location".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -4721,31 +4726,63 @@ fn build_ll_alloc_and_set_nonnull_helper_graph(
     ))
 }
 
-/// `rlib/jit.py isconstant`: the interpreter fallback is `NonConstant(False)`.
-/// The traced path is the oopspec `jit.isconstant`, which the rich spine
-/// mints itself. A flowspace wrapper that always sees false takes the
-/// trampoline; that graph is not what the rich tracer runs.
+/// Function pointer whose `_name` is the CallPath `lib.rs` marks
+/// `jit.isconstant`. Spine B splits that name on `::` so
+/// `rewrite_op_direct_call` emits `int_isconstant`.
+fn isconstant_intrinsic_funcptr() -> Constant {
+    let ft = FuncType {
+        args: vec![LowLevelType::Signed],
+        result: LowLevelType::Bool,
+    };
+    let ptr = functionptr(
+        ft.clone(),
+        "majit_rlib::jit::isconstant",
+        None,
+        Some("majit_rlib::jit::isconstant".to_string()),
+    );
+    Constant::with_concretetype(
+        ConstValue::LLPtr(Box::new(ptr)),
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        })),
+    )
+}
+
+/// `rlib/jit.py isconstant`: the interpreter fallback is
+/// `NonConstant(False)` inside the marked intrinsic; the traced path is
+/// the oopspec `jit.isconstant`, rewritten to `int_isconstant`.
 fn build_ll_alloc_and_set_isconstant_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
     let value = variable_with_lltype("value", LowLevelType::Signed);
-    let startblock = Block::shared(vec![Hlvalue::Variable(value)]);
+    let startblock = Block::shared(vec![Hlvalue::Variable(value.clone())]);
     let return_var = variable_with_lltype("result", LowLevelType::Bool);
     let mut graph = FunctionGraph::with_return_var(
         name.to_string(),
         startblock.clone(),
         Hlvalue::Variable(return_var),
     );
+    let result = variable_with_lltype("result", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(isconstant_intrinsic_funcptr()),
+            Hlvalue::Variable(value),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
     startblock.closeblock(vec![
         Link::new(
-            vec![bool_const(false)],
+            vec![Hlvalue::Variable(result)],
             Some(graph.returnblock.clone()),
             None,
         )
         .into_ref(),
     ]);
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `rlib/jit.py isconstant` is `@specialize.call_location()`.
+    func.annspecialcase = Some("specialize:call_location".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -4796,8 +4833,10 @@ fn build_ll_alloc_and_set_trampoline_helper_graph(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
-    // `@dont_look_inside` (`rlib/jit.py` `look_inside_iff`).
+    // `@dont_look_inside` (`rlib/jit.py` `look_inside_iff`); the trampoline
+    // also receives `specialize:call_location`.
     func._jit_look_inside_ = Some(false);
+    func.annspecialcase = Some("specialize:call_location".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -10225,14 +10264,53 @@ mod tests {
             !calls.iter().any(|(_, name)| name == nonnull),
             "jit arm must not call the loop directly, got {calls:?}"
         );
+        let tramp_func = find(&trampoline)
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("trampoline GraphFunc");
+        assert_eq!(tramp_func._jit_look_inside_, Some(false));
         assert_eq!(
-            find(&trampoline)
-                .borrow()
-                .func
-                .as_ref()
-                .unwrap()
-                ._jit_look_inside_,
-            Some(false)
+            tramp_func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let orig_func = find(nonnull)
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("nonnull GraphFunc");
+        assert!(
+            orig_func._jit_unroll_safe_,
+            "look_inside_iff marks the original unroll_safe"
+        );
+        assert_eq!(
+            orig_func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let isc = find("_ll_alloc_and_set_isconstant");
+        let isc_g = isc.borrow();
+        assert_eq!(
+            isc_g.func.as_ref().unwrap().annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let isc_calls = direct_call_callees(&isc_g);
+        assert!(
+            isc_calls
+                .iter()
+                .any(|(_, name)| name == "majit_rlib::jit::isconstant"),
+            "isconstant helper calls the marked intrinsic, got {isc_calls:?}"
+        );
+        let wrap_func = find(&wrapper)
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("wrapper GraphFunc");
+        assert_eq!(
+            wrap_func.annspecialcase, None,
+            "look_inside_iff wrapper f does not get call_location"
         );
         let start = find(nonnull).borrow().startblock.clone();
         let (count, all_ops) = walk_ops(&start);

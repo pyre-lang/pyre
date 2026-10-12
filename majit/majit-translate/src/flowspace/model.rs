@@ -4553,6 +4553,12 @@ pub struct GraphFunc {
     /// can apply the same default as upstream's
     /// `getattr(func, '_jit_look_inside_', True)`.
     pub _jit_look_inside_: Option<bool>,
+    /// Upstream function attribute set by `rlib/jit.py unroll_safe`
+    /// (`func._jit_unroll_safe_ = True`). `look_inside_iff` marks the
+    /// original this way so a backedge is not treated as an unsafe
+    /// loop. `false` mirrors the "attribute absent" default
+    /// (`getattr(func, '_jit_unroll_safe_', False)`).
+    pub _jit_unroll_safe_: bool,
     /// Upstream function attribute consulted by
     /// `description.py:222-224`.
     ///
@@ -4690,6 +4696,7 @@ impl GraphFunc {
             host_call: None,
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
+            _jit_unroll_safe_: false,
             relax_sig_check: None,
             _dont_reach_me_in_del_: false,
             _always_inline_: AlwaysInline::Absent,
