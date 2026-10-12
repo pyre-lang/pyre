@@ -5090,14 +5090,24 @@ pub(crate) fn derive_subject_inputcells(
              `front::mir`)"
         )));
     }
-    // AccessDirect two-phase subjects are independent roots: there is no
-    // caller pycall carrying flagged `args_s`. `specialize.py
-    // default_specialize` would have seen those flags; stamp them on
-    // virtualizable formals so this subject's body is the AccessDirect
-    // specialization (`rlib/jit.py` hint / `_virtualizable_`).
-    if legacy.access_directly {
-        for cell in &mut cells {
-            crate::annotator::builtin::stamp_access_directly_on_virtualizable(cell);
+    // `annrpython.py bindinputargs` binds each actual's annotation onto
+    // the matching startblock formal; `mergeinputargs` / `unionof`
+    // intersects flags on later callers. `specialize.py default_specialize`
+    // uses one `(AccessDirect, key)` graph when any argument is flagged,
+    // but the per-formal flags stay those of each actual.
+    // `FunctionGraph.access_directly_inputs` / `fresh_virtualizable_inputs`
+    // are that converged set — including on the regular split portal
+    // (`warmspot.py _portal_args_s`). Seed those formals only; the
+    // reconstructed Input-op cells start with empty flags.
+    let ad_ids = legacy.access_directly_inputs.as_deref().unwrap_or(&[]);
+    let fresh_ids = legacy.fresh_virtualizable_inputs.as_deref().unwrap_or(&[]);
+    if !ad_ids.is_empty() || !fresh_ids.is_empty() {
+        for (idx, var) in startblock.inputargs.iter().enumerate() {
+            let id = var.id();
+            let fresh = fresh_ids.contains(&id);
+            if fresh || ad_ids.contains(&id) {
+                crate::annotator::builtin::stamp_bound_virtualizable_flags(&mut cells[idx], fresh);
+            }
         }
     }
     Ok(cells)
@@ -7017,6 +7027,82 @@ mod tests {
             msg.contains("Unknown") && msg.contains("None"),
             "error must mention Unknown + missing projection, got: {msg}"
         );
+    }
+
+    fn input_ref_formals(
+        name: &str,
+        n: usize,
+    ) -> (LegacyGraph, Vec<crate::flowspace::model::Variable>) {
+        let mut graph = LegacyGraph::new(name);
+        let entry = graph.startblock;
+        let mut vars = Vec::new();
+        for i in 0..n {
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: format!("a{i}"),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var.clone());
+            vars.push(var);
+        }
+        (graph, vars)
+    }
+
+    fn instance_flag_names(cell: &SomeValue) -> Vec<String> {
+        let SomeValue::Instance(inst) = cell else {
+            panic!("expected SomeInstance, got {cell:?}");
+        };
+        inst.flags.keys().cloned().collect()
+    }
+
+    /// `specialize.py default_specialize` uses one `(AccessDirect, key)`
+    /// graph when any actual is flagged, but `bindinputargs` copies each
+    /// actual's own annotation. `f(flagged, ordinary)` flags only formal 0.
+    #[test]
+    fn derive_subject_inputcells_seeds_only_recorded_access_directly_formals() {
+        let (mut graph, vars) = input_ref_formals("f", 2);
+        graph.access_directly = true;
+        graph.access_directly_inputs = Some(vec![vars[0].id()]);
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("typed Input ops must project to definite SomeValue cells");
+        assert_eq!(instance_flag_names(&cells[0]), ["access_directly"]);
+        assert!(instance_flag_names(&cells[1]).is_empty());
+    }
+
+    /// `rlib/jit.py` hint `fresh_virtualizable=True` sets both flags on
+    /// the actual; `bindinputargs` copies them onto that formal.
+    #[test]
+    fn derive_subject_inputcells_keeps_fresh_virtualizable_with_access_directly() {
+        let (mut graph, vars) = input_ref_formals("f", 1);
+        graph.access_directly = true;
+        graph.access_directly_inputs = Some(vec![vars[0].id()]);
+        graph.fresh_virtualizable_inputs = Some(vec![vars[0].id()]);
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("typed Input ops must project to definite SomeValue cells");
+        assert_eq!(
+            instance_flag_names(&cells[0]),
+            ["access_directly", "fresh_virtualizable"]
+        );
+    }
+
+    /// `warmspot.py _portal_args_s`: the regular split portal is not an
+    /// AccessDirect graph, but its recorded red formal still carries the
+    /// flag (`inherit_split_portal_access_directly`).
+    #[test]
+    fn derive_subject_inputcells_seeds_split_portal_red_from_recorded_ids() {
+        let (mut graph, vars) = input_ref_formals("eval_loop_jit_portal", 2);
+        graph.access_directly_inputs = Some(vec![vars[0].id()]);
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("typed Input ops must project to definite SomeValue cells");
+        assert!(!graph.access_directly);
+        assert_eq!(instance_flag_names(&cells[0]), ["access_directly"]);
+        assert!(instance_flag_names(&cells[1]).is_empty());
     }
 
     #[test]

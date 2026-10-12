@@ -7987,13 +7987,18 @@ pub struct FunctionGraph {
     /// under alt_name `{name}__AccessDirect_None`. That copy is a distinct
     /// `FunctionGraph`; the regular graph is never stamped.
     pub access_directly: bool,
-    /// Formals of the AccessDirect copy whose binding still carries the
-    /// flag. `None` on the regular graph, and on a copy that was never
-    /// bound (`bindinputargs` never ran on its startblock). `Some(ids)` is
-    /// the startblock binding after the annotator fixpoint (`bindinputargs`
-    /// then `mergeinputargs` / `unionof`); ids only ever shrink. Lives on
-    /// the AccessDirect copy only.
+    /// Formals whose binding still carries `access_directly`.
+    /// `None` until `bindinputargs` first runs on the startblock.
+    /// `Some(ids)` is the startblock binding after the annotator fixpoint
+    /// (`bindinputargs` then `mergeinputargs` / `unionof`); ids only ever
+    /// shrink. Present on AccessDirect copies and on the split portal
+    /// (`warmspot.py _portal_args_s` / `split_graph_and_record_jitdriver`).
     pub access_directly_inputs: Option<Vec<u64>>,
+    /// Formals whose binding still carries `fresh_virtualizable`
+    /// (`rlib/jit.py` hint `fresh_virtualizable=True` sets both flags).
+    /// Same `None` / `Some(ids)` / shrink-only contract as
+    /// `access_directly_inputs`; a subset of those formals.
+    pub fresh_virtualizable_inputs: Option<Vec<u64>>,
     /// Call-result Variable ids whose annotation carries `access_directly`.
     /// `annrpython.py binding(op.result)` after `recursivecall` returns
     /// `binding(graph.getreturnvar())`. Empty until a call's callee return
@@ -8132,6 +8137,16 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
                 })
                 .collect()
         }),
+        fresh_virtualizable_inputs: graph.fresh_virtualizable_inputs.as_ref().map(|ids| {
+            ids.iter()
+                .filter_map(|id| {
+                    varmap
+                        .iter()
+                        .find(|(var, _)| var.id() == *id)
+                        .map(|(_, copied)| copied.id())
+                })
+                .collect()
+        }),
         access_directly_call_results: graph
             .access_directly_call_results
             .iter()
@@ -8226,6 +8241,7 @@ impl FunctionGraph {
             hints: Vec::new(),
             access_directly: false,
             access_directly_inputs: None,
+            fresh_virtualizable_inputs: None,
             access_directly_call_results: Vec::new(),
             access_directly_return: false,
             func: FuncEffects::default(),

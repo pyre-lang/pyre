@@ -2137,12 +2137,30 @@ fn instance_is_virtualizable(inst: &SomeInstance) -> bool {
 /// `access_directly = True` still has to mint the same flag on its
 /// virtualizable formals so the subject's body is the AccessDirect
 /// specialization.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn stamp_access_directly_on_virtualizable(s: &mut SomeValue) {
     let SomeValue::Instance(inst) = s else {
         return;
     };
     if instance_is_virtualizable(inst) {
         inst.flags.insert("access_directly".to_string(), true);
+    }
+}
+
+/// Bind `access_directly` / `fresh_virtualizable` onto a reconstructed
+/// startblock cell the way `annrpython.py bindinputargs` copies the
+/// actual's `SomeInstance.flags`. The recorded formal ids
+/// (`FunctionGraph.access_directly_inputs` /
+/// `fresh_virtualizable_inputs`) are the filter; `unionof` already
+/// intersected them across callers. `fresh_virtualizable=True` sets
+/// both flags (`rlib/jit.py` hint).
+pub(crate) fn stamp_bound_virtualizable_flags(s: &mut SomeValue, fresh: bool) {
+    let SomeValue::Instance(inst) = s else {
+        return;
+    };
+    inst.flags.insert("access_directly".to_string(), true);
+    if fresh {
+        inst.flags.insert("fresh_virtualizable".to_string(), true);
     }
 }
 
@@ -3170,6 +3188,30 @@ mod tests {
         let mut s = instance_of(&bk, "Plain", false, &[]);
         stamp_access_directly_on_virtualizable(&mut s);
         assert!(flags_of(&s).is_empty());
+    }
+
+    /// `annrpython.py bindinputargs` copies the actual's flags onto the
+    /// reconstructed cell; the recorded formal ids are the filter.
+    #[test]
+    fn stamp_bound_virtualizable_flags_copies_access_directly() {
+        let bk = bk();
+        let mut s = instance_of(&bk, "Plain", false, &[]);
+        stamp_bound_virtualizable_flags(&mut s, false);
+        assert_eq!(flags_of(&s), vec!["access_directly".to_string()]);
+    }
+
+    #[test]
+    fn stamp_bound_virtualizable_flags_copies_both_when_fresh() {
+        let bk = bk();
+        let mut s = instance_of(&bk, "Plain", false, &[]);
+        stamp_bound_virtualizable_flags(&mut s, true);
+        assert_eq!(
+            flags_of(&s),
+            vec![
+                "access_directly".to_string(),
+                "fresh_virtualizable".to_string()
+            ]
+        );
     }
 
     /// The `fresh_virtualizable` spelling carries `access_directly` with it,
