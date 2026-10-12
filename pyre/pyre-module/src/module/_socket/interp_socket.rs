@@ -6617,16 +6617,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let mut control = {
                     let total_control: usize = cmsgs
                         .iter()
-                        .map(|(_, _, d)| unsafe {
-                            libc::CMSG_SPACE(d.len() as libc::c_uint) as usize
-                        })
+                        .map(|(_, _, d)| libc::CMSG_SPACE(d.len() as libc::c_uint) as usize)
                         .sum();
                     let mut control = vec![0u8; total_control];
                     if total_control > 0 {
-                        let mut packing_msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                        let mut packing_msg: libc::msghdr = std::mem::zeroed();
                         packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                         packing_msg.msg_controllen = total_control as _;
-                        unsafe {
+                        {
                             let mut cur = libc::CMSG_FIRSTHDR(&packing_msg);
                             for (level, ty, data) in &cmsgs {
                                 if cur.is_null() {

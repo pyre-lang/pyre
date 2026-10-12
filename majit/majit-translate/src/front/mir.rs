@@ -55125,7 +55125,6 @@ pub(crate) fn collect_foreign_opaque_method_externals(
 /// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
 /// directly from its `<Impl>` NameSeg, the free-function twin of
 /// [`Lowering::resolve_impl_owner_adt_def_id`] over the `<Impl>` segment.
-#[cfg(any(test, feature = "mir-frontend"))]
 fn impl_owner_adt_def_id_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<u64> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
@@ -55162,7 +55161,6 @@ fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
 /// `Ref(Some(root))` so the residual intern's the enum-base ClassDef;
 /// every other shape (`Option`, fieldless enum, tuple, reference,
 /// non-opaque struct) is declined.
-#[cfg(any(test, feature = "mir-frontend"))]
 fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     // A reference return (`&T`) is not the owned residual result the
     // stub models; decline.
