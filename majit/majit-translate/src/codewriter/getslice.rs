@@ -879,6 +879,37 @@ mod tests {
     }
 
     #[test]
+    fn minted_helper_arraycopy_becomes_os_arraycopy() {
+        let mut cc = CallControl::new();
+        // `analyze_pipeline_from_module_paths` in lib.rs marks this oopspec
+        // for the production pipeline (`rgc.py` `@jit.oopspec('list.ll_arraycopy(...)')`).
+        cc.mark_oopspec(
+            CallPath::from_segments(["ll_arraycopy"]),
+            "list.ll_arraycopy(source, dest, source_start, dest_start, length)".to_string(),
+        );
+        let path = listslice_startonly_path(
+            &mut cc,
+            &ValueType::Ref(None),
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+        );
+        let graph = cc
+            .function_graphs()
+            .get(&path)
+            .expect("listslice helper is registered");
+        let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+        let mut transformer =
+            crate::codewriter::jtransform::Transformer::new(&config).with_callcontrol(&mut cc);
+        let out = transformer.transform(&graph);
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.detail.contains("oopspec Arraycopy")),
+            "minted ll_arraycopy must become OS_ARRAYCOPY; notes={:?}",
+            out.notes
+        );
+    }
+
+    #[test]
     fn minusone_helper_has_one_list_arg_and_arraycopy() {
         let graph = build_ll_listslice_minusone_graph(
             "ll_listslice_minusone__ref",

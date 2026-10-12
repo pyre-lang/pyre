@@ -8131,6 +8131,53 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
+/// Record the `&[PyObjectRef]` argument array a generated builtin wrapper
+/// reads, and stamp a walk-time items block so a later void `OS_ARRAYCOPY`
+/// (`ll_listslice_startonly`) can execute. `new_array_clear` in the jitcode
+/// walker already materializes that way (`mod.rs`); this site records the
+/// op directly, so it has to stamp the block itself. `try_set_opref_concrete`
+/// is the recording-time shadow (`walk_op_const_ptr_refs`), not
+/// `make_constant` — the compiled trace still allocates, and virtualize
+/// removes a constant-length array (`heapcache.py new_array`).
+fn record_and_materialize_wrapper_args_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    wrapper_items: &[OpRef],
+) -> (OpRef, ConcreteValue) {
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
+    let args_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+    let mut concrete = ConcreteValue::Null;
+    if let Ok(cap) = usize::try_from(wrapper_items.len() as i64)
+        && let Some(block) =
+            unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(cap) }
+        && ctx.trace_ctx.try_set_opref_concrete(
+            args_array,
+            majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+        )
+    {
+        concrete = ConcreteValue::Ref(block as pyre_object::PyObjectRef);
+    }
+    for (index, &item) in wrapper_items.iter().enumerate() {
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        // The wrapper reads its `&[PyObjectRef]` argument through this same
+        // ArrayDescr, so its getarrayitem returns the live CALL operand.
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+        super::heapcache_ops::walker_fill_materialized_array(ctx, args_array, index, item);
+    }
+    (args_array, concrete)
+}
+
 /// Stamp wrapper arguments, walk the generated body, restore the caller
 /// frame, and handle SubReturn / SubRaise.  Shared by CALL
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
@@ -8185,26 +8232,8 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, args_array_concrete) =
+        record_and_materialize_wrapper_args_array(ctx, &wrapper_items);
 
     let saved_vable = if !nested_helper && owns_virtualizable_shadow {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
@@ -8301,7 +8330,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     // The helper's level ends with its walk.  A type-call `__init__` walked
@@ -8760,24 +8789,8 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, args_array_concrete) =
+        record_and_materialize_wrapper_args_array(ctx, &wrapper_items);
 
     let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
@@ -8835,7 +8848,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     drop(helper_frame);

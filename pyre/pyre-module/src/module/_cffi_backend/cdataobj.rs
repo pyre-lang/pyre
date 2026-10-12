@@ -1012,17 +1012,25 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
         return Err(PyError::type_error("__call__ needs a cdata receiver"));
     }
     // `W_CData.call`: `with self as ptr: return self.ctype.call(ptr, args_w)`.
-    // The gateway reads `len` first so the walker can name the array
-    // descriptor; the pins then keep every argument across `cdata_arg`.
-    let nargs = args.len();
+    // `UnwrapSpec_EmitRun.visit_args_w` (`gateway.py`) passes
+    // `space.fixedview` of the vararg as `args_w`; that list is `args[1:]`.
+    // The pins keep every argument alive across `cdata_arg` on the
+    // interpreter; the jitcode eraser drops them (`RootBracketPlan`), so
+    // the recording walk sees `args` as the incoming GcArray and
+    // `&args[1:]` as `ll_listslice_startonly` (`rlist.py rtype_getslice`).
+    //
+    // Moving nursery: `args` on the interpreter is a native slice of
+    // already-rooted words (`Function.funccall` builtin arm). Success-path
+    // `cdata_arg` / `ctype_ref` / `kind` do not GC-allocate; `do_call`
+    // pins `args_w` again before any conversion that can collect. The JIT
+    // never sees that native slice — erasure leaves the incoming GcArray,
+    // which the collector rewrites.
     let roots = pyre_object::gc_roots::push_roots();
     let args_base = roots.pin_roots(args);
     let cdata = cdata_arg(roots.get(args_base))?;
     let ct = cdata.ctype_ref()?;
     if ct.kind == ctypeobj::KIND_FUNC {
-        let mut rest = vec![pyre_object::PY_NULL; nargs - 1];
-        pyre_object::gc_roots::shadow_stack_copy_range(args_base + 1, &mut rest);
-        return super::ctypefunc::call(ct, cdata.ptr, &rest);
+        return super::ctypefunc::call(ct, cdata.ptr, &args[1..]);
     }
     Err(unsafe { PyError::from_exc_object(cdata_not_callable(ct)) })
 }
