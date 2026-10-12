@@ -8471,10 +8471,23 @@ fn reconstruct_inline_recipe(
         let Some(pc) = usize::try_from(frame.pc).ok() else {
             decline!("NoPendingResultColor");
         };
+        // Same two-twin order as `compute_inline_caller_frame` /
+        // `Unavail::Nested/NoResultColor`: the trivia twin answers only
+        // while the post-call `-live-` is also the fallthrough pc's own
+        // resume marker. A CALL whose fallthrough has its own per-pc
+        // marker, or whose TOS at the CALL is a constant (`u16::MAX`),
+        // leaves trivia empty; the after-residual twin keys the result
+        // color by the CALL offset. `resume.py rebuild_from_resumedata`
+        // always rebuilds the frame — this is the color that walk needs
+        // to drop from the live box list, not a reason to abort.
         let Some(color) = pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
             p.result_color_trivia_for_jitcode_pc(pc)
+                .filter(|&c| c != u16::MAX)
+                .or_else(|| {
+                    p.result_color_after_residual_for_jitcode_pc(pc)
+                        .filter(|&c| c != u16::MAX)
+                })
                 .map(|c| c as usize)
-                .filter(|&c| c != u16::MAX as usize)
         }) else {
             decline!("NoPendingResultColor");
         };
