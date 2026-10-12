@@ -3,7 +3,7 @@
 //! A door outside the mainloop — anything asking "is this position already
 //! compiled?" — has to build the merge point's key itself, and before the macro
 //! emitted this the only way was to write the layout out by hand: the seed, one
-//! `green_uhash_step` per slot, in the order `[target, ..greens]`. A consumer
+//! `green_uhash_step` per declared green, in declaration order. A consumer
 //! that got a slot wrong still hashed to something, just not to the cell it
 //! meant, and the failure is silent and total: the probe answers no forever, so
 //! the door never enters an artifact that exists and every counter stays
@@ -87,7 +87,12 @@ fn dispatch_green_key(program: &Bytecode, threshold: u32) -> i64 {
     }
     // The probe under test, asked from inside so it can reach the driver this
     // run compiled against — a door in a real embedder holds its own.
-    let (hash, _slots) = __majit_green_key_dispatch_green_key(LOOP_HEADER, program);
+    let (hash, slots) = __majit_green_key_dispatch_green_key(LOOP_HEADER, program);
+    assert_eq!(
+        slots.len(),
+        2,
+        "greens = [pc, program] is two declared slots; a third is the retired prepended-target layout"
+    );
     PROBE_FOUND.store(driver.has_compiled_loop(hash), Ordering::Relaxed);
     LOOPS_COMPILED.store(driver.get_stats().loops_compiled, Ordering::Relaxed);
     state.regs[0]

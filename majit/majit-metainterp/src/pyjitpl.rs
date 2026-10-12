@@ -33171,6 +33171,43 @@ mod tests {
     }
 
     #[test]
+    fn portal_close_green_key_matches_the_bound_reached_cell() {
+        // `compile.py` `compile_loop` files the procedure token on
+        // `original_boxes[:num_green_args]` (`warmstate.py`
+        // `attach_procedure_to_interp` / `JitCell.get_uhash`). The portal
+        // `jit_merge_point` banks ARE those greens (`interp_jit.py`
+        // `[next_instr, is_being_profiled, pycode]`). Rebuilding them
+        // through a second pc prepend hashed a sibling key, so the next
+        // `maybe_compile_and_run` never entered the assembler.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let code: usize = 0x6000;
+        let pc: usize = 5;
+        let green_key = crate::green_key_from_code_ptr(code, pc);
+        meta.bound_reached(green_key, (code, pc), None, None, &[Value::Int(0)]);
+        let closed = {
+            let ctx = meta.trace_ctx().expect("bound_reached started tracing");
+            ctx.merge_point_green_key(&[pc as i64, 0], &[code as i64], &[])
+                .expect("portal banks must rebuild the pypyjit green key")
+        };
+        assert_eq!(
+            closed.get_uhash(),
+            green_key,
+            "close key must be the cell bound_reached started"
+        );
+        assert_eq!(
+            meta.warm_state_for_driver(0).cell_key_for(&closed),
+            Some(green_key),
+            "the started cell must be the typed cell of these greens"
+        );
+        assert_eq!(
+            meta.warm_state_for_driver(0).ensure_cell_key(&closed),
+            green_key,
+            "compile_loop ensure_cell_key must not mint a sibling"
+        );
+    }
+
+    #[test]
     fn failed_bridge_compile_is_ticked_again() {
         // `AbstractResumeGuardDescr.done_compiling`: `jitcounter.tick` resets
         // the counter when `must_compile` fires. A bridge that does not
@@ -34184,12 +34221,14 @@ mod tests {
         }
         {
             let ctx = meta.trace_ctx().unwrap();
+            // No structured key: the banks are the declared greens, whose
+            // first int is the back-edge target (`next_instr`).
             ctx.set_driver_descriptor(crate::jitdriver::JitDriverStaticData::new(
-                vec![("g", Type::Int)],
+                vec![("next_instr", Type::Int), ("g", Type::Int)],
                 vec![("r", Type::Int)],
             ));
             ctx.close_green_pc = Some(pc);
-            ctx.close_greens = Some((vec![extra], Vec::new(), Vec::new()));
+            ctx.close_greens = Some((vec![pc, extra], Vec::new(), Vec::new()));
         }
         let closed = meta
             .trace_ctx()
@@ -34243,9 +34282,12 @@ mod tests {
         assert_eq!(idx1, 1);
         meta.finish_setup_descrs_for_jitdrivers();
 
-        let pc = 11i64;
         let extra = 7200i64;
-        let parked = majit_ir::GreenKey::new(vec![pc, extra]);
+        // compile.py `compile_retrace` / pyjitpl.py `reached_loop_header`:
+        // `greenkey = original_boxes[:num_green_args]`. This driver declares
+        // one green (`g`); `close_green_pc` is the resume pc, not a
+        // prepended key slot (`interp_jit.py` `next_instr`).
+        let parked = majit_ir::GreenKey::new(vec![extra]);
         let hash = parked.get_uhash();
         let squatter = std::sync::Arc::new(JitCellToken::new(
             meta.warm_state_for_driver(idx1).alloc_token_number(),
@@ -34274,7 +34316,7 @@ mod tests {
         {
             let ctx = meta.trace_ctx().unwrap();
             ctx.set_driver_descriptor(second);
-            ctx.close_green_pc = Some(pc);
+            ctx.close_green_pc = Some(11);
             ctx.close_greens = Some((vec![extra], Vec::new(), Vec::new()));
         }
         meta.partial_trace = Some(PartialTrace {

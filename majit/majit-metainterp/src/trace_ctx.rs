@@ -403,10 +403,10 @@ pub struct TraceCtx {
     /// Red `OpRef`s from [`Self::portal_red_regs_*`] at the last portal
     /// frame, for a Continue walk that has already dropped that frame.
     pub(crate) live_portal_reds: Option<Vec<(OpRef, Type)>>,
-    /// The int pc green that belongs to [`Self::close_greens`].  The structured
-    /// `can_enter_jit` key prepends the back-edge target before the declared
-    /// greens, so reconstructing the interpreter-entered key for a close needs
-    /// this target in addition to the merge-point green tuple.
+    /// The int pc green that belongs to [`Self::close_greens`].
+    /// Walk resume (`resume_walk_after_close` / `close_header_pc`) reads it
+    /// as the merge-point's guest pc; the close key itself is the declared
+    /// greens (`merge_point_green_key`).
     pub(crate) close_green_pc: Option<i64>,
     /// Typed greens of the merge point that closed the trace, when the
     /// producer built them itself. `close_green_key` returns this before
@@ -3036,8 +3036,7 @@ impl TraceCtx {
             return Some(key.clone());
         }
         let greens = self.close_greens.as_ref()?;
-        let pc = self.close_green_pc?;
-        self.merge_point_green_key(pc, &greens.0, &greens.1, &greens.2)
+        self.merge_point_green_key(&greens.0, &greens.1, &greens.2)
     }
 
     /// Green banks `warmspot.py handle_jitexception` assigns after a
@@ -3184,40 +3183,35 @@ impl TraceCtx {
         live
     }
 
-    /// pyjitpl.py / :3005 `get_procedure_token(greenboxes)` analog: the
+    /// pyjitpl.py `get_procedure_token(greenboxes)` analog: the
     /// jitcell key the INTERPRETER would enter by for these greens.  The
     /// grouping is per JitCode register bank; rebuild the declared green order
     /// before hashing so this matches warmstate.py `JitCell.get_uhash`.
     pub fn merge_point_green_key_hash(
         &self,
-        pc: i64,
         ints: &[i64],
         refs: &[i64],
         floats: &[i64],
     ) -> Option<u64> {
-        Some(
-            self.merge_point_green_key(pc, ints, refs, floats)?
-                .get_uhash(),
-        )
+        Some(self.merge_point_green_key(ints, refs, floats)?.get_uhash())
     }
 
     /// The typed form of [`Self::merge_point_green_key_hash`], for callers
     /// that must resolve the key to a cell rather than only hash it.
     pub fn merge_point_green_key(
         &self,
-        pc: i64,
         ints: &[i64],
         refs: &[i64],
         floats: &[i64],
     ) -> Option<GreenKey> {
+        // pyjitpl.py `reached_loop_header` / compile.py `compile_loop`:
+        // `greenkey = original_boxes[:num_green_args]` — the declared greens
+        // in declared order. warmstate.py `JitCell.get_uhash` hashes that
+        // tuple. A driver that needs the loop-header pc declares it
+        // (`interp_jit.py` `next_instr`); it is not an extra prepended slot.
         let spec: smallvec::SmallVec<[GreenType; majit_ir::GREEN_INLINE]> =
             if let Some(key) = self.green_key_values.as_ref() {
-                debug_assert_eq!(
-                    key.types.first().copied(),
-                    Some(GreenType::Int),
-                    "structured green key must start with the prepended target pc",
-                );
-                smallvec::SmallVec::from_slice(key.types.get(1..)?)
+                smallvec::SmallVec::from_slice(&key.types)
             } else {
                 smallvec::SmallVec::from_iter(
                     self.driver_descriptor
@@ -3229,8 +3223,6 @@ impl TraceCtx {
 
         let mut values = smallvec::SmallVec::<[i64; majit_ir::GREEN_INLINE]>::new();
         let mut types = smallvec::SmallVec::<[GreenType; majit_ir::GREEN_INLINE]>::new();
-        values.push(pc);
-        types.push(GreenType::Int);
         let mut int_i = 0;
         let mut ref_i = 0;
         let mut float_i = 0;
@@ -3253,8 +3245,8 @@ impl TraceCtx {
                 }
             };
             values.push(value);
+            types.push(*tp);
         }
-        types.extend(spec.iter().copied());
         Some(GreenKey::with_types(values, types))
     }
 
@@ -8345,6 +8337,48 @@ mod tests {
         assert_eq!(boxes[1].ty, Type::Ref);
         assert_eq!(boxes[0].opref, OpRef::input_arg_typed(0, Type::Int));
         assert_eq!(boxes[1].opref, OpRef::input_arg_typed(1, Type::Ref));
+    }
+
+    #[test]
+    fn merge_point_green_key_does_not_double_prepend_pypyjit_portal_banks() {
+        // pypyjit greens are `[next_instr, is_being_profiled, pycode]`
+        // (`interp_jit.py`). `jit_merge_point` banks hold that full
+        // tuple. `TraceCtx::with_green_key` stores the same tuple as
+        // `green_key_values`. The close key is those declared greens
+        // (`warmstate.py` `JitCell.get_uhash` / `get_jitcell`).
+        let key = majit_ir::pypyjit_greenkey(5, false, 0x1000);
+        let ctx = TraceCtx::with_green_key(
+            Trace::new(),
+            key.get_uhash(),
+            key.clone(),
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let closed = ctx
+            .merge_point_green_key(&[5, 0], &[0x1000], &[])
+            .expect("portal banks rebuild the pypyjit green key");
+        assert_eq!(closed, key);
+        assert_eq!(closed.get_uhash(), key.get_uhash());
+    }
+
+    #[test]
+    fn merge_point_green_key_equals_declared_greens_for_a_non_pypyjit_driver() {
+        // `compile.py` `compile_loop` / `warmstate.py` `JitCell.get_uhash`
+        // hash `original_boxes[:num_green_args]` — the declared greens in
+        // declared order. A driver that needs the loop-header pc includes
+        // it in that list (`interp_jit.py` `next_instr`); there is no
+        // extra prepended element.
+        let key = majit_ir::GreenKey::with_types(vec![7, 99], vec![Type::Int, Type::Int]);
+        let ctx = TraceCtx::with_green_key(
+            Trace::new(),
+            key.get_uhash(),
+            key.clone(),
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let closed = ctx
+            .merge_point_green_key(&[7, 99], &[], &[])
+            .expect("declared greens rebuild the close key");
+        assert_eq!(closed, key);
+        assert_eq!(closed.get_uhash(), key.get_uhash());
     }
 
     #[test]

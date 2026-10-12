@@ -1406,9 +1406,10 @@ pub fn green_uhash_step(x: u64, tp: GreenType, value: i64) -> u64 {
 
 /// Inline slots for [`GreenKey`] values/types.
 ///
-/// `merge_point_green_key` prepends the target pc onto the driver greens, so
-/// a five-green portal (`pc, stackok, is_queue, bm, program`) is six i64s.
-/// Eight covers that plus a couple of extra greens without spilling.
+/// Inline capacity for the declared greens of one jitdriver
+/// (`original_boxes[:num_green_args]`). Eight covers a five-green portal
+/// (`pc, stackok, is_queue, bm, program`) plus a couple of extra greens
+/// without spilling.
 pub const GREEN_INLINE: usize = 8;
 
 /// Structured green key — represents the exact values and types of all

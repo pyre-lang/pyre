@@ -1849,9 +1849,9 @@ pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStrea
 /// A door that wants to ask whether some position is already compiled has to
 /// name that position the way the merge point names it. Without this builder
 /// the door has to write the layout out by hand: seed, one `green_uhash_step`
-/// per slot, in the order `[target, ..greens]` with the pc substituted into the
-/// greens. `majit_ir::pypyjit_greenkey` is the same function hard-coded for one
-/// consumer's three greens, so a consumer with a different green list cannot
+/// per declared green, in declaration order, with the target substituted for a
+/// `pc` green. `majit_ir::pypyjit_greenkey` is the same function hard-coded for
+/// one consumer's three greens, so a consumer with a different green list cannot
 /// reach it; its own documentation says why open-coding the layout is a hazard
 /// — "a swapped slot still hashes to something, just not to the same cell".
 ///
@@ -1905,18 +1905,15 @@ fn generate_green_key_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         return quote! {};
     };
 
-    // The marker's own position argument leads, then each declared green with
-    // the arming position substituted for `pc` — the same list
-    // `green_key_expr` folds at the merge point, and in the same order. Here
-    // the target IS the pc, so the substitution is the identity and a green
-    // spelled `pc` simply names the leading parameter a second time.
-    let pc: Ident = syn::parse_quote!(pc);
-    let slots: Vec<Ident> = std::iter::once(pc.clone()).chain(greens).collect();
+    // Declared greens in declaration order — the same list `green_key_expr`
+    // folds at the merge point (`pyjitpl.py` `original_boxes[:num_green_args]`).
+    // A driver that needs the loop-header pc declares it (`interp_jit.py`
+    // `next_instr`); it is not an extra prepended slot.
+    let slots: Vec<Ident> = greens;
 
     // One parameter per DISTINCT slot, in first-appearance order. A green that
-    // repeats — `greens = [pc, program]` is the common case, and its slot list
-    // is `[pc, pc, program]` — is read twice from one argument rather than
-    // asked for twice, which is what `Copy` is for.
+    // repeats is read twice from one argument rather than asked for twice,
+    // which is what `Copy` is for.
     let mut params: Vec<Ident> = Vec::new();
     for slot in &slots {
         if !params.contains(slot) {
@@ -3914,18 +3911,20 @@ fn rewrite_body(
             // ONCE — the green expressions must not be re-evaluated, so
             // the deferred key builder below closes over these `Copy`
             // locals rather than over the expressions.
-            let all_reprs: Vec<TokenStream> =
-                std::iter::once(quote! { <_ as majit_ir::GreenAsI64>::__green_repr(#target) })
-                    .chain(green_reprs)
-                    .collect();
-            let slots: Vec<syn::Ident> = (0..all_reprs.len())
+            //
+            // The slots ARE the declared greens (`pyjitpl.py`
+            // `original_boxes[:num_green_args]` / `warmstate.py`
+            // `JitCell.get_uhash`). A declared `pc` green is the target
+            // (`subst_target_for_pc`); the target is not prepended in
+            // front of that list.
+            let slots: Vec<syn::Ident> = (0..green_reprs.len())
                 .map(|i| {
                     syn::Ident::new(&format!("__green_slot{i}"), proc_macro2::Span::call_site())
                 })
                 .collect();
             let bind: Vec<TokenStream> = slots
                 .iter()
-                .zip(&all_reprs)
+                .zip(&green_reprs)
                 .map(|(slot, repr)| quote! { let #slot = #repr; })
                 .collect();
             // `get_uhash` unrolled over the declared greens — the count and
@@ -5733,6 +5732,61 @@ mod tests {
             run_arm.contains("take_single_pass_finish_ref"),
             "the Run arm must drain the single-pass finish before the portal. \
              Arm was:\n{run_arm}"
+        );
+    }
+
+    /// `can_enter_jit` / the generated helper hash `original_boxes[:num_green_args]`
+    /// (`pyjitpl.py` `reached_loop_header` / `warmstate.py` `JitCell.get_uhash`).
+    /// `greens = [pc, program]` is two slots; a third `__green_slot2` is the
+    /// retired layout that prepended the back-edge target in front of that list.
+    #[test]
+    fn green_key_uses_declared_greens_without_prepending_the_target() {
+        let config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                let mut driver: majit_metainterp::JitDriver<S> =
+                    majit_metainterp::JitDriver::new(threshold);
+                let mut pc: usize = 0;
+                let mut state = S { acc: 0 };
+                while pc < program.len() {
+                    jit_merge_point!(driver, program, pc; state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => {
+                            can_enter_jit!(driver, 0usize, &mut state, program, || {});
+                            pc = 0;
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
+                state.acc
+            }
+        };
+        let expanded = transform_jit_interp(config, func).to_string();
+        assert!(
+            expanded.contains("__green_slot0"),
+            "declared greens must occupy slot 0. Expansion was:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("__green_slot1"),
+            "greens = [pc, program] occupies two slots. Expansion was:\n{expanded}"
+        );
+        assert!(
+            !expanded.contains("__green_slot2"),
+            "a third slot is the retired prepended-target layout. Expansion was:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("__majit_green_key_mainloop") && expanded.contains("; 2usize"),
+            "`__majit_green_key_mainloop` must return two declared-green slots. \
+             Expansion was:\n{expanded}"
         );
     }
 
