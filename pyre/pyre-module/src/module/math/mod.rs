@@ -32,7 +32,7 @@ pyre_interpreter::py_module! {
         // Floating-point manipulation. `fabs`, `ulp`, `frexp`, `ldexp`,
         // `fmod`, `copysign` and `remainder` are installed in `extra_init`.
         "modf"      / 1 = m::modf,
-        "nextafter" / * = m::nextafter,
+        "nextafter" / * = m::nextafter; pyre_interpreter::Signature::new(vec!["x", "y", "steps"], None, None, 1, 2),
         "fma"       / 3 = m::fma,
 
         // Classification. `isclose` is installed in `extra_init`.
@@ -43,20 +43,20 @@ pyre_interpreter::py_module! {
         // Conversion. `degrees` and `radians` are installed in `extra_init`.
 
         // Multi-dimensional
-        "hypot" / * = m::hypot,
+        "hypot" / * = m::hypot; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
         "dist"  / 2 = m::dist,
 
         // Aggregation
         "fsum"    / 1 = m::fsum,
-        "prod"    / * = m::prod,
+        "prod"    / * = m::prod; pyre_interpreter::Signature::new(vec!["iterable", "start"], None, None, 1, 1),
         "sumprod" / 2 = m::sumprod,
 
         // Integer math
         "factorial" / 1 = m::factorial,
-        "gcd"   / * = m::gcd,
-        "lcm"   / * = m::lcm,
+        "gcd"   / * = m::gcd; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
+        "lcm"   / * = m::lcm; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
         "comb"  / 2 = m::comb,
-        "perm"  / * = m::perm,
+        "perm"  / * = m::perm; pyre_interpreter::Signature::new(vec!["n", "k"], None, None, 0, 2),
         // `isqrt` is installed in `extra_init`.
     },
     extra_init: |ns| {
@@ -110,12 +110,28 @@ pyre_interpreter::py_module! {
         pyre_interpreter::__pyre_store!(
             ns,
             "log",
-            pyre_interpreter::make_module_builtin_function("log", m::__majit_wrap_math_log)
+            pyre_interpreter::make_module_builtin_function_with_fast_arity_and_sig(
+                "log",
+                m::__majit_wrap_math_log,
+                pyre_interpreter::HOPELESS,
+                pyre_interpreter::Signature::new(vec!["x", "base"], None, None, 0, 2),
+            )
         );
         pyre_interpreter::__pyre_store!(
             ns,
             "isclose",
-            pyre_interpreter::make_module_builtin_function("isclose", m::__majit_wrap_math_isclose)
+            pyre_interpreter::make_module_builtin_function_with_fast_arity_and_sig(
+                "isclose",
+                m::__majit_wrap_math_isclose,
+                2,
+                pyre_interpreter::Signature::new(
+                    vec!["a", "b", "rel_tol", "abs_tol"],
+                    None,
+                    None,
+                    2,
+                    2,
+                ),
+            )
         );
         let install2 = |mut ns: pyre_object::PyObjectRef,
                         name: &'static str,

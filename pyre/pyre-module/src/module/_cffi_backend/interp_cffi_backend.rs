@@ -87,31 +87,74 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // `newp(ctype, init=None)`, `string(cdata, maxlen=-1)`,
     // `typeoffsetof(ctype, field_or_index, following=0)` carry a default, and
     // the rest of this group binds its own arguments for the same reason.
-    for (name, f) in [
+    for (name, f, argnames) in [
         (
             "newp",
             super::func::newp as pyre_interpreter::gateway::BuiltinCodeFn,
+            &["ctype", "init"] as &[&'static str],
         ),
-        ("string", super::func::string),
-        ("typeoffsetof", super::func::typeoffsetof),
-        ("rawaddressof", super::func::rawaddressof),
+        ("string", super::func::string, &["cdata", "maxlen"]),
+        (
+            "typeoffsetof",
+            super::func::typeoffsetof,
+            &["ctype", "field_or_index", "following"],
+        ),
+        (
+            "rawaddressof",
+            super::func::rawaddressof,
+            &["ctype", "cdata", "offset"],
+        ),
         (
             "complete_struct_or_union",
             super::func::complete_struct_or_union,
+            &[
+                "ctype",
+                "fields",
+                "ignored",
+                "totalsize",
+                "totalalignment",
+                "sflags",
+                "pack",
+            ],
         ),
-        ("new_function_type", super::func::new_function_type),
-        ("load_library", super::func::load_library),
-        ("from_buffer", super::func::from_buffer),
-        ("gcp", super::func::gcp),
-        ("_offset_in_bytes", super::func::offset_in_bytes),
-        ("callback", super::func::callback),
+        (
+            "new_function_type",
+            super::func::new_function_type,
+            &["fargs", "fresult", "ellipsis", "abi"],
+        ),
+        (
+            "load_library",
+            super::func::load_library,
+            &["filename", "flags"],
+        ),
+        (
+            "from_buffer",
+            super::func::from_buffer,
+            &["ctype", "x", "require_writable"],
+        ),
+        ("gcp", super::func::gcp, &["cdata", "destructor", "size"]),
+        (
+            "_offset_in_bytes",
+            super::func::offset_in_bytes,
+            &["bytes", "offset"],
+        ),
+        (
+            "callback",
+            super::func::callback,
+            &["ctype", "callable", "error", "onerror"],
+        ),
     ] {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             name,
             pyre_interpreter::gateway::with_module(
                 MODULE,
-                pyre_interpreter::make_module_builtin_function(name, f),
+                pyre_interpreter::gateway::make_module_builtin_function_with_arity_and_sig(
+                    name,
+                    f,
+                    pyre_interpreter::HOPELESS,
+                    pyre_interpreter::gateway::Signature::new(argnames.to_vec(), None, None, 0, 0),
+                ),
             )
         );
     }
@@ -167,9 +210,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         "getwinerror",
         pyre_interpreter::gateway::with_module(
             MODULE,
-            pyre_interpreter::make_module_builtin_function(
+            pyre_interpreter::gateway::make_module_builtin_function_with_arity_and_sig(
                 "getwinerror",
                 super::cerrno::getwinerror,
+                pyre_interpreter::HOPELESS,
+                pyre_interpreter::gateway::Signature::new(vec!["code"], None, None, 0, 0),
             ),
         )
     );

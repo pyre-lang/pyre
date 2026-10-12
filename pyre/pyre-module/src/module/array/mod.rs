@@ -892,27 +892,17 @@ fn array_append_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "extend", true)?;
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    let positional_given = if positional.is_empty() {
-        0
-    } else {
-        positional.len() - 1
-    };
-    let supplied = positional_given + pyre_interpreter::builtins::real_kwarg_count(kwargs);
+    // Bound scope: `self`, `iterable` (`PY_NULL` omitted).
+    let iterable = args.get(1).copied().filter(|value| !value.is_null());
     // [3.14-spec] CPython v3.14.6 `array_array_extend`'s positional-only
     // clinic gateway checks the required positional count before diagnosing
     // its blank keyword slot; PyPy's interp2app gateway reports its own owner.
-    if positional_given == 0 {
+    let Some(iterable) = iterable else {
         return Err(PyError::type_error(
             "extend() takes exactly 1 positional argument (0 given)",
         ));
-    }
-    if supplied > 1 {
-        return Err(PyError::type_error(format!(
-            "extend() takes at most 1 argument ({supplied} given)"
-        )));
-    }
-    array_extend_iterable(positional[0], positional[1], true)?;
+    };
+    array_extend_iterable(args[0], iterable, true)?;
     Ok(pyre_object::w_none())
 }
 
@@ -2331,7 +2321,11 @@ pub fn init_array_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "extend",
-        pyre_interpreter::make_builtin_function("extend", array_extend_method)
+        pyre_interpreter::make_builtin_function_with_signature(
+            "extend",
+            array_extend_method,
+            pyre_interpreter::Signature::new(vec!["self", "iterable"], None, None, 0, 2),
+        )
     );
     // `insert` uses the PyArg_UnpackTuple arity wording and the fixed
     // `array.insert` keyword owner, both supplied by its gateway body.

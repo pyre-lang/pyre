@@ -2372,24 +2372,20 @@ fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "can't create new thread at interpreter shutdown",
         ));
     }
-    let (pos, kwargs_marker) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() < 2 || pos.len() > 3 {
-        return Err(crate::PyError::type_error(
-            "start_new_thread expected 2 or 3 arguments",
-        ));
-    }
-    let callable = pos[0];
+    // Bound scope: required `function`/`args`, optional `kwargs` (`PY_NULL`
+    // omitted).  Direct tests may pass an unpadded slice.
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let callable = bound(0)
+        .ok_or_else(|| crate::PyError::type_error("start_new_thread expected 2 or 3 arguments"))?;
     if !crate::baseobjspace::callable_w(callable) {
         return Err(crate::PyError::type_error("first arg must be callable"));
     }
-    if unsafe { !is_tuple(pos[1]) } {
+    let w_args = bound(1)
+        .ok_or_else(|| crate::PyError::type_error("start_new_thread expected 2 or 3 arguments"))?;
+    if unsafe { !is_tuple(w_args) } {
         return Err(crate::PyError::type_error("2nd arg must be a tuple"));
     }
-    let w_args = pos[1];
-    let kwargs = pos
-        .get(2)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs_marker, "kwargs"));
+    let kwargs = bound(2);
     if kwargs.is_some_and(|d| unsafe { !is_dict(d) }) {
         return Err(crate::PyError::type_error(
             "optional 3rd arg must be a dictionary",
@@ -2409,19 +2405,19 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             "can't create new thread at interpreter shutdown",
         ));
     }
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let mut callable = pos
-        .first()
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("missing function argument"))?;
+    // Bound scope: pos-only `function`, kw-only `handle`/`daemon` (`PY_NULL`
+    // omitted).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let mut callable =
+        bound(0).ok_or_else(|| crate::PyError::type_error("missing function argument"))?;
     if !crate::baseobjspace::callable_w(callable) {
         return Err(crate::PyError::type_error("function must be callable"));
     }
-    let requested = crate::builtins::kwarg_get(kwargs, "handle");
+    let requested = bound(1);
     let has_requested = requested.is_some();
     let req_roots = pyre_object::gc_roots::push_roots();
     let req_slot = req_roots.pin_roots(&[requested.unwrap_or(PY_NULL)]);
-    let daemon = match crate::builtins::kwarg_get(kwargs, "daemon") {
+    let daemon = match bound(2) {
         Some(value) => pyre_object::with_roots!(callable => crate::baseobjspace::is_true(value))?,
         None => false,
     };
@@ -3003,9 +2999,9 @@ crate::py_module! {
                 ident
             }))
         },
-        "start_joinable_thread"  / * = start_joinable_thread,
-        "start_new_thread"       / * = start_new_thread,
-        "start_new"              / * = start_new_thread,
+        "start_joinable_thread"  / * = start_joinable_thread; crate::Signature::new(vec!["function", "handle", "daemon"], None, None, 2, 1),
+        "start_new_thread"       / * = start_new_thread; crate::Signature::new(vec!["function", "args", "kwargs"], None, None, 0, 0),
+        "start_new"              / * = start_new_thread; crate::Signature::new(vec!["function", "args", "kwargs"], None, None, 0, 0),
     },
     extra_init: |ns| {
         // `set_name`, `_get_name` and `_NAME_MAXLEN` are published only where

@@ -1908,6 +1908,14 @@ const REPLACE_KWARGS: [&str; 18] = [
     "co_exceptiontable",
 ];
 
+/// `code.replace(self, /, **co_* )` — pos-only receiver, keyword-only fields.
+pub fn code_replace_signature() -> crate::gateway::Signature {
+    let mut names = Vec::with_capacity(REPLACE_KWARGS.len() + 1);
+    names.push("self");
+    names.extend_from_slice(&REPLACE_KWARGS);
+    crate::gateway::Signature::new(names, None, None, REPLACE_KWARGS.len(), 1)
+}
+
 #[inline]
 unsafe fn require_code(
     obj: PyObjectRef,
@@ -2863,51 +2871,31 @@ pub unsafe fn code_branches(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyEr
 /// # Safety
 /// `args[0]` must be the receiver `code` object (verified).
 pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let w_self = pos.first().copied().unwrap_or(PY_NULL);
+    // Bound scope: self, then the 18 keyword-only co_* fields (`PY_NULL` omitted).
+    let w_self = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(PY_NULL);
     if w_self.is_null() || !unsafe { is_code(w_self) } {
         return Err(crate::PyError::type_error(
             "descriptor 'replace' requires a 'code' object",
         ));
     }
-    // `replace` is keyword-only (`__args__.topacked()` asserts no positional
-    // args at pycode.py).
-    if pos.len() > 1 {
-        return Err(crate::PyError::type_error(
-            "replace() takes no positional arguments",
-        ));
-    }
-    // `read_code_consts` and `box_code_object` allocate. Pin the receiver and
-    // kwargs dict and reload them at each use.
+    // `read_code_consts` and `box_code_object` allocate. Pin the bound scope
+    // and reload each field from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
-    let has_kwargs = kwargs.is_some();
-    let root_base = if let Some(kw) = kwargs {
-        pyre_object::gc_roots::pin_roots(&[w_self, kw])
-    } else {
-        pyre_object::gc_roots::pin_roots(&[w_self])
-    };
+    let root_base = pyre_object::gc_roots::pin_roots(args);
+    let n_bound = args.len();
     let w_self = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    let kwargs = || {
-        if has_kwargs {
-            Some(pyre_object::gc_roots::shadow_stack_get(root_base + 1))
-        } else {
-            None
+    let get = |name: &str| -> Option<PyObjectRef> {
+        let index = 1 + REPLACE_KWARGS.iter().position(|&field| field == name)?;
+        if index >= n_bound {
+            return None;
         }
+        let value = pyre_object::gc_roots::shadow_stack_get(root_base + index);
+        if value.is_null() { None } else { Some(value) }
     };
-    // pycode.py:86-87 `raise TypeError(f"{kwds.popitem()[0]!r} is an invalid
-    // keyword argument for replace()")`.
-    if let Some(dict) = kwargs() {
-        for (key, _) in unsafe { pyre_object::w_dict_str_entries(dict) } {
-            if key == "__pyre_kw__" {
-                continue;
-            }
-            if !REPLACE_KWARGS.contains(&key.as_str()) {
-                return Err(crate::PyError::type_error(format!(
-                    "replace() got an unexpected keyword argument '{key}'"
-                )));
-            }
-        }
-    }
 
     let code_ptr = unsafe { w_code_get_ptr(w_self()) } as *const crate::CodeObject;
     if code_ptr.is_null() {
@@ -2942,7 +2930,6 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             Some((&*ptr).clone())
         }
     };
-    let get = |name: &str| crate::builtins::kwarg_get(kwargs(), name);
     let rebuild_localspluskinds = get("co_varnames").is_some()
         || get("co_cellvars").is_some()
         || get("co_freevars").is_some();

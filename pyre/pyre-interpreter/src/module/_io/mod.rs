@@ -1635,7 +1635,17 @@ pub(crate) fn fileio_type() -> PyObjectRef {
         let ns_slot = tp_base + 1;
         crate::builtins::init_file_wrapper_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
         crate::builtins::init_fileio_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
-        let init_fn = crate::make_builtin_function("__init__", crate::builtins::fileio_init);
+        let init_fn = crate::make_builtin_function_with_signature(
+            "__init__",
+            crate::builtins::fileio_init,
+            crate::gateway::Signature::new(
+                vec!["self", "file", "mode", "closefd", "opener"],
+                None,
+                None,
+                0,
+                1,
+            ),
+        );
         let init_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(init_fn);
         type_method(
@@ -1747,7 +1757,13 @@ crate::py_module! {
         "DEFAULT_BUFFER_SIZE" => w_int_new(DEFAULT_BUFFER_SIZE),
     },
     functions: {
-        "open"            / * = crate::builtins::builtin_open,
+        "open"            / * = crate::builtins::builtin_open; crate::gateway::Signature::new(
+            vec!["file", "mode", "buffering", "encoding", "errors", "newline", "closefd", "opener"],
+            None,
+            None,
+            0,
+            0,
+        ),
         // `io.open_code(path)` — `_PyIO_open_code` opens the path in binary
         // read mode ("rb"); pyre has no audit hooks so it is just `open`.
         "open_code"       / * = |args| {

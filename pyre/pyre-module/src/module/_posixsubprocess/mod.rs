@@ -734,13 +734,13 @@ mod imp {
     }
 
     pub fn fork_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        let (pos, _kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        if pos.len() != 22 {
+        let given = args.iter().filter(|value| !value.is_null()).count();
+        if given != 22 {
             return Err(PyError::type_error(format!(
-                "fork_exec() takes exactly 22 arguments ({} given)",
-                pos.len()
+                "fork_exec() takes exactly 22 arguments ({given} given)"
             )));
         }
+        let pos = args;
 
         // [3.14-spec] PyPy `interp_subprocess.fork_exec` permits preexec_fn
         // during shutdown, but CPython 3.14 `_posixsubprocess.fork_exec`
@@ -837,7 +837,44 @@ pyre_interpreter::py_module! {
     "_posixsubprocess",
     extra_init: |ns| {
         #[cfg(all(unix, feature = "host_env"))]
-        pyre_interpreter::__pyre_store!(ns, "fork_exec", pyre_interpreter::make_builtin_function("fork_exec", imp::fork_exec));
+        pyre_interpreter::__pyre_store!(
+            ns,
+            "fork_exec",
+            pyre_interpreter::make_builtin_function_with_signature(
+                "fork_exec",
+                imp::fork_exec,
+                pyre_interpreter::Signature::new(
+                    vec![
+                        "args",
+                        "executable_list",
+                        "close_fds",
+                        "fds_to_keep",
+                        "cwd",
+                        "env_list",
+                        "p2cread",
+                        "p2cwrite",
+                        "c2pread",
+                        "c2pwrite",
+                        "errread",
+                        "errwrite",
+                        "errpipe_read",
+                        "errpipe_write",
+                        "restore_signals",
+                        "call_setsid",
+                        "pgid_to_set",
+                        "gid",
+                        "groups_list",
+                        "uid",
+                        "child_umask",
+                        "preexec_fn",
+                    ],
+                    None,
+                    None,
+                    0,
+                    22,
+                ),
+            )
+        );
         #[cfg(not(all(unix, feature = "host_env")))]
         let _ = ns;
     }

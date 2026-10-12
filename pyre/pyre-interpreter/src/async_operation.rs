@@ -133,12 +133,7 @@ pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// trailing `__pyre_kw__` marker and refusing keywords.  Clinic
 /// `builtin_aiter` takes no keywords and exactly one positional.
 pub fn builtin_aiter(args: &[PyObjectRef]) -> PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "aiter() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     crate::gateway::check_declared_arity("aiter", 1, positional.len())?;
     // `positional` is the gateway's native copy; `handle` may allocate.
     let mut w_obj = positional[0];
@@ -150,28 +145,21 @@ pub fn builtin_aiter(args: &[PyObjectRef]) -> PyResult {
 /// stripping the trailing `__pyre_kw__` marker and refusing keywords.
 /// `_PyArg_CheckPositional` on `builtin_anext` is at least 1, at most 2.
 pub fn builtin_anext(args: &[PyObjectRef]) -> PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
+    // Bound scope from `parse_obj`: `aiterator`, `default` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(
-            "anext() takes no keyword arguments",
+            "anext expected at least 1 argument, got 0",
         ));
     }
-    if positional.is_empty() {
-        return Err(crate::PyError::type_error(format!(
-            "anext expected at least 1 argument, got {}",
-            positional.len()
-        )));
-    }
-    if positional.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "anext expected at most 2 arguments, got {}",
-            positional.len()
-        )));
-    }
-    // `positional` is the gateway's native copy; `handle` may allocate.
-    let mut w_iterator = positional[0];
-    let mut w_default = positional.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    // `args` is the gateway's native copy; `handle` may allocate.
+    let mut w_iterator = args[0];
+    let mut w_default = args
+        .get(1)
+        .copied()
+        .filter(|w| !w.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
     let w_anext = pyre_object::with_roots!(w_iterator, w_default => handle(ANEXT))?;
     let live = [w_iterator, w_default];
-    crate::call::call_function_impl_result(w_anext, &live[..positional.len()])
+    let n = if w_default.is_null() { 1 } else { 2 };
+    crate::call::call_function_impl_result(w_anext, &live[..n])
 }

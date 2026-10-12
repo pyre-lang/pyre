@@ -1174,29 +1174,18 @@ fn str_join_many_items(
 /// falling back to the matching keyword.
 fn resolve_split_args(
     args: &[PyObjectRef],
-    fn_name: &str,
+    _fn_name: &str,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::clinic_arity(
-        fn_name,
-        pos.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        2,
-        0,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
-    let sep = pos
+    // Bound scope: `self`, `sep`, `maxsplit` (`PY_NULL` omitted).
+    let sep = args
         .get(1)
         .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"))
+        .filter(|o| !o.is_null())
         .unwrap_or(pyre_object::PY_NULL);
-    let maxsplit = pos
+    let maxsplit = args
         .get(2)
         .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "maxsplit"))
+        .filter(|o| !o.is_null())
         .unwrap_or(pyre_object::PY_NULL);
     Ok((sep, maxsplit))
 }
@@ -1891,48 +1880,39 @@ fn str_descr_endswith_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 }
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `old` / `new` are positional-only; `count` is positional-or-keyword.
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() < 3 {
+    // Bound scope: `self`, `old`, `new` (pos-only), `count` (`PY_NULL` omitted).
+    let pos0 = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let pos1 = args.get(1).copied().filter(|o| !o.is_null());
+    let pos2 = args.get(2).copied().filter(|o| !o.is_null());
+    let given = usize::from(pos1.is_some()) + usize::from(pos2.is_some());
+    let (Some(pos1), Some(pos2)) = (pos1, pos2) else {
         return Err(crate::PyError::type_error(format!(
-            "replace() takes at least 2 positional arguments ({} given)",
-            args_given(pos)
+            "replace() takes at least 2 positional arguments ({given} given)",
         )));
-    }
-    if pos.len() > 4 {
-        return Err(crate::PyError::type_error(format!(
-            "replace() takes at most 3 arguments ({} given)",
-            args_given(pos)
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["count"], "replace")?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "replace", "count", pos.get(3).is_some())?;
+    };
     // pypy/objspace/std/unicodeobject.py descr_replace —
     // both `old` and `new` must be str / W_UnicodeObject; otherwise
     // TypeError("replace() argument N must be str, not ...").
-    if !unsafe { pyre_object::is_str(pos[1]) } {
+    if !unsafe { pyre_object::is_str(pos1) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 1 must be str, not {}",
-            clinic_arg_type_name(pos[1])
+            clinic_arg_type_name(pos1)
         )));
     }
-    if !unsafe { pyre_object::is_str(pos[2]) } {
+    if !unsafe { pyre_object::is_str(pos2) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 2 must be str, not {}",
-            clinic_arg_type_name(pos[2])
+            clinic_arg_type_name(pos2)
         )));
     }
     // `__index__` on `count` can collect, so pin the three strings and the
     // optional count together and copy their payloads off the objects first.
-    let w_count = pos
-        .get(3)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "count"));
+    let w_count = args.get(3).copied().filter(|o| !o.is_null());
     let _roots = pyre_object::gc_roots::push_roots();
     let base = if let Some(c) = w_count {
-        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2], c])
+        pyre_object::gc_roots::pin_roots(&[pos0, pos1, pos2, c])
     } else {
-        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2]])
+        pyre_object::gc_roots::pin_roots(&[pos0, pos1, pos2])
     };
     let recv = || pyre_object::gc_roots::shadow_stack_get(base);
     let s = unsafe { pyre_object::w_str_get_wtf8(recv()) }.to_wtf8_buf();
@@ -4569,9 +4549,7 @@ pub(crate) fn encode_utf8_with_errors(
 /// of the string. Other codecs fall through to a best-effort UTF-8 encoding.
 pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "encode")?;
-    // `encoding` and `errors` arrive positionally or by keyword; builtin
-    // kwargs are packed in a trailing `__pyre_kw__` dict.
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // Bound scope: `self`, `encoding`, `errors` (`PY_NULL` omitted).
     // Clinic's `encode` converter is `_PyArg_BadArgument`: a rejected
     // value is `None` or its type name.  PyPy's `get_encoding_and_errors`
     // goes through `space.text_w` / `_typed_unwrap_error` and says
@@ -4590,42 +4568,26 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 ))),
             }
         };
-    // `encode(encoding=None, errors=None)` — both positional-or-keyword;
-    // the gateway rejects unknown keywords and a value given both ways.
-    crate::builtins::clinic_arity(
-        "encode",
-        pos.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        2,
-        0,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "encode")?;
-    // Only the counts are read off the native slices once they are pinned.
-    let nargs = args.len();
-    let npos = pos.len();
     let _roots = pyre_object::gc_roots::push_roots();
+    let n = args.len();
     let arg_base = pyre_object::gc_roots::pin_roots(args);
-    let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(arg_base + i);
-    let kwargs = kwargs.map(|_| reload(nargs - 1));
-    let dual =
-        |name: &str, p: Option<PyObjectRef>| -> Result<Option<PyObjectRef>, crate::PyError> {
-            let kw = crate::builtins::kwarg_get(kwargs, name);
-            if p.is_some() && kw.is_some() {
-                return Err(crate::PyError::type_error(format!(
-                    "got multiple values for argument '{name}'"
-                )));
-            }
-            Ok(p.or(kw))
-        };
-    let w_encoding = if npos > 1 { Some(reload(1)) } else { None };
-    let w_errors = if npos > 2 { Some(reload(2)) } else { None };
-    let has_w_errors = w_errors.is_some();
-    let w_errors_slot = _roots.pin_roots(&[w_errors.unwrap_or(pyre_object::PY_NULL)]);
-    let encoding_arg = dual("encoding", w_encoding)?;
+    let reload = |i: usize| {
+        if i < n {
+            pyre_object::gc_roots::shadow_stack_get(arg_base + i)
+        } else {
+            pyre_object::PY_NULL
+        }
+    };
+    let encoding_arg = {
+        let w = reload(1);
+        if w.is_null() { None } else { Some(w) }
+    };
+    let errors_arg = {
+        let w = reload(2);
+        if w.is_null() { None } else { Some(w) }
+    };
     let encoding = str_arg("encoding", encoding_arg, "utf-8")?;
-    let w_errors = has_w_errors.then(|| _roots.get(w_errors_slot));
-    let errors = str_arg("errors", dual("errors", w_errors)?, "strict")?;
+    let errors = str_arg("errors", errors_arg, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(
         reload(0),
         &encoding,
@@ -6038,29 +6000,15 @@ fn cp_is_linebreak(cp: CodePoint) -> bool {
 
 pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "splitlines")?;
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "splitlines() takes at most 1 argument ({} given)",
-            args_given(pos)
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
-    crate::builtins::kwarg_reject_duplicate(
-        kwargs,
-        "splitlines",
-        "keepends",
-        pos.get(1).is_some(),
-    )?;
-    let keepends_obj =
-        crate::builtins::kwarg_get(kwargs, "keepends").or_else(|| pos.get(1).copied());
+    // Bound scope: `self`, `keepends` (`PY_NULL` omitted).
+    let keepends_obj = args.get(1).copied().filter(|o| !o.is_null());
     let recv_roots = pyre_object::gc_roots::push_roots();
     let recv_slot = if let Some(keepends_obj) = keepends_obj {
-        let recv_slot = recv_roots.publish(&[pos[0], keepends_obj]);
+        let recv_slot = recv_roots.publish(&[args[0], keepends_obj]);
         recv_roots.normalize(recv_slot, 2);
         recv_slot
     } else {
-        let recv_slot = recv_roots.publish(&[pos[0]]);
+        let recv_slot = recv_roots.publish(&[args[0]]);
         recv_roots.normalize(recv_slot, 1);
         recv_slot
     };
@@ -6103,7 +6051,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// PyPy: unicodeobject.py descr_removeprefix (Python 3.9+)
 pub fn descr_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    let pos = args;
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "str.removeprefix() takes exactly one argument ({} given)",
@@ -6131,7 +6079,7 @@ pub fn descr_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_removesuffix (Python 3.9+)
 pub fn descr_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    let pos = args;
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "str.removesuffix() takes exactly one argument ({} given)",
@@ -6167,30 +6115,18 @@ pub fn descr_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_expandtabs
 pub fn descr_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `tabsize` is positional-or-keyword (default 8).
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "expandtabs() takes at most 1 argument ({} given)",
-            args_given(pos)
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "expandtabs", "tabsize", pos.get(1).is_some())?;
+    // Bound scope: `self`, `tabsize` (`PY_NULL` omitted; default 8).
     // [3.14-spec] PyPy `W_UnicodeObject.descr_expandtabs` unwraps a machine
     // `int`; CPython `unicode_expandtabs` declares an Argument Clinic `int`
     // and therefore calls `PyLong_AsInt` before inspecting even an empty
     // receiver.  Keep PyPy's method body below, but narrow this observable
     // argument boundary to a C int.
-    let w_tabsize = pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"));
+    let w_tabsize = args.get(1).copied().filter(|o| !o.is_null());
     let _roots = pyre_object::gc_roots::push_roots();
     let recv_slot = if let Some(t) = w_tabsize {
-        pyre_object::gc_roots::pin_roots(&[pos[0], t])
+        pyre_object::gc_roots::pin_roots(&[args[0], t])
     } else {
-        pyre_object::gc_roots::pin_roots(&[pos[0]])
+        pyre_object::gc_roots::pin_roots(&[args[0]])
     };
     let tabsize = i64::from(match w_tabsize {
         Some(_) => crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(

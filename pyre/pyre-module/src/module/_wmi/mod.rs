@@ -44,19 +44,11 @@ fn is_select_query(query: &[u16]) -> bool {
 
 /// `_wmi.exec_query($module, /, query)`.
 fn exec_query(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    pyre_interpreter::builtins::clinic_arity(
-        "exec_query",
-        positional.len(),
-        pyre_interpreter::builtins::real_kwarg_count(kwargs),
-        1,
-        1,
-        0,
-    )?;
-    let query = positional
+    // Bound scope: required `query` (`PY_NULL` omitted).
+    let query = args
         .first()
         .copied()
-        .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "query"))
+        .filter(|o| !o.is_null())
         .ok_or_else(|| {
             pyre_interpreter::PyError::type_error(
                 "exec_query() missing required argument 'query' (pos 1)",
@@ -103,11 +95,19 @@ pyre_interpreter::py_module! {
     extra_init: |ns| {
         pyre_interpreter::__pyre_store!(ns, "exec_query", pyre_interpreter::gateway::with_module(
                 "_wmi",
-                pyre_interpreter::make_module_builtin_function_with_doc(
-                    "exec_query",
-                    exec_query,
-                    EXEC_QUERY_DOC,
-                ),
+                {
+                    let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
+                        "exec_query",
+                        exec_query,
+                        Some(EXEC_QUERY_DOC),
+                        pyre_interpreter::Signature::new(vec!["query"], None, None, 0, 0),
+                    );
+                    pyre_interpreter::function_new_builtin(
+                        code as *const (),
+                        "exec_query".to_string(),
+                        pyre_object::PY_NULL,
+                    )
+                },
             ));
     },
 }

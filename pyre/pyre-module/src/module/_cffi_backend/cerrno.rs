@@ -22,8 +22,8 @@ pub fn set_errno(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `cerrno.py getwinerror`.
 #[cfg(windows)]
 pub fn getwinerror(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let code = match args.first() {
-        Some(&w_code) => pyre_interpreter::baseobjspace::int_w(w_code)? as i32,
+    let code = match args.first().copied().filter(|value| !value.is_null()) {
+        Some(w_code) => pyre_interpreter::baseobjspace::int_w(w_code)? as i32,
         None => -1,
     };
     let code = if code == -1 {

@@ -4,8 +4,9 @@
 
 use crate::executioncontext::ActionFlagOps;
 use crate::{
-    make_builtin_function, make_builtin_function_with_arity,
-    make_builtin_function_with_arity_and_maybe_sig, module_ns_store,
+    Signature, make_builtin_function, make_builtin_function_with_arity,
+    make_builtin_function_with_arity_and_maybe_sig, make_builtin_function_with_signature,
+    module_ns_store,
 };
 use pyre_object::*;
 use std::sync::OnceLock;
@@ -1165,29 +1166,16 @@ fn sys_get_coroutine_origin_tracking_depth(_args: &[PyObjectRef]) -> crate::PyRe
 }
 
 fn sys_set_coroutine_origin_tracking_depth(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(
-        kwargs,
-        &["depth"],
-        "set_coroutine_origin_tracking_depth",
-    )?;
-    if positional.len() > 1 {
-        return Err(crate::PyError::type_error(format!(
-            "set_coroutine_origin_tracking_depth() takes exactly one argument ({} given)",
-            positional.len(),
-        )));
-    }
-    let kw_depth = crate::builtins::kwarg_get(kwargs, "depth");
-    if !positional.is_empty() && kw_depth.is_some() {
-        return Err(crate::PyError::type_error(
-            "set_coroutine_origin_tracking_depth() got multiple values for argument 'depth'",
-        ));
-    }
-    let w_depth = positional.first().copied().or(kw_depth).ok_or_else(|| {
-        crate::PyError::type_error(
-            "set_coroutine_origin_tracking_depth() missing required argument 'depth'",
-        )
-    })?;
+    // Bound scope: `depth` (`PY_NULL` omitted).
+    let w_depth = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error(
+                "set_coroutine_origin_tracking_depth() missing required argument 'depth'",
+            )
+        })?;
     let indexed = crate::baseobjspace::space_index(w_depth)?;
     let depth = crate::baseobjspace::int_w(indexed)?;
     if depth < 0 {
@@ -1237,32 +1225,9 @@ fn sys_get_asyncgen_hooks_impl(_args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn sys_set_asyncgen_hooks_impl(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(
-        kwargs,
-        &["firstiter", "finalizer"],
-        "set_asyncgen_hooks",
-    )?;
-    if positional.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "set_asyncgen_hooks() takes at most 2 arguments ({} given)",
-            positional.len()
-        )));
-    }
-    let kw_firstiter = crate::builtins::kwarg_get(kwargs, "firstiter");
-    let kw_finalizer = crate::builtins::kwarg_get(kwargs, "finalizer");
-    if !positional.is_empty() && kw_firstiter.is_some() {
-        return Err(crate::PyError::type_error(
-            "set_asyncgen_hooks() got multiple values for argument 'firstiter'",
-        ));
-    }
-    if positional.len() > 1 && kw_finalizer.is_some() {
-        return Err(crate::PyError::type_error(
-            "set_asyncgen_hooks() got multiple values for argument 'finalizer'",
-        ));
-    }
-    let firstiter = positional.first().copied().or(kw_firstiter);
-    let finalizer = positional.get(1).copied().or(kw_finalizer);
+    // Bound scope: `firstiter`, `finalizer` (`PY_NULL` omitted).
+    let firstiter = args.first().copied().filter(|o| !o.is_null());
+    let finalizer = args.get(1).copied().filter(|o| !o.is_null());
     let ec = current_execution_context();
     if !ec.is_null() {
         unsafe {
@@ -1971,63 +1936,51 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "_getframemodulename",
-        crate::make_builtin_function("_getframemodulename", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(kwargs, &["depth"], "_getframemodulename")?;
-            // The arity is judged on the total argument count, so supplying
-            // `depth` both ways is "takes at most 1 argument (2 given)" rather
-            // than the duplicate-binding report.
-            let supplied = positional.len() + crate::builtins::real_kwarg_count(kwargs);
-            if supplied > 1 {
-                return Err(crate::PyError::type_error(format!(
-                    "_getframemodulename() takes at most 1 argument ({supplied} given)"
-                )));
-            }
-            let depth = match crate::builtins::bind_pos_or_kw(
-                positional,
-                kwargs,
-                0,
-                "depth",
-                "_getframemodulename",
-                1,
-            )? {
-                Some(v) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?,
-                None => 0,
-            };
-            let ec = current_execution_context();
-            if ec.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let mut current = unsafe { (*ec).gettopframe_nohidden() };
-            // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
-            // post-decrement test fails immediately for a negative depth, so a
-            // negative walks zero frames and reports the current module rather
-            // than `None`.
-            let mut remaining = depth.max(0);
-            while !current.is_null() && remaining > 0 {
-                current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
-                remaining -= 1;
-            }
-            if current.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            // `get_w_globals` reads `pycode`, which `interp_jit.py`
-            // declares virtualizable, so the frame it is read off has to be
-            // materialized first.  The force belongs HERE, at the consumer, and
-            // not at the walk that reached the frame — see [`force_frame`]:
-            // forcing a walk escapes the traced virtualizable and
-            // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
-            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
-            crate::executioncontext::jit_force_virtualizable(anchor.live());
-            let w_globals = unsafe { (*anchor.live()).get_w_globals() };
-            if w_globals.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            match crate::baseobjspace::finditem_str(w_globals, "__name__")? {
-                Some(name) if !name.is_null() => Ok(name),
-                _ => Ok(pyre_object::w_none()),
-            }
-        }),
+        crate::make_builtin_function_with_signature(
+            "_getframemodulename",
+            |args| {
+                // Bound scope: optional `depth` (`PY_NULL` omitted).
+                let depth = match args.get(0).copied().filter(|value| !value.is_null()) {
+                    Some(v) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?,
+                    None => 0,
+                };
+                let ec = current_execution_context();
+                if ec.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                let mut current = unsafe { (*ec).gettopframe_nohidden() };
+                // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
+                // post-decrement test fails immediately for a negative depth, so a
+                // negative walks zero frames and reports the current module rather
+                // than `None`.
+                let mut remaining = depth.max(0);
+                while !current.is_null() && remaining > 0 {
+                    current =
+                        crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
+                    remaining -= 1;
+                }
+                if current.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                // `get_w_globals` reads `pycode`, which `interp_jit.py`
+                // declares virtualizable, so the frame it is read off has to be
+                // materialized first.  The force belongs HERE, at the consumer, and
+                // not at the walk that reached the frame — see [`force_frame`]:
+                // forcing a walk escapes the traced virtualizable and
+                // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
+                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
+                crate::executioncontext::jit_force_virtualizable(anchor.live());
+                let w_globals = unsafe { (*anchor.live()).get_w_globals() };
+                if w_globals.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                match crate::baseobjspace::finditem_str(w_globals, "__name__")? {
+                    Some(name) if !name.is_null() => Ok(name),
+                    _ => Ok(pyre_object::w_none()),
+                }
+            },
+            crate::Signature::new(vec!["depth"], None, None, 0, 0),
+        ),
     );
     // sys.exc_info() → (type, value, traceback)
     //
@@ -2841,41 +2794,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "exit",
-        crate::make_module_builtin_function("exit", |args| {
-            // `exit(exitcode=None)` — resolve the single optional argument
-            // like the app-level signature: strip the `__pyre_kw__` trailer,
-            // reject unknown keywords, reproduce the normal function-call
-            // arity diagnostics, and reject a positional/`exitcode=`
-            // duplicate.
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(kwargs, &["exitcode"], "exit")?;
-            if positional.len() > 1 {
-                return Err(crate::PyError::type_error(format!(
-                    "exit() takes from 0 to 1 positional arguments but {} were given",
-                    positional.len()
-                )));
-            }
-            let kw_exitcode = crate::builtins::kwarg_get(kwargs, "exitcode");
-            if !positional.is_empty() && kw_exitcode.is_some() {
-                return Err(crate::PyError::type_error(
-                    "exit() got multiple values for argument 'exitcode'",
-                ));
-            }
-            let exitcode = positional
-                .first()
-                .copied()
-                .or(kw_exitcode)
-                .unwrap_or_else(w_none);
-            let cls = crate::builtins::lookup_exc_class("SystemExit")
-                .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
-            let ctor_args = if unsafe { is_tuple(exitcode) } {
-                unsafe { w_tuple_items_copy_as_vec(exitcode) }
-            } else {
-                vec![exitcode]
-            };
-            let exc = crate::call::call_function_impl_result(cls, &ctor_args)?;
-            Err(unsafe { crate::PyError::from_exc_object(exc) })
-        }),
+        crate::make_module_builtin_function_with_arity_and_sig(
+            "exit",
+            |args| {
+                // Bound scope: optional `exitcode` (`PY_NULL` omitted).
+                let exitcode = args
+                    .get(0)
+                    .copied()
+                    .filter(|value| !value.is_null())
+                    .unwrap_or_else(w_none);
+                let cls = crate::builtins::lookup_exc_class("SystemExit")
+                    .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
+                let ctor_args = if unsafe { is_tuple(exitcode) } {
+                    unsafe { w_tuple_items_copy_as_vec(exitcode) }
+                } else {
+                    vec![exitcode]
+                };
+                let exc = crate::call::call_function_impl_result(cls, &ctor_args)?;
+                Err(unsafe { crate::PyError::from_exc_object(exc) })
+            },
+            crate::HOPELESS,
+            crate::Signature::new(vec!["exitcode"], None, None, 0, 0),
+        ),
     );
     // `init_sys_streams`: Windows has no `sys.abiflags`; its ABI tag
     // belongs to `sys.winver`.  Absence is observable through `hasattr` and is
@@ -3312,29 +3252,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "getunicodeinternedsize",
-        crate::make_builtin_function("getunicodeinternedsize", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(
-                kwargs,
-                &["_only_immortal"],
-                "getunicodeinternedsize",
-            )?;
-            if !positional.is_empty() {
-                return Err(crate::PyError::type_error(
-                    "getunicodeinternedsize() takes no positional arguments",
-                ));
-            }
-            let only_immortal = match crate::builtins::kwarg_get(kwargs, "_only_immortal") {
-                Some(value) => crate::baseobjspace::is_true(value)?,
-                None => false,
-            };
-            let size = if only_immortal {
-                pyre_object::unicodeobject::interned_size_immortal()
-            } else {
-                pyre_object::unicodeobject::interned_size()
-            };
-            Ok(w_int_new(size as i64))
-        }),
+        crate::make_builtin_function_with_signature(
+            "getunicodeinternedsize",
+            |args| {
+                // Bound scope: kw-only `_only_immortal` (`PY_NULL` omitted).
+                let only_immortal = match args.get(0).copied().filter(|value| !value.is_null()) {
+                    Some(value) => crate::baseobjspace::is_true(value)?,
+                    None => false,
+                };
+                let size = if only_immortal {
+                    pyre_object::unicodeobject::interned_size_immortal()
+                } else {
+                    pyre_object::unicodeobject::interned_size()
+                };
+                Ok(w_int_new(size as i64))
+            },
+            crate::Signature::new(vec!["_only_immortal"], None, None, 1, 0),
+        ),
     );
     module_ns_store(
         roots.get(ns_slot),
@@ -3555,9 +3489,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         "set_coroutine_origin_tracking_depth",
         // `depth` is positional-or-keyword, so this cannot take the
         // fixed-arity carrier (which rejects keywords before the body runs).
-        crate::make_builtin_function(
+        make_builtin_function_with_signature(
             "set_coroutine_origin_tracking_depth",
             sys_set_coroutine_origin_tracking_depth,
+            Signature::new(vec!["depth"], None, None, 0, 0),
         ),
     );
     module_ns_store(
@@ -3568,7 +3503,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "set_asyncgen_hooks",
-        crate::make_builtin_function("set_asyncgen_hooks", sys_set_asyncgen_hooks_impl),
+        make_builtin_function_with_signature(
+            "set_asyncgen_hooks",
+            sys_set_asyncgen_hooks_impl,
+            Signature::new(vec!["firstiter", "finalizer"], None, None, 0, 0),
+        ),
     );
     // sys.getfilesystemencoding
     module_ns_store(
@@ -3626,7 +3565,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "audit",
-        crate::make_builtin_function("audit", sys_audit),
+        crate::gateway::with_module(
+            "sys",
+            crate::make_builtin_function_with_signature(
+                "audit",
+                sys_audit,
+                Signature::new(vec!["event"], Some("args"), None, 0, 1),
+            ),
+        ),
     );
     // sys._clear_type_descriptors(cls) — remove the descriptors owned by the
     // original class before `dataclasses._add_slots` copies its namespace into
@@ -3973,17 +3919,14 @@ pub fn audit_hooks_armed() -> bool {
 /// encode is there for the error it raises: an event name holding a lone
 /// surrogate is a `UnicodeEncodeError` at the call.
 fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "sys.audit() takes no keyword arguments",
-        ));
-    }
-    let Some(&w_event) = positional.first() else {
+    // Signature `event, *args`: omitted event is PY_NULL; extras arrive as
+    // a tuple in slot 1.  Keywords are rejected at parse_obj.
+    if args.first().is_none_or(|a| a.is_null()) {
         return Err(crate::PyError::type_error(
             "audit expected at least 1 argument, got 0",
         ));
-    };
+    }
+    let w_event = args[0];
     // `@unwrap_spec(event="text")`
     if !unsafe { pyre_object::is_str(w_event) } {
         // `_PyArg_BadArgument` names the `None` singleton itself rather than
@@ -4004,13 +3947,21 @@ fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     // only as copied pointers — the same bracket [`audit`] takes around its
     // own — and the owned copy is taken so no borrow of the event outlives
     // the unwrap.
+    let extra: Vec<pyre_object::PyObjectRef> = if args.len() > 1 && !args[1].is_null() {
+        unsafe { pyre_object::w_tuple_items_copy_as_vec(args[1]) }
+    } else {
+        Vec::new()
+    };
     let _roots = pyre_object::gc_roots::push_roots();
-    let args_slot = _roots.pin_roots(positional);
-    let event = crate::baseobjspace::str_utf8_w(_roots.get(args_slot))?.to_string();
+    let mut live = Vec::with_capacity(1 + extra.len());
+    live.push(w_event);
+    live.extend_from_slice(&extra);
+    let base = _roots.pin_roots(&live);
+    let event = crate::baseobjspace::str_utf8_w(_roots.get(base))?.to_string();
     let w_text = _roots.pin_root(w_str_new_managed(&event));
-    let mut args_w: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(positional.len() - 1);
-    for i in 1..positional.len() {
-        args_w.push(_roots.get(args_slot + i));
+    let mut args_w: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(extra.len());
+    for i in 0..extra.len() {
+        args_w.push(_roots.get(base + 1 + i));
     }
     audit_w(w_text, &args_w)?;
     Ok(w_none())

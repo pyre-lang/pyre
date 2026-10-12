@@ -4919,198 +4919,173 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "__init__",
-            pyre_interpreter::make_builtin_function("__init__", |args| {
-                // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
-                // w_fileno=None)`.
-                let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let after_self = if args.is_empty() { args } else { &args[1..] };
-                let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(after_self);
-                // `descr_init`'s `@unwrap_spec` signature rejects unknown
-                // keywords and a parameter supplied both by position and name.
-                pyre_interpreter::builtins::kwarg_reject_unknown(
-                    kwargs,
-                    &["family", "type", "proto", "fileno"],
-                    "socket",
-                )?;
-                pyre_interpreter::builtins::kwarg_reject_duplicate(
-                    kwargs,
-                    "socket",
-                    "family",
-                    !pos.is_empty(),
-                )?;
-                pyre_interpreter::builtins::kwarg_reject_duplicate(
-                    kwargs,
-                    "socket",
-                    "type",
-                    pos.len() >= 2,
-                )?;
-                pyre_interpreter::builtins::kwarg_reject_duplicate(
-                    kwargs,
-                    "socket",
-                    "proto",
-                    pos.len() >= 3,
-                )?;
-                pyre_interpreter::builtins::kwarg_reject_duplicate(
-                    kwargs,
-                    "socket",
-                    "fileno",
-                    pos.len() >= 4,
-                )?;
-                // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
-                // w_fileno=None)` — each parameter comes from its positional
-                // slot, then its keyword; family/type/proto keep the sentinel
-                // -1 (resolved below from the module defaults or the fd).
-                let family_obj = pos
-                    .first()
-                    .copied()
-                    .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "family"));
-                let type_obj = pos
-                    .get(1)
-                    .copied()
-                    .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "type"));
-                let proto_obj = pos
-                    .get(2)
-                    .copied()
-                    .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "proto"));
-                let fileno_obj = pos
-                    .get(3)
-                    .copied()
-                    .or_else(|| pyre_interpreter::builtins::kwarg_get(kwargs, "fileno"));
-                // `@unwrap_spec(family=int, type=int, proto=int)` — a present
-                // argument goes through the gateway int converter (`__index__` /
-                // `__int__`, OverflowError if it does not fit), defaulting to the
-                // -1 sentinel when omitted.
-                let int_arg =
+            pyre_interpreter::make_builtin_function_with_signature(
+                "__init__",
+                |args| {
+                    // Bound scope: `self`, optional `family`/`type`/`proto`/`fileno`
+                    // (`PY_NULL` omitted). `interp_socket.py descr_init(family=-1,
+                    // type=-1, proto=-1, w_fileno=None)`.
+                    let mut obj = args
+                        .first()
+                        .copied()
+                        .filter(|o| !o.is_null())
+                        .unwrap_or(pyre_object::PY_NULL);
+                    let bound = |i: usize| args.get(i).copied().filter(|o| !o.is_null());
+                    let family_obj = bound(1);
+                    let type_obj = bound(2);
+                    let proto_obj = bound(3);
+                    let fileno_obj = bound(4);
+                    // `@unwrap_spec(family=int, type=int, proto=int)` — a present
+                    // argument goes through the gateway int converter (`__index__` /
+                    // `__int__`, OverflowError if it does not fit), defaulting to the
+                    // -1 sentinel when omitted.
+                    let int_arg =
                 |obj: Option<pyre_object::PyObjectRef>| -> Result<libc::c_int, pyre_interpreter::PyError> {
                 match obj {
                     Some(o) => Ok(pyre_interpreter::baseobjspace::int_w(o)? as libc::c_int),
                     None => Ok(-1),
                 }
             };
-                // Each `int_w` can collect. Read every Option first, then keep
-                // the socket and the four words in one pin for the rest of init.
-                let has_family = family_obj.is_some();
-                let family_word = family_obj.unwrap_or(pyre_object::PY_NULL);
-                let has_type = type_obj.is_some();
-                let type_word = type_obj.unwrap_or(pyre_object::PY_NULL);
-                let has_proto = proto_obj.is_some();
-                let proto_word = proto_obj.unwrap_or(pyre_object::PY_NULL);
-                let has_fileno_obj = fileno_obj.is_some();
-                let fileno_word = fileno_obj.unwrap_or(pyre_object::PY_NULL);
-                let has_fileno = has_fileno_obj && !pyre_object::is_none(fileno_word);
-                let init_roots = pyre_object::gc_roots::push_roots();
-                let init_base =
-                    init_roots.pin_roots(&[obj, family_word, type_word, proto_word, fileno_word]);
-                let mut family = int_arg(has_family.then(|| init_roots.get(init_base + 1)))?;
-                let mut ty = int_arg(has_type.then(|| init_roots.get(init_base + 2)))?;
-                let mut proto = int_arg(has_proto.then(|| init_roots.get(init_base + 3)))?;
-                obj = init_roots.get(init_base);
-                if !has_fileno {
-                    // `interp_socket.py W_Socket.descr_init` — without a fileno the
-                    // sentinels resolve to AF_INET / SOCK_STREAM / 0.
+                    // Each `int_w` can collect. Read every Option first, then keep
+                    // the socket and the four words in one pin for the rest of init.
+                    let has_family = family_obj.is_some();
+                    let family_word = family_obj.unwrap_or(pyre_object::PY_NULL);
+                    let has_type = type_obj.is_some();
+                    let type_word = type_obj.unwrap_or(pyre_object::PY_NULL);
+                    let has_proto = proto_obj.is_some();
+                    let proto_word = proto_obj.unwrap_or(pyre_object::PY_NULL);
+                    let has_fileno_obj = fileno_obj.is_some();
+                    let fileno_word = fileno_obj.unwrap_or(pyre_object::PY_NULL);
+                    let has_fileno = has_fileno_obj && !pyre_object::is_none(fileno_word);
+                    let init_roots = pyre_object::gc_roots::push_roots();
+                    let init_base = init_roots.pin_roots(&[
+                        obj,
+                        family_word,
+                        type_word,
+                        proto_word,
+                        fileno_word,
+                    ]);
+                    let mut family = int_arg(has_family.then(|| init_roots.get(init_base + 1)))?;
+                    let mut ty = int_arg(has_type.then(|| init_roots.get(init_base + 2)))?;
+                    let mut proto = int_arg(has_proto.then(|| init_roots.get(init_base + 3)))?;
+                    obj = init_roots.get(init_base);
+                    if !has_fileno {
+                        // `interp_socket.py W_Socket.descr_init` — without a fileno the
+                        // sentinels resolve to AF_INET / SOCK_STREAM / 0.
+                        if family == -1 {
+                            family = rffi::AF_INET;
+                        }
+                        if ty == -1 {
+                            ty = rffi::SOCK_STREAM;
+                        }
+                        if proto == -1 {
+                            proto = 0;
+                        }
+                        // `socket` and the cloexec `fcntl` release the interpreter.
+                        // `obj` is reloaded before `socket_init_state` writes it.
+                        // The new descriptor is not inherited across exec.
+                        #[cfg(unix)]
+                        let fd = {
+                            pyre_object::with_roots!(obj => {
+                                majit_rlib::rsocket::socket(family, ty, proto).map_err(rsocket_os_error)
+                            })?
+                        };
+                        #[cfg(windows)]
+                        let fd = {
+                            let fd =
+                                pyre_object::with_roots!(obj => rffi::socket(family, ty, proto));
+                            if rffi::is_invalid(fd) {
+                                return Err(socket_last_error());
+                            }
+                            pyre_object::with_roots!(obj => rffi::set_cloexec(fd));
+                            fd
+                        };
+                        socket_init_state(obj, fd, family, ty, proto)?;
+                        return Ok(pyre_object::w_none());
+                    }
+                    // A socket handed over by `share` arrives as the bytes of the
+                    // `WSAPROTOCOL_INFOW` that wrote it, and re-opening it is what
+                    // `WSASocketW` under `FROM_PROTOCOL_INFO` does.  The three
+                    // arguments the caller gave are not read at all: the structure
+                    // names the family, type and protocol itself, so `fromshare`
+                    // reaches this with `socket(0, 0, 0, info)`.
+                    #[cfg(all(windows, feature = "host_env"))]
+                    if pyre_object::is_bytes(init_roots.get(init_base + 4)) {
+                        // Copied out before the interpreter is released: the borrow
+                        // would not survive a collection running in another thread.
+                        let data = unsafe {
+                            pyre_object::bytesobject::w_bytes_data(init_roots.get(init_base + 4))
+                        }
+                        .to_vec();
+                        let size = rustpython_host_env::socket::protocol_info_size();
+                        if data.len() != size {
+                            return Err(pyre_interpreter::PyError::value_error(format!(
+                                "socket descriptor string has wrong size, should be {size} bytes."
+                            )));
+                        }
+                        let shared = {
+                            let _blocked =
+                                pyre_interpreter::module::thread::before_external_block();
+                            rustpython_host_env::socket::socket_from_share_data(&data)
+                        }
+                        .map_err(socket_io_err)?;
+                        // `before_external_block` lets another thread collect.
+                        socket_init_state(
+                            init_roots.get(init_base),
+                            shared.raw,
+                            shared.family,
+                            shared.socket_type,
+                            shared.protocol,
+                        )?;
+                        return Ok(pyre_object::w_none());
+                    }
+                    // `interp_socket.py W_Socket.descr_init` — wrap an existing fd.  A float
+                    // fileno is a TypeError, a negative fd a ValueError, and any
+                    // -1 family/type/proto is derived from the descriptor itself.
+                    if pyre_object::is_float(init_roots.get(init_base + 4)) {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "integer argument expected, got float",
+                        ));
+                    }
+                    // `interp_socket.py` — `space.int_w(w_fileno)` accepts ints,
+                    // longs, and objects with `__int__` / `__index__`.
+                    let fd = pyre_object::with_roots!(obj => {
+                        pyre_interpreter::baseobjspace::int_w(init_roots.get(init_base + 4))
+                    })?;
+                    if fd < 0 {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "negative file descriptor",
+                        ));
+                    }
+                    let fd = rffi::socket_from_i64(fd);
+                    // [3.14-spec] PyPy `W_Socket.descr_init` only probes SO_TYPE when
+                    // `type == -1`, and consequently accepts a regular-file fd when
+                    // the caller supplies family/type.  The public 3.14
+                    // `test_socket_fileno_requires_socket_fd` requires ENOTSOCK for
+                    // both forms.  No JIT/immutability hint covers `descr_init`, so
+                    // validate the descriptor once while keeping PyPy's field-owner
+                    // and subsequent inference order unchanged.
+                    let detected_type = pyre_object::with_roots!(obj => socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_TYPE))?;
                     if family == -1 {
-                        family = rffi::AF_INET;
+                        family = pyre_object::with_roots!(obj => socket_detect_family(fd))?;
                     }
                     if ty == -1 {
-                        ty = rffi::SOCK_STREAM;
+                        ty = detected_type;
                     }
                     if proto == -1 {
-                        proto = 0;
+                        proto = pyre_object::with_roots!(obj => socket_get_so_protocol(fd))?;
                     }
-                    // `socket` and the cloexec `fcntl` release the interpreter.
-                    // `obj` is reloaded before `socket_init_state` writes it.
-                    // The new descriptor is not inherited across exec.
-                    #[cfg(unix)]
-                    let fd = {
-                        pyre_object::with_roots!(obj => {
-                            majit_rlib::rsocket::socket(family, ty, proto).map_err(rsocket_os_error)
-                        })?
-                    };
-                    #[cfg(windows)]
-                    let fd = {
-                        let fd = pyre_object::with_roots!(obj => rffi::socket(family, ty, proto));
-                        if rffi::is_invalid(fd) {
-                            return Err(socket_last_error());
-                        }
-                        pyre_object::with_roots!(obj => rffi::set_cloexec(fd));
-                        fd
-                    };
                     socket_init_state(obj, fd, family, ty, proto)?;
-                    return Ok(pyre_object::w_none());
-                }
-                // A socket handed over by `share` arrives as the bytes of the
-                // `WSAPROTOCOL_INFOW` that wrote it, and re-opening it is what
-                // `WSASocketW` under `FROM_PROTOCOL_INFO` does.  The three
-                // arguments the caller gave are not read at all: the structure
-                // names the family, type and protocol itself, so `fromshare`
-                // reaches this with `socket(0, 0, 0, info)`.
-                #[cfg(all(windows, feature = "host_env"))]
-                if pyre_object::is_bytes(init_roots.get(init_base + 4)) {
-                    // Copied out before the interpreter is released: the borrow
-                    // would not survive a collection running in another thread.
-                    let data =
-                        { pyre_object::bytesobject::w_bytes_data(init_roots.get(init_base + 4)) }
-                            .to_vec();
-                    let size = rustpython_host_env::socket::protocol_info_size();
-                    if data.len() != size {
-                        return Err(pyre_interpreter::PyError::value_error(format!(
-                            "socket descriptor string has wrong size, should be {size} bytes."
-                        )));
-                    }
-                    let shared = {
-                        let _blocked = pyre_interpreter::module::thread::before_external_block();
-                        rustpython_host_env::socket::socket_from_share_data(&data)
-                    }
-                    .map_err(socket_io_err)?;
-                    // `before_external_block` lets another thread collect.
-                    socket_init_state(
-                        init_roots.get(init_base),
-                        shared.raw,
-                        shared.family,
-                        shared.socket_type,
-                        shared.protocol,
-                    )?;
-                    return Ok(pyre_object::w_none());
-                }
-                // `interp_socket.py W_Socket.descr_init` — wrap an existing fd.  A float
-                // fileno is a TypeError, a negative fd a ValueError, and any
-                // -1 family/type/proto is derived from the descriptor itself.
-                if pyre_object::is_float(init_roots.get(init_base + 4)) {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "integer argument expected, got float",
-                    ));
-                }
-                // `interp_socket.py` — `space.int_w(w_fileno)` accepts ints,
-                // longs, and objects with `__int__` / `__index__`.
-                let fd = pyre_object::with_roots!(obj => {
-                    pyre_interpreter::baseobjspace::int_w(init_roots.get(init_base + 4))
-                })?;
-                if fd < 0 {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "negative file descriptor",
-                    ));
-                }
-                let fd = rffi::socket_from_i64(fd);
-                // [3.14-spec] PyPy `W_Socket.descr_init` only probes SO_TYPE when
-                // `type == -1`, and consequently accepts a regular-file fd when
-                // the caller supplies family/type.  The public 3.14
-                // `test_socket_fileno_requires_socket_fd` requires ENOTSOCK for
-                // both forms.  No JIT/immutability hint covers `descr_init`, so
-                // validate the descriptor once while keeping PyPy's field-owner
-                // and subsequent inference order unchanged.
-                let detected_type = pyre_object::with_roots!(obj => socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_TYPE))?;
-                if family == -1 {
-                    family = pyre_object::with_roots!(obj => socket_detect_family(fd))?;
-                }
-                if ty == -1 {
-                    ty = detected_type;
-                }
-                if proto == -1 {
-                    proto = pyre_object::with_roots!(obj => socket_get_so_protocol(fd))?;
-                }
-                socket_init_state(obj, fd, family, ty, proto)?;
-                Ok(pyre_object::w_none())
-            })
+                    Ok(pyre_object::w_none())
+                },
+                pyre_interpreter::Signature::new(
+                    vec!["self", "family", "type", "proto", "fileno"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
         )
     };
 

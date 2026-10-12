@@ -6,7 +6,8 @@
 //! typed fields, `pyre_object::interp_sre`).
 
 use crate::{
-    make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
+    Signature, make_builtin_function, make_builtin_function_with_arity,
+    make_builtin_function_with_signature, make_module_builtin_function,
     make_module_builtin_function_with_arity,
 };
 use pyre_object::interp_sre::{
@@ -197,35 +198,55 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "match",
-            make_builtin_function("match", sre_pattern_match)
+            make_builtin_function_with_signature(
+                "match",
+                sre_pattern_match,
+                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "fullmatch",
-            make_builtin_function("fullmatch", sre_pattern_fullmatch)
+            make_builtin_function_with_signature(
+                "fullmatch",
+                sre_pattern_fullmatch,
+                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "search",
-            make_builtin_function("search", sre_pattern_search)
+            make_builtin_function_with_signature(
+                "search",
+                sre_pattern_search,
+                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "findall",
-            make_builtin_function("findall", sre_pattern_findall)
+            make_builtin_function_with_signature(
+                "findall",
+                sre_pattern_findall,
+                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "finditer",
-            make_builtin_function("finditer", sre_pattern_finditer)
+            make_builtin_function_with_signature(
+                "finditer",
+                sre_pattern_finditer,
+                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+            ),
         )
     };
     // interp_sre.py `scanner = interp2app(W_SRE_Pattern.finditer_w)`
@@ -234,28 +255,44 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "scanner",
-            make_builtin_function("scanner", sre_pattern_finditer)
+            make_builtin_function_with_signature(
+                "scanner",
+                sre_pattern_finditer,
+                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "sub",
-            make_builtin_function("sub", sre_pattern_sub)
+            make_builtin_function_with_signature(
+                "sub",
+                sre_pattern_sub,
+                Signature::new(vec!["self", "repl", "string", "count"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "subn",
-            make_builtin_function("subn", sre_pattern_subn)
+            make_builtin_function_with_signature(
+                "subn",
+                sre_pattern_subn,
+                Signature::new(vec!["self", "repl", "string", "count"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "split",
-            make_builtin_function("split", sre_pattern_split)
+            make_builtin_function_with_signature(
+                "split",
+                sre_pattern_split,
+                Signature::new(vec!["self", "string", "maxsplit"], None, None, 0, 1),
+            ),
         )
     };
     // interp_sre.py:651-653 `__repr__`/`__copy__`/`__deepcopy__`
@@ -1402,48 +1439,30 @@ fn do_match(
     match_all: bool,
     name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(kwargs, &["string", "pos", "endpos"], name)?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "string", "string", args.get(1).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "pos", "pos", args.get(2).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "endpos", "endpos", args.get(3).is_some())?;
-    if args.len() > 4 {
-        return Err(crate::PyError::type_error(format!(
-            "{name}() takes at most 3 arguments ({} given)",
-            args.len() - 1
-        )));
-    }
-    let Some(string) = args
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "string"))
-    else {
+    // Bound scope: `self`, `string`, `pos`, `endpos` (`PY_NULL` omitted).
+    let Some(string) = args.get(1).copied().filter(|o| !o.is_null()) else {
         return Err(crate::PyError::type_error("requires self and string"));
     };
     let pat = args
         .first()
         .copied()
+        .filter(|o| !o.is_null())
         .ok_or_else(|| crate::PyError::type_error(format!("{name} requires self and string")))?;
+    let _ = (pat, string);
     // A buffer subject is gathered into fresh bytes nothing else holds
     // (`readbuf_obj`), and `subj` borrows that payload, so it has to survive the
     // bound conversions below — `pos` and `endpos` run `__index__`, which is
     // user code, and a sweep in there would free the gathered bytes underneath
     // both the slice and the match this returns.
     //
-    // `args` is the gateway stack copy (`index_bounds_not_none`): the first
-    // bound's `__index__` collects, so the pattern, the subject, the second
-    // bound, and kwargs have to be shadow-stack slots rather than that copy.
+    // Bound slots are the gateway stack copy (`index_bounds_not_none`): the
+    // first bound's `__index__` collects, so the pattern, the subject, and the
+    // second bound have to be shadow-stack slots rather than that copy.
     let _roots = pyre_object::gc_roots::push_roots();
     let arg_base = pyre_object::gc_roots::pin_roots(args);
     let args_len = args.len();
-    let kw_slot = kwargs.map(|k| {
-        let _ = pyre_object::gc_roots::pin_root(k);
-        pyre_object::gc_roots::shadow_stack_len() - 1
-    });
-    let string_slot = pyre_object::gc_roots::pin_roots(&[string]);
     let pat = || pyre_object::gc_roots::shadow_stack_get(arg_base);
-    let string = || pyre_object::gc_roots::shadow_stack_get(string_slot);
-    let kwargs_now = || kw_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let string = || pyre_object::gc_roots::shadow_stack_get(arg_base + 1);
     get_code(pat()).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     let (subj, w_buffer) = make_subject(pat(), string())?;
     let buffer_slot = pyre_object::gc_roots::pin_roots(&[w_buffer]);
@@ -1451,8 +1470,8 @@ fn do_match(
 
     let (pos, endpos) = normalize_bounds(
         subj.len(),
-        arg_int_kw_rooted(arg_base, args_len, 2, kwargs_now(), "pos", 0)?,
-        arg_int_kw_rooted(arg_base, args_len, 3, kwargs_now(), "endpos", i64::MAX)?,
+        arg_int_rooted(arg_base, args_len, 2, 0)?,
+        arg_int_rooted(arg_base, args_len, 3, i64::MAX)?,
     );
     // `pos`/`endpos` ran `__index__`. Reload the subject from the
     // rooted objects so a moving collection during that conversion
@@ -1575,38 +1594,15 @@ fn arg_int(args: &[PyObjectRef], idx: usize, default: i64) -> Result<i64, crate:
     }
 }
 
-/// Resolve an optional int argument (`pos`/`endpos`/`count`) that may be
-/// supplied positionally or by keyword — the unwrap_spec binding the
-/// gateway performs for these builtins (e.g. `match(w_string, pos=0,
-/// endpos=sys.maxint)`, interp_sre.py:262).  `pos_args` must already have
-/// the trailing `__pyre_kw__` dict stripped ([`split_builtin_kwargs`]).
-fn arg_int_kw(
-    pos_args: &[PyObjectRef],
-    idx: usize,
-    kwargs: Option<PyObjectRef>,
-    name: &str,
-    default: i64,
-) -> Result<i64, crate::PyError> {
-    if let Some(w) = crate::builtins::kwarg_get(kwargs, name) {
-        return sre_index_int(w);
-    }
-    arg_int(pos_args, idx, default)
-}
-
-/// `arg_int_kw` over a rooted gateway copy.  The first bound's `__index__`
-/// collects, so the second bound is read back from its shadow-stack slot
-/// (`index_bounds_not_none` / `slice_unpack`).
-fn arg_int_kw_rooted(
+/// Optional bound int (`pos`/`endpos`/`count`) over a rooted gateway copy.
+/// The first bound's `__index__` collects, so the second bound is read back
+/// from its shadow-stack slot (`index_bounds_not_none` / `slice_unpack`).
+fn arg_int_rooted(
     arg_base: usize,
     args_len: usize,
     idx: usize,
-    kwargs: Option<PyObjectRef>,
-    name: &str,
     default: i64,
 ) -> Result<i64, crate::PyError> {
-    if let Some(w) = crate::builtins::kwarg_get(kwargs, name) {
-        return sre_index_int(w);
-    }
     if idx < args_len {
         let w = pyre_object::gc_roots::shadow_stack_get(arg_base + idx);
         if !w.is_null() {
@@ -1616,54 +1612,35 @@ fn arg_int_kw_rooted(
     Ok(default)
 }
 
-fn required_arg_kw(
-    pos_args: &[PyObjectRef],
-    idx: usize,
-    kwargs: Option<PyObjectRef>,
-    name: &str,
-    function: &str,
-) -> Result<PyObjectRef, crate::PyError> {
-    let positional = pos_args.get(idx).copied();
-    let keyword = crate::builtins::kwarg_get(kwargs, name);
-    if positional.is_some() && keyword.is_some() {
-        return Err(crate::PyError::type_error(format!(
-            "{function}() got multiple values for argument '{name}'"
-        )));
-    }
-    positional
-        .or(keyword)
-        .ok_or_else(|| crate::PyError::type_error(format!("{function} requires self and {name}")))
-}
-
 /// `findall_w` (interp_sre.py) — non-overlapping matches.  With no
 /// groups the whole match is collected; with one group that group's text;
 /// with two or more a tuple of the groups.  Unmatched groups become the
 /// empty string (`w_emptystr`, :344-347).
 fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // Bound scope: `self`, `string`, `pos`, `endpos` (`PY_NULL` omitted).
     let pat = args
         .first()
         .copied()
+        .filter(|o| !o.is_null())
         .ok_or_else(|| crate::PyError::type_error("findall requires self and string"))?;
-    let string = required_arg_kw(args, 1, kwargs, "string", "findall")?;
+    let Some(string) = args.get(1).copied().filter(|o| !o.is_null()) else {
+        return Err(crate::PyError::type_error(
+            "findall requires self and string",
+        ));
+    };
+    let _ = (pat, string);
     let arg_base = pyre_object::gc_roots::pin_roots(args);
     let args_len = args.len();
-    let kw_slot = kwargs.map(|k| {
-        let _ = pyre_object::gc_roots::pin_root(k);
-        pyre_object::gc_roots::shadow_stack_len() - 1
-    });
-    let string_slot = pyre_object::gc_roots::pin_roots(&[string]);
     let pat = || pyre_object::gc_roots::shadow_stack_get(arg_base);
-    let string = || pyre_object::gc_roots::shadow_stack_get(string_slot);
-    let kwargs_now = || kw_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let string = || pyre_object::gc_roots::shadow_stack_get(arg_base + 1);
     get_code(pat()).ok_or_else(|| crate::PyError::type_error("no code"))?;
     let (subj, w_buffer) = make_subject(pat(), string())?;
     let buffer_slot = pyre_object::gc_roots::pin_roots(&[w_buffer]);
     let (pos, endpos) = normalize_bounds(
         subj.len(),
-        arg_int_kw_rooted(arg_base, args_len, 2, kwargs_now(), "pos", 0)?,
-        arg_int_kw_rooted(arg_base, args_len, 3, kwargs_now(), "endpos", i64::MAX)?,
+        arg_int_rooted(arg_base, args_len, 2, 0)?,
+        arg_int_rooted(arg_base, args_len, 3, i64::MAX)?,
     );
     let pat = pat();
     let subj = unsafe {
@@ -1732,12 +1709,17 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `finditer_w` (interp_sre.py) — returns the lazy
 /// `W_SRE_Scanner` that yields a `W_SRE_Match` per non-overlapping match.
 fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // Bound scope: `self`, `string`, `pos`, `endpos` (`PY_NULL` omitted).
     let pat = args
         .first()
         .copied()
+        .filter(|o| !o.is_null())
         .ok_or_else(|| crate::PyError::type_error("finditer requires self and string"))?;
-    let string = required_arg_kw(args, 1, kwargs, "string", "finditer")?;
+    let Some(string) = args.get(1).copied().filter(|o| !o.is_null()) else {
+        return Err(crate::PyError::type_error(
+            "finditer requires self and string",
+        ));
+    };
     if !unsafe { is_sre_pattern(pat) } {
         return Err(crate::PyError::type_error(
             "descriptor 'finditer' for 're.Pattern'",
@@ -1745,29 +1727,23 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     // Validate the compiled code is present (matches do_match's guard).
     get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
+    let _ = string;
     // Same window as `do_match`: the gathered bytes are held only here across
     // the `__index__` calls the bound conversions make, and the scanner keeps
-    // them as its `_buffer`.  The gateway `args` copy is pinned too — the
-    // first bound's `__index__` would otherwise leave the second bound as a
-    // from-space word.
+    // them as its `_buffer`.  Bound slots are pinned too — the first bound's
+    // `__index__` would otherwise leave the second bound as a from-space word.
     let _roots = pyre_object::gc_roots::push_roots();
     let arg_base = pyre_object::gc_roots::pin_roots(args);
     let args_len = args.len();
-    let kw_slot = kwargs.map(|k| {
-        let _ = pyre_object::gc_roots::pin_root(k);
-        pyre_object::gc_roots::shadow_stack_len() - 1
-    });
-    let string_slot = pyre_object::gc_roots::pin_roots(&[string]);
     let pat = || pyre_object::gc_roots::shadow_stack_get(arg_base);
-    let string = || pyre_object::gc_roots::shadow_stack_get(string_slot);
-    let kwargs_now = || kw_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let string = || pyre_object::gc_roots::shadow_stack_get(arg_base + 1);
     let (subj, w_buffer) = make_subject(pat(), string())?;
     let buffer_slot = pyre_object::gc_roots::pin_roots(&[w_buffer]);
     let w_buffer = || pyre_object::gc_roots::shadow_stack_get(buffer_slot);
     let (pos, endpos) = normalize_bounds(
         subj.len(),
-        arg_int_kw_rooted(arg_base, args_len, 2, kwargs_now(), "pos", 0)?,
-        arg_int_kw_rooted(arg_base, args_len, 3, kwargs_now(), "endpos", i64::MAX)?,
+        arg_int_rooted(arg_base, args_len, 2, 0)?,
+        arg_int_rooted(arg_base, args_len, 3, i64::MAX)?,
     );
     let export_active = unsafe { crate::builtins::buffer_export_incref(string()) };
     let scanner = w_sre_scanner_new(
@@ -1843,20 +1819,22 @@ impl Drop for HeldBufferExport {
 /// caps the number of substitutions (0 = unlimited).
 fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if args.len() < 3 {
+    // Bound scope: `self`, `repl`, `string`, `count` (`PY_NULL` omitted).
+    let pat = args.first().copied().filter(|o| !o.is_null());
+    let repl = args.get(1).copied().filter(|o| !o.is_null());
+    let string = args.get(2).copied().filter(|o| !o.is_null());
+    let (Some(pat), Some(repl), Some(string)) = (pat, repl, string) else {
         return Err(crate::PyError::type_error(
             "sub requires self, repl, string",
         ));
-    }
-    let pat = args[0];
+    };
     // The pattern, the replacement, and the subject are published together.
     // Everything below runs Python -- an `__index__` on `count`, the template
     // parse, and the filter once per match -- and a match object stamps the
     // subject into traced fields.  `base` stays the replacement slot so the
     // held export below is the subject at `base + 1`.
     let pat_slot = pyre_object::gc_roots::publish_roots(&[pat]);
-    let base = pyre_object::gc_roots::publish_roots(&[args[1], args[2]]);
+    let base = pyre_object::gc_roots::publish_roots(&[repl, string]);
     pyre_object::gc_roots::normalize_roots(pat_slot, 3);
     let w_repl = || pyre_object::gc_roots::shadow_stack_get(base);
     let string = || pyre_object::gc_roots::shadow_stack_get(base + 1);
@@ -1870,7 +1848,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     // `subj` borrows the payload; the template parse and every match
     // allocate. Re-read it through the pinned subject objects after each.
     let subject_now = || unsafe { subject_of(string(), w_buffer()) };
-    let count = arg_int_kw(args, 3, kwargs, "count", 0)?;
+    let count = arg_int(args, 3, 0)?;
 
     // interp_sre.py:437-472 — a callable filter is applied per match; a
     // literal (no backslash) is inserted verbatim; otherwise the template
@@ -2061,12 +2039,15 @@ fn is_exact_str_or_bytes(w: PyObjectRef) -> bool {
 /// final item.
 fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // Bound scope: `self`, `string`, `maxsplit` (`PY_NULL` omitted).
     let pat = args
         .first()
         .copied()
+        .filter(|o| !o.is_null())
         .ok_or_else(|| crate::PyError::type_error("split requires self and string"))?;
-    let string = required_arg_kw(args, 1, kwargs, "string", "split")?;
+    let Some(string) = args.get(1).copied().filter(|o| !o.is_null()) else {
+        return Err(crate::PyError::type_error("split requires self and string"));
+    };
     // The pattern and the subject are published together: the count conversion
     // and the result list both allocate, and the pattern is read again after
     // each of them.
@@ -2088,7 +2069,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             pyre_object::gc_roots::shadow_stack_get(buffer_slot),
         )
     };
-    let maxsplit = arg_int_kw(args, 2, kwargs, "maxsplit", 0)?;
+    let maxsplit = arg_int(args, 2, 0)?;
     let num_groups = unsafe {
         (*(pyre_object::gc_roots::shadow_stack_get(pat_slot) as *const W_SRE_Pattern)).num_groups
     }

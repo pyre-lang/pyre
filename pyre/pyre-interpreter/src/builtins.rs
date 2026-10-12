@@ -1715,18 +1715,9 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// CPython 3.14 `memoryview_tobytes_impl` — copy the live view through
 /// `PyBuffer_ToContiguous` in C, Fortran, or any-contiguous order.
 fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    clinic_arity(
-        "tobytes",
-        positional.len().saturating_sub(1),
-        real_kwarg_count(kwargs),
-        0,
-        1,
-        0,
-    )?;
-    kwarg_reject_unknown(kwargs, &["order"], "tobytes")?;
-    let mv = positional.first().copied().unwrap_or(w_none());
-    let w_order = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "order", "tobytes", 1)?;
+    // Bound scope: `self`, `order` (`PY_NULL` omitted).
+    let mv = args.first().copied().unwrap_or(w_none());
+    let w_order = args.get(1).copied().filter(|o| !o.is_null());
     unsafe {
         memoryview_check_released(mv)?;
         let order = match w_order {
@@ -1968,22 +1959,16 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// under a new native format and optionally a new N-D shape, sharing the
 /// same backing (`descr_cast` → `_cast_to_1D` / `_cast_to_ND`).
 fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["format", "shape"], "cast")?;
-    // `format` and `shape` are the whole signature; a third positional was
-    // being read past and dropped.
-    if positional.len() > 3 {
-        return Err(crate::PyError::type_error(format!(
-            "cast() takes at most 2 arguments ({} given)",
-            crate::type_methods::args_given(positional)
-        )));
-    }
-    let mut mv = positional.first().copied().unwrap_or(w_none());
-    let fmt_obj = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "format", "cast", 1)?
+    // Bound scope: `self`, `format`, `shape` (`PY_NULL` omitted).
+    let mut mv = args.first().copied().unwrap_or(w_none());
+    let fmt_obj = args
+        .get(1)
+        .copied()
+        .filter(|o| !o.is_null())
         .ok_or_else(|| {
             crate::PyError::type_error("cast() missing required argument 'format' (pos 1)")
         })?;
-    let shape_obj = resolve_pos_or_kw(positional.get(2).copied(), kwargs, "shape", "cast", 2)?;
+    let shape_obj = args.get(2).copied().filter(|o| !o.is_null());
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
@@ -3179,27 +3164,48 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         make_builtin_function("index", memoryview_index),
     );
     // `__exit__(self, *exc)`, `__release_buffer__(self, view)`,
-    // `__delitem__(self, *args)`, `hex(self, sep=, bytes_per_sep=)`, and
-    // `cast(format[, shape])` take variable / optional trailing arguments,
-    // so they register as plain (non-arity-pinned) builtins.
+    // `__delitem__(self, *args)`, and `cast(format[, shape])` take variable
+    // / optional trailing arguments, so they register as plain
+    // (non-arity-pinned) builtins.  `hex` shares bytes.hex's Signature so a
+    // keyword call binds `sep` / `bytes_per_sep` before the forwarder runs.
     for (name, f) in [
         ("__exit__", memoryview_exit as MvFn),
         ("__release_buffer__", memoryview_release_buffer),
         ("__delitem__", memoryview_delitem),
-        ("tobytes", memoryview_tobytes),
-        ("hex", memoryview_hex),
     ] {
         type_ns_store(ns_slot, name, make_builtin_function(name, f));
     }
     type_ns_store(
         ns_slot,
-        "cast",
-        crate::gateway::make_builtin_function_with_doc(
-            "cast",
-            memoryview_cast,
-            "Cast a memoryview to a new format or shape.",
+        "hex",
+        crate::make_builtin_function_with_signature(
+            "hex",
+            memoryview_hex,
+            crate::gateway::Signature::new(vec!["self", "sep", "bytes_per_sep"], None, None, 0, 1),
         ),
     );
+    type_ns_store(
+        ns_slot,
+        "tobytes",
+        crate::make_builtin_function_with_signature(
+            "tobytes",
+            memoryview_tobytes,
+            crate::gateway::Signature::new(vec!["self", "order"], None, None, 0, 1),
+        ),
+    );
+    type_ns_store(ns_slot, "cast", {
+        let code = crate::gateway::builtin_code_new_with_signature(
+            "cast",
+            memoryview_cast,
+            Some("Cast a memoryview to a new format or shape."),
+            crate::gateway::Signature::new(vec!["self", "format", "shape"], None, None, 0, 1),
+        );
+        crate::function_new_with_fixed_code(
+            code as *const (),
+            "cast".to_string(),
+            pyre_object::PY_NULL,
+        )
+    });
     // memoryobject.py:777-788 — `format` / `itemsize` / … are
     // `GetSetProperty(W_MemoryView.w_get_*)`.  `fget` is called
     // `(descriptor, receiver)`.
@@ -3376,7 +3382,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "print",
-        || make_module_builtin_function("print", builtin_print),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "print",
+                builtin_print,
+                0,
+                crate::gateway::Signature::new(
+                    vec!["sep", "end", "file", "flush"],
+                    Some("args"),
+                    None,
+                    4,
+                    0,
+                ),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -3521,7 +3540,16 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "getattr",
-        || make_module_builtin_function("getattr", builtin_getattr),
+        || {
+            // operation.py `getattr(space, w_obj, w_name, w_default)` — three
+            // positional-only slots; `w_default` omitted is `PY_NULL`.
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "getattr",
+                builtin_getattr,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["object", "name", "default"], None, None, 0, 3),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -3615,12 +3643,26 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "iter",
-        || make_module_builtin_function("iter", __majit_wrap_builtin_iter),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "iter",
+                __majit_wrap_builtin_iter,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["object", "sentinel"], None, None, 0, 2),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "next",
-        || make_module_builtin_function("next", builtin_next),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "next",
+                builtin_next,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["iterator", "default"], None, None, 0, 2),
+            )
+        },
     );
     // aiter/anext resolve their app-level implementations lazily; the
     // builtins dict is filled before an execution context exists.  Arity is
@@ -3629,12 +3671,26 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "aiter",
-        || make_module_builtin_function("aiter", crate::async_operation::builtin_aiter),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "aiter",
+                crate::async_operation::builtin_aiter,
+                1,
+                crate::gateway::Signature::new(vec!["async_iterable"], None, None, 0, 1),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "anext",
-        || make_module_builtin_function("anext", crate::async_operation::builtin_anext),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "anext",
+                crate::async_operation::builtin_anext,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["aiterator", "default"], None, None, 0, 2),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -3649,12 +3705,26 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "vars",
-        || make_module_builtin_function("vars", builtin_vars),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "vars",
+                builtin_vars,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["object"], None, None, 0, 1),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "dir",
-        || make_module_builtin_function("dir", builtin_dir),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "dir",
+                builtin_dir,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["object"], None, None, 0, 1),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -3736,17 +3806,62 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "exec",
-        || make_module_builtin_function("exec", builtin_exec),
+        || {
+            // `exec(source, /, globals=None, locals=None, *, closure=None)`.
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "exec",
+                builtin_exec,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(
+                    vec!["source", "globals", "locals", "closure"],
+                    None,
+                    None,
+                    1,
+                    1,
+                ),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "eval",
-        || make_module_builtin_function("eval", builtin_eval),
+        || {
+            // `eval(source, /, globals=None, locals=None)` — Signature bind.
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "eval",
+                builtin_eval,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["source", "globals", "locals"], None, None, 0, 1),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "compile",
-        || make_module_builtin_function("compile", builtin_compile),
+        || {
+            // `compile(source, filename, mode, flags=0, dont_inherit=False,
+            // optimize=-1, *, _feature_version=-1)` — Signature bind.
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "compile",
+                builtin_compile,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(
+                    vec![
+                        "source",
+                        "filename",
+                        "mode",
+                        "flags",
+                        "dont_inherit",
+                        "optimize",
+                        "_feature_version",
+                    ],
+                    None,
+                    None,
+                    1,
+                    0,
+                ),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -3761,12 +3876,41 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "input",
-        || make_module_builtin_function("input", builtin_input),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "input",
+                builtin_input,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["prompt"], None, None, 0, 1),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "open",
-        || make_module_builtin_function("open", builtin_open),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "open",
+                builtin_open,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(
+                    vec![
+                        "file",
+                        "mode",
+                        "buffering",
+                        "encoding",
+                        "errors",
+                        "newline",
+                        "closefd",
+                        "opener",
+                    ],
+                    None,
+                    None,
+                    0,
+                    0,
+                ),
+            )
+        },
     );
     ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     // Exception hierarchy — exceptions are real types so they can be
@@ -4467,80 +4611,150 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "any",
-        || make_module_builtin_function_with_arity("any", builtin_any, 1),
-    );
-    crate::module_ns_get_or_insert_with(
-        pyre_object::gc_roots::shadow_stack_get(ns_slot),
-        "all",
-        || make_module_builtin_function_with_arity("all", builtin_all, 1),
-    );
-    crate::module_ns_get_or_insert_with(
-        pyre_object::gc_roots::shadow_stack_get(ns_slot),
-        "sum",
-        || make_module_builtin_function("sum", builtin_sum),
-    );
-    crate::module_ns_get_or_insert_with(
-        pyre_object::gc_roots::shadow_stack_get(ns_slot),
-        "round",
-        || make_module_builtin_function("round", builtin_round),
-    );
-    crate::module_ns_get_or_insert_with(
-        pyre_object::gc_roots::shadow_stack_get(ns_slot),
-        "divmod",
         || {
-            // operation.py `divmod(space, w_x, w_y)` — two positional-only
-            // arguments, so any keyword is rejected with "takes no keyword
-            // arguments".
             crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "divmod",
-                __majit_wrap_builtin_divmod,
-                2,
-                crate::gateway::Signature::new(vec!["x", "y"], None, None, 0, 2),
+                "any",
+                builtin_any,
+                1,
+                crate::gateway::Signature::new(vec!["iterable"], None, None, 0, 1),
             )
         },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "all",
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "all",
+                builtin_all,
+                1,
+                crate::gateway::Signature::new(vec!["iterable"], None, None, 0, 1),
+            )
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "sum",
+        || {
+        // `sum(iterable, /, start=0)` — interp body, Signature bind.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "sum",
+            builtin_sum,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["iterable", "start"], None, None, 0, 1),
+        )
+    },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "round",
+        || {
+        // `operation.round(space, w_number, w_ndigits=None)` — both
+        // positional-or-keyword; Signature bind.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "round",
+            builtin_round,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["number", "ndigits"], None, None, 0, 0),
+        )
+    },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "divmod",
+        || {
+        // operation.py `divmod(space, w_x, w_y)` — two positional-only
+        // arguments, so any keyword is rejected with "takes no keyword
+        // arguments".
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "divmod",
+            __majit_wrap_builtin_divmod,
+            2,
+            crate::gateway::Signature::new(vec!["x", "y"], None, None, 0, 2),
+        )
+    },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "pow",
-        || make_module_builtin_function("pow", __majit_wrap_builtin_pow),
+        || {
+        // `operation.pow(space, w_base, w_exp, w_mod)` with omitted
+        // modulus as `WrappedDefault(None)`; Signature bind.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "pow",
+            __majit_wrap_builtin_pow,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["base", "exp", "mod"], None, None, 0, 0),
+        )
+    },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "hex",
-        || make_module_builtin_function("hex", builtin_hex),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "hex",
+                builtin_hex,
+                1,
+                crate::gateway::Signature::new(vec!["number"], None, None, 0, 1),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "oct",
-        || make_module_builtin_function("oct", builtin_oct),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "oct",
+                builtin_oct,
+                1,
+                crate::gateway::Signature::new(vec!["number"], None, None, 0, 1),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "bin",
-        || make_module_builtin_function("bin", builtin_bin),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "bin",
+                builtin_bin,
+                1,
+                crate::gateway::Signature::new(vec!["number"], None, None, 0, 1),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "format",
-        || make_module_builtin_function("format", builtin_format),
+        || {
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "format",
+                builtin_format,
+                crate::HOPELESS,
+                crate::gateway::Signature::new(vec!["value", "format_spec"], None, None, 0, 2),
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "issubclass",
-        || make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2),
+        || {
+        make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
+    },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__import__",
         || {
-            // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
-            // `baseobjspace.py` keeps that same object as
-            // `space.w_default_importlib_import`.
-            let w_import =
-                make_module_builtin_function("__import__", __majit_wrap_builtin_dunder_import);
-            crate::importing::set_default_importlib_import(w_import);
-            w_import
-        },
+        // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
+        // `baseobjspace.py` keeps that same object as
+        // `space.w_default_importlib_import`.
+        let w_import =
+            make_module_builtin_function("__import__", __majit_wrap_builtin_dunder_import);
+        crate::importing::set_default_importlib_import(w_import);
+        w_import
+    },
     );
 
     // Descriptor types
@@ -4793,20 +5007,8 @@ fn input_write_prompt(stdout: PyObjectRef, prompt: PyObjectRef) -> Result<(), cr
 /// flush stderr, write and flush the prompt, call `stdin.readline()`, then
 /// strip one trailing newline.
 fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "input() takes no keyword arguments",
-        ));
-    }
-    if pos.len() > 1 {
-        return Err(crate::PyError::type_error(format!(
-            "input expected at most 1 argument, got {}",
-            pos.len()
-        )));
-    }
-
-    let prompt_arg = pos.first().copied();
+    // Bound scope from `parse_obj`: `prompt` (`PY_NULL` omitted).
+    let prompt_arg = args.first().copied().filter(|w| !w.is_null());
     let prompt = prompt_arg.unwrap_or_else(|| pyre_object::w_str_new(""));
 
     let _roots = pyre_object::gc_roots::push_roots();
@@ -4997,80 +5199,57 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
+pub(crate) fn bound_starargs(args: &[PyObjectRef], index: usize) -> Vec<PyObjectRef> {
+    args.get(index)
+        .copied()
+        .filter(|value| !value.is_null())
+        .map(|tuple| unsafe { pyre_object::w_tuple_items_copy_as_vec(tuple) })
+        .unwrap_or_default()
+}
+
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch).
-    // Distinguished from regular dict args by __pyre_kw__ marker key.
-    let n_args = args.len();
-    let is_kwargs = n_args != 0
-        && unsafe {
-            let last = *args.last().unwrap();
-            is_dict(last)
-                && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-        };
-    // Filled only when `flush`'s truth test collects; the positional slice is
-    // then this copy rather than `args`.
-    let mut positional_buf: Vec<PyObjectRef> = Vec::new();
-    let (positional, end, sep, file, flush) = if is_kwargs {
-        let kwargs = *args.last().unwrap();
-        // app_io.py print_ — the app-level signature is
-        // `(*args, sep, end, file, flush)`, so any other keyword is an
-        // unexpected-keyword TypeError.
-        for (k, _) in unsafe { pyre_object::w_dict_items(kwargs) } {
-            let name = unsafe { pyre_object::w_str_get_wtf8(k) };
-            match name.as_str() {
-                Ok("__pyre_kw__") | Ok("sep") | Ok("end") | Ok("file") | Ok("flush") => {}
-                _ => {
-                    return Err(crate::PyError::type_error(format!(
-                        "print() got an unexpected keyword argument '{name}'"
-                    )));
-                }
-            }
-        }
-        let end_val = unsafe { pyre_object::w_dict_getitem_str(kwargs, "end") };
-        let sep_val = unsafe { pyre_object::w_dict_getitem_str(kwargs, "sep") };
-        // The type check is up front; the str() rendering happens at write
-        // time so a raising `__str__` leaves the preceding output in place.
-        let mut end_obj = print_sep_check(end_val, "end")?;
-        let mut sep_obj = print_sep_check(sep_val, "sep")?;
-        // `file=None` (or absent) uses the native stdout path; any other
-        // object is written through its `write` / `flush` methods.
-        let mut file_obj = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "file") } {
-            Some(f) if !unsafe { pyre_object::is_none(f) } => Some(f),
-            _ => None,
-        };
-        let flush = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "flush") } {
-            Some(f) => {
-                let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[
-                    end_obj.unwrap_or(pyre_object::PY_NULL),
-                    sep_obj.unwrap_or(pyre_object::PY_NULL),
-                    file_obj.unwrap_or(pyre_object::PY_NULL),
-                ]);
-                let pinned_args = args.to_vec();
-                let args_base = roots.pin_roots(&pinned_args);
-                let r = crate::baseobjspace::is_true(f);
-                let w = roots.get(base);
-                end_obj = if w.is_null() { None } else { Some(w) };
-                let w = roots.get(base + 1);
-                sep_obj = if w.is_null() { None } else { Some(w) };
-                let w = roots.get(base + 2);
-                file_obj = if w.is_null() { None } else { Some(w) };
-                positional_buf = vec![pyre_object::PY_NULL; n_args - 1];
-                pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut positional_buf);
-                drop(roots);
-                r?
-            }
-            None => {
-                positional_buf = args[..n_args - 1].to_vec();
-                false
-            }
-        };
-        let positional: &[PyObjectRef] = &positional_buf;
-        (positional, end_obj, sep_obj, file_obj, flush)
-    } else {
-        (args, None, None, None, false)
+    // Bound scope: sep, end, file, flush, *args. app_io.py print_.
+    let sep_val = args.get(0).copied().filter(|value| !value.is_null());
+    let end_val = args.get(1).copied().filter(|value| !value.is_null());
+    let file_val = args.get(2).copied().filter(|value| !value.is_null());
+    let flush_val = args.get(3).copied().filter(|value| !value.is_null());
+    let mut positional_buf = bound_starargs(args, 4);
+    // The type check is up front; the str() rendering happens at write
+    // time so a raising `__str__` leaves the preceding output in place.
+    let mut end_obj = print_sep_check(end_val, "end")?;
+    let mut sep_obj = print_sep_check(sep_val, "sep")?;
+    // `file=None` (or absent) uses the native stdout path; any other
+    // object is written through its `write` / `flush` methods.
+    let mut file_obj = match file_val {
+        Some(f) if !unsafe { pyre_object::is_none(f) } => Some(f),
+        _ => None,
     };
+    let flush = match flush_val {
+        Some(f) => {
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.pin_roots(&[
+                end_obj.unwrap_or(pyre_object::PY_NULL),
+                sep_obj.unwrap_or(pyre_object::PY_NULL),
+                file_obj.unwrap_or(pyre_object::PY_NULL),
+            ]);
+            let args_base = roots.pin_roots(&positional_buf);
+            let r = crate::baseobjspace::is_true(f);
+            let w = roots.get(base);
+            end_obj = if w.is_null() { None } else { Some(w) };
+            let w = roots.get(base + 1);
+            sep_obj = if w.is_null() { None } else { Some(w) };
+            let w = roots.get(base + 2);
+            file_obj = if w.is_null() { None } else { Some(w) };
+            let n = positional_buf.len();
+            positional_buf = vec![pyre_object::PY_NULL; n];
+            pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut positional_buf);
+            drop(roots);
+            r?
+        }
+        None => false,
+    };
+    let positional: &[PyObjectRef] = &positional_buf;
+    let (end, sep, file, flush) = (end_obj, sep_obj, file_obj, flush);
 
     // The values to print need the same treatment as the sink below, and they
     // need it first: `resolve_default_print_target` reaches `sys.stdout`
@@ -13295,39 +13474,32 @@ pub fn is_build_class_builtin(obj: PyObjectRef) -> bool {
 
 /// `str(obj)` → convert to string
 pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["object", "encoding", "errors"], "str")?;
-    let kw_count = kwargs
-        .map(|dict| unsafe {
-            pyre_object::w_dict_str_entries_wtf8(dict)
-                .iter()
-                .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
-                .count()
-        })
-        .unwrap_or(0);
-    let arg_count = pos.len() + kw_count;
-    if pos.len() > 3 {
+    // Bound scope from `parse_obj` on `str.__new__`: `object`, `encoding`,
+    // `errors` (`PY_NULL` omitted). unicodeobject.py `descr_new`.
+    if args.len() > 3 {
         return Err(crate::PyError::type_error(format!(
             "str expected at most 3 arguments, got {}",
-            pos.len()
-        )));
-    }
-    if arg_count > 3 {
-        return Err(crate::PyError::type_error(format!(
-            "str() takes at most 3 arguments ({} given)",
-            arg_count
+            args.len()
         )));
     }
     // `str(object='', encoding='utf-8', errors='strict')` — every parameter
-    // is positional-or-keyword (unicodeobject.py:descr_new).  An absent
-    // `object` yields the empty string; an encoding/errors of None counts as
-    // "not given".
-    let mut obj = match resolve_pos_or_kw(pos.first().copied(), kwargs, "object", "str", 1)? {
-        Some(o) => o,
-        None => return Ok(w_str_new("")),
+    // is positional-or-keyword.  An absent `object` yields the empty string;
+    // an encoding/errors of None counts as "not given".
+    let mut obj = if args.is_empty() || args[0].is_null() {
+        return Ok(w_str_new(""));
+    } else {
+        args[0]
     };
-    let w_encoding = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "encoding", "str", 2)?;
-    let w_errors = resolve_pos_or_kw(pos.get(2).copied(), kwargs, "errors", "str", 3)?;
+    let w_encoding = if args.len() > 1 && !args[1].is_null() {
+        Some(args[1])
+    } else {
+        None
+    };
+    let w_errors = if args.len() > 2 && !args[2].is_null() {
+        Some(args[2])
+    } else {
+        None
+    };
     // `_get_encoding_and_errors` — a *supplied* encoding/errors must be a
     // str; an explicit `None` is supplied (not "omitted") and so is
     // rejected.  Encoding is validated before errors.
@@ -13586,31 +13758,27 @@ pub fn call_and_check(
 
 /// intobject.py _new_baseint
 pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `int(x=0, base=10)` — `x` is positional-only (a `base` keyword is the
-    // only one accepted), `base` is positional-or-keyword at position 2
-    // (intobject.py descr_new).
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    // `descr_new(space, w_inttype, w_x, __posonly__, w_base=None)` has two
-    // user-visible slots.  PyPy's gateway rejects surplus positionals while
-    // binding that signature, before `_new_int` runs; pyre's flat builtin
-    // ABI must perform the same gateway check explicitly.
-    if pos.len() > 2 {
+    // Bound scope from `parse_obj` on `int.__new__`: `x`, `base`
+    // (`PY_NULL` omitted). intobject.py `descr_new`.
+    if args.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "int expected at most 2 arguments, got {}",
-            pos.len()
+            args.len()
         )));
     }
-    kwarg_reject_unknown(kwargs, &["base"], "int")?;
-    let w_base = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "base", "int", 2)?;
-    let mut obj = match pos.first().copied() {
-        Some(o) => o,
-        None => {
-            // intobject.py:986 — a base without a value is a missing source.
-            if w_base.is_some() {
-                return Err(crate::PyError::type_error("int() missing string argument"));
-            }
-            return Ok(w_int_new(0));
+    let w_base = if args.len() > 1 && !args[1].is_null() {
+        Some(args[1])
+    } else {
+        None
+    };
+    let mut obj = if args.is_empty() || args[0].is_null() {
+        // intobject.py descr_new — a base without a value is a missing source.
+        if w_base.is_some() {
+            return Err(crate::PyError::type_error("int() missing string argument"));
         }
+        return Ok(w_int_new(0));
+    } else {
+        args[0]
     };
 
     if w_base.is_none() {
@@ -14292,23 +14460,17 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `getattr(obj, name[, default])` → value — direct call
 fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "getattr() takes no keyword arguments",
-        ));
-    }
-    // `getattr(object, name[, default])`: two or three app-level arguments.
-    if args.len() < 2 {
+    // Bound scope from `parse_obj`: `object`, `name`, `default` (`PY_NULL`
+    // omitted). Positional-only.
+    let given = args.iter().take(3).filter(|w| !w.is_null()).count() + args.len().saturating_sub(3);
+    if args.len() < 2 || args[0].is_null() || args[1].is_null() {
         return Err(crate::PyError::type_error(format!(
-            "getattr expected at least 2 arguments, got {}",
-            args.len()
+            "getattr expected at least 2 arguments, got {given}"
         )));
     }
     if args.len() > 3 {
         return Err(crate::PyError::type_error(format!(
-            "getattr expected at most 3 arguments, got {}",
-            args.len()
+            "getattr expected at most 3 arguments, got {given}"
         )));
     }
     let obj = args[0];
@@ -14317,7 +14479,7 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // was supplied AND the error is an AttributeError; other errors (and the
     // no-default case) propagate.  With a default the error never surfaces,
     // so that arm runs suppressed (`_PyObject_LookupAttr`).
-    if args.len() > 2 {
+    if args.len() > 2 && !args[2].is_null() {
         // `args` is a native slice the gateway copied out of its own root
         // slots: the pin keeps the default alive, but nothing rewrites this
         // copy, and `lookup_attr` runs Python (`__getattr__`,
@@ -14382,15 +14544,9 @@ fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `tuple.__new__` is positional-only, so any keyword is a TypeError
-    // (an empty `**{}` is not a keyword and is allowed).
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "tuple() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // `tuple.__new__` is positional-only; keywords are refused at the
+    // Signature bind. An empty iterable yields `()`.
+    if args.is_empty() || args[0].is_null() {
         return Ok(w_tuple_new(vec![]));
     }
     let obj = args[0];
@@ -14430,15 +14586,9 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `list.__new__` is positional-only, so any keyword is a TypeError
-    // (an empty `**{}` is not a keyword and is allowed).
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "list() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // `list.__new__` is positional-only; keywords are refused at the
+    // Signature bind. An empty iterable yields `[]`.
+    if args.is_empty() || args[0].is_null() {
         return Ok(w_list_new(vec![]));
     }
     // CPython `list_vectorcall_impl` allocates an empty list then delegates to
@@ -15064,44 +15214,27 @@ static __majit_wrap_iter_self_target: crate::gateway::BuiltinWrapperDescriptor =
 /// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
 /// `module/__builtin__/operation.py` iter
 fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `iter` is a keyword-rejecting builtin; a `sentinel` is only ever
-    // positional (`iter(callable, sentinel)`).  Strip the kwargs marker so a
-    // keyword call raises instead of consuming the marker dict as an argument.
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "iter() takes no keyword arguments",
-        ));
-    }
-    match positional.len() {
-        0 => Err(crate::PyError::type_error(
+    // Bound scope from `parse_obj`: `object`, `sentinel` (`PY_NULL` omitted).
+    let object = args.first().copied().filter(|w| !w.is_null());
+    let sentinel = args.get(1).copied().filter(|w| !w.is_null());
+    match (object, sentinel) {
+        (None, _) => Err(crate::PyError::type_error(
             "iter expected at least 1 argument, got 0",
         )),
-        1 => crate::baseobjspace::iter(positional[0]),
-        2 => {
-            if !crate::baseobjspace::callable_w(positional[0]) {
+        (Some(obj), None) => crate::baseobjspace::iter(obj),
+        (Some(obj), Some(sent)) => {
+            if !crate::baseobjspace::callable_w(obj) {
                 return Err(crate::PyError::type_error("iter(v, w): v must be callable"));
             }
-            Ok(pyre_object::operation::w_callable_iterator_new(
-                positional[0],
-                positional[1],
-            ))
+            Ok(pyre_object::operation::w_callable_iterator_new(obj, sent))
         }
-        n => Err(crate::PyError::type_error(format!(
-            "iter expected at most 2 arguments, got {n}"
-        ))),
     }
 }
 
 /// `next(iterator[, default])` — PyPy: baseobjspace.py next
 fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "next() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // Bound scope from `parse_obj`: `iterator`, `default` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(
             "next expected at least 1 argument, got 0",
         ));
@@ -15112,7 +15245,7 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    if args.len() > 1 {
+    if args.len() > 1 && !args[1].is_null() {
         // The iterator body runs Python between the gateway's pin and this
         // return, and `args` is a native copy nothing rewrites when a list or
         // dict default is moved -- see `builtin_getattr`.  Keep the
@@ -18686,57 +18819,67 @@ pub(crate) fn replace_compile_syntax_error_filename(
 }
 
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `compile(source, filename, mode, flags=0, dont_inherit=False,
-    // optimize=-1, *, _feature_version=-1)`: the three required parameters and
-    // flags/dont_inherit/optimize are positional-or-keyword; _feature_version
-    // is keyword-only.  PyCF_ONLY_AST follows PyPy's compile_to_ast boundary.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let source = bind_pos_or_kw(pos, kwargs, 0, "source", "compile", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("compile() missing required argument 'source' (pos 1)")
-    })?;
-    let filename_obj =
-        bind_pos_or_kw(pos, kwargs, 1, "filename", "compile", 2)?.ok_or_else(|| {
+    // Bound scope from `parse_obj`: `source`, `filename`, `mode`, `flags`,
+    // `dont_inherit`, `optimize`, kw-only `_feature_version` (`PY_NULL` omitted).
+    // PyCF_ONLY_AST follows PyPy's compile_to_ast boundary.
+    let source = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error("compile() missing required argument 'source' (pos 1)")
+        })?;
+    let filename_obj = args
+        .get(1)
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
             crate::PyError::type_error("compile() missing required argument 'filename' (pos 2)")
         })?;
-    let mode_obj = bind_pos_or_kw(pos, kwargs, 2, "mode", "compile", 3)?.ok_or_else(|| {
-        crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
-    })?;
-    // Every declared slot binds before the unrecognized keywords are
-    // reported, so a call missing a required argument names that argument.
-    kwarg_reject_unknown(
-        kwargs,
-        &[
-            "source",
-            "filename",
-            "mode",
-            "flags",
-            "dont_inherit",
-            "optimize",
-            "_feature_version",
-        ],
-        "compile",
-    )?;
+    let mode_obj = args
+        .get(2)
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
+        })?;
+    let flags_obj = args
+        .get(3)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let dont_inherit_obj = args
+        .get(4)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let optimize_obj = args
+        .get(5)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let feature_obj = args
+        .get(6)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
     // compiling.py compile: `space.isinstance_w(w_source, W_AST)` and
     // `source_as_str` run after fsencode / gettypeobject / encode, all of
     // which collect. `w_source` is a gateway local; gct_fv_gc_malloc reloads
     // it. The native path imports `_ast` for the same type probe, which is
-    // another collection, so pin source / filename / mode from here.
-    let n_pos = pos.len();
+    // another collection, so pin the bound slots from here.
     let _compile_roots = pyre_object::gc_roots::push_roots();
     let compile_base = pyre_object::gc_roots::publish_roots(&[
         source,
         filename_obj,
         mode_obj,
-        kwargs.unwrap_or(pyre_object::PY_NULL),
+        flags_obj,
+        dont_inherit_obj,
+        optimize_obj,
+        feature_obj,
     ]);
-    let pos_base = pyre_object::gc_roots::publish_roots(pos);
-    pyre_object::gc_roots::normalize_roots(compile_base, 4 + n_pos);
+    pyre_object::gc_roots::normalize_roots(compile_base, 7);
     let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(compile_base + i);
-    let mut pos_buf = vec![pyre_object::PY_NULL; n_pos];
-    let kwargs = || {
-        let w = reload(3);
-        if w.is_null() { None } else { Some(w) }
-    };
     // `compiling.py:12-13 unwrap_spec(filename='fsencode', mode='text')`.
     let filename_bytes = crate::gateway::fsencode_bytes_w(reload(1))?;
     // The code object spells its filename as `newfilename` does
@@ -18749,37 +18892,35 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let filename_text = crate::gateway::fsdecode_filename_wtf8(&filename_bytes);
     let (filename, filename_bytes) = crate::pycode::split_code_filename_bytes(filename_bytes, None);
     let mode = crate::baseobjspace::text_w(reload(2))?;
-    // flags / optimize are positional-or-keyword ints.
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mut flags = match bind_pos_or_kw(&pos_buf, kwargs(), 3, "flags", "compile", 4)? {
-        Some(v) => crate::baseobjspace::gateway_int_w(v)?,
-        None => 0,
+    let mut flags = if reload(3).is_null() {
+        0
+    } else {
+        crate::baseobjspace::gateway_int_w(reload(3))?
     };
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let dont_inherit = match bind_pos_or_kw(&pos_buf, kwargs(), 4, "dont_inherit", "compile", 5)? {
-        // [3.14-spec] PyPy's unwrap_spec still requires an integer here, but
-        // CPython `builtin_compile_impl` accepts any truth-testable object.
-        // `test_compile_filename_refleak` makes the difference observable with
-        // a __bool__ that raises ValueError.  The surrounding flag merge and
-        // compiler ownership remain PyPy's `compiling.py:compile` path.
-        Some(v) => crate::baseobjspace::is_true(v)?,
-        None => false,
+    // [3.14-spec] PyPy's unwrap_spec still requires an integer here, but
+    // CPython `builtin_compile_impl` accepts any truth-testable object.
+    // `test_compile_filename_refleak` makes the difference observable with
+    // a __bool__ that raises ValueError.  The surrounding flag merge and
+    // compiler ownership remain PyPy's `compiling.py:compile` path.
+    let dont_inherit = if reload(4).is_null() {
+        false
+    } else {
+        crate::baseobjspace::is_true(reload(4))?
     };
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mut optimize = match bind_pos_or_kw(&pos_buf, kwargs(), 5, "optimize", "compile", 6)? {
-        Some(v) => crate::baseobjspace::gateway_int_w(v)?,
-        None => -1,
+    let mut optimize = if reload(5).is_null() {
+        -1
+    } else {
+        crate::baseobjspace::gateway_int_w(reload(5))?
     };
     // PyPy `PythonAstCompiler.compile_to_ast` passes this keyword-only value
     // through `CompileInfo.feature_version` to the parser.
-    let feature_version = match kwarg_get(kwargs(), "_feature_version") {
-        Some(value) => {
-            let value = crate::baseobjspace::gateway_int_w(value)?;
-            i64::from(i32::try_from(value).map_err(|_| {
-                crate::PyError::overflow_error("Python int too large to convert to C int")
-            })?)
-        }
-        None => -1,
+    let feature_version = if reload(6).is_null() {
+        -1
+    } else {
+        let value = crate::baseobjspace::gateway_int_w(reload(6))?;
+        i64::from(i32::try_from(value).map_err(|_| {
+            crate::PyError::overflow_error("Python int too large to convert to C int")
+        })?)
     };
 
     // Any bit outside the recognised compilation-flag set is rejected.
@@ -19026,38 +19167,17 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// them into `DictStorage`s before invocation and copies the post-run
 /// namespace contents back so that callers see the new bindings.
 pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `exec(source, /, globals=None, locals=None, *, closure=None)`: source is
-    // positional-only; globals/locals are positional-or-keyword; `closure` is
-    // keyword-only.  `closure` supplies the cell objects that bind a code
-    // object's free variables (bltinmodule.c builtin_exec_impl); a None
-    // closure normalises to "absent" (PY_NULL).
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    // The positional-only `source` is bound before the unrecognized keywords
-    // are reported, so a keywords-only call is reported against `source`.
-    if pos.is_empty() {
-        return Err(crate::PyError::type_error(
-            "exec() takes at least 1 positional argument (0 given)",
-        ));
-    }
-    if pos.len() > 3 {
-        // A fourth positional is refused for landing on the keyword-only
-        // `closure`; past that the count exceeds the four parameters the
-        // signature has at all, and the total is what gets reported.
-        let message = if pos.len() == 4 {
-            "exec() takes at most 3 positional arguments (4 given)".to_string()
-        } else {
-            format!("exec() takes at most 4 arguments ({} given)", pos.len())
-        };
-        return Err(crate::PyError::type_error(message));
-    }
-    kwarg_reject_unknown(kwargs, &["globals", "locals", "closure"], "exec")?;
-    let source = pos[0];
-    let globals_arg =
-        bind_pos_or_kw(pos, kwargs, 1, "globals", "exec", 2)?.unwrap_or(pyre_object::PY_NULL);
-    let locals_arg =
-        bind_pos_or_kw(pos, kwargs, 2, "locals", "exec", 3)?.unwrap_or(pyre_object::PY_NULL);
-    // `if closure is None: closure = NULL` — treat None as unset.
-    let closure = match kwarg_get(kwargs, "closure") {
+    // Bound scope: pos-only `source`, `globals`/`locals`, kw-only `closure`
+    // (`PY_NULL` omitted).  `closure` supplies the cell objects that bind a
+    // code object's free variables; a None closure normalises to "absent"
+    // (PY_NULL).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let source = bound(0).ok_or_else(|| {
+        crate::PyError::type_error("exec() takes at least 1 positional argument (0 given)")
+    })?;
+    let globals_arg = bound(1).unwrap_or(pyre_object::PY_NULL);
+    let locals_arg = bound(2).unwrap_or(pyre_object::PY_NULL);
+    let closure = match bound(3) {
         Some(c) if !unsafe { pyre_object::is_none(c) } => c,
         _ => pyre_object::PY_NULL,
     };
@@ -19067,28 +19187,23 @@ pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `eval(source_or_code, globals=None, locals=None)` — same plumbing as
 /// exec but returns the value of the expression.
 fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `eval(source, /, globals=None, locals=None)`: source is positional-only;
-    // globals/locals are positional-or-keyword.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    // The positional-only `source` is bound before the unrecognized keywords
-    // are reported, so a keywords-only call is reported against `source`.
-    if pos.is_empty() {
+    // Bound scope: `source` (pos-only), `globals`, `locals` (`PY_NULL` omitted).
+    if args.first().copied().is_none_or(|o| o.is_null()) {
         return Err(crate::PyError::type_error(
             "eval() takes at least 1 positional argument (0 given)",
         ));
     }
-    if pos.len() > 3 {
-        return Err(crate::PyError::type_error(format!(
-            "eval() takes at most 3 arguments ({} given)",
-            pos.len()
-        )));
-    }
-    kwarg_reject_unknown(kwargs, &["globals", "locals"], "eval")?;
-    let source = pos[0];
-    let globals_arg =
-        bind_pos_or_kw(pos, kwargs, 1, "globals", "eval", 2)?.unwrap_or(pyre_object::PY_NULL);
-    let locals_arg =
-        bind_pos_or_kw(pos, kwargs, 2, "locals", "eval", 3)?.unwrap_or(pyre_object::PY_NULL);
+    let source = args[0];
+    let globals_arg = args
+        .get(1)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let locals_arg = args
+        .get(2)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
     // eval() has no closure parameter — pass "absent".
     exec_or_eval(source, globals_arg, locals_arg, true, pyre_object::PY_NULL)
 }
@@ -19734,19 +19849,14 @@ crate::builtin_wrapper_descriptor!(
 );
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "vars() takes no keyword arguments",
-        ));
+    // Bound scope from `parse_obj`: `object` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
+        return builtin_locals(&[]);
     }
-    if args.is_empty() {
-        return builtin_locals(args);
-    }
-    if args.len() != 1 {
+    if args.len() > 1 && args[1..].iter().any(|w| !w.is_null()) {
         return Err(crate::PyError::type_error(format!(
             "vars expected at most 1 argument, got {}",
-            args.len()
+            args.iter().filter(|w| !w.is_null()).count()
         )));
     }
     // app_inspect.py:21-24 — the attribute lookup itself decides whether the
@@ -19971,13 +20081,8 @@ pub extern "C" fn jit_dir_names_from_locals(mapping: PyObjectRef) -> PyObjectRef
 /// With argument: sorted list of attribute names from obj.__dict__ plus
 /// type MRO. Modules expose their namespace via w_module_get_namespace.
 pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "dir() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // Bound scope from `parse_obj`: `object` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
         // `bltinmodule.c builtin_dir` — with no argument, list the names in
         // the caller's local scope: `sorted(frame.f_locals)`.  Resolve the
         // frame exactly as `locals()` does, then return the mapping's sorted
@@ -19995,10 +20100,10 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
         return dir_names_from_locals_mapping(w_locals_dict);
     }
-    if args.len() > 1 {
+    if args.len() > 1 && args[1..].iter().any(|w| !w.is_null()) {
         return Err(crate::PyError::type_error(format!(
             "dir expected at most 1 argument, got {}",
-            args.len()
+            args.iter().filter(|w| !w.is_null()).count()
         )));
     }
     let obj = args[0];
@@ -21325,16 +21430,10 @@ pub(crate) fn builtin_filter(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "filter() takes no keyword arguments",
-        ));
-    }
-    if args.len() != 2 {
+    let given = args.iter().filter(|w| !w.is_null()).count();
+    if given != 2 || args.len() < 2 || args[0].is_null() || args[1].is_null() {
         return Err(crate::PyError::type_error(format!(
-            "filter expected 2 arguments, got {}",
-            args.len()
+            "filter expected 2 arguments, got {given}"
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
@@ -21372,9 +21471,15 @@ pub(crate) fn builtin_map(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["strict"], "map")?;
-    if args.len() < 2 {
+    // Bound tail after `cls`: func, strict, *iterables.
+    let Some(w_func) = args.first().copied().filter(|value| !value.is_null()) else {
+        return Err(crate::PyError::type_error(
+            "map() must have at least two arguments.",
+        ));
+    };
+    let w_strict = args.get(1).copied().filter(|value| !value.is_null());
+    let iterables = bound_starargs(args, 2);
+    if iterables.is_empty() {
         return Err(crate::PyError::type_error(
             "map() must have at least two arguments.",
         ));
@@ -21383,13 +21488,13 @@ pub(crate) fn builtin_map(
     // PyPy's `args_w` and `build_iterators_from_args` keep every argument live
     // while `space.iter` and the Python 3.14 `strict` truth conversion execute.
     let _roots = pyre_object::gc_roots::push_roots();
-    let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype]);
-    let args_base = pyre_object::gc_roots::publish_roots(args);
-    let w_strict = kwarg_get(kwargs, "strict");
+    let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype, w_func]);
+    let func_slot = subtype_slot + 1;
+    let args_base = pyre_object::gc_roots::publish_roots(&iterables);
     let strict_slot = w_strict.map(|value| pyre_object::gc_roots::publish_roots(&[value]));
     pyre_object::gc_roots::normalize_roots(
-        args_base,
-        args.len() + usize::from(strict_slot.is_some()),
+        subtype_slot,
+        2 + iterables.len() + usize::from(strict_slot.is_some()),
     );
     let strict = strict_slot
         .map(|slot| {
@@ -21399,8 +21504,8 @@ pub(crate) fn builtin_map(
         .unwrap_or(false);
 
     // `functional.py build_iterators_from_args` — `iter()` each input.
-    let mut iter_slots = Vec::with_capacity(args.len() - 1);
-    for index in 1..args.len() {
+    let mut iter_slots = Vec::with_capacity(iterables.len());
+    for index in 0..iterables.len() {
         let w_iter = crate::baseobjspace::iter(unsafe {
             pyre_object::gc_roots::shadow_stack_get(args_base + index)
         })?;
@@ -21416,7 +21521,7 @@ pub(crate) fn builtin_map(
     let _ = pyre_object::gc_roots::pin_root(w_iterators);
     let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::functional::w_map_new(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(args_base) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(func_slot) },
         unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_slot) },
         strict,
         pyre_object::gc_roots::shadow_stack_get(subtype_slot),
@@ -21431,22 +21536,16 @@ pub(crate) fn builtin_zip(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // Pyre's flat builtin ABI surfaces kwargs as a trailing dict; strip it
-    // before the positional walk and look up `strict` from it.
-    let (args, kwargs) = split_builtin_kwargs(args);
-    // `zip_new` parses its keywords with `PyArg_ParseTupleAndKeywords(empty,
-    // kwds, "|$p:zip", ...)`, so the keyword *count* is checked against the
-    // single `strict` slot before any name is looked at.
-    clinic_arity("zip", 0, real_kwarg_count(kwargs), 0, 0, 1)?;
-    kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
+    // Bound tail after `cls`: strict, *iterables.
+    let w_strict = args.first().copied().filter(|value| !value.is_null());
+    let iterables = bound_starargs(args, 1);
     let _roots = pyre_object::gc_roots::push_roots();
     let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype]);
-    let args_base = pyre_object::gc_roots::publish_roots(args);
-    let strict_slot =
-        kwarg_get(kwargs, "strict").map(|value| pyre_object::gc_roots::publish_roots(&[value]));
+    let args_base = pyre_object::gc_roots::publish_roots(&iterables);
+    let strict_slot = w_strict.map(|value| pyre_object::gc_roots::publish_roots(&[value]));
     pyre_object::gc_roots::normalize_roots(
-        args_base,
-        args.len() + usize::from(strict_slot.is_some()),
+        subtype_slot,
+        1 + iterables.len() + usize::from(strict_slot.is_some()),
     );
     let strict = strict_slot
         .map(|slot| {
@@ -21455,8 +21554,8 @@ pub(crate) fn builtin_zip(
         .transpose()?
         .unwrap_or(false);
     // `functional.py build_iterators_from_args` — `iter()` each input.
-    let mut iter_slots = Vec::with_capacity(args.len());
-    for index in 0..args.len() {
+    let mut iter_slots = Vec::with_capacity(iterables.len());
+    for index in 0..iterables.len() {
         let w_iter = crate::baseobjspace::iter(unsafe {
             pyre_object::gc_roots::shadow_stack_get(args_base + index)
         })?;
@@ -21489,47 +21588,15 @@ pub(crate) fn builtin_enumerate(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    if positional.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "enumerate() takes at most 2 arguments ({} given)",
-            positional.len()
-        )));
-    }
-    // `iterable` and `start` are the only accepted keywords; an unknown one is
-    // reported with the vectorcall-style "invalid keyword argument" message.
-    if let Some(dict) = kwargs {
-        for (key, _) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }.iter() {
-            let k = key.as_str().unwrap_or("");
-            if k == "__pyre_kw__" || k == "iterable" || k == "start" {
-                continue;
-            }
-            return Err(crate::PyError::type_error(format!(
-                "'{key}' is an invalid keyword argument for enumerate()"
-            )));
-        }
-    }
-    // `iterable` is positional-or-keyword; once filled positionally a stray
-    // `iterable=` keyword is rejected as invalid rather than "multiple values".
-    let source = if !positional.is_empty() {
-        if kwarg_get(kwargs, "iterable").is_some() {
-            return Err(crate::PyError::type_error(
-                "'iterable' is an invalid keyword argument for enumerate()",
-            ));
-        }
-        positional[0]
-    } else if let Some(iterable) = kwarg_get(kwargs, "iterable") {
-        iterable
-    } else {
-        return Err(crate::PyError::type_error(
-            "enumerate() missing required argument 'iterable'",
-        ));
-    };
-    let start_obj = if positional.len() > 1 {
-        Some(positional[1])
-    } else {
-        kwarg_get(kwargs, "start")
-    };
+    // Bound scope from `enumerate.__new__`: `iterable`, `start` (`PY_NULL` omitted).
+    let source = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error("enumerate() missing required argument 'iterable'")
+        })?;
+    let start_obj = args.get(1).copied().filter(|o| !o.is_null());
     // The constructor can execute user `__index__` and allocate. Keep both
     // arguments in the shadow stack exactly as the translated RPython locals
     // remain GC-visible across `space.index` / `space.iter`.
@@ -21597,16 +21664,10 @@ pub(crate) fn builtin_reversed(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "reversed() takes no keyword arguments",
-        ));
-    }
-    if args.len() != 1 {
+    let given = args.iter().filter(|w| !w.is_null()).count();
+    if given != 1 || args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(format!(
-            "reversed expected 1 argument, got {}",
-            args.len()
+            "reversed expected 1 argument, got {given}"
         )));
     }
     // `descr___new__2` can execute `__reversed__`, `__len__`, or allocate an
@@ -22196,12 +22257,7 @@ pub fn builtin_any_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_any(args)
 }
 fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "any() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     if positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "any() takes exactly one argument ({} given)",
@@ -22976,39 +23032,37 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// The existing file helpers keep their state in reserved instance slots; a
 /// FileIO instance uses the same slots but always exposes a binary raw stream.
 pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["file", "mode", "closefd", "opener"], "FileIO")?;
-    let n_pos = pos.len();
-    let has_kwargs = kwargs.is_some();
-    let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
-    let mut self_obj = pos
-        .first()
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("FileIO.__init__() missing self"))?;
+    // Bound scope: `self`, required `file`, optional `mode`/`closefd`/`opener`
+    // (`PY_NULL` omitted).
     let _arg_roots = pyre_object::gc_roots::push_roots();
-    let pos_base = pyre_object::gc_roots::publish_roots(pos);
-    let kwargs_slot = pyre_object::gc_roots::publish_roots(&[kwargs_word]);
-    let self_slot = pyre_object::gc_roots::publish_roots(&[self_obj]);
-    pyre_object::gc_roots::normalize_roots(pos_base, n_pos + 2);
-    self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
-    let mut pos_buf = vec![pyre_object::PY_NULL; n_pos];
-    let kwargs = || has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
+    let n = args.len();
+    let pos_base = pyre_object::gc_roots::pin_roots(args);
+    let bound = |i: usize| {
+        if i < n {
+            let w = pyre_object::gc_roots::shadow_stack_get(pos_base + i);
+            if w.is_null() { None } else { Some(w) }
+        } else {
+            None
+        }
+    };
+    let mut self_obj =
+        bound(0).ok_or_else(|| crate::PyError::type_error("FileIO.__init__() missing self"))?;
     // `_pyio.FileIO.__init__` invalidates the previous open-time snapshot
     // before doing anything that can reject the new arguments.  The fresh
     // snapshot is published only after the complete initialization succeeds.
     pyre_object::with_roots!(self_obj => fileio_clear_stat_atopen(self_obj));
+    self_obj = pyre_object::gc_roots::shadow_stack_get(pos_base);
     if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
         fileio.set_seekable_flag(-1);
     } else {
         pyre_object::with_roots!(self_obj =>
             crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", w_none())
         );
+        self_obj = pyre_object::gc_roots::shadow_stack_get(pos_base);
     }
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mut file = bind_pos_or_kw(&pos_buf, kwargs(), 1, "file", "FileIO", 1)?
+    let mut file = bound(1)
         .ok_or_else(|| crate::PyError::type_error("FileIO() missing required argument 'file'"))?;
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mode_obj = match bind_pos_or_kw(&pos_buf, kwargs(), 2, "mode", "FileIO", 2)? {
+    let mode_obj = match bound(2) {
         Some(mode) => mode,
         None => {
             let _mode_roots = pyre_object::gc_roots::push_roots();
@@ -23068,9 +23122,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         _ => unreachable!(),
     };
 
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mut closefd_obj = bind_pos_or_kw(&pos_buf, kwargs(), 3, "closefd", "FileIO", 3)?
-        .unwrap_or_else(|| w_bool_from(true));
+    let mut closefd_obj = bound(3).unwrap_or_else(|| w_bool_from(true));
     let closefd = pyre_object::with_roots!(closefd_obj, file, self_obj =>
         crate::baseobjspace::is_true(closefd_obj)
     )?;
@@ -23084,9 +23136,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "Cannot use closefd=False with file name",
         ));
     }
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let opener =
-        bind_pos_or_kw(&pos_buf, kwargs(), 4, "opener", "FileIO", 4)?.unwrap_or_else(w_none);
+    let opener = bound(4).unwrap_or_else(w_none);
     let _open_roots = pyre_object::gc_roots::push_roots();
     let file_slot = pyre_object::gc_roots::publish_roots(&[file, closefd_obj, opener]);
     let closefd_slot = file_slot + 1;
@@ -24930,45 +24980,26 @@ fn builtin_open_impl(
     args: &[PyObjectRef],
     allow_windows_console: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    // Every declared slot binds before the unrecognized keywords are
-    // reported, so a call missing `file` names `file`.
-    let file = bind_pos_or_kw(positional, kwargs, 0, "file", "open", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("open() missing required argument 'file' (pos 1)")
-    })?;
-    kwarg_reject_unknown(
-        kwargs,
-        &[
-            "file",
-            "mode",
-            "buffering",
-            "encoding",
-            "errors",
-            "newline",
-            "closefd",
-            "opener",
-        ],
-        "open",
-    )?;
-    // Bind every argument before unwrap-style conversions start.  A conversion
-    // can call Python and move objects, so the complete live argument set must
-    // already be on the shadow stack before the first such callback.
-    let npos = positional.len();
-    let has_kwargs = kwargs.is_some();
+    // Bound scope: `file`, `mode`, `buffering`, `encoding`, `errors`,
+    // `newline`, `closefd`, `opener` (`PY_NULL` omitted).
     let argument_roots = pyre_object::gc_roots::push_roots();
-    let file = pyre_object::gc_roots::pin_root(file);
-    let mut file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    // `str_utf8_w` can collect; the arguments still to bind are read back
-    // from their slots after it.
-    let positional_base = pyre_object::gc_roots::pin_roots(positional);
-    let kwargs_slot = pyre_object::gc_roots::pin_roots(&[kwargs.unwrap_or(PY_NULL)]);
-    let positional: Vec<PyObjectRef> = (0..npos)
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
-        .collect();
-    let positional = positional.as_slice();
-    let kwargs = has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
-    let w_mode =
-        bind_pos_or_kw(positional, kwargs, 1, "mode", "open", 2)?.unwrap_or_else(|| w_str_new("r"));
+    let n = args.len();
+    let base = argument_roots.pin_roots(args);
+    let bound = |i: usize| {
+        if i < n {
+            let w = pyre_object::gc_roots::shadow_stack_get(base + i);
+            if w.is_null() { None } else { Some(w) }
+        } else {
+            None
+        }
+    };
+    if bound(0).is_none() {
+        return Err(crate::PyError::type_error(
+            "open() missing required argument 'file' (pos 1)",
+        ));
+    }
+    let mut file_slot = base;
+    let w_mode = bound(1).unwrap_or_else(|| w_str_new("r"));
     if unsafe { !pyre_object::is_str(w_mode) } {
         return Err(crate::PyError::type_error(format!(
             "open() argument 'mode' must be str, not {}",
@@ -24976,23 +25007,12 @@ fn builtin_open_impl(
         )));
     }
     let mode = crate::baseobjspace::str_utf8_w(w_mode)?.to_string();
-    let positional: Vec<PyObjectRef> = (0..npos)
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
-        .collect();
-    let positional = positional.as_slice();
-    let kwargs = has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
-    let w_buffering = bind_pos_or_kw(positional, kwargs, 2, "buffering", "open", 3)?
-        .unwrap_or_else(|| w_int_new(-1));
-    let w_encoding =
-        bind_pos_or_kw(positional, kwargs, 3, "encoding", "open", 4)?.unwrap_or_else(w_none);
-    let w_errors =
-        bind_pos_or_kw(positional, kwargs, 4, "errors", "open", 5)?.unwrap_or_else(w_none);
-    let w_newline =
-        bind_pos_or_kw(positional, kwargs, 5, "newline", "open", 6)?.unwrap_or_else(w_none);
-    let w_closefd = bind_pos_or_kw(positional, kwargs, 6, "closefd", "open", 7)?
-        .unwrap_or_else(|| w_bool_from(true));
-    let w_opener =
-        bind_pos_or_kw(positional, kwargs, 7, "opener", "open", 8)?.unwrap_or_else(w_none);
+    let w_buffering = bound(2).unwrap_or_else(|| w_int_new(-1));
+    let w_encoding = bound(3).unwrap_or_else(w_none);
+    let w_errors = bound(4).unwrap_or_else(w_none);
+    let w_newline = bound(5).unwrap_or_else(w_none);
+    let w_closefd = bound(6).unwrap_or_else(|| w_bool_from(true));
+    let w_opener = bound(7).unwrap_or_else(w_none);
 
     for value in [
         w_buffering,
@@ -25343,38 +25363,18 @@ fn file_wrapper_store(slot: usize, name: &str, value: PyObjectRef) {
 /// assemble buffered or text layers; public `open()` below does that after it
 /// has constructed the real `_io.FileIO` object.
 fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Err(crate::PyError::type_error(
-            "open() missing required argument 'file' (pos 1)",
-        ));
-    }
-    let (open_pos, open_kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(
-        open_kwargs,
-        &[
-            "file",
-            "mode",
-            "buffering",
-            "encoding",
-            "errors",
-            "newline",
-            "closefd",
-            "opener",
-        ],
-        "open",
-    )?;
-    let mut path_obj =
-        resolve_pos_or_kw(open_pos.first().copied(), open_kwargs, "file", "open", 1)?.ok_or_else(
-            || crate::PyError::type_error("open() missing required argument 'file' (pos 1)"),
-        )?;
-    let mode_obj = resolve_pos_or_kw(open_pos.get(1).copied(), open_kwargs, "mode", "open", 2)?;
-    let encoding_obj =
-        resolve_pos_or_kw(open_pos.get(3).copied(), open_kwargs, "encoding", "open", 4)?;
-    let errors_obj = resolve_pos_or_kw(open_pos.get(4).copied(), open_kwargs, "errors", "open", 5)?;
-    let mut closefd_obj =
-        resolve_pos_or_kw(open_pos.get(6).copied(), open_kwargs, "closefd", "open", 7)?;
-    let mut opener_obj =
-        resolve_pos_or_kw(open_pos.get(7).copied(), open_kwargs, "opener", "open", 8)?;
+    // Internal positional helper used by `FileIO.__init__`. The public
+    // `open()` binds through Signature; this leaf reads the already-ordered
+    // slots (`file`, `mode`, fd, encoding, errors, newline, `closefd`, `opener`).
+    let slot = |i: usize| args.get(i).copied().filter(|o| !o.is_null());
+    let mut path_obj = slot(0).ok_or_else(|| {
+        crate::PyError::type_error("open() missing required argument 'file' (pos 1)")
+    })?;
+    let mode_obj = slot(1);
+    let encoding_obj = slot(3);
+    let errors_obj = slot(4);
+    let mut closefd_obj = slot(6);
+    let mut opener_obj = slot(7);
     let str_or_none =
         |obj: Option<PyObjectRef>, name: &str| -> Result<Option<String>, crate::PyError> {
             match obj {
@@ -25891,12 +25891,7 @@ pub fn builtin_all_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_all(args)
 }
 fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "all() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     if positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "all() takes exactly one argument ({} given)",
@@ -25984,22 +25979,24 @@ fn compensated_sum_to_double(total: CompensatedSum) -> f64 {
 }
 
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `sum(iterable, /, start=0)`: iterable is positional-only, start is
-    // positional-or-keyword; at most two arguments total.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let total = pos.len() + real_kwarg_count(kwargs);
-    if total > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "sum() takes at most 2 arguments ({total} given)"
-        )));
-    }
-    if pos.is_empty() {
+    // Bound scope from `parse_obj`: `iterable`, `start` (`PY_NULL` omitted).
+    // `sum(iterable, /, start=0)`.
+    if args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(
             "sum() takes at least 1 positional argument (0 given)",
         ));
     }
-    kwarg_reject_unknown(kwargs, &["start"], "sum")?;
-    let start_opt = bind_pos_or_kw(pos, kwargs, 1, "start", "sum", 2)?;
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "sum() takes at most 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+    let start_opt = if args.len() > 1 && !args[1].is_null() {
+        Some(args[1])
+    } else {
+        None
+    };
     // `_regular_sum`: `for x in sequence: last = last + x` over the generic
     // iterator protocol (so generators, ranges, sets, dict views, ... all
     // work).  Very intentionally `last + x`, not `+=` — preserving a mutable
@@ -26022,7 +26019,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // local a foreign collection has left stale. Pin the iterable before the
     // default `start=0` mint so that nursery object cannot move first.
     let last_slot = roots.base();
-    let _ = roots.pin_root(pos[0]);
+    let _ = roots.pin_root(args[0]);
     let start = start_opt.unwrap_or_else(|| w_int_new(0));
     if unsafe { pyre_object::is_str(start) } {
         return Err(crate::PyError::type_error(
@@ -26421,19 +26418,26 @@ pub(crate) fn builtin_round_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 }
 
 fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate::PyError> {
-    // `round(number, ndigits=None)`: both positional-or-keyword; at most two.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let total = pos.len() + real_kwarg_count(kwargs);
-    if total > 2 {
+    // Bound scope from `parse_obj`: `number`, `ndigits` (`PY_NULL` omitted).
+    // `round(number, ndigits=None)`. Method `__round__` arrives as
+    // `[self, ndigits?]` after `reject_kwargs`.
+    if args.is_empty() || args[0].is_null() {
+        return Err(crate::PyError::type_error(
+            "round() missing required argument 'number' (pos 1)",
+        ));
+    }
+    if args.len() > 2 {
         return Err(crate::PyError::type_error(format!(
-            "round() takes at most 2 arguments ({total} given)"
+            "round() takes at most 2 arguments ({} given)",
+            args.len()
         )));
     }
-    let obj = bind_pos_or_kw(pos, kwargs, 0, "number", "round", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("round() missing required argument 'number' (pos 1)")
-    })?;
-    kwarg_reject_unknown(kwargs, &["number", "ndigits"], "round")?;
-    let ndigits_arg = bind_pos_or_kw(pos, kwargs, 1, "ndigits", "round", 2)?;
+    let obj = args[0];
+    let ndigits_arg = if args.len() > 1 && !args[1].is_null() {
+        Some(args[1])
+    } else {
+        None
+    };
     let ndigits = ndigits_arg.as_ref();
     unsafe {
         // `operation.py`'s `round` reaches `__round__` through the type, so a
@@ -26629,24 +26633,33 @@ static __majit_wrap_builtin_pow_target: crate::gateway::BuiltinWrapperDescriptor
 
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `pow(base, exp, mod=None)`: all positional-or-keyword; at most three.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let total = pos.len() + real_kwarg_count(kwargs);
-    if total > 3 {
+    // Bound scope from `parse_obj`: `base`, `exp`, `mod` (`PY_NULL` omitted).
+    // `pow(base, exp, mod=None)`.
+    if args.is_empty() || args[0].is_null() {
+        return Err(crate::PyError::type_error(
+            "pow() missing required argument 'base' (pos 1)",
+        ));
+    }
+    if args.len() < 2 || args[1].is_null() {
+        return Err(crate::PyError::type_error(
+            "pow() missing required argument 'exp' (pos 2)",
+        ));
+    }
+    if args.len() > 3 {
         return Err(crate::PyError::type_error(format!(
-            "pow() takes at most 3 arguments ({total} given)"
+            "pow() takes at most 3 arguments ({} given)",
+            args.len()
         )));
     }
-    let base = bind_pos_or_kw(pos, kwargs, 0, "base", "pow", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("pow() missing required argument 'base' (pos 1)")
-    })?;
-    let exp = bind_pos_or_kw(pos, kwargs, 1, "exp", "pow", 2)?.ok_or_else(|| {
-        crate::PyError::type_error("pow() missing required argument 'exp' (pos 2)")
-    })?;
-    kwarg_reject_unknown(kwargs, &["base", "exp", "mod"], "pow")?;
+    let base = args[0];
+    let exp = args[1];
     // `WrappedDefault(None)`: an omitted modulus arrives as `w_None`, and
     // `descroperation.py pow` turns that into the two-argument form.
-    let modulus = bind_pos_or_kw(pos, kwargs, 2, "mod", "pow", 3)?.unwrap_or_else(w_none);
+    let modulus = if args.len() > 2 && !args[2].is_null() {
+        args[2]
+    } else {
+        w_none()
+    };
     crate::objspace::descroperation::pow3(base, exp, modulus)
 }
 
@@ -26709,12 +26722,6 @@ pub(crate) fn format_index_radix(
 
 /// `hex(x)` — PyPy: operation.py hex
 fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "hex() takes no keyword arguments",
-        ));
-    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "hex() takes exactly one argument ({} given)",
@@ -26727,12 +26734,6 @@ fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `oct(x)` — PyPy: operation.py oct
 fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "oct() takes no keyword arguments",
-        ));
-    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "oct() takes exactly one argument ({} given)",
@@ -26745,12 +26746,6 @@ fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `bin(x)` — PyPy: operation.py bin
 fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "bin() takes no keyword arguments",
-        ));
-    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "bin() takes exactly one argument ({} given)",
@@ -27250,22 +27245,11 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// `format(value, format_spec='')` — operation.py format → space.format
 fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "format() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // Bound scope from `parse_obj`: `value`, `format_spec` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(
             "format expected at least 1 argument, got 0",
         ));
-    }
-    if args.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "format expected at most 2 arguments, got {}",
-            args.len()
-        )));
     }
     let value = args[0];
     // `builtin_format_impl`: the `format_spec` must be a `str` — validated
@@ -27275,7 +27259,7 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // applies it — dispatching a `__format__` override (including a builtin
     // subclass's) or, for a plain builtin, the shared spec parser; the same
     // path f-string `{v:spec}` and `"{:spec}".format(v)` use.
-    let spec = if args.len() > 1 {
+    let spec = if args.len() > 1 && !args[1].is_null() {
         crate::type_methods::check_format_spec(args[1], "format() argument 2")?
     } else {
         pyre_object::PY_NULL

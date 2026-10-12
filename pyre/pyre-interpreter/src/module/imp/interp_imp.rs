@@ -1169,44 +1169,47 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }));
     crate::__pyre_store!(ns, "find_frozen", // `withdata` is keyword-only, so no call shape fills every parameter
         // positionally and there is no fixed natural arity to fast-path on.
-        crate::make_builtin_function("find_frozen", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(kwargs, &["withdata"], "find_frozen")?;
-            if positional.len() != 1 {
-                return Err(crate::PyError::type_error(format!(
-                    "find_frozen() takes exactly 1 positional argument ({} given)",
-                    positional.len()
-                )));
-            }
-            let name = frozen_name(positional, "find_frozen")?;
-            // `withdata: bool(accept={int})` — any object, read for truth.
-            let withdata = match crate::builtins::kwarg_get(kwargs, "withdata") {
-                Some(value) => crate::baseobjspace::is_true(value)?,
-                None => false,
-            };
-            let Some(entry) = served_frozen_module(&name) else {
-                return Ok(pyre_object::w_none());
-            };
-            let _roots = pyre_object::gc_roots::push_roots();
-            let data_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(if withdata {
-                frozen_data(entry)?
-            } else {
-                pyre_object::w_none()
-            });
-            let origname_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(
-                entry
-                    .origname
-                    .map(pyre_object::w_str_new)
-                    .unwrap_or_else(pyre_object::w_none),
-            );
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::gc_roots::shadow_stack_get(data_slot),
-                pyre_object::w_bool_from(entry.is_package),
-                pyre_object::gc_roots::shadow_stack_get(origname_slot),
-            ]))
-        }));
+        crate::make_builtin_function_with_signature(
+            "find_frozen",
+            |args| {
+                // Bound scope: pos-only `name`, kw-only `withdata` (`PY_NULL` omitted).
+                let name = args.first().copied().filter(|value| !value.is_null());
+                let Some(name) = name else {
+                    return Err(crate::PyError::type_error(
+                        "find_frozen() takes exactly 1 positional argument (0 given)",
+                    ));
+                };
+                let name = frozen_name(&[name], "find_frozen")?;
+                // `withdata: bool(accept={int})` — any object, read for truth.
+                let withdata = match args.get(1).copied().filter(|value| !value.is_null()) {
+                    Some(value) => crate::baseobjspace::is_true(value)?,
+                    None => false,
+                };
+                let Some(entry) = served_frozen_module(&name) else {
+                    return Ok(pyre_object::w_none());
+                };
+                let _roots = pyre_object::gc_roots::push_roots();
+                let data_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(if withdata {
+                    frozen_data(entry)?
+                } else {
+                    pyre_object::w_none()
+                });
+                let origname_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(
+                    entry
+                        .origname
+                        .map(pyre_object::w_str_new)
+                        .unwrap_or_else(pyre_object::w_none),
+                );
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::gc_roots::shadow_stack_get(data_slot),
+                    pyre_object::w_bool_from(entry.is_package),
+                    pyre_object::gc_roots::shadow_stack_get(origname_slot),
+                ]))
+            },
+            crate::gateway::Signature::new(vec!["name", "withdata"], None, None, 1, 1),
+        ));
     crate::__pyre_store!(ns, "_override_frozen_modules_for_tests", crate::make_builtin_function("_override_frozen_modules_for_tests", |args| {
             let Some(&value) = args.first() else {
                 return Err(crate::PyError::type_error(

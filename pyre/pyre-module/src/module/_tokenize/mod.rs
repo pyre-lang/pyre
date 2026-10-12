@@ -208,51 +208,47 @@ impl W_TokenizerIter {
     #[staticmethod]
     fn __new__(
         _cls: PyObjectRef,
-        args: &[PyObjectRef],
+        readline: PyObjectRef,
+        #[kwonly] extra_tokens: PyObjectRef,
+        #[kwonly]
+        #[default(pyre_object::PY_NULL)]
+        encoding: PyObjectRef,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        // The descriptor ABI includes the requested class at positional[0].
-        let positional = positional.get(1..).unwrap_or(&[]);
-        pyre_interpreter::builtins::kwarg_reject_unknown(
-            kwargs,
-            &["encoding", "extra_tokens"],
-            "tokenizeriter",
-        )?;
-        if positional.len() != 1 {
-            return Err(pyre_interpreter::PyError::type_error(format!(
-                "tokenizeriter() takes exactly 1 positional argument ({} given)",
-                positional.len()
-            )));
+        // Bound scope: `cls`/`readline`, kw-only `extra_tokens`/`encoding`
+        // (`PY_NULL` omitted).
+        if readline.is_null() {
+            return Err(pyre_interpreter::PyError::type_error(
+                "tokenizeriter() takes exactly 1 positional argument (0 given)",
+            ));
         }
-        let mut readline = positional[0];
+        if extra_tokens.is_null() {
+            return Err(pyre_interpreter::PyError::type_error(
+                "tokenizeriter() missing required argument 'extra_tokens' (pos 2)",
+            ));
+        }
+        let mut readline = readline;
         if !pyre_interpreter::baseobjspace::callable_w(readline) {
             return Err(pyre_interpreter::PyError::type_error(
                 "source must be callable",
             ));
         }
-        let w_extra =
-            pyre_interpreter::builtins::kwarg_get(kwargs, "extra_tokens").ok_or_else(|| {
-                pyre_interpreter::PyError::type_error(
-                    "tokenizeriter() missing required argument 'extra_tokens' (pos 2)",
-                )
-            })?;
-        let has_kwargs = kwargs.is_some();
-        let mut kwargs_root = kwargs.unwrap_or(pyre_object::PY_NULL);
+        let mut encoding_root = encoding;
+        let mut extra_root = extra_tokens;
         let extra_tokens = pyre_object::with_roots!(
-            readline, kwargs_root => pyre_interpreter::baseobjspace::is_true(w_extra)
+            readline, encoding_root, extra_root => pyre_interpreter::baseobjspace::is_true(extra_root)
         )?;
-        let kwargs = has_kwargs.then_some(kwargs_root);
-        let encoding = match pyre_interpreter::builtins::kwarg_get(kwargs, "encoding") {
-            Some(value) => unsafe {
-                if !is_str(value) {
+        let encoding = if encoding_root.is_null() {
+            None
+        } else {
+            unsafe {
+                if !is_str(encoding_root) {
                     return Err(pyre_interpreter::PyError::type_error(format!(
                         "tokenizeriter() argument 'encoding' must be str, not {}",
-                        pyre_interpreter::type_methods::clinic_arg_type_name(value)
+                        pyre_interpreter::type_methods::clinic_arg_type_name(encoding_root)
                     )));
                 }
-                Some(w_str_get_wtf8(value).to_wtf8_buf())
-            },
-            None => None,
+                Some(w_str_get_wtf8(encoding_root).to_wtf8_buf())
+            }
         };
         let _ = type_object();
         Ok(W_TokenizerIter::allocate_stable(W_TokenizerIter {
