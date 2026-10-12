@@ -8277,6 +8277,41 @@ fn overlay_stream_ref_slots(
     }
 }
 
+/// Result dest of the `inline_call` / `residual_call` that ends at
+/// `resume_pc`. `MIFrame.get_list_of_active_boxes` reads that dest as
+/// `self.bytecode[self.pc - 1]` and the bank as `self._result_argcode`.
+enum CallResultDest {
+    Color { bank: char, color: usize },
+    Void,
+    Missing,
+}
+
+fn call_result_dest_ending_at(code: &[u8], resume_pc: usize) -> CallResultDest {
+    let Some(op) = crate::jitcode_runtime::decoded_ops(code).find(|op| {
+        op.next_pc == resume_pc
+            && (op.opname.starts_with("inline_call") || op.opname.starts_with("residual_call"))
+    }) else {
+        return CallResultDest::Missing;
+    };
+    let mut chars = op.argcodes.chars();
+    let mut bank = None;
+    while let Some(c) = chars.next() {
+        if c == '>' {
+            bank = chars.next();
+        }
+    }
+    let Some(bank) = bank else {
+        return CallResultDest::Void;
+    };
+    let Some(&color) = resume_pc.checked_sub(1).and_then(|idx| code.get(idx)) else {
+        return CallResultDest::Missing;
+    };
+    CallResultDest::Color {
+        bank,
+        color: usize::from(color),
+    }
+}
+
 /// Decode one suspended inline-callee frame's resume section into a
 /// [`ReconstructRecipe`], or `None` to decline the multi-frame inline rebuild.
 ///
@@ -8471,27 +8506,36 @@ fn reconstruct_inline_recipe(
         let Some(pc) = usize::try_from(frame.pc).ok() else {
             decline!("NoPendingResultColor");
         };
-        // Same two-twin order as `compute_inline_caller_frame` /
-        // `Unavail::Nested/NoResultColor`: the trivia twin answers only
-        // while the post-call `-live-` is also the fallthrough pc's own
-        // resume marker. A CALL whose fallthrough has its own per-pc
-        // marker, or whose TOS at the CALL is a constant (`u16::MAX`),
-        // leaves trivia empty; the after-residual twin keys the result
-        // color by the CALL offset. `resume.py rebuild_from_resumedata`
-        // always rebuilds the frame — this is the color that walk needs
-        // to drop from the live box list, not a reason to abort.
-        let Some(color) = pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
-            p.result_color_trivia_for_jitcode_pc(pc)
-                .filter(|&c| c != u16::MAX)
-                .or_else(|| {
-                    p.result_color_after_residual_for_jitcode_pc(pc)
-                        .filter(|&c| c != u16::MAX)
-                })
-                .map(|c| c as usize)
-        }) else {
+        // `MIFrame.get_list_of_active_boxes` (`pyjitpl.py`): when
+        // `in_a_call`, the destination is the call's last operand
+        // (`self.bytecode[self.pc - 1]`) and the bank is
+        // `self._result_argcode`. `frame.pc` is the post-call `-live-`
+        // coordinate, so the call is the op that ends there. The
+        // after-residual color table is keyed by the CALL offset
+        // (`result_color_after_residual_for_jitcode_pc`); feeding it
+        // this resume pc would read the next Python instruction's TOS.
+        let Some(p) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
             decline!("NoPendingResultColor");
         };
-        Some(color)
+        match call_result_dest_ending_at(p.jitcode.code.as_slice(), pc) {
+            CallResultDest::Color { bank: 'r', color } => Some(color),
+            CallResultDest::Color { .. } => decline!("PendingResultNotRef"),
+            CallResultDest::Void => None,
+            CallResultDest::Missing => {
+                // Trivia is keyed by the resume marker, which `frame.pc`
+                // is. Used when the body is a skeleton / the call op
+                // cannot be decoded. Never the CALL-keyed after-residual
+                // table.
+                let Some(color) = p
+                    .result_color_trivia_for_jitcode_pc(pc)
+                    .filter(|&c| c != u16::MAX)
+                    .map(|c| c as usize)
+                else {
+                    decline!("NoPendingResultColor");
+                };
+                Some(color)
+            }
+        }
     } else {
         None
     };

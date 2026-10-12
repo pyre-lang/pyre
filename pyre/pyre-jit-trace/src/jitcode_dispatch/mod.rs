@@ -2875,8 +2875,13 @@ fn surface_inline_subloop_after_back_edge(
     carrier_resume: bool,
     op_pc: usize,
     op_next_pc: usize,
+    no_loop_header: bool,
 ) -> Option<(DispatchOutcome, usize)> {
-    if ctx.seen_loop_header_for_jdindex < 0 && !carrier_resume {
+    // `opimpl_jit_merge_point`: `if not jitdriver_sd.no_loop_header` is
+    // the only gate that waits for an explicit `loop_header`. With
+    // `no_loop_header` the handler stamps `seen_loop_header_for_jdindex`
+    // itself and proceeds to `do_recursive_call(..., assembler_call=True)`.
+    if ctx.seen_loop_header_for_jdindex < 0 && !carrier_resume && !no_loop_header {
         return None;
     }
     if token.is_none() && !carrier_resume {
@@ -15678,6 +15683,18 @@ fn handle<Sym: WalkSym>(
             // `try_walker_inline_resolved_user_call`. A missing token there
             // residualizes the original CALL.
             let carrier_resume = ctx.fbw_mode.carrier_resume;
+            // `opimpl_jit_merge_point` (`pyjitpl.py`): looked up once and
+            // shared by both inlined CALL_ASSEMBLER arms, the after-back-edge
+            // helper, and the auto-stamp below. `no_loop_header` stamps
+            // `seen_loop_header_for_jdindex` itself instead of waiting for
+            // an explicit `loop_header`.
+            let no_loop_header = ctx
+                .trace_ctx
+                .metainterp_sd()
+                .jitdrivers_sd
+                .get(jdindex)
+                .map(|jd| jd.no_loop_header)
+                .unwrap_or(false);
             let callee_code = (!ctx.is_top_level
                 && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
             .then(|| {
@@ -15689,7 +15706,10 @@ fn handle<Sym: WalkSym>(
             })
             .flatten();
             if let Some(callee_code) = callee_code {
-                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 || carrier_resume {
+                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
+                    || carrier_resume
+                    || no_loop_header
+                {
                     let callee_key = crate::driver::make_green_key_typed(
                         callee_code as *const (),
                         next_instr,
@@ -15714,15 +15734,17 @@ fn handle<Sym: WalkSym>(
                         carrier_resume,
                         op.pc,
                         op.next_pc,
+                        no_loop_header,
                     ) {
                         return Ok(outcome);
                     }
                 } else {
                     // Fall-through onto a loop header in an inlined frame:
-                    // `opimpl_jit_merge_point` `if portal_call_depth: return`.
-                    // Continue here so an unresolved callee pycode green does
-                    // not abort the walk; the body records until the first
-                    // backward jump stamps `loop_header`.
+                    // `opimpl_jit_merge_point` `if not jitdriver_sd.no_loop_header:
+                    // if portal_call_depth: return`. Continue here so an
+                    // unresolved callee pycode green does not abort the walk;
+                    // the body records until the first backward jump stamps
+                    // `loop_header`.
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
@@ -15748,7 +15770,10 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
-                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 || carrier_resume {
+                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
+                            || carrier_resume
+                            || no_loop_header
+                        {
                             let callee_key = crate::driver::make_green_key_typed(
                                 callee_code as *const (),
                                 next_instr,
@@ -15773,6 +15798,7 @@ fn handle<Sym: WalkSym>(
                                 carrier_resume,
                                 op.pc,
                                 op.next_pc,
+                                no_loop_header,
                             ) {
                                 return Ok(outcome);
                             }
@@ -15835,13 +15861,6 @@ fn handle<Sym: WalkSym>(
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // pyjitpl.py `if not jitdriver_sd.no_loop_header:`
-                let no_loop_header = ctx
-                    .trace_ctx
-                    .metainterp_sd()
-                    .jitdrivers_sd
-                    .get(jdindex)
-                    .map(|jd| jd.no_loop_header)
-                    .unwrap_or(false);
                 if !no_loop_header {
                     // pyjitpl.py `if self.metainterp.portal_call_depth:
                     // return` — nested portal call waits for an explicit
