@@ -664,6 +664,19 @@ fn pin_src(r: &Rvalue) -> Option<PinSrc> {
     }
 }
 
+/// Source of a pin-preserving copy: `dest = src`, or a cast of that local.
+///
+/// `pin_src` follows projections to chase a pin *argument*. A field load is a
+/// new pointer; `gct_direct_call` roots the live variables around the
+/// collecting op, not a pointer read from one of them.
+fn pin_copy_src(r: &Rvalue) -> Option<u64> {
+    let op = match r {
+        Rvalue::Use(o, _) | Rvalue::Cast(_, o, _) => o,
+        _ => return None,
+    };
+    operand_place(op).and_then(bare_local)
+}
+
 /// Every local the value reaching a pin argument is spelled by.
 ///
 /// The whole alias chain is kept, not only its end: a pin publishes a *value*,
@@ -2627,13 +2640,13 @@ pub fn scan(
                 }
             }
         }
-        // Statement-order pin transfer. An alias assign is only a copy:
-        // `dest = src` clears `dest` and writes `src`'s bits, so `a = a`
-        // keeps the pin. A non-alias assign kills the destination. The
-        // call destination is killed after these statements, because
-        // `BaseFrameworkGCTransformer.gct_direct_call` reads livevars at
-        // the collecting op (`push_roots`), after the block's statements
-        // and before the call overwrites its destination.
+        // Statement-order pin transfer. A copy is `dest = src` or a cast of
+        // that local: it clears `dest` and writes `src`'s bits, so `a = a`
+        // keeps the pin. A projected load is a new pointer and kills
+        // `dest`. The call destination is killed after these statements,
+        // because `gct_direct_call` reads livevars at the collecting op
+        // (`push_roots`), after the block's statements and before the call
+        // overwrites its destination.
         enum RawPinXfer {
             Kill(u64),
             Copy { src: u64, dest: u64 },
@@ -2647,7 +2660,7 @@ pub fn scan(
                 match st.stmt_kind() {
                     Ok(StmtKind::Assign(place, rvalue)) => {
                         if let Some(d) = bare_local(&place) {
-                            if let Some(PinSrc::Alias(src)) = pin_src(&rvalue) {
+                            if let Some(src) = pin_copy_src(&rvalue) {
                                 stmt_xfers[b].push(RawPinXfer::Copy { src, dest: d });
                             } else {
                                 stmt_xfers[b].push(RawPinXfer::Kill(d));
@@ -2732,14 +2745,29 @@ pub fn scan(
         }
         let edits: Vec<BlockEdit> = (0..n)
             .map(|b| {
+                if !is_forward(&forward, b) {
+                    return BlockEdit {
+                        stmts: Vec::new(),
+                        call_dest_kill: None,
+                        retire_scopes: Vec::new(),
+                        retire_all: false,
+                        add_bits: Vec::new(),
+                    };
+                }
+                // A tracked destination always drops its previous pin. It
+                // gains one only when the source is a tracked bare local
+                // (`gct_direct_call` livevars).
                 let stmts: Vec<PinXfer> = stmt_xfers[b]
                     .iter()
                     .filter_map(|xfer| match *xfer {
                         RawPinXfer::Kill(local) => local_at.get(&local).copied().map(PinXfer::Kill),
-                        RawPinXfer::Copy { src, dest } => Some(PinXfer::Copy {
-                            src: *local_at.get(&src)?,
-                            dest: *local_at.get(&dest)?,
-                        }),
+                        RawPinXfer::Copy { src, dest } => {
+                            let dest = *local_at.get(&dest)?;
+                            match local_at.get(&src) {
+                                Some(&src) => Some(PinXfer::Copy { src, dest }),
+                                None => Some(PinXfer::Kill(dest)),
+                            }
+                        }
                     })
                     .collect();
                 let mut call_dest_kill = None;
@@ -2837,6 +2865,10 @@ pub fn scan(
         for _round in 0..n + 8 {
             for b in 0..n {
                 let at = b * words;
+                if !is_forward(&forward, b) {
+                    outs[at..at + words].fill(0);
+                    continue;
+                }
                 outs[at..at + words].copy_from_slice(&pinned_in[at..at + words]);
                 let e = &edits[b];
                 let o = &mut outs[at..at + words];
@@ -3640,7 +3672,9 @@ fn adt_may_run_user_drop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_charon_reader::ullbc::{Operand, Place, PlaceKind, Rvalue, StmtKind, TyRef};
+    use majit_charon_reader::ullbc::{
+        Operand, Place, PlaceKind, ProjectionElem, Rvalue, StmtKind, TyRef,
+    };
 
     fn ty() -> TyRef {
         TyRef::Dedup { id: 0 }
@@ -3745,6 +3779,43 @@ mod tests {
     fn an_unmodelled_rvalue_yields_no_source_at_all() {
         assert!(pin_src(&Rvalue::Unknown).is_none());
         assert!(pin_src(&Rvalue::Len(local(1))).is_none());
+    }
+
+    fn field_of(i: u64) -> Place {
+        Place {
+            kind: PlaceKind::Projection(
+                Box::new(local(i)),
+                ProjectionElem::Tagged(serde_json::json!({"Field": [null, 0]})),
+            ),
+            ty: ty(),
+        }
+    }
+
+    /// `dest = src` and a cast of that local copy the pin; a field load does not.
+    #[test]
+    fn only_a_bare_local_copy_or_cast_transfers_a_pin() {
+        assert_eq!(
+            pin_copy_src(&Rvalue::Use(mv(2), serde_json::Value::Null)),
+            Some(2)
+        );
+        assert_eq!(
+            pin_copy_src(&Rvalue::Cast(serde_json::Value::Null, mv(2), ty())),
+            Some(2)
+        );
+        assert_eq!(
+            pin_copy_src(&Rvalue::Use(
+                Operand::Copy(field_of(2)),
+                serde_json::Value::Null
+            )),
+            None
+        );
+        assert_eq!(
+            pin_src(&Rvalue::Use(
+                Operand::Copy(field_of(2)),
+                serde_json::Value::Null
+            )),
+            Some(PinSrc::Alias(2))
+        );
     }
 
     fn helper_fact(
@@ -4735,6 +4806,230 @@ mod tests {
                 .iter()
                 .map(|f| (f.callee_id, &f.callee_name))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Open a root scope, pin `pin_arg`, assign `assign_dest`, then a
+    /// collecting call with `assign_dest` still live.
+    fn short_bracket_after_pin_assign(
+        pin_arg: u64,
+        assign_dest: u64,
+        assign_rvalue: serde_json::Value,
+        extra_locals: serde_json::Value,
+    ) -> ScanStats {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let gc_ty = serde_json::json!({"Deduplicated": 100});
+        let scope_ty = serde_json::json!({"Deduplicated": 200});
+        let gens = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place =
+            |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let call_bb = |fun: u64,
+                       args: serde_json::Value,
+                       dest: u64,
+                       dest_ty: &serde_json::Value,
+                       target: u64,
+                       statements: serde_json::Value| {
+            serde_json::json!({
+                "statements": statements,
+                "is_cleanup": false,
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
+                        "args": args,
+                        "dest": place(dest, dest_ty)
+                    },
+                    "target": target,
+                    "on_unwind": 5
+                }}}
+            })
+        };
+        let mut locals = serde_json::json!([
+            {"index": 0, "name": null, "span": span.clone(), "ty": scalar.clone()},
+            {"index": 1, "name": "scope", "span": span.clone(), "ty": scope_ty.clone()},
+            {"index": 2, "name": "obj", "span": span.clone(), "ty": gc_ty.clone()},
+            {"index": 3, "name": "loaded", "span": span.clone(), "ty": gc_ty.clone()},
+            {"index": 4, "name": "tmp", "span": span.clone(), "ty": scalar.clone()}
+        ]);
+        if let Some(extra) = extra_locals.as_array() {
+            locals
+                .as_array_mut()
+                .expect("locals is an array")
+                .extend(extra.iter().cloned());
+        }
+        let assign = serde_json::json!({
+            "span": span.clone(),
+            "kind": {"Assign": [place(assign_dest, &gc_ty), assign_rvalue]}
+        });
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "holder"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": locals},
+                "body": [
+                    call_bb(3, serde_json::json!([]), 1, &scope_ty, 1, serde_json::json!([])),
+                    call_bb(
+                        2,
+                        serde_json::json!([{"Copy": place(pin_arg, &gc_ty)}]),
+                        pin_arg,
+                        &gc_ty,
+                        2,
+                        serde_json::json!([])
+                    ),
+                    call_bb(
+                        1,
+                        serde_json::json!([]),
+                        4,
+                        &scalar,
+                        3,
+                        serde_json::json!([assign])
+                    ),
+                    call_bb(
+                        4,
+                        serde_json::json!([{"Copy": place(assign_dest, &gc_ty)}]),
+                        4,
+                        &scalar,
+                        4,
+                        serde_json::json!([])
+                    ),
+                    {"statements": [], "is_cleanup": false, "terminator": {
+                        "span": span.clone(), "kind": "Return"
+                    }},
+                    {"statements": [], "is_cleanup": true, "terminator": {
+                        "span": span.clone(), "kind": "UnwindResume"
+                    }}
+                ]
+            }}
+        });
+        let opaque = |id: u64, path: &[&str], output: &serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(path),
+                "signature": {"is_unsafe": false, "inputs": [], "output": output.clone()},
+                "body": "Opaque"
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [
+                    holder,
+                    opaque(1, &["fixture", "collect"], &scalar),
+                    opaque(2, &["pyre_object", "gc_roots", "pin_root"], &gc_ty),
+                    opaque(3, &["pyre_object", "gc_roots", "push_roots"], &scope_ty),
+                    opaque(4, &["fixture", "touch"], &scalar)
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("pin-assign fixture parses");
+        let cg = super::super::framework::build(&llbc);
+        let mut reach = HashSet::new();
+        reach.insert(0);
+        reach.insert(1);
+        let mut push_roots = HashSet::new();
+        push_roots.insert(3);
+        let mut gc_tys = HashSet::new();
+        gc_tys.insert(100);
+        let (_, stats) = scan(
+            &llbc,
+            &cg,
+            &reach,
+            &push_roots,
+            &gc_tys,
+            &HashSet::new(),
+            &[],
+        );
+        assert_eq!(
+            stats.unparsed_terminator_bodies, 0,
+            "terminators must parse"
+        );
+        assert_eq!(stats.unparsed_statement_bodies, 0, "statements must parse");
+        assert_eq!(
+            stats.withheld_contents_opaque, 0,
+            "pin transfer must be readable: {:?}",
+            stats.opaque_by_reason
+        );
+        stats
+    }
+
+    /// A field load is a new pointer. Pinning the aggregate does not pin
+    /// the loaded word (`gct_direct_call` livevars).
+    #[test]
+    fn a_field_load_does_not_inherit_the_source_pin() {
+        let gc_ty = serde_json::json!({"Deduplicated": 100});
+        let field = serde_json::json!({
+            "kind": {"Projection": [
+                {"kind": {"Local": 2}, "ty": gc_ty.clone()},
+                {"Field": [null, 0]}
+            ]},
+            "ty": gc_ty.clone()
+        });
+        let stats = short_bracket_after_pin_assign(
+            2,
+            3,
+            serde_json::json!({"Use": [{"Copy": field}, null]}),
+            serde_json::json!([]),
+        );
+        assert_eq!(stats.withheld_under_a_bracket, 1);
+        assert_eq!(
+            stats.short_brackets.len(),
+            1,
+            "short={} covers={}",
+            stats.withheld_bracket_short,
+            stats.withheld_bracket_covers
+        );
+        assert_eq!(
+            stats.short_brackets[0].missing,
+            vec!["loaded".to_string()],
+            "pinned={:?}",
+            stats.short_brackets[0].pinned
+        );
+    }
+
+    /// Assigning an untracked source onto a pinned local kills the pin.
+    #[test]
+    fn assigning_an_untracked_source_clears_the_destination_pin() {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let stats = short_bracket_after_pin_assign(
+            3,
+            3,
+            serde_json::json!({"Use": [
+                {"Move": {"kind": {"Local": 5}, "ty": scalar.clone()}},
+                null
+            ]}),
+            serde_json::json!([{
+                "index": 5, "name": "bits", "span": span, "ty": scalar
+            }]),
+        );
+        assert_eq!(stats.withheld_under_a_bracket, 1);
+        assert_eq!(
+            stats.short_brackets.len(),
+            1,
+            "short={} covers={}",
+            stats.withheld_bracket_short,
+            stats.withheld_bracket_covers
+        );
+        assert_eq!(
+            stats.short_brackets[0].missing,
+            vec!["loaded".to_string()],
+            "pinned={:?}",
+            stats.short_brackets[0].pinned
         );
     }
 
