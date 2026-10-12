@@ -11160,7 +11160,7 @@ pub fn make_jit_w_long_toint_calldescr() -> DescrRef {
 fn simple_field_spec_from_bh(
     spec: &majit_jitcode::jitcode::BhFieldSpec,
 ) -> majit_ir::descr::SimpleFieldDescrSpec {
-    majit_ir::descr::SimpleFieldDescrSpec {
+    let mut out = majit_ir::descr::SimpleFieldDescrSpec {
         index: spec.index,
         field_key: spec.field_key().to_string(),
         name: spec.name.clone(),
@@ -11176,6 +11176,29 @@ fn simple_field_spec_from_bh(
         // name fallback instead of arriving as a declaration of a guess.
         is_class_word: spec.is_class_word,
         index_in_parent: spec.index_in_parent,
+    };
+    stamp_vtable_method_field_spec(&mut out);
+    out
+}
+
+/// A rustc vtable slot does not change. `SizeDescr.all_fielddescrs` is
+/// the intern identity `get_field_descr` returns, so a `{vtable}`
+/// `method_*` row that arrived as a fn-pointer Ref stays mutable unless
+/// it is stamped here (`jtransform.handle_getfield_typeptr` analog:
+/// the slot read is a pure load off a promoted vtable).
+fn stamp_vtable_method_field_spec(spec: &mut majit_ir::descr::SimpleFieldDescrSpec) {
+    let leaf = if spec.field_key.is_empty() {
+        spec.name.rsplit('.').next().unwrap_or("")
+    } else {
+        spec.field_key
+            .rsplit('.')
+            .next()
+            .unwrap_or(spec.field_key.as_str())
+    };
+    if leaf.starts_with("method_") && spec.name.contains("{vtable}") {
+        spec.is_immutable = true;
+        spec.field_type = Type::Int;
+        spec.flag = majit_ir::descr::ArrayFlag::Unsigned;
     }
 }
 
@@ -11790,7 +11813,7 @@ fn field_spec_from_owned_bh(
     } else {
         spec.field_key
     };
-    majit_ir::descr::SimpleFieldDescrSpec {
+    let mut out = majit_ir::descr::SimpleFieldDescrSpec {
         index: spec.index,
         field_key,
         name: spec.name,
@@ -11803,7 +11826,9 @@ fn field_spec_from_owned_bh(
         virtualizable: false,
         is_class_word: spec.is_class_word,
         index_in_parent: spec.index_in_parent,
-    }
+    };
+    stamp_vtable_method_field_spec(&mut out);
+    out
 }
 
 /// Field counts for STRUCT rows that already carry a vtable.
@@ -12829,7 +12854,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // `BhFieldSpec.index` so the `parent` matching fallback
             // produces a `SimpleFieldDescr` whose `index()` matches the
             // upstream value rather than a `u32::MAX` sentinel.
-            let field = majit_jitcode::jitcode::BhFieldSpec {
+            let mut field = majit_jitcode::jitcode::BhFieldSpec {
                 // `index()` is the key the `HeapCache` files a field read
                 // under, so it has to separate every field one object can be
                 // read through.  A numbered field answers with its position;
@@ -12872,6 +12897,20 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 // here declares and the name is what the rebuild reads.
                 is_class_word: None,
             };
+            if name
+                .rsplit('.')
+                .next()
+                .unwrap_or(name)
+                .starts_with("method_")
+                && (owner == "{vtable}"
+                    || owner.ends_with("::{vtable}")
+                    || name.contains("{vtable}"))
+            {
+                field.is_immutable = true;
+                field.field_type = Type::Int;
+                field.field_flag = majit_ir::descr::ArrayFlag::Unsigned;
+                field.is_field_signed = false;
+            }
             // The claim itself goes beside the spec, unflattened.
             field_descr_from_bh_field(
                 &field,

@@ -440,14 +440,23 @@ fn retarget_vtable_method_bases(graph: &mut FunctionGraph, llbc: &Llbc) -> usize
         }) else {
             continue;
         };
-        let OpKind::FieldRead { base, pure, .. } = &mut op.kind else {
-            continue;
-        };
-        *base = meta;
-        // The slot of a vtable does not change. The base is the metadata
-        // word, an int (`raw` pointer); `getfield_raw_r` is emitted only
-        // for a pure read (`jtransform.py` `rewrite_op_getfield`).
-        *pure = true;
+        {
+            let OpKind::FieldRead { base, pure, ty, .. } = &mut op.kind else {
+                continue;
+            };
+            *base = meta;
+            // The slot of a vtable does not change. The base is the metadata
+            // word, an int (`raw` pointer). The slot itself is a function
+            // address (`getfield_raw_i`), not a GC pointer: a Ref-typed
+            // result would assemble as `getfield_gc_r` / `getfield_raw_r`
+            // and `optimize_getfield` would `make_equal_to` that Ref onto
+            // the ConstInt the load produces.
+            *pure = true;
+            *ty = ValueType::Int;
+        }
+        if let Some(result) = op.result.as_ref() {
+            FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+        }
         retargeted += 1;
     }
     // A leftover `FatVtable` GetfieldGcR of the same slot as the

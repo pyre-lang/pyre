@@ -18,7 +18,7 @@ use crate::call::CallDescriptor;
 use crate::codewriter::support::{NormalizedArg, decode_builtin_call};
 use crate::model::{
     CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation,
-    ValueType, remap_control_flow_metadata_var,
+    ValueType, VecFieldPart, remap_control_flow_metadata_var,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -2410,6 +2410,37 @@ fn field_read_result_is_later_base(
     })
 }
 
+/// Bank for `int_guard_value` on a rustc vtable word. The word is an
+/// address (`FatLen` Int after `dyn_fat`). `getkind` of an unstamped
+/// cell is Unknown → `'r'`, which assembled `ref_guard_value` against
+/// an int register and the walker skipped the guard (`implement_guard_value`
+/// null-concrete arm).
+fn vtable_word_guard_kind(var: &crate::flowspace::model::Variable) -> char {
+    match FunctionGraph::concretetype_of(var) {
+        crate::codewriter::type_state::ConcreteType::GcRef => 'r',
+        crate::codewriter::type_state::ConcreteType::Float => 'f',
+        _ => 'i',
+    }
+}
+
+/// True when `result` (or a phi alias) is the base of a `{vtable}` `method_*`
+/// FieldRead. Distinguishes a dyn-trait vtable word (`FatLen` after
+/// `dyn_fat`) from a slice length at the same metadata offset.
+fn field_feeds_vtable_method(
+    graph: &FunctionGraph,
+    result: &crate::flowspace::model::Variable,
+) -> bool {
+    let aliases = phi_aliases(graph, result);
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::FieldRead { base, field, .. } => {
+                aliases.contains(base) && field.is_vtable_method_slot()
+            }
+            _ => false,
+        })
+    })
+}
+
 /// `OpKind` has no operand walker. `Variable`'s `Debug` includes its
 /// identity, so a second copy of that text is another use.
 fn kind_mentions_var(kind: &OpKind, var: &crate::flowspace::model::Variable) -> bool {
@@ -3672,7 +3703,8 @@ impl<'a> Transformer<'a> {
                 rewritten
             }
             OpKind::FieldRead { field, ty, .. } => {
-                self.rewrite_op_getfield(op, field, ty, graph_name, graph)
+                let rewritten = self.rewrite_op_getfield(op, field, ty, graph_name, graph);
+                self.promote_dyn_vtable_word(op, field, ty, graph, graph_name, rewritten)
             }
             // ── rewrite_op_setfield ──
             OpKind::FieldWrite { field, value, .. }
@@ -6124,6 +6156,79 @@ impl<'a> Transformer<'a> {
         ])
     }
 
+    /// `jtransform.handle_getfield_typeptr` analog for a dyn-trait vtable
+    /// word: keep the metadata-word getfield and emit `-live-` +
+    /// `int_guard_value` on that word. The class is promoted once per
+    /// strategy value; a later `{vtable}` `method_*` read is then a pure
+    /// load off a Const and folds to a Const funcptr.
+    fn promote_dyn_vtable_word(
+        &mut self,
+        op: &SpaceOperation,
+        field: &FieldDescriptor,
+        _ty: &ValueType,
+        graph: &FunctionGraph,
+        graph_name: &str,
+        rewritten: RewriteResult,
+    ) -> RewriteResult {
+        let Some(result_var) = op.result.as_ref() else {
+            return rewritten;
+        };
+        let is_vtable_word = matches!(field.vec_part, Some(VecFieldPart::FatVtable))
+            || (matches!(field.vec_part, Some(VecFieldPart::FatLen))
+                && field_feeds_vtable_method(graph, result_var));
+        if !is_vtable_word {
+            return rewritten;
+        }
+        match &rewritten {
+            RewriteResult::Identity(_) => return rewritten,
+            RewriteResult::Replace(ops) if ops.is_empty() => return rewritten,
+            RewriteResult::Replace(ops)
+                if ops.iter().any(|candidate| {
+                    matches!(
+                        candidate.kind,
+                        OpKind::GuardValue { .. } | OpKind::GuardClass { .. }
+                    )
+                }) =>
+            {
+                return rewritten;
+            }
+            _ => {}
+        }
+        let (mut ops, guarded) = match rewritten {
+            RewriteResult::Keep => (vec![op.clone()], result_var.clone()),
+            RewriteResult::Replace(ops) => {
+                let guarded = ops
+                    .iter()
+                    .rev()
+                    .find_map(|candidate| candidate.result.clone())
+                    .unwrap_or_else(|| result_var.clone());
+                (ops, guarded)
+            }
+            RewriteResult::Identity(_) => unreachable!("identity already returned"),
+        };
+        let kind_char = vtable_word_guard_kind(&guarded);
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!(
+                "rewrite: getfield({}.{:?}) → vtable guard_value",
+                field.owner_root.as_deref().unwrap_or("<?>"),
+                field.vec_part
+            ),
+        });
+        ops.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Live,
+        });
+        ops.push(SpaceOperation {
+            result: None,
+            kind: OpKind::GuardValue {
+                value: guarded,
+                kind_char,
+            },
+        });
+        RewriteResult::Replace(ops)
+    }
+
     /// RPython `rpython/jit/codewriter/jtransform.py rewrite_op_getfield`.
     ///
     /// Virtualizable lowering takes precedence (RPython `self.vable_array_vars`
@@ -6212,6 +6317,53 @@ impl<'a> Transformer<'a> {
                 detail: format!("rewrite: getfield({}) → dropped (void)", field.name),
             });
             return RewriteResult::Replace(Vec::new());
+        }
+        // A rustc vtable slot is a function address. MIR may type the
+        // `method_*` FieldRead as Ref (a fn-pointer); leaving that
+        // assembles `getfield_gc_r` and `optimize_getfield` then
+        // `make_equal_to`s the Ref onto the ConstInt the load produces.
+        if field.is_vtable_method_slot() {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            let base = base.clone();
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+            // `jtransform.py handle_getfield_typeptr`: `-live-` then
+            // `guard_class` on the instance, after which the method-slot
+            // getfield is a pure read off a Const. The fat-pointer vtable
+            // word is that instance's class; promote it once here so two
+            // `method_*` reads on the same strategy share the guard.
+            let kind_char = vtable_word_guard_kind(&base);
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!(
+                    "rewrite: getfield({}.{}) → vtable guard_value + int-kind slot",
+                    field.owner_root.as_deref().unwrap_or("<?>"),
+                    field.name
+                ),
+            });
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::GuardValue {
+                        value: base.clone(),
+                        kind_char,
+                    },
+                },
+                SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::FieldRead {
+                        base,
+                        field: field.clone(),
+                        ty: ValueType::Int,
+                        pure: true,
+                    },
+                },
+            ]);
         }
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
         // A raw address is an int. A later getfield/setfield/raw_load/
@@ -17050,6 +17202,115 @@ mod tests {
         assert_eq!(
             guard, &input_var,
             "GuardValue.value must follow _do_renaming through same_as"
+        );
+    }
+
+    /// A FatLen that feeds a `{vtable}` `method_*` read is the dyn-trait
+    /// vtable word: `handle_getfield_typeptr` analog keeps the getfield and
+    /// emits `-live-` + `int_guard_value` on that word. A slice FatLen does
+    /// not.
+    #[test]
+    fn transform_graph_promotes_dyn_vtable_fat_len_once() {
+        let mut graph = FunctionGraph::new("vtable_word");
+        let strategy = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "strategy".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let vtable = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: strategy,
+                    field: FieldDescriptor::new("imp", Some("DictStrategyRef".into()))
+                        .with_vec_part(VecFieldPart::FatLen),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: vtable.clone(),
+                field: FieldDescriptor::new(
+                    "method_length",
+                    Some("dictmultiobject::DictStrategy::{vtable}".into()),
+                ),
+                ty: ValueType::Int,
+                pure: true,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops = &transformed
+            .graph
+            .block(transformed.graph.startblock)
+            .operations;
+        let kinds: Vec<&str> = ops
+            .iter()
+            .map(|op| match &op.kind {
+                OpKind::Input { .. } => "input",
+                OpKind::FieldRead { field, .. } if field.vec_part == Some(VecFieldPart::FatLen) => {
+                    "fatlen"
+                }
+                OpKind::FieldRead { field, .. } if field.is_vtable_method_slot() => "method",
+                OpKind::Live => "live",
+                OpKind::GuardValue { kind_char: 'i', .. } => "guard_i",
+                other => panic!("unexpected op {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "input", "fatlen", "live", "guard_i", "live", "guard_i", "method"
+            ],
+            "vtable word is getfield + live + guard_value; slot read re-guards that word then stays a getfield: {ops:?}"
+        );
+
+        let mut slice_graph = FunctionGraph::new("slice_len");
+        let buf = slice_graph
+            .push_op_var(
+                slice_graph.startblock,
+                OpKind::Input {
+                    name: "buf".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        slice_graph.push_op_var(
+            slice_graph.startblock,
+            OpKind::FieldRead {
+                base: buf,
+                field: FieldDescriptor::new("items", Some("Items".into()))
+                    .with_vec_part(VecFieldPart::FatLen),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        slice_graph.set_return(slice_graph.startblock, None);
+        let slice_transformed = transform_graph(&slice_graph, &GraphTransformConfig::default());
+        let slice_ops = &slice_transformed
+            .graph
+            .block(slice_transformed.graph.startblock)
+            .operations;
+        assert!(
+            !slice_ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::GuardValue { .. })),
+            "slice FatLen must not emit a vtable guard: {slice_ops:?}"
         );
     }
 

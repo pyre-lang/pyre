@@ -1716,6 +1716,18 @@ impl AssemblerEncode for Assembler {
                 } else {
                     'v'
                 };
+                // A `{vtable}` `method_*` slot is a function address. The
+                // result bank must be Int so the opcode is `getfield_raw_i`
+                // (or `getfield_gc_i`) matching the ConstInt the load
+                // produces. A leftover Ref bank is `GetfieldGcR` and
+                // `make_equal_to` panics on ConstInt.
+                if field.is_vtable_method_slot() {
+                    assert_eq!(
+                        result_kind, 'i',
+                        "vtable method slot must assemble as getfield_*_i — graph {:?}",
+                        self.current_graph_name,
+                    );
+                }
                 // `jtransform.py rewrite_op_getfield`: a non-pure raw
                 // ref load is refused. A pure one is re-emitted as
                 // `getfield_raw_r` with the `_pure` suffix stripped.
@@ -4355,6 +4367,28 @@ fn fallback_field_layout(
     (field_size, field_type, field_flag, is_signed)
 }
 
+/// A rustc vtable slot does not change. SizeDescr `all_fielddescrs` is
+/// the intern identity `get_field_descr` returns (`descr.py`), so the
+/// slot must already be Int + immutable here or the minted FieldDescr
+/// stays `is_always_pure() == false` and the tracer re-guards it.
+fn vtable_method_slot_layout(
+    owner: &str,
+    field_name: &str,
+    field_type: majit_ir::value::Type,
+    field_flag: majit_ir::descr::ArrayFlag,
+    is_immutable: bool,
+) -> (majit_ir::value::Type, majit_ir::descr::ArrayFlag, bool) {
+    if crate::model::is_vtable_method_slot_parts(owner, field_name) {
+        (
+            majit_ir::value::Type::Int,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            true,
+        )
+    } else {
+        (field_type, field_flag, is_immutable)
+    }
+}
+
 fn bh_field_name(owner: &str, field_name: &str) -> String {
     if owner.is_empty() || field_name.contains('.') {
         field_name.to_string()
@@ -4906,15 +4940,22 @@ fn bh_all_field_specs_for_struct_into(
             }
             let index_in_parent = specs.len();
             let field_key = format!("{field_prefix}{}", fl.name);
+            let (field_type, field_flag, is_immutable) = vtable_method_slot_layout(
+                owner,
+                &fl.name,
+                fl.field_type,
+                fl.flag,
+                fl.is_immutable(),
+            );
             specs.push(bh_field_spec_from_parts(
                 index_in_parent as u32,
                 root_owner,
                 &field_key,
                 base_offset + fl.offset,
                 fl.size,
-                fl.field_type,
-                fl.flag,
-                fl.is_immutable(),
+                field_type,
+                field_flag,
+                is_immutable,
                 fl.is_quasi_immutable(),
                 index_in_parent,
             ));
@@ -4963,6 +5004,13 @@ fn bh_all_field_specs_for_struct_into(
                 let index_in_parent = specs.len();
                 let rank = cc.field_immutability(Some(owner), field_name);
                 let field_key = format!("{field_prefix}{field_name}");
+                let (field_type, field_flag, is_immutable) = vtable_method_slot_layout(
+                    owner,
+                    field_name,
+                    field_type,
+                    field_flag,
+                    rank.is_some(),
+                );
                 specs.push(bh_field_spec_from_parts(
                     index_in_parent as u32,
                     root_owner,
@@ -4971,7 +5019,7 @@ fn bh_all_field_specs_for_struct_into(
                     field_size,
                     field_type,
                     field_flag,
-                    rank.is_some(),
+                    is_immutable,
                     rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
                     index_in_parent,
                 ));
@@ -5421,6 +5469,18 @@ fn fielddescrof(
         field_flag = flag;
         is_field_signed = false;
         field_key = format!("{field_key}{suffix}");
+    }
+    // A rustc vtable slot does not change. `descr.is_always_pure()` lets
+    // the walker fold `getfield_raw_i` of `method_*` off a Const vtable
+    // (`pyjitpl.py` ConstPtr + always-pure getfield) after
+    // `promote_dyn_vtable_word` has guarded that vtable once. The slot
+    // is a function address, so the descr bank is Int even when MIR
+    // typed the FieldRead as a fn-pointer Ref.
+    if field.is_vtable_method_slot() {
+        is_immutable = true;
+        field_type = majit_ir::value::Type::Int;
+        field_flag = majit_ir::descr::ArrayFlag::Unsigned;
+        is_field_signed = false;
     }
     crate::jitcode::BhDescr::Field {
         offset,
@@ -6822,6 +6882,55 @@ mod tests {
         };
         assert_eq!(offset, 0);
         assert_eq!(field_size, crate::layout::target_word_size());
+    }
+
+    #[test]
+    fn fielddescrof_marks_vtable_method_slots_immutable() {
+        use crate::model::FieldDescriptor;
+
+        let field = FieldDescriptor::new(
+            "method_length",
+            Some("dictmultiobject::DictStrategy::{vtable}".into()),
+        );
+        let crate::jitcode::BhDescr::Field {
+            is_immutable,
+            name,
+            owner,
+            field_type,
+            ..
+        } = fielddescrof(&field, &crate::model::ValueType::Ref(None), None, false)
+        else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+        assert!(is_immutable, "method_* on {{vtable}} is always_pure");
+        assert_eq!(field_type, majit_ir::value::Type::Int);
+        assert_eq!(name, "method_length");
+        assert!(
+            owner.contains("{vtable}"),
+            "owner must keep the vtable spelling, got {owner:?}"
+        );
+
+        let qualified = FieldDescriptor::new(
+            "dictmultiobject::DictStrategy::{vtable}.method_length",
+            Some("dictmultiobject::DictStrategy::{vtable}".into()),
+        );
+        assert!(
+            qualified.is_vtable_method_slot(),
+            "a qualified method_* name is still a vtable slot"
+        );
+
+        let ordinary = FieldDescriptor::new("num_live_items", Some("ObjectDictStorage".into()));
+        let crate::jitcode::BhDescr::Field {
+            is_immutable: ordinary_imm,
+            ..
+        } = fielddescrof(&ordinary, &crate::model::ValueType::Int, None, true)
+        else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+        assert!(
+            !ordinary_imm,
+            "a non-vtable field stays mutable without an immutability rank"
+        );
     }
 
     /// The pair the mint census exists for: two `fielddescrof` calls whose
