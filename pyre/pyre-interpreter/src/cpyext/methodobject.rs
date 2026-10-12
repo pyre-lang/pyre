@@ -897,8 +897,7 @@ fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(crate::PyError::type_error("__call__ requires self"));
     }
     let carrier = args[0];
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    descr_call_method(carrier, positional, kwargs)
+    descr_call_method(carrier, &args[1..], None)
 }
 
 /// Keyword path: names stay on `Arguments` (`func__args__`).
@@ -952,16 +951,8 @@ pub(super) fn call_method_def_in_class(
     let name = text_or_empty(unsafe { (*method).ml_name });
     let flags = unsafe { (*method).ml_flags }
         & !(MethFlags::METH_CLASS | MethFlags::METH_STATIC | MethFlags::METH_COEXIST);
-    // `arguments_pos_and_kwargs` builds a real dict; leftover packed
-    // marker dicts still carry the sentinel as a value. Skip that
-    // identity so a caller keyword spelled `__pyre_kw__` stays.
     let keywords: Vec<(String, PyObjectRef)> = match kwargs {
-        Some(dict) => unsafe {
-            pyre_object::w_dict_str_entries(dict)
-                .into_iter()
-                .filter(|(_, value)| !pyre_object::kw_marker::is_kw_marker_sentinel(*value))
-                .collect()
-        },
+        Some(dict) => unsafe { pyre_object::w_dict_str_entries(dict) },
         None => Vec::new(),
     };
     if !keywords.is_empty() && !flags.contains(MethFlags::METH_KEYWORDS) {

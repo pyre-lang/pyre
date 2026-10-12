@@ -1731,8 +1731,8 @@ mod local_class {
         #[staticmethod]
         fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::typedef::check_user_subclass(type_object(), cls)?;
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
+            let positional = args;
+            if positional.len() > 1 {
                 // Construction arguments are rejected by the initializer the
                 // subtype inherits, not by the requested type: a subclass that
                 // defines its own `__init__` consumes them, and
@@ -1754,13 +1754,9 @@ mod local_class {
             let roots = pyre_object::gc_roots::push_roots();
             let cls_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(cls);
-            // A plain `_local()` has no keyword mapping, and a null takes no
-            // shadow-stack slot.
-            let initkwargs_slot = kwargs.map(|w_kwargs| {
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_kwargs);
-                slot
-            });
+            // Keywords stay on `Arguments` for the `*_args` entry. Wrap is
+            // positional: extra constructor args live in `args[1..]`.
+            let initkwargs_slot: Option<usize> = None;
             // Pinned BEFORE the tuple is built: `w_tuple_new` allocates, and
             // while it roots the elements it is given, `cls` and the keyword
             // mapping are raw locals of this frame that a moving collection

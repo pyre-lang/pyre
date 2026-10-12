@@ -1829,11 +1829,11 @@ fn cfield_repr(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let pos = args;
     let get = |name: &str, position: usize| {
         pyre_interpreter::builtins::resolve_pos_or_kw(
             pos.get(position).copied(),
-            kwargs,
+            None,
             name,
             "CField",
             position,
@@ -1975,8 +1975,7 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
             "__init__ requires self",
         ));
     }
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
-    structure_init_from(args[0], pos, kwargs)
+    structure_init_from(args[0], &args[1..], None)
 }
 
 /// Keyword path: field names stay on `Arguments` (`func__args__`).
@@ -2046,9 +2045,6 @@ fn structure_init_from(
                 continue;
             }
             let key = pyre_interpreter::baseobjspace::str_utf8_w(key_obj)?.to_string();
-            if key == "__pyre_kw__" {
-                continue;
-            }
             // Duplicate positional + keyword assignment for the same field.
             if let Some(pos_idx) = names.iter().position(|n| *n == key)
                 && pos_idx < pos_len
@@ -2310,7 +2306,7 @@ fn array_init(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let obj = args[0];
-    let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
+    let pos = &args[1..];
     let npos = pos.len();
     let roots = pyre_object::gc_roots::push_roots();
     let pos_base = roots.publish(pos);
@@ -2883,7 +2879,7 @@ fn pointer_init(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let obj = args[0];
-    let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
+    let pos = &args[1..];
     if let Some(&val) = pos.first()
         && !unsafe { pyre_object::is_none(val) }
     {

@@ -73,12 +73,6 @@ fn extract_char(func: &str, argno: Option<u32>, obj: PyObjectRef) -> Result<Code
 
 /// Single required character argument (`category`, `bidirectional`, …).
 fn one_char(func: &str, args: &[PyObjectRef]) -> Result<CodePoint, PyError> {
-    let (args, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(PyError::type_error(format!(
-            "unicodedata.{func}() takes no keyword arguments"
-        )));
-    }
     if args.len() != 1 {
         return Err(PyError::type_error(format!(
             "unicodedata.{func}() takes exactly one argument ({} given)",
@@ -94,15 +88,8 @@ fn char_and_default(
     func: &str,
     args: &[PyObjectRef],
 ) -> Result<(CodePoint, Option<PyObjectRef>), PyError> {
-    // UCD instance methods still arrive with a packed marker; the
-    // module-level Signature path has already bound and filled omitted
-    // slots with PY_NULL.
-    let (args, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(PyError::type_error(format!(
-            "unicodedata.{func}() takes no keyword arguments"
-        )));
-    }
+    // Module-level Signature path has already bound and filled omitted
+    // slots with PY_NULL. Wrap is positional.
     let given = args.iter().filter(|a| !a.is_null()).count();
     if given == 0 {
         return Err(PyError::type_error(format!(

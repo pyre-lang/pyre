@@ -4,11 +4,8 @@
 # key overwrites a real user keyword and the suite still passes.
 #
 # parity-tests reason: `Arguments.keyword_names_w` / `keywords_w` keep the name
-# out of band (`argument.py`). A builtin that packs a trailing dict tagged
-# `__pyre_kw__` (`pack_pyre_kwargs`) then cannot tell a caller keyword of that
-# spelling from the carrier: `dict(**{K:7})` becomes `{}`, `sum([1,2], **{K:0})`
-# becomes `3`. Each row pins CPython 3.14.6. Rows that still ride the marker
-# accept the current collision as xfail until the owning consumer group lands.
+# out of band (`argument.py`). A user keyword spelled `__pyre_kw__` is a real
+# item: `dict(**{K:7})` is `{K: 7}`. Each row pins CPython 3.14.6.
 #
 # pyre-check: pypy-diverges: pypy3 words round/pow/int/str as "takes no keyword
 # arguments" (and names `int.__new__`/`str.__new__`); type.__init_subclass__
@@ -25,13 +22,11 @@ def _catch(thunk):
         return (type(err).__name__, str(err))
 
 
-def _check(label, thunk, expected, xfail=None):
+def _check(label, thunk, expected):
     got = _catch(thunk)
     if got == expected:
         return
-    if xfail is not None and got == xfail:
-        return
-    raise AssertionError("%s: got %r, expected %r (xfail %r)" % (label, got, expected, xfail))
+    raise AssertionError("%s: got %r, expected %r" % (label, got, expected))
 
 
 def dict_starstar_keeps_the_marker_key():
@@ -39,7 +34,6 @@ def dict_starstar_keeps_the_marker_key():
         "dict(**{K:7})",
         lambda: dict(**{K: 7}),
         ("ok", {K: 7}),
-        xfail=("ok", {}),
     )
 
 
@@ -51,7 +45,6 @@ def dict_starstar_getitem_reads_the_marker_key():
         "dict(**{K:7})[K]",
         thunk,
         ("ok", 7),
-        xfail=("KeyError", repr(K)),
     )
 
 
@@ -118,7 +111,6 @@ def type_init_subclass_names_the_class():
             "TypeError",
             "C.__init_subclass__() takes no keyword arguments",
         ),
-        xfail=("ok", "C"),
     )
 
 
@@ -135,10 +127,6 @@ def dict_get_takes_no_keyword_arguments():
         "{}.get(**{K:1})",
         lambda: {}.get(**{K: 1}),
         ("TypeError", "dict.get() takes no keyword arguments"),
-        xfail=(
-            "TypeError",
-            "cannot use 'dict' as a dict key (unhashable type: 'dict')",
-        ),
     )
 
 

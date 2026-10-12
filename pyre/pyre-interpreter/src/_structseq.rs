@@ -113,18 +113,17 @@ fn structseq_replace_args(
 }
 
 fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let Some(&inst) = positional.first() else {
+    let Some(&inst) = args.first() else {
         return Err(PyError::type_error(
             "__replace__() missing 1 required positional argument: 'self'",
         ));
     };
-    if positional.len() != 1 {
+    if args.len() != 1 {
         return Err(PyError::type_error(
             "__replace__() takes no positional arguments",
         ));
     }
-    structseq_replace_from(inst, kwargs)
+    structseq_replace_from(inst, None)
 }
 
 fn structseq_replace_from(
@@ -162,11 +161,6 @@ fn structseq_replace_from(
         .map(|dict| unsafe { pyre_object::w_dict_items(dict) })
         .unwrap_or_default()
     {
-        if unsafe { pyre_object::is_str(key) }
-            && unsafe { pyre_object::w_str_get_wtf8(key) } == "__pyre_kw__"
-        {
-            continue;
-        }
         let key_obj = if unsafe { pyre_object::is_str(key) } {
             key
         } else {

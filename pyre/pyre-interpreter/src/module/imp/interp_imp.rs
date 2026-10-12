@@ -1240,12 +1240,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // on; registering one would declare a call shape the closure does not
         // actually require.
         crate::make_builtin_function("get_frozen_object", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if crate::builtins::has_real_kwargs(kwargs) {
-                return Err(crate::PyError::type_error(
-                    "_imp.get_frozen_object() takes no keyword arguments",
-                ));
-            }
+            let positional = args;
             if positional.len() > 2 {
                 return Err(crate::PyError::type_error(format!(
                     "get_frozen_object expected at most 2 arguments, got {}",
@@ -1290,12 +1285,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // `interp_imp.py create_builtin`. `BuiltinImporter.create_module`
                 // passes the spec and expects the module back; `_load` then
                 // binds it in sys.modules.
-                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                if crate::builtins::has_real_kwargs(kwargs) {
-                    return Err(crate::PyError::type_error(
-                        "_imp.create_builtin() takes no keyword arguments",
-                    ));
-                }
+                let positional = args;
                 if positional.len() != 1 {
                     return Err(crate::PyError::type_error(format!(
                         "_imp.create_builtin() takes exactly one argument ({} given)",

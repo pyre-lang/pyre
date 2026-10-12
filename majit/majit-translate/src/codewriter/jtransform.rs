@@ -24178,7 +24178,7 @@ mod tests {
         graph.push_op_var(
             entry,
             OpKind::Call {
-                target: CallTarget::function_path(["split_builtin_kwargs"]),
+                target: CallTarget::function_path(["leading_non_null_count"]),
                 args: crate::model::call_args(vec![array.clone()]),
                 result_ty: ValueType::Void,
             },

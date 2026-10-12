@@ -129,8 +129,7 @@ pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     }
 }
 
-/// `aiter(obj)` — delegates to the app-level `aiter` after stripping the
-/// trailing `__pyre_kw__` marker and refusing keywords.  Clinic
+/// `aiter(obj)` — delegates to the app-level `aiter`. Clinic
 /// `builtin_aiter` takes no keywords and exactly one positional.
 pub fn builtin_aiter(args: &[PyObjectRef]) -> PyResult {
     let positional = args;
@@ -141,8 +140,7 @@ pub fn builtin_aiter(args: &[PyObjectRef]) -> PyResult {
     crate::call::call_function_impl_result(w_aiter, &[w_obj])
 }
 
-/// `anext(iterator[, default])` — delegates to the app-level `anext` after
-/// stripping the trailing `__pyre_kw__` marker and refusing keywords.
+/// `anext(iterator[, default])` — delegates to the app-level `anext`.
 /// `_PyArg_CheckPositional` on `builtin_anext` is at least 1, at most 2.
 pub fn builtin_anext(args: &[PyObjectRef]) -> PyResult {
     // Bound scope from `parse_obj`: `aiterator`, `default` (`PY_NULL` omitted).

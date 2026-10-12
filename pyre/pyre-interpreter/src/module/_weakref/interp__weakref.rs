@@ -971,15 +971,9 @@ fn referent_name_suffix(w_obj: PyObjectRef) -> Result<Wtf8Buf, PyError> {
 /// ```
 pub fn descr__init__weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // args[0] = self, args[1] = w_obj, args[2] = w_callable (optional)
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() > 3 {
+    if args.len() > 3 {
         return Err(PyError::type_error(
             "__init__ expected at most 2 arguments".to_string(),
-        ));
-    }
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(PyError::type_error(
-            "ref() does not take keyword arguments".to_string(),
         ));
     }
     Ok(pyre_object::w_none())
@@ -1391,12 +1385,9 @@ fn descr__new__weakref_typecall(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
             "ref() takes at least 1 argument".to_string(),
         ));
     }
-    // PyPy's trailing `__args__` captures keywords separately: __new__ uses
-    // only its positional `w_obj` / `w_callable` slots, while __init__ below
-    // is responsible for rejecting keywords on the exact builtin type. Do
-    // not mistake pyre's flat keyword-marker dict for the callback object.
-    let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    descr__new__weakref(args[0], positional)
+    // `__new__` uses only its positional `w_obj` / `w_callable` slots.
+    // Keywords stay on `Arguments` for the `*_args` entry.
+    descr__new__weakref(args[0], &args[1..])
 }
 
 /// pypy/module/_weakref/interp__weakref.py getweakrefcount
@@ -1468,8 +1459,8 @@ pub fn callable_proxy_descr__call__(args: &[PyObjectRef]) -> Result<PyObjectRef,
     let base = _roots.pin_roots(args);
     let w_obj = force(_roots.get(base))?;
     // `space.call_args(w_obj, __args__)` preserves both positional and keyword
-    // arguments. Re-split pyre's flat builtin kwargs marker before forwarding
-    // so the marker dict cannot leak into the referent as a positional value.
+    // arguments. Wrap is positional, so the rest slice is the referent call's
+    // positionals.
     let mut forwarded = Vec::with_capacity(args.len() - 1);
     for i in 1..args.len() {
         forwarded.push(_roots.get(base + i));

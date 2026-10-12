@@ -381,7 +381,7 @@ fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
 
 /// `array.__new__(cls, typecode, [initializer])` — `interp_array.py w_array`.
 fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let pos = args;
     if pos.len() < 2 {
         return Err(PyError::type_error(
             "array() takes at least 1 argument (0 given)",
@@ -405,30 +405,6 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
         .map_or(PY_NULL, |ty| ty.as_ptr());
     let canonical_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(canonical);
-    let cls = pyre_object::gc_roots::shadow_stack_get(pos_base);
-    // PyPy's interp2app gateway leaves keywords available to a subtype's
-    // overridden __init__.  The exact array type (and a subtype inheriting
-    // array.__init__) rejects them later; __new__ itself must not mistake the
-    // flat ABI's kwargs marker for the optional initializer.
-    let init_matches = std::ptr::eq(cls, pyre_object::gc_roots::shadow_stack_get(canonical_slot))
-        || unsafe {
-            match (
-                pyre_interpreter::baseobjspace::lookup_in_type(cls, "__init__"),
-                pyre_interpreter::baseobjspace::lookup_in_type(
-                    pyre_object::gc_roots::shadow_stack_get(canonical_slot),
-                    "__init__",
-                ),
-            ) {
-                (Some(sub), Some(base)) => std::ptr::eq(sub, base),
-                (None, None) => true,
-                _ => false,
-            }
-        };
-    if init_matches && pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(PyError::type_error(
-            "array.array() takes no keyword arguments",
-        ));
-    }
     let w_typecode = pyre_object::gc_roots::shadow_stack_get(pos_base + 1);
     // typecode must be a 1-character str.
     if !unsafe { pyre_object::is_str(w_typecode) } {

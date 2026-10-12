@@ -3054,8 +3054,7 @@ fn descr_classmethod_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `descr.__call__(cls, *args)`, the unbound spelling.
 fn classmethod_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    classmethod_descr_call_body(carrier, positional, kwargs)
+    classmethod_descr_call_body(carrier, &args[1..], None)
 }
 
 fn classmethod_descr_call_args(
@@ -3099,8 +3098,7 @@ fn classmethod_descr_call_body(
 /// `descr.__call__(instance, *args)`, the unbound spelling.
 fn method_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    method_descr_call_body(carrier, positional, kwargs)
+    method_descr_call_body(carrier, &args[1..], None)
 }
 
 fn method_descr_call_args(
@@ -3585,17 +3583,7 @@ fn ternary_args(positional: &[PyObjectRef], keywords: &[(String, PyObjectRef)]) 
 }
 
 fn split_call(args: &[PyObjectRef]) -> (Vec<PyObjectRef>, Vec<(String, PyObjectRef)>) {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let keywords: Vec<(String, PyObjectRef)> = match kwargs {
-        Some(dict) => unsafe {
-            pyre_object::w_dict_str_entries(dict)
-                .into_iter()
-                .filter(|(_, value)| !pyre_object::kw_marker::is_kw_marker_sentinel(*value))
-                .collect()
-        },
-        None => Vec::new(),
-    };
-    (positional.to_vec(), keywords)
+    (args.to_vec(), Vec::new())
 }
 
 /// `slot_tp_new` — `cls.__new__(cls, *args, **kwds)`.

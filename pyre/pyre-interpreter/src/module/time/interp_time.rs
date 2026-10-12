@@ -2449,12 +2449,7 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// and positional-only: the `app_time.py` definition binds its parameters by
 /// keyword, but the demoted module builtin takes none (`METH_VARARGS`).
 pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "strptime() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     if positional.is_empty() {
         return Err(crate::PyError::type_error(
             "strptime() missing 1 required positional argument: 'string'",
@@ -2509,12 +2504,7 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// positional-only: the `app_time.py` definition binds `name` by keyword, but
 /// the demoted module builtin takes none (`METH_VARARGS`).
 pub fn get_clock_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "get_clock_info() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     if positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "get_clock_info() takes exactly 1 argument ({} given)",

@@ -705,17 +705,11 @@ pub fn method_noarg_failure(
     name: &str,
     receiver_slots: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if crate::builtins::has_builtin_kwargs(args) {
-        Err(crate::PyError::type_error(format!(
-            "{name}() takes no keyword arguments"
-        )))
-    } else {
-        method_arity_failure(
-            name,
-            "no arguments",
-            (args.len() as i64 - receiver_slots).max(0),
-        )
-    }
+    method_arity_failure(
+        name,
+        "no arguments",
+        (args.len() as i64 - receiver_slots).max(0),
+    )
 }
 
 /// Cold `_PyArg_CheckPositional` exact-count failure.
@@ -908,9 +902,9 @@ pub struct BuiltinCode {
     /// gateway.py `BuiltinCode.sig` — the argument `Signature`
     /// (named params, `*args`/`**kwargs`, kw-only tail) used to bind
     /// keyword arguments into positional order before the function runs.
-    /// `null` means no declared signature: keywords are either rejected
-    /// (arity 0..=4) or packed as a trailing marker until that builtin
-    /// migrates.  The pointee is leaked to `'static` so the raw pointer
+    /// `null` means no declared signature: keywords are rejected
+    /// (arity 0..=4 and remaining HOPELESS alike).  The pointee is leaked
+    /// to `'static` so the raw pointer
     /// carries no Drop obligation and is not a GC pointer, matching the
     /// `func` function-pointer convention.
     pub sig: *const Signature,
@@ -1307,38 +1301,17 @@ pub unsafe fn builtin_code_call(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let code = obj as *const BuiltinCode;
-    // The trailing marker dict is not an argument, so every check below reads
-    // the positional slice: counting it as the receiver would report the
-    // keyword dict as the object the descriptor was called on.
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // Wrap is positional. Keywords stay on `Arguments` for passthrough /
+    // Signature entries; remaining HOPELESS CALL_KW already rejects them.
+    let positional = args;
     unsafe { builtin_code_check_receiver(code, positional) }?;
-    // The receiver the two argument refusals below name, read the same way
-    // the check above reads it: an unfilled `self` slot is `PY_NULL`, not an
-    // argument the call supplied.
     let receiver = positional.first().copied().filter(|r| !r.is_null());
     // eval.py:16-23 — a `fast_natural_arity` of 0..=4 is the exact positional
     // count the implementation was registered for; `HOPELESS`,
     // `PASSTHROUGHARGS1` and the `FLATPYCALL` bit all exceed 4.  A body with a
     // fixed arity indexes its slice directly, so a call that supplies a
-    // different number of arguments is rejected before the body runs.  The
-    // trailing marker dict occupies a slot of its own, so the keyword one
-    // argument short of the arity leaves the slice at exactly the declared
-    // length — the split has to happen before the count is read, not only once
-    // a length already mismatched.
+    // different number of arguments is rejected before the body runs.
     let arity = unsafe { (*code).fast_natural_arity } as usize;
-    // A builtin registered by arity alone declares no parameter names (`sig`
-    // is null), so it is positional-only and a keyword cannot name anything it
-    // accepts.  Checked ahead of the count, which is the order the messages
-    // come in (`','.join('a', 'b', x=1)` reports the keyword).  A declared
-    // count above the fast-path ceiling is rejected here too; only the
-    // `FLATPYCALL` / `PASSTHROUGHARGS1` / `HOPELESS` markers, whose bodies read
-    // the raw slice themselves, are left to do their own checking.
-    if arity < BuiltinCodeFlags::FLATPYCALL.bits() as usize
-        && unsafe { (*code).sig.is_null() }
-        && crate::builtins::has_real_kwargs(kwargs)
-    {
-        return Err(no_keyword_arguments(unsafe { &*code }, receiver));
-    }
     if arity <= 4 && positional.len() != arity {
         // A keyword call binds through `parse_obj` first and then hands this
         // function the filled scope (`scope_length` slots, omitted kw-only as
@@ -2167,21 +2140,14 @@ pub fn check_declared_arity(name: &str, arity: usize, given: usize) -> Result<()
     Err(crate::PyError::type_error(message))
 }
 
-/// Check the declared arity as positional-only. Keyword calls carry a trailing
-/// marker dict in the raw builtin slice; the callee still receives that raw
-/// slice after the arity guard.
+/// Check the declared arity as positional-only. Wrap is positional;
+/// keywords stay on `Arguments` for the `*_args` path.
 pub fn check_declared_positional_arity(
     name: &str,
     arity: usize,
     args: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(format!(
-            "{name}() takes no keyword arguments"
-        )));
-    }
-    check_declared_arity(name, arity, positional.len())
+    check_declared_arity(name, arity, args.len())
 }
 
 /// `make_builtin_function` with known fixed arity for fast-path dispatch.
@@ -2456,9 +2422,9 @@ pub fn make_module_builtin_function_with_arity(
 
 /// `make_module_builtin_function_with_arity` additionally carrying an argument
 /// `Signature` so the keyword-call path binds arguments by name at the call
-/// site — the builtin then receives only positional slots and never the
-/// `__pyre_kw__` marker dict. A `*args`/`**kwargs`/kw-only signature is demoted
-/// to `HOPELESS` (as in `make_builtin_function_with_arity_and_maybe_sig`).
+/// site — the builtin then receives only positional slots. A
+/// `*args`/`**kwargs`/kw-only signature is demoted to `HOPELESS` (as in
+/// `make_builtin_function_with_arity_and_maybe_sig`).
 pub fn make_module_builtin_function_with_arity_and_sig(
     name: &'static str,
     func: BuiltinCodeFn,

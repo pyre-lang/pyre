@@ -1253,8 +1253,7 @@ fn allocate_iobase_instance(
     owner_name: &str,
     args: &[PyObjectRef],
 ) -> crate::PyResult {
-    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
-    let Some(&cls) = positional.first() else {
+    let Some(&cls) = args.first() else {
         return Err(crate::PyError::type_error(format!(
             "{owner_name}.__new__(): not enough arguments"
         )));

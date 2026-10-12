@@ -292,15 +292,9 @@ fn bind_method(
 
 fn no_keyword_varargs<'a>(
     args: &'a [PyObjectRef],
-    method: &str,
+    _method: &str,
 ) -> Result<&'a [PyObjectRef], PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::real_kwarg_count(kwargs) != 0 {
-        return Err(PyError::type_error(format!(
-            "{method}() takes no keyword arguments"
-        )));
-    }
-    Ok(positional)
+    Ok(args)
 }
 
 fn dict_string_type(ffi: &W_FFIObject, string: &str) -> Option<PyObjectRef> {

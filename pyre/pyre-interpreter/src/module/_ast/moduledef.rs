@@ -341,7 +341,7 @@ fn is_ast_method_descriptor(descr: PyObjectRef, expected: crate::gateway::Builti
 /// `W_AST_init`.  Keep that PyPy path for every ordinary callable.  Only when
 /// the live type still owns the generated AST init, inherits `object.__new__`
 /// unchanged, and uses the default metaclass do we invoke those same two
-/// descriptor bodies with pyre's raw builtin-kwargs carrier.
+/// descriptor bodies with the raw kwargs dict.
 fn call_type_with_raw_kwargs(
     w_type: PyObjectRef,
     positional: &[PyObjectRef],
@@ -368,10 +368,9 @@ fn call_type_with_raw_kwargs(
     }
 
     Some((|| -> crate::PyResult {
-        // The type, positionals and kwargs entries all cross object.__new__
+        // The type, positionals and kwargs dict all cross object.__new__
         // and ast_type_init, both allocating calls.  Publish the caller-owned
-        // slice before packing the raw carrier and rebuild each argument list
-        // from the forwarded slots.
+        // slice and rebuild each argument list from the forwarded slots.
         let roots = pyre_object::gc_roots::push_roots();
         let type_slot = roots.publish(&[w_type]);
         let positional_base = roots.publish(positional);
@@ -379,28 +378,21 @@ fn call_type_with_raw_kwargs(
         roots.normalize(type_slot, positional.len() + 2);
         let current_positional = |index: usize| roots.get(positional_base + index);
 
-        let current_entries = unsafe { pyre_object::w_dict_items(roots.get(kwargs_slot)) };
-        let carrier = crate::call::pack_pyre_kwargs(&current_entries);
-        let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(carrier);
-
-        let mut new_args = Vec::with_capacity(positional.len() + 2);
+        let mut new_args = Vec::with_capacity(positional.len() + 1);
         new_args.push(roots.get(type_slot));
         for index in 0..positional.len() {
             new_args.push(current_positional(index));
         }
-        new_args.push(roots.get(carrier_slot));
         let instance = crate::typedef::object_descr_new(&new_args)?;
         let instance_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(instance);
 
-        let mut init_args = Vec::with_capacity(positional.len() + 2);
+        let mut init_args = Vec::with_capacity(positional.len() + 1);
         init_args.push(roots.get(instance_slot));
         for index in 0..positional.len() {
             init_args.push(current_positional(index));
         }
-        init_args.push(roots.get(carrier_slot));
-        ast_init(&init_args)?;
+        ast_init_from(&init_args, Some(roots.get(kwargs_slot)))?;
         Ok(roots.get(instance_slot))
     })())
 }
@@ -439,7 +431,7 @@ fn call_method_with_raw_kwargs(
         }
     }
 
-    Some({
+    Some((|| -> crate::PyResult {
         let roots = pyre_object::gc_roots::push_roots();
         let receiver_slot = receiver.map(|receiver| {
             let slot = pyre_object::gc_roots::shadow_stack_len();
@@ -454,21 +446,25 @@ fn call_method_with_raw_kwargs(
             positional.len() + 1 + usize::from(receiver.is_some()),
         );
 
-        let current_entries = unsafe { pyre_object::w_dict_items(roots.get(kwargs_slot)) };
-        let carrier = crate::call::pack_pyre_kwargs(&current_entries);
-        let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(carrier);
-
-        let mut args = Vec::with_capacity(positional.len() + 2);
-        if let Some(slot) = receiver_slot {
-            args.push(roots.get(slot));
+        let zelf = if let Some(slot) = receiver_slot {
+            roots.get(slot)
+        } else if positional.is_empty() {
+            return Err(crate::PyError::type_error("AST.__replace__() missing self"));
+        } else {
+            roots.get(positional_base)
+        };
+        let extra = if receiver_slot.is_some() {
+            positional.len()
+        } else {
+            positional.len() - 1
+        };
+        if extra != 0 {
+            return Err(crate::PyError::type_error(
+                "__replace__() takes no positional arguments",
+            ));
         }
-        for index in 0..positional.len() {
-            args.push(roots.get(positional_base + index));
-        }
-        args.push(roots.get(carrier_slot));
-        ast_replace(&args)
-    })
+        ast_replace_from(zelf, Some(roots.get(kwargs_slot)))
+    })())
 }
 
 /// The raw-keyword exception is decided once at the CALL_FUNCTION_EX
@@ -534,8 +530,7 @@ fn ast_init_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> crate
 }
 
 fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    ast_init_from(positional, kwargs)
+    ast_init_from(args, None)
 }
 
 fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> crate::PyResult {
@@ -620,13 +615,6 @@ fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> cra
         for index in 0..entries.len() {
             let key_slot = entries_base + index * 2;
             let value_slot = key_slot + 1;
-            let key = roots.get(key_slot);
-            if unsafe {
-                pyre_object::is_str(key) && pyre_object::w_str_get_wtf8(key) == "__pyre_kw__"
-            } {
-                continue;
-            }
-
             if crate::baseobjspace::contains(roots.get(fields_obj_slot), roots.get(key_slot))? {
                 if !crate::type_methods::set_discard_checked(
                     roots.get(remaining_slot),
@@ -740,16 +728,15 @@ fn ast_replace_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> cr
 }
 
 fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if positional.is_empty() {
+    if args.is_empty() {
         return Err(crate::PyError::type_error("AST.__replace__() missing self"));
     }
-    if positional.len() != 1 {
+    if args.len() != 1 {
         return Err(crate::PyError::type_error(
             "__replace__() takes no positional arguments",
         ));
     }
-    ast_replace_from(positional[0], kwargs)
+    ast_replace_from(args[0], None)
 }
 
 fn ast_replace_from(zelf: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::PyResult {
@@ -821,13 +808,6 @@ fn ast_replace_from(zelf: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::Py
     for index in 0..keyword_entries.len() {
         let key = roots.get(keyword_base + index * 2);
         let value = roots.get(keyword_base + index * 2 + 1);
-        if unsafe {
-            pyre_object::is_str(key)
-                && pyre_object::w_str_get_wtf8(key) == "__pyre_kw__"
-                && pyre_object::kw_marker::is_kw_marker_sentinel(value)
-        } {
-            continue;
-        }
         if !crate::type_methods::set_discard_checked(roots.get(expecting_slot), key)? {
             // The discard hashes and compares the key through the Python
             // protocol, so read it back rather than reusing the local.
@@ -945,13 +925,6 @@ fn ast_replace_from(zelf: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::Py
     for index in 0..keyword_entries.len() {
         let key = roots.get(keyword_base + index * 2);
         let value = roots.get(keyword_base + index * 2 + 1);
-        if unsafe {
-            pyre_object::is_str(key)
-                && pyre_object::w_str_get_wtf8(key) == "__pyre_kw__"
-                && pyre_object::kw_marker::is_kw_marker_sentinel(value)
-        } {
-            continue;
-        }
         crate::baseobjspace::setitem(roots.get(payload_slot), key, value)?;
     }
 

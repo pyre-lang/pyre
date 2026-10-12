@@ -102,12 +102,7 @@ fn declaring_builtin_type_name(receiver: PyObjectRef) -> String {
 /// TypeError for a keyword handed to a builtin method that takes a fixed
 /// number of positional arguments.
 ///
-/// Every arity helper here counts the raw slice length, so the body it guards
-/// has no parameter a keyword could name — a keyword-aware builtin reads the
-/// trailing marker dict itself (`split_builtin_kwargs`) and never validates by
-/// slice length.  Without this the marker would be counted as a positional
-/// value and reach the implementation as one.  A slot wrapper reports itself
-/// as `wrapper NAME()`, everything else under its qualified name.
+/// Remaining HOPELESS CALL_KW already rejects keywords before wrap runs.
 pub(crate) fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
     reject_kwargs_of(None, args, name)
 }
@@ -115,25 +110,12 @@ pub(crate) fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crat
 /// [`reject_kwargs`] for a method whose declaring class is fixed rather than
 /// read off the receiver — see [`arity_no_args_of`].
 pub fn reject_kwargs_of(
-    owner: Option<&str>,
-    args: &[PyObjectRef],
-    name: &str,
+    _owner: Option<&str>,
+    _args: &[PyObjectRef],
+    _name: &str,
 ) -> Result<(), crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if !crate::builtins::has_real_kwargs(kwargs) {
-        return Ok(());
-    }
-    let slot = positional.first().is_some_and(|&receiver| {
-        crate::gateway::is_slot_wrapper(&declaring_builtin_type_name(receiver), name)
-    });
-    let subject = match (slot, owner) {
-        (true, _) => format!("wrapper {name}"),
-        (false, Some(owner)) => format!("{owner}.{name}"),
-        (false, None) => method_qualname(positional, name),
-    };
-    Err(crate::PyError::type_error(format!(
-        "{subject}() takes no keyword arguments"
-    )))
+    // Remaining HOPELESS CALL_KW already rejects keywords before wrap.
+    Ok(())
 }
 
 /// TypeError for a method requiring exactly `n` positional arguments after
@@ -1169,9 +1151,8 @@ fn str_join_many_items(
 }
 
 /// `str.split` / `str.rsplit` take `sep` and `maxsplit` positionally or by
-/// keyword.  Builtin kwargs arrive as a trailing `__pyre_kw__` dict, so
-/// resolve each argument from its positional slot (after the receiver),
-/// falling back to the matching keyword.
+/// keyword. Resolve each argument from its positional slot (after the
+/// receiver); keywords stay on `Arguments` for the `*_args` path.
 fn resolve_split_args(
     args: &[PyObjectRef],
     _fn_name: &str,
@@ -1772,9 +1753,8 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// (miss residual `_compute_index_storage`) then the elidable
 /// `codepoint_position_at_index`.
 fn str_idx_params_unrooted(args: &[PyObjectRef]) -> Option<(PyObjectRef, PyObjectRef, i64, i64)> {
-    // `startswith(prefix[, start[, end]])` behind the receiver.  A keyword
-    // argument rides the same slice as a trailing marker dict, which is
-    // neither `int` nor `None`, so the bound tests below decline it.
+    // `startswith(prefix[, start[, end]])` behind the receiver. Wrap is
+    // positional.
     if args.len() < 2 || args.len() > 4 {
         return None;
     }
@@ -2144,9 +2124,8 @@ pub fn descr_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     require_receiver(args, "format")?;
     // `pypy/objspace/std/newformat.py Formatter.format` —
     // positional args are slots 1.. of the receiver; keyword args
-    // (`{name}` lookups) live in the trailing CALL_KW dict.
-    let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    str_method_format_core(args[0], positional, kwargs_dict, None)
+    // (`{name}` lookups) stay on `Arguments` for `descr_format_args`.
+    str_method_format_core(args[0], &args[1..], None, None)
 }
 
 /// Keyword path: names stay on `Arguments` (`func__args__`).
@@ -6507,8 +6486,8 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     // Those two residuals stay out of this graph; the slow arm is one real
     // fnaddr.
     if (args.len() == 2 || args.len() == 3) && !args[0].is_null() {
-        // A three-word call can be `d.get(k, **kw)`: the third word is then
-        // the marker dict, not a default.
+        // A three-word call is `d.get(k, default)`. Keywords are refused
+        // before wrap.
         let tail = if args.len() == 3 {
             args[2]
         } else {
@@ -6539,24 +6518,21 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     dict_get_slow(dict, key, default, args.len() as i64)
 }
 
-/// Exact `dict`, an exact `str` key, and a third word that is not the
-/// trailing keyword dict.
+/// Exact `dict`, an exact `str` key, and a third word that is the default.
 ///
 /// Exactness is the requirement, not layout: `py_type_check` passes a `str`
 /// subclass, whose `__hash__` can raise, and the unchecked probe reports that
 /// raise as a miss.  `tail` is `PY_NULL` for a two-word call; anything else is
-/// the caller's third word, and a keyword marker there means the call is
-/// `d.get(k, **kw)`, which `dict_method_get` rejects.
+/// the caller's third word. Keywords are refused before wrap.
 ///
 /// The dict's strategy is deliberately not tested here.  Reading it in this
 /// call and probing in the next is a time-of-check window, so
 /// [`dict_get_plain`] decides it under the lock that probes.
 #[majit_macros::dont_look_inside_cannot_raise]
-fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, tail: PyObjectRef) -> bool {
+fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, _tail: PyObjectRef) -> bool {
     unsafe {
         pyre_object::is_exact_type(dict, &pyre_object::DICT_TYPE)
             && pyre_object::is_exact_type(key, &pyre_object::STR_TYPE)
-            && (tail.is_null() || !crate::builtins::builtin_kwargs_marker_tail(tail))
     }
 }
 
@@ -7057,8 +7033,8 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
 /// subclass instance is updated through its backing dict rather than its own
 /// (uninitialised) strategy slot.
 ///
-/// `__pyre_kw__`-marked dict is the kwargs vehicle pyre's CALL_KW
-/// emits for builtin callees (`call.rs`'s `pack_pyre_kwargs`).
+/// Keyword arguments arrive out of band on `Arguments` (`keyword_names_w`
+/// / `keywords_w`); the wrap path is positional only.
 pub fn dict_init_or_update(
     args: &[PyObjectRef],
     name: &str,
@@ -7074,11 +7050,10 @@ pub fn dict_init_or_update(
         .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + i))
         .collect::<Vec<_>>();
     require_receiver(&rooted_args, "update")?;
-    let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&rooted_args);
     dict_init_or_update_from(
-        positional[0],
-        positional.get(1..).unwrap_or(&[]),
-        kwargs_dict,
+        rooted_args[0],
+        rooted_args.get(1..).unwrap_or(&[]),
+        None,
         name,
     )
 }
@@ -7141,13 +7116,6 @@ fn dict_init_or_update_from(
             let items_base = pyre_object::gc_roots::pin_roots(&flat);
             for i in 0..items.len() {
                 let k = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i);
-                let v = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i + 1);
-                // A leftover packed marker dict still carries the sentinel
-                // under `__pyre_kw__`. Skip that identity, not the key name:
-                // a caller keyword spelled `__pyre_kw__` is a real item.
-                if pyre_object::kw_marker::is_kw_marker_sentinel(v) {
-                    continue;
-                }
                 dict_store_checked(
                     pyre_object::gc_roots::shadow_stack_get(backing_slot),
                     k,

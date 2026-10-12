@@ -691,12 +691,7 @@ mod context_methods {
             mut cls: PyObjectRef,
             args: &[PyObjectRef],
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "_SSLContext.__new__() takes no keyword arguments",
-                ));
-            }
+            let positional = args;
             let protocol_obj = positional.get(1).copied().ok_or_else(|| {
                 pyre_interpreter::PyError::type_error(
                     "_SSLContext.__new__() missing required argument 'protocol'",
@@ -1517,8 +1512,8 @@ mod memory_bio_methods {
             cls: PyObjectRef,
             args: &[PyObjectRef],
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            if positional.len() != 1 || pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+            let positional = args;
+            if positional.len() != 1 {
                 return Err(pyre_interpreter::PyError::type_error(
                     "MemoryBIO() takes no arguments",
                 ));
@@ -2442,13 +2437,11 @@ mod ssl_socket_methods {
         fn read(&mut self, args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             // `args` is the gateway's native copy; a collection in
             // `ensure_connection` or `int_w` does not forward it.
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            let mut w_kwargs = kwargs.unwrap_or(PY_NULL);
+            let positional = args;
             let mut w_size = positional.get(1).copied().unwrap_or(PY_NULL);
             let mut w_buffer = positional.get(2).copied().unwrap_or(PY_NULL);
-            pyre_object::with_roots!(w_kwargs, w_size, w_buffer => ensure_connection(self))?;
-            let kwargs = (!w_kwargs.is_null()).then_some(w_kwargs);
-            if pyre_interpreter::builtins::has_real_kwargs(kwargs) || positional.len() > 3 {
+            pyre_object::with_roots!(w_size, w_buffer => ensure_connection(self))?;
+            if positional.len() > 3 {
                 return Err(pyre_interpreter::PyError::type_error(
                     "read() takes at most 2 arguments",
                 ));

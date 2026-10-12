@@ -364,7 +364,7 @@ fn publish_codec_args(
     args: &[PyObjectRef],
     entry_point: &str,
 ) -> Result<usize, pyre_interpreter::PyError> {
-    let (positional, _) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let positional = args;
     if positional.len() < 4 {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "{entry_point}() requires 4 arguments"
@@ -511,7 +511,7 @@ fn raw_decode_stateful(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 }
 
 fn raw_initial_state(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
-    let (positional, _) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let positional = args;
     if positional.len() < 2 {
         return Err(pyre_interpreter::PyError::type_error(
             "_initial_state() requires 2 arguments",

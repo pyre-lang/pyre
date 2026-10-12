@@ -1382,8 +1382,7 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     // `getrandbits` registers with a `Signature`, so the call path resolves
     // keywords into positional PY_NULL-padded slots before the wrapper runs.
     // The argument preamble counts the leading non-null slots of the wrapper's
-    // own argument array; it does not peel a `split_builtin_kwargs(args)`
-    // result and read that instead.
+    // own argument array.
     //
     // Asked of the array the count reads rather than of the count's position:
     // `descr_check` now precedes the preamble, so the count is no longer the

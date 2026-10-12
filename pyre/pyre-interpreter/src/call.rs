@@ -1428,11 +1428,10 @@ pub fn builtin_code_call_positional(
             // `descr_check` before the binder: binding reports a surplus
             // positional or an unknown keyword, and upstream reaches neither
             // until the receiver has answered for itself.
-            let (positional, _) = crate::builtins::split_builtin_kwargs(current_args);
             unsafe {
                 crate::gateway::builtin_code_check_receiver(
                     current_code as *const crate::gateway::BuiltinCode,
-                    positional,
+                    current_args,
                 )
             }?;
             let fname = unsafe {
@@ -3542,7 +3541,7 @@ pub fn call_with_kwargs(
 }
 
 /// `space.call_args(w_func, args)` — keywords stay on `Arguments`
-/// (`keyword_names_w` / `keywords_w`) instead of a trailing marker dict.
+/// (`keyword_names_w` / `keywords_w`).
 pub fn call_args(callable: PyObjectRef, args: &crate::argument::Arguments) -> PyResult {
     let pos = args.arguments_w.as_slice();
     let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
@@ -3778,8 +3777,8 @@ fn call_with_kwargs_in_ctx_impl(
         // `gateway.py BuiltinCode.funcrun_obj` / `PassThroughArguments0/1.funcrun`.
         // Keywords stay on `Arguments.keyword_names_w` / `keywords_w`. A
         // `Signature` binds through `parse_obj`; a passthrough body receives
-        // the `Arguments` object. Remaining null-sig HOPELESS builtins still
-        // pack a trailing marker dict until those consumers migrate.
+        // the `Arguments` object. Remaining null-sig HOPELESS builtins take
+        // no keywords (`arity <= 4` and `HOPELESS` alike).
         if unsafe { crate::is_builtin_code(code as pyre_object::PyObjectRef) } {
             // `BuiltinCodePassThroughArguments0/1.funcrun`: keywords stay
             // out of band on `Arguments`.  A no-keyword call never reaches
@@ -3820,9 +3819,8 @@ fn call_with_kwargs_in_ctx_impl(
                 );
             }
             // Signature-bearing builtins bind keywords into positional
-            // order via their declared Signature instead of receiving a
-            // trailing `__pyre_kw__` dict.  A null sig falls through to the
-            // dict-packing path below until that builtin is migrated.
+            // order via their declared Signature.  A null sig refuses
+            // keywords the way a fixed-arity builtin does.
             if let Some(sig) =
                 unsafe { crate::builtin_code_get_signature(code as pyre_object::PyObjectRef) }
             {
@@ -3992,10 +3990,7 @@ fn call_with_kwargs_in_ctx_impl(
                     )
                 };
             }
-            let arity = unsafe {
-                crate::builtin_code_get_fast_natural_arity(code as pyre_object::PyObjectRef)
-            };
-            if arity <= 4 && nkw > 0 {
+            if nkw > 0 {
                 let receiver = if npos == 0 {
                     None
                 } else {
@@ -4008,90 +4003,8 @@ fn call_with_kwargs_in_ctx_impl(
                     )
                 });
             }
-            // `gct_fv_gc_malloc` bracket (`framework.py`) for the kwargs
-            // dict below.  `w_dict_new` allocates in the nursery, so the fresh
-            // dict is a young object no root names, and every step that follows
-            // allocates: `w_dict_store`'s strategy promotion and the call this
-            // frame ends in.  An allocation leaves RUNNING before taking
-            // `gc_mutex` (`gc_sync.rs`), so a collector on another thread runs
-            // there and relocates or reclaims anything the shadow stack does
-            // not name.  The scope reaches every `return` below, which is
-            // where the dict stops being a livevar.
-            //
-            // The positionals, the keyword values and the wrapped names are
-            // already pinned by this function's entry bracket, so they are
-            // read back through `current_pos_arg` / `current_kwarg` /
-            // `current_kw_name`. `_collect_keyword_args` setitems that name
-            // object.
-            let kw_roots = pyre_object::gc_roots::push_roots();
-            let kw_slot = kw_roots.base();
-            if nkw > 0 {
-                let _ = kw_roots.pin_root(pyre_object::w_dict_new());
-                for index in 0..nkw {
-                    unsafe {
-                        pyre_object::w_dict_store(
-                            kw_roots.get(kw_slot),
-                            current_kw_name(index),
-                            current_kwarg(index),
-                        );
-                    }
-                }
-                // Store the marker last so a user keyword literally named
-                // `__pyre_kw__` cannot overwrite the sentinel: the reserved
-                // key always resolves to the sentinel value that detection
-                // compares by identity.
-                unsafe {
-                    let marker_key = pyre_object::kw_marker::w_kw_marker_key();
-                    let marker_value = pyre_object::kw_marker::w_kw_marker_sentinel();
-                    pyre_object::w_dict_store(kw_roots.get(kw_slot), marker_key, marker_value);
-                }
-            }
-            let mut full_args: Vec<PyObjectRef> = (0..npos).map(current_pos_arg).collect();
-            if nkw > 0 {
-                full_args.push(kw_roots.get(kw_slot));
-                // Step 2 of the Arguments port: when this is a profiled
-                // builtin call AND kwargs are present, route through
-                // `call_args_and_c_profile_args` with a structured
-                // `Arguments::with_kw(pos_args, keyword_names_w,
-                // keywords_w)`.  Otherwise `call_args_and_c_profile`
-                // (reached via `call_callable`'s on_builtin closure)
-                // would build `Arguments::positional_only(full_args)`
-                // and surface the trailing kwargs dict at index 0,
-                // breaking the FunctionWithFixedCode rebinding's
-                // firstarg() (`argument.py` returns `None`
-                // when positional count is zero, not the kwargs dict).
-                let frame_ptr = c_profile_frame(profile_anchor.live());
-                if !frame_ptr.is_null() {
-                    // The argument marshalling below allocates before the frame
-                    // is handed to the profiling call, so the profiled frame is
-                    // read back out of the anchor rather than from this local.
-                    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
-                    // The dict stores above can move the positionals, the
-                    // names and the dict. Read each back from its slot.
-                    let pos_now = rooted_pos();
-                    let names_now = rooted_names();
-                    let values_now = rooted_values();
-                    let mut arguments =
-                        crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
-                    full_args = pos_now
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(kw_roots.get(kw_slot)))
-                        .collect();
-                    let w_res = crate::baseobjspace::call_args_and_c_profile_args(
-                        unsafe { &mut *frame_anchor.live() },
-                        current_callable(),
-                        &mut arguments,
-                        &full_args,
-                    );
-                    if w_res == pyre_object::PY_NULL {
-                        return Err(take_call_error()
-                            .unwrap_or_else(|| crate::PyError::value_error("call failed")));
-                    }
-                    return Ok(w_res);
-                }
-            }
-            return call_callable_in_ctx(execution_context, current_callable(), &full_args);
+            let pos = rooted_pos();
+            return call_callable_in_ctx(execution_context, current_callable(), &pos);
         }
 
         // For user functions: resolve kwargs to parameter slots
@@ -4465,8 +4378,7 @@ fn call_with_kwargs_in_ctx_impl(
         // (`cdata=` on `_cffi_backend.buffer`, `format=` on `_lzma`, `ident=`
         // on `select.kevent`) are non-acceptable-as-base too. Route those
         // through `__new__` / `__init__`.  `traceback` and `memoryview` bind
-        // the keywords in the body instead of through a `Signature`, so the
-        // marker dict has to reach `__new__` rather than be refused here.
+        // the keywords in the body instead of through a `Signature`.
         let accepts_keywords_despite_nonbase = std::ptr::eq(
             current_type(),
             crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
@@ -6245,23 +6157,7 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             "__build_class__: not enough arguments",
         ));
     }
-    let kwds_dict = if args.len() > 2 {
-        let last = args[args.len() - 1];
-        let is_kwds = unsafe { pyre_object::is_dict(last) }
-            && unsafe {
-                pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-            };
-        is_kwds.then_some(last)
-    } else {
-        None
-    };
-    let base_end = if kwds_dict.is_some() {
-        args.len() - 1
-    } else {
-        args.len()
-    };
-    real_build_class_from(args[0], args[1], &args[2..base_end], kwds_dict)
+    real_build_class_from(args[0], args[1], &args[2..], None)
 }
 
 /// Keyword path: names stay on `Arguments` (`func__args__`).
@@ -6318,7 +6214,7 @@ fn real_build_class_from(
             let extra_roots = extra_roots.as_ref().expect("opened for a kwargs dict");
             let extra_slot = extra_roots.base();
             let w_metaclass = unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") };
-            // Collect extra kwargs (not metaclass, not __pyre_kw__).
+            // Collect extra kwargs (not metaclass).
             // `w_dict_items` already dispatches `is_module_dict` so a
             // class statement with `**module_dict` (rare but valid)
             // walks the strategy.
@@ -6329,7 +6225,7 @@ fn real_build_class_from(
                 for (k, v) in pyre_object::w_dict_items(last) {
                     if pyre_object::is_str(k) {
                         let key = pyre_object::w_str_get_wtf8(k).as_str();
-                        if key != Ok("metaclass") && key != Ok("__pyre_kw__") {
+                        if key != Ok("metaclass") {
                             pyre_object::w_dict_store(extra_roots.get(extra_slot), k, v);
                         }
                     }
@@ -6434,27 +6330,7 @@ pub fn build_class_body_namespace_is_module_dict(args: &[PyObjectRef]) -> bool {
     if args.len() < 2 {
         return false;
     }
-    let mut base_args = &args[2..];
-    if let Some(&last) = base_args.last() {
-        let is_kwds = unsafe { pyre_object::is_dict(last) }
-            && unsafe {
-                pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-            };
-        if is_kwds {
-            // An explicit `metaclass=type` still reaches `descr___prepare__`,
-            // which answers `newdict(module=True)`, so the body runs in a
-            // module dict exactly as the implicit winner does.  Any other
-            // metaclass may define its own `__prepare__` and is undecidable
-            // from here.  The base test below keeps the winner `type`.
-            if let Some(metaclass) = unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") }
-                && !std::ptr::eq(metaclass, crate::typedef::w_type())
-            {
-                return false;
-            }
-            base_args = &base_args[..base_args.len() - 1];
-        }
-    }
+    let base_args = &args[2..];
     let w_type_type = crate::typedef::w_type();
     base_args.iter().all(|&base| unsafe {
         // A non-type base reaches `__mro_entries__`, which runs Python and can
@@ -7436,39 +7312,6 @@ fn build_class_inner(
     Ok(w_type())
 }
 
-/// Pack `(name, value)` keyword pairs into the `__pyre_kw__`-tagged
-/// trailing dict that the builtin kwargs ABI (`split_builtin_kwargs`)
-/// consumes.  Mirrors the producer in `call_with_kwargs`.
-pub(crate) fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
-    // The dict is born young, and `w_dict_store` allocates when it promotes the
-    // strategy — see the bracket in `call_with_kwargs`. `kw_items` is the
-    // caller's array of raw references, so the pairs still to be installed are
-    // pinned as well: the first promotion relocates every one of them.
-    let kw_roots = pyre_object::gc_roots::push_roots();
-    let item_slot = kw_roots.base();
-    for &(k, v) in kw_items {
-        let _ = kw_roots.pin_root(k);
-        let _ = kw_roots.pin_root(v);
-    }
-    let kw_slot = item_slot + kw_items.len() * 2;
-    let _ = kw_roots.pin_root(pyre_object::w_dict_new());
-    unsafe {
-        for i in 0..kw_items.len() {
-            pyre_object::w_dict_store(
-                kw_roots.get(kw_slot),
-                kw_roots.get(item_slot + i * 2),
-                kw_roots.get(item_slot + i * 2 + 1),
-            );
-        }
-        // Marker stored last so a user keyword named `__pyre_kw__` cannot
-        // overwrite the sentinel detection compares by identity.
-        let marker_key = pyre_object::kw_marker::w_kw_marker_key();
-        let marker_value = pyre_object::kw_marker::w_kw_marker_sentinel();
-        pyre_object::w_dict_store(kw_roots.get(kw_slot), marker_key, marker_value);
-    }
-    kw_roots.get(kw_slot)
-}
-
 /// typeobject.py `_init_subclass` — after a class is created,
 /// call `super(w_type, w_type).__init_subclass__(**kwds)` exactly once.
 ///
@@ -7484,8 +7327,7 @@ pub(crate) fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObj
 /// The super-proxy getattr performs descriptor binding (a classmethod
 /// binds `w_type` as cls; a plain function binds `w_type` as the super
 /// obj), and the call forwards only the class-definition keywords.
-/// `init_subclass_kwargs` must already exclude the `__pyre_kw__` marker
-/// and the `metaclass` key.
+/// `init_subclass_kwargs` must already exclude the `metaclass` key.
 ///
 /// `w_effective_bases` is unused now that resolution follows the MRO, but
 /// is kept in the signature so the call sites need not change.

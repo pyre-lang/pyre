@@ -7,8 +7,8 @@
 
 use crate::{
     Signature, make_builtin_function, make_builtin_function_with_arity,
-    make_builtin_function_with_signature, make_module_builtin_function,
-    make_module_builtin_function_with_arity,
+    make_builtin_function_with_signature, make_module_builtin_function_with_arity,
+    make_module_builtin_function_with_arity_and_sig,
 };
 use pyre_object::interp_sre::{
     W_SRE_Match, W_SRE_Pattern, W_SRE_Scanner, W_SRE_Template, is_sre_match, is_sre_pattern,
@@ -47,7 +47,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "compile",
-        make_module_builtin_function("compile", sre_compile)
+        make_module_builtin_function_with_arity_and_sig(
+            "compile",
+            sre_compile,
+            crate::HOPELESS,
+            Signature::new(
+                vec![
+                    "pattern",
+                    "flags",
+                    "code",
+                    "groups",
+                    "groupindex",
+                    "indexgroup",
+                ],
+                None,
+                None,
+                0,
+                0,
+            ),
+        )
     );
     // `_sre.template` (`sre.c` `_sre_template_impl`). `re._compile_template`
     // caches its result; expand/sub consume that object instead of reparsing.
@@ -763,34 +781,36 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let flags = unsafe { w_int_get_value(args[1]) };
-    let groups = if args.len() > 3 {
-        unsafe { w_int_get_value(args[3]) }
-    } else {
-        0
+    let groups_arg = args.get(3).copied().filter(|o| !o.is_null());
+    let groups = match groups_arg {
+        Some(g) => unsafe { w_int_get_value(g) },
+        None => 0,
     };
+    let groupindex_arg = args.get(4).copied().filter(|o| !o.is_null());
+    let indexgroup_arg = args.get(5).copied().filter(|o| !o.is_null());
     // `extract_code` allocates.  Publish every already-live operand first,
     // then mint the omitted defaults — a sequential pin of a fresh object
     // after a published live set is safe; pinning an unpublished live
     // second slice is not.
     let roots = pyre_object::gc_roots::push_roots();
     let mut live = vec![args[0], args[2]];
-    if args.len() > 4 {
-        live.push(args[4]);
+    if let Some(groupindex) = groupindex_arg {
+        live.push(groupindex);
     }
-    if args.len() > 5 {
-        live.push(args[5]);
+    if let Some(indexgroup) = indexgroup_arg {
+        live.push(indexgroup);
     }
     let base = roots.pin_roots(&live);
     let pattern_slot = base;
     let code_list_slot = base + 1;
-    let groupindex_slot = if args.len() > 4 {
+    let groupindex_slot = if groupindex_arg.is_some() {
         base + 2
     } else {
         let _ = roots.pin_root(w_dict_new());
         pyre_object::gc_roots::shadow_stack_len() - 1
     };
-    let indexgroup_slot = if args.len() > 5 {
-        base + 3
+    let indexgroup_slot = if indexgroup_arg.is_some() {
+        base + 2 + usize::from(groupindex_arg.is_some())
     } else {
         let _ = roots.pin_root(w_tuple_new(vec![]));
         pyre_object::gc_roots::shadow_stack_len() - 1

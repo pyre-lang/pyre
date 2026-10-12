@@ -26,8 +26,7 @@ pub(super) fn set_param_args(
 pub(super) fn set_param(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let (pos, kwds) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    set_param_from(pos, kwds)
+    set_param_from(args, None)
 }
 
 fn set_param_from(
@@ -71,9 +70,6 @@ fn set_param_from(
                 continue;
             }
             let key = unsafe { pyre_object::w_str_get_wtf8(k) };
-            if key == "__pyre_kw__" {
-                continue;
-            }
             if key == "enable_opts" {
                 enable_opts = Some(pyre_interpreter::baseobjspace::text_w(v)?);
             } else {

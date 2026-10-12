@@ -6029,10 +6029,10 @@ pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)>
 /// Iterate over (key_wtf8, value) pairs, preserving lone-surrogate keys.
 ///
 /// The surrogate-preserving counterpart of [`w_dict_str_entries`], used
-/// by the keyword-argument ABI (`call_with_kwargs`, `bind_kwargs_to_signature`,
-/// the builtin `__pyre_kw__` readers).  `Arguments` keeps keyword names as
-/// byte-ish `str` (`keywords: [str]`, `argument.py`), so a `**{'\udc80': v}`
-/// key survives as a `Wtf8Buf` rather than being dropped.
+/// by the keyword-argument ABI (`call_with_kwargs`, `bind_kwargs_to_signature`).
+/// `Arguments` keeps keyword names as byte-ish `str` (`keywords: [str]`,
+/// `argument.py`), so a `**{'\udc80': v}` key survives as a `Wtf8Buf`
+/// rather than being dropped.
 ///
 /// Non-str keys are dropped here, which is correct for the name-enumeration
 /// callers (`dir()`, dict merge).  It is NOT, however, the `**kwargs`-unpack

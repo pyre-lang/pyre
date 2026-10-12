@@ -820,6 +820,7 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
         Some("Raised when a COM method call failed."),
         pyre_interpreter::builtins::exc_exception_new,
         Some(comerror_init),
+        None,
         w_exception,
     ));
     COMERROR_TYPE_OBJ.set(comerror);
@@ -846,16 +847,7 @@ fn comerror_init(
             "__init__() missing 1 required positional argument: 'self'",
         ));
     };
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
-    if kwargs.is_some_and(|dict| {
-        unsafe { pyre_object::w_dict_str_entries(dict) }
-            .iter()
-            .any(|(key, _)| key != "__pyre_kw__")
-    }) {
-        return Err(pyre_interpreter::PyError::type_error(
-            "COMError() takes no keyword arguments",
-        ));
-    }
+    let positional = &args[1..];
     let [hresult, text, details] = positional else {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "COMError expected 3 arguments, got {}",

@@ -367,10 +367,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // stores this object directly as its `_select` class attribute; a
         // descriptor-shaped builtin would bind the selector instance and
         // shift the three fd-set arguments.
-        pyre_interpreter::make_module_builtin_function("select", |args| {
+        pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+            "select",
+            |args| {
             #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
-                if args.len() < 3 {
+                if args.len() < 3
+                    || args[0].is_null()
+                    || args[1].is_null()
+                    || args[2].is_null()
+                {
                     return Err(pyre_interpreter::PyError::type_error(
                         "select() takes at least 3 arguments",
                     ));
@@ -575,7 +581,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     "select.select requires host_env feature on a Unix or Windows platform",
                 ))
             }
-        })
+            },
+            pyre_interpreter::HOPELESS,
+            pyre_interpreter::gateway::Signature::new(
+                vec!["rlist", "wlist", "xlist", "timeout"],
+                None,
+                None,
+                0,
+                0,
+            ),
+        ),
     );
 
     // `interp_select.py poll()` — factory returning a fresh polling

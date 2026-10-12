@@ -221,18 +221,17 @@ fn sys_namespace_type() -> PyObjectRef {
 }
 
 fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let Some(&self_obj) = positional.first() else {
+    let Some(&self_obj) = args.first() else {
         return Err(crate::PyError::type_error(
             "__init__() missing 1 required positional argument: 'self'",
         ));
     };
-    if positional.len() > 1 {
+    if args.len() > 1 {
         return Err(crate::PyError::type_error(
             "types.SimpleNamespace() takes no positional arguments",
         ));
     }
-    namespace_apply_kwargs(self_obj, kwargs)
+    namespace_apply_kwargs(self_obj, None)
 }
 
 fn sys_namespace_init_args(
@@ -253,14 +252,14 @@ fn sys_namespace_init_args(
     )
 }
 
-/// Copy the keyword arguments into a namespace instance's dict, skipping the
-/// `__pyre_kw__` marker. Shared by `sys.namespace` and `types.SimpleNamespace`
-/// construction. `lib_pypy._structseq.SimpleNamespace.__init__` writes the
-/// instance dict directly, so `setdictvalue` is used rather than `setattr` — a
-/// subclass `__setattr__` is not consulted during construction.
+/// Copy the keyword arguments into a namespace instance's dict. Shared by
+/// `sys.namespace` and `types.SimpleNamespace` construction.
+/// `lib_pypy._structseq.SimpleNamespace.__init__` writes the instance dict
+/// directly, so `setdictvalue` is used rather than `setattr` — a subclass
+/// `__setattr__` is not consulted during construction.
 fn namespace_apply_kwargs(self_obj: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::PyResult {
     if let Some(dict) = kwargs {
-        namespace_update_dict(self_obj, dict, true)?;
+        namespace_update_dict(self_obj, dict)?;
     } else {
         // `self.__dict__.update(kwargs)` evaluates `self.__dict__` first, so
         // a receiver without an instance dict raises even for no keywords.
@@ -269,15 +268,13 @@ fn namespace_apply_kwargs(self_obj: PyObjectRef, kwargs: Option<PyObjectRef>) ->
     Ok(w_none())
 }
 
-/// CPython 3.14 `PyDict_Update(ns->ns_dict, source)`, with the flat builtin
-/// ABI's private `__pyre_kw__` marker optionally omitted.  Validate every key
+/// CPython 3.14 `PyDict_Update(ns->ns_dict, source)`. Validate every key
 /// before the first store, matching `PyArg_ValidateKeywordArguments`: a bad
 /// mapping cannot partially update the namespace.  The destination is the
 /// real instance dict, so subclass `__setattr__` is deliberately bypassed.
 fn namespace_update_dict(
     self_obj: PyObjectRef,
     source: PyObjectRef,
-    skip_kw_marker: bool,
 ) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
@@ -302,11 +299,6 @@ fn namespace_update_dict(
     for i in 0..items.len() {
         let key = pyre_object::gc_roots::shadow_stack_get(items_sp + i * 2);
         let value = pyre_object::gc_roots::shadow_stack_get(items_sp + i * 2 + 1);
-        if skip_kw_marker
-            && unsafe { pyre_object::w_str_get_wtf8(key).as_str() == Ok("__pyre_kw__") }
-        {
-            continue;
-        }
         crate::type_methods::dict_store_checked(
             pyre_object::gc_roots::shadow_stack_get(sp + 2),
             key,
@@ -402,7 +394,7 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
     for i in 0..args.len() {
         rooted.push(_roots.get(sp + i));
     }
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&rooted);
+    let positional = rooted.as_slice();
     let Some(&self_obj) = positional.first() else {
         return Err(crate::PyError::type_error(
             "__init__() missing 1 required positional argument: 'self'",
@@ -418,17 +410,12 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
     // relative to positional arguments.  Pin the parsed operands into a
     // canonical order before any allocation instead of deriving their slots
     // from the flat input layout.
-    let mut operands = Vec::with_capacity(3);
+    let mut operands = Vec::with_capacity(2);
     operands.push(self_obj);
     if positional.len() == 2 {
         operands.push(positional[1]);
     }
-    if let Some(kwargs) = kwargs {
-        operands.push(kwargs);
-    }
     let operands_sp = _roots.pin_roots(&operands);
-    let has_kwargs = kwargs.is_some();
-    let kwargs_slot = _roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
     if positional.len() == 2 {
         let temporary = w_dict_new();
         let _ = pyre_object::gc_roots::pin_root(temporary);
@@ -441,20 +428,12 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
         namespace_update_dict(
             pyre_object::gc_roots::shadow_stack_get(operands_sp),
             pyre_object::gc_roots::shadow_stack_get(temporary_slot),
-            false,
         )?;
     }
-    let kwargs = has_kwargs.then(|| _roots.get(kwargs_slot));
-    let w_kwargs = if kwargs.is_some() {
-        Some(pyre_object::gc_roots::shadow_stack_get(
-            operands_sp + 1 + usize::from(positional.len() == 2),
-        ))
-    } else {
-        None
-    };
+    // Keywords stay on `Arguments` for `simple_namespace_init_args`.
     namespace_apply_kwargs(
         pyre_object::gc_roots::shadow_stack_get(operands_sp),
-        w_kwargs,
+        None,
     )
 }
 
@@ -489,7 +468,6 @@ fn simple_namespace_init_args(
         namespace_update_dict(
             _roots.get(self_slot),
             pyre_object::gc_roots::shadow_stack_get(temporary_slot),
-            false,
         )?;
     }
     let w_kwargs = if had_kwargs {
@@ -914,18 +892,17 @@ fn simple_namespace_replace_args(
 }
 
 fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let Some(&self_obj) = positional.first() else {
+    let Some(&self_obj) = args.first() else {
         return Err(crate::PyError::type_error(
             "__replace__() missing 1 required positional argument: 'self'",
         ));
     };
-    if positional.len() != 1 {
+    if args.len() != 1 {
         return Err(crate::PyError::type_error(
             "__replace__() takes no positional arguments",
         ));
     }
-    simple_namespace_replace_from(self_obj, kwargs)
+    simple_namespace_replace_from(self_obj, None)
 }
 
 fn simple_namespace_replace_from(
@@ -996,13 +973,11 @@ fn simple_namespace_replace_from(
     namespace_update_dict(
         pyre_object::gc_roots::shadow_stack_get(result_slot),
         pyre_object::gc_roots::shadow_stack_get(sp + 3 + usize::from(has_kwargs)),
-        false,
     )?;
     if has_kwargs {
         namespace_update_dict(
             pyre_object::gc_roots::shadow_stack_get(result_slot),
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
-            true,
         )?;
     }
     Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
@@ -3533,34 +3508,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "getsizeof",
-        crate::gateway::make_builtin_function_with_doc(
-            "getsizeof",
-            |args| {
-                let scope = crate::builtins::bind_builtin_kwargs(
-                    args,
-                    &["object", "default"],
-                    &[true, false],
-                    "getsizeof",
-                )?;
-                let w_obj = scope[0];
-                let w_default = scope[1];
-                let roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = roots.base();
-                let _ = roots.pin_root(w_obj);
-                let default_slot = obj_slot + 1;
-                let w_default = roots.pin_root(w_default);
-                match get_sizeof(roots.get(obj_slot)) {
-                    Ok(size) => Ok(size),
-                    Err(err)
-                        if !w_default.is_null() && err.kind == crate::PyErrorKind::TypeError =>
-                    {
-                        Ok(roots.get(default_slot))
+        {
+            let function = make_builtin_function_with_signature(
+                "getsizeof",
+                |args| {
+                    let scope = crate::builtins::bind_builtin_kwargs(
+                        args,
+                        &["object", "default"],
+                        &[true, false],
+                        "getsizeof",
+                    )?;
+                    let w_obj = scope[0];
+                    let w_default = scope[1];
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = roots.base();
+                    let _ = roots.pin_root(w_obj);
+                    let default_slot = obj_slot + 1;
+                    let w_default = roots.pin_root(w_default);
+                    match get_sizeof(roots.get(obj_slot)) {
+                        Ok(size) => Ok(size),
+                        Err(err)
+                            if !w_default.is_null()
+                                && err.kind == crate::PyErrorKind::TypeError =>
+                        {
+                            Ok(roots.get(default_slot))
+                        }
+                        Err(err) => Err(err),
                     }
-                    Err(err) => Err(err),
-                }
-            },
-            GETSIZEOF_DOC,
-        ),
+                },
+                Signature::new(vec!["object", "default"], None, None, 0, 0),
+            );
+            let _ = unsafe {
+                crate::function::function_set_doc(function, w_str_new(GETSIZEOF_DOC))
+            };
+            function
+        },
     );
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes
     // tests only require the strong-reference delta created by a c_char_p

@@ -194,6 +194,28 @@ pub fn __majit_wrap_builtin_sorted(args: &[PyObjectRef]) -> PyResult {
     crate::call::call_function_impl_result(w_sorted, &live_args)
 }
 
+/// Keyword path: names stay on `Arguments` (`func__args__`).  Applevel
+/// `sorted` reports unknown keywords as `sort()`, so this forwards the
+/// same `Arguments` object rather than binding a Signature on the trampoline.
+pub fn builtin_sorted_args(args: &crate::argument::Arguments) -> PyResult {
+    let roots = pyre_object::gc_roots::push_roots();
+    let pos = &args.arguments_w;
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let pos_base = roots.pin_roots(pos);
+    let names_base = roots.pin_roots(names);
+    let values_base = roots.pin_roots(values);
+    let npos = pos.len();
+    let nnames = names.len();
+    install_applevel_builtins();
+    let w_sorted = app_sorted()?;
+    let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
+    let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(names_base + i)).collect();
+    let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(values_base + i)).collect();
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    crate::call::call_args(w_sorted, &forwarded)
+}
+
 /// Identity of the published app-level `sorted` BuiltinFunction.  Compares
 /// addresses only, so a stale word never matches: the published object is
 /// allocated old and never moves.
