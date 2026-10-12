@@ -146,6 +146,16 @@ fn ffi_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     make_plain_ffi_object(w_subtype)
 }
 
+/// `W_FFIObject___new__(space, w_subtype, __args__)`. Extras belong to
+/// `descr_init`; keywords stay on `Arguments`.
+fn ffi_new_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    let _ = args;
+    ffi_new(&[w_type])
+}
+
 /// `W_FFIObject.descr_init`.
 fn ffi_init(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let a = bind_method(
@@ -1294,7 +1304,7 @@ fn init_ffi_type(ns: PyObjectRef) {
         |name: &str, value: PyObjectRef| pyre_interpreter::__pyre_put_new!(ns_slot, name, value);
     store(
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(ffi_new),
+        pyre_interpreter::typedef::make_new_descr_passthrough1(ffi_new, ffi_new_args),
     );
     store(
         "__init__",

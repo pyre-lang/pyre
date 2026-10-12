@@ -275,7 +275,10 @@ fn init_weakref_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            crate::typedef::make_new_descr(descr__new__weakref_typecall)
+            crate::typedef::make_new_descr_passthrough1(
+                descr__new__weakref_typecall,
+                descr__new__weakref_typecall_args,
+            )
         )
     };
     unsafe {
@@ -1388,6 +1391,15 @@ fn descr__new__weakref_typecall(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
     // `__new__` uses only its positional `w_obj` / `w_callable` slots.
     // Keywords stay on `Arguments` for the `*_args` entry.
     descr__new__weakref(args[0], &args[1..])
+}
+
+fn descr__new__weakref_typecall_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    descr__new__weakref_typecall(&crate::builtins::passthrough1_positional_slice(
+        w_type, args,
+    ))
 }
 
 /// pypy/module/_weakref/interp__weakref.py getweakrefcount

@@ -870,9 +870,19 @@ pub struct MethodOwner {
 /// it is later reached, so a call that named a base reaches the base's
 /// implementation rather than being redirected to whatever the receiver's own
 /// type carries.
+/// `W_PyCWrapperObject.descr_call(self, space, w_self, __args__)`.
+pub type WrapperCallArgsFn = fn(
+    *const std::ffi::c_void,
+    PyObjectRef,
+    &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError>;
+
 pub struct WrapperCall {
     pub slot: *const std::ffi::c_void,
     pub call: fn(*const std::ffi::c_void, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    /// Keyword path: `descr_call(..., w_self, __args__)`. None for a
+    /// wrapper whose call shape takes no keywords (`__repr__`, `__hash__`).
+    pub call_args: Option<WrapperCallArgsFn>,
 }
 
 /// A built-in function object.
@@ -1258,7 +1268,7 @@ pub(crate) unsafe fn builtin_code_check_receiver(
     if owner.is_null() {
         return Ok(());
     }
-    // `bind_kwargs_to_signature` lays out every declared slot and leaves the
+    // `parse_builtin_signature` lays out every declared slot and leaves the
     // ones the call did not fill as `PY_NULL`, so a descriptor invoked with no
     // receiver at all arrives with its `self` slot present but empty.  Reading
     // that slot as an argument reported a missing receiver as a foreign one,
@@ -1520,7 +1530,7 @@ fn arity_mismatch(
 /// (`list.sort($self, /, *, key=None, reverse=False)`).  Such a method is an
 /// argument-clinic `_PyArg_UnpackKeywords` parse under its bare name, so its
 /// errors take that wording; every other shape keeps the `Arguments` wording
-/// `call::bind_kwargs_to_signature` produced.  `pos_args` leads with the
+/// `call::parse_builtin_signature` produced.  `pos_args` leads with the
 /// receiver.
 ///
 /// # Safety
@@ -1745,6 +1755,23 @@ pub unsafe fn builtin_code_passthrough1(obj: PyObjectRef) -> Option<BuiltinCodeP
     unsafe { (*(obj as *const BuiltinCode)).func_args1 }
 }
 
+/// `W_PyCWrapperObject.func` plus `descr_call(..., __args__)`, when this
+/// code is a keyword-accepting slot wrapper.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_wrapper_call_args(
+    obj: PyObjectRef,
+) -> Option<(*const std::ffi::c_void, WrapperCallArgsFn)> {
+    let wrapper = unsafe { (*(obj as *const BuiltinCode)).wrapper };
+    if wrapper.is_null() {
+        return None;
+    }
+    let wrapper = unsafe { &*wrapper };
+    wrapper.call_args.map(|call_args| (wrapper.slot, call_args))
+}
+
 /// Get the name of a built-in function.
 ///
 /// # Safety
@@ -1956,7 +1983,7 @@ pub fn make_builtin_function_as_builtin_with_doc(
 /// defaults onto `Function.w_kw_defs` at registration.  Names without a
 /// recorded default map to `None`.  A non-None default is installed later
 /// through [`function_set_kwonly_default_pairs`].
-fn with_registered_kwonly_defaults(function: PyObjectRef) -> PyObjectRef {
+pub(crate) fn with_registered_kwonly_defaults(function: PyObjectRef) -> PyObjectRef {
     let code = unsafe { crate::function::getcode(function) };
     let Some(sig) = (unsafe { builtin_code_get_signature(code) }) else {
         return function;
@@ -1983,6 +2010,25 @@ fn with_registered_kwonly_defaults(function: PyObjectRef) -> PyObjectRef {
             roots.get(fn_slot),
             roots.get(dict_slot),
         );
+    }
+    roots.get(fn_slot)
+}
+
+/// Store `n` PY_NULL positional defaults on `function`.
+///
+/// `unicodeobject.py` `descr_new` / `bytesobject.py` `descr_new` default
+/// `w_object`/`w_source`, `w_encoding`, and `w_errors` to `None`. The binder
+/// fills omitted slots from `Function.defs_w` (`interp2app` `_getdefaults`);
+/// PY_NULL keeps those slots distinct from an explicit `None`.
+pub fn function_set_null_positional_defaults(function: PyObjectRef, n: usize) -> PyObjectRef {
+    if n == 0 {
+        return function;
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = roots.publish(&[function]);
+    let defs_slot = roots.publish(&[pyre_object::w_tuple_new(vec![pyre_object::PY_NULL; n])]);
+    unsafe {
+        crate::function::function_set_defaults(roots.get(fn_slot), roots.get(defs_slot));
     }
     roots.get(fn_slot)
 }
@@ -2059,7 +2105,7 @@ pub fn make_builtin_function_as_builtin_with_fast_arity_and_signature(
 
 /// `make_builtin_function` for a builtin with a declared argument
 /// `Signature`, so the call path binds keyword arguments into positional
-/// order before the function runs (see `call::bind_kwargs_to_signature`).
+/// order before the function runs (see `call::parse_builtin_signature`).
 pub fn make_builtin_function_with_signature(
     name: &'static str,
     func: BuiltinCodeFn,

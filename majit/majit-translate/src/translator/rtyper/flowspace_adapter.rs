@@ -8134,11 +8134,11 @@ mod tests {
     /// anchor therefore runs both stages and checks the adapter output.
     #[test]
     #[ignore]
-    fn bind_kwargs_to_signature_has_no_residual_vec_from_elem_after_adaptation() {
+    fn parse_builtin_signature_has_no_residual_vec_from_elem_after_adaptation() {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = majit_charon_reader::Llbc::load(path).expect("load real LLBC");
-        let legacy = crate::front::mir::lower_function(&llbc, "bind_kwargs_to_signature")
-            .expect("lower bind_kwargs_to_signature");
+        let legacy = crate::front::mir::lower_function(&llbc, "parse_builtin_signature")
+            .expect("lower parse_builtin_signature");
         let raw_from_elem = legacy
             .blocks
             .iter()

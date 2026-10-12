@@ -1723,25 +1723,38 @@ mod local_class {
                 std::ptr::write(&mut (*this).state_lock, parking_lot::const_mutex(()));
             }
         }
-    }
 
-    #[crate::pyre_methods(doc = "Thread-local data", weakrefable)]
-    impl W_Local {
-        /// `os_local.py descr_local__new__`.
-        #[staticmethod]
-        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            crate::typedef::check_user_subclass(type_object(), cls)?;
-            let positional = args;
-            if positional.len() > 1 {
-                // Construction arguments are rejected by the initializer the
-                // subtype inherits, not by the requested type: a subclass that
-                // defines its own `__init__` consumes them, and
-                // `create_new_dict` replays that call on every further thread.
-                // os_local.py runs this ahead of `allocate_instance`, so a
-                // refused construction never reaches `_register_in_ec`
-                // (os_local.py).
-                let w_parent_init = unsafe { crate::baseobjspace::lookup_where(cls, "__init__") }
-                    .map(|(w_where, _)| w_where);
+        /// `os_local.py descr_local__new__`. Wrap is the positional slice;
+        /// keywords stay on `Arguments` for [`local_descr_new_args`].
+        fn descr_new(
+            cls: PyObjectRef,
+            extra_pos: &[PyObjectRef],
+            kwargs: Option<PyObjectRef>,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(cls);
+            let n_extra = extra_pos.len();
+            let extra_base = pyre_object::gc_roots::pin_roots(extra_pos);
+            let initkwargs_slot = kwargs.map(|dict| {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(dict);
+                slot
+            });
+            crate::typedef::check_user_subclass(
+                type_object(),
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
+            )?;
+            // `if __args__.arguments_w or __args__.keyword_names_w` then the
+            // inherited `__init__` must consume them (`os_local.py`).
+            if n_extra > 0 || initkwargs_slot.is_some() {
+                let w_parent_init = unsafe {
+                    crate::baseobjspace::lookup_where(
+                        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+                        "__init__",
+                    )
+                }
+                .map(|(w_where, _)| w_where);
                 if w_parent_init == Some(crate::typedef::w_object()) {
                     return Err(crate::PyError::type_error(
                         "Initialization arguments are not supported",
@@ -1751,18 +1764,15 @@ mod local_class {
             // os_local.py `Local.__init__` installs the first dictionary
             // before app-level __init__ is entered, preventing recursive
             // initialization.
-            let roots = pyre_object::gc_roots::push_roots();
-            let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(cls);
-            // Keywords stay on `Arguments` for the `*_args` entry. Wrap is
-            // positional: extra constructor args live in `args[1..]`.
-            let initkwargs_slot: Option<usize> = None;
             // Pinned BEFORE the tuple is built: `w_tuple_new` allocates, and
             // while it roots the elements it is given, `cls` and the keyword
             // mapping are raw locals of this frame that a moving collection
             // cannot update.  Pinning them afterwards would record evacuated
             // addresses, so both are read back from their slots below.
-            let initargs = w_tuple_new(positional.get(1..).unwrap_or(&[]).to_vec());
+            let extra_now: Vec<PyObjectRef> = (0..n_extra)
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(extra_base + i))
+                .collect();
+            let initargs = w_tuple_new(extra_now);
             let initargs_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(initargs);
             let dicts_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1813,7 +1823,67 @@ mod local_class {
             drop(roots);
             Ok(obj)
         }
+    }
 
+    /// Positional wrap for `BuiltinCodePassThroughArguments1`.
+    pub(super) fn local_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let Some(&cls) = args.first() else {
+            return Err(crate::PyError::type_error(
+                "_thread._local.__new__(): not enough arguments",
+            ));
+        };
+        W_Local::descr_new(cls, args.get(1..).unwrap_or(&[]), None)
+    }
+
+    /// `descr_local__new__(space, w_subtype, __args__)`.
+    pub(super) fn local_descr_new_args(
+        w_type: PyObjectRef,
+        args: &crate::argument::Arguments,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        let roots = pyre_object::gc_roots::push_roots();
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_type);
+        let (extra, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+        let n_extra = extra.len();
+        let extra_base = pyre_object::gc_roots::pin_roots(&extra);
+        let kwargs_slot = kwargs.map(|dict| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(dict);
+            slot
+        });
+        let extra_now: Vec<PyObjectRef> = (0..n_extra)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(extra_base + i))
+            .collect();
+        let result = W_Local::descr_new(
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            &extra_now,
+            kwargs_slot.map(pyre_object::gc_roots::shadow_stack_get),
+        );
+        drop(roots);
+        result
+    }
+
+    pub(super) fn install_local_new(tp: PyObjectRef) {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let roots = pyre_object::gc_roots::push_roots();
+            let tp_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(tp);
+            let descr =
+                crate::typedef::make_new_descr_passthrough1(local_descr_new, local_descr_new_args);
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(descr);
+            crate::type_dict_store(
+                pyre_object::gc_roots::shadow_stack_get(tp_slot),
+                "__new__",
+                pyre_object::gc_roots::shadow_stack_get(descr_slot),
+            );
+            drop(roots);
+        });
+    }
+
+    #[crate::pyre_methods(doc = "Thread-local data", weakrefable)]
+    impl W_Local {
         #[getter]
         fn __dict__(&self) -> Result<PyObjectRef, crate::PyError> {
             self.current_dict()
@@ -1826,7 +1896,14 @@ pub use local_class::{
 };
 
 fn local_type() -> PyObjectRef {
-    local_class::type_object()
+    let tp = local_class::type_object();
+    // `os_local.py Local` is an ordinary TypeDef base; CPython 3.14's
+    // `local_type_spec` also carries `Py_TPFLAGS_BASETYPE`. The
+    // `cpython_heaptype` marker otherwise projects IMMUTABLETYPE without
+    // BASETYPE, which would refuse `class T(_thread._local)`.
+    unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, true) };
+    local_class::install_local_new(tp);
+    tp
 }
 
 /// W_Root.getdict dispatch for `os_local.Local.getdict`.  `None` means the

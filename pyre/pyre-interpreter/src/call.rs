@@ -1412,9 +1412,10 @@ pub(crate) fn set_orig_class(
 /// here, and the JIT residual-call path in `pyre-jit`) must route through this
 /// to give a `*args`/optional-positional body the slot shape it reads.
 pub fn builtin_code_call_positional(
-    current_code: PyObjectRef,
+    current_callable: PyObjectRef,
     current_args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
+    let current_code = unsafe { crate::getcode(current_callable) } as PyObjectRef;
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code) } {
         // `function.py` `nargs == fast_natural_arity` then `fastcall_N`.
         // A matching positional slice is already the bound scope.  Any other
@@ -1427,45 +1428,51 @@ pub fn builtin_code_call_positional(
         if needs_bind {
             // `descr_check` before the binder: binding reports a surplus
             // positional or an unknown keyword, and upstream reaches neither
-            // until the receiver has answered for itself.
-            unsafe {
-                crate::gateway::builtin_code_check_receiver(
-                    current_code as *const crate::gateway::BuiltinCode,
-                    current_args,
-                )
-            }?;
-            let fname = unsafe {
-                crate::gateway::builtin_code_call_name(current_code, current_args.first().copied())
-            };
-            // `bind_kwargs_to_signature` reaches `store_collected_keyword`,
-            // and that `__hash__` can collect. `current_code` is read again
-            // for the binding error and for `builtin_code_call`, so publish
-            // it with the positional slice and read both back from the slots.
+            // until the receiver has answered for itself.  Pin the Function
+            // first so `funcrun_obj`'s `func.defs_w` / `func.w_kw_defs` stay
+            // live across that check and `_parse`.
             let n_args = current_args.len();
             let roots = pyre_object::gc_roots::push_roots();
-            let code_slot = roots.publish(&[current_code]);
+            let fn_slot = roots.publish(&[current_callable]);
             let args_base = roots.publish(current_args);
-            roots.normalize(code_slot, 1 + n_args);
+            roots.normalize(fn_slot, 1 + n_args);
+            let callable_now = roots.get(fn_slot);
+            let code_now = unsafe { crate::getcode(callable_now) } as PyObjectRef;
+            let args_for_check: Vec<PyObjectRef> =
+                (0..n_args).map(|i| roots.get(args_base + i)).collect();
+            unsafe {
+                crate::gateway::builtin_code_check_receiver(
+                    code_now as *const crate::gateway::BuiltinCode,
+                    &args_for_check,
+                )
+            }?;
+            let callable_now = roots.get(fn_slot);
+            let code_now = unsafe { crate::getcode(callable_now) } as PyObjectRef;
             let args_for_bind: Vec<PyObjectRef> =
                 (0..n_args).map(|i| roots.get(args_base + i)).collect();
-            let bound = match bind_kwargs_to_signature(sig, &fname, &args_for_bind, &[], &[]) {
-                Ok(bound) => bound,
-                Err(err) => {
-                    let code_now = roots.get(code_slot);
-                    let args_now: Vec<PyObjectRef> =
-                        (0..n_args).map(|i| roots.get(args_base + i)).collect();
-                    return Err(unsafe {
-                        crate::gateway::builtin_code_binding_error(
-                            code_now,
-                            sig,
-                            &args_now,
-                            &[],
-                            err,
-                        )
-                    });
-                }
+            let fname = unsafe {
+                crate::gateway::builtin_code_call_name(code_now, args_for_bind.first().copied())
             };
-            return unsafe { crate::builtin_code_call(roots.get(code_slot), &bound) };
+            let bound =
+                match bind_from_callable(callable_now, sig, &fname, &args_for_bind, &[], &[]) {
+                    Ok(bound) => bound,
+                    Err(err) => {
+                        let code_now = unsafe { crate::getcode(roots.get(fn_slot)) } as PyObjectRef;
+                        let args_now: Vec<PyObjectRef> =
+                            (0..n_args).map(|i| roots.get(args_base + i)).collect();
+                        return Err(unsafe {
+                            crate::gateway::builtin_code_binding_error(
+                                code_now,
+                                sig,
+                                &args_now,
+                                &[],
+                                err,
+                            )
+                        });
+                    }
+                };
+            let code_now = unsafe { crate::getcode(roots.get(fn_slot)) } as PyObjectRef;
+            return unsafe { crate::builtin_code_call(code_now, &bound) };
         }
     }
     unsafe { crate::builtin_code_call(current_code, current_args) }
@@ -1478,7 +1485,7 @@ fn call_builtin_code_many_from_roots(root_base: usize, nargs: usize) -> PyResult
     builtin_code_call_positional(rooted[0], &rooted[1..])
 }
 
-fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+fn call_builtin_code_positional(callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     // `gateway.py BuiltinCode.funcrun` is translated with both its code
     // object and `Arguments.arguments_w` live across gateway dispatch.  A
     // collection between the outer `space.call_function` reload and this
@@ -1493,7 +1500,7 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     // whose return type reads Void, which panics the codewriter.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
-    let _ = _roots.pin_root(code);
+    let _ = _roots.pin_root(callable);
     for &arg in args {
         let _ = _roots.pin_root(arg);
     }
@@ -1501,30 +1508,30 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     // common fixed-arity cases the same way so source translation sees no Rust
     // array slicing/indexing helpers between the live roots and the gateway
     // indirect call.  The uncommon variadic case stays a residual helper.
-    let current_code = _roots.get(root_base);
+    let current_callable = _roots.get(root_base);
     match args.len() {
-        0 => builtin_code_call_positional(current_code, &[]),
+        0 => builtin_code_call_positional(current_callable, &[]),
         1 => {
             let a0 = _roots.get(root_base + 1);
-            builtin_code_call_positional(current_code, &[a0])
+            builtin_code_call_positional(current_callable, &[a0])
         }
         2 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
-            builtin_code_call_positional(current_code, &[a0, a1])
+            builtin_code_call_positional(current_callable, &[a0, a1])
         }
         3 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
             let a2 = _roots.get(root_base + 3);
-            builtin_code_call_positional(current_code, &[a0, a1, a2])
+            builtin_code_call_positional(current_callable, &[a0, a1, a2])
         }
         4 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
             let a2 = _roots.get(root_base + 3);
             let a3 = _roots.get(root_base + 4);
-            builtin_code_call_positional(current_code, &[a0, a1, a2, a3])
+            builtin_code_call_positional(current_callable, &[a0, a1, a2, a3])
         }
         nargs => call_builtin_code_many_from_roots(root_base, nargs),
     }
@@ -1674,8 +1681,7 @@ fn call_function_carrier_with_mode(
                 }
                 return Ok(w_res);
             }
-            let code = unsafe { crate::getcode(callable) };
-            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
+            call_builtin_code_positional(callable, args)
         }
         CallableKind::User => match mode {
             CallMode::Jit => call_user_function_with_ctx(execution_context, callable, args),
@@ -2694,7 +2700,7 @@ pub fn call_callable_inline_residual(
 /// diagnostics, `*args` / `**kwargs` packing, error message text) matches
 /// CPython bit-for-bit.  Reifying an `Arguments` object with the same
 /// method surface is a separate, much larger refactor that would also
-/// re-thread `call_with_kwargs` / `bind_kwargs_to_signature`; it is out of
+/// re-thread `call_with_kwargs` / `parse_builtin_signature`; it is out of
 /// scope here and tracked as a follow-up.
 pub(crate) fn resolve_kwargs(
     callable: PyObjectRef,
@@ -3134,36 +3140,6 @@ unsafe fn store_collected_keyword(
     })
 }
 
-/// Bind keyword arguments to a builtin's declared `Signature`, producing
-/// the flat positional slice the `#[pyre_function]` wrapper reads.
-///
-/// `gateway.py BuiltinCode.funcrun_obj` calls `args.parse_obj` (`argument.py`)
-/// with `func.defs_w` / `func.w_kw_defs`.  This is that binder: the previous
-/// hand copy of `_match_signature` is gone.  Missing positional slots stay
-/// `PY_NULL` when `Function.defs_w` is empty so wrappers that treat a null
-/// slot as omitted keep working until registration copies `func_defaults`.
-///
-/// `keyword_names_w` and `keywords_w` are the wrapped lists
-/// `Arguments.keyword_names_w` keeps parallel. Callers that only have host
-/// buffers mint one exact `str` per name before calling.
-pub fn bind_kwargs_to_signature(
-    sig: &crate::Signature,
-    fname: &str,
-    pos_args: &[PyObjectRef],
-    keyword_names_w: &[PyObjectRef],
-    keywords_w: &[PyObjectRef],
-) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    parse_builtin_signature(
-        sig,
-        fname,
-        pos_args,
-        keyword_names_w,
-        keywords_w,
-        None,
-        pyre_object::PY_NULL,
-    )
-}
-
 fn function_defaults_vec(func: PyObjectRef) -> Option<Vec<PyObjectRef>> {
     let defaults = unsafe { crate::function_get_defaults(func) };
     if defaults.is_null() || !unsafe { pyre_object::is_tuple(defaults) } {
@@ -3227,21 +3203,9 @@ pub fn parse_builtin_signature(
     let defaults_base = defaults_w.map(|d| pyre_object::gc_roots::pin_roots(d));
     let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_kw_defs);
-    // `builtin_code_call_positional` has the BuiltinCode, not the Function,
-    // so `w_kw_defs` is null there.  Fill the same None dict
-    // `with_registered_kwonly_defaults` stores on the Function
-    // (`interp2app` `_getdefaults`).
-    let synthesized = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot).is_null()
-        && sig.num_kwonlyargnames() > 0;
-    if synthesized {
-        let synthesized_defs = synthesize_kwonly_none_defaults(sig);
-        let _ = pyre_object::gc_roots::pin_root(synthesized_defs);
-    }
-    let w_kw_defs = if synthesized {
-        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1)
-    } else {
-        pyre_object::gc_roots::shadow_stack_get(kw_defs_slot)
-    };
+    // `Function.w_kw_defs` is filled at registration
+    // (`with_registered_kwonly_defaults` / `interp2app` `_getdefaults`).
+    let w_kw_defs = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot);
     let pos_now: Vec<PyObjectRef> = (0..npos)
         .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
         .collect();
@@ -3282,7 +3246,16 @@ pub fn parse_builtin_signature(
         let skip = usize::from(signature_cls_constructor(sig));
         let n = sig.argnames.len() - skip;
         let m = npos + nkw - skip;
-        if skip != 0 && nkw == 0 {
+        // `_PyArg_CheckPositional` (`int("5", 10, 1)` → `int expected at most
+        // 2 arguments, got 3`) applies when user-facing parameters after
+        // `cls` are still positional-only. Clinic METH_KEYWORDS constructors
+        // (`traceback`) use `{fname}() takes at most {n} arguments ({m}
+        // given)` for an all-positional overflow as well.
+        // [3.14-spec] `unicode_new` uses `PyArg_UnpackTuple(..., "str", 0, 3)`
+        // so `str("a","b","c","d")` is `str expected at most 3 arguments, got 4`
+        // even though encoding/errors are positional-or-keyword. `bytes` stays
+        // on the clinic form. Measured 3.14.6; `test_str.StrTest.test_str_invalid_call`.
+        if skip != 0 && nkw == 0 && (sig.posonlyargcount > skip || fname == "str") {
             let argword = if n == 1 { "argument" } else { "arguments" };
             return Err(crate::PyError::type_error(format!(
                 "{fname} expected at most {n} {argword}, got {m}"
@@ -3299,6 +3272,18 @@ pub fn parse_builtin_signature(
             let names_now: Vec<PyObjectRef> = (0..nkw)
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
                 .collect();
+            // Clinic `_PyArg_UnpackKeywords` reports the first empty required
+            // slot even when the call also passed an unknown or duplicate
+            // keyword (`traceback(None, frame, 0, spam=1)`).
+            if matches!(
+                err,
+                crate::argument::ArgErr::UnknownKwds { .. }
+                    | crate::argument::ArgErr::MultipleValues { .. }
+            ) && let Some(msg) =
+                clinic_first_unfilled_required(sig, fname, npos, ndef, &names_now)
+            {
+                return Err(crate::PyError::type_error(msg));
+            }
             return Err(rewrite_builtin_keyword_error(sig, fname, &names_now, err));
         }
         Err(crate::argument::MatchSignatureError::Py(err)) => return Err(err),
@@ -3319,6 +3304,56 @@ fn signature_accepts_keywords(sig: &crate::Signature) -> bool {
 
 fn signature_cls_constructor(sig: &crate::Signature) -> bool {
     sig.argnames.first().copied() == Some("cls")
+}
+
+/// Clinic wording for the first required positional-or-keyword slot left
+/// empty. `ndef` is `Function.defs_w` length, not the PY_NULL pad.
+fn clinic_first_unfilled_required(
+    sig: &crate::Signature,
+    fname: &str,
+    npos: usize,
+    ndef: usize,
+    keyword_names_w: &[PyObjectRef],
+) -> Option<String> {
+    if !signature_accepts_keywords(sig) || sig.has_kwarg() || sig.has_vararg() {
+        return None;
+    }
+    let skip = usize::from(signature_cls_constructor(sig));
+    // `sum` / `round` are not constructors; an unknown keyword is
+    // `got an unexpected keyword argument` even when a later optional
+    // slot is empty. Restrict to `cls` constructors (`traceback`).
+    if skip == 0 {
+        return None;
+    }
+    let n_pos_params = sig.num_argnames();
+    let optional_start = n_pos_params.saturating_sub(ndef);
+    // `int.base` is the trailing pos-or-kw of a descr_new that still has
+    // user-facing positional-only parameters. `Function.defs_w` is often
+    // empty, so treat that last slot as optional rather than required.
+    let user_posonly = sig.posonlyargcount.saturating_sub(skip);
+    for i in skip..n_pos_params {
+        if npos > i {
+            continue;
+        }
+        let name = sig.argnames[i];
+        let filled_by_kw = keyword_names_w
+            .iter()
+            .any(|&w_name| keyword_name_utf8(&keyword_name_text(w_name)) == Some(name));
+        if filled_by_kw {
+            continue;
+        }
+        if i >= optional_start {
+            continue;
+        }
+        if user_posonly > 0 && i + 1 == n_pos_params {
+            continue;
+        }
+        let pos = i - skip + 1;
+        return Some(format!(
+            "{fname}() missing required argument '{name}' (pos {pos})"
+        ));
+    }
+    None
 }
 
 /// [3.14-spec] overlay on `ArgErr` variants while they are still known.
@@ -3404,27 +3439,6 @@ fn first_unexpected_keyword_name(
     None
 }
 
-/// Stand-in for `Function.w_kw_defs` when the binder has only a BuiltinCode
-/// (`builtin_code_call_positional`).  Every kw-only name maps to `None` so
-/// `parse_obj` fills the slot rather than raising `ArgErrMissing`.
-fn synthesize_kwonly_none_defaults(sig: &crate::Signature) -> PyObjectRef {
-    let n_pos = sig.num_argnames();
-    let n_kwonly = sig.num_kwonlyargnames();
-    let _roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = _roots.base();
-    let _ = _roots.pin_root(pyre_object::w_dict_new());
-    for i in 0..n_kwonly {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str(
-                _roots.get(dict_slot),
-                sig.argnames[n_pos + i],
-                pyre_object::w_none(),
-            );
-        }
-    }
-    _roots.get(dict_slot)
-}
-
 /// Residual `BuiltinCodePassThroughArguments0.funcrun`.
 #[majit_macros::dont_look_inside]
 fn call_passthrough0(
@@ -3442,6 +3456,17 @@ fn call_passthrough1(
     arguments: &crate::argument::Arguments,
 ) -> PyResult {
     func_args(w_obj, arguments)
+}
+
+/// Residual `W_PyCWrapperObject.descr_call(..., w_self, __args__)`.
+#[majit_macros::dont_look_inside]
+fn call_passthrough_wrapper(
+    call_args: crate::gateway::WrapperCallArgsFn,
+    slot: *const std::ffi::c_void,
+    w_obj: PyObjectRef,
+    arguments: &crate::argument::Arguments,
+) -> PyResult {
+    call_args(slot, w_obj, arguments)
 }
 
 /// `baseobjspace.py call_args_and_c_profile` around a passthrough body.
@@ -3784,6 +3809,34 @@ fn call_with_kwargs_in_ctx_impl(
             // out of band on `Arguments`.  A no-keyword call never reaches
             // here, so the positional slice ABI (`func`) is unchanged.
             let code_obj = code as pyre_object::PyObjectRef;
+            // `W_PyCWrapperObject.descr_call(..., w_self, __args__)`.
+            // `__init__`/`__call__` are retagged `SLOT_WRAPPER_TYPE`;
+            // `__new__` stays a Function with `new_self` (`function_set_new_self`)
+            // but still carries `WrapperCall.call_args`. Dispatch on that
+            // field, not on `is_slot_wrapper`.
+            if let Some((slot, call_args)) =
+                unsafe { crate::gateway::builtin_code_wrapper_call_args(code_obj) }
+            {
+                if npos == 0 {
+                    return Err(PyError::type_error(format!(
+                        "{}() missing 1 required positional argument",
+                        unsafe { crate::gateway::builtin_code_name(code_obj) }
+                    )));
+                }
+                return call_passthrough_maybe_profile(
+                    profile_anchor.live(),
+                    current_callable,
+                    || {
+                        let rest: Vec<PyObjectRef> = (1..npos).map(current_pos_arg).collect();
+                        let names_now = rooted_names();
+                        let values_now = rooted_values();
+                        crate::argument::Arguments::with_kw(&rest, &names_now, &values_now)
+                    },
+                    |arguments| {
+                        call_passthrough_wrapper(call_args, slot, current_pos_arg(0), arguments)
+                    },
+                );
+            }
             if let Some(func_args) = unsafe { crate::gateway::builtin_code_passthrough0(code_obj) }
             {
                 return call_passthrough_maybe_profile(
@@ -4731,7 +4784,7 @@ pub fn call_function_impl_result(
                 // signature-aware positional path so variadic builtins
                 // (*args / **kwargs) get their tail packed; non-variadic
                 // builtins fall through to the raw fast path.
-                return call_builtin_code_positional(code as pyre_object::PyObjectRef, args);
+                return call_builtin_code_positional(callable, args);
             }
             // User function: create frame + eval. The bare-PyObjectRef
             // helper stashes any error in `PENDING_CALL_ERROR` and returns

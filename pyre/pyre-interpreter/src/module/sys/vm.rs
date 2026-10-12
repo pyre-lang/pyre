@@ -383,6 +383,16 @@ fn simple_namespace_new(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::gc_roots::shadow_stack_get(object_slot))
 }
 
+/// `namespace_new` ignores constructor arguments after the subtype; they
+/// belong to `namespace_init`. Keywords stay on `Arguments`.
+fn simple_namespace_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let flat = crate::builtins::passthrough1_positional_slice(w_type, args);
+    simple_namespace_new(&flat)
+}
+
 /// CPython 3.14 `namespace_init`: accept at most one positional mapping or
 /// iterable of pairs, validate that its resulting dict has only string keys,
 /// merge it into the instance, then overlay keyword arguments.  This is the
@@ -517,8 +527,9 @@ fn simple_namespace_variadic_method(
 fn simple_namespace_new_descr() -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    let descr = crate::typedef::make_new_descr_with_doc(
+    let descr = crate::typedef::make_new_descr_passthrough1_with_doc(
         simple_namespace_new,
+        simple_namespace_new_args,
         "Create and return a new object.  See help(type) for accurate signature.",
     );
     let _ = pyre_object::gc_roots::pin_root(descr);

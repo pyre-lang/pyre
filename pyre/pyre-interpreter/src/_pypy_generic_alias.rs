@@ -1563,7 +1563,7 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__call__",
-            make_builtin_function_passthrough1("__call__", ga_call, ga_call_args),
+            make_builtin_function_passthrough1("__call__", ga_call, ga_call_args)
         )
     };
     unsafe {

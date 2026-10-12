@@ -4540,23 +4540,19 @@ fn init_module_type(mut ns: PyObjectRef) {
             "Create and return a new object.  See help(type) for accurate signature.",
         )
     );
-    crate::__pyre_store!(
-        ns,
-        "__init__",
-        {
-            let code = crate::gateway::builtin_code_new_with_signature(
-                "__init__",
-                module_descr_init,
-                Some("Initialize self.  See help(type(self)) for accurate signature."),
-                crate::gateway::Signature::new(vec!["self", "name", "doc"], None, None, 0, 1),
-            );
-            crate::function_new_with_fixed_code(
-                code as *const (),
-                "__init__".to_string(),
-                pyre_object::PY_NULL,
-            )
-        }
-    );
+    crate::__pyre_store!(ns, "__init__", {
+        let code = crate::gateway::builtin_code_new_with_signature(
+            "__init__",
+            module_descr_init,
+            Some("Initialize self.  See help(type(self)) for accurate signature."),
+            crate::gateway::Signature::new(vec!["self", "name", "doc"], None, None, 0, 1),
+        );
+        crate::function_new_with_fixed_code(
+            code as *const (),
+            "__init__".to_string(),
+            pyre_object::PY_NULL,
+        )
+    });
     for (name, function, arity, doc) in [
         (
             "__repr__",
@@ -6479,7 +6475,11 @@ fn init_reversed_type(mut ns: PyObjectRef) {
         "__doc__",
         w_str_new("Return a reverse iterator over the values of the given sequence.")
     );
-    crate::__pyre_store!(ns, "__new__", make_functional_new_descr_posonly(reversed_descr_new, vec!["cls", "sequence"]));
+    crate::__pyre_store!(
+        ns,
+        "__new__",
+        make_functional_new_descr_posonly(reversed_descr_new, vec!["cls", "sequence"])
+    );
     for (name, function, arity) in [
         (
             "__iter__",
@@ -6556,7 +6556,7 @@ fn init_filter_type(mut ns: PyObjectRef) {
     crate::__pyre_store!(
         ns,
         "__new__",
-        make_functional_new_descr_passthrough1(filter_descr_new, filter_descr_new_args),
+        make_functional_new_descr_passthrough1(filter_descr_new, filter_descr_new_args)
     );
     for (name, function) in [
         (
@@ -7909,16 +7909,19 @@ fn init_str_type(ns: PyObjectRef) {
             ns_slot,
             "__new__",
             // unicodeobject.py descr_new — `object`/`encoding`/`errors`
-            // are all positional-or-keyword.
-            make_new_descr_with_signature(
-                str_descr_new,
-                crate::gateway::Signature::new(
-                    vec!["cls", "object", "encoding", "errors"],
-                    None,
-                    None,
-                    0,
-                    1,
+            // are all positional-or-keyword with `None` defaults.
+            crate::gateway::function_set_null_positional_defaults(
+                make_new_descr_with_signature(
+                    str_descr_new,
+                    crate::gateway::Signature::new(
+                        vec!["cls", "object", "encoding", "errors"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                3,
             )
         )
     };
@@ -8236,7 +8239,7 @@ fn init_str_type(ns: PyObjectRef) {
                 "format",
                 crate::type_methods::descr_format,
                 crate::type_methods::descr_format_args,
-            ),
+            )
         )
     };
     unsafe {
@@ -9151,7 +9154,13 @@ fn init_dict_type(ns: PyObjectRef) {
             )
         )
     };
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(dict_descr_new, dict_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(dict_descr_new, dict_descr_new_args)
+        )
+    };
     // dictmultiobject.py:446 __class_getitem__ = interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     unsafe {
@@ -9178,14 +9187,14 @@ fn init_dict_type(ns: PyObjectRef) {
                 "__init__",
                 crate::type_methods::dict_descr_init,
                 crate::type_methods::dict_descr_init_args,
-            ),
+            )
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "get",
-            make_builtin_function("get", crate::type_methods::__majit_wrap_dict_descr_get),
+            make_builtin_function("get", crate::type_methods::__majit_wrap_dict_descr_get)
         )
     };
     unsafe {
@@ -9229,7 +9238,7 @@ fn init_dict_type(ns: PyObjectRef) {
                 "update",
                 crate::type_methods::dict_method_update,
                 crate::type_methods::dict_method_update_args,
-            ),
+            )
         )
     };
     unsafe {
@@ -10188,7 +10197,7 @@ fn init_pytraceback_type(ns: PyObjectRef) {
                     0,
                     1,
                 ),
-            ),
+            )
         )
     };
     // `PyTraceback.typedef` registers `__dir__` immediately after the
@@ -11846,7 +11855,7 @@ fn init_tuple_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_passthrough1(__majit_wrap_tuple_descr_new, tuple_descr_new_args),
+            make_new_descr_passthrough1(__majit_wrap_tuple_descr_new, tuple_descr_new_args)
         )
     };
     unsafe {
@@ -14277,6 +14286,20 @@ fn type_descr_init_args(_self: PyObjectRef, args: &crate::argument::Arguments) -
     Ok(pyre_object::w_none())
 }
 
+/// typeobject.py `descr___prepare__(space, __args__)`.
+fn type_descr_prepare(_args: &[PyObjectRef]) -> crate::PyResult {
+    Ok(pyre_object::w_module_dict_new())
+}
+
+/// Keywords stay on `Arguments`; every argument is swallowed.
+fn type_descr_prepare_args(
+    _w_cls: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let _ = args;
+    Ok(pyre_object::w_module_dict_new())
+}
+
 fn init_type_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -14297,7 +14320,7 @@ fn init_type_type(ns: PyObjectRef) {
             make_new_descr_passthrough1(
                 crate::builtins::type_descr_new,
                 crate::builtins::type_descr_new_args,
-            ),
+            )
         )
     };
     unsafe {
@@ -14348,7 +14371,7 @@ fn init_type_type(ns: PyObjectRef) {
                 "__init__",
                 type_descr_init,
                 type_descr_init_args,
-            ),
+            )
         )
     };
     // CPython 3.14 typeobject.c slotdefs: type has its own native
@@ -15089,19 +15112,33 @@ fn init_type_type(ns: PyObjectRef) {
     // implementation only has to produce the mapping a class body executes
     // in, so a metaclass that does not override it never sees the name,
     // bases, or keywords `build_class` forwards.
-    unsafe {
-        crate::__pyre_put_new!(
-            ns_slot,
+    {
+        let prepare_func = crate::gateway::make_builtin_function_passthrough1(
             "__prepare__",
-            pyre_object::function::w_classmethod_new(
-                crate::gateway::make_builtin_function_with_text_signature(
-                    "__prepare__",
-                    |_args| Ok(pyre_object::w_module_dict_new()),
-                    "($cls, name, bases, /, **kwds)",
-                ),
+            type_descr_prepare,
+            type_descr_prepare_args,
+        );
+        let func_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(prepare_func);
+        unsafe {
+            crate::function::fset_func_text_signature(
+                pyre_object::gc_roots::shadow_stack_get(func_slot),
+                pyre_object::w_str_new("($cls, name, bases, /, **kwds)"),
+            );
+        }
+        let prepare = pyre_object::function::w_classmethod_new(
+            pyre_object::gc_roots::shadow_stack_get(func_slot),
+        );
+        let prepare_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(prepare);
+        unsafe {
+            crate::__pyre_put_new!(
+                ns_slot,
+                "__prepare__",
+                pyre_object::gc_roots::shadow_stack_get(prepare_slot)
             )
-        )
-    };
+        };
+    }
 
     // typeobject.py descr___subclasses__ — return the list of
     // immediate subclasses recorded in `weak_subclasses` (dead weakrefs
@@ -16367,7 +16404,7 @@ fn init_function_type_common(ns: PyObjectRef) {
                 "__call__",
                 function_descr_call,
                 function_descr_call_args,
-            ),
+            )
         )
     };
 }
@@ -17596,7 +17633,7 @@ fn init_function_type(ns: PyObjectRef) {
                     0,
                     1,
                 ),
-            ),
+            )
         )
     };
     unsafe {
@@ -17860,7 +17897,7 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                 "__call__",
                 builtin_function_descr_call,
                 builtin_function_descr_call_args,
-            ),
+            )
         )
     };
 
@@ -18453,7 +18490,7 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
                 "__call__",
                 slot_wrapper_descr_call,
                 slot_wrapper_descr_call_args,
-            ),
+            )
         );
         // [3.14-spec] PyPy keeps slot functions as
         // `FunctionWithFixedCode`, while CPython's `PyWrapperDescr_Type`
@@ -18704,7 +18741,7 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
                 "__call__",
                 method_wrapper_descr_call,
                 method_wrapper_descr_call_args,
-            ),
+            )
         );
         crate::__pyre_put_new!(
             ns_slot,
@@ -18882,7 +18919,7 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
                 "__call__",
                 method_descriptor_descr_call,
                 method_descriptor_descr_call_args,
-            ),
+            )
         );
         crate::__pyre_put_new!(
             ns_slot,
@@ -19043,7 +19080,7 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
                 "__call__",
                 classmethod_descriptor_descr_call,
                 classmethod_descriptor_descr_call_args,
-            ),
+            )
         );
         // No `__reduce__`: `PyClassMethodDescr_Type` has none, so pickling one
         // falls through to `copyreg._reduce_ex` and is rejected.
@@ -19121,7 +19158,7 @@ fn init_method_type(ns: PyObjectRef) {
                 "__call__",
                 crate::function::descr_method_call,
                 crate::function::descr_method_call_args,
-            ),
+            )
         )
     };
     unsafe {
@@ -19472,23 +19509,21 @@ fn init_code_type(ns: PyObjectRef) {
         ("__replace__", "The same as replace()."),
     ] {
         unsafe {
-            crate::__pyre_put_new!(
-                ns_slot,
-                name,
-                {
-                    let code = crate::gateway::builtin_code_new_with_signature(
-                        name,
-                        |args| unsafe { crate::pycode::code_replace(args) },
-                        Some(doc),
-                        crate::pycode::code_replace_signature(),
-                    );
+            crate::__pyre_put_new!(ns_slot, name, {
+                let code = crate::gateway::builtin_code_new_with_signature(
+                    name,
+                    |args| unsafe { crate::pycode::code_replace(args) },
+                    Some(doc),
+                    crate::pycode::code_replace_signature(),
+                );
+                crate::gateway::with_registered_kwonly_defaults(
                     crate::function_new_with_fixed_code(
                         code as *const (),
                         name.to_string(),
                         pyre_object::PY_NULL,
-                    )
-                }
-            )
+                    ),
+                )
+            })
         }
     }
     unsafe {
@@ -20527,7 +20562,7 @@ fn init_staticmethod_type(ns: PyObjectRef) {
                 "__call__",
                 descr_call,
                 descr_call_args,
-            ),
+            )
         );
         crate::__pyre_put_new!(
             ns_slot,
@@ -20796,7 +20831,11 @@ fn init_instancemethod_type(ns: PyObjectRef) {
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_posonly(instancemethod_descr_new, vec!["cls", "function"]));
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_posonly(instancemethod_descr_new, vec!["cls", "function"])
+        );
         crate::__pyre_put_new!(
             ns_slot,
             "__call__",
@@ -20804,7 +20843,7 @@ fn init_instancemethod_type(ns: PyObjectRef) {
                 "__call__",
                 instancemethod_descr_call,
                 instancemethod_descr_call_args,
-            ),
+            )
         );
         crate::__pyre_put_new!(
             ns_slot,
@@ -21374,6 +21413,16 @@ fn property_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     ))
 }
 
+/// `generic_new_descr` ignores constructor extras; they belong to `__init__`.
+/// Keywords stay on `Arguments`. Wrap is the subtype only.
+fn property_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let _ = args;
+    property_descr_new(&[w_type])
+}
+
 /// PyPy `W_Property.init`, with CPython 3.14's `prop_name` reset and
 /// subclass-doc placement taking precedence where the versions differ.
 fn property_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
@@ -21532,37 +21581,39 @@ fn init_property_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr(property_descr_new)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(property_descr_new, property_descr_new_args)
+        )
+    };
     set_type_callable_text_signature(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__new__",
         "($type, *args, **kwargs)",
     );
     unsafe {
-        crate::__pyre_put_new!(
-            ns_slot,
-            "__init__",
-            {
-                let descr = crate::make_builtin_function_with_signature(
-                    "__init__",
-                    property_descr_init,
-                    crate::gateway::Signature::new(
-                        vec!["self", "fget", "fset", "fdel", "doc"],
-                        None,
-                        None,
-                        0,
-                        1,
-                    ),
-                );
-                unsafe {
-                    crate::function::fset_func_text_signature(
-                        descr,
-                        w_str_new("($self, fget=None, fset=None, fdel=None, doc=None)"),
-                    )
-                };
-                descr
-            }
-        );
+        crate::__pyre_put_new!(ns_slot, "__init__", {
+            let descr = crate::make_builtin_function_with_signature(
+                "__init__",
+                property_descr_init,
+                crate::gateway::Signature::new(
+                    vec!["self", "fget", "fset", "fdel", "doc"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            );
+            unsafe {
+                crate::function::fset_func_text_signature(
+                    descr,
+                    w_str_new("($self, fget=None, fset=None, fdel=None, doc=None)"),
+                )
+            };
+            descr
+        });
         crate::__pyre_put_new!(
             ns_slot,
             "__get__",
@@ -22846,7 +22897,7 @@ fn init_int_type(ns: PyObjectRef) {
                     1,
                     1,
                 ),
-            ),
+            )
         )
     };
     // int.from_bytes(bytes, byteorder='big', *, signed=False) — classmethod.
@@ -23307,7 +23358,13 @@ fn init_complex_type(ns: PyObjectRef) {
             )
         )
     };
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(complex_descr_new, complex_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(complex_descr_new, complex_descr_new_args)
+        )
+    };
     let repr = |args: &[PyObjectRef]| {
         let (re, im) = unsafe {
             (
@@ -23608,7 +23665,13 @@ fn init_float_type(ns: PyObjectRef) {
             w_str_new("Convert a string or number to a floating-point number, if possible.")
         )
     };
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(float_descr_new, float_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(float_descr_new, float_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -25644,15 +25707,20 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_with_signature(
-                bytes_descr_new,
-                crate::gateway::Signature::new(
-                    vec!["cls", "source", "encoding", "errors"],
-                    None,
-                    None,
-                    0,
-                    1,
+            // bytesobject.py descr_new — `w_source`/`w_encoding`/`w_errors`
+            // default to `None`.
+            crate::gateway::function_set_null_positional_defaults(
+                make_new_descr_with_signature(
+                    bytes_descr_new,
+                    crate::gateway::Signature::new(
+                        vec!["cls", "source", "encoding", "errors"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                3,
             )
         )
     };
@@ -29786,31 +29854,33 @@ fn init_bytearray_type(ns: PyObjectRef) {
         )
     };
     unsafe { crate::__pyre_put_new!(ns_slot, "__hash__", w_none()) };
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(bytearray_descr_new, bytearray_descr_new_args)) };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
-            "__init__",
-            {
-                let code = crate::gateway::builtin_code_new_with_signature(
-                    "__init__",
-                    bytearray_descr_init,
-                    Some("Initialize self.  See help(type(self)) for accurate signature."),
-                    crate::gateway::Signature::new(
-                        vec!["self", "source", "encoding", "errors"],
-                        None,
-                        None,
-                        0,
-                        1,
-                    ),
-                );
-                crate::function_new_with_fixed_code(
-                    code as *const (),
-                    "__init__".to_string(),
-                    pyre_object::PY_NULL,
-                )
-            }
+            "__new__",
+            make_new_descr_passthrough1(bytearray_descr_new, bytearray_descr_new_args)
         )
+    };
+    unsafe {
+        crate::__pyre_put_new!(ns_slot, "__init__", {
+            let code = crate::gateway::builtin_code_new_with_signature(
+                "__init__",
+                bytearray_descr_init,
+                Some("Initialize self.  See help(type(self)) for accurate signature."),
+                crate::gateway::Signature::new(
+                    vec!["self", "source", "encoding", "errors"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            );
+            crate::function_new_with_fixed_code(
+                code as *const (),
+                "__init__".to_string(),
+                pyre_object::PY_NULL,
+            )
+        })
     };
     unsafe {
         crate::__pyre_put_new!(
@@ -32375,7 +32445,13 @@ fn init_set_type(ns: PyObjectRef) {
             pyre_object::w_str_new("Build an unordered collection of unique elements."),
         )
     };
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(set_descr_new, set_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(set_descr_new, set_descr_new_args)
+        )
+    };
     set_type_callable_text_signature(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__new__",
@@ -32408,7 +32484,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "__init__",
                 set_descr_init,
                 set_descr_init_args,
-            ),
+            )
         )
     };
     init_setlike_common(pyre_object::gc_roots::shadow_stack_get(ns_slot), false);
@@ -32621,7 +32697,13 @@ fn init_frozenset_type(ns: PyObjectRef) {
             pyre_object::w_str_new("Build an immutable unordered collection of unique elements."),
         )
     };
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(frozenset_descr_new, frozenset_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(frozenset_descr_new, frozenset_descr_new_args)
+        )
+    };
     set_type_callable_text_signature(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__new__",
@@ -35446,6 +35528,30 @@ fn compress_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let mut exact =
         gettypefor(&pyre_object::interp_itertools::COMPRESS_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let (cls, scope_w) = pyre_object::with_roots!(exact => itertools_constructor_scope(args, "compress", vec!["data", "selectors"], &[]))?;
+    compress_descr_new_from(cls, scope_w, exact)
+}
+
+fn compress_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut exact =
+        gettypefor(&pyre_object::interp_itertools::COMPRESS_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    let (cls, scope_w) = pyre_object::with_roots!(exact => itertools_constructor_scope_from_args(
+        w_type,
+        args,
+        "compress",
+        vec!["data", "selectors"],
+        &[],
+    ))?;
+    compress_descr_new_from(cls, scope_w, exact)
+}
+
+fn compress_descr_new_from(
+    cls: PyObjectRef,
+    scope_w: Vec<PyObjectRef>,
+    mut exact: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::publish_roots(&[cls, scope_w[0], scope_w[1]]);
     let exact_slot = pyre_object::gc_roots::publish_roots(&[exact]);
@@ -35670,7 +35776,13 @@ fn init_takewhile_type(ns: PyObjectRef) {
     let ns = pyre_object::gc_roots::pin_root(ns);
     // W_TakeWhile.typedef, in source order (minus the 3.14-removed pickle
     // entries between __next__ and __doc__).
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(takewhile_descr_new, takewhile_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(takewhile_descr_new, takewhile_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -35701,7 +35813,13 @@ fn init_dropwhile_type(ns: PyObjectRef) {
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
     // W_DropWhile.typedef, in source order.
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(dropwhile_descr_new, dropwhile_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(dropwhile_descr_new, dropwhile_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -35732,7 +35850,13 @@ fn init_filterfalse_type(ns: PyObjectRef) {
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
     // W_FilterFalse.typedef, in source order.
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(filterfalse_descr_new, filterfalse_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(filterfalse_descr_new, filterfalse_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -35779,6 +35903,13 @@ fn islice_arg_int(
 }
 
 fn islice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    islice_descr_new_from(args, false)
+}
+
+fn islice_descr_new_from(
+    args: &[PyObjectRef],
+    has_keywords: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     // W_ISlice___new__(space, w_subtype, w_iterable, w_startstop, __args__).
     let exact =
         gettypefor(&pyre_object::interp_itertools::ISLICE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
@@ -35806,6 +35937,13 @@ fn islice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let values_base = pyre_object::gc_roots::publish_roots(args_w);
     let exact_slot = pyre_object::gc_roots::publish_roots(&[exact]);
     pyre_object::gc_roots::normalize_roots(cls_slot, 1 + n_args + 1);
+    // CPython 3.14 permits keywords only for an overridden subtype
+    // `__init__`; the base initializer rejects them (`builtinclass_new_args_check`).
+    {
+        let exact = unsafe { pyre_object::gc_roots::shadow_stack_get(exact_slot) };
+        let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
+        builtinclass_new_args_check("islice", exact, cls, 0, has_keywords)?;
+    }
     let value =
         |index: usize| unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + index) };
 
@@ -35867,11 +36005,29 @@ fn islice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     ))
 }
 
+fn islice_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    // Positional start/stop/step stay on the slice. Extra keywords belong
+    // to an overridden subtype `__init__`.
+    islice_descr_new_from(
+        &crate::builtins::passthrough1_positional_slice(w_type, args),
+        crate::builtins::arguments_has_keywords(args),
+    )
+}
+
 fn init_islice_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr(islice_descr_new)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(islice_descr_new, islice_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -36151,7 +36307,30 @@ fn combinations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let mut exact = gettypefor(&pyre_object::interp_itertools::COMBINATIONS_TYPE)
         .map_or(PY_NULL, |p| p.as_ptr());
     let (cls, scope) = pyre_object::with_roots!(exact => itertools_constructor_scope(args, "combinations", vec!["iterable", "r"], &[]))?;
+    combinations_descr_new_from(cls, scope, exact)
+}
 
+fn combinations_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut exact = gettypefor(&pyre_object::interp_itertools::COMBINATIONS_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
+    let (cls, scope) = pyre_object::with_roots!(exact => itertools_constructor_scope_from_args(
+        w_type,
+        args,
+        "combinations",
+        vec!["iterable", "r"],
+        &[],
+    ))?;
+    combinations_descr_new_from(cls, scope, exact)
+}
+
+fn combinations_descr_new_from(
+    cls: PyObjectRef,
+    scope: Vec<PyObjectRef>,
+    mut exact: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let n_scope = scope.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::publish_roots(&[cls]);
@@ -36206,7 +36385,13 @@ fn init_combinations_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr(combinations_descr_new)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(combinations_descr_new, combinations_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -36247,7 +36432,30 @@ fn combinations_with_replacement_descr_new(
         vec!["iterable", "r"],
         &[],
     ))?;
+    combinations_with_replacement_descr_new_from(cls, scope, exact)
+}
 
+fn combinations_with_replacement_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut exact = gettypefor(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
+    let (cls, scope) = pyre_object::with_roots!(exact => itertools_constructor_scope_from_args(
+        w_type,
+        args,
+        "combinations_with_replacement",
+        vec!["iterable", "r"],
+        &[],
+    ))?;
+    combinations_with_replacement_descr_new_from(cls, scope, exact)
+}
+
+fn combinations_with_replacement_descr_new_from(
+    cls: PyObjectRef,
+    scope: Vec<PyObjectRef>,
+    mut exact: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let n_scope = scope.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::publish_roots(&[cls]);
@@ -36308,7 +36516,10 @@ fn init_combinations_with_replacement_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr(combinations_with_replacement_descr_new)
+            make_new_descr_passthrough1(
+                combinations_with_replacement_descr_new,
+                combinations_with_replacement_descr_new_args,
+            )
         )
     };
     unsafe {
@@ -36344,7 +36555,30 @@ fn permutations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let mut exact = gettypefor(&pyre_object::interp_itertools::PERMUTATIONS_TYPE)
         .map_or(PY_NULL, |p| p.as_ptr());
     let (cls, scope) = pyre_object::with_roots!(exact => itertools_constructor_scope(args, "permutations", vec!["iterable", "r"], &[w_none()]))?;
+    permutations_descr_new_from(cls, scope, exact)
+}
 
+fn permutations_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut exact = gettypefor(&pyre_object::interp_itertools::PERMUTATIONS_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
+    let (cls, scope) = pyre_object::with_roots!(exact => itertools_constructor_scope_from_args(
+        w_type,
+        args,
+        "permutations",
+        vec!["iterable", "r"],
+        &[w_none()],
+    ))?;
+    permutations_descr_new_from(cls, scope, exact)
+}
+
+fn permutations_descr_new_from(
+    cls: PyObjectRef,
+    scope: Vec<PyObjectRef>,
+    mut exact: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let n_scope = scope.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::publish_roots(&[cls]);
@@ -36433,7 +36667,13 @@ fn init_permutations_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr(permutations_descr_new)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(permutations_descr_new, permutations_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -36467,7 +36707,30 @@ fn groupby_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let mut exact =
         gettypefor(&pyre_object::interp_itertools::GROUPBY_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let (cls, scope) = pyre_object::with_roots!(exact => itertools_constructor_scope(args, "groupby", vec!["iterable", "key"], &[w_none()]))?;
+    groupby_descr_new_from(cls, scope, exact)
+}
 
+fn groupby_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut exact =
+        gettypefor(&pyre_object::interp_itertools::GROUPBY_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    let (cls, scope) = pyre_object::with_roots!(exact => itertools_constructor_scope_from_args(
+        w_type,
+        args,
+        "groupby",
+        vec!["iterable", "key"],
+        &[w_none()],
+    ))?;
+    groupby_descr_new_from(cls, scope, exact)
+}
+
+fn groupby_descr_new_from(
+    cls: PyObjectRef,
+    scope: Vec<PyObjectRef>,
+    mut exact: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let n_scope = scope.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::publish_roots(&[cls]);
@@ -36526,7 +36789,13 @@ fn init_groupby_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr(groupby_descr_new)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(groupby_descr_new, groupby_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -36852,7 +37121,13 @@ fn init_compress_type(ns: PyObjectRef) {
     let ns = pyre_object::gc_roots::pin_root(ns);
     // interp_itertools.py W_Compress.typedef, in source order.  Python 3.14
     // uses the shorter public docstring below.
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr(compress_descr_new)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(compress_descr_new, compress_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -36883,7 +37158,13 @@ fn init_starmap_type(ns: PyObjectRef) {
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
     // interp_itertools.py W_StarMap.typedef, with Python 3.14's public doc.
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(starmap_descr_new, starmap_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(starmap_descr_new, starmap_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -37134,7 +37415,13 @@ fn init_pairwise_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(pairwise_descr_new, pairwise_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(pairwise_descr_new, pairwise_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -37164,7 +37451,13 @@ fn init_cycle_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(cycle_descr_new, cycle_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(cycle_descr_new, cycle_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -37295,7 +37588,13 @@ fn init_chain_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    unsafe { crate::__pyre_put_new!(ns_slot, "__new__", make_new_descr_passthrough1(chain_descr_new, chain_descr_new_args)) };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(chain_descr_new, chain_descr_new_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,

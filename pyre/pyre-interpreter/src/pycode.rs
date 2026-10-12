@@ -2894,7 +2894,11 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             return None;
         }
         let value = pyre_object::gc_roots::shadow_stack_get(root_base + index);
-        if value.is_null() { None } else { Some(value) }
+        if value.is_null() || unsafe { pyre_object::is_none(value) } {
+            None
+        } else {
+            Some(value)
+        }
     };
 
     let code_ptr = unsafe { w_code_get_ptr(w_self()) } as *const crate::CodeObject;

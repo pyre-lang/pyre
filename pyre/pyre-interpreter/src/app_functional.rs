@@ -209,11 +209,16 @@ pub fn builtin_sorted_args(args: &crate::argument::Arguments) -> PyResult {
     let nnames = names.len();
     install_applevel_builtins();
     let w_sorted = app_sorted()?;
+    let sorted_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_sorted);
     let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
     let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(names_base + i)).collect();
     let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(values_base + i)).collect();
     let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
-    crate::call::call_args(w_sorted, &forwarded)
+    crate::call::call_args(
+        pyre_object::gc_roots::shadow_stack_get(sorted_slot),
+        &forwarded,
+    )
 }
 
 /// Identity of the published app-level `sorted` BuiltinFunction.  Compares

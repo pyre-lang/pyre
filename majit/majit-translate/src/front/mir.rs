@@ -100776,8 +100776,8 @@ mod tests {
                 .is_some_and(|values| values.iter().any(|hint| hint == "elidable")),
             "Signature.find_argname must retain PyPy's @jit.elidable marker"
         );
-        let graph = super::lower_function(&llbc, "bind_kwargs_to_signature")
-            .expect("lower bind_kwargs_to_signature");
+        let graph = super::lower_function(&llbc, "parse_builtin_signature")
+            .expect("lower parse_builtin_signature");
 
         let residual_scalar_indexes: Vec<_> = graph
             .blocks

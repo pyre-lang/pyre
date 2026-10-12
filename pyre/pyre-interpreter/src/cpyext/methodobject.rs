@@ -237,7 +237,7 @@ pub fn pycfunction_type() -> PyObjectRef {
                         "__call__",
                         descr_call,
                         descr_call_args,
-                    ),
+                    )
                 );
                 crate::__pyre_put_new!(
                     ns_slot,

@@ -3924,7 +3924,7 @@ fn builtin_call_kw_bind_signature(
         return None;
     }
     let nparams = sig.argnames.len();
-    // `bind_kwargs_to_signature` appends packed `*args` / `**kwargs` slots
+    // `parse_builtin_signature` appends packed `*args` / `**kwargs` slots
     // after the named ones; this permutation builds only the named slots.
     if nparams == 0 || sig.varargname.is_some() || sig.kwargname.is_some() {
         return None;

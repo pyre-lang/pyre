@@ -161,7 +161,10 @@ cached_type!(CFIELD, cfield_type, || {
         pyre_interpreter::__pyre_store!(
             ns,
             "__new__",
-            pyre_interpreter::typedef::make_new_descr(cfield_new_internal)
+            pyre_interpreter::typedef::make_new_descr_passthrough1(
+                cfield_new_internal,
+                cfield_new_internal_args,
+            )
         );
         pyre_interpreter::__pyre_store!(
             ns,
@@ -376,7 +379,7 @@ fn init_aggregate_base(ns: PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(structure_new)
+        pyre_interpreter::typedef::make_new_descr_passthrough1(structure_new, structure_new_args,)
     );
     pyre_interpreter::__pyre_store!(
         ns,
@@ -385,7 +388,7 @@ fn init_aggregate_base(ns: PyObjectRef) {
             "__init__",
             structure_init,
             structure_init_args,
-        ),
+        )
     );
     pyre_interpreter::__pyre_store!(
         ns,
@@ -1829,15 +1832,42 @@ fn cfield_repr(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
-    let pos = args;
+    cfield_new_internal_from(args, None)
+}
+
+fn cfield_new_internal_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+    let mut flat = Vec::with_capacity(1 + pos.len());
+    flat.push(w_type);
+    flat.extend_from_slice(&pos);
+    cfield_new_internal_from(&flat, kwargs)
+}
+
+fn cfield_new_internal_from(args: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let n_args = args.len();
+    let kw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwargs.unwrap_or(pyre_object::PY_NULL));
     let get = |name: &str, position: usize| {
-        pyre_interpreter::builtins::resolve_pos_or_kw(
-            pos.get(position).copied(),
-            None,
-            name,
-            "CField",
-            position,
-        )
+        let positional = if position < n_args {
+            let value = pyre_object::gc_roots::shadow_stack_get(args_base + position);
+            if value.is_null() { None } else { Some(value) }
+        } else {
+            None
+        };
+        let kwargs = {
+            let value = pyre_object::gc_roots::shadow_stack_get(kw_slot);
+            if value.is_null() { None } else { Some(value) }
+        };
+        pyre_interpreter::builtins::resolve_pos_or_kw(positional, kwargs, name, "CField", position)
     };
     let internal = get("_internal_use", 6)?
         .is_some_and(|value| pyre_interpreter::baseobjspace::is_true(value).unwrap_or(false));
@@ -1954,6 +1984,15 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
     let buffer = pyre_object::w_bytearray_new(size);
     unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), "_b_", buffer) };
     Ok(obj)
+}
+
+/// Keyword path: extras belong to `structure_init_args`.
+fn structure_new_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> PyResult {
+    let _ = args;
+    structure_new(&[w_type])
 }
 
 /// Field names in base-first order (`init_pos_args`).

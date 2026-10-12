@@ -98,7 +98,7 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
             "__call__",
             cfuncptr_call,
             cfuncptr_call_args,
-        ),
+        )
     );
     // `restype` / `argtypes` — settable data descriptors with class-attr
     // fallback to `_restype_` / `_argtypes_`.

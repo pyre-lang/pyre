@@ -70,10 +70,11 @@ fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
         .to_string()
     };
     let flags = (unsafe { w_int_get_value(w_flags) }) as libc::c_int;
-    let mode = if args.len() >= 3 {
-        (unsafe { w_int_get_value(w_mode) }) as libc::c_uint
+    // `lib_pypy/_posixshmem.py shm_open(path, flags, mode=0o777)`.
+    let mode = if w_mode.is_null() {
+        0o777
     } else {
-        0o600
+        (unsafe { w_int_get_value(w_mode) }) as libc::c_uint
     };
     let c_name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))?;
@@ -143,7 +144,24 @@ pyre_interpreter::py_module! {
     extra_init: |ns| {
         #[cfg(feature = "host_env")]
         {
-            pyre_interpreter::__pyre_store!(ns, "shm_open", pyre_interpreter::make_builtin_function("shm_open", shm_open));
+            pyre_interpreter::__pyre_store!(
+                ns,
+                "shm_open",
+                pyre_interpreter::gateway::function_set_null_positional_defaults(
+                    pyre_interpreter::make_builtin_function_with_signature(
+                        "shm_open",
+                        shm_open,
+                        pyre_interpreter::Signature::new(
+                            vec!["path", "flags", "mode"],
+                            None,
+                            None,
+                            0,
+                            0,
+                        ),
+                    ),
+                    1,
+                )
+            );
             pyre_interpreter::__pyre_store!(ns, "shm_unlink", pyre_interpreter::make_builtin_function_with_arity("shm_unlink", shm_unlink, 1));
         }
         #[cfg(not(feature = "host_env"))]

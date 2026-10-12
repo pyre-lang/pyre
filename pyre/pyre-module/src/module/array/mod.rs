@@ -486,6 +486,17 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     Ok(obj)
 }
 
+/// Keyword path: positional typecode/initializer stay on the slice. Extra
+/// keywords belong to an overridden subtype `__init__`.
+fn array_descr_new_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> PyResult {
+    array_descr_new(&pyre_interpreter::builtins::passthrough1_positional_slice(
+        w_type, args,
+    ))
+}
+
 /// `fromunicode` — append code points of a str to a `'u'` array.
 fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError> {
     // [3.14-spec] Argument Clinic's `unicode` converter runs before
@@ -2260,7 +2271,10 @@ pub fn init_array_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(array_descr_new)
+        pyre_interpreter::typedef::make_new_descr_passthrough1(
+            array_descr_new,
+            array_descr_new_args,
+        )
     );
     let m = |name: &'static str, f: fn(&[PyObjectRef]) -> PyResult, arity: u16| {
         pyre_interpreter::__pyre_put_new!(

@@ -1617,7 +1617,7 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::__pyre_put_new!(
         ns_slot,
         "scandir",
-        wasm_builtin("scandir", scandir, &["path"], &[]),
+        wasm_builtin("scandir", scandir, &["path"], &[])
     );
     crate::__pyre_put_new!(
         ns_slot,

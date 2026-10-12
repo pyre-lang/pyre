@@ -137,7 +137,7 @@ pyre_interpreter::py_module! {
                     ("rel_tol", pyre_object::floatobject::w_float_new(1e-9)),
                     ("abs_tol", pyre_object::floatobject::w_float_new(0.0)),
                 ],
-            ),
+            )
         );
         let install2 = |mut ns: pyre_object::PyObjectRef,
                         name: &'static str,

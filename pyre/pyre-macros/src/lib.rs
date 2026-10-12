@@ -127,7 +127,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     reject_duplicate_param_names(&param_names, user_name.span())?;
 
     // Keyword calls bind through the registered `Signature` before this
-    // wrapper runs (`call::bind_kwargs_to_signature` / `parse_obj`).  PY_NULL
+    // wrapper runs (`call::parse_builtin_signature` / `parse_obj`).  PY_NULL
     // is never a real argument, so the leading non-null run is the true
     // positional count on both the keyword-bound and the raw positional path.
     // Skipped for varargs fns — `&[PyObjectRef]` consumes the whole slice.
@@ -519,7 +519,7 @@ fn unwrap_arg(
     // gets no missing-argument guard.
     let is_optional = option_inner(ty).is_some();
     let expr = match default {
-        // `bind_kwargs_to_signature` pads `args` to the parameter count
+        // `parse_builtin_signature` pads `args` to the parameter count
         // with PY_NULL, so the default only applies when the slot is both
         // present and non-null.
         Some(default) => quote! {
@@ -2702,7 +2702,7 @@ fn expand_pyre_methods(
                 quote! {
                     // Every `#[pyre_methods]` shim registers with a
                     // `Signature` (see `method_sig` below), so the call path
-                    // (`call::bind_kwargs_to_signature`) has already resolved
+                    // (`call::parse_builtin_signature`) has already resolved
                     // keywords into positional PY_NULL-padded slots before the
                     // wrapper runs.  PY_NULL is never a real argument, so the
                     // leading non-null run is the true positional count on both
@@ -2726,7 +2726,7 @@ fn expand_pyre_methods(
             if has_varargs || is_property || has_keyword_slots {
                 // See `expand_pyre_function`: once a slot can be filled by
                 // keyword, the resolved scope no longer distinguishes it from
-                // a positional one, and `bind_kwargs_to_signature` has already
+                // a positional one, and `parse_builtin_signature` has already
                 // applied the bound.
                 quote! {}
             } else {
@@ -3004,18 +3004,53 @@ fn expand_pyre_methods(
             // entry: `add_tp_new_wrapper` stores the carrier itself, so the
             // namespace holds a `builtin_function_or_method` bound to the
             // owning type rather than a `staticmethod` around one.
+            // A raw whole-args `__new__` (`generic_new_descr`) is
+            // `PassThroughArguments1`: keywords stay on `Arguments` and the
+            // wrap sees only the positional slice, matching
+            // `typedef.py generic_new_descr` / `object.__new__` when `__init__`
+            // is overridden.
             MethodKind::Static if py_name == "__new__" => {
+                let descr = if has_varargs {
+                    let args_name = format_ident!("__pyre_passthrough1_{}", mname);
+                    wrappers.push(quote! {
+                        pub fn #args_name(
+                            w_type: ::pyre_object::PyObjectRef,
+                            args: &::pyre_interpreter::argument::Arguments,
+                        ) -> ::std::result::Result<
+                            ::pyre_object::PyObjectRef,
+                            ::pyre_interpreter::PyError,
+                        > {
+                            let flat = ::pyre_interpreter::builtins::passthrough1_positional_slice(
+                                w_type, args,
+                            );
+                            #wrapper_name(&flat)
+                        }
+                    });
+                    quote! {
+                        ::pyre_interpreter::typedef::make_new_descr_passthrough1(
+                            #wrapper_name,
+                            #args_name,
+                        )
+                    }
+                } else {
+                    quote! {
+                        ::pyre_interpreter::typedef::make_new_descr_maybe_sig(
+                            #wrapper_name,
+                            #method_sig,
+                        )
+                    }
+                };
                 registrations.push(quote! {{
-                    let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
-                    let __pyre_built = ::pyre_interpreter::typedef::make_new_descr_maybe_sig(#wrapper_name, #method_sig);
-                    let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
-                    let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
-                    unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                #py_name,
-                ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
-            ) };
-                }});
+                        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+                        let __pyre_built = #descr;
+                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    #py_name,
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                ) };
+                    }});
             }
             MethodKind::Static => {
                 registrations.push(quote! {{

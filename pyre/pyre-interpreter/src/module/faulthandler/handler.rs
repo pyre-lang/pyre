@@ -706,9 +706,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // `pypy_faulthandler_dump_traceback_later` starts a watchdog thread
         // (`faulthandler_thread`). That rewrite is out of this pass; the
         // Python entry remains a no-op.
-        pyre_interpreter::make_builtin_function("dump_traceback_later", |_| {
-            Ok(pyre_object::w_none())
-        })
+        pyre_interpreter::make_builtin_function_passthrough0(
+            "dump_traceback_later",
+            |_| Ok(pyre_object::w_none()),
+            |_args| Ok(pyre_object::w_none()),
+        )
     );
     crate::__pyre_put_new!(
         ns_slot,

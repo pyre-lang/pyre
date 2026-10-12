@@ -590,7 +590,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 0,
                 0,
             ),
-        ),
+        )
     );
 
     // `interp_select.py poll()` — factory returning a fresh polling

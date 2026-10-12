@@ -4856,6 +4856,28 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 );
 
 #[cfg(any(unix, windows))]
+fn socket_descr_new(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let cls = args
+        .first()
+        .copied()
+        .filter(|w_cls| unsafe { pyre_object::is_type(*w_cls) })
+        .unwrap_or_else(socket_type);
+    Ok(pyre_object::w_instance_new(cls))
+}
+
+/// Keyword path: extras belong to `descr_init`.
+#[cfg(any(unix, windows))]
+fn socket_descr_new_args(
+    w_type: pyre_object::PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let _ = args;
+    socket_descr_new(&[w_type])
+}
+
+#[cfg(any(unix, windows))]
 fn init_socket_type(ns: pyre_object::PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4864,20 +4886,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `descr_init` below installs the RSocket state.  Keeping allocation and
     // initialisation separate is required when socket.py's Python subclass
     // explicitly calls `_socket.socket.__init__(self, ...)`.
-    unsafe {
-        pyre_interpreter::__pyre_put_new!(
-            ns_slot,
-            "__new__",
-            pyre_interpreter::typedef::make_new_descr(|args| {
-                let cls = args
-                    .first()
-                    .copied()
-                    .filter(|w_cls| pyre_object::is_type(*w_cls))
-                    .unwrap_or_else(socket_type);
-                Ok(pyre_object::w_instance_new(cls))
-            })
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr_passthrough1(
+            socket_descr_new,
+            socket_descr_new_args,
         )
-    };
+    );
     unsafe {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
