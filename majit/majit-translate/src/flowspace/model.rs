@@ -1758,16 +1758,11 @@ impl HostEnv {
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
         // Class-method qualnames used by `@typer_for(<class>.__init__)`
-        // decorators upstream (rbuiltin.py).  Pyre encodes them
-        // as single-string qualname builtins instead of resolving via
-        // descriptor lookup.  `EnvironmentError.__init__` (rbuiltin.py)
-        // is omitted — its body uses `r_self.setfield(v_self, 'errno', ...)`
-        // which requires InstanceRepr setfield trait plumbing that is
-        // not yet wired through `findbltintyper`; registering only the
-        // qualname without the typer body surfaces as a registry hit
-        // that returns no body, which is observably wrong.
-        {
-            let name = "object.__init__";
+        // decorators upstream (`rbuiltin.py typer_for`).  Pyre encodes
+        // them as single-string qualname builtins instead of resolving
+        // via descriptor lookup.  `install_default_typers` keys the
+        // matching `rtype_*__init__` bodies on these same HostObjects.
+        for name in ["object.__init__", "EnvironmentError.__init__"] {
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
         // Pyre-internal front-end pointer-downcast narrow (#298): the
@@ -1932,6 +1927,30 @@ impl HostEnv {
         objectmodel.module_set(
             "instantiate",
             HostObject::new_builtin_callable("rpython.rlib.objectmodel.instantiate"),
+        );
+        // `rbuiltin.py typer_for(objectmodel.hlinvoke)` /
+        // `typer_for(objectmodel.r_dict)` /
+        // `typer_for(objectmodel.r_ordereddict)`.  Qualnames match the
+        // `BUILTIN_ANALYZERS` keys in annotator/builtin.rs.
+        objectmodel.module_set(
+            "hlinvoke",
+            HostObject::new_builtin_callable("rpython.rlib.objectmodel.hlinvoke"),
+        );
+        objectmodel.module_set(
+            "r_dict",
+            HostObject::new_builtin_callable("rpython.rlib.objectmodel.r_dict"),
+        );
+        objectmodel.module_set(
+            "r_ordereddict",
+            HostObject::new_builtin_callable("rpython.rlib.objectmodel.r_ordereddict"),
+        );
+
+        // `rbuiltin.py typer_for(OrderedDict)` — `from collections import
+        // OrderedDict`.  Qualname matches `BUILTIN_ANALYZERS`.
+        let collections = HostObject::new_module("collections");
+        collections.module_set(
+            "OrderedDict",
+            HostObject::new_builtin_callable("collections.OrderedDict"),
         );
 
         // `rpython.rtyper.lltypesystem.lltype` — typing-time callables that
@@ -2530,6 +2549,7 @@ impl HostEnv {
         mods.insert("rpython.rlib.rpath".into(), rpath);
         mods.insert("rpython.rlib.rarithmetic".into(), rarithmetic);
         mods.insert("rpython.rlib.objectmodel".into(), objectmodel);
+        mods.insert("collections".into(), collections);
         mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
         mods.insert("weakref".into(), weakref_mod);

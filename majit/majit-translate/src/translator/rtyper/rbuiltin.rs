@@ -134,14 +134,14 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///
 ///   * rbuiltin.py — `min` / `max` landed (`ll_min` / `ll_max`
 ///     helper graphs keyed per argument lltype).
-///   * rbuiltin.py — `reversed` (need `Repr::newiter` trait
-///     method + iterator repr family)
+///   * rbuiltin.py — `reversed` registered (`rtype_builtin_reversed`
+///     via `Repr::newiter`).
 ///   * rbuiltin.py — `object.__init__` is trivial and landed.
 ///     `EnvironmentError.__init__` stores `errno` / `strerror` /
 ///     `filename` through `InstanceRepr::setfield`.
 ///     `WindowsError.__init__` stores `winerror` the same way.
-///   * rbuiltin.py — `objectmodel.hlinvoke` (PBC-callable
-///     dispatch)
+///   * rbuiltin.py — `objectmodel.hlinvoke` registered
+///     (`rtype_hlinvoke`).
 ///   * rbuiltin.py — `range` / `xrange` / `enumerate`
 ///     (delegate to ported `rrange.py`)
 ///   * rbuiltin.py — `lltype.malloc` / `free` family fully
@@ -188,9 +188,9 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///   * rbuiltin.py — `objectmodel.instantiate` (PBC handling +
 ///     `rclass.rtype_new_instance`)
 ///   * rbuiltin.py — `OrderedDict` / `objectmodel.r_dict` /
-///     `objectmodel.r_ordereddict` lower through
-///     `OrderedDictRepr::ll_newdict` and, when `custom_eq_hash`,
-///     store `fnkeyeq` / `fnkeyhash`.
+///     `objectmodel.r_ordereddict` registered (`rtype_dict_constructor`
+///     via `OrderedDictRepr::ll_newdict`; `custom_eq_hash` stores
+///     `fnkeyeq` / `fnkeyhash`).
 ///   * rbuiltin.py — weakref family low-level path
 ///     (`weakref_create/deref`, `cast_ptr_to_weakrefptr`,
 ///     `cast_weakrefptr_to_ptr` — ported; high-level `BaseWeakRefRepr`
@@ -230,6 +230,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("min", rtype_builtin_min),
         // rbuiltin.py:246-250
         ("max", rtype_builtin_max),
+        // rbuiltin.py `typer_for(reversed)`
+        ("reversed", rtype_builtin_reversed),
         // rbuiltin.py:709-715
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
@@ -316,6 +318,18 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ),
         // rbuiltin.py
         ("rpython.rlib.objectmodel", "instantiate", rtype_instantiate),
+        // rbuiltin.py `typer_for(objectmodel.hlinvoke)`
+        ("rpython.rlib.objectmodel", "hlinvoke", rtype_hlinvoke),
+        // rbuiltin.py `typer_for(objectmodel.r_dict)` /
+        // `typer_for(objectmodel.r_ordereddict)`
+        ("rpython.rlib.objectmodel", "r_dict", rtype_dict_constructor),
+        (
+            "rpython.rlib.objectmodel",
+            "r_ordereddict",
+            rtype_dict_constructor,
+        ),
+        // rbuiltin.py `typer_for(OrderedDict)` (`from collections import OrderedDict`)
+        ("collections", "OrderedDict", rtype_dict_constructor),
         // rbuiltin.py — `rtype_const_result` is registered for
         // four upstream callables.  `front::mir` synthesises the
         // production dispatch path; these entries keep the registry
@@ -5536,6 +5550,70 @@ mod tests {
         assert!(
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `object.__init__`"
+        );
+    }
+
+    fn assert_findbltintyper(host: HostObject, expected: BuiltinTyperFn, label: &str) {
+        let f = BuiltinFunctionRepr::new(host)
+            .findbltintyper()
+            .unwrap_or_else(|e| panic!("{label}: findbltintyper: {e}"));
+        assert!(
+            std::ptr::eq(f as *const (), expected as *const ()),
+            "{label} must resolve to the registered typer"
+        );
+    }
+
+    #[test]
+    fn findbltintyper_resolves_reversed() {
+        // rbuiltin.py `typer_for(reversed)` — production dispatch is
+        // `BuiltinFunctionRepr.findbltintyper`, not a direct typer call.
+        let host = HOST_ENV
+            .lookup_builtin("reversed")
+            .expect("HOST_ENV missing builtin `reversed`");
+        assert_findbltintyper(host, rtype_builtin_reversed, "reversed");
+    }
+
+    #[test]
+    fn findbltintyper_resolves_hlinvoke_and_dict_constructors() {
+        // rbuiltin.py `typer_for(objectmodel.hlinvoke)` /
+        // `typer_for(objectmodel.r_dict)` /
+        // `typer_for(objectmodel.r_ordereddict)` /
+        // `typer_for(OrderedDict)`.
+        let hlinvoke = HOST_ENV
+            .import_module("rpython.rlib.objectmodel")
+            .and_then(|m| m.module_get("hlinvoke"))
+            .expect("HOST_ENV missing objectmodel.hlinvoke");
+        assert_findbltintyper(hlinvoke, rtype_hlinvoke, "objectmodel.hlinvoke");
+        for (module, attr, label) in [
+            ("rpython.rlib.objectmodel", "r_dict", "objectmodel.r_dict"),
+            (
+                "rpython.rlib.objectmodel",
+                "r_ordereddict",
+                "objectmodel.r_ordereddict",
+            ),
+            ("collections", "OrderedDict", "collections.OrderedDict"),
+        ] {
+            let host = HOST_ENV
+                .import_module(module)
+                .and_then(|m| m.module_get(attr))
+                .unwrap_or_else(|| panic!("HOST_ENV missing {label}"));
+            assert_findbltintyper(host, rtype_dict_constructor, label);
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn findbltintyper_resolves_EnvironmentError_init() {
+        // rbuiltin.py `typer_for(EnvironmentError.__init__)`.  The
+        // HostObject must live in HOST_ENV; `install_default_typers`
+        // skips names that `lookup_builtin` does not return.
+        let host = HOST_ENV
+            .lookup_builtin("EnvironmentError.__init__")
+            .expect("HOST_ENV missing `EnvironmentError.__init__` qualname builtin");
+        assert_findbltintyper(
+            host,
+            rtype_EnvironmentError__init__,
+            "EnvironmentError.__init__",
         );
     }
 
