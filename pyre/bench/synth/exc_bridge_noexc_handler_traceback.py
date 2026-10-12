@@ -1,5 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=<module>
+# pyre-check: requires-modules=_tokenize
 # A residual FileType call inside argparse.parse_args raises into a hot
 # try/except. The loop trace records GUARD_EXCEPTION on a raising iteration;
 # later failures of that guard carry no pending JIT exception, so
