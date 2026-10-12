@@ -534,6 +534,42 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
     .flatten()
 }
 
+/// The value under a chain of `__cast_instance_intrinsic` identity casts.
+fn peel_instance_casts(graph: &FunctionGraph, var: &Variable) -> Variable {
+    let mut current = var.clone();
+    for _ in 0..8 {
+        let Some(operand) = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| {
+                (op.result.as_ref() == Some(&current))
+                    .then(|| instance_cast_operand(&op.kind))
+                    .flatten()
+            })
+        else {
+            break;
+        };
+        current = resolve_block_alias(graph, &operand).unwrap_or(operand);
+    }
+    current
+}
+
+fn instance_cast_operand(kind: &OpKind) -> Option<Variable> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if segments.as_slice() != [crate::runtime_names::shims::CAST_INSTANCE] {
+        return None;
+    }
+    args.first().and_then(LinkArg::as_variable).cloned()
+}
+
 fn const_int_value(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
     let var = resolve_block_alias(graph, var)?;
     graph
@@ -577,10 +613,15 @@ fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable
     };
     let lhs = resolve_block_alias(graph, &lhs).unwrap_or(lhs);
     let rhs = resolve_block_alias(graph, &rhs).unwrap_or(rhs);
+    // `arraylen` of an object array is taken on the `[PyObject]` cast of
+    // the slice. The cast is the same value (`cast_opaque_ptr`), so
+    // `len(cast(s)) - 1` is still the receiver's minus-one end.
+    let slice = peel_instance_casts(graph, &slice);
     let has_len = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
         op.result.as_ref() == Some(&lhs)
             && matches!(&op.kind, OpKind::ArrayLen { base, .. }
-                if resolve_block_alias(graph, base).as_ref() == Some(&slice))
+                if resolve_block_alias(graph, base)
+                    .is_some_and(|base| peel_instance_casts(graph, &base) == slice))
     });
     // The subtraction is unsigned, so Charon's faithful literal spelling is
     // `ConstUInt(1)`.  `const_int_value` accepts both integer banks only for
@@ -2304,6 +2345,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `len` of an object array is taken on the `[PyObject]` cast. That
+    /// length is still the slice's length, so `s[..len-1]` stays MinusOne.
+    #[test]
+    fn rewrite_minusone_sees_arraylen_through_instance_cast() {
+        let mut g = FunctionGraph::new("test_slice_index_minusone_cast");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let cast = g
+            .push_op_var(
+                a,
+                crate::model::cast_instance_call("[PyObject]", slice.clone()),
+                true,
+            )
+            .unwrap();
+        let len = g
+            .push_op_var(
+                a,
+                OpKind::ArrayLen {
+                    base: cast,
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        let one = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let end = g
+            .push_op_var(
+                a,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: len,
+                    rhs: one,
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let range = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: rangeto_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeTo".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(a).operations.push(SpaceOperation {
+            result: None,
+            kind: end_field_write(&range, &end),
+        });
+        let _sub = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: slice_index_call_target(),
+                    args: crate::model::call_args(vec![slice, range.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, None);
+        let site = SliceIndexRangeToSite {
+            range_result: range,
+            end,
+        };
+        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 1);
+        assert!(g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments == &["__getslice_minusone".to_string()] && args.len() == 1
+            )
+        }));
     }
 
     /// `&s[..k]` uses the existing StartStop contract: a synthetic constant

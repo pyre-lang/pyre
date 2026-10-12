@@ -676,7 +676,6 @@ impl CodeWriter {
         // box call receives a proven literal, the interned `W_UnicodeObject`
         // is one Ref constant — not an rstr `Ptr(STR)`.
         crate::translator::rtyper::box_str_const_fold::fold_box_str_constants(&mut graph_owned);
-        let graph = &graph_owned;
 
         // RPython codewriter.py:37 `portal_jd =
         // self.callcontrol.jitdriver_sd_from_portal_graph(graph)` — look
@@ -695,9 +694,9 @@ impl CodeWriter {
         //
         // No `with_type_state(&type_state)` — `dual_gate_type_state`
         // already committed every kind to each backing Variable's
-        // `concretetype` cell, and `Variable::clone` Rc-shares that
-        // cell so jtransform's internal `rewritten = graph.clone()`
-        // carries it through.
+        // `concretetype` cell. `copygraph` shares that `Rc`, and
+        // `Transformer::transform_owned` rewrites this graph in place
+        // (`jtransform.py` `Transformer.transform`).
         //
         // `cpu.rtyper.exceptiondata.fn_exception_match` is cloned out
         // of the dual-gate session before the `&mut CallControl`
@@ -713,7 +712,7 @@ impl CodeWriter {
                     .with_callcontrol(callcontrol)
                     .with_portal_jd(portal_jd_index)
                     .with_excmatch(excmatch.as_ref());
-                transformer.transform(graph)
+                transformer.transform_owned(graph_owned)
             });
         // Transformer is dropped here, releasing the &mut CallControl borrow.
 
@@ -899,6 +898,9 @@ impl CodeWriter {
         super::type_state::force_int_bank_cells(rewritten_graph);
         super::type_state::rebucket_kind_lists(rewritten_graph);
         super::type_state::coerce_cross_bank_links(rewritten_graph);
+        // A fused `int_*` guard reads the int bank. An operand whose cell
+        // is now `GcRef` is cast before the guard (`cast_ptr_to_int`).
+        super::type_state::reint_fused_int_ref_operands(rewritten_graph);
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),

@@ -164,6 +164,24 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                 );
                 continue;
             }
+            // `#[specialize_argtype(N)]` emits
+            // `_annspecialcase_argtype_<fn> = "specialize:argtype(N)"`.
+            // The const value is the whole hint (`specialize.py`
+            // `specialize_argtype`); do not prefix it again.
+            if leaf.starts_with("_annspecialcase_argtype_") {
+                let hint = global_marker_str(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "specialize:argtype marker `{path}` has an undecodable \
+                         string initializer; this signals a marker encoding/decoder drift"
+                    )
+                });
+                push_hint(
+                    &mut out,
+                    marker_path_to_fn_path(&path, "_annspecialcase_argtype_", &function_paths),
+                    &hint,
+                );
+                continue;
+            }
             for (prefix, hints) in CONST_PREFIX_HINTS {
                 if leaf.starts_with(prefix) {
                     // `elidable_promote` renames the decorated body to
@@ -393,7 +411,11 @@ pub(crate) fn marker_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
 
 fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
-    for block in &body.body {
+    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _))) =
                 stmt.stmt_kind()
@@ -424,7 +446,11 @@ fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
     // not by an `init` field.
     let init_id = marker_init_fun_id(gd)?;
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
-    for block in &body.body {
+    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &block.statements {
             let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _)) =
                 stmt.stmt_kind().ok()?
@@ -464,7 +490,11 @@ fn decode_aroundstate_marker(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, i6
     let body = llbc.fn_by_id(init_id)?.unstructured()?;
     let mut fn_id: Option<u64> = None;
     let mut save_err: Option<i64> = None;
-    for block in &body.body {
+    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind() else {
                 continue;

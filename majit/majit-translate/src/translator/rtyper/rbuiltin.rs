@@ -3863,7 +3863,40 @@ pub fn rtype_direct_arrayitems(hop: &HighLevelOp, _kwds_i: &HashMap<String, usiz
 /// ```
 ///
 pub fn rtype_direct_ptradd(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rclass::InstanceRepr;
+    use crate::translator::rtyper::rmodel::PtrRepr;
     use crate::translator::rtyper::rtyper::GenopResult;
+
+    // A classdef-less instance reaches `direct_ptradd` as `InstanceRepr`
+    // whose concretetype is already `Ptr` (`InstanceRepr.lowleveltype`,
+    // `build_instance_types`). Relabel it the same way
+    // `rtype_cast_ptr_to_int` does before the `PtrRepr` assert. A classed
+    // instance is an object receiver and stays rejected. An empty
+    // `args_v` (the assert-only shape) is left untouched.
+    let needs_swap = hop
+        .args_r
+        .borrow()
+        .first()
+        .and_then(|r| r.as_ref())
+        .is_some_and(|r| r.repr_class_id() != ReprClassId::PtrRepr);
+    if needs_swap && !hop.args_v.borrow().is_empty() {
+        let classed = hop.args_r.borrow()[0].as_ref().is_some_and(|r| {
+            (r.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<InstanceRepr>()
+                .is_some_and(|inst| inst.classdef().is_some())
+        });
+        if !classed {
+            let v = hop.args_v.borrow()[0].clone();
+            let concrete = match &v {
+                Hlvalue::Variable(var) => var.concretetype(),
+                Hlvalue::Constant(c) => c.concretetype.clone(),
+            };
+            if let Some(LowLevelType::Ptr(ptr)) = concrete {
+                hop.args_r.borrow_mut()[0] = Some(Arc::new(PtrRepr::new(*ptr)) as Arc<dyn Repr>);
+            }
+        }
+    }
 
     let r_arg = arg_repr(hop, 0)?;
     // `assert isinstance(hop.args_r[0], rptr.PtrRepr)`.
@@ -6401,6 +6434,96 @@ mod tests {
             err.to_string().contains("must be PtrRepr"),
             "rtype_direct_ptradd asserts PtrRepr, got {err}"
         );
+    }
+
+    #[test]
+    fn rtype_direct_ptradd_rejects_non_ptr_concretetype() {
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let inst = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("root InstanceRepr");
+        let var = Variable::named("word");
+        var.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_r.borrow_mut().push(Some(inst as Arc<dyn Repr>));
+        let err = rtype_direct_ptradd(&hop, &HashMap::new()).expect_err("Ptr concretetype");
+        assert!(
+            err.to_string().contains("must be PtrRepr"),
+            "a non-pointer concretetype stays rejected, got {err}"
+        );
+    }
+
+    #[test]
+    fn rtype_direct_ptradd_rejects_classed_instance() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("pkg.Boxed", None);
+        let inst =
+            getinstancerepr(&hop.rtyper, Some(&classdef), Flavor::Gc).expect("classed instance");
+        let var = Variable::named("obj");
+        var.set_concretetype(Some(LowLevelType::Ptr(Box::new(objectptr_type()))));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_s.borrow_mut().push(SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(None, false, Default::default()),
+        ));
+        hop.args_r.borrow_mut().push(Some(inst as Arc<dyn Repr>));
+        let err = rtype_direct_ptradd(&hop, &HashMap::new()).expect_err("classed instance");
+        assert!(
+            err.to_string().contains("must be PtrRepr"),
+            "a classed instance stays rejected, got {err}"
+        );
+    }
+
+    #[test]
+    fn rtype_direct_ptradd_swaps_classdef_less_instance_with_ptr_concretetype() {
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::PtrRepr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let inst = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("root InstanceRepr");
+        let ptr = objectptr_type();
+        let var = Variable::named("base");
+        var.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )));
+        hop.args_s.borrow_mut().push(SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(None, false, Default::default()),
+        ));
+        hop.args_r.borrow_mut().push(Some(inst as Arc<dyn Repr>));
+        let result_repr: Arc<dyn Repr> = Arc::new(PtrRepr::new(ptr));
+        *hop.r_result.borrow_mut() = Some(result_repr);
+
+        let result = rtype_direct_ptradd(&hop, &HashMap::new())
+            .expect("classdef-less Ptr concretetype swaps")
+            .expect("direct_ptradd returns a pointer");
+        assert_eq!(
+            hop.args_r.borrow()[0].as_ref().map(|r| r.repr_class_id()),
+            Some(ReprClassId::PtrRepr),
+            "the fallback relabels InstanceRepr to PtrRepr"
+        );
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "direct_ptradd");
     }
 
     fn dict_constructor_hop() -> (

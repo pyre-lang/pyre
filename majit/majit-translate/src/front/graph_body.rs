@@ -311,15 +311,31 @@ impl GraphBodyProvider {
         let fd = krate.llbc.fn_by_id(src.def_id).ok_or_else(|| {
             LowerError::Unsupported(format!("no FunDecl for def_id {}", src.def_id))
         })?;
-        krate
-            .lowering(&self.tables, |lowering| lowering.build_decl(fd))
-            .map_err(|e| match e {
-                DeclBuildError::NoBody => LowerError::Unsupported(format!(
-                    "{}: no Unstructured body",
-                    fd.item_meta.name_path()
-                )),
-                DeclBuildError::Lower { error, .. } => error,
-            })
+        // Same order as the deferred closure in `declare_crate`: the header
+        // is snapshotted before the body exists, the body is stamped
+        // afterwards, and clause specializations the body queued are
+        // declared before the funcobj is returned.
+        let (header, stamp, declared) = krate.lowering(&self.tables, |lowering| {
+            let header = lowering.decl_header(fd);
+            let stamp = header.graph_stamp();
+            let declared = lowering.decl_header_graph(fd, &stamp);
+            (header, stamp, declared)
+        });
+        let Some(declared) = declared else {
+            return Err(LowerError::Unsupported(format!(
+                "{}: no Unstructured body",
+                fd.item_meta.name_path()
+            )));
+        };
+        let Some(graph) = krate.build_decl_graph(&self.tables, src.def_id, &stamp, &declared)
+        else {
+            return Err(LowerError::Unsupported(format!(
+                "{}: body did not lower",
+                fd.item_meta.name_path()
+            )));
+        };
+        krate.declare_queued_specs(&self.tables);
+        Ok(header.into_semantic(LazyGraph::built(graph)))
     }
 }
 
@@ -742,5 +758,26 @@ mod tests {
             "malloc_typed graph hints {:?}",
             function("malloc_typed").graph().hints
         );
+        // `build` is the demand entry. It must stamp the same header and
+        // the same body the deferred closure did, including a template
+        // whose `dont_look_inside` exists only on the built graph.
+        for name in ["malloc_typed", "malloc_typed_stable"] {
+            let deferred = function(name);
+            let src = GraphBodySource {
+                llbc_index: 0,
+                def_id: deferred
+                    .fun_decl_id
+                    .unwrap_or_else(|| panic!("{name} has no FunDecl")),
+            };
+            let demanded = provider
+                .build(src)
+                .unwrap_or_else(|e| panic!("build {name}: {e}"));
+            assert_eq!(demanded.hints, deferred.hints, "{name} header hints");
+            assert_eq!(
+                demanded.graph().hints,
+                deferred.graph().hints,
+                "{name} graph hints"
+            );
+        }
     }
 }

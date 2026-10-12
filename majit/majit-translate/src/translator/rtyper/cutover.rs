@@ -3328,6 +3328,19 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self"],
         LowLevelType::Float,
     ),
+    // Fractional part. `complex_richcompare` uses it to test that a
+    // float lane is integral before the integer compare. Same opaque
+    // float residual as `floor` / `ceil`; the defining path is `core`.
+    (
+        &["std", "f64", "<Impl>", "fract"],
+        &["self"],
+        LowLevelType::Float,
+    ),
+    (
+        &["core", "f64", "<Impl>", "fract"],
+        &["self"],
+        LowLevelType::Float,
+    ),
     (
         &["std", "f64", "<Impl>", "powf"],
         &["self", "n"],
@@ -3986,6 +3999,36 @@ pub(crate) fn run_two_phase_prepass(
     call_registry.two_phase().prepass_done = true;
 }
 
+/// Text of a caught annotator or rtyper unwind.
+///
+/// `simple_call_SomeObject` raises `AnnotatorError` from
+/// `compute_at_fixpoint`. `panic_payload_text` reads that object; a
+/// string downcast misses it and the phase line cannot name the failure.
+/// `binding` panics with a `String`. Capture the unwind origin so a
+/// phase-B `KeyError` names the rtyper frame, not only the caller's block.
+fn install_binding_backtrace_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let text = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        if text.contains("no binding for arg") {
+            eprintln!(
+                "[PREPASS binding-backtrace] {text}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        prev(info);
+    }));
+}
+
+fn unwind_panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    crate::annotator::model::panic_payload_text(payload)
+        .unwrap_or_else(|| "<non-string panic>".to_string())
+}
+
 /// Whether the `MAJIT_RTYPER_VERBOSE` de-aggregating census is enabled.
 /// Matches the `== "1"` contract the codewriter's coverage gauge uses
 /// (`codewriter.rs`), so a literal `MAJIT_RTYPER_VERBOSE=0` stays off.
@@ -4264,6 +4307,9 @@ fn run_two_phase_prepass_inner(
 ) {
     // Exists to localise prepass nondeterminism (gh#1139).
     let determinism_trace = crate::determinism_trace_enabled();
+    if rtyper_verbose_enabled() {
+        install_binding_backtrace_hook();
+    }
 
     // Deterministic order (R3): candidate_graphs is a HashSet; iterating it
     // directly would make classdef numbering (and thus Match/Skip
@@ -4628,14 +4674,7 @@ fn run_phase_b_rtype_isolated(
                     if rtyper_verbose_enabled() {
                         let reason = match other {
                             Ok(Err(e)) => format!("rtype Err: {e:?}"),
-                            Err(p) => {
-                                let msg = p
-                                    .downcast_ref::<String>()
-                                    .cloned()
-                                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                                    .unwrap_or_else(|| "<non-string panic>".to_string());
-                                format!("rtype PANIC: {msg}")
-                            }
+                            Err(p) => format!("rtype PANIC: {}", unwind_panic_text(&**p)),
                             Ok(Ok(())) => unreachable!(),
                         };
                         let gname = gopt

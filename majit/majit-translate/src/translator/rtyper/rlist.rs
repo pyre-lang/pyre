@@ -690,18 +690,23 @@ fn alloc_and_set_helper_name(layout: ListLayout) -> &'static str {
     }
 }
 
-/// Mint the six sub-helpers of the `ll_alloc_and_set` family in dependency
-/// order and build the top-level dispatch graph
-/// ([`build_ll_alloc_and_set_helper_graph`]).
+/// Mint the `ll_alloc_and_set` family in dependency order and build the
+/// top-level dispatch graph ([`build_ll_alloc_and_set_helper_graph`]).
 ///
-/// The chain (`rlist.py:487-537`) is
+/// The chain (`rlist.py` `ll_alloc_and_set`) is
 /// `ll_alloc_and_set → {_ll_alloc_and_set_jit, _ll_alloc_and_set_nojit}`,
-/// with the jit arm reaching `{_ll_alloc_and_clear, _ll_alloc_and_set_nonnull}`
-/// and both leaf arms reaching `LIST.ll_newlist` plus the T1 rgc helpers
-/// `rgc.ll_arrayclear` / `rgc.ll_arrayfill`. Each sub-helper is minted through
+/// with the jit arm reaching `_ll_alloc_and_clear` or the
+/// `look_inside_iff` wrapper around `_ll_alloc_and_set_nonnull`
+/// (`rlib/jit.py` `look_inside_iff`). Both leaf arms reach
+/// `LIST.ll_newlist` plus the T1 rgc helpers `rgc.ll_arrayclear` /
+/// `rgc.ll_arrayfill`. Each sub-helper is minted through
 /// [`RPythonTyper::lowlevel_helper_function_with_builder`], converted to a
 /// callee `Constant` by [`functionptr_const`], and threaded into the parent
 /// builder — the exact orchestration shape of `rtype_builder_new`.
+///
+/// The public nonnull graph stays the original four-block loop. The
+/// wrapper, its `dont_look_inside` trampoline, and the `isconstant`
+/// fallback are separate graphs; the jit arm calls the wrapper.
 fn build_alloc_and_set_family(
     rtyper: &RPythonTyper,
     layout: ListLayout,
@@ -811,7 +816,9 @@ fn build_alloc_and_set_family(
         )?
     };
 
-    // _ll_alloc_and_set_nonnull(LIST, count, item) (rlist.py).
+    // _ll_alloc_and_set_nonnull(LIST, count, item) (rlist.py). The
+    // graph under this name is the original loop. `look_inside_iff`
+    // wraps it below; the jit arm calls the wrapper.
     let nonnull = {
         let ptr = ptr_lltype.clone();
         let newlist_fn = functionptr_const(rtyper, &newlist)?;
@@ -833,11 +840,72 @@ fn build_alloc_and_set_family(
         )?
     };
 
+    // `rlib/jit.py isconstant` interpreter fallback (`NonConstant(False)`).
+    // Both layouts share one graph: the `(name, args, result)` cache hits
+    // on the second layout. The traced path is the rich-spine oopspec.
+    let isconstant = rtyper.lowlevel_helper_function_with_builder(
+        "_ll_alloc_and_set_isconstant".to_string(),
+        vec![LowLevelType::Signed],
+        LowLevelType::Bool,
+        |_r, _a, _res| {
+            build_ll_alloc_and_set_isconstant_helper_graph("_ll_alloc_and_set_isconstant")
+        },
+    )?;
+
+    // `@dont_look_inside` trampoline: one call of the original loop.
+    let trampoline_name = format!("{nonnull_name}_trampoline");
+    let trampoline = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        let orig_fn = functionptr_const(rtyper, &nonnull)?;
+        let name = trampoline_name.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            trampoline_name,
+            vec![LowLevelType::Signed, item_lltype.clone()],
+            ptr_lltype.clone(),
+            move |_r, _a, _res| {
+                build_ll_alloc_and_set_trampoline_helper_graph(
+                    &name,
+                    ptr.clone(),
+                    item.clone(),
+                    orig_fn.clone(),
+                )
+            },
+        )?
+    };
+
+    // `look_inside_iff` wrapper. The jit arm's nonnull callee is this
+    // graph, not the loop (`rlib/jit.py` `look_inside_iff`).
+    let wrapper_name = format!("{nonnull_name}_look_inside_iff");
+    let wrapper = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        let orig_fn = functionptr_const(rtyper, &nonnull)?;
+        let trampoline_fn = functionptr_const(rtyper, &trampoline)?;
+        let isconstant_fn = functionptr_const(rtyper, &isconstant)?;
+        let name = wrapper_name.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            wrapper_name,
+            vec![LowLevelType::Signed, item_lltype.clone()],
+            ptr_lltype.clone(),
+            move |_r, _a, _res| {
+                build_ll_alloc_and_set_look_inside_iff_helper_graph(
+                    &name,
+                    ptr.clone(),
+                    item.clone(),
+                    orig_fn.clone(),
+                    trampoline_fn.clone(),
+                    isconstant_fn.clone(),
+                )
+            },
+        )?
+    };
+
     // _ll_alloc_and_set_jit(LIST, count, item) (rlist.py).
     let jit = {
         let ptr = ptr_lltype.clone();
         let clear_fn = functionptr_const(rtyper, &clear)?;
-        let nonnull_fn = functionptr_const(rtyper, &nonnull)?;
+        let nonnull_fn = functionptr_const(rtyper, &wrapper)?;
         let item = item_lltype.clone();
         rtyper.lowlevel_helper_function_with_builder(
             jit_name.to_string(),
@@ -4502,11 +4570,15 @@ fn build_ll_alloc_and_clear_helper_graph(
 ///     return l
 /// ```
 ///
-/// The `@jit.look_inside_iff(isconstant(count) and count < 137)` marker is a
-/// TRACING policy and is omitted (optional fidelity follow-up).  Three-block
-/// loop: startblock `l = ll_newlist(count)` then enters the header with
-/// `i = 0`; header `int_lt(i, count)` branches true → body, false → return l;
-/// body `ll_setitem_fast(l, i, item)` then `i += 1` back to header.
+/// This graph is the original loop body. `build_alloc_and_set_family`
+/// mints the `look_inside_iff` wrapper (`rlib/jit.py` `look_inside_iff`:
+/// `unroll_safe` on the original, a `dont_look_inside` trampoline, and
+/// `if not we_are_jitted() or (isconstant(count) and count < 137)`) under
+/// `{name}_look_inside_iff` and points the jit arm at that wrapper. The
+/// loop itself stays four blocks: startblock `l = ll_newlist(count)` then
+/// enters the header with `i = 0`; header `int_lt(i, count)` branches
+/// true → body, false → return l; body `ll_setitem_fast(l, i, item)` then
+/// `i += 1` back to header.
 fn build_ll_alloc_and_set_nonnull_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
@@ -4633,6 +4705,277 @@ fn build_ll_alloc_and_set_nonnull_helper_graph(
             ],
             Some(block_cond),
             None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["count".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// `rlib/jit.py isconstant`: the interpreter fallback is `NonConstant(False)`.
+/// The traced path is the oopspec `jit.isconstant`, which the rich spine
+/// mints itself. A flowspace wrapper that always sees false takes the
+/// trampoline; that graph is not what the rich tracer runs.
+fn build_ll_alloc_and_set_isconstant_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
+    let value = variable_with_lltype("value", LowLevelType::Signed);
+    let startblock = Block::shared(vec![Hlvalue::Variable(value)]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![bool_const(false)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["value".to_string()],
+        func,
+    ))
+}
+
+/// `look_inside_iff`'s `@dont_look_inside` trampoline: one `direct_call`
+/// of the original nonnull loop.
+fn build_ll_alloc_and_set_trampoline_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    orig_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let count_arg = variable_with_lltype("count", LowLevelType::Signed);
+    let item_arg = variable_with_lltype("item", item_lltype);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(count_arg.clone()),
+        Hlvalue::Variable(item_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let res = variable_with_lltype("result", ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(orig_fn),
+            Hlvalue::Variable(count_arg),
+            Hlvalue::Variable(item_arg),
+        ],
+        Hlvalue::Variable(res.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `@dont_look_inside` (`rlib/jit.py` `look_inside_iff`).
+    func._jit_look_inside_ = Some(false);
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["count".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// `rlib/jit.py look_inside_iff` wrapper around the nonnull loop:
+///
+/// ```python
+/// def f(count, item):
+///     if not we_are_jitted() or (isconstant(count) and count < 137):
+///         return orig(count, item)
+///     else:
+///         return trampoline(count, item)
+/// ```
+///
+/// `we_are_jitted` is the `SpecTag` exitswitch (true link first, matching
+/// [`build_ll_alloc_and_set_helper_graph`]). The predicate short-circuits:
+/// `isconstant` false goes to the trampoline, true checks `count < 137`.
+fn build_ll_alloc_and_set_look_inside_iff_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    orig_fn: Constant,
+    trampoline_fn: Constant,
+    isconstant_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let count_arg = variable_with_lltype("count", LowLevelType::Signed);
+    let item_arg = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(count_arg.clone()),
+        Hlvalue::Variable(item_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let orig_count = variable_with_lltype("count", LowLevelType::Signed);
+    let orig_item = variable_with_lltype("item", item_lltype.clone());
+    let block_orig = Block::shared(vec![
+        Hlvalue::Variable(orig_count.clone()),
+        Hlvalue::Variable(orig_item.clone()),
+    ]);
+    let orig_res = variable_with_lltype("result", ptr_lltype.clone());
+    block_orig.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(orig_fn),
+            Hlvalue::Variable(orig_count),
+            Hlvalue::Variable(orig_item),
+        ],
+        Hlvalue::Variable(orig_res.clone()),
+    ));
+    block_orig.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(orig_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let tr_count = variable_with_lltype("count", LowLevelType::Signed);
+    let tr_item = variable_with_lltype("item", item_lltype.clone());
+    let block_tramp = Block::shared(vec![
+        Hlvalue::Variable(tr_count.clone()),
+        Hlvalue::Variable(tr_item.clone()),
+    ]);
+    let tr_res = variable_with_lltype("result", ptr_lltype);
+    block_tramp
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(trampoline_fn),
+                Hlvalue::Variable(tr_count),
+                Hlvalue::Variable(tr_item),
+            ],
+            Hlvalue::Variable(tr_res.clone()),
+        ));
+    block_tramp.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(tr_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let lt_count = variable_with_lltype("count", LowLevelType::Signed);
+    let lt_item = variable_with_lltype("item", item_lltype.clone());
+    let block_lt = Block::shared(vec![
+        Hlvalue::Variable(lt_count.clone()),
+        Hlvalue::Variable(lt_item.clone()),
+    ]);
+    let below = variable_with_lltype("below", LowLevelType::Bool);
+    block_lt.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(lt_count.clone()), signed_const(137)],
+        Hlvalue::Variable(below.clone()),
+    ));
+    block_lt.borrow_mut().exitswitch = Some(Hlvalue::Variable(below));
+    block_lt.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(lt_count.clone()),
+                Hlvalue::Variable(lt_item.clone()),
+            ],
+            Some(block_orig.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(lt_count), Hlvalue::Variable(lt_item)],
+            Some(block_tramp.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let pred_count = variable_with_lltype("count", LowLevelType::Signed);
+    let pred_item = variable_with_lltype("item", item_lltype);
+    let block_pred = Block::shared(vec![
+        Hlvalue::Variable(pred_count.clone()),
+        Hlvalue::Variable(pred_item.clone()),
+    ]);
+    let is_const = variable_with_lltype("is_constant", LowLevelType::Bool);
+    block_pred.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(isconstant_fn),
+            Hlvalue::Variable(pred_count.clone()),
+        ],
+        Hlvalue::Variable(is_const.clone()),
+    ));
+    block_pred.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_const));
+    block_pred.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(pred_count.clone()),
+                Hlvalue::Variable(pred_item.clone()),
+            ],
+            Some(block_lt),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(pred_count), Hlvalue::Variable(pred_item)],
+            Some(block_tramp),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(count_arg.clone()),
+                Hlvalue::Variable(item_arg.clone()),
+            ],
+            Some(block_pred),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(count_arg), Hlvalue::Variable(item_arg)],
+            Some(block_orig),
+            Some(bool_const(false)),
         )
         .into_ref(),
     ]);
@@ -9809,6 +10152,97 @@ mod tests {
         (count, all_ops)
     }
 
+    fn direct_call_func_name(arg: &Hlvalue) -> Option<String> {
+        let Hlvalue::Constant(constant) = arg else {
+            return None;
+        };
+        let ConstValue::LLPtr(ptr) = &constant.value else {
+            return None;
+        };
+        let crate::translator::rtyper::lltypesystem::lltype::PtrObj::Strong(obj) = &ptr._obj0
+        else {
+            return None;
+        };
+        let crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Func(func) = obj else {
+            return None;
+        };
+        Some(func._name.clone())
+    }
+
+    fn direct_call_callees(graph: &FunctionGraph) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for block in graph.iterblocks() {
+            for op in &block.borrow().operations {
+                if op.opname != "direct_call" {
+                    continue;
+                }
+                let Some(name) = op.args.first().and_then(direct_call_func_name) else {
+                    continue;
+                };
+                out.push((op.args.len(), name));
+            }
+        }
+        out
+    }
+
+    /// The jit arm calls the `look_inside_iff` wrapper, and the public
+    /// nonnull name stays the original four-block loop.
+    fn assert_look_inside_family(
+        graphs: &[crate::flowspace::model::GraphRef],
+        jit: &str,
+        nonnull: &str,
+        clear: &str,
+    ) {
+        let find = |name: &str| {
+            graphs
+                .iter()
+                .find(|g| g.borrow().name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .clone()
+        };
+        let wrapper = format!("{nonnull}_look_inside_iff");
+        let trampoline = format!("{nonnull}_trampoline");
+        for name in [
+            wrapper.as_str(),
+            trampoline.as_str(),
+            "_ll_alloc_and_set_isconstant",
+        ] {
+            assert!(
+                graphs.iter().any(|g| g.borrow().name == name),
+                "family must mint `{name}`"
+            );
+        }
+        let calls = direct_call_callees(&find(jit).borrow());
+        assert!(
+            calls.iter().any(|(n, name)| *n == 3 && name == &wrapper),
+            "jit 3-arg callee is the wrapper, got {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(n, name)| *n == 2 && name == clear),
+            "jit 2-arg callee is the clear arm, got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(_, name)| name == nonnull),
+            "jit arm must not call the loop directly, got {calls:?}"
+        );
+        assert_eq!(
+            find(&trampoline)
+                .borrow()
+                .func
+                .as_ref()
+                .unwrap()
+                ._jit_look_inside_,
+            Some(false)
+        );
+        let start = find(nonnull).borrow().startblock.clone();
+        let (count, all_ops) = walk_ops(&start);
+        assert_eq!(count, 4, "public nonnull name stays the 4-block loop");
+        let n = |name: &str| all_ops.iter().filter(|op| op.as_str() == name).count();
+        assert_eq!(n("direct_call"), 2);
+        assert_eq!(n("int_lt"), 1);
+        assert_eq!(n("int_add"), 1);
+    }
+
     /// `ll_arraymove` must dispatch on the sign of `delta` and carry both
     /// element loops, so a right move — `ll_insert_nonneg`'s
     /// `ll_arraymove(l, index, index + 1, length - index)` — walks descending
@@ -9932,20 +10366,18 @@ mod tests {
         );
 
         // The minted family graphs must be registered under their upstream
-        // names (the resized spellings).
-        let names: Vec<String> = ann
-            .translator
-            .graphs
-            .borrow()
-            .iter()
-            .map(|g| g.borrow().name.clone())
-            .collect();
+        // names (the resized spellings), plus the `look_inside_iff` split.
+        let graphs = ann.translator.graphs.borrow().clone();
+        let names: Vec<String> = graphs.iter().map(|g| g.borrow().name.clone()).collect();
         for expected in [
             "ll_alloc_and_set",
             "_ll_alloc_and_set_jit",
             "_ll_alloc_and_set_nojit",
             "_ll_alloc_and_clear",
             "_ll_alloc_and_set_nonnull",
+            "_ll_alloc_and_set_nonnull_look_inside_iff",
+            "_ll_alloc_and_set_nonnull_trampoline",
+            "_ll_alloc_and_set_isconstant",
             "ll_arrayclear",
             "ll_arrayfill",
             "ll_newlist",
@@ -9955,6 +10387,12 @@ mod tests {
                 "family must mint `{expected}`, got {names:?}"
             );
         }
+        assert_look_inside_family(
+            &graphs,
+            "_ll_alloc_and_set_jit",
+            "_ll_alloc_and_set_nonnull",
+            "_ll_alloc_and_clear",
+        );
     }
 
     /// The fixed layout mints the `ll_fixed_*` dispatch/jit/nojit spellings so
@@ -10002,13 +10440,8 @@ mod tests {
             .expect("rtype_alloc_and_set must lower")
             .expect("alloc_and_set returns the fresh list Variable");
 
-        let names: Vec<String> = ann
-            .translator
-            .graphs
-            .borrow()
-            .iter()
-            .map(|g| g.borrow().name.clone())
-            .collect();
+        let graphs = ann.translator.graphs.borrow().clone();
+        let names: Vec<String> = graphs.iter().map(|g| g.borrow().name.clone()).collect();
         assert!(
             names.iter().any(|n| n == "ll_fixed_alloc_and_set"),
             "fixed arm mints ll_fixed_alloc_and_set, got {names:?}"
@@ -10017,9 +10450,25 @@ mod tests {
             names.iter().any(|n| n == "ll_fixed_newlist"),
             "fixed arm mints ll_fixed_newlist, got {names:?}"
         );
+        for expected in [
+            "_ll_fixed_alloc_and_set_nonnull_look_inside_iff",
+            "_ll_fixed_alloc_and_set_nonnull_trampoline",
+            "_ll_alloc_and_set_isconstant",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "fixed arm must mint `{expected}`, got {names:?}"
+            );
+        }
         assert!(
             !names.iter().any(|n| n == "ll_alloc_and_set"),
             "fixed arm must NOT mint the resized ll_alloc_and_set, got {names:?}"
+        );
+        assert_look_inside_family(
+            &graphs,
+            "_ll_fixed_alloc_and_set_jit",
+            "_ll_fixed_alloc_and_set_nonnull",
+            "_ll_fixed_alloc_and_clear",
         );
     }
 

@@ -1760,6 +1760,51 @@ impl FunctionDesc {
         self.cachedgraph(combined_key, None, builder)
     }
 
+    /// Structural identity of a payload whose `knowntype` is
+    /// [`KnownType::Other`].
+    ///
+    /// `specialize_argtype` keys a scalar by [`KnownType`]. A tuple, a
+    /// list, and an instance are all `Other`, so those would share one
+    /// graph. The key is the annotation shape (`RDict` versus a pair of
+    /// vecs), not a debug rendering of addresses.
+    fn storage_box_payload_key(s: &SomeValue) -> String {
+        match s {
+            SomeValue::Instance(inst) => {
+                let name = inst
+                    .classdef
+                    .as_ref()
+                    .map(|cd| cd.borrow().name.clone())
+                    .unwrap_or_else(|| "_".to_string());
+                format!("inst:{name}")
+            }
+            SomeValue::Tuple(t) => {
+                let parts: Vec<String> =
+                    t.items.iter().map(Self::storage_box_payload_key).collect();
+                format!("tuple({})", parts.join(","))
+            }
+            SomeValue::List(list) => {
+                format!(
+                    "list({})",
+                    Self::storage_box_payload_key(&list.listdef.s_value())
+                )
+            }
+            SomeValue::RustVec(v) => {
+                format!("rustvec({})", Self::storage_box_payload_key(&v.s_item))
+            }
+            SomeValue::Integer(i) => {
+                if i.unsigned {
+                    "uint".to_string()
+                } else {
+                    "int".to_string()
+                }
+            }
+            SomeValue::Float(_) => "float".to_string(),
+            SomeValue::String(_) => "str".to_string(),
+            SomeValue::None_(_) => "none".to_string(),
+            other => format!("{:?}", other.tag()),
+        }
+    }
+
     pub(crate) fn default_specialize(
         &self,
         inputcells: &mut Vec<Option<SomeValue>>,
@@ -1919,7 +1964,16 @@ impl FunctionDesc {
                     "specialize:argtype({idx}): argument is unannotated"
                 ))
             })?;
-            key_parts.push(GraphCacheKey::KnownType(s.knowntype()));
+            // `specialize.py` `specialize_argtype` keys `args_s[i].knowntype`.
+            // Scalars already split (`int` versus `r_uint`). `Other` is one
+            // bucket for every container and instance, so a storage-box
+            // payload keys the shape instead (`storage_box_payload_key`).
+            let key = if s.knowntype() == super::model::KnownType::Other {
+                GraphCacheKey::String(Self::storage_box_payload_key(s))
+            } else {
+                GraphCacheKey::KnownType(s.knowntype())
+            };
+            key_parts.push(key);
         }
         self.maybe_star_args(GraphCacheKey::Tuple(key_parts), args_s)
     }

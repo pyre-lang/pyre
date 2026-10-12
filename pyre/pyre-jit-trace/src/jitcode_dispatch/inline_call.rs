@@ -1674,6 +1674,11 @@ fn known_int_result(
         "int_neg/i>i" => Some(int(0)?.wrapping_neg()),
         "int_invert/i>i" => Some(!int(0)?),
         "int_is_true/i>i" => Some(bool_word(int(0)? != 0)),
+        // `blackhole.py bhimpl_int_force_ge_zero`: `0` if `i < 0` else `i`.
+        "int_force_ge_zero/i>i" => {
+            let n = int(0)?;
+            Some(if n < 0 { 0 } else { n })
+        }
         "int_lt/ii>i" => Some(bool_word(int(0)? < int(1)?)),
         "int_le/ii>i" => Some(bool_word(int(0)? <= int(1)?)),
         "int_eq/ii>i" => Some(bool_word(int(0)? == int(1)?)),

@@ -249,8 +249,9 @@ fn ref_kind_mutates(kind: &Value) -> bool {
 
 /// Assignments of each local: `Assign` destinations, call destinations,
 /// and `&mut` / `*mut` borrows of a local. `StorageLive` / `StorageDead`
-/// are not definitions.
-fn local_def_counts(body: &Unstructured, llbc: &Llbc) -> Vec<u32> {
+/// are not definitions. Only blocks in `forward_blocks` are counted: an
+/// `on_unwind` cleanup block is still in the body.
+fn local_def_counts(body: &Unstructured, llbc: &Llbc, forward_blocks: &[bool]) -> Vec<u32> {
     let n = body.locals.locals.len();
     let mut counts = vec![0u32; n];
     let bump = |counts: &mut [u32], l: Option<usize>| {
@@ -260,7 +261,10 @@ fn local_def_counts(body: &Unstructured, llbc: &Llbc) -> Vec<u32> {
             *c = c.saturating_add(1);
         }
     };
-    for block in &body.body {
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
         for stmt in &block.statements {
             let Ok(kind) = stmt.stmt_kind_ref() else {
                 continue;
@@ -521,7 +525,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
     let mut classified: HashMap<usize, (Leaf, bool)> = HashMap::new();
+    let forward_blocks = super::forward_reachable_mask(llbc, &body);
     for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && let Some(class) = classify_call(call, llbc)
         {
@@ -539,7 +547,10 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // after the rewrite nothing rewinds a leftover
     // (`_fix_graph_after_inlining`). A callee that only reads below entry
     // is checked against the entry depth in the walk below.
-    for block in &body.body {
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && classify_call(call, llbc).is_none()
             && callee_path(call, llbc)
@@ -574,7 +585,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         };
     let slot_local = |k: usize| n_locals + k;
 
-    let def_counts = local_def_counts(body, llbc);
+    let def_counts = local_def_counts(body, llbc, &forward_blocks);
     let single_def = |dest: usize| def_counts.get(dest).copied() == Some(1);
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
@@ -975,12 +986,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             Ok(TermKind::Return) => {
                 if depth != 0 {
                     // 10.04 `Drop` of the guard lives in an `is_cleanup`
-                    // block; `unstructured` leaves those out and appends
-                    // one `UnwindResume`. Return is then the normal closer.
+                    // block. `FunDecl::unstructured` keeps those blocks, so
+                    // `UnwindResume` is among them and a later
+                    // `UnwindTerminate` can be last. Return is then the
+                    // normal closer.
                     if body
                         .body
-                        .last()
-                        .is_some_and(|bb| matches!(bb.term(llbc), Ok(TermKind::UnwindResume)))
+                        .iter()
+                        .any(|bb| matches!(bb.term_ref(llbc), Ok(TermKind::UnwindResume)))
                     {
                         depth = 0;
                     } else {
@@ -1021,6 +1034,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         watched.insert(*local);
     }
     for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
         if !visited[bb] {
             continue;
         }
@@ -1114,8 +1130,8 @@ pub(super) fn is_root_scope_local(body: &Unstructured, llbc: &Llbc, local: usize
 /// block: `_a = [x, y]; _r = &_a; _s = &*_r; _p = _s as &[_]`.  Returns the
 /// literal's statement index and its element operands.
 ///
-/// Statement JSON is read off this block, the CFG after unwind-only blocks
-/// are dropped, so the index matches the rewrite.
+/// The index is this block's own statement index. Cleanup blocks stay in the
+/// body at their extracted indices and are not renumbered out of the way.
 fn resolve_published_array(
     block: &majit_charon_reader::ullbc::BasicBlock,
     slice: Option<usize>,
@@ -1164,15 +1180,20 @@ pub(super) fn erase_shadow_stack(
     if fd.item_meta.name_path().contains("::gc_roots::") {
         return Ok(None);
     }
-    // `body` is the CFG after unwind-only blocks are dropped (and promoted
-    // constants spliced).  The rewrite has to use that numbering: the
-    // extracted artefact still has those blocks, and mixing the two is
-    // how a same-block array publish was refused as unresolved.
-    let mut u = unstructured_json_from_body(body);
+    // `body` keeps every extracted block at its original index (promoted
+    // constants already spliced). The walk records only blocks reached from
+    // bb0; `on_unwind` is not a successor, so a cleanup block stays in the
+    // body and is not entered. Rewriting against any other numbering is how
+    // a same-block array publish was refused as unresolved.
+    //
+    // The JSON rebuild parses every terminator kind. A body with no bracket
+    // never reads that tree (`analyze` returns `None`), so build it only
+    // once a plan exists.
     let plan = match analyze(body, llbc)? {
         Some(plan) => plan,
         None => return Ok(None),
     };
+    let mut u = unstructured_json_from_body(body);
     let span = u["span"].clone();
     // The slot locals.
     if plan.slot_count > 0 {
@@ -1574,7 +1595,11 @@ fn callee_effect_of(llbc: &Llbc, path: &str) -> CalleeEffect {
 }
 
 fn first_non_none_callee(body: &Unstructured, llbc: &Llbc) -> Option<(String, CalleeEffect)> {
-    for block in &body.body {
+    let forward_blocks = super::forward_reachable_mask(llbc, &body);
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && classify_call(call, llbc).is_none()
             && let Some(path) = callee_path(call, llbc)
@@ -2357,7 +2382,11 @@ fn discover_stack_effects(
         let Some(body) = fd.unstructured() else {
             continue;
         };
-        for block in &body.body {
+        let forward_blocks = super::forward_reachable_mask(llbc, &body);
+        for (bb_idx, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
             if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
                 && let Some(path) = callee_path(call, llbc)
             {
@@ -2676,9 +2705,9 @@ mod tests {
         })
     }
 
-    /// A `pin_roots` of a same-block array, with an unwind-only block in
-    /// front of it in the artefact.  The CFG drop of that block must not
-    /// make the array unresolvable.
+    /// A `pin_roots` of a same-block array, with a cleanup block in front of
+    /// that array block. The body keeps every extracted block at its original
+    /// index; erase still accepts the publish.
     #[test]
     fn erase_accepts_publish_when_cleanup_blocks_precede_the_array() {
         let ty = json!({"Deduplicated": 0});
@@ -2754,11 +2783,12 @@ mod tests {
         assert_eq!(
             body.body.len(),
             4,
-            "three kept blocks plus one unwind resume"
+            "extracted blocks stay at their original indices"
         );
         assert!(
-            body.body.iter().all(|bb| !bb.is_cleanup),
-            "unwind-only block should have been dropped"
+            body.body[1].is_cleanup
+                && matches!(body.body[1].term_ref(&llbc), Ok(TermKind::UnwindResume)),
+            "block 1 is the cleanup UnwindResume"
         );
         match erase_shadow_stack(fd, &body, &llbc) {
             Ok(Some(_)) => {}
@@ -2804,6 +2834,14 @@ mod tests {
             "statements": [],
             "terminator": {"span": span(), "kind": kind},
             "is_cleanup": false
+        })
+    }
+
+    fn bb_cleanup(kind: Value) -> Value {
+        json!({
+            "statements": [],
+            "terminator": {"span": span(), "kind": kind},
+            "is_cleanup": true
         })
     }
 
@@ -2996,6 +3034,27 @@ mod tests {
         json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]})
     }
 
+    /// A cleanup block that reassigns a local is not a second definition.
+    #[test]
+    fn local_def_counts_skips_cleanup_reassign() {
+        let llbc = fixture_llbc();
+        let use_copy0 = json!({"Use": [{"Copy": place(0)}, "Yes"]});
+        let body = body_of(
+            2,
+            vec![
+                bb_stmts(vec![assign_local(1, use_copy0.clone())], json!("Return")),
+                json!({
+                    "statements": [assign_local(1, use_copy0)],
+                    "terminator": {"span": span(), "kind": "UnwindResume"},
+                    "is_cleanup": true
+                }),
+            ],
+        );
+        let forward_blocks = super::super::forward_reachable_mask(&llbc, &body);
+        let counts = local_def_counts(&body, &llbc, &forward_blocks);
+        assert_eq!(counts.get(1).copied(), Some(1));
+    }
+
     /// `zip_two_tuple_next` / `tuple_iter_descr_next`: pin, then name the
     /// slot as `shadow_stack_len() - 1`, then get it.
     fn len_minus_one_body(sub_op: Value) -> Unstructured {
@@ -3032,6 +3091,31 @@ mod tests {
             is_neutral(&body, &llbc),
             "len-1 of a just-pinned slot must be depth-neutral"
         );
+    }
+
+    /// `Drop` of the guard lives in an `is_cleanup` block. `unstructured`
+    /// keeps those blocks, so a later `UnwindTerminate` can be last while
+    /// `UnwindResume` remains in the body. Return with published slots is
+    /// accepted when a retained block is `UnwindResume`.
+    #[test]
+    fn analyze_accepts_return_with_slots_when_unwind_resume_is_not_last() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            3,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![copy(0)], 2, 2)),
+                bb(json!("Return")),
+                bb_cleanup(json!("UnwindResume")),
+                bb_cleanup(json!("UnwindTerminate")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
     }
 
     /// `pin_self`: pin, `len - 1`, return that index. The return place is

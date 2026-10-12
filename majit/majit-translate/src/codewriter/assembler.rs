@@ -710,6 +710,8 @@ impl AssemblerExt for Assembler {
             jit_merge_point_offset: state.jit_merge_point_offset,
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
+            // dump() reads `_ssarepr`. Assembler.assemble always assigns
+            // `jitcode._ssarepr = ssarepr`. The serialized body skips the field.
             _ssarepr: Some(std::sync::Arc::new(ssarepr.clone())),
         };
 

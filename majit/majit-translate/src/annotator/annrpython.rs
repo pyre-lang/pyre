@@ -2497,15 +2497,14 @@ impl RPythonAnnotator {
         let unions = match unions {
             Ok(u) => u,
             Err((slot, e)) => {
-                // One body is every monomorphization. A payload or pointer
-                // class that does not meet the class already bound here is
-                // a different instantiation, not a generalization. Keep the
-                // bound class; replacing it with a classdef-less word fails
-                // `setbinding` against a string already stored in the slot.
+                // `copy_nonoverlapping::<T>` is one body for every `T`. A
+                // pointer class that does not meet the class already bound
+                // here is a different instantiation, not a generalization.
+                // Keep the bound class; replacing it with a classdef-less
+                // word fails `setbinding` against a value already stored.
                 let gname = graph.borrow().name.clone();
-                let per_type_body = gname.ends_with("gc_alloc_storage_box")
-                    || gname == "copy_nonoverlapping"
-                    || gname.ends_with("::copy_nonoverlapping");
+                let per_type_body =
+                    gname == "copy_nonoverlapping" || gname.ends_with("::copy_nonoverlapping");
                 if per_type_body {
                     let _ = (slot, e);
                     oldcells.clone()

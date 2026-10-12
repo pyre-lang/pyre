@@ -57,16 +57,16 @@ fn lowers_straight_line_add() {
         3,
         "straight_line_add takes three i64 args"
     );
-    // Charon nightly-2026.10.04 emits 7 MIR BBs: three overflow Asserts,
-    // a Return, and a dedicated UnwindResume successor per Assert.
-    // `FunDecl::unstructured` drops the three cleanup blocks and appends
-    // one shared UnwindResume, leaving 5. The FunctionGraph adds
-    // startblock(0)/returnblock(1)/exceptblock(2) as canonical sentinels
-    // but the MIR bb0 maps onto startblock, so the total is 5 + 2 = 7.
+    // Charon emits 7 MIR BBs: three overflow Asserts, a Return, and one
+    // cleanup UnwindResume per Assert. `FlowContext.build_flow` records a
+    // block only when `pendingblocks` reaches it, and the lowering never
+    // follows `on_unwind`, so the three cleanup blocks are not recorded.
+    // bb0 maps onto startblock; returnblock and exceptblock are the other
+    // sentinels. 4 reachable MIR blocks + those two sentinels = 6.
     assert_eq!(
         graph.blocks.len(),
-        7,
-        "5 MIR bbs + returnblock + exceptblock"
+        6,
+        "4 reachable MIR bbs + returnblock + exceptblock"
     );
 
     // At least one of the MIR blocks should carry a BinOp operation
@@ -146,9 +146,11 @@ fn lowers_strategy_len_with_discriminant_switch() {
     let llbc = load_corpus();
     let graph = lower_function(llbc, "strategy_len").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::strategy_len");
-    // bb0 Discriminant + Switch, bb1/bb2/bb3 arm bodies + Return,
-    // bb4 Abort → 5 MIR bbs + returnblock + exceptblock = 7.
-    assert_eq!(graph.blocks.len(), 7);
+    // bb0 Discriminant + Switch, bb1/bb2/bb3 arm bodies + Return.
+    // bb4 is the Abort default of that switch, outside the edges the
+    // lowering emits, so it is not recorded. 4 reachable MIR bbs +
+    // returnblock + exceptblock = 6.
+    assert_eq!(graph.blocks.len(), 6);
 }
 
 /// Charon `TerminatorKind::Panic` lowers the same implicit
@@ -246,6 +248,154 @@ fn a_panic_terminator_raises_implicitly_like_abort() {
     };
     assert_eq!(implicit_raises(&abort_graph), 1);
     assert_eq!(implicit_raises(&panic_graph), 1);
+}
+
+/// A generic two-variant enum `SwitchInt` with one 0 arm and a panic-abort
+/// default is niche-shaped for the mask, so the panic block is recorded.
+/// Lowering still routes on `niche_disc_vars`, so the generic path filters
+/// the panic default link and the extra block has no incoming edge.
+#[test]
+fn generic_one_arm_switchint_panic_default_lowers() {
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::ExitSwitch;
+
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+        "generated_from_span": null
+    });
+    let unit = serde_json::json!({"Tuple": []});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let enum_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let item_meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let local = |index: u64, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": null,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let variant = |name: &str, disc: u64| {
+        serde_json::json!({
+            "name": name,
+            "fields": [{"name": null, "ty": i64_ty}],
+            "discriminant": {"Scalar": {"Unsigned": ["U8", disc.to_string()]}}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.281",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": item_meta(&["probe", "AB"]),
+                "kind": {"Enum": [variant("A", 0), variant("B", 1)]}
+            }],
+            "fun_decls": [{
+                "def_id": 0,
+                "item_meta": item_meta(&["probe", "switch_ab"]),
+                "signature": {"is_unsafe": false, "inputs": [enum_ty], "output": unit},
+                "body": {"Unstructured": {
+                    "span": span,
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            local(0, &unit),
+                            local(1, &enum_ty),
+                            local(2, &i64_ty)
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(2, &i64_ty),
+                                    {"Discriminant": place(1, &enum_ty)}
+                                ]}
+                            }],
+                            "terminator": {"span": span, "kind": {"Switch": {
+                                "discr": {"Copy": place(2, &i64_ty)},
+                                "targets": {"SwitchInt": [
+                                    null,
+                                    [[{"Scalar": {"Unsigned": ["U8", "0"]}}, 1]],
+                                    2
+                                ]}
+                            }}},
+                            "is_cleanup": false
+                        },
+                        {
+                            "statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &unit),
+                                    {"Aggregate": ["Tuple", []]}
+                                ]}
+                            }],
+                            "terminator": {"span": span, "kind": "Return"},
+                            "is_cleanup": false
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span, "kind": {"Abort": "UndefinedBehavior"}},
+                            "is_cleanup": false
+                        }
+                    ]
+                }}
+            }],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let context = LowerContext::new(&llbc);
+    let graph = lower_fun_decl(&context, llbc.fn_by_id(0).expect("switch_ab"))
+        .expect("generic one-arm SwitchInt with panic default lowers");
+
+    let reached = reachable_blocks(&graph);
+    assert!(
+        reached.contains(&graph.startblock),
+        "startblock stays reachable"
+    );
+    assert!(
+        reached.contains(&graph.returnblock),
+        "returnblock stays reachable"
+    );
+    for b in &graph.blocks {
+        if !reached.contains(&b.id) {
+            continue;
+        }
+        if b.id == graph.returnblock || b.id == graph.exceptblock {
+            continue;
+        }
+        assert!(b.is_closed(), "reachable block {:?} must be closed", b.id);
+        assert!(
+            b.exitswitch != Some(ExitSwitch::LastException),
+            "block {:?} carries a LastException exitswitch",
+            b.id
+        );
+    }
 }
 
 #[test]

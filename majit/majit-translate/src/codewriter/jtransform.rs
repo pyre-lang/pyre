@@ -2705,6 +2705,18 @@ impl<'a> Transformer<'a> {
     /// to hand-set kinds call `FunctionGraph::set_concretetype_of_inline(&var, ct)`
     /// directly.
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
+        // Callers that still read the pre-image (`transform_graph`, tests)
+        // get the one `copygraph` here. The codewriter already made that
+        // copy and calls [`Self::transform_owned`].
+        self.transform_owned(graph.clone())
+    }
+
+    /// Rewrite `graph` in place.
+    ///
+    /// `codewriter.py` `transform_graph_to_jitcode` does one
+    /// `copygraph(graph, shallowvars=True)` and `Transformer.transform`
+    /// rewrites that object.
+    pub fn transform_owned(&mut self, graph: FunctionGraph) -> GraphTransformResult {
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             self.analysis_cache = std::mem::take(&mut cc.analysis_cache);
         }
@@ -2715,8 +2727,7 @@ impl<'a> Transformer<'a> {
         result
     }
 
-    fn transform_body(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
-        let mut rewritten = graph.clone();
+    fn transform_body(&mut self, mut rewritten: FunctionGraph) -> GraphTransformResult {
         join_blocks(&mut rewritten);
 
         // jtransform.py transform_graph starts with
@@ -6366,7 +6377,13 @@ impl<'a> Transformer<'a> {
         // `PyObject` pointer; a `New` that has not stamped the typeptr
         // then reads `[null+8]` for `w_class`. A one-word FLAG_STRUCT is
         // a transparent newtype and stays an ordinary load.
-        if !field.taken_by_address
+        //
+        // `vec_part` already names one header word (`fielddescrof` adds
+        // `vec_layout`'s offset). `signature.py` `num_argnames` reads
+        // that word of an inline `Vec`; replacing it with the parent
+        // pointer would make `len(argnames)` the container itself.
+        if field.vec_part.is_none()
+            && !field.taken_by_address
             && let Some((offset, size)) = self
                 .callcontrol
                 .as_deref()
@@ -8058,7 +8075,43 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_operation(&lowered, graph_name, graph);
         }
-        // RPython: guess_call_kind(op) → dispatch to handle_*_call
+        // `__array_repeat(fill, count)` — a Rust `[v; N]`. A lifted
+        // graph meets `rtype_alloc_and_set` (`rlist.py`), which calls
+        // `ll_alloc_and_set`. A graph on this spine never met the
+        // rtyper, so mint `ll_fixed_alloc_and_set` here and redirect
+        // the call to it (`codewriter::alloc_and_set`). The nonzero
+        // fill is that helper's loop, traced under `look_inside_iff`
+        // (`rlist.py _ll_alloc_and_set_nonnull`); `do_fixed_newlist`
+        // refuses a non-zero default. A zero fill is the jit arm's
+        // `new_array_clear`. Without an ARRAY identity the marker
+        // stays a residual call. `LIST` is folded, so the helper
+        // takes `(count, item)`.
+        if let CallTarget::FunctionPath { segments, .. } = target
+            && segments.as_slice() == ["__array_repeat"]
+            && args.len() == 2
+            && let Some(result) = op.result.as_ref()
+            && let Some(identity) = fixed_repeat_identity(graph, result, result_ty)
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::alloc_and_set::ll_fixed_alloc_and_set_path(cc, &identity);
+            FunctionGraph::set_concretetype_of_inline(
+                result,
+                crate::codewriter::type_state::ConcreteType::GcRef,
+            );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: path.segments.clone(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![args[1].clone(), args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+            };
+            return self.rewrite_operation(&helper_call, graph_name, graph);
+        }
+        // RPython: guess_call_kind(op) → dispatch to handle_*_call;
         if self.callcontrol.is_some() {
             let kind = self.callcontrol.as_mut().unwrap().guess_call_kind(op);
             return match kind {
@@ -12643,6 +12696,18 @@ fn fn_const_target_from_field_write(
     found
 }
 
+fn item_spelling_from_array_type_id(id: &str) -> Option<String> {
+    let id = id.trim();
+    if id == crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID {
+        return Some("*mut PyObject".to_string());
+    }
+    let inner = id.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() || crate::front::typestr::depth0_sep(inner, ';').is_some() {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 /// `do_fixed_newlist`: `new_array_clear` when `ARRAY.OF` is a GC pointer
 /// or a struct holding one, otherwise `new_array`. An inline `[T; N]`
 /// follows its element. A bare nominal spelling is not assumed to be a
@@ -12677,6 +12742,77 @@ fn fixed_list_reader(item: &str) -> Option<(String, bool)> {
     let id = crate::front::mir::slice_array_type_id(&format!("[{item};0]"))?;
     let nolength = crate::front::typestr::nolength_from_array_type_id(Some(id.as_str()));
     Some((id, nolength))
+}
+
+/// ARRAY identity of a rich `__array_repeat`.
+///
+/// A lifted graph reaches `rtype_alloc_and_set`, which folds `LIST`
+/// into `ll_alloc_and_set`. This spine never met the rtyper, so the
+/// item comes from a shaped `Array<T;N>` result or from an
+/// `ArrayRead` / `ArrayWrite` of the result (`LinkClasses`: the front
+/// threads the value through every block as a fresh inputarg). A
+/// headerless reader, a nested item, or two consumers that name
+/// different items stay the residual call.
+fn fixed_repeat_identity(
+    graph: &FunctionGraph,
+    result: &crate::flowspace::model::Variable,
+    result_ty: &ValueType,
+) -> Option<crate::codewriter::alloc_and_set::FixedArrayRepeat> {
+    let classes = crate::codewriter::getslice::LinkClasses::of(graph);
+    let mut consumer_item: Option<String> = None;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let (base, array_type_id) = match &op.kind {
+                OpKind::ArrayRead {
+                    base,
+                    array_type_id,
+                    ..
+                }
+                | OpKind::ArrayWrite {
+                    base,
+                    array_type_id,
+                    ..
+                } => (base, array_type_id),
+                _ => continue,
+            };
+            if !classes.same(base, result) {
+                continue;
+            }
+            let Some(id) = array_type_id.as_deref() else {
+                continue;
+            };
+            let item = item_spelling_from_array_type_id(id)?;
+            match &consumer_item {
+                Some(seen) if seen != &item => return None,
+                Some(_) => {}
+                None => consumer_item = Some(item),
+            }
+        }
+    }
+    let shaped = match result_ty {
+        ValueType::Ref(Some(owner)) if majit_ir::descr::is_shaped_array_name(owner) => {
+            crate::front::mir::shaped_array_parts(owner).map(|(item, _)| item.to_string())
+        }
+        _ => None,
+    };
+    let item = match (shaped, consumer_item) {
+        (Some(shaped_item), Some(consumer)) if shaped_item != consumer => return None,
+        (Some(shaped_item), _) => shaped_item,
+        (None, Some(consumer)) => consumer,
+        (None, None) => return None,
+    };
+    if item.starts_with('[') || item.contains(';') {
+        return None;
+    }
+    let (array_type_id, nolength) = fixed_list_reader(&item)?;
+    if nolength {
+        return None;
+    }
+    Some(crate::codewriter::alloc_and_set::FixedArrayRepeat {
+        item_ty: crate::front::mir::tuple_field_value_type(&item),
+        array_type_id,
+        clears: fixed_list_clears(&item),
+    })
 }
 
 /// High-level `newlist(item0, …, itemN)` (`OpKind::NewList`).
@@ -24168,6 +24304,516 @@ mod tests {
                 .any(|kind| matches!(kind, OpKind::ArrayWrite { .. })),
             "empty newlist has no item stores: {ops:?}"
         );
+    }
+
+    /// `[v; N]` is `__array_repeat`. A graph on this spine never met
+    /// `rtype_alloc_and_set`, so a recovered ARRAY identity redirects to
+    /// `ll_fixed_alloc_and_set` (`rlist.py`). The nonzero fill is that
+    /// helper's loop, traced under `look_inside_iff`; the call site does
+    /// not emit N `setarrayitem`s. A zero fill is the jit arm's
+    /// `new_array_clear`. A headerless reader, a nested item, or two
+    /// consumers that name different items stay the residual call.
+    #[test]
+    fn fixed_array_repeat_redirects_to_alloc_and_set() {
+        fn is_repeat(kind: &OpKind) -> bool {
+            matches!(
+                kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["__array_repeat"]
+            )
+        }
+        fn transform_with_cc(
+            graph: &FunctionGraph,
+        ) -> (Vec<SpaceOperation>, crate::call::CallControl) {
+            let config = GraphTransformConfig::default();
+            let mut cc = crate::call::CallControl::new();
+            let result = {
+                let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+                transformer.transform(graph)
+            };
+            let ops = result
+                .graph
+                .blocks
+                .into_iter()
+                .flat_map(|block| block.operations)
+                .collect();
+            (ops, cc)
+        }
+        fn registered_graph(
+            cc: &crate::call::CallControl,
+            name: &str,
+        ) -> std::rc::Rc<FunctionGraph> {
+            let path = crate::parse::CallPath::from_segments([name]);
+            cc.function_graphs()
+                .get(&path)
+                .unwrap_or_else(|| panic!("missing helper {name}"))
+        }
+        fn registered_ops(cc: &crate::call::CallControl, name: &str) -> Vec<SpaceOperation> {
+            registered_graph(cc, name)
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.clone())
+                .collect()
+        }
+        fn inline_name(ops: &[SpaceOperation]) -> Option<&str> {
+            ops.iter().find_map(|op| match &op.kind {
+                OpKind::InlineCall { jitcode, .. } => Some(jitcode.0.name.as_str()),
+                _ => None,
+            })
+        }
+        fn assert_redirect(ops: &[SpaceOperation], outer: &str) {
+            assert!(
+                !ops.iter().any(|op| is_repeat(&op.kind)),
+                "constant repeat must redirect, got {ops:?}"
+            );
+            assert!(
+                !ops.iter().any(|op| {
+                    matches!(
+                        op.kind,
+                        OpKind::NewArray { .. }
+                            | OpKind::NewArrayClear { .. }
+                            | OpKind::ArrayWrite { .. }
+                    )
+                }),
+                "the call site does not unroll, got {ops:?}"
+            );
+            assert_eq!(inline_name(ops), Some(outer), "inline callee: {ops:?}");
+        }
+        fn assert_residual(ops: &[SpaceOperation]) {
+            // With a CallControl the unresolved marker is a residual
+            // call (`ConstFnAddr` of `__array_repeat`), not the original
+            // `Call`.
+            let residual = ops.iter().any(|op| is_repeat(&op.kind))
+                || ops.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::ConstFnAddr { path, .. } if path == "__array_repeat"
+                    )
+                });
+            assert!(residual, "identity-less repeat stays the call, got {ops:?}");
+            assert!(
+                !ops.iter().any(|op| {
+                    matches!(
+                        op.kind,
+                        OpKind::InlineCall { .. }
+                            | OpKind::NewArray { .. }
+                            | OpKind::NewArrayClear { .. }
+                    )
+                }),
+                "a residual repeat allocates nothing, got {ops:?}"
+            );
+        }
+        fn repeat_graph(
+            name: &str,
+            owner: Option<&str>,
+            fill: OpKind,
+            count: Option<OpKind>,
+        ) -> FunctionGraph {
+            let mut graph = FunctionGraph::new(name);
+            let entry = graph.startblock;
+            let fill_var = graph.push_op_var(entry, fill, true).unwrap();
+            let mut args = vec![fill_var];
+            if let Some(count) = count {
+                args.push(graph.push_op_var(entry, count, true).unwrap());
+            }
+            let result_ty = match owner {
+                Some(owner) => ValueType::Ref(Some(owner.to_string())),
+                None => ValueType::Ref(None),
+            };
+            let array = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["__array_repeat"]),
+                        args: crate::model::call_args(args),
+                        result_ty,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(entry, Some(array));
+            graph
+        }
+        fn call_named<'a>(ops: &'a [SpaceOperation], name: &str) -> bool {
+            ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.len() == 1 && segments[0] == name
+                )
+            })
+        }
+
+        // `[-1i64; 32]`. The site is one inline call. The loop, the
+        // `count < 137` guard, and the zero-fill clear live in the family.
+        {
+            let graph = repeat_graph(
+                "repeat_i64",
+                Some("Array<i64;32>"),
+                OpKind::ConstInt(-1),
+                Some(OpKind::ConstUInt(32)),
+            );
+            let (ops, cc) = transform_with_cc(&graph);
+            let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[i64]");
+            assert_redirect(&ops, &names.outer);
+
+            let nonnull = registered_graph(&cc, &names.nonnull);
+            assert!(nonnull.func.unroll_safe);
+            let nops = registered_ops(&cc, &names.nonnull);
+            assert_eq!(
+                nops.iter()
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::ArrayWrite {
+                                array_type_id: Some(id),
+                                nolength: false,
+                                ..
+                            } if id == "[i64]"
+                        )
+                    })
+                    .count(),
+                1,
+                "the loop body stores once"
+            );
+            assert_eq!(
+                nops.iter()
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::NewArray {
+                                array_type_id: Some(id),
+                                ..
+                            } if id == "[i64]"
+                        )
+                    })
+                    .count(),
+                1
+            );
+            assert!(
+                !nops
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
+            );
+
+            let wops = registered_ops(&cc, &names.wrapper);
+            assert!(wops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice() == ["majit_rlib", "jit", "isconstant"]
+                )
+            }));
+            assert!(
+                wops.iter()
+                    .any(|op| matches!(op.kind, OpKind::ConstInt(137)))
+            );
+
+            let jops = registered_ops(&cc, &names.jit);
+            assert_eq!(
+                jops.iter()
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::NewArrayClear {
+                                array_type_id: Some(id),
+                                ..
+                            } if id == "[i64]"
+                        )
+                    })
+                    .count(),
+                1
+            );
+            assert!(call_named(&jops, &names.wrapper));
+            assert!(
+                !jops
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. }))
+            );
+
+            let tramp = registered_graph(&cc, &names.trampoline);
+            assert_eq!(tramp.func.jit_look_inside, Some(false));
+
+            // `rlist.py ll_alloc_and_set` clamps with `int_force_ge_zero`
+            // (`pyjitpl.py` exec-generated `opimpl_int_force_ge_zero`).
+            let oops = registered_ops(&cc, &names.outer);
+            assert!(
+                oops.iter().any(|op| {
+                    matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "int_force_ge_zero")
+                }),
+                "outer clamps with int_force_ge_zero, got {oops:?}"
+            );
+            assert!(
+                !oops
+                    .iter()
+                    .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lt")),
+                "outer does not spell the clamp as count < 0, got {oops:?}"
+            );
+        }
+
+        // Zero fill redirects to the same outer helper. The clear is the
+        // jit arm, not N stores and not a site-level `new_array_clear`.
+        {
+            let graph = repeat_graph(
+                "repeat_zero",
+                Some("Array<i64;4>"),
+                OpKind::ConstInt(0),
+                Some(OpKind::ConstInt(4)),
+            );
+            let (ops, _) = transform_with_cc(&graph);
+            let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[i64]");
+            assert_redirect(&ops, &names.outer);
+        }
+
+        // Non-null object fill: the nonnull alloc clears, then one store.
+        {
+            let mut graph = FunctionGraph::new("repeat_obj");
+            let entry = graph.startblock;
+            let fill = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let count = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+            let array = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["__array_repeat"]),
+                        args: crate::model::call_args(vec![fill, count]),
+                        result_ty: ValueType::Ref(Some("Array<*mut PyObject;2>".to_string())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(entry, Some(array));
+            let (ops, cc) = transform_with_cc(&graph);
+            let id = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
+            let names = crate::codewriter::alloc_and_set::alloc_and_set_names(id);
+            assert_redirect(&ops, &names.outer);
+            let nops = registered_ops(&cc, &names.nonnull);
+            assert_eq!(
+                nops.iter()
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::NewArrayClear {
+                                array_type_id: Some(got),
+                                ..
+                            } if got == id
+                        )
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                nops.iter()
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::ArrayWrite {
+                                array_type_id: Some(got),
+                                nolength: false,
+                                ..
+                            } if got == id
+                        )
+                    })
+                    .count(),
+                1
+            );
+        }
+
+        // No shaped result: an `ArrayRead` of the result names `[i64]`.
+        {
+            let mut graph = repeat_graph(
+                "repeat_consumer",
+                None,
+                OpKind::ConstInt(-1),
+                Some(OpKind::ConstInt(3)),
+            );
+            let entry = graph.startblock;
+            let array = graph.blocks[entry.0]
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice() == ["__array_repeat"] => op.result.clone(),
+                    _ => None,
+                })
+                .unwrap();
+            let index = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+            graph.push_op_var(
+                entry,
+                OpKind::ArrayRead {
+                    base: array,
+                    index,
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("[i64]".to_string()),
+                    nolength: false,
+                    pure: false,
+                },
+                true,
+            );
+            let (ops, _) = transform_with_cc(&graph);
+            let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[i64]");
+            assert_redirect(&ops, &names.outer);
+        }
+
+        // The front threads the value into the next block as a fresh
+        // inputarg. `LinkClasses` still recovers `[i64]`.
+        {
+            let mut graph = FunctionGraph::new("repeat_phi");
+            let entry = graph.startblock;
+            let fill = graph
+                .push_op_var(entry, OpKind::ConstInt(-1), true)
+                .unwrap();
+            let count = graph
+                .push_op_var(entry, OpKind::ConstInt(32), true)
+                .unwrap();
+            let array = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["__array_repeat"]),
+                        args: crate::model::call_args(vec![fill, count]),
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap();
+            let (header, args) = graph.create_block_with_arg_vars(1);
+            let phi = args[0].clone();
+            graph.set_goto(entry, header, vec![array]);
+            let index = graph
+                .push_op_var(header, OpKind::ConstInt(0), true)
+                .unwrap();
+            graph.push_op_var(
+                header,
+                OpKind::ArrayRead {
+                    base: phi.clone(),
+                    index,
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("[i64]".to_string()),
+                    nolength: false,
+                    pure: false,
+                },
+                true,
+            );
+            graph.set_return(header, Some(phi));
+            let (ops, _) = transform_with_cc(&graph);
+            let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[i64]");
+            assert_redirect(&ops, &names.outer);
+        }
+
+        // A non-constant count, `count == 137`, and a type/count
+        // disagreement still redirect. The ceiling lives in the wrapper.
+        for (name, owner, count) in [
+            ("repeat_runtime", "Array<i64;32>", None),
+            ("repeat_137", "Array<i64;137>", Some(OpKind::ConstInt(137))),
+            (
+                "repeat_disagree",
+                "Array<i64;32>",
+                Some(OpKind::ConstInt(4)),
+            ),
+        ] {
+            let mut graph = FunctionGraph::new(name);
+            let entry = graph.startblock;
+            let fill = graph
+                .push_op_var(entry, OpKind::ConstInt(-1), true)
+                .unwrap();
+            let count_var = match count {
+                Some(kind) => graph.push_op_var(entry, kind, true).unwrap(),
+                None => graph.alloc_value_var(),
+            };
+            let array = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["__array_repeat"]),
+                        args: crate::model::call_args(vec![fill, count_var]),
+                        result_ty: ValueType::Ref(Some(owner.to_string())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(entry, Some(array));
+            let (ops, _) = transform_with_cc(&graph);
+            let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[i64]");
+            assert_redirect(&ops, &names.outer);
+        }
+
+        // Shaped item and consumer item disagree.
+        {
+            let mut graph = repeat_graph(
+                "repeat_disagree_item",
+                Some("Array<i64;4>"),
+                OpKind::ConstInt(-1),
+                Some(OpKind::ConstInt(4)),
+            );
+            let entry = graph.startblock;
+            let array = graph.blocks[entry.0]
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice() == ["__array_repeat"] => op.result.clone(),
+                    _ => None,
+                })
+                .unwrap();
+            let index = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+            graph.push_op_var(
+                entry,
+                OpKind::ArrayRead {
+                    base: array,
+                    index,
+                    item_ty: ValueType::Float,
+                    array_type_id: Some("[f64]".to_string()),
+                    nolength: false,
+                    pure: false,
+                },
+                true,
+            );
+            let (ops, _) = transform_with_cc(&graph);
+            assert_residual(&ops);
+        }
+
+        // Headerless `[u32]`, a nested item, and a 1-arg call stay residual.
+        {
+            let graph = repeat_graph(
+                "repeat_u32",
+                Some("Array<u32;4>"),
+                OpKind::ConstInt(7),
+                Some(OpKind::ConstInt(4)),
+            );
+            let (ops, _) = transform_with_cc(&graph);
+            assert_residual(&ops);
+        }
+        {
+            let graph = repeat_graph(
+                "repeat_nested",
+                Some("Array<[u8;4];2>"),
+                OpKind::ConstInt(0),
+                Some(OpKind::ConstInt(2)),
+            );
+            let (ops, _) = transform_with_cc(&graph);
+            assert_residual(&ops);
+        }
+        {
+            let graph = repeat_graph(
+                "repeat_one",
+                Some("Array<i64;4>"),
+                OpKind::ConstInt(-1),
+                None,
+            );
+            let (ops, _) = transform_with_cc(&graph);
+            assert_residual(&ops);
+        }
     }
 
     /// Allocation and every read of a fixed array share the `&[T]` reader's
