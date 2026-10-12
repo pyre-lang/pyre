@@ -1819,14 +1819,6 @@ impl WarmEnterState {
         self.counter.reset(self.bucket_of(cell_key));
     }
 
-    /// Reset ALL counters to zero. Used after invalidation with incomplete
-    /// resume data (NONE fail_args) to prevent immediate recompilation.
-    /// TODO: RPython has no equivalent; this is a
-    /// pyre-only recovery path.
-    pub fn decay_all_counters_to_zero(&mut self) {
-        self.counter.reset_all();
-    }
-
     /// Check if a green key carries `JC_DONT_TRACE_HERE`.
     pub fn is_dont_trace_here(&self, cell_key: u64) -> bool {
         self.cell_by_key(cell_key)

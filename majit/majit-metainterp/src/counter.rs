@@ -332,16 +332,6 @@ impl JitCounterInner {
         }
     }
 
-    /// TODO: no RPython equivalent.
-    /// Zero all timetable entries.
-    pub fn reset_all(&mut self) {
-        self.apply_pending_decay();
-
-        for entry in &mut self.timetable {
-            *entry = Entry::default();
-        }
-    }
-
     /// counter.py set_decay(decay)
     pub fn set_decay(&mut self, decay: i32) {
         self.apply_pending_decay();
@@ -636,12 +626,6 @@ impl JitCounter {
     /// counter.py reset(hash)
     pub fn reset(&mut self, hash: u64) {
         self.inner.borrow_mut().reset(hash)
-    }
-
-    /// TODO: no RPython equivalent.
-    /// Zero all timetable entries.
-    pub fn reset_all(&mut self) {
-        self.inner.borrow_mut().reset_all()
     }
 
     /// counter.py set_decay(decay)
