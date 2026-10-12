@@ -10792,6 +10792,37 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
     type_addr: i64,
     intval_descr: majit_ir::DescrRef,
 ) -> Result<OpRef, DispatchError> {
+    walker_unbox_int_typed_with_guard(
+        ctx,
+        op_pc,
+        obj,
+        type_addr,
+        intval_descr,
+        walker_emit_guard_with_snapshot,
+    )
+}
+
+/// [`walker_unbox_int_typed`] whose tag test and `GuardClass` go through
+/// `emit_guard` instead of the walker-pc snapshot.
+///
+/// An operator-tail result pins those guards on the tail resume (enclosing
+/// chain + caller + tail with the box pending) so a later arrival deopts
+/// into `_setup_return_value_r` (`blackhole.py`) rather than the CALL that
+/// would re-run the dunder. `MIFrame.opimpl_guard_class` records nothing
+/// when `is_class_known`; the same skip lives here so a prior pin does not
+/// suppress the tag test by marking the class known first.
+fn walker_unbox_int_typed_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+    intval_descr: majit_ir::DescrRef,
+    mut emit_guard: F,
+) -> Result<OpRef, DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, usize, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
     // A known-class operand is provably a heap `W_IntObject` — a prior
     // `GuardClass` derefed its `ob_type`, impossible on a tagged immediate — so
     // it needs neither the tag test nor a repeated `GuardClass`.  Skipping the
@@ -10802,7 +10833,7 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
         if let Some(o) = walker_concrete_ref_object(ctx, obj) {
             if pyre_object::tagged_int::is_tagged_int(o) {
                 let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, true);
-                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[lowbit])?;
+                emit_guard(ctx, op_pc, OpCode::GuardTrue, &[lowbit])?;
                 return Ok(crate::helpers::emit_untag_int(
                     ctx.trace_ctx,
                     obj,
@@ -10822,7 +10853,7 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
                 // With the guard the boxed leg then deopts (not faults) on a
                 // tagged arrival.
                 let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, false);
-                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
+                emit_guard(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
             }
             // A heap-concrete LOCALS-region InputArg is an entry/loop-carried
             // frame local that the concrete boundary
@@ -10851,9 +10882,7 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
             ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
         } else {
             let type_const = ctx.trace_ctx.const_int(type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+            emit_guard(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
             ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
         }
     }

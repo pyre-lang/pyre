@@ -10316,6 +10316,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     let result_type = unsafe { (*concrete).ob_type } as i64;
                     let result_type_const = ctx.trace_ctx.const_int(result_type);
                     let Some(caller) = operator_tail_caller.as_ref() else {
+                        if fbw_executed_effect_count() != executed_effects_before {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                None,
+                                crate::operator_continuation::OperatorTail::Format,
+                                value,
+                            );
+                        }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     };
                     walker_emit_operator_tail_result_guard(
@@ -10360,6 +10369,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // drops would replay the CALL (`LoopBearingCalleeInlineUnsupported`
                     // with no latch) and run `__len__` twice.
                     let Some(caller) = operator_tail_caller.as_ref() else {
+                        if fbw_executed_effect_count() != executed_effects_before {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                None,
+                                crate::operator_continuation::OperatorTail::Len,
+                                value,
+                            );
+                        }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     };
                     if !len_value.is_some_and(|value| value >= 0) {
@@ -10383,41 +10401,30 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         ConcreteValue::Ref(obj) => obj,
                         _ => pyre_object::PY_NULL,
                     };
-                    let raw = if pyre_object::tagged_int::CAN_BE_TAGGED
-                        && pyre_object::tagged_int::is_tagged_int(concrete)
-                    {
-                        let lowbit =
-                            crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, value, true);
-                        walker_emit_operator_tail_result_guard(
-                            ctx,
-                            op.pc,
-                            crate::operator_continuation::OperatorTail::Len,
-                            caller,
-                            value,
-                            OpCode::GuardTrue,
-                            &[lowbit],
-                        )?;
-                        crate::helpers::emit_untag_int(
-                            ctx.trace_ctx,
-                            value,
-                            pyre_object::tagged_int::untag_int(concrete),
-                        )
-                    } else {
-                        let result_type = unsafe { (*concrete).ob_type } as i64;
-                        let result_type_const = ctx.trace_ctx.const_int(result_type);
-                        walker_emit_operator_tail_result_guard(
-                            ctx,
-                            op.pc,
-                            crate::operator_continuation::OperatorTail::Len,
-                            caller,
-                            value,
-                            OpCode::GuardClass,
-                            &[value, result_type_const],
-                        )?;
-                        let (int_type, intval_descr) =
-                            crate::state::int_or_bool_unbox_type_descr(concrete);
-                        walker_unbox_int_typed(ctx, op.pc, value, int_type, intval_descr)?
-                    };
+                    // Tag test then `GuardClass`, both with the tail-resume
+                    // snapshot: a prior `walker_emit_operator_tail_result_guard`
+                    // `GuardClass` used to mark the class known first and
+                    // suppress `walker_unbox_int_typed`'s tagged-pointer test.
+                    let (int_type, intval_descr) =
+                        crate::state::int_or_bool_unbox_type_descr(concrete);
+                    let raw = walker_unbox_int_typed_with_guard(
+                        ctx,
+                        op.pc,
+                        value,
+                        int_type,
+                        intval_descr,
+                        |ctx, op_pc, opcode, args| {
+                            walker_emit_operator_tail_result_guard(
+                                ctx,
+                                op_pc,
+                                crate::operator_continuation::OperatorTail::Len,
+                                caller,
+                                value,
+                                opcode,
+                                args,
+                            )
+                        },
+                    )?;
                     let zero = ctx.trace_ctx.const_int(0);
                     let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw, zero]);
                     ctx.trace_ctx
@@ -10458,6 +10465,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     == Some(crate::operator_continuation::OperatorTail::Truth)
                 {
                     let Some(caller) = operator_tail_caller.as_ref() else {
+                        if fbw_executed_effect_count() != executed_effects_before {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                None,
+                                crate::operator_continuation::OperatorTail::Truth,
+                                value,
+                            );
+                        }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     };
                     match truth_bool_result_int(ctx, op.pc, value, concrete_for_shadow, caller)? {
@@ -13540,10 +13556,29 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     tail: crate::operator_continuation::OperatorTail,
     result: OpRef,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if let Some(caller) = caller {
-        let _ = super::residual_call::latch_operator_tail_return(ctx, caller, tail, result);
+    // The dunder has already run. `callee_inline_unsupported` is the
+    // residual-not-abort class for a CALL that was never entered;
+    // `blackhole_required` keeps `leaves_complete_image` so a published
+    // latch can convert through `convert_and_run_from_pyjitpl`
+    // (`blackhole.py`).
+    if let Some(caller) = caller
+        && super::residual_call::latch_operator_tail_return(ctx, caller, tail, result)
+    {
+        return Err(DispatchError::callee_inline_abort(op_pc, true));
     }
-    Err(DispatchError::callee_inline_unsupported(op_pc))
+    // Latch failed: `convert_and_run_from_pyjitpl` copies live frames, so
+    // this branch is an invariant failure. `jit_strict_mode` (`MAJIT_STRICT`
+    // / debug) panics so `pyre/check.py` turns it red. Without strict mode
+    // the interpreter replays the region and the dunder runs again.
+    crate::jitcode_dispatch::census_record("OperatorTailLatchFailed");
+    if majit_metainterp::jit_strict_mode() {
+        panic!(
+            "operator-tail latch failed after the dunder ran; \
+             convert_and_run_from_pyjitpl copies live frames"
+        );
+    }
+    let _ = ctx.session.borrow_mut().claim_abort_coordinate(true);
+    Err(DispatchError::callee_inline_abort(op_pc, true))
 }
 
 /// Turn `__bool__`'s returned box into the int `is_true` answers.
@@ -13565,20 +13600,29 @@ fn truth_bool_result_int<Sym: WalkSym>(
         ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_bool(obj) } => obj,
         _ => return Ok(None),
     };
-    let result_type = unsafe { (*obj).ob_type } as i64;
-    let result_type_const = ctx.trace_ctx.const_int(result_type);
-    walker_emit_operator_tail_result_guard(
-        ctx,
-        op_pc,
-        crate::operator_continuation::OperatorTail::Truth,
-        caller,
-        value,
-        OpCode::GuardClass,
-        &[value, result_type_const],
-    )?;
     let bit = i64::from(unsafe { pyre_object::w_bool_get_value(obj) });
     let (int_type, intval_descr) = crate::state::int_or_bool_unbox_type_descr(obj);
-    let raw = walker_unbox_int_typed(ctx, op_pc, value, int_type, intval_descr)?;
+    // Same decision as the typed-unbox path: no `GuardClass` when the
+    // class is already known, and the tag test (when `CAN_BE_TAGGED`)
+    // before that class guard, both carrying the Truth tail snapshot.
+    let raw = walker_unbox_int_typed_with_guard(
+        ctx,
+        op_pc,
+        value,
+        int_type,
+        intval_descr,
+        |ctx, op_pc, opcode, args| {
+            walker_emit_operator_tail_result_guard(
+                ctx,
+                op_pc,
+                crate::operator_continuation::OperatorTail::Truth,
+                caller,
+                value,
+                opcode,
+                args,
+            )
+        },
+    )?;
     Ok(Some((raw, ConcreteValue::Int(bit))))
 }
 

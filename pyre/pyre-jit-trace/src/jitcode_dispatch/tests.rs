@@ -348,6 +348,142 @@ fn every_continuation_parent_carries_the_pending_result_placeholder() {
     }
 }
 
+fn dummy_operator_tail_caller() -> InlineParentFrame {
+    InlineParentFrame {
+        jitcode_index: 0,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(0),
+        resume_marker_jit_pc: None,
+        boxes: Vec::new(),
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+    }
+}
+
+/// `capture_vstack_mirror_image` returns `None` when the walk mirror is
+/// invalid. The latch must then return false and leave the multi-frame
+/// cell empty — publishing a `mirror_stack: None` image lets adopt decline
+/// into entry replay of a dunder that already ran.
+#[test]
+fn operator_tail_latch_without_a_mirror_publishes_nothing() {
+    reset_single_frame_blackhole();
+    let mut tc = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let caller = dummy_operator_tail_caller();
+    let result = OpRef::input_arg_ref(0);
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert!(
+        !latch_operator_tail_return(
+            &wc,
+            &caller,
+            crate::operator_continuation::OperatorTail::Len,
+            result,
+        ),
+        "a missing vstack mirror must refuse the latch",
+    );
+    assert!(
+        !multi_frame_blackhole_is_latched(),
+        "a refused latch must publish nothing",
+    );
+}
+
+/// `MIFrame.opimpl_guard_class` records nothing when `is_class_known`.
+/// Format / Len / Truth pin the observed class through the same helper.
+#[test]
+fn operator_tail_known_class_result_records_no_guard_class() {
+    let mut tc = fresh_trace_ctx();
+    let result = OpRef::input_arg_ref(0);
+    tc.heap_cache_mut().class_now_known(result);
+    assert!(
+        tc.heap_cache().is_class_known(result),
+        "the fixture must pin a non-constant box",
+    );
+    let type_const = tc.const_int(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let caller = dummy_operator_tail_caller();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    walker_emit_operator_tail_result_guard(
+        &mut wc,
+        0,
+        crate::operator_continuation::OperatorTail::Format,
+        &caller,
+        result,
+        majit_ir::OpCode::GuardClass,
+        &[result, type_const],
+    )
+    .expect("a known-class GuardClass is a no-op");
+    drop(wc);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "a known-class result must not record GuardClass",
+    );
+    assert!(
+        !tc.ops()
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardClass),
+        "no GuardClass op on a class the heap cache already knows",
+    );
+}
+
 /// One `residual_call_r_i/iRd>i` with an empty argument varlist, whose funcbox
 /// operand names the Int-bank slot `funcbox`.
 fn residual_call_with_funcbox(funcbox: u8) -> Vec<u8> {

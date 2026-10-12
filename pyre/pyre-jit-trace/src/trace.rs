@@ -5458,21 +5458,15 @@ fn run_perfn_walk<Sym: WalkSym>(
                             crate::jitcode_dispatch::census_record("MidBodyDeclineBeforeRun");
                         }
                         Err(MidBodyDecline::AfterRun(_)) => {
-                            // WalkAbort did not run. The rebuild's
-                            // `execute_frame` already ran the remaining
-                            // callee body, then
-                            // `flush_walk_end_state_after_outer_call`
-                            // declined — the invariant
-                            // `try_commit_midbody_abort_inner` marks with
-                            // `debug_assert`. Entry replay would re-execute
-                            // that body. Commit AfterApplied so the rebuilt
-                            // run stands.
+                            // WalkAbort did not run. `execute_frame` already
+                            // ran the remaining callee body, then
+                            // `flush_walk_end_state_after_outer_call` failed.
+                            // That is an invariant failure of the flush:
+                            // `finishframe` installs the return in the caller
+                            // before continuing. Do not commit AfterApplied —
+                            // that flush did not happen. Falling through
+                            // leaves entry replay, which re-runs the region.
                             crate::jitcode_dispatch::census_record("MidBodyDeclineAfterRun");
-                            let _ = commit_walk_end(
-                                flush_committed,
-                                WalkEndCommitLeg::CalleeRebuild,
-                                WalkEndResume::AfterApplied,
-                            );
                         }
                     }
                 }

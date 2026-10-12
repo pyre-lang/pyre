@@ -3268,6 +3268,16 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
         }
         return Ok(());
     }
+    // `MIFrame.opimpl_guard_class` records nothing when `is_class_known`.
+    // A prior pin already proved `ob_type`, so repeating `GuardClass` is
+    // dead weight and would mark the class known before a later typed
+    // unbox, suppressing that helper's tagged-pointer test.
+    if opcode == OpCode::GuardClass
+        && let Some(subject) = subject
+        && ctx.trace_ctx.heap_cache().is_class_known(subject)
+    {
+        return Ok(());
+    }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if opcode == OpCode::GuardClass
@@ -3283,7 +3293,7 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
         );
     }
     let mut tail_frame = super::operator_continuation_parent_frame(tail)
-        .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
+        .ok_or(DispatchError::callee_inline_abort(op_pc, true))?;
     tail_frame.boxes = vec![result];
     // `capture_resumedata` walks every `MetaInterp.framestack` entry.
     // `walker_capture_transparent_helper_snapshot` takes the same

@@ -1492,6 +1492,22 @@ pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
     result: OpRef,
 ) -> bool {
     let origin = "operator-tail-return";
+    // `try_adopt_multi_frame_blackhole` requires the mirror for WalkAbort.
+    // Capture it first so a missing image publishes nothing, rather than a
+    // latch whose adopt then declines into entry replay of the dunder.
+    let mirror_stack = if ctx.fbw_mode.inline_subwalk {
+        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
+            latchdbg!("origin={origin} mf-root-parent-stack");
+            return false;
+        };
+        mirror_stack
+    } else {
+        let Some(mirror_stack) = capture_vstack_mirror_image(ctx, origin) else {
+            latchdbg!("origin={origin} mirror");
+            return false;
+        };
+        mirror_stack
+    };
     let mut framestack = majit_metainterp::MIFrameStack::empty();
     {
         let session = ctx.session.borrow();
@@ -1551,21 +1567,12 @@ pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
         ConcreteValue::Ref(value) => value as i64,
         _ => 0,
     };
-    let mirror_stack = if ctx.fbw_mode.inline_subwalk {
-        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
-            latchdbg!("origin={origin} mf-root-parent-stack");
-            return false;
-        };
-        Some(mirror_stack)
-    } else {
-        capture_vstack_mirror_image(ctx, origin)
-    };
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
         *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
             framestack,
             last_exc_value,
             raising_exception: false,
-            mirror_stack,
+            mirror_stack: Some(mirror_stack),
             origin,
         });
     });
