@@ -7350,12 +7350,25 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
     // class has its own typeptr. Handing back the cached owner would stamp
     // the first class's vtable onto every later `new_with_vtable`; the
     // optimizer then proves `guard_class` against the live typeptr always
-    // fails. The allocation keeps the vtable it asked for, but
-    // `all_fielddescrs` is the cached ranking (`descr.py get_size_descr`
-    // is one field list per STRUCT; `heaptracker.all_fielddescrs` and
-    // `get_fielddescr_index_in` are one walk).
-    let incoming_offsets: Vec<usize> = field_specs.iter().map(|spec| spec.offset).collect();
+    // fails (`rewrite.py optimize_GUARD_CLASS`). The allocation keeps the
+    // vtable it asked for, but `all_fielddescrs` is the cached ranking
+    // (`descr.py get_size_descr` is one field list per STRUCT;
+    // `heaptracker.all_fielddescrs` and `get_fielddescr_index_in` are one
+    // walk).
+    //
+    // Compare that full positional list, not `field_specs` alone. The
+    // leading class-word extra_gc leaf is `all_fielddescrs[0]`
+    // (`heaptracker.py` typeptr is skipped and the class word is the
+    // first numbered field); `field_specs` starts at the payload, so an
+    // equal-offset-bag check against cache[STRUCT] fails for every
+    // headered object STRUCT and the arm below would return the first
+    // class's descr.
     let built = size_descr;
+    let incoming_offsets: Vec<usize> = built
+        .all_fielddescrs()
+        .iter()
+        .map(|field| field.offset())
+        .collect();
     let size_descr = match try_downcast_arc::<SimpleSizeDescr>(parent) {
         Ok(cached)
             if vtable != 0
@@ -7369,9 +7382,16 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
                 Arc::new((*built).clone().with_all_fielddescrs(fields))
             }
         }
+        // `size_descr_agrees_with_spec` is true for two different class
+        // typeptrs of the same size (`W_ExceptionExtended` shares one
+        // STRUCT). That is cache[STRUCT] identity, not the SizeDescr
+        // `new_with_vtable` must carry: only a matching typeptr, or a
+        // fieldless `get_size_descr` shell, may reuse the cached Arc.
         Ok(cached)
-            if size_descr_agrees_with_spec(&*cached, size, vtable)
-                || size_descr_same_struct_layout(&*cached, size, &incoming_offsets) =>
+            if (cached.vtable() == vtable
+                || (cached.all_fielddescrs().is_empty() && cached.vtable() == 0))
+                && (size_descr_agrees_with_spec(&*cached, size, vtable)
+                    || size_descr_same_struct_layout(&*cached, size, &incoming_offsets)) =>
         {
             cached
         }
@@ -9400,6 +9420,97 @@ mod register_keyed_size_authority_tests {
         );
         assert_eq!(again.size_descr.vtable(), 0x1111);
         assert!(Arc::ptr_eq(&first.size_descr, &again.size_descr));
+    }
+
+    /// `W_ExceptionExtended` is one STRUCT (`descr.py get_size_descr
+    /// cache[STRUCT]`) shared by several class typeptrs. The class word is
+    /// `all_fielddescrs[0]` (`heaptracker.py` numbers it as the first
+    /// field); payload `field_specs` start at offset 16. An equal-offset-bag
+    /// check against `field_specs` alone misses that leading leaf, so the
+    /// second class used to receive the first class's SizeDescr and
+    /// `rewrite.py optimize_GUARD_CLASS` proved the live typeptr always
+    /// failed.
+    #[test]
+    fn keyed_group_keeps_the_requested_vtable_when_a_leading_class_word_is_present() {
+        let cache_key = 0x1_0000_00ae_u64;
+        let spec = SimpleFieldDescrSpec {
+            index: 0,
+            field_key: "kind".to_string(),
+            name: "SharedLayout.kind".to_string(),
+            offset: 16,
+            field_size: 1,
+            field_type: Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Unsigned,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+        };
+        let class_word: Arc<dyn FieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "SharedLayout.w_class",
+                "w_class",
+            )
+            .with_class_word(true),
+        );
+        let extra = [class_word];
+        let first = make_simple_descr_group_keyed_with_headerless(
+            3,
+            32,
+            9,
+            cache_key,
+            0x1111,
+            true,
+            false,
+            &[spec.clone()],
+            &extra,
+        );
+        let second = make_simple_descr_group_keyed_with_headerless(
+            3,
+            32,
+            9,
+            cache_key,
+            0x2222,
+            true,
+            false,
+            &[spec],
+            &extra,
+        );
+        assert_eq!(first.size_descr.vtable(), 0x1111);
+        assert_eq!(
+            second.size_descr.vtable(),
+            0x2222,
+            "new_with_vtable of the second class must keep its own typeptr"
+        );
+        assert!(!Arc::ptr_eq(&first.size_descr, &second.size_descr));
+        let first_offsets: Vec<usize> = first
+            .size_descr
+            .all_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        let second_offsets: Vec<usize> = second
+            .size_descr
+            .all_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        assert_eq!(
+            first_offsets, second_offsets,
+            "heaptracker.all_fielddescrs is one ranking per STRUCT"
+        );
+        assert_eq!(
+            first_offsets.first().copied(),
+            Some(8),
+            "the class word is all_fielddescrs[0]"
+        );
     }
 
     /// A published parent that lists nothing — what a mint installs when it
