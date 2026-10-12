@@ -1,9 +1,8 @@
 //! `rpython/rlib/rlocale.py`.
 //!
-//! `numeric_formatting` is the entry the number formatter reads. It shares
-//! the `localeconv` walk with `_locale.localeconv`, so the grouping
-//! `format(x, 'n')` uses and the grouping `locale.localeconv()` reports
-//! come from the same read.
+//! `numeric_formatting` is the entry the number formatter reads.
+//! `numeric_formatting_impl` reads `decimal_point`, `thousands_sep`, and
+//! `grouping` from the `lconv` `localeconv` returns.
 //!
 //! `setlocale` raises [`LocaleError`] when the host refuses the setting.
 //! The `_locale` builtin maps that error onto `locale.Error`.
@@ -155,8 +154,18 @@ fn localeconv_from_lconv(lp: *mut libc::lconv) -> LocaleConv {
 pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     #[cfg(all(unix, not(target_arch = "wasm32"), feature = "host_env"))]
     {
-        let conv = localeconv_from_lconv(unsafe { localeconv() });
-        (conv.decimal_point, conv.thousands_sep, conv.grouping)
+        // `numeric_formatting_impl` reads only these three `lconv` fields.
+        let lp = unsafe { localeconv() };
+        if lp.is_null() {
+            return (b".".to_vec(), Vec::new(), Vec::new());
+        }
+        unsafe {
+            (
+                charp_to_bytes((*lp).decimal_point),
+                charp_to_bytes((*lp).thousands_sep),
+                charp_to_bytes((*lp).grouping),
+            )
+        }
     }
     #[cfg(all(windows, feature = "host_env"))]
     {
@@ -326,7 +335,10 @@ fn defining_module() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+    #[cfg(not(all(
+        any(all(unix, not(target_arch = "wasm32")), windows),
+        feature = "host_env"
+    )))]
     #[test]
     fn numeric_formatting_stands_in_for_the_c_locale() {
         let (decimal, sep, grouping) = super::numeric_formatting();

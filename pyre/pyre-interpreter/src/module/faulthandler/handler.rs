@@ -371,7 +371,17 @@ mod ll {
 /// `cintf.py pypy_faulthandler_write`.
 #[cfg(all(unix, feature = "host_env"))]
 fn faulthandler_write(fd: i32, buf: &[u8]) {
-    let _ = unsafe { ll::c_write(fd, buf.as_ptr() as *mut libc::c_void, buf.len()) };
+    let mut remaining = buf;
+    while !remaining.is_empty() {
+        let n = unsafe { ll::c_write(fd, remaining.as_ptr() as *mut libc::c_void, remaining.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return;
+            }
+            continue;
+        }
+        remaining = &remaining[n as usize..];
+    }
 }
 
 /// `faulthandler.c:1043 faulthandler_suppress_crash_report` — the crash helpers

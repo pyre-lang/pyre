@@ -136,16 +136,28 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             };
             use std::os::unix::ffi::OsStrExt;
             let name_bytes = name_owned.as_ref().map(|n| n.as_os_str().as_bytes());
-            let h = majit_rlib::rdynload::dlopen(name_bytes, mode).map_err(|e| {
-                let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
-                match &name_owned {
-                    None => msg.push_str("None"),
-                    Some(name) => {
-                        msg.push_wtf8(&pyre_interpreter::gateway::fsdecode_os_str_wtf8(name))
+            // `fsencode_or_none` / `bytes0_w` reject an embedded NUL before
+            // `rdynload.dlopen`.
+            if let Some(bytes) = name_bytes
+                && bytes.contains(&0)
+            {
+                return Err(pyre_interpreter::PyError::value_error("embedded null byte"));
+            }
+            let h = majit_rlib::rdynload::dlopen(name_bytes, mode).map_err(|e| match e {
+                majit_rlib::rdynload::DLOpenError::Message(err) => {
+                    let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
+                    match &name_owned {
+                        None => msg.push_str("None"),
+                        Some(name) => {
+                            msg.push_wtf8(&pyre_interpreter::gateway::fsdecode_os_str_wtf8(name))
+                        }
                     }
+                    msg.push_str(&format!("): {}", String::from_utf8_lossy(&err)));
+                    pyre_interpreter::PyError::os_error(msg)
                 }
-                msg.push_str(&format!("): {}", e.msg));
-                pyre_interpreter::PyError::os_error(msg)
+                majit_rlib::rdynload::DLOpenError::OsError(errno) => {
+                    pyre_interpreter::PyError::os_error_with_errno(errno, "")
+                }
             })?;
             Ok(pyre_object::w_int_new(h as usize as i64))
         })

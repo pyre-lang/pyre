@@ -613,17 +613,11 @@ pub fn dlopen_w(mut w_filename: PyObjectRef, flags: i64) -> Result<(String, usiz
 }
 
 /// `space.fsencode_w` — a library name is a path, so it reaches the loader in
-/// the filesystem's own units rather than through a lossy decode.
+/// the filesystem's own units rather than through a lossy decode. `fsencode_w`
+/// rejects an embedded NUL.
 fn filename_of(w_filename: PyObjectRef) -> Result<std::ffi::OsString, PyError> {
-    unsafe {
-        if pyre_object::bytesobject::is_bytes(w_filename) {
-            return Ok(pyre_interpreter::gateway::os_string_from_fs_bytes(
-                pyre_object::bytesobject::w_bytes_data(w_filename),
-            ));
-        }
-    }
     Ok(pyre_interpreter::gateway::os_string_from_fs_bytes(
-        &pyre_interpreter::gateway::fsencode(w_filename)?,
+        &pyre_interpreter::gateway::fsencode_bytes_w(w_filename)?,
     ))
 }
 
@@ -660,10 +654,18 @@ fn open_library(
         .map(|n| std::os::unix::ffi::OsStrExt::as_bytes(n.as_os_str()));
     majit_rlib::rdynload::dlopen(bytes, flags as majit_rlib::rdynload::INT)
         .map(|handle| handle as usize)
-        .map_err(|e| PyError::os_error(format!("cannot load library {fname}: {}", e.msg)))
+        .map_err(|e| match e {
+            majit_rlib::rdynload::DLOpenError::Message(msg) => PyError::os_error(format!(
+                "cannot load library {fname}: {}",
+                String::from_utf8_lossy(&msg)
+            )),
+            majit_rlib::rdynload::DLOpenError::OsError(errno) => {
+                PyError::os_error_with_errno(errno, "")
+            }
+        })
 }
 
-#[cfg(all(feature = "host_env", windows))]
+#[cfg(windows)]
 fn open_library(
     w_filename: PyObjectRef,
     is_none: bool,
@@ -682,7 +684,7 @@ fn open_library(
     })
 }
 
-#[cfg(not(any(unix, all(feature = "host_env", windows))))]
+#[cfg(not(any(unix, windows)))]
 fn open_library(
     _w_filename: PyObjectRef,
     _is_none: bool,

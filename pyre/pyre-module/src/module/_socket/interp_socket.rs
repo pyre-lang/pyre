@@ -2929,6 +2929,28 @@ fn rsocket_os_error(error: majit_rlib::rsocket::CSocketError) -> pyre_interprete
     socket_io_err(std::io::Error::from_raw_os_error(error.errno))
 }
 
+/// `_rsocket_rffi.py SOCKLEN_T_LIMIT`.
+#[cfg(unix)]
+const SOCKLEN_T_LIMIT: usize = if (libc::c_int::MAX as u64) > 0x7fff_ffff {
+    0x7fff_ffff
+} else {
+    libc::c_int::MAX as usize
+};
+
+/// `_rsocket_rffi.py get_CMSG_SPACE`.
+#[cfg(unix)]
+fn get_cmsg_space(length: usize) -> Option<usize> {
+    let space1 = unsafe { libc::CMSG_SPACE(1) } as usize;
+    if length > SOCKLEN_T_LIMIT.saturating_sub(space1) {
+        return None;
+    }
+    let tmp = unsafe { libc::CMSG_SPACE(length as libc::c_uint) } as usize;
+    if tmp > SOCKLEN_T_LIMIT || tmp < length {
+        return None;
+    }
+    Some(tmp)
+}
+
 /// Release the interpreter around a WinSock call and return the code
 /// `last_error_code` reported. WinSock does not write the C runtime's `errno`.
 /// `recvmsg` and `sendmsg` stay on `call_external_function`.
@@ -6576,6 +6598,16 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                                 "sendmsg: ancillary data must be bytes-like",
                             ));
                         };
+                        // `sendmsg_implementation` rejects a payload whose
+                        // `CMSG_SPACE` does not fit `SOCKLEN_T_LIMIT` before
+                        // copying it into the control buffer.
+                        let nbytes = buffer.as_bytes().len();
+                        if get_cmsg_space(nbytes).is_none() {
+                            buffer.release();
+                            return Err(pyre_interpreter::PyError::os_error(
+                                "ancillary data item too large",
+                            ));
+                        }
                         let data = buffer.as_bytes().to_vec();
                         buffer.release();
                         cmsgs.push((level, ty, data));
@@ -6614,33 +6646,45 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 };
 
                 // Lay out cmsgs into a single control buffer.
+                // `sendmsg_implementation` sums `CMSG_SPACE` per item with a
+                // wrap check against `SOCKLEN_T_LIMIT`.
                 let mut control = {
-                    let total_control: usize = cmsgs
-                        .iter()
-                        .map(|(_, _, d)| libc::CMSG_SPACE(d.len() as libc::c_uint) as usize)
-                        .sum();
-                    let mut control = vec![0u8; total_control];
-                    if total_control > 0 {
+                    let mut controllen = 0usize;
+                    let mut controllen_last = 0usize;
+                    for (_, _, data) in &cmsgs {
+                        let Some(space) = get_cmsg_space(data.len()) else {
+                            return Err(pyre_interpreter::PyError::os_error(
+                                "ancillary data item too large",
+                            ));
+                        };
+                        controllen += space;
+                        if controllen > SOCKLEN_T_LIMIT || controllen < controllen_last {
+                            return Err(pyre_interpreter::PyError::os_error(
+                                "too much ancillary data",
+                            ));
+                        }
+                        controllen_last = controllen;
+                    }
+                    let mut control = vec![0u8; controllen];
+                    if controllen > 0 {
                         let mut packing_msg: libc::msghdr = std::mem::zeroed();
                         packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                        packing_msg.msg_controllen = total_control as _;
-                        {
-                            let mut cur = libc::CMSG_FIRSTHDR(&packing_msg);
-                            for (level, ty, data) in &cmsgs {
-                                if cur.is_null() {
-                                    break;
-                                }
-                                let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
-                                (*cur).cmsg_level = *level;
-                                (*cur).cmsg_type = *ty;
-                                (*cur).cmsg_len = cmsg_len as _;
-                                std::ptr::copy_nonoverlapping(
-                                    data.as_ptr(),
-                                    libc::CMSG_DATA(cur),
-                                    data.len(),
-                                );
-                                cur = libc::CMSG_NXTHDR(&packing_msg, cur);
+                        packing_msg.msg_controllen = controllen as _;
+                        let mut cur = libc::CMSG_FIRSTHDR(&packing_msg);
+                        for (level, ty, data) in &cmsgs {
+                            if cur.is_null() {
+                                break;
                             }
+                            let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
+                            (*cur).cmsg_level = *level;
+                            (*cur).cmsg_type = *ty;
+                            (*cur).cmsg_len = cmsg_len as _;
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                libc::CMSG_DATA(cur),
+                                data.len(),
+                            );
+                            cur = libc::CMSG_NXTHDR(&packing_msg, cur);
                         }
                     }
                     control

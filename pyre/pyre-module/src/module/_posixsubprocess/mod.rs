@@ -122,9 +122,11 @@ mod imp {
             }
         }
         close_raw(errpipe_read)?;
+        // `pypy_subprocess_child_exec`: a collision dup of c2pwrite/errwrite
+        // is non-inheritable (`rpy_set_inheritable(fd, 0)`).
         let c2pwrite = if c2pwrite == 0 {
             let dup = dup_raw(c2pwrite)?;
-            set_inheritable(unsafe { BorrowedFd::borrow_raw(dup) }, true)?;
+            set_inheritable(unsafe { BorrowedFd::borrow_raw(dup) }, false)?;
             dup
         } else {
             c2pwrite
@@ -132,7 +134,7 @@ mod imp {
         let mut errwrite = errwrite;
         while errwrite == 0 || errwrite == 1 {
             let dup = dup_raw(errwrite)?;
-            set_inheritable(unsafe { BorrowedFd::borrow_raw(dup) }, true)?;
+            set_inheritable(unsafe { BorrowedFd::borrow_raw(dup) }, false)?;
             errwrite = dup;
         }
         dup_into_stdio(p2cread, 0)?;
@@ -141,102 +143,203 @@ mod imp {
         Ok(())
     }
 
-    fn should_keep(above: i32, keep: &[BorrowedFd<'_>], fd: i32) -> bool {
-        fd > above
-            && keep
-                .binary_search_by_key(&fd, BorrowedFd::as_raw_fd)
-                .is_err()
+    /// `_posixsubprocess.c _pos_int_from_ascii`.
+    fn pos_int_from_ascii(name: &[u8]) -> Option<i32> {
+        let mut num = 0i32;
+        let mut rest = name;
+        while let Some((&b, next)) = rest.split_first() {
+            if !b.is_ascii_digit() {
+                break;
+            }
+            num = num.wrapping_mul(10).wrapping_add((b - b'0') as i32);
+            rest = next;
+        }
+        if rest.is_empty() { Some(num) } else { None }
     }
 
-    fn close_dir_fds(above: i32, keep: &[BorrowedFd<'_>]) -> std::io::Result<()> {
-        #[cfg(any(
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_vendor = "apple",
-            target_os = "linux",
-            target_os = "android",
-        ))]
+    fn is_fd_in_sorted_fd_sequence(fd: i32, keep: &[BorrowedFd<'_>]) -> bool {
+        keep.binary_search_by_key(&fd, BorrowedFd::as_raw_fd)
+            .is_ok()
+    }
+
+    /// `_posixsubprocess.c FD_DIR`.
+    #[cfg(any(target_os = "freebsd", target_vendor = "apple"))]
+    const FD_DIR: &CStr = c"/dev/fd";
+    #[cfg(not(any(target_os = "freebsd", target_vendor = "apple")))]
+    const FD_DIR: &CStr = c"/proc/self/fd";
+
+    /// `_posixsubprocess.c safe_get_max_fd`.
+    fn safe_get_max_fd() -> i32 {
+        #[cfg(target_os = "netbsd")]
         {
-            #[cfg(any(
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "openbsd",
-                target_vendor = "apple",
-            ))]
-            let fd_dir_name = c"/dev/fd";
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let fd_dir_name = c"/proc/self/fd";
-            let dir = unsafe { libc::opendir(fd_dir_name.as_ptr()) };
-            if dir.is_null() {
-                return Err(last_err());
+            let local_max_fd = unsafe { libc::fcntl(0, libc::F_MAXFD) };
+            if local_max_fd >= 0 {
+                return local_max_fd;
             }
-            let dirfd = unsafe { libc::dirfd(dir) };
-            loop {
-                majit_rlib::rposix::_set_errno(0);
-                let entry = unsafe { libc::readdir(dir) };
-                if entry.is_null() {
-                    break;
-                }
-                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-                let Some(fd) = name.to_bytes().iter().try_fold(0i32, |n, &c| {
-                    let digit = (c as char).to_digit(10)?;
-                    n.checked_mul(10)?.checked_add(digit as i32)
-                }) else {
-                    continue;
-                };
-                if fd != dirfd && should_keep(above, keep, fd) {
-                    let _ = close_raw(fd);
-                }
-            }
-            let _ = unsafe { libc::closedir(dir) };
-            Ok(())
         }
-        #[cfg(not(any(
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_vendor = "apple",
-            target_os = "linux",
-            target_os = "android",
-        )))]
+        #[cfg(target_os = "openbsd")]
         {
-            let _ = (above, keep);
-            Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+            let mut rl = unsafe { std::mem::zeroed::<libc::rlimit>() };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } >= 0 {
+                return rl.rlim_max as i32;
+            }
+        }
+        let local_max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        if local_max_fd == -1 {
+            256
+        } else {
+            local_max_fd as i32
         }
     }
 
-    fn close_fds_brute_force(above: i32, keep: &[BorrowedFd<'_>]) {
-        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-        let max_fd = if max_fd > 0 { max_fd as i32 } else { 256 };
-        let mut prev = above;
-        for fd in keep
-            .iter()
-            .map(BorrowedFd::as_raw_fd)
-            .chain(core::iter::once(max_fd))
-        {
-            for candidate in prev + 1..fd {
-                let _ = unsafe { libc::close(candidate) };
+    /// `_posixsubprocess.c _close_fds_by_brute_force`.
+    fn close_fds_brute_force(mut start_fd: i32, keep: &[BorrowedFd<'_>]) {
+        let end_fd = safe_get_max_fd();
+        for fd in keep.iter().map(BorrowedFd::as_raw_fd) {
+            if fd < start_fd {
+                continue;
             }
-            prev = fd;
+            for fd_num in start_fd..fd {
+                let _ = unsafe { libc::close(fd_num) };
+            }
+            start_fd = fd + 1;
+        }
+        if start_fd <= end_fd {
+            for fd_num in start_fd..end_fd {
+                let _ = unsafe { libc::close(fd_num) };
+            }
         }
     }
 
-    fn close_fds(above: i32, keep: &[BorrowedFd<'_>]) {
-        if close_dir_fds(above, keep).is_ok() {
+    /// `_posixsubprocess.c _close_open_fds_safe`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn close_open_fds_safe(start_fd: i32, keep: &[BorrowedFd<'_>]) {
+        #[repr(C)]
+        struct LinuxDirent64 {
+            d_ino: u64,
+            d_off: i64,
+            d_reclen: u16,
+            d_type: u8,
+            d_name: [libc::c_char; 256],
+        }
+        let fd_dir_fd = unsafe { libc::open(FD_DIR.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd_dir_fd == -1 {
+            close_fds_brute_force(start_fd, keep);
             return;
         }
-        close_fds_brute_force(above, keep);
+        let mut buffer = std::mem::MaybeUninit::<LinuxDirent64>::uninit();
+        loop {
+            let bytes = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    fd_dir_fd,
+                    buffer.as_mut_ptr(),
+                    std::mem::size_of::<LinuxDirent64>(),
+                )
+            };
+            if bytes <= 0 {
+                break;
+            }
+            let mut offset = 0isize;
+            while offset < bytes {
+                let entry = unsafe {
+                    &*((buffer.as_ptr() as *const u8).offset(offset) as *const LinuxDirent64)
+                };
+                let name = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) };
+                if let Some(fd) = pos_int_from_ascii(name.to_bytes())
+                    && fd != fd_dir_fd
+                    && fd >= start_fd
+                    && !is_fd_in_sorted_fd_sequence(fd, keep)
+                {
+                    let _ = unsafe { libc::close(fd) };
+                }
+                offset += entry.d_reclen as isize;
+            }
+        }
+        let _ = unsafe { libc::close(fd_dir_fd) };
+    }
+
+    /// `_posixsubprocess.c _is_fdescfs_mounted_on_dev_fd`.
+    #[cfg(target_os = "freebsd")]
+    fn is_fdescfs_mounted_on_dev_fd() -> bool {
+        let mut dev_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        let mut dev_fd_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::stat(c"/dev".as_ptr(), &mut dev_stat) } != 0 {
+            return false;
+        }
+        if unsafe { libc::stat(FD_DIR.as_ptr(), &mut dev_fd_stat) } != 0 {
+            return false;
+        }
+        dev_stat.st_dev != dev_fd_stat.st_dev
+    }
+
+    /// `_posixsubprocess.c _close_open_fds_maybe_unsafe`.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn close_open_fds_maybe_unsafe(start_fd: i32, keep: &[BorrowedFd<'_>]) {
+        #[cfg(target_os = "freebsd")]
+        let proc_fd_dir = if !is_fdescfs_mounted_on_dev_fd() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { libc::opendir(FD_DIR.as_ptr()) }
+        };
+        #[cfg(not(target_os = "freebsd"))]
+        let proc_fd_dir = unsafe { libc::opendir(FD_DIR.as_ptr()) };
+        if proc_fd_dir.is_null() {
+            close_fds_brute_force(start_fd, keep);
+            return;
+        }
+        let fd_used_by_opendir = unsafe { libc::dirfd(proc_fd_dir) };
+        loop {
+            majit_rlib::rposix::_set_errno(0);
+            let entry = unsafe { libc::readdir(proc_fd_dir) };
+            if entry.is_null() {
+                if majit_rlib::rposix::_get_errno() != 0 {
+                    close_fds_brute_force(start_fd, keep);
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if let Some(fd) = pos_int_from_ascii(name.to_bytes())
+                && fd != fd_used_by_opendir
+                && fd >= start_fd
+                && !is_fd_in_sorted_fd_sequence(fd, keep)
+            {
+                let _ = unsafe { libc::close(fd) };
+            }
+        }
+        let _ = unsafe { libc::closedir(proc_fd_dir) };
+    }
+
+    /// `_posixsubprocess.c _close_open_fds`.
+    fn close_open_fds(start_fd: i32, keep: &[BorrowedFd<'_>]) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        close_open_fds_safe(start_fd, keep);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        close_open_fds_maybe_unsafe(start_fd, keep);
+    }
+
+    /// `_posixsubprocess.c local_pypysig_default`.
+    fn local_pypysig_default(signum: i32) {
+        unsafe {
+            let mut context: libc::sigaction = std::mem::zeroed();
+            context.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut context.sa_mask);
+            context.sa_flags = 0;
+            libc::sigaction(signum, &context, std::ptr::null_mut());
+            // `HAVE_SIGINTERRUPT`: `pypysig_siginterrupt(signum, 1)` via
+            // `sigaction` + `SA_RESTART` (`signals.c pypysig_siginterrupt`).
+            if libc::sigaction(signum, std::ptr::null(), &mut context) == 0 {
+                context.sa_flags &= !libc::SA_RESTART;
+                libc::sigaction(signum, &context, std::ptr::null_mut());
+            }
+        }
     }
 
     fn restore_signals() {
-        unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            libc::signal(libc::SIGXFSZ, libc::SIG_DFL);
-        }
+        local_pypysig_default(libc::SIGPIPE);
+        #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+        local_pypysig_default(libc::SIGXFZ);
+        local_pypysig_default(libc::SIGXFSZ);
     }
 
     fn exec_replace(
@@ -598,7 +701,7 @@ mod imp {
         *ctx = ExecErrorContext::Exec;
 
         if d.close_fds {
-            close_fds(2, d.fds_to_keep);
+            close_open_fds(3, d.fds_to_keep);
         }
 
         let err = exec_replace(d.exec_list, d.argv, d.envp);
