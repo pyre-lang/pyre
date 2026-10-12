@@ -434,10 +434,11 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, pyre_interpreter::PyError
         _ => {}
     }
     super::interp_ctypes::lookup_symbol(handle, &name_bytes).map_err(|e| {
-        use rustpython_host_env::ctypes::LookupSymbolError as E;
-        if matches!(e, E::LibraryNotFound) {
+        #[cfg(windows)]
+        if matches!(e, super::interp_ctypes::LookupSymbolError::LibraryNotFound) {
             return pyre_interpreter::PyError::value_error("library not found");
         }
+        let _ = e;
         // A symbol name arrives as bytes, so it is decoded the way a name the
         // host handed us is: `format!` would fold a byte with no UTF-8
         // spelling to U+FFFD and report a symbol nobody asked for.

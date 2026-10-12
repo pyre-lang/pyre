@@ -79,7 +79,16 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "DEFAULT_MODE",
-        pyre_object::w_int_new(host_ctypes::dlopen_mode(None) as i64)
+        pyre_object::w_int_new({
+            #[cfg(unix)]
+            {
+                majit_rlib::rdynload::_dlopen_default_mode() as i64
+            }
+            #[cfg(not(unix))]
+            {
+                host_ctypes::dlopen_mode(None) as i64
+            }
+        })
     );
 
     #[cfg(windows)]
@@ -87,7 +96,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
 
     let mut ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
-    // ── dlopen(name, mode=DEFAULT_MODE) → integer handle into host libcache ──
+    // ── dlopen(name, mode=DEFAULT_MODE) → raw `DLLHANDLE` ──
     #[cfg(unix)]
     pyre_interpreter::__pyre_store!(
         ns,
@@ -98,54 +107,47 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     "dlopen() missing library name",
                 ));
             }
-            let w_name = args[0];
-            let mut w_mode = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            let name = unsafe {
+            let mut w_name = args[0];
+            let mode = if args.len() >= 2 {
+                let w_mode = args[1];
+                pyre_object::with_roots!(w_name => pyre_interpreter::baseobjspace::int_w(w_mode))?
+                    as majit_rlib::rdynload::INT
+            } else {
+                -1
+            };
+            let name_owned: Option<std::ffi::OsString> = unsafe {
                 if pyre_object::is_none(w_name) {
-                    // dlopen(None) → process handle
-                    let load_flags = if args.len() >= 2 {
-                        Some(pyre_interpreter::baseobjspace::int_w(w_mode)? as libc::c_int)
-                    } else {
-                        None
-                    };
-                    let mode = host_ctypes::dlopen_mode(load_flags);
-                    let ptr = rustpython_host_env::ctypes::dlopen_self(mode).map_err(|e| {
-                        pyre_interpreter::PyError::os_error(format!("dlopen(None): {e}"))
-                    })?;
-                    let h = rustpython_host_env::ctypes::insert_raw_library_handle(ptr);
-                    return Ok(pyre_object::w_int_new(h as i64));
-                }
-                // A library name is a path, so it reaches `dlopen` in the
-                // filesystem's own units: a byte with no UTF-8 spelling names
-                // a real file and must not be replaced with U+FFFD.
-                if pyre_object::is_bytes(w_name) {
-                    pyre_interpreter::gateway::os_string_from_fs_bytes(
+                    None
+                } else if pyre_object::is_bytes(w_name) {
+                    Some(pyre_interpreter::gateway::os_string_from_fs_bytes(
                         pyre_object::bytesobject::w_bytes_data(w_name),
-                    )
+                    ))
                 } else if pyre_object::is_str(w_name) {
-                    pyre_interpreter::gateway::os_string_from_fs_bytes(&pyre_object::with_roots!(
-                        w_mode => pyre_interpreter::gateway::fsencode(w_name)
-                    )?)
+                    Some(pyre_interpreter::gateway::os_string_from_fs_bytes(
+                        &pyre_object::with_roots!(w_name => {
+                            pyre_interpreter::gateway::fsencode(w_name)
+                        })?,
+                    ))
                 } else {
                     return Err(pyre_interpreter::PyError::type_error(
                         "dlopen: name must be a string, bytes or None",
                     ));
                 }
             };
-            let load_flags = if args.len() >= 2 {
-                Some(pyre_interpreter::baseobjspace::int_w(w_mode)? as i32)
-            } else {
-                None
-            };
-            let mode = host_ctypes::dlopen_mode(load_flags);
-            let h =
-                rustpython_host_env::ctypes::open_library_with_mode(&name, mode).map_err(|e| {
-                    let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
-                    msg.push_wtf8(&pyre_interpreter::gateway::fsdecode_os_str_wtf8(&name));
-                    msg.push_str(&format!("): {}", pyre_interpreter::with_causes(&e)));
-                    pyre_interpreter::PyError::os_error(msg)
-                })?;
-            Ok(pyre_object::w_int_new(h as i64))
+            use std::os::unix::ffi::OsStrExt;
+            let name_bytes = name_owned.as_ref().map(|n| n.as_os_str().as_bytes());
+            let h = majit_rlib::rdynload::dlopen(name_bytes, mode).map_err(|e| {
+                let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
+                match &name_owned {
+                    None => msg.push_str("None"),
+                    Some(name) => {
+                        msg.push_wtf8(&pyre_interpreter::gateway::fsdecode_os_str_wtf8(name))
+                    }
+                }
+                msg.push_str(&format!("): {}", e.msg));
+                pyre_interpreter::PyError::os_error(msg)
+            })?;
+            Ok(pyre_object::w_int_new(h as usize as i64))
         })
     );
 
@@ -176,11 +178,8 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     pyre_interpreter::baseobjspace::str_utf8_w(w_name)?.to_string()
                 };
                 let addr = lookup_symbol(h, name.as_bytes()).map_err(|e| {
-                    use rustpython_host_env::ctypes::LookupSymbolError as L;
                     let msg = match e {
-                        L::LibraryNotFound => "library not found".to_string(),
-                        L::LibraryClosed => "library closed".to_string(),
-                        L::Load(s) => s,
+                        LookupSymbolError::Load(s) => s,
                     };
                     pyre_interpreter::PyError::os_error(format!("dlsym({name}): {msg}"))
                 })?;
@@ -204,7 +203,8 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let h = pyre_interpreter::baseobjspace::int_w(args[0])? as usize;
-                rustpython_host_env::ctypes::drop_library(h);
+                let _ =
+                    unsafe { majit_rlib::rdynload::dlclose(h as majit_rlib::rdynload::DLLHANDLE) };
                 Ok(pyre_object::w_none())
             },
             1,
@@ -492,46 +492,44 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
 /// Resolve `symbol` in the library a `_handle` names, for `CFuncPtr((name,
 /// dll))` and `in_dll`.
 ///
-/// The two platforms disagree on what a `_handle` is. On posix it is a key
-/// into `host_env`'s library cache, which owns the `dlopen` handle and does
-/// the `dlsym`. On Windows it is the `HMODULE` `LoadLibrary` returned — that
-/// cache cannot take one, and `GetProcAddress` on the module is what
-/// `_ctypes.c` does with it anyway.
+/// On posix `_handle` is the raw `DLLHANDLE`. On Windows it is the `HMODULE`
+/// `LoadLibrary` returned, and `GetProcAddress` on the module is what
+/// `_ctypes.c` does with it.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+pub(super) enum LookupSymbolError {
+    #[cfg(windows)]
+    LibraryNotFound,
+    #[cfg(windows)]
+    LibraryClosed,
+    Load(String),
+}
+
 #[cfg(all(unix, feature = "host_env"))]
-pub(super) fn lookup_symbol(
-    handle: usize,
-    symbol: &[u8],
-) -> Result<usize, rustpython_host_env::ctypes::LookupSymbolError> {
-    use rustpython_host_env::ctypes::LookupSymbolError as Error;
-    let address = rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol)?;
-    // `dlsym` reports a miss by returning NULL, and a resolver that itself
-    // returns NULL — an IFUNC — leaves `dlerror` unset, so the load succeeds
-    // with address 0. `rdynload.dlsym` rejects that: address 0 is not a symbol.
-    if address == 0 {
-        return Err(Error::Load(format!(
-            "symbol '{}' not found",
-            String::from_utf8_lossy(symbol)
-        )));
-    }
-    Ok(address)
+pub(super) fn lookup_symbol(handle: usize, symbol: &[u8]) -> Result<usize, LookupSymbolError> {
+    majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, symbol)
+        .map(|address| address as usize)
+        .map_err(|name| {
+            LookupSymbolError::Load(format!(
+                "symbol '{}' not found",
+                String::from_utf8_lossy(&name)
+            ))
+        })
 }
 
 #[cfg(all(windows, feature = "host_env"))]
-pub(super) fn lookup_symbol(
-    handle: usize,
-    symbol: &[u8],
-) -> Result<usize, rustpython_host_env::ctypes::LookupSymbolError> {
-    use rustpython_host_env::ctypes::LookupSymbolError as Error;
+pub(super) fn lookup_symbol(handle: usize, symbol: &[u8]) -> Result<usize, LookupSymbolError> {
     if handle == 0 {
-        return Err(Error::LibraryNotFound);
+        return Err(LookupSymbolError::LibraryNotFound);
     }
     // `GetProcAddress` names the export in the module's own narrow spelling,
     // and an embedded NUL would silently truncate the name it looks for.
     let Ok(name) = std::ffi::CString::new(symbol) else {
-        return Err(Error::Load("symbol name contains a null byte".to_string()));
+        return Err(LookupSymbolError::Load(
+            "symbol name contains a null byte".to_string(),
+        ));
     };
     rustpython_host_env::ctypes::get_proc_address(handle as _, &name).ok_or_else(|| {
-        Error::Load(format!(
+        LookupSymbolError::Load(format!(
             "symbol '{}' not found",
             String::from_utf8_lossy(symbol)
         ))

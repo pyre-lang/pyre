@@ -325,6 +325,55 @@ const WINDOWS_EXCEPTIONS: [(&str, i32); 5] = [
     ("_EXCEPTION_STACK_OVERFLOW", 0xc000_00fdu32 as i32),
 ];
 
+/// `cintf.py direct_llexternal`: `_nowrapper=True`, `sandboxsafe=True`.
+/// Signal-handler code stays async-signal-safe.
+#[cfg(all(unix, feature = "host_env"))]
+mod ll {
+    use majit_rlib::rffi::{INT, SIZE_T, SSIZE_T, VOIDP};
+
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["unistd.h", "signal.h"],
+        };
+    }
+
+    // libc form of `cintf.py pypy_faulthandler_write`.
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_write = "write",
+        [INT, VOIDP, SIZE_T],
+        SSIZE_T,
+        compilation_info = ECI,
+        sandboxsafe = true,
+        _nowrapper = true
+    );
+
+    // `rsignal.c_raise` is sandboxsafe but not `_nowrapper`; the handler
+    // must not go through a wrapper.
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_raise = "raise",
+        [INT],
+        INT,
+        compilation_info = ECI,
+        sandboxsafe = true,
+        _nowrapper = true
+    );
+
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_signal = "signal",
+        [INT, libc::sighandler_t],
+        libc::sighandler_t,
+        compilation_info = ECI,
+        sandboxsafe = true,
+        _nowrapper = true
+    );
+}
+
+/// `cintf.py pypy_faulthandler_write`.
+#[cfg(all(unix, feature = "host_env"))]
+fn faulthandler_write(fd: i32, buf: &[u8]) {
+    let _ = unsafe { ll::c_write(fd, buf.as_ptr() as *mut libc::c_void, buf.len()) };
+}
+
 /// `faulthandler.c:1043 faulthandler_suppress_crash_report` — the crash helpers
 /// below take the process down on purpose, so the OS must not stop to offer a
 /// crash dialog first and hang a test run waiting on it.
@@ -363,11 +412,29 @@ extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
     msg[PREFIX.len()..PREFIX.len() + name.len()].copy_from_slice(name);
     msg[PREFIX.len() + name.len()] = b'\n';
     let fd = HANDLER.fd.load(std::sync::atomic::Ordering::Relaxed);
-    rustpython_host_env::faulthandler::write_fd(fd, &msg[..PREFIX.len() + name.len() + 1]);
-    if signum == libc::SIGSEGV {
-        rustpython_host_env::faulthandler::signal_default_and_raise(signum);
-    } else {
-        rustpython_host_env::faulthandler::raise_signal(signum);
+    let out = &msg[..PREFIX.len() + name.len() + 1];
+    #[cfg(unix)]
+    {
+        faulthandler_write(fd, out);
+        if signum == libc::SIGSEGV {
+            unsafe {
+                ll::c_signal(signum, libc::SIG_DFL);
+                ll::c_raise(signum);
+            }
+        } else {
+            unsafe {
+                ll::c_raise(signum);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        rustpython_host_env::faulthandler::write_fd(fd, out);
+        if signum == libc::SIGSEGV {
+            rustpython_host_env::faulthandler::signal_default_and_raise(signum);
+        } else {
+            rustpython_host_env::faulthandler::raise_signal(signum);
+        }
     }
 }
 
@@ -922,5 +989,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 #[cfg(all(unix, feature = "host_env"))]
 extern "C" fn faulthandler_user_handler(signum: libc::c_int) {
     let msg = format!("User signal {signum} delivered (faulthandler)\n");
-    rustpython_host_env::faulthandler::write_fd(2, msg.as_bytes());
+    faulthandler_write(2, msg.as_bytes());
 }

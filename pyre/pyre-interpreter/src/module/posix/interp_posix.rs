@@ -240,160 +240,159 @@ fn collect_env_entries(
 
 #[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
 fn sysconf_names() -> &'static [(&'static str, i32)] {
-    use rustpython_host_env::posix as host_posix;
     &[
-        ("SC_2_CHAR_TERM", host_posix::_SC_2_CHAR_TERM),
-        ("SC_2_C_BIND", host_posix::_SC_2_C_BIND),
-        ("SC_2_C_DEV", host_posix::_SC_2_C_DEV),
-        ("SC_2_FORT_DEV", host_posix::_SC_2_FORT_DEV),
-        ("SC_2_FORT_RUN", host_posix::_SC_2_FORT_RUN),
-        ("SC_2_LOCALEDEF", host_posix::_SC_2_LOCALEDEF),
-        ("SC_2_SW_DEV", host_posix::_SC_2_SW_DEV),
-        ("SC_2_UPE", host_posix::_SC_2_UPE),
-        ("SC_2_VERSION", host_posix::_SC_2_VERSION),
-        ("SC_AIO_LISTIO_MAX", host_posix::_SC_AIO_LISTIO_MAX),
-        ("SC_AIO_MAX", host_posix::_SC_AIO_MAX),
-        ("SC_AIO_PRIO_DELTA_MAX", host_posix::_SC_AIO_PRIO_DELTA_MAX),
-        ("SC_ARG_MAX", host_posix::_SC_ARG_MAX),
-        ("SC_ASYNCHRONOUS_IO", host_posix::_SC_ASYNCHRONOUS_IO),
-        ("SC_ATEXIT_MAX", host_posix::_SC_ATEXIT_MAX),
-        ("SC_BC_BASE_MAX", host_posix::_SC_BC_BASE_MAX),
-        ("SC_BC_DIM_MAX", host_posix::_SC_BC_DIM_MAX),
-        ("SC_BC_SCALE_MAX", host_posix::_SC_BC_SCALE_MAX),
-        ("SC_BC_STRING_MAX", host_posix::_SC_BC_STRING_MAX),
-        ("SC_CHILD_MAX", host_posix::_SC_CHILD_MAX),
-        ("SC_CLK_TCK", host_posix::_SC_CLK_TCK),
-        ("SC_COLL_WEIGHTS_MAX", host_posix::_SC_COLL_WEIGHTS_MAX),
-        ("SC_DELAYTIMER_MAX", host_posix::_SC_DELAYTIMER_MAX),
-        ("SC_EXPR_NEST_MAX", host_posix::_SC_EXPR_NEST_MAX),
-        ("SC_FSYNC", host_posix::_SC_FSYNC),
-        ("SC_GETGR_R_SIZE_MAX", host_posix::_SC_GETGR_R_SIZE_MAX),
-        ("SC_GETPW_R_SIZE_MAX", host_posix::_SC_GETPW_R_SIZE_MAX),
-        ("SC_IOV_MAX", host_posix::_SC_IOV_MAX),
-        ("SC_JOB_CONTROL", host_posix::_SC_JOB_CONTROL),
-        ("SC_LINE_MAX", host_posix::_SC_LINE_MAX),
-        ("SC_LOGIN_NAME_MAX", host_posix::_SC_LOGIN_NAME_MAX),
-        ("SC_MAPPED_FILES", host_posix::_SC_MAPPED_FILES),
-        ("SC_MEMLOCK", host_posix::_SC_MEMLOCK),
-        ("SC_MEMLOCK_RANGE", host_posix::_SC_MEMLOCK_RANGE),
-        ("SC_MEMORY_PROTECTION", host_posix::_SC_MEMORY_PROTECTION),
-        ("SC_MESSAGE_PASSING", host_posix::_SC_MESSAGE_PASSING),
-        ("SC_MQ_OPEN_MAX", host_posix::_SC_MQ_OPEN_MAX),
-        ("SC_MQ_PRIO_MAX", host_posix::_SC_MQ_PRIO_MAX),
-        ("SC_NGROUPS_MAX", host_posix::_SC_NGROUPS_MAX),
-        ("SC_NPROCESSORS_CONF", host_posix::_SC_NPROCESSORS_CONF),
-        ("SC_NPROCESSORS_ONLN", host_posix::_SC_NPROCESSORS_ONLN),
-        ("SC_OPEN_MAX", host_posix::_SC_OPEN_MAX),
-        ("SC_PAGE_SIZE", host_posix::_SC_PAGE_SIZE),
-        ("SC_PAGESIZE", host_posix::_SC_PAGE_SIZE),
+        ("SC_2_CHAR_TERM", libc::_SC_2_CHAR_TERM),
+        ("SC_2_C_BIND", libc::_SC_2_C_BIND),
+        ("SC_2_C_DEV", libc::_SC_2_C_DEV),
+        ("SC_2_FORT_DEV", libc::_SC_2_FORT_DEV),
+        ("SC_2_FORT_RUN", libc::_SC_2_FORT_RUN),
+        ("SC_2_LOCALEDEF", libc::_SC_2_LOCALEDEF),
+        ("SC_2_SW_DEV", libc::_SC_2_SW_DEV),
+        ("SC_2_UPE", libc::_SC_2_UPE),
+        ("SC_2_VERSION", libc::_SC_2_VERSION),
+        ("SC_AIO_LISTIO_MAX", libc::_SC_AIO_LISTIO_MAX),
+        ("SC_AIO_MAX", libc::_SC_AIO_MAX),
+        ("SC_AIO_PRIO_DELTA_MAX", libc::_SC_AIO_PRIO_DELTA_MAX),
+        ("SC_ARG_MAX", libc::_SC_ARG_MAX),
+        ("SC_ASYNCHRONOUS_IO", libc::_SC_ASYNCHRONOUS_IO),
+        ("SC_ATEXIT_MAX", libc::_SC_ATEXIT_MAX),
+        ("SC_BC_BASE_MAX", libc::_SC_BC_BASE_MAX),
+        ("SC_BC_DIM_MAX", libc::_SC_BC_DIM_MAX),
+        ("SC_BC_SCALE_MAX", libc::_SC_BC_SCALE_MAX),
+        ("SC_BC_STRING_MAX", libc::_SC_BC_STRING_MAX),
+        ("SC_CHILD_MAX", libc::_SC_CHILD_MAX),
+        ("SC_CLK_TCK", libc::_SC_CLK_TCK),
+        ("SC_COLL_WEIGHTS_MAX", libc::_SC_COLL_WEIGHTS_MAX),
+        ("SC_DELAYTIMER_MAX", libc::_SC_DELAYTIMER_MAX),
+        ("SC_EXPR_NEST_MAX", libc::_SC_EXPR_NEST_MAX),
+        ("SC_FSYNC", libc::_SC_FSYNC),
+        ("SC_GETGR_R_SIZE_MAX", libc::_SC_GETGR_R_SIZE_MAX),
+        ("SC_GETPW_R_SIZE_MAX", libc::_SC_GETPW_R_SIZE_MAX),
+        ("SC_IOV_MAX", libc::_SC_IOV_MAX),
+        ("SC_JOB_CONTROL", libc::_SC_JOB_CONTROL),
+        ("SC_LINE_MAX", libc::_SC_LINE_MAX),
+        ("SC_LOGIN_NAME_MAX", libc::_SC_LOGIN_NAME_MAX),
+        ("SC_MAPPED_FILES", libc::_SC_MAPPED_FILES),
+        ("SC_MEMLOCK", libc::_SC_MEMLOCK),
+        ("SC_MEMLOCK_RANGE", libc::_SC_MEMLOCK_RANGE),
+        ("SC_MEMORY_PROTECTION", libc::_SC_MEMORY_PROTECTION),
+        ("SC_MESSAGE_PASSING", libc::_SC_MESSAGE_PASSING),
+        ("SC_MQ_OPEN_MAX", libc::_SC_MQ_OPEN_MAX),
+        ("SC_MQ_PRIO_MAX", libc::_SC_MQ_PRIO_MAX),
+        ("SC_NGROUPS_MAX", libc::_SC_NGROUPS_MAX),
+        ("SC_NPROCESSORS_CONF", libc::_SC_NPROCESSORS_CONF),
+        ("SC_NPROCESSORS_ONLN", libc::_SC_NPROCESSORS_ONLN),
+        ("SC_OPEN_MAX", libc::_SC_OPEN_MAX),
+        ("SC_PAGE_SIZE", libc::_SC_PAGE_SIZE),
+        ("SC_PAGESIZE", libc::_SC_PAGE_SIZE),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_PASS_MAX", host_posix::_SC_PASS_MAX),
-        ("SC_PHYS_PAGES", host_posix::_SC_PHYS_PAGES),
-        ("SC_PRIORITIZED_IO", host_posix::_SC_PRIORITIZED_IO),
+        ("SC_PASS_MAX", libc::_SC_PASS_MAX),
+        ("SC_PHYS_PAGES", libc::_SC_PHYS_PAGES),
+        ("SC_PRIORITIZED_IO", libc::_SC_PRIORITIZED_IO),
         (
             "SC_PRIORITY_SCHEDULING",
-            host_posix::_SC_PRIORITY_SCHEDULING,
+            libc::_SC_PRIORITY_SCHEDULING,
         ),
-        ("SC_REALTIME_SIGNALS", host_posix::_SC_REALTIME_SIGNALS),
-        ("SC_RE_DUP_MAX", host_posix::_SC_RE_DUP_MAX),
-        ("SC_RTSIG_MAX", host_posix::_SC_RTSIG_MAX),
-        ("SC_SAVED_IDS", host_posix::_SC_SAVED_IDS),
-        ("SC_SEMAPHORES", host_posix::_SC_SEMAPHORES),
-        ("SC_SEM_NSEMS_MAX", host_posix::_SC_SEM_NSEMS_MAX),
-        ("SC_SEM_VALUE_MAX", host_posix::_SC_SEM_VALUE_MAX),
+        ("SC_REALTIME_SIGNALS", libc::_SC_REALTIME_SIGNALS),
+        ("SC_RE_DUP_MAX", libc::_SC_RE_DUP_MAX),
+        ("SC_RTSIG_MAX", libc::_SC_RTSIG_MAX),
+        ("SC_SAVED_IDS", libc::_SC_SAVED_IDS),
+        ("SC_SEMAPHORES", libc::_SC_SEMAPHORES),
+        ("SC_SEM_NSEMS_MAX", libc::_SC_SEM_NSEMS_MAX),
+        ("SC_SEM_VALUE_MAX", libc::_SC_SEM_VALUE_MAX),
         (
             "SC_SHARED_MEMORY_OBJECTS",
-            host_posix::_SC_SHARED_MEMORY_OBJECTS,
+            libc::_SC_SHARED_MEMORY_OBJECTS,
         ),
-        ("SC_SIGQUEUE_MAX", host_posix::_SC_SIGQUEUE_MAX),
-        ("SC_STREAM_MAX", host_posix::_SC_STREAM_MAX),
-        ("SC_SYNCHRONIZED_IO", host_posix::_SC_SYNCHRONIZED_IO),
-        ("SC_THREADS", host_posix::_SC_THREADS),
+        ("SC_SIGQUEUE_MAX", libc::_SC_SIGQUEUE_MAX),
+        ("SC_STREAM_MAX", libc::_SC_STREAM_MAX),
+        ("SC_SYNCHRONIZED_IO", libc::_SC_SYNCHRONIZED_IO),
+        ("SC_THREADS", libc::_SC_THREADS),
         (
             "SC_THREAD_ATTR_STACKADDR",
-            host_posix::_SC_THREAD_ATTR_STACKADDR,
+            libc::_SC_THREAD_ATTR_STACKADDR,
         ),
         (
             "SC_THREAD_ATTR_STACKSIZE",
-            host_posix::_SC_THREAD_ATTR_STACKSIZE,
+            libc::_SC_THREAD_ATTR_STACKSIZE,
         ),
         (
             "SC_THREAD_DESTRUCTOR_ITERATIONS",
-            host_posix::_SC_THREAD_DESTRUCTOR_ITERATIONS,
+            libc::_SC_THREAD_DESTRUCTOR_ITERATIONS,
         ),
-        ("SC_THREAD_KEYS_MAX", host_posix::_SC_THREAD_KEYS_MAX),
+        ("SC_THREAD_KEYS_MAX", libc::_SC_THREAD_KEYS_MAX),
         (
             "SC_THREAD_PRIORITY_SCHEDULING",
-            host_posix::_SC_THREAD_PRIORITY_SCHEDULING,
+            libc::_SC_THREAD_PRIORITY_SCHEDULING,
         ),
         (
             "SC_THREAD_PRIO_INHERIT",
-            host_posix::_SC_THREAD_PRIO_INHERIT,
+            libc::_SC_THREAD_PRIO_INHERIT,
         ),
         (
             "SC_THREAD_PRIO_PROTECT",
-            host_posix::_SC_THREAD_PRIO_PROTECT,
+            libc::_SC_THREAD_PRIO_PROTECT,
         ),
         (
             "SC_THREAD_PROCESS_SHARED",
-            host_posix::_SC_THREAD_PROCESS_SHARED,
+            libc::_SC_THREAD_PROCESS_SHARED,
         ),
         (
             "SC_THREAD_SAFE_FUNCTIONS",
-            host_posix::_SC_THREAD_SAFE_FUNCTIONS,
+            libc::_SC_THREAD_SAFE_FUNCTIONS,
         ),
-        ("SC_THREAD_STACK_MIN", host_posix::_SC_THREAD_STACK_MIN),
-        ("SC_THREAD_THREADS_MAX", host_posix::_SC_THREAD_THREADS_MAX),
-        ("SC_TIMERS", host_posix::_SC_TIMERS),
-        ("SC_TIMER_MAX", host_posix::_SC_TIMER_MAX),
-        ("SC_TTY_NAME_MAX", host_posix::_SC_TTY_NAME_MAX),
-        ("SC_TZNAME_MAX", host_posix::_SC_TZNAME_MAX),
-        ("SC_VERSION", host_posix::_SC_VERSION),
-        ("SC_XOPEN_CRYPT", host_posix::_SC_XOPEN_CRYPT),
-        ("SC_XOPEN_ENH_I18N", host_posix::_SC_XOPEN_ENH_I18N),
-        ("SC_XOPEN_LEGACY", host_posix::_SC_XOPEN_LEGACY),
-        ("SC_XOPEN_REALTIME", host_posix::_SC_XOPEN_REALTIME),
+        ("SC_THREAD_STACK_MIN", libc::_SC_THREAD_STACK_MIN),
+        ("SC_THREAD_THREADS_MAX", libc::_SC_THREAD_THREADS_MAX),
+        ("SC_TIMERS", libc::_SC_TIMERS),
+        ("SC_TIMER_MAX", libc::_SC_TIMER_MAX),
+        ("SC_TTY_NAME_MAX", libc::_SC_TTY_NAME_MAX),
+        ("SC_TZNAME_MAX", libc::_SC_TZNAME_MAX),
+        ("SC_VERSION", libc::_SC_VERSION),
+        ("SC_XOPEN_CRYPT", libc::_SC_XOPEN_CRYPT),
+        ("SC_XOPEN_ENH_I18N", libc::_SC_XOPEN_ENH_I18N),
+        ("SC_XOPEN_LEGACY", libc::_SC_XOPEN_LEGACY),
+        ("SC_XOPEN_REALTIME", libc::_SC_XOPEN_REALTIME),
         (
             "SC_XOPEN_REALTIME_THREADS",
-            host_posix::_SC_XOPEN_REALTIME_THREADS,
+            libc::_SC_XOPEN_REALTIME_THREADS,
         ),
-        ("SC_XOPEN_SHM", host_posix::_SC_XOPEN_SHM),
-        ("SC_XOPEN_UNIX", host_posix::_SC_XOPEN_UNIX),
-        ("SC_XOPEN_VERSION", host_posix::_SC_XOPEN_VERSION),
-        ("SC_XOPEN_XCU_VERSION", host_posix::_SC_XOPEN_XCU_VERSION),
+        ("SC_XOPEN_SHM", libc::_SC_XOPEN_SHM),
+        ("SC_XOPEN_UNIX", libc::_SC_XOPEN_UNIX),
+        ("SC_XOPEN_VERSION", libc::_SC_XOPEN_VERSION),
+        ("SC_XOPEN_XCU_VERSION", libc::_SC_XOPEN_XCU_VERSION),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_XBS5_ILP32_OFF32", host_posix::_SC_XBS5_ILP32_OFF32),
+        ("SC_XBS5_ILP32_OFF32", libc::_SC_XBS5_ILP32_OFF32),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_XBS5_ILP32_OFFBIG", host_posix::_SC_XBS5_ILP32_OFFBIG),
+        ("SC_XBS5_ILP32_OFFBIG", libc::_SC_XBS5_ILP32_OFFBIG),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_XBS5_LP64_OFF64", host_posix::_SC_XBS5_LP64_OFF64),
+        ("SC_XBS5_LP64_OFF64", libc::_SC_XBS5_LP64_OFF64),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_XBS5_LPBIG_OFFBIG", host_posix::_SC_XBS5_LPBIG_OFFBIG),
+        ("SC_XBS5_LPBIG_OFFBIG", libc::_SC_XBS5_LPBIG_OFFBIG),
     ]
 }
 
@@ -1898,29 +1897,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(ns_slot, "_have_functions", w_have_functions);
     // POSIX constants — real libc values (cross-platform subset).
     for (name, val) in [
-        #[cfg(feature = "host_env")]
-        ("F_OK", rustpython_host_env::os::F_OK as i64),
-        #[cfg(all(not(feature = "host_env"), unix))]
+        #[cfg(unix)]
         ("F_OK", libc::F_OK as i64),
-        #[cfg(all(not(feature = "host_env"), not(unix)))]
+        #[cfg(all(windows, feature = "host_env"))]
+        ("F_OK", rustpython_host_env::os::F_OK as i64),
+        #[cfg(all(not(unix), not(feature = "host_env")))]
         ("F_OK", 0i64),
-        #[cfg(feature = "host_env")]
-        ("R_OK", rustpython_host_env::os::R_OK as i64),
-        #[cfg(all(not(feature = "host_env"), unix))]
+        #[cfg(unix)]
         ("R_OK", libc::R_OK as i64),
-        #[cfg(all(not(feature = "host_env"), not(unix)))]
+        #[cfg(all(windows, feature = "host_env"))]
+        ("R_OK", rustpython_host_env::os::R_OK as i64),
+        #[cfg(all(not(unix), not(feature = "host_env")))]
         ("R_OK", 4i64),
-        #[cfg(feature = "host_env")]
-        ("W_OK", rustpython_host_env::os::W_OK as i64),
-        #[cfg(all(not(feature = "host_env"), unix))]
+        #[cfg(unix)]
         ("W_OK", libc::W_OK as i64),
-        #[cfg(all(not(feature = "host_env"), not(unix)))]
+        #[cfg(all(windows, feature = "host_env"))]
+        ("W_OK", rustpython_host_env::os::W_OK as i64),
+        #[cfg(all(not(unix), not(feature = "host_env")))]
         ("W_OK", 2i64),
-        #[cfg(feature = "host_env")]
-        ("X_OK", rustpython_host_env::os::X_OK as i64),
-        #[cfg(all(not(feature = "host_env"), unix))]
+        #[cfg(unix)]
         ("X_OK", libc::X_OK as i64),
-        #[cfg(all(not(feature = "host_env"), not(unix)))]
+        #[cfg(all(windows, feature = "host_env"))]
+        ("X_OK", rustpython_host_env::os::X_OK as i64),
+        #[cfg(all(not(unix), not(feature = "host_env")))]
         ("X_OK", 1i64),
         ("O_RDONLY", libc::O_RDONLY as i64),
         ("O_WRONLY", libc::O_WRONLY as i64),
@@ -2126,43 +2125,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `<sysexits.h>`. The header is a verbatim descendant of the 4.3BSD one
         // wherever it is carried, so the values are the same on every host that
         // has it and the `libc` crate binds none of them.
-        #[cfg(feature = "host_env")]
-        for (name, val) in [
-            ("EX_OK", rustpython_host_env::posix::EX_OK as i64),
-            ("EX_USAGE", rustpython_host_env::posix::EX_USAGE as i64),
-            ("EX_DATAERR", rustpython_host_env::posix::EX_DATAERR as i64),
-            ("EX_NOINPUT", rustpython_host_env::posix::EX_NOINPUT as i64),
-            ("EX_NOUSER", rustpython_host_env::posix::EX_NOUSER as i64),
-            ("EX_NOHOST", rustpython_host_env::posix::EX_NOHOST as i64),
-            (
-                "EX_UNAVAILABLE",
-                rustpython_host_env::posix::EX_UNAVAILABLE as i64,
-            ),
-            (
-                "EX_SOFTWARE",
-                rustpython_host_env::posix::EX_SOFTWARE as i64,
-            ),
-            ("EX_OSERR", rustpython_host_env::posix::EX_OSERR as i64),
-            ("EX_OSFILE", rustpython_host_env::posix::EX_OSFILE as i64),
-            (
-                "EX_CANTCREAT",
-                rustpython_host_env::posix::EX_CANTCREAT as i64,
-            ),
-            ("EX_IOERR", rustpython_host_env::posix::EX_IOERR as i64),
-            (
-                "EX_TEMPFAIL",
-                rustpython_host_env::posix::EX_TEMPFAIL as i64,
-            ),
-            (
-                "EX_PROTOCOL",
-                rustpython_host_env::posix::EX_PROTOCOL as i64,
-            ),
-            ("EX_NOPERM", rustpython_host_env::posix::EX_NOPERM as i64),
-            ("EX_CONFIG", rustpython_host_env::posix::EX_CONFIG as i64),
-        ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
-        }
-        #[cfg(not(feature = "host_env"))]
         for (name, val) in [
             ("EX_OK", 0i64),
             ("EX_USAGE", 64),
@@ -2289,38 +2251,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
         // The `cmd` `lockf` takes, which is the whole of its vocabulary and
         // which os.py neither writes nor names.
-        #[cfg(all(
-            feature = "host_env",
-            any(
-                target_os = "android",
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "netbsd",
-                target_os = "redox"
-            )
-        ))]
-        for (name, val) in [
-            ("F_ULOCK", rustpython_host_env::fcntl::F_ULOCK as i64),
-            ("F_LOCK", rustpython_host_env::fcntl::F_LOCK as i64),
-            ("F_TLOCK", rustpython_host_env::fcntl::F_TLOCK as i64),
-            ("F_TEST", rustpython_host_env::fcntl::F_TEST as i64),
-        ] {
-            crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
-        }
-        #[cfg(not(all(
-            feature = "host_env",
-            any(
-                target_os = "android",
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "netbsd",
-                target_os = "redox"
-            )
-        )))]
         for (name, val) in [
             ("F_ULOCK", libc::F_ULOCK as i64),
             ("F_LOCK", libc::F_LOCK as i64),
@@ -5213,10 +5143,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if crate::importing::utf8_mode_flag() != 0 {
                     return Ok(pyre_object::w_str_new_managed("utf-8"));
                 }
-                #[cfg(feature = "host_env")]
-                let codeset = rustpython_host_env::locale::nl_langinfo_codeset();
+                #[cfg(all(
+                    unix,
+                    not(target_arch = "wasm32"),
+                    feature = "host_env",
+                    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+                ))]
+                let codeset = majit_rlib::rlocale::nl_langinfo_codeset();
                 // host_env owns nl_langinfo; without it there is no locale to ask.
-                #[cfg(not(feature = "host_env"))]
+                #[cfg(not(all(
+                    unix,
+                    not(target_arch = "wasm32"),
+                    feature = "host_env",
+                    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+                )))]
                 let codeset: Option<Vec<u8>> = None;
                 match codeset {
                     Some(codeset) if !codeset.is_empty() => Ok(pyre_object::w_str_new_managed(
@@ -7498,8 +7438,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // real implementations out of that build so a missed name cannot openat.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
-        use rustpython_host_env::posix as host_posix;
-
         /// `interp_posix._pipe_inhcache`.
         static PIPE_INHCACHE: majit_rlib::rposix::SetNonInheritableCache =
             majit_rlib::rposix::SetNonInheritableCache::new();
@@ -7664,7 +7602,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // surrogateescape rather than U+FFFD.
                         return Ok(crate::typedef::charp2uni(&msg));
                     }
-                    #[cfg(not(feature = "sandbox"))]
+                    #[cfg(all(unix, not(feature = "sandbox")))]
+                    {
+                        let msg = majit_rlib::rposix::strerror(code).map_err(|()| {
+                            crate::PyError::value_error("strerror() argument out of range")
+                        })?;
+                        Ok(crate::typedef::charp2uni(&msg))
+                    }
+                    #[cfg(all(not(unix), not(feature = "sandbox")))]
                     Ok(pyre_object::w_str_new_managed(
                         &rustpython_host_env::time::strerror(code),
                     ))
@@ -9842,9 +9787,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         // `app_posix.wait3` / `app_posix.wait4` import `_pypy_wait`, which
         // retries EINTR and wraps the rusage as `resource.struct_rusage`.
-        fn wait_rusage_to_py(
-            ru: rustpython_host_env::resource::RUsage,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        fn wait_rusage_to_py(ru: libc::rusage) -> Result<PyObjectRef, crate::PyError> {
             let resource = crate::importing::get_builtin_module("resource").ok_or_else(|| {
                 crate::PyError::runtime_error("resource module is not initialized")
             })?;
@@ -9858,20 +9801,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let mut fields = pyre_object::gc_roots::RootedItems::new();
             fields.push(pyre_object::floatobject::w_float_new(tv_to_f(ru.ru_utime)));
             fields.push(pyre_object::floatobject::w_float_new(tv_to_f(ru.ru_stime)));
-            fields.push(pyre_object::w_int_new(ru.ru_maxrss));
-            fields.push(pyre_object::w_int_new(ru.ru_ixrss));
-            fields.push(pyre_object::w_int_new(ru.ru_idrss));
-            fields.push(pyre_object::w_int_new(ru.ru_isrss));
-            fields.push(pyre_object::w_int_new(ru.ru_minflt));
-            fields.push(pyre_object::w_int_new(ru.ru_majflt));
-            fields.push(pyre_object::w_int_new(ru.ru_nswap));
-            fields.push(pyre_object::w_int_new(ru.ru_inblock));
-            fields.push(pyre_object::w_int_new(ru.ru_oublock));
-            fields.push(pyre_object::w_int_new(ru.ru_msgsnd));
-            fields.push(pyre_object::w_int_new(ru.ru_msgrcv));
-            fields.push(pyre_object::w_int_new(ru.ru_nsignals));
-            fields.push(pyre_object::w_int_new(ru.ru_nvcsw));
-            fields.push(pyre_object::w_int_new(ru.ru_nivcsw));
+            fields.push(pyre_object::w_int_new(ru.ru_maxrss as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_ixrss as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_idrss as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_isrss as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_minflt as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_majflt as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_nswap as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_inblock as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_oublock as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_msgsnd as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_msgrcv as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_nsignals as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_nvcsw as i64));
+            fields.push(pyre_object::w_int_new(ru.ru_nivcsw as i64));
             // `_make_struct_rusage` calls `struct_rusage((...))`, so a
             // rebound type's constructor is observable.
             let tuple = pyre_object::w_tuple_new(fields.take());
@@ -9881,26 +9824,39 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         }
 
-        fn wait_with_rusage<F>(wait: F) -> Result<PyObjectRef, crate::PyError>
-        where
-            F: Fn() -> std::io::Result<(libc::pid_t, i32, rustpython_host_env::resource::RUsage)>,
+        fn wait_with_rusage(pid: Option<libc::pid_t>, options: i32) -> Result<PyObjectRef, crate::PyError>
         {
             loop {
-                let result = {
-                    let _blocked = crate::module::thread::before_external_block();
-                    wait()
+                let mut status: i32 = 0;
+                let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+                // `_pypy_wait.wait3` / `wait4` wrap libc `wait3` / `wait4`.
+                // `c_wait3` / `c_wait4` release the GIL and save errno.
+                let res = match pid {
+                    None => unsafe {
+                        majit_rlib::rposix::c_wait3(&mut status, options, ru.as_mut_ptr())
+                    },
+                    Some(pid) => unsafe {
+                        majit_rlib::rposix::c_wait4(pid, &mut status, options, ru.as_mut_ptr())
+                    },
                 };
-                match result {
-                    Ok((pid, status, ru)) => {
-                        let rusage = wait_rusage_to_py(ru)?;
-                        let mut fields = pyre_object::gc_roots::RootedItems::new();
-                        fields.push(pyre_object::w_int_new(pid as i64));
-                        fields.push(pyre_object::w_int_new(status as i64));
-                        fields.push(rusage);
-                        return Ok(pyre_object::w_tuple_new(fields.take()));
-                    }
-                    Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                if res < 0 {
+                    crate::builtins::eintr_retry_with(
+                        std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                        |e| io_err(e, ""),
+                    )?;
+                    continue;
                 }
+                let ru = if res == 0 {
+                    unsafe { std::mem::zeroed() }
+                } else {
+                    unsafe { ru.assume_init() }
+                };
+                let rusage = wait_rusage_to_py(ru)?;
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(res as i64));
+                fields.push(pyre_object::w_int_new(status as i64));
+                fields.push(rusage);
+                return Ok(pyre_object::w_tuple_new(fields.take()));
             }
         }
 
@@ -9914,7 +9870,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         return Err(crate::PyError::type_error("wait3() requires 1 argument"));
                     }
                     let options = crate::baseobjspace::c_int_w(args[0])?;
-                    wait_with_rusage(|| host_posix::wait3(options))
+                    wait_with_rusage(None, options)
                 },
                 1,
             )
@@ -9935,7 +9891,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::baseobjspace::c_int_w(w_pid))?
                         as libc::pid_t;
                     let options = crate::baseobjspace::c_int_w(w_options)?;
-                    wait_with_rusage(|| host_posix::wait4(pid, options))
+                    wait_with_rusage(Some(pid), options)
                 },
                 2,
             )
@@ -10824,9 +10780,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(ns_slot, "statvfs_result", super::statvfs_result_seq_type());
 
         #[cfg(not(target_os = "redox"))]
-        fn statvfs_info_from_raw(st: libc::statvfs) -> rustpython_host_env::posix::StatVfsInfo {
+        struct StatVfsInfo {
+            f_bsize: libc::c_ulong,
+            f_frsize: libc::c_ulong,
+            f_blocks: libc::fsblkcnt_t,
+            f_bfree: libc::fsblkcnt_t,
+            f_bavail: libc::fsblkcnt_t,
+            f_files: libc::fsfilcnt_t,
+            f_ffree: libc::fsfilcnt_t,
+            f_favail: libc::fsfilcnt_t,
+            f_flag: libc::c_ulong,
+            f_namemax: libc::c_ulong,
+            f_fsid: libc::c_ulong,
+        }
+        #[cfg(not(target_os = "redox"))]
+        fn statvfs_info_from_raw(st: libc::statvfs) -> StatVfsInfo {
             // Darwin `f_fsid` is `fsid_t`, not `c_ulong`. Copy native-endian
-            // bytes the way `host_env::posix::statvfs_info_from_raw` does.
+            // bytes the way `statvfs_info_from_raw` does.
             let f_fsid = {
                 let ptr = core::ptr::addr_of!(st.f_fsid) as *const u8;
                 let size = core::mem::size_of_val(&st.f_fsid);
@@ -10843,7 +10813,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     0
                 }
             };
-            rustpython_host_env::posix::StatVfsInfo {
+            StatVfsInfo {
                 f_bsize: st.f_bsize,
                 f_frsize: st.f_frsize,
                 f_blocks: st.f_blocks,
@@ -10858,9 +10828,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
         }
         #[cfg(not(target_os = "redox"))]
-        fn statvfs_to_obj(
-            info: rustpython_host_env::posix::StatVfsInfo,
-        ) -> pyre_object::PyObjectRef {
+        fn statvfs_to_obj(info: StatVfsInfo) -> pyre_object::PyObjectRef {
             let _roots = pyre_object::gc_roots::push_roots();
             let fsid_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(info.f_fsid as i64));
@@ -11983,7 +11951,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // through `posix.WIFEXITED`/`WEXITSTATUS`, each of which is
                     // `@unwrap_spec(status=c_int)`.
                     let status = crate::baseobjspace::c_int_w(args[0])?;
-                    match rustpython_host_env::time::waitstatus_to_exitcode(status) {
+                    let code = if libc::WIFEXITED(status) {
+                        Some(libc::WEXITSTATUS(status))
+                    } else if libc::WIFSIGNALED(status) {
+                        Some(-libc::WTERMSIG(status))
+                    } else {
+                        None
+                    };
+                    match code {
                         Some(code) => Ok(pyre_object::w_int_new(code as i64)),
                         None => Err(crate::PyError::value_error(
                             "waitstatus_to_exitcode: invalid status",
@@ -12033,7 +12008,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         //   * offset == int: read as i64 (`space.gateway_r_longlong_w`)
         //     and routed through `rposix.c_sendfile` (linux) or, on Darwin,
         //     `rposix.sendfile` when headers/trailers are absent and flags
-        //     is 0, else `host_posix::sendfile` for the 3.14 header/trailer
+        //     is 0, else `rposix.sendfile_hdtr` for the 3.14 header/trailer
         //     arguments.
         //   * Returns bytes-sent as int (PyPy: space.newint(res)).
         //
@@ -12058,13 +12033,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ns_slot,
             "sendfile",
             crate::make_builtin_function("sendfile", |args| {
-                #[cfg(target_os = "macos")]
-                use std::os::fd::BorrowedFd;
                 // Every parameter is positional-or-keyword. `headers`,
                 // `trailers` and `flags` are the BSD `sendfile(2)` tail.
                 // Darwin with no headers/trailers and flags=0 uses
-                // `rposix.c_sendfile`; headers or trailers keep
-                // `host_posix::sendfile`. Listing the BSD-only parameters
+                // `rposix.sendfile`; headers, trailers or flags use
+                // `rposix.sendfile_hdtr`. Listing the BSD-only parameters
                 // makes unknown keywords fail during argument binding on
                 // every platform.
                 // interp_posix.py `@unwrap_spec(out_fd=c_int, count=int)`,
@@ -12353,23 +12326,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             }
                         }
                     }
-                    let out_b = pyre_object::with_roots!(
-                        w_out_fd, w_in_fd, w_offset, w_count,
-                        w_headers, w_trailers, w_flags => fd_borrow(out_fd)
-                    )?;
-                    let in_b = pyre_object::with_roots!(
-                        w_out_fd, w_in_fd, w_offset, w_count,
-                        w_headers, w_trailers, w_flags => fd_borrow(in_fd)
-                    )?;
                     // An empty sequence is indistinguishable from an absent
                     // one at the syscall boundary, independently for headers
                     // and trailers.
-                    let header_slices = header_buffers
-                        .as_ref()
-                        .map(|buffers| buffers.iter().map(Vec::as_slice).collect::<Vec<&[u8]>>());
-                    let trailer_slices = trailer_buffers
-                        .as_ref()
-                        .map(|buffers| buffers.iter().map(Vec::as_slice).collect::<Vec<&[u8]>>());
+                    let header_iovs = header_buffers.as_ref().map(|buffers| {
+                        buffers
+                            .iter()
+                            .map(|buffer| libc::iovec {
+                                iov_base: buffer.as_ptr() as *mut libc::c_void,
+                                iov_len: buffer.len(),
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    let trailer_iovs = trailer_buffers.as_ref().map(|buffers| {
+                        buffers
+                            .iter()
+                            .map(|buffer| libc::iovec {
+                                iov_base: buffer.as_ptr() as *mut libc::c_void,
+                                iov_len: buffer.len(),
+                            })
+                            .collect::<Vec<_>>()
+                    });
                     // `sendfile(2)` on this host spends the length cell on the
                     // header and the file together — "the value of len argument
                     // indicates the maximum number of bytes in the header
@@ -12389,52 +12366,34 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         _ => count_raw,
                     };
                     loop {
-                        let (res, written) = pyre_object::with_roots!(
+                        match pyre_object::with_roots!(
                             w_out_fd, w_in_fd, w_offset, w_count,
                             w_headers, w_trailers, w_flags => {
-                            let _blocked = crate::module::thread::before_external_block();
-                            host_posix::sendfile(
-                                in_b,
-                                out_b,
-                                offset_i64 as rustpython_host_env::crt_fd::Offset,
-                                count,
-                                header_slices.as_deref(),
-                                trailer_slices.as_deref(),
+                            majit_rlib::rposix::sendfile_hdtr(
+                                out_fd,
+                                in_fd,
+                                offset_i64 as libc::off_t,
+                                count as libc::off_t,
+                                header_iovs.as_deref(),
+                                trailer_iovs.as_deref(),
+                                flags,
                             )
-                        });
-                        match res {
-                            Ok(_) => {
+                        }) {
+                            Ok(written) => {
                                 return Ok(pyre_object::with_roots!(
                                     w_out_fd, w_in_fd, w_offset, w_count,
                                     w_headers, w_trailers, w_flags => {
-                                    pyre_object::w_int_new(written)
+                                    pyre_object::w_int_new(written as i64)
                                 }));
                             }
-                            Err(error) => {
-                                // rposix.sendfile: BSD sendfile reports a
-                                // partial transfer through sbytes even when the
-                                // syscall result is EAGAIN/EBUSY. Return that
-                                // progress so asyncio advances its file offset
-                                // instead of resending the same range. EINTR is
-                                // not in that set, so a partial transfer a signal
-                                // interrupted goes to the retry below, which asks
-                                // for the caller's original range again.
-                                if written != 0
-                                    && matches!(
-                                        error.raw_os_error(),
-                                        Some(libc::EAGAIN) | Some(libc::EBUSY)
-                                    )
-                                {
-                                    return Ok(pyre_object::with_roots!(
-                                        w_out_fd, w_in_fd, w_offset, w_count,
-                                        w_headers, w_trailers, w_flags => {
-                                        pyre_object::w_int_new(written)
-                                    }));
-                                }
+                            Err(errno) => {
                                 pyre_object::with_roots!(
                                     w_out_fd, w_in_fd, w_offset, w_count,
                                     w_headers, w_trailers, w_flags => {
-                                    crate::builtins::eintr_retry_with(error, |e| io_err(e, ""))
+                                    crate::builtins::eintr_retry_with(
+                                        std::io::Error::from_raw_os_error(errno),
+                                        |e| io_err(e, ""),
+                                    )
                                 })?;
                             }
                         }
@@ -12452,16 +12411,234 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             not(feature = "sandbox")
         ))]
         {
+            enum PosixSpawnFileAction {
+                Open {
+                    fd: i32,
+                    path: std::ffi::CString,
+                    oflag: i32,
+                    mode: u32,
+                },
+                Close {
+                    fd: i32,
+                },
+                Dup2 {
+                    fd: i32,
+                    newfd: i32,
+                },
+            }
             #[cfg(all(
                 any(target_os = "linux", target_os = "freebsd"),
                 not(target_env = "musl")
             ))]
-            use rustpython_host_env::posix::PosixSpawnScheduler as SpawnScheduler;
+            struct SpawnScheduler {
+                policy: Option<i32>,
+                param: libc::sched_param,
+            }
             #[cfg(not(all(
                 any(target_os = "linux", target_os = "freebsd"),
                 not(target_env = "musl")
             )))]
             type SpawnScheduler = ();
+
+            fn supports_posix_spawn_setsid() -> bool {
+                cfg!(any(
+                    target_os = "linux",
+                    target_os = "haiku",
+                    target_os = "solaris",
+                    target_os = "illumos",
+                    target_os = "hurd",
+                ))
+            }
+
+            fn spawn_sigset(signals: &[i32]) -> Result<libc::sigset_t, i32> {
+                let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                if unsafe { majit_rlib::rsignal::c_sigemptyset(&mut set) } != 0 {
+                    return Err(majit_rlib::rposix::_get_errno());
+                }
+                for &sig in signals {
+                    if unsafe { majit_rlib::rsignal::c_sigaddset(&mut set, sig) } != 0 {
+                        return Err(majit_rlib::rposix::_get_errno());
+                    }
+                }
+                Ok(set)
+            }
+
+            fn do_posix_spawn(
+                path: &std::ffi::CStr,
+                args: &[std::ffi::CString],
+                env: &[std::ffi::CString],
+                file_actions: &[PosixSpawnFileAction],
+                setsigdef: Option<&[i32]>,
+                setpgroup: Option<libc::pid_t>,
+                resetids: bool,
+                setsid: bool,
+                setsigmask: Option<&[i32]>,
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "freebsd"),
+                    not(target_env = "musl")
+                ))]
+                scheduler: Option<&SpawnScheduler>,
+                spawnp: bool,
+            ) -> Result<libc::pid_t, i32> {
+                let argv = exec_pointer_array(args);
+                let envp = exec_pointer_array(env);
+                let mut pid: libc::pid_t = 0;
+                let mut actions = unsafe { std::mem::zeroed::<libc::posix_spawn_file_actions_t>() };
+                let mut attr = unsafe { std::mem::zeroed::<libc::posix_spawnattr_t>() };
+                let err = unsafe { majit_rlib::rposix::c_posix_spawn_file_actions_init(&mut actions) };
+                if err != 0 {
+                    return Err(err);
+                }
+                let err = unsafe { majit_rlib::rposix::c_posix_spawnattr_init(&mut attr) };
+                if err != 0 {
+                    let _ = unsafe {
+                        majit_rlib::rposix::c_posix_spawn_file_actions_destroy(&mut actions)
+                    };
+                    return Err(err);
+                }
+                let mut flags: libc::c_short = 0;
+                let result = (|| {
+                    for action in file_actions {
+                        let err = match action {
+                            PosixSpawnFileAction::Open {
+                                fd,
+                                path,
+                                oflag,
+                                mode,
+                            } => unsafe {
+                                majit_rlib::rposix::c_posix_spawn_file_actions_addopen(
+                                    &mut actions,
+                                    *fd,
+                                    path.as_ptr(),
+                                    *oflag,
+                                    *mode as libc::mode_t,
+                                )
+                            },
+                            PosixSpawnFileAction::Close { fd } => unsafe {
+                                majit_rlib::rposix::c_posix_spawn_file_actions_addclose(
+                                    &mut actions, *fd,
+                                )
+                            },
+                            PosixSpawnFileAction::Dup2 { fd, newfd } => unsafe {
+                                majit_rlib::rposix::c_posix_spawn_file_actions_adddup2(
+                                    &mut actions, *fd, *newfd,
+                                )
+                            },
+                        };
+                        if err != 0 {
+                            return Err(err);
+                        }
+                    }
+                    if let Some(sigs) = setsigdef {
+                        let set = spawn_sigset(sigs)?;
+                        let err = unsafe {
+                            majit_rlib::rposix::c_posix_spawnattr_setsigdefault(&mut attr, &set)
+                        };
+                        if err != 0 {
+                            return Err(err);
+                        }
+                        flags |= libc::POSIX_SPAWN_SETSIGDEF as libc::c_short;
+                    }
+                    if let Some(pgid) = setpgroup {
+                        let err = unsafe {
+                            majit_rlib::rposix::c_posix_spawnattr_setpgroup(&mut attr, pgid)
+                        };
+                        if err != 0 {
+                            return Err(err);
+                        }
+                        flags |= libc::POSIX_SPAWN_SETPGROUP as libc::c_short;
+                    }
+                    if resetids {
+                        flags |= libc::POSIX_SPAWN_RESETIDS as libc::c_short;
+                    }
+                    if setsid {
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "haiku",
+                            target_os = "solaris",
+                            target_os = "illumos",
+                            target_os = "hurd",
+                        ))]
+                        {
+                            flags |= libc::POSIX_SPAWN_SETSID as libc::c_short;
+                        }
+                        #[cfg(not(any(
+                            target_os = "linux",
+                            target_os = "haiku",
+                            target_os = "solaris",
+                            target_os = "illumos",
+                            target_os = "hurd",
+                        )))]
+                        {
+                            return Err(libc::ENOTSUP);
+                        }
+                    }
+                    if let Some(sigs) = setsigmask {
+                        let set = spawn_sigset(sigs)?;
+                        let err = unsafe {
+                            majit_rlib::rposix::c_posix_spawnattr_setsigmask(&mut attr, &set)
+                        };
+                        if err != 0 {
+                            return Err(err);
+                        }
+                        flags |= libc::POSIX_SPAWN_SETSIGMASK as libc::c_short;
+                    }
+                    #[cfg(all(
+                        any(target_os = "linux", target_os = "freebsd"),
+                        not(target_env = "musl")
+                    ))]
+                    if let Some(scheduler) = scheduler {
+                        if let Some(policy) = scheduler.policy {
+                            let err = unsafe {
+                                majit_rlib::rposix::c_posix_spawnattr_setschedpolicy(
+                                    &mut attr, policy,
+                                )
+                            };
+                            if err != 0 {
+                                return Err(err);
+                            }
+                            flags |= libc::POSIX_SPAWN_SETSCHEDULER as libc::c_short;
+                        }
+                        let err = unsafe {
+                            majit_rlib::rposix::c_posix_spawnattr_setschedparam(
+                                &mut attr,
+                                &scheduler.param,
+                            )
+                        };
+                        if err != 0 {
+                            return Err(err);
+                        }
+                        flags |= libc::POSIX_SPAWN_SETSCHEDPARAM as libc::c_short;
+                    }
+                    if flags != 0 {
+                        let err = unsafe {
+                            majit_rlib::rposix::c_posix_spawnattr_setflags(&mut attr, flags)
+                        };
+                        if err != 0 {
+                            return Err(err);
+                        }
+                    }
+                    let spawn = if spawnp {
+                        majit_rlib::rposix::c_posix_spawnp
+                    } else {
+                        majit_rlib::rposix::c_posix_spawn
+                    };
+                    let err = unsafe {
+                        spawn(
+                            &mut pid,
+                            path.as_ptr(),
+                            &actions,
+                            &attr,
+                            argv.as_ptr(),
+                            envp.as_ptr(),
+                        )
+                    };
+                    if err != 0 { Err(err) } else { Ok(pid) }
+                })();
+                let _ = unsafe { majit_rlib::rposix::c_posix_spawn_file_actions_destroy(&mut actions) };
+                let _ = unsafe { majit_rlib::rposix::c_posix_spawnattr_destroy(&mut attr) };
+                result
+            }
 
             fn build_posix_spawn(
                 args: &[pyre_object::PyObjectRef],
@@ -12544,7 +12721,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
-                if setsid && !host_posix::supports_posix_spawn_setsid() {
+                if setsid && !supports_posix_spawn_setsid() {
                     return Err(argument_unavailable(func, "setsid"));
                 }
                 let setsigmask = match crate::builtins::kwarg_get(kwargs(), "setsigmask") {
@@ -12557,38 +12734,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 let _scheduler = parse_spawn_scheduler(func, kwargs())?;
                 let file_actions_obj = crate::builtins::kwarg_get(kwargs(), "file_actions");
-                let actions: Vec<rustpython_host_env::posix::PosixSpawnFileAction> =
-                    if let Some(fa) = file_actions_obj {
-                        if unsafe { pyre_object::is_none(fa) } {
-                            Vec::new()
-                        } else {
-                            decode_file_actions(fa)?
-                        }
-                    } else {
+                let actions: Vec<PosixSpawnFileAction> = if let Some(fa) = file_actions_obj {
+                    if unsafe { pyre_object::is_none(fa) } {
                         Vec::new()
-                    };
-                let config = host_posix::PosixSpawnConfig {
-                    path: c_path.as_c_str(),
-                    args: &argv,
-                    env: &env,
-                    file_actions: &actions,
-                    setsigdef: setsigdef.as_deref(),
+                    } else {
+                        decode_file_actions(fa)?
+                    }
+                } else {
+                    Vec::new()
+                };
+                let result = do_posix_spawn(
+                    c_path.as_c_str(),
+                    &argv,
+                    &env,
+                    &actions,
+                    setsigdef.as_deref(),
                     setpgroup,
                     resetids,
                     setsid,
-                    setsigmask: setsigmask.as_deref(),
+                    setsigmask.as_deref(),
                     #[cfg(all(
                         any(target_os = "linux", target_os = "freebsd"),
                         not(target_env = "musl")
                     ))]
-                    scheduler: _scheduler,
+                    _scheduler.as_ref(),
                     spawnp,
-                };
-                let result = {
-                    let _blocked = crate::module::thread::before_external_block();
-                    host_posix::posix_spawn(config)
-                };
-                let pid = result.map_err(|e| io_err_with_filename(e, path.w_path()))?;
+                );
+                let pid = result.map_err(|errno| {
+                    io_err_with_filename(std::io::Error::from_raw_os_error(errno), path.w_path())
+                })?;
                 Ok(pyre_object::w_int_new(pid as i64))
             }
             fn collect_spawn_env(
@@ -12669,9 +12843,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             fn decode_file_actions(
                 obj: pyre_object::PyObjectRef,
-            ) -> Result<Vec<rustpython_host_env::posix::PosixSpawnFileAction>, crate::PyError>
-            {
-                use rustpython_host_env::posix::PosixSpawnFileAction;
+            ) -> Result<Vec<PosixSpawnFileAction>, crate::PyError> {
                 let items =
                     crate::builtins::sequence_fast(obj, "file_actions must be a sequence or None")?;
                 // Every field of a `file_actions` entry is an `int` argument of
@@ -12981,10 +13153,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // to apply, then the declaration's `c_int` / `id_t`.
                     // `rposix.c_getpriority` uses `RFFI_FULL_ERRNO_ZERO`: `-1`
                     // is a successful priority when the saved errno stays 0.
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    type PriorityWhichType = libc::__priority_which_t;
+                    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+                    type PriorityWhichType = libc::c_int;
+                    #[cfg(target_os = "freebsd")]
+                    type PriorityWhoType = i32;
+                    #[cfg(not(target_os = "freebsd"))]
+                    type PriorityWhoType = u32;
                     let which = pyre_object::with_roots!(w_who => crate::baseobjspace::int_w(w_which))?
-                        as host_posix::PriorityWhichType
+                        as PriorityWhichType
                         as libc::c_int;
-                    let who = crate::baseobjspace::int_w(w_who)? as host_posix::PriorityWhoType
+                    let who = crate::baseobjspace::int_w(w_who)? as PriorityWhoType
                         as libc::id_t;
                     let prio = unsafe { majit_rlib::rposix::c_getpriority(which, who) };
                     let errno = majit_rlib::rposix::get_saved_errno();
@@ -13014,12 +13194,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let w_which = args[0];
                     let mut w_who = args[1];
                     let mut w_prio = args[2];
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    type PriorityWhichType = libc::__priority_which_t;
+                    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+                    type PriorityWhichType = libc::c_int;
+                    #[cfg(target_os = "freebsd")]
+                    type PriorityWhoType = i32;
+                    #[cfg(not(target_os = "freebsd"))]
+                    type PriorityWhoType = u32;
                     let which = pyre_object::with_roots!(w_who, w_prio =>
                         crate::baseobjspace::int_w(w_which))?
-                        as host_posix::PriorityWhichType
+                        as PriorityWhichType
                         as libc::c_int;
                     let who = pyre_object::with_roots!(w_prio => crate::baseobjspace::int_w(w_who))?
-                        as host_posix::PriorityWhoType as libc::id_t;
+                        as PriorityWhoType
+                        as libc::id_t;
                     let prio = crate::baseobjspace::int_w(w_prio)? as i32;
                     // `rposix.c_setpriority` releases the GIL and saves errno.
                     // `-1` is the failure.
@@ -13052,16 +13241,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         const PATHCONF_NAMES: &[(&str, i32)] = &[
             ("PC_ALLOC_SIZE_MIN", libc::_PC_ALLOC_SIZE_MIN),
             ("PC_ASYNC_IO", libc::_PC_ASYNC_IO),
-            ("PC_CHOWN_RESTRICTED", host_posix::_PC_CHOWN_RESTRICTED),
+            ("PC_CHOWN_RESTRICTED", libc::_PC_CHOWN_RESTRICTED),
             ("PC_FILESIZEBITS", libc::_PC_FILESIZEBITS),
-            ("PC_LINK_MAX", host_posix::_PC_LINK_MAX),
-            ("PC_MAX_CANON", host_posix::_PC_MAX_CANON),
-            ("PC_MAX_INPUT", host_posix::_PC_MAX_INPUT),
+            ("PC_LINK_MAX", libc::_PC_LINK_MAX),
+            ("PC_MAX_CANON", libc::_PC_MAX_CANON),
+            ("PC_MAX_INPUT", libc::_PC_MAX_INPUT),
             ("PC_MIN_HOLE_SIZE", libc::_PC_MIN_HOLE_SIZE),
-            ("PC_NAME_MAX", host_posix::_PC_NAME_MAX),
-            ("PC_NO_TRUNC", host_posix::_PC_NO_TRUNC),
-            ("PC_PATH_MAX", host_posix::_PC_PATH_MAX),
-            ("PC_PIPE_BUF", host_posix::_PC_PIPE_BUF),
+            ("PC_NAME_MAX", libc::_PC_NAME_MAX),
+            ("PC_NO_TRUNC", libc::_PC_NO_TRUNC),
+            ("PC_PATH_MAX", libc::_PC_PATH_MAX),
+            ("PC_PIPE_BUF", libc::_PC_PIPE_BUF),
             ("PC_PRIO_IO", libc::_PC_PRIO_IO),
             ("PC_REC_INCR_XFER_SIZE", libc::_PC_REC_INCR_XFER_SIZE),
             ("PC_REC_MAX_XFER_SIZE", libc::_PC_REC_MAX_XFER_SIZE),
@@ -13069,31 +13258,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ("PC_REC_XFER_ALIGN", libc::_PC_REC_XFER_ALIGN),
             ("PC_SYMLINK_MAX", libc::_PC_SYMLINK_MAX),
             ("PC_SYNC_IO", libc::_PC_SYNC_IO),
-            ("PC_VDISABLE", host_posix::_PC_VDISABLE),
+            ("PC_VDISABLE", libc::_PC_VDISABLE),
         ];
+        // glibc `bits/confname.h`. `libc` does not export `_PC_*` on linux.
         #[cfg(target_os = "linux")]
         const PATHCONF_NAMES: &[(&str, i32)] = &[
-            ("PC_2_SYMLINKS", host_posix::_PC_2_SYMLINKS),
-            ("PC_ALLOC_SIZE_MIN", host_posix::_PC_ALLOC_SIZE_MIN),
-            ("PC_ASYNC_IO", host_posix::_PC_ASYNC_IO),
-            ("PC_CHOWN_RESTRICTED", host_posix::_PC_CHOWN_RESTRICTED),
-            ("PC_FILESIZEBITS", host_posix::_PC_FILESIZEBITS),
-            ("PC_LINK_MAX", host_posix::_PC_LINK_MAX),
-            ("PC_MAX_CANON", host_posix::_PC_MAX_CANON),
-            ("PC_MAX_INPUT", host_posix::_PC_MAX_INPUT),
-            ("PC_NAME_MAX", host_posix::_PC_NAME_MAX),
-            ("PC_NO_TRUNC", host_posix::_PC_NO_TRUNC),
-            ("PC_PATH_MAX", host_posix::_PC_PATH_MAX),
-            ("PC_PIPE_BUF", host_posix::_PC_PIPE_BUF),
-            ("PC_PRIO_IO", host_posix::_PC_PRIO_IO),
-            ("PC_REC_INCR_XFER_SIZE", host_posix::_PC_REC_INCR_XFER_SIZE),
-            ("PC_REC_MAX_XFER_SIZE", host_posix::_PC_REC_MAX_XFER_SIZE),
-            ("PC_REC_MIN_XFER_SIZE", host_posix::_PC_REC_MIN_XFER_SIZE),
-            ("PC_REC_XFER_ALIGN", host_posix::_PC_REC_XFER_ALIGN),
+            ("PC_2_SYMLINKS", 20),
+            ("PC_ALLOC_SIZE_MIN", 18),
+            ("PC_ASYNC_IO", 10),
+            ("PC_CHOWN_RESTRICTED", 6),
+            ("PC_FILESIZEBITS", 13),
+            ("PC_LINK_MAX", 0),
+            ("PC_MAX_CANON", 1),
+            ("PC_MAX_INPUT", 2),
+            ("PC_NAME_MAX", 3),
+            ("PC_NO_TRUNC", 7),
+            ("PC_PATH_MAX", 4),
+            ("PC_PIPE_BUF", 5),
+            ("PC_PRIO_IO", 11),
+            ("PC_REC_INCR_XFER_SIZE", 14),
+            ("PC_REC_MAX_XFER_SIZE", 15),
+            ("PC_REC_MIN_XFER_SIZE", 16),
+            ("PC_REC_XFER_ALIGN", 17),
             ("PC_SOCK_MAXBUF", 12),
-            ("PC_SYMLINK_MAX", host_posix::_PC_SYMLINK_MAX),
-            ("PC_SYNC_IO", host_posix::_PC_SYNC_IO),
-            ("PC_VDISABLE", host_posix::_PC_VDISABLE),
+            ("PC_SYMLINK_MAX", 19),
+            ("PC_SYNC_IO", 9),
+            ("PC_VDISABLE", 8),
         ];
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
         const PATHCONF_NAMES: &[(&str, i32)] = &[];

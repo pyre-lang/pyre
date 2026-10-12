@@ -35,6 +35,45 @@ pub type RUSAGE = libc::rusage;
 /// `rtime.RUSAGE_SELF`.
 pub const RUSAGE_SELF: INT = libc::RUSAGE_SELF;
 
+/// `rtime.CLOCK_REALTIME`.
+pub const CLOCK_REALTIME: libc::clockid_t = libc::CLOCK_REALTIME;
+/// `rtime.CLOCK_MONOTONIC`.
+pub const CLOCK_MONOTONIC: libc::clockid_t = libc::CLOCK_MONOTONIC;
+/// `rtime.CLOCK_MONOTONIC_RAW`.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "fuchsia",
+    target_vendor = "apple"
+))]
+pub const CLOCK_MONOTONIC_RAW: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
+/// `rtime.CLOCK_PROCESS_CPUTIME_ID`.
+#[cfg(not(any(
+    target_os = "illumos",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "openbsd",
+    target_os = "wasi",
+)))]
+pub const CLOCK_PROCESS_CPUTIME_ID: libc::clockid_t = libc::CLOCK_PROCESS_CPUTIME_ID;
+/// `rtime.CLOCK_THREAD_CPUTIME_ID`.
+#[cfg(not(any(
+    target_os = "illumos",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "openbsd",
+    target_os = "redox",
+)))]
+pub const CLOCK_THREAD_CPUTIME_ID: libc::clockid_t = libc::CLOCK_THREAD_CPUTIME_ID;
+/// Darwin clocks that keep counting across sleep, and the `_APPROX` pair
+/// that read a cached value instead of taking the timebase lock.
+#[cfg(target_vendor = "apple")]
+pub const CLOCK_MONOTONIC_RAW_APPROX: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW_APPROX;
+#[cfg(target_vendor = "apple")]
+pub const CLOCK_UPTIME_RAW: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
+#[cfg(target_vendor = "apple")]
+pub const CLOCK_UPTIME_RAW_APPROX: libc::clockid_t = libc::CLOCK_UPTIME_RAW_APPROX;
+
 crate::rffi::external_compilation_info! {
     const TIME_ECI = {
         includes: ["sys/time.h", "time.h", "errno.h", "sys/types.h", "unistd.h", "sys/resource.h"],

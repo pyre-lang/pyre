@@ -63,17 +63,19 @@ crate::py_module! {
                     crate::__pyre_store!(ns, "clock_settime_ns", crate::make_builtin_function_with_arity("clock_settime_ns", t::clock_settime_ns, 2));
                 }
             }
-            crate::__pyre_store!(ns, "CLOCK_REALTIME", pyre_object::w_int_new(rustpython_host_env::time::CLOCK_REALTIME as i64));
-            crate::__pyre_store!(ns, "CLOCK_MONOTONIC", pyre_object::w_int_new(rustpython_host_env::time::CLOCK_MONOTONIC as i64));
+            crate::__pyre_store!(ns, "CLOCK_REALTIME",
+                pyre_object::w_int_new(majit_rlib::rtime::CLOCK_REALTIME as i64));
+            crate::__pyre_store!(ns, "CLOCK_MONOTONIC",
+                pyre_object::w_int_new(majit_rlib::rtime::CLOCK_MONOTONIC as i64));
             // The two darwin clocks that keep counting across sleep, and the
             // `_APPROX` pair that read a cached value instead of taking the
             // timebase lock.
             #[cfg(target_vendor = "apple")]
             for (name, val) in [
-                ("CLOCK_MONOTONIC_RAW", rustpython_host_env::time::CLOCK_MONOTONIC_RAW as i64),
-                ("CLOCK_MONOTONIC_RAW_APPROX", rustpython_host_env::time::CLOCK_MONOTONIC_RAW_APPROX as i64),
-                ("CLOCK_UPTIME_RAW", rustpython_host_env::time::CLOCK_UPTIME_RAW as i64),
-                ("CLOCK_UPTIME_RAW_APPROX", rustpython_host_env::time::CLOCK_UPTIME_RAW_APPROX as i64),
+                ("CLOCK_MONOTONIC_RAW", majit_rlib::rtime::CLOCK_MONOTONIC_RAW as i64),
+                ("CLOCK_MONOTONIC_RAW_APPROX", majit_rlib::rtime::CLOCK_MONOTONIC_RAW_APPROX as i64),
+                ("CLOCK_UPTIME_RAW", majit_rlib::rtime::CLOCK_UPTIME_RAW as i64),
+                ("CLOCK_UPTIME_RAW_APPROX", majit_rlib::rtime::CLOCK_UPTIME_RAW_APPROX as i64),
             ] {
                 crate::__pyre_store!(ns, name, pyre_object::w_int_new(val));
             }
@@ -84,7 +86,8 @@ crate::py_module! {
                 target_os = "openbsd",
                 target_os = "wasi",
             )))]
-            crate::__pyre_store!(ns, "CLOCK_PROCESS_CPUTIME_ID", pyre_object::w_int_new(rustpython_host_env::time::CLOCK_PROCESS_CPUTIME_ID as i64));
+            crate::__pyre_store!(ns, "CLOCK_PROCESS_CPUTIME_ID",
+                pyre_object::w_int_new(majit_rlib::rtime::CLOCK_PROCESS_CPUTIME_ID as i64));
             #[cfg(not(any(
                 target_os = "illumos",
                 target_os = "netbsd",
@@ -93,7 +96,8 @@ crate::py_module! {
                 target_os = "redox",
             )))]
             {
-                crate::__pyre_store!(ns, "CLOCK_THREAD_CPUTIME_ID", pyre_object::w_int_new(rustpython_host_env::time::CLOCK_THREAD_CPUTIME_ID as i64));
+                crate::__pyre_store!(ns, "CLOCK_THREAD_CPUTIME_ID",
+                    pyre_object::w_int_new(majit_rlib::rtime::CLOCK_THREAD_CPUTIME_ID as i64));
                 // thread_time reads CLOCK_THREAD_CPUTIME_ID, so it is exposed on
                 // exactly the platforms that carry the constant — the same gate
                 // `_get_time_info` uses for its "thread_time" arm.

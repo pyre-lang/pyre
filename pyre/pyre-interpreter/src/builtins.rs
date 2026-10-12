@@ -8939,7 +8939,12 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
         EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
         EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
     };
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    #[cfg(all(unix, feature = "host_env", not(target_arch = "wasm32")))]
+    use libc::{
+        EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
+        EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
+    };
+    #[cfg(all(windows, feature = "host_env", not(target_arch = "wasm32")))]
     use rustpython_host_env::errno::errors::{
         EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
         EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
@@ -24883,29 +24888,24 @@ fn fileio_close_owned_fd(fd: i32) {
     let _ = fd;
 }
 
-/// PyPy `_open_inhcache.set_non_inheritable(fd)` / `rposix.set_inheritable`.
+/// `interp_fileio._open_inhcache.set_non_inheritable(fd)`. The cache probes
+/// the first descriptor once; where `O_CLOEXEC` already made it
+/// non-inheritable no later open issues a call.
 /// A caller-supplied integer descriptor is deliberately excluded: FileIO must
 /// preserve that descriptor's existing inheritance flag.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate::PyError> {
-    use std::os::fd::BorrowedFd;
-
-    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-    rustpython_host_env::posix::set_inheritable(fd, false).map_err(|error| {
-        crate::PyError::os_error_syscall(error.raw_os_error().unwrap_or(0), w_name)
-    })
-}
-
-#[cfg(all(unix, not(feature = "host_env"), not(feature = "sandbox")))]
-fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate::PyError> {
-    let current = crt_call!(libc::fcntl(fd, libc::F_GETFD));
-    if current < 0 {
-        return Err(crate::PyError::os_error_syscall(crt_errno(), w_name));
-    }
-    if current & libc::FD_CLOEXEC == 0
-        && crt_call!(libc::fcntl(fd, libc::F_SETFD, current | libc::FD_CLOEXEC)) < 0
-    {
-        return Err(crate::PyError::os_error_syscall(crt_errno(), w_name));
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn fileio_set_non_inheritable(fd: i32, mut w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    /// `interp_fileio._open_inhcache`.
+    static OPEN_INHCACHE: majit_rlib::rposix::SetNonInheritableCache =
+        majit_rlib::rposix::SetNonInheritableCache::new();
+    // `_c_get_inheritable` / `_c_set_inheritable` release the GIL and save
+    // errno.
+    let ret = pyre_object::with_roots!(w_name => OPEN_INHCACHE.set_non_inheritable(fd));
+    if ret < 0 {
+        return Err(crate::PyError::os_error_syscall(
+            majit_rlib::rposix::get_saved_errno(),
+            w_name,
+        ));
     }
     Ok(())
 }
@@ -25653,7 +25653,10 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         };
-        if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
+        // `_c_set_inheritable` releases the GIL; `path_obj` is live here.
+        if let Err(error) = pyre_object::with_roots!(path_obj => {
+            fileio_set_non_inheritable(fd, resolved_path.w_path())
+        }) {
             fileio_close_owned_fd(fd);
             return Err(error);
         }

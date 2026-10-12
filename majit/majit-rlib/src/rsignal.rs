@@ -129,6 +129,33 @@ crate::rffi::llexternal!(
     save_err = crate::rffi::RFFI_SAVE_ERRNO
 );
 
+// `rsignal.c_siginterrupt` is `pypysig_siginterrupt` (`signals.c`).
+// `siginterrupt(2)` is deprecated on glibc 2.21+; the helper uses
+// `sigaction` + `SA_RESTART` instead. `rsignal.external` is
+// `sandboxsafe=True` and this call also saves errno.
+unsafe fn pypysig_siginterrupt(sig: INT, flag: INT) -> INT {
+    let mut act = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    if unsafe { libc::sigaction(sig, std::ptr::null(), &mut act) } < 0 {
+        return -1;
+    }
+    if flag != 0 {
+        act.sa_flags &= !libc::SA_RESTART;
+    } else {
+        act.sa_flags |= libc::SA_RESTART;
+    }
+    unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) }
+}
+
+crate::rffi::llexternal!(
+    pub c_siginterrupt = "pypysig_siginterrupt",
+    [INT, INT],
+    INT,
+    compilation_info = SIGNAL_ECI,
+    sandboxsafe = true,
+    save_err = crate::rffi::RFFI_SAVE_ERRNO,
+    macro = pypysig_siginterrupt
+);
+
 // `rsignal.c_sigpending`.
 crate::rffi::llexternal!(
     pub c_sigpending = "sigpending",

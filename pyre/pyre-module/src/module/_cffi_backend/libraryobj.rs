@@ -17,8 +17,8 @@ use super::ctypeobj;
 pub struct W_Library {
     /// `W_Library.name`.
     pub w_name: PyObjectRef,
-    /// `W_Library.handle`, as the index of the host loader's own record.
-    /// Zero once the library has been closed.
+    /// `W_Library.handle`, the raw `DLLHANDLE`. Zero once the library
+    /// has been closed.
     pub handle: i64,
     /// Whether closing this object closes the library: a `void *` handle
     /// handed in was opened by someone else, and is left alone.
@@ -98,18 +98,33 @@ pub unsafe fn w_library_dealloc(obj: PyObjectRef) {
     close_lib(unsafe { &mut *(obj as *mut W_Library) });
 }
 
-#[cfg(all(feature = "host_env", any(unix, windows)))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+pub(crate) fn drop_library(handle: usize) {
+    let _ = unsafe { majit_rlib::rdynload::dlclose(handle as majit_rlib::rdynload::DLLHANDLE) };
+}
+
+#[cfg(all(windows, feature = "host_env"))]
 pub(crate) fn drop_library(handle: usize) {
     rustpython_host_env::ctypes::drop_library(handle);
 }
 
-#[cfg(not(all(feature = "host_env", any(unix, windows))))]
+#[cfg(not(any(
+    all(unix, feature = "host_env", not(feature = "sandbox")),
+    all(windows, feature = "host_env")
+)))]
 pub(crate) fn drop_library(_handle: usize) {}
 
 /// `rdynload.dlsym`, split the way the host loader splits it: a function
 /// address and a data address are looked up differently on Windows.
 pub(crate) fn dlsym(handle: usize, name: &str, is_function: bool) -> Option<usize> {
-    #[cfg(all(feature = "host_env", any(unix, windows)))]
+    #[cfg(unix)]
+    {
+        let _ = is_function;
+        majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, name.as_bytes())
+            .ok()
+            .map(|address| address as usize)
+    }
+    #[cfg(all(windows, feature = "host_env"))]
     {
         let symbol = name.as_bytes();
         let address = if is_function {
@@ -117,11 +132,9 @@ pub(crate) fn dlsym(handle: usize, name: &str, is_function: bool) -> Option<usiz
         } else {
             rustpython_host_env::ctypes::lookup_data_symbol_addr(handle, symbol)
         };
-        // A resolver that itself returns NULL leaves the load reporting
-        // success with address 0, which is not a symbol.
         address.ok().filter(|&a| a != 0)
     }
-    #[cfg(not(all(feature = "host_env", any(unix, windows))))]
+    #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
     {
         let _ = (handle, name, is_function);
         None

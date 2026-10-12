@@ -1915,19 +1915,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let c_name = std::ffi::CString::new(name).map_err(|_| {
                         pyre_interpreter::PyError::value_error("embedded null in name")
                     })?;
-                    #[cfg(not(feature = "host_env"))]
-                    {
-                        let _ = c_name;
-                        return Err(pyre_interpreter::PyError::not_implemented(
-                            "socket.if_nametoindex requires host_env",
-                        ));
+                    let interfaces = majit_rlib::rsocket::if_nameindex().map_err(|error| {
+                        socket_io_err(std::io::Error::from_raw_os_error(error.errno))
+                    })?;
+                    for (index, nam) in interfaces {
+                        if nam == c_name.as_bytes() {
+                            return Ok(pyre_object::w_int_new(index as i64));
+                        }
                     }
-                    #[cfg(feature = "host_env")]
-                    {
-                        let idx = rustpython_host_env::socket::if_nametoindex_checked(&c_name)
-                            .map_err(socket_io_err)?;
-                        Ok(pyre_object::w_int_new(idx as i64))
-                    }
+                    // `interp_socket.py if_nametoindex` raises a bare
+                    // `OSError("No such device or address")`. The 3.14 test
+                    // requires `.errno`; ENXIO is that message's POSIX code.
+                    Err(socket_io_err(std::io::Error::from_raw_os_error(libc::ENXIO)))
                 },
                 1,
             )
@@ -1956,20 +1955,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             "Python int too large for C unsigned int",
                         )
                     })?;
-                    #[cfg(not(feature = "host_env"))]
-                    {
-                        let _ = idx;
-                        return Err(pyre_interpreter::PyError::not_implemented(
-                            "socket.if_indextoname requires host_env",
-                        ));
+                    let interfaces = majit_rlib::rsocket::if_nameindex().map_err(|error| {
+                        socket_io_err(std::io::Error::from_raw_os_error(error.errno))
+                    })?;
+                    for (index, name) in interfaces {
+                        if index == idx {
+                            return Ok(pyre_interpreter::gateway::fsdecode_filename_bytes(&name));
+                        }
                     }
-                    #[cfg(feature = "host_env")]
-                    {
-                        let name = rustpython_host_env::socket::if_indextoname_checked(idx)
-                            .map_err(socket_io_err)?
-                            .into_bytes();
-                        Ok(pyre_interpreter::gateway::fsdecode_filename_bytes(&name))
-                    }
+                    // `interp_socket.py if_indextoname` raises the same bare
+                    // `OSError`; publish ENXIO so `.errno` is set.
+                    Err(socket_io_err(std::io::Error::from_raw_os_error(libc::ENXIO)))
                 },
                 1,
             )
@@ -2068,16 +2064,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let raw = pyre_interpreter::builtins::space_index_w(
                         pyre_interpreter::baseobjspace::space_index(args[0])?,
                     )?;
-                    #[cfg(all(feature = "host_env", not(target_os = "redox")))]
-                    let n = usize::try_from(raw)
-                        .ok()
-                        .and_then(rustpython_host_env::socket::checked_cmsg_space)
-                        .ok_or_else(|| {
-                            pyre_interpreter::PyError::overflow_error(
-                                "CMSG_SPACE() argument out of range",
-                            )
-                        })?;
-                    #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
                     let n = {
                         let max_payload =
                             i64::from(libc::c_int::MAX) - i64::from(unsafe { libc::CMSG_SPACE(1) });
@@ -2108,16 +2094,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let raw = pyre_interpreter::builtins::space_index_w(
                         pyre_interpreter::baseobjspace::space_index(args[0])?,
                     )?;
-                    #[cfg(all(feature = "host_env", not(target_os = "redox")))]
-                    let n = usize::try_from(raw)
-                        .ok()
-                        .and_then(rustpython_host_env::socket::checked_cmsg_len)
-                        .ok_or_else(|| {
-                            pyre_interpreter::PyError::overflow_error(
-                                "CMSG_LEN() argument out of range",
-                            )
-                        })?;
-                    #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
                     let n = {
                         if raw < 0 || raw > i64::from(libc::c_int::MAX) {
                             return Err(pyre_interpreter::PyError::overflow_error(
@@ -6638,34 +6614,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 };
 
                 // Lay out cmsgs into a single control buffer.
-                #[cfg(all(feature = "host_env", not(target_os = "redox")))]
-                let mut control = {
-                    let refs: Vec<_> = cmsgs
-                        .iter()
-                        .map(|(level, ty, data)| (*level, *ty, data.as_slice()))
-                        .collect();
-                    rustpython_host_env::socket::pack_ancillary_messages(&refs).map_err(
-                        |error| {
-                            use rustpython_host_env::socket::AncillaryPackError;
-                            match error {
-                                AncillaryPackError::ItemTooLarge => {
-                                    pyre_interpreter::PyError::os_error(
-                                        "ancillary data item too large",
-                                    )
-                                }
-                                AncillaryPackError::TooMuchData => {
-                                    pyre_interpreter::PyError::os_error("too much ancillary data")
-                                }
-                                AncillaryPackError::UnexpectedNullHeader => {
-                                    pyre_interpreter::PyError::runtime_error(
-                                        "unexpected NULL result from CMSG_FIRSTHDR/CMSG_NXTHDR",
-                                    )
-                                }
-                            }
-                        },
-                    )?
-                };
-                #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
                 let mut control = {
                     let total_control: usize = cmsgs
                         .iter()
