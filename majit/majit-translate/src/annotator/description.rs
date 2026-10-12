@@ -3729,6 +3729,34 @@ mod tests {
         assert_eq!(graph.graph.borrow().name, "f__int");
     }
 
+    #[test]
+    fn specialize_argtype_keys_each_listed_index() {
+        let (_ann, bk) = ann_bk();
+        let func = compiled_graph_func("def f(x, y):\n    return x\n", Vec::new());
+        let host = HostObject::new_user_function(func.clone());
+        let fd = FunctionDesc::new(
+            bk,
+            Some(host),
+            "f",
+            func.code.as_ref().unwrap().signature.clone(),
+            Some(func.defaults.clone()),
+            Some(Specializer::Argtype {
+                parms: vec!["0".to_string(), "1".to_string()],
+            }),
+        );
+        let mut inputcells = vec![
+            Some(SomeValue::Integer(SomeInteger::default())),
+            Some(SomeValue::Bool(super::super::model::SomeBool::new())),
+        ];
+        let graph = fd
+            .specialize(&mut inputcells, None)
+            .expect("argtype specialization")
+            .expect_graph()
+            .unwrap();
+
+        assert_eq!(graph.graph.borrow().name, "f__int_bool");
+    }
+
     /// Build a memo-specialised FunctionDesc whose `host_call` maps a
     /// bool argument to an int, then drive `specialize` and assert it
     /// returns the union-of-results annotation (specialize.py).

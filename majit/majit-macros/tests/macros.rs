@@ -11,6 +11,36 @@ mod source_call_location {
     }
 }
 
+mod source_argtype {
+    #[majit_macros::specialize_argtype(0, 1)]
+    fn convert(a: usize, b: usize) -> usize {
+        assert_eq!(_annspecialcase_argtype_convert, "specialize:argtype(0,1)");
+        a + b
+    }
+
+    trait Convert {
+        fn static_convert(a: usize) -> usize;
+    }
+
+    struct Owner;
+
+    impl Convert for Owner {
+        // A static method has no receiver; a sibling associated const
+        // would be `error[E0438]` because the trait does not declare it.
+        #[majit_macros::specialize_argtype(0)]
+        fn static_convert(a: usize) -> usize {
+            let _ = _annspecialcase_argtype_static_convert;
+            a
+        }
+    }
+
+    #[test]
+    fn argtype_attribute_compiles_on_free_fn_and_trait_impl_static_method() {
+        assert_eq!(convert(1, 2), 3);
+        assert_eq!(Owner::static_convert(4), 4);
+    }
+}
+
 mod source_memo {
     #[majit_macros::specialize_memo]
     fn memo(value: usize) -> usize {
