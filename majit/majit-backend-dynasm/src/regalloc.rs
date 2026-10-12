@@ -34,6 +34,16 @@ pub const SAVE_DEFAULT_REGS: u8 = 0;
 pub const SAVE_GCREF_REGS: u8 = 1;
 pub const SAVE_ALL_REGS: u8 = 2;
 
+/// `save_all_regs` for the CALL_MALLOC_NURSERY_VARSIZE spill. x86
+/// `consider_call_malloc_nursery_varsize` uses the default: the
+/// `malloc_slowpath_varsize` helper saves every register but ecx/edx into
+/// the jitframe. The aarch64 emitter still expects a live length in its
+/// frame slot, so it keeps spilling every binding.
+#[cfg(target_arch = "x86_64")]
+const VARSIZE_MALLOC_SAVE_REGS: u8 = SAVE_DEFAULT_REGS;
+#[cfg(not(target_arch = "x86_64"))]
+const VARSIZE_MALLOC_SAVE_REGS: u8 = SAVE_ALL_REGS;
+
 /// `guard.getfailargs()` as OpRefs. Sixteen stay on the stack so a
 /// regex-shaped guard does not mint the 128 B SmallVec spill that
 /// `lower_op` used to allocate per guard.
@@ -6218,22 +6228,28 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.inputarg_pos,
-            &self.op_pos,
-        );
-        // aarch64/regalloc.py:1016
-        self.rm.spill_or_move_registers_before_call(
-            &MALLOC_NURSERY_CLOBBER,
-            &[],
-            SAVE_ALL_REGS,
-            &mut self.longevity,
-            &mut self.fm,
-            &mut self.pending_moves,
-            &type_index,
-        );
+        // `consider_call_malloc_nursery_varsize` /
+        // `prepare_op_call_malloc_nursery_varsize`: spill only when
+        // `stays_alive(length_box)`. A length that dies here is unbound
+        // with no stack sync, and `loc` would then allocate an empty slot.
+        let length_box = op.arg(2).to_opref();
+        if self.rm.stays_alive(length_box, &self.longevity) {
+            let type_index = OpTypeIndex::from_parts(
+                self.inputargs,
+                self.operations,
+                &self.inputarg_pos,
+                &self.op_pos,
+            );
+            self.rm.spill_or_move_registers_before_call(
+                &MALLOC_NURSERY_CLOBBER,
+                &[],
+                VARSIZE_MALLOC_SAVE_REGS,
+                &mut self.longevity,
+                &mut self.fm,
+                &mut self.pending_moves,
+                &type_index,
+            );
+        }
         // aarch64/regalloc.py:1018
         let result_reg = self.rm.force_allocate_reg(
             op.pos().get(),
@@ -6265,7 +6281,7 @@ impl<'a> RegAlloc<'a> {
         self.rm
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         // aarch64/regalloc.py: lengthloc = self.rm.loc(length_box)
-        let lengthloc = self.loc(op.arg(2).to_opref(), Type::Int);
+        let lengthloc = self.loc(length_box, Type::Int);
         // aarch64/regalloc.py:1030: itemsize = op.getarg(1).getint()
         let itemsize = self.const_value(op.arg(1).to_opref());
         // aarch64/regalloc.py:1033: kind = op.getarg(0).getint()
@@ -6285,21 +6301,28 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.inputarg_pos,
-            &self.op_pos,
-        );
-        self.rm.spill_or_move_registers_before_call(
-            &MALLOC_NURSERY_CLOBBER,
-            &[],
-            SAVE_ALL_REGS,
-            &mut self.longevity,
-            &mut self.fm,
-            &mut self.pending_moves,
-            &type_index,
-        );
+        // `consider_call_malloc_nursery_varsize` /
+        // `prepare_op_call_malloc_nursery_varsize`: spill only when
+        // `stays_alive(length_box)`. See `consider_call_malloc_nursery_varsize`.
+        if let Some(&length_box) = args.get(2)
+            && self.rm.stays_alive(length_box, &self.longevity)
+        {
+            let type_index = OpTypeIndex::from_parts(
+                self.inputargs,
+                self.operations,
+                &self.inputarg_pos,
+                &self.op_pos,
+            );
+            self.rm.spill_or_move_registers_before_call(
+                &MALLOC_NURSERY_CLOBBER,
+                &[],
+                VARSIZE_MALLOC_SAVE_REGS,
+                &mut self.longevity,
+                &mut self.fm,
+                &mut self.pending_moves,
+                &type_index,
+            );
+        }
         let result_reg = self.rm.force_allocate_reg(
             dst.unwrap_or(OpRef::NONE),
             &[],

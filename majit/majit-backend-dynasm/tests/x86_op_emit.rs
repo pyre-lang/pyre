@@ -1743,6 +1743,96 @@ fn failure_recovery_captures_a_pending_exception() {
     assert!(!majit_backend_dynasm::jit_exc_is_pending());
 }
 
+/// A box whose `pos` is the constant (`pack_op_pos`, shortpreamble /
+/// heap-const). `compute_vars_longevity` rejects a Const fail-arg
+/// (`assert not isinstance(arg, Const)`). `locs_for_fail` still lowers
+/// this box through `convert_to_imm`, and `generate_quick_failure`
+/// reloads the bits through r11.
+fn heap_const_failarg(value: i64) -> Operand {
+    let op = OpRc::new(Op::new(OpCode::SameAsI, &[]));
+    op.pos().set(OpRef::const_int(value));
+    Operand::from_bound_op(&op)
+}
+
+/// `INT_ADD` of a constant that does not fit imm32 loads it into r11
+/// (`_load_scratch`). The failing guard's recovery then reloads that
+/// same word and a word 40 bytes away (`restore_scratch_register_known_value`
+/// plus `LEA`). A far constant still takes `MOV_ri`.
+#[test]
+fn guard_recovery_reuses_known_scratch_value() {
+    const SCRATCH_BASE: i64 = 1i64 << 32;
+    const NEAR: i64 = SCRATCH_BASE + 40;
+    const FAR: i64 = SCRATCH_BASE + (1i64 << 40);
+
+    let _lock = lock_exception_cells();
+    let _clear = ClearExc;
+    majit_backend_dynasm::jit_exc_clear();
+
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[rb(i0), rb(OpRef::const_int(SCRATCH_BASE))],
+    );
+    add.pos().set(OpRef::int_op(1));
+    let eq = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(0))]);
+    eq.pos().set(OpRef::int_op(2));
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+    guard.pos().set(OpRef::void_op(3));
+    guard.setdescr(make_resume_guard_descr_typed(vec![
+        Type::Int,
+        Type::Int,
+        Type::Int,
+        Type::Int,
+    ]));
+    guard.set_fail_arg_types(vec![Type::Int, Type::Int, Type::Int, Type::Int]);
+    guard.setfailargs(
+        vec![
+            rb(OpRef::int_op(1)),
+            heap_const_failarg(SCRATCH_BASE),
+            heap_const_failarg(NEAR),
+            heap_const_failarg(FAR),
+        ]
+        .into(),
+    );
+    let ops = vec![
+        OpRc::new(add),
+        OpRc::new(eq),
+        OpRc::new(guard),
+        OpRc::new(finish(4)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile scratch guard: {err:?}"));
+
+    let mut mov_r11 = [0u8; 10];
+    mov_r11[0] = 0x49;
+    mov_r11[1] = 0xBB;
+    mov_r11[2..].copy_from_slice(&SCRATCH_BASE.to_le_bytes());
+    let code = compiled_bytes(&token);
+    let movs = code
+        .windows(mov_r11.len())
+        .filter(|w| *w == mov_r11)
+        .count();
+    assert_eq!(
+        movs, 1,
+        "recovery must reuse r11 instead of reloading {SCRATCH_BASE:#x}"
+    );
+    assert!(
+        code.windows(4).any(|w| w == [0x4D, 0x8D, 0x5B, 0x28]),
+        "recovery must lea r11, [r11+40] for the near constant"
+    );
+
+    let frame = backend.execute_token(&token, &[Value::Int(7)]);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 7 + SCRATCH_BASE);
+    assert_eq!(backend.get_int_value(&frame, 1), SCRATCH_BASE);
+    assert_eq!(backend.get_int_value(&frame, 2), NEAR);
+    assert_eq!(backend.get_int_value(&frame, 3), FAR);
+}
+
 fn no_collect_effect() -> EffectInfo {
     let mut effect = EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None);
     effect.can_collect = false;
@@ -3278,6 +3368,102 @@ fn call_malloc_nursery_varsize_small_and_large() {
     assert!(!majit_gc::can_move(ptr));
     assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
     assert_eq!(unsafe { *(ptr.0 as *const i64) }, large);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+}
+
+/// `consider_call_malloc_nursery_varsize`: the length is an `INT_ADD`
+/// result, so it lives in a register. When that box dies at the alloc,
+/// `spill_or_move_registers_before_call` must not run — it would unbind
+/// the length with no stack sync. When a later store keeps it alive, the
+/// spill is legal and `loc` still sees the value.
+fn run_varsize_from_add(length_lives: bool, len_a: i64, len_b: i64) -> (majit_ir::GcRef, u32, i64) {
+    let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size: 1 << 20,
+        large_object_threshold: 4096,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    let array_tid = gc.register_type(majit_gc::TypeInfo::varsize(8, 8, 0, false, Vec::new()));
+    let mut backend = wb_backend(gc);
+    let a = OpRef::input_arg_int(0);
+    let b = OpRef::input_arg_int(1);
+    let n = OpRef::input_arg_int(2);
+    let k = OpRef::input_arg_int(3);
+    let sum = OpRef::int_op(4);
+    let len = OpRef::int_op(5);
+    let obj = OpRef::ref_op(6);
+    let alloc = op_at(
+        OpCode::CallMallocNurseryVarsize,
+        &[OpRef::const_int(0), OpRef::const_int(8), len],
+        obj,
+    );
+    alloc.setdescr(Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        8,
+        8,
+        array_tid,
+        Type::Int,
+    )));
+    let mut ops = vec![
+        op_at(OpCode::IntAdd, &[a, b], sum),
+        op_at(OpCode::IntAdd, &[n, k], len),
+        alloc,
+    ];
+    let mut pos = 7u32;
+    if length_lives {
+        ops.push(gc_store(obj, 0, len, 8, pos));
+        pos += 1;
+    }
+    ops.push(gc_store(obj, 8, sum, 8, pos));
+    ops.push(finish_ref(obj, pos + 1));
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+        InputArg::from_type_rc(Type::Int, 3),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(
+        &token,
+        &[
+            Value::Int(20),
+            Value::Int(22),
+            Value::Int(len_a),
+            Value::Int(len_b),
+        ],
+    );
+    let ptr = finished_ref(&backend, &frame);
+    (ptr, array_tid, len_a.wrapping_add(len_b))
+}
+
+#[test]
+fn call_malloc_nursery_varsize_length_dies_and_stays() {
+    let (ptr, array_tid, _len) = run_varsize_from_add(false, 1, 2);
+    assert!(!ptr.is_null());
+    assert!(majit_gc::can_move(ptr), "length 3 stays in the nursery");
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+
+    let (ptr, array_tid, len) = run_varsize_from_add(false, 100_000, 40_000);
+    assert!(!ptr.is_null());
+    assert!(
+        !majit_gc::can_move(ptr),
+        "length {len} must take the non-moving path"
+    );
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+
+    let (ptr, array_tid, len) = run_varsize_from_add(true, 1, 2);
+    assert!(!ptr.is_null());
+    assert!(majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, len);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
+
+    let (ptr, array_tid, len) = run_varsize_from_add(true, 100_000, 40_000);
+    assert!(!ptr.is_null());
+    assert!(!majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, array_tid);
+    assert_eq!(unsafe { *(ptr.0 as *const i64) }, len);
     assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
 }
 

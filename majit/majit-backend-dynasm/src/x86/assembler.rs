@@ -2183,6 +2183,13 @@ struct GuardToken {
     /// exc=True failure-recovery variant that stages pos_exc_value into
     /// jf_guard_exc (store_info_on_descr:236) so grab_exc_value can read it.
     must_save_exception: bool,
+    /// `implement_guard` / `genop_guard_guard_not_invalidated` store
+    /// `get_scratch_register_known_value()` here. `-1` is unknown.
+    /// `generate_quick_failure` assigns it back
+    /// (`restore_scratch_register_known_value` emits no code) before the
+    /// const stores. A token whose recovery is not entered from its own
+    /// jump with r11 unchanged stays `-1`.
+    known_scratch_value: i64,
 }
 
 /// What `assembler.py patch_pending_failure_recoveries` reads off a guard
@@ -6154,6 +6161,11 @@ impl<'a> Assembler386<'a> {
                         guard_argloc,
                         faillocs,
                     );
+                    // Replayed from `CondCallSlowPath` after the call, which
+                    // clobbers r11. The fast-path cache is not that edge, so
+                    // `known_scratch_value` stays unknown here.
+                    // `generate_guard_no_exception` records it at the
+                    // slow-path `jcc`.
                     self.record_guard_token_side_effects(op, &token);
                     self.stash_cond_call_guard_token(token);
                 } else {
@@ -6694,6 +6706,10 @@ impl<'a> Assembler386<'a> {
         let fail_cc = invert_cc(cc);
         let fail_label = self.emit_guard_jcc(fail_cc);
         let pos = self.mc.offset().0;
+        // `implement_guard`: the `Jcc` does not change r11, so the cache
+        // at this point is the value the recovery jump leaves in the
+        // register.
+        let known_scratch_value = self.scratch_register_value;
         self.append_guard_token_with_faillocs(
             op,
             op_index,
@@ -6702,6 +6718,10 @@ impl<'a> Assembler386<'a> {
             guard_argloc,
             faillocs,
         );
+        self.pending_guard_tokens
+            .last_mut()
+            .expect("guard token appended")
+            .known_scratch_value = known_scratch_value;
         self.set_last_guard_jump_offset(pos);
     }
 
@@ -6724,6 +6744,10 @@ impl<'a> Assembler386<'a> {
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
+        // No branch from this position. Recovery is not entered with the
+        // fallthrough r11 cache, so `known_scratch_value` stays unknown.
+        // `genop_guard_guard_not_invalidated` overwrites it: the patched
+        // `JMP` does enter with r11 unchanged.
         let fail_label = self.mc.new_dynamic_label();
         self.append_guard_token_with_faillocs(
             op,
@@ -6763,6 +6787,10 @@ impl<'a> Assembler386<'a> {
             .expect("guard token appended");
         token.pos_jump_offset = Some(pos + 1);
         token.guard_not_invalidated = true;
+        // `genop_guard_guard_not_invalidated` records the scratch cache.
+        // `get_relative_pos(break_basic_block=False)` does not forget, and
+        // the `JMP rel32` written by `invalidate_loop` does not change r11.
+        token.known_scratch_value = self.scratch_register_value;
         self.ensure_next_label_is_at_least_at_position(pos + 5);
     }
 
@@ -6800,6 +6828,9 @@ impl<'a> Assembler386<'a> {
         faillocs: &[Option<Loc>],
     ) {
         let fail_label = self.mc.new_dynamic_label();
+        // The `jmp` leaves r11 unchanged. Capture the cache before
+        // `forget_after_call_or_jmp`, which only drops the fallthrough.
+        let known_scratch_value = self.scratch_register_value;
         dynasm!(self.mc ; .arch x64 ; jmp =>fail_label);
         let pos = self.mc.offset().0;
         self.forget_after_call_or_jmp();
@@ -6811,6 +6842,10 @@ impl<'a> Assembler386<'a> {
             guard_argloc,
             faillocs,
         );
+        self.pending_guard_tokens
+            .last_mut()
+            .expect("guard token appended")
+            .known_scratch_value = known_scratch_value;
         self.set_last_guard_jump_offset(pos);
     }
 
@@ -6975,6 +7010,7 @@ impl<'a> Assembler386<'a> {
                 op.opcode,
                 OpCode::GuardException | OpCode::GuardNoException | OpCode::GuardNotForced
             ),
+            known_scratch_value: -1,
         }
     }
 
@@ -7093,9 +7129,9 @@ impl<'a> Assembler386<'a> {
     ///
     /// Immediate fail-args are extra frame slots (`const_stores`). They are
     /// written here, before the two pushes, so `rd_locs` still names them.
-    /// `restore_scratch_register_known_value` is skipped: `GuardToken` has no
-    /// `known_scratch_value`, and `_build_failure_recovery` clobbers `r11`.
-    /// Then `PUSH` the descr and the gcmap and `JMP`
+    /// `restore_scratch_register_known_value` assigns `known_scratch_value`
+    /// and emits nothing, so a nearby constant is a `LEA` from the r11 the
+    /// guard jump left behind. Then `PUSH` the descr and the gcmap and `JMP`
     /// `failure_recovery_code[exc + 2 * withfloats]` (`store_info_on_descr`).
     fn generate_quick_failure(&mut self, guard_token: GuardToken) -> RecoveryStub {
         let stub_start = self.mc.offset();
@@ -7107,10 +7143,12 @@ impl<'a> Assembler386<'a> {
                 &format!("recovery stub: binding {fail_label:?}"),
             );
         }
-        // The fail label is a join. The fallthrough scratch cache does not
-        // describe this edge.
+        // The fail label is a join, so `get_relative_pos` forgets the
+        // fallthrough cache. `restore_scratch_register_known_value` then
+        // installs the value recorded at the guard jump. `-1` stays unknown.
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>fail_label);
+        self.scratch_register_value = guard_token.known_scratch_value;
 
         for &(slot, val) in &guard_token.const_stores {
             let ofs = Self::slot_offset(slot);
@@ -7543,6 +7581,11 @@ impl<'a> Assembler386<'a> {
             self.emit_jcc_to_label(invert_cc(cc), fail_label);
             let pos = self.mc.offset().0;
             token.pos_jump_offset = Some(pos - 4);
+            // `generate_guard_no_exception` calls `implement_guard`, which
+            // records the scratch cache at this `jcc`. The call forgot it;
+            // `emit_guard_no_exception_check` reloaded the exception address
+            // into r11, and the `jcc` leaves that value in place.
+            token.known_scratch_value = self.scratch_register_value;
             self.pending_guard_tokens.push(token);
         } else if expects_guard_no_exception {
             panic!("a cond-call asked for GUARD_NO_EXCEPTION and the guard never stored the token");
