@@ -6600,23 +6600,6 @@ mod tests {
     }
 
     #[test]
-    fn store_state_array_aborts_when_array_elem_slot_is_missing() {
-        let mut builder = JitCodeBuilder::new();
-        builder.load_const_i_value(0, 0);
-        builder.load_const_i_value(1, 7);
-        builder.store_state_array(0, 0, 1);
-        builder.void_return();
-        let jitcode = builder.finish();
-        let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym;
-        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
-        assert!(
-            matches!(action, TraceAction::Abort),
-            "store_state_array with no array_elem_slot must abort; got {action:?}"
-        );
-    }
-
-    #[test]
     fn merge_point_setup_starts_at_marker_and_seeds_every_typed_bank() {
         let mut builder = JitCodeBuilder::new();
         builder.load_const_i_value(2, -1);

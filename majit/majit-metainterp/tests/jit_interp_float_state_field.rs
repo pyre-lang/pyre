@@ -528,13 +528,15 @@ mod virt_array_with_float_scalar {
     }
 
     #[test]
-    fn merge_point_marker_lists_flattened_int_cells_as_reds() {
-        // Marker lists both flattened `[int]` cells (`handle_jit_marker__jit_merge_point`
-        // / `make_three_lists`). The `-live-` before the merge point keeps
-        // `cells[1]` so a guard resume restores it.
+    fn merge_point_marker_lists_plain_int_array_as_one_red() {
+        // Marker lists the `[int]` items-pointer then length
+        // (`handle_jit_marker__jit_merge_point` / `make_three_lists`).
+        // The `-live-` before the merge point keeps both so a
+        // guard resume restores them. `cells.len() == 3` so a missing
+        // length slot cannot be mistaken for a per-item red.
         let state = MixedState {
             sp: 0,
-            cells: vec![0; 2],
+            cells: vec![0; 3],
             acc: 0.0,
             stack: VirtArray::filled(0, 2),
         };
@@ -553,12 +555,17 @@ mod virt_array_with_float_scalar {
         let banks = decode_jit_merge_point_banks(&jc.code, mp);
         assert!(
             banks.red_i.contains(&1),
-            "marker lists cells[0] at int_identity_base; reds_i={:?}",
+            "marker lists the [int] items-pointer at int_identity_base; reds_i={:?}",
             banks.red_i
         );
         assert!(
             banks.red_i.contains(&2),
-            "marker lists cells[1]; reds_i={:?}",
+            "marker lists the [int] length after the pointer; reds_i={:?}",
+            banks.red_i
+        );
+        assert!(
+            !banks.red_i.contains(&3),
+            "cells are not per-item reds; reds_i={:?}",
             banks.red_i
         );
 
@@ -576,8 +583,13 @@ mod virt_array_with_float_scalar {
             &all_liveness,
         );
         assert!(
+            indices.int.iter().any(|&r| r == 1),
+            "guard resume live set includes the [int] items-pointer (int_regs[1]); live_i={:?}",
+            indices.int
+        );
+        assert!(
             indices.int.iter().any(|&r| r == 2),
-            "guard resume live set includes cells[1] (int_regs[2]); live_i={:?}",
+            "guard resume live set includes the [int] length (int_regs[2]); live_i={:?}",
             indices.int
         );
     }
@@ -597,18 +609,29 @@ mod virt_array_with_float_scalar {
         let meta = state.build_meta(0, program);
         // `virtualizable.py VirtualizableInfo.__init__`: `sp` and `acc` sit
         // on the virtualizable with `stack`, so they are not independent
-        // JitDriver reds. The red block is the fixed `[int]` cells plus the
-        // one identity.
+        // JitDriver reds. The red block is the `[int]` items-pointer then
+        // length plus the one identity, independent of `cells.len()`.
         assert_eq!(
             state.live_value_types(&meta),
             vec![
-                majit_ir::Type::Int, // cells[0]
-                majit_ir::Type::Int, // cells[1]
+                majit_ir::Type::Int, // cells items-pointer
+                majit_ir::Type::Int, // cells length
                 majit_ir::Type::Ref, // vable identity
             ],
             "no `stack` element belongs in the red block",
         );
-        assert_eq!(state.extract_live(&meta).len(), 3);
+        let live = state.extract_live(&meta);
+        assert_eq!(live.len(), 3);
+        assert_eq!(
+            live[0],
+            state.cells.as_ptr() as i64,
+            "the [int] first red is the Vec items pointer"
+        );
+        assert_eq!(
+            live[1],
+            state.cells.len() as i64,
+            "the [int] second red is the Vec length"
+        );
     }
 
     #[test]
@@ -624,8 +647,9 @@ mod virt_array_with_float_scalar {
         let mut sym = <MixedState as JitState>::create_sym(&meta, 0);
         state.initialize_sym(&mut sym, &meta);
 
-        // Plain reds live in the portal frame; `__JitSym` keeps flattened-array
-        // lengths (layout) and virt-array length mirrors (fresh-callee capacity).
+        // Plain reds live in the portal frame; `__JitSym` keeps `{name}_len`
+        // for is_compatible / fresh-entry sizing and virt-array length
+        // mirrors (fresh-callee capacity).
         assert_eq!(sym.cells_len, 2);
         assert_eq!(sym.stack_len_value, 2);
         assert_eq!(

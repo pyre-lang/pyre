@@ -1646,9 +1646,10 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::InlineVoid => {
                     let shared_path = inline_shared_path(&call.func)?;
                     let prebuild_path = inline_prebuild_path(&call.func)?;
-                    let (inline_call, post_live) = inline_call_tokens_void(&arg_bindings);
-                    let __arg_regs: Vec<Register> =
-                        arg_bindings.iter().map(Register::from_binding).collect();
+                    let identity = plain_array_identity_int_pairs(self.config);
+                    let (inline_call, post_live) =
+                        inline_call_tokens_void(&arg_bindings, &identity);
+                    let __arg_regs = inline_call_read_regs(&arg_bindings, &identity);
                     self.inline_liveness_prebuild.push(quote! {
                         #prebuild_path(__asm);
                     });
@@ -1671,9 +1672,10 @@ impl<'c> Lowerer<'c> {
                             .map(|segment| segment.ident.to_string()),
                         _ => None,
                     }?;
-                    let (inline_call, post_live) = inline_call_tokens_void(&arg_bindings);
-                    let arg_regs: Vec<Register> =
-                        arg_bindings.iter().map(Register::from_binding).collect();
+                    let identity = plain_array_identity_int_pairs(self.config);
+                    let (inline_call, post_live) =
+                        inline_call_tokens_void(&arg_bindings, &identity);
+                    let arg_regs = inline_call_read_regs(&arg_bindings, &identity);
                     self.inline_liveness_prebuild.push(quote! {
                         __majit_pipeline_liveness_prebuild(__asm);
                     });
@@ -1715,9 +1717,10 @@ impl<'c> Lowerer<'c> {
                             .map(|segment| segment.ident.to_string()),
                         _ => None,
                     }?;
-                    let (inline_call, post_live) = inline_call_tokens(&arg_bindings, throwaway_reg);
-                    let arg_regs: Vec<Register> =
-                        arg_bindings.iter().map(Register::from_binding).collect();
+                    let identity = plain_array_identity_int_pairs(self.config);
+                    let (inline_call, post_live) =
+                        inline_call_tokens(&arg_bindings, throwaway_reg, &identity);
+                    let arg_regs = inline_call_read_regs(&arg_bindings, &identity);
                     self.inline_liveness_prebuild.push(quote! {
                         __majit_pipeline_liveness_prebuild(__asm);
                     });
@@ -1744,9 +1747,10 @@ impl<'c> Lowerer<'c> {
                     let shared_path = inline_shared_path(&call.func)?;
                     let sub_return_kind = jit_arg_kind_tokens(result_kind);
                     let prebuild_path = inline_prebuild_path(&call.func)?;
-                    let (inline_call, post_live) = inline_call_tokens(&arg_bindings, throwaway_reg);
-                    let __arg_regs: Vec<Register> =
-                        arg_bindings.iter().map(Register::from_binding).collect();
+                    let identity = plain_array_identity_int_pairs(self.config);
+                    let (inline_call, post_live) =
+                        inline_call_tokens(&arg_bindings, throwaway_reg, &identity);
+                    let __arg_regs = inline_call_read_regs(&arg_bindings, &identity);
                     self.inline_liveness_prebuild.push(quote! {
                         #prebuild_path(__asm);
                     });

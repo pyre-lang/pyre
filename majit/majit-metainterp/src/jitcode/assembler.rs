@@ -234,8 +234,8 @@ pub struct JitCodeBuilder {
     /// markers while leaving this first offset unchanged. The LLBC sibling
     /// enforces `jtransform.py`'s single-marker portal-graph contract.
     jit_merge_point_offset: Option<usize>,
-    /// Latched by `load_state_field` / `store_state_field` and the ref,
-    /// float, and array forms. `finish` copies it to
+    /// Latched by `load_state_field` / `store_state_field` and the ref and
+    /// float forms. `finish` copies it to
     /// `JitCodeExecState::reads_identity_slots`.
     reads_identity_slots: bool,
     /// RPython `jitcode.py` `self.fnaddr = fnaddr`. RPython hands
@@ -593,30 +593,6 @@ impl JitCodeBuilder {
         self.touch_float_reg(src);
         self.write_insn("store_state_field_float/df");
         self.push_u16(field_idx);
-        self.push_u8(src as u8);
-    }
-
-    /// Load an array state field element into an int register.
-    /// The element index comes from another int register.
-    pub fn load_state_array(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
-        self.reads_identity_slots = true;
-        self.touch_reg(index_reg);
-        self.touch_reg(dest);
-        self.write_insn("load_state_array/dii");
-        self.push_u16(array_idx);
-        self.push_u8(index_reg as u8);
-        self.push_u8(dest as u8);
-    }
-
-    /// Store an int register value into an array state field element.
-    /// The element index comes from another int register.
-    pub fn store_state_array(&mut self, array_idx: u16, index_reg: u16, src: u16) {
-        self.reads_identity_slots = true;
-        self.touch_reg(index_reg);
-        self.touch_reg(src);
-        self.write_insn("store_state_array/dii");
-        self.push_u16(array_idx);
-        self.push_u8(index_reg as u8);
         self.push_u8(src as u8);
     }
 
@@ -2091,6 +2067,20 @@ impl JitCodeBuilder {
         self.push_reg_u8(index_reg, "getarrayitem_gc_i index");
         self.push_u16(descr_idx);
         self.push_reg_u8(dst, "getarrayitem_gc_i dst");
+    }
+
+    /// `blackhole.py` `bhimpl_getarrayitem_raw_i`: `[array_reg][index_reg][descr][dst]`,
+    /// `getarrayitem_raw_i/iid>i`. Int-bank base (raw address).
+    /// `jtransform.py` `rewrite_op_getarrayitem` raw arm.
+    pub fn getarrayitem_raw_i(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
+        self.touch_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_reg(dst);
+        self.write_insn("getarrayitem_raw_i/iid>i");
+        self.push_reg_u8(array_reg, "getarrayitem_raw_i array");
+        self.push_reg_u8(index_reg, "getarrayitem_raw_i index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_raw_i dst");
     }
 
     /// The always-pure spelling of [`Self::getarrayitem_gc_i`], for an array
@@ -7270,8 +7260,10 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
 /// expansion (`codegen_state.rs`'s `generate_state_fields_jit_state`), so
 /// `live_r` and `live_f` are
 /// empty.  `total_slots` matches `JitCodeSym::total_slots`:
-/// `num_scalars + sum(array_lens) + num_vable_identity_slots`, where the last
-/// term is 1 when the state has a virtualizable and 0 otherwise —
+/// `num_scalars + sum(array_lens) + num_vable_identity_slots`. Callers
+/// pass ptr then len (two Int slots) per plain `[int]` as `num_scalars`
+/// with empty `array_lens`. The last term is 1 when the state has a virtualizable
+/// and 0 otherwise —
 /// `pyjitpl.py:2984-2989` carries the virtualizable once regardless of how
 /// many `[.. ; virt]` arrays it holds, and `virtualizable.py:150-153` reads
 /// every array length off the live object rather than boxing it.

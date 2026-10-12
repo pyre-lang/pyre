@@ -1701,8 +1701,6 @@ mod tests {
             ("store_state_field_ref/dr", insns::BC_STORE_STATE_FIELD_REF),
             ("load_state_field/di", insns::BC_LOAD_STATE_FIELD),
             ("store_state_field/di", insns::BC_STORE_STATE_FIELD),
-            ("load_state_array/dii", insns::BC_LOAD_STATE_ARRAY),
-            ("store_state_array/dii", insns::BC_STORE_STATE_ARRAY),
             // pyre nested-bytecode inline_call (pyre-only `P` argcode).
             ("inline_call_nested_ext/P", insns::BC_INLINE_CALL),
             // Ref-result variant of the borrow-checker abort signal.

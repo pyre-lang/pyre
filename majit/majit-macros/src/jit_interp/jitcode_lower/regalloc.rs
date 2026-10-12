@@ -479,7 +479,8 @@ fn non_register_positions(method: &str) -> &'static [usize] {
         | "setarrayitem_gc_f"
         | "raw_load_i"
         | "raw_load_f"
-        | "raw_store_i" => &[3],
+        | "raw_store_i"
+        | "getarrayitem_raw_i" => &[3],
         "getfield_gc_i" | "getfield_gc_r" | "getfield_gc_f" | "setfield_gc_i" | "setfield_gc_r"
         | "setfield_gc_f" => &[2, 3, 4],
         "new_struct" => &[1, 2, 3, 4, 5],
@@ -489,9 +490,7 @@ fn non_register_positions(method: &str) -> &'static [usize] {
         | "load_state_field_float"
         | "store_state_field"
         | "store_state_field_ref"
-        | "store_state_field_float"
-        | "load_state_array"
-        | "store_state_array" => &[0],
+        | "store_state_field_float" => &[0],
         "vable_getfield_int_with_base"
         | "vable_getfield_ref_with_base"
         | "vable_getfield_float_with_base"

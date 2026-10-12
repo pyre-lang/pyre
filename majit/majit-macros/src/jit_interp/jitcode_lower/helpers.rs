@@ -183,18 +183,103 @@ pub(super) fn int_arg_regs(bindings: &[Binding]) -> Option<Vec<u16>> {
         .collect()
 }
 
-pub(super) fn inline_int_arg_tokens(bindings: &[Binding]) -> TokenStream {
+pub(super) fn inline_int_arg_pairs(bindings: &[Binding]) -> Vec<(u16, u16)> {
     let mut next_idx = 0u16;
-    let args = bindings.iter().filter_map(|binding| match binding.kind {
-        BindingKind::Int => {
-            let reg = binding.reg;
-            let idx = next_idx;
-            next_idx = next_idx.saturating_add(1);
-            Some(quote! { (#reg, #idx) })
-        }
-        BindingKind::Ref | BindingKind::Float => None,
+    bindings
+        .iter()
+        .filter_map(|binding| match binding.kind {
+            BindingKind::Int => {
+                let reg = binding.reg;
+                let idx = next_idx;
+                next_idx = next_idx.saturating_add(1);
+                Some((reg, idx))
+            }
+            BindingKind::Ref | BindingKind::Float => None,
+        })
+        .collect()
+}
+
+/// Plain `[int]` ptr then len identity slots as `(parent, callee)` pairs.
+///
+/// `MIFrame.setup_call` / `fill_registers` and `bhimpl_inline_call_ir_v`
+/// give the callee only the declared argument boxes. `getarrayitem_raw_i`
+/// reads the ptr register of the current JitCode frame, so that register
+/// must be a declared int argument. Callee register equals the identity
+/// slot the sub-JitCode already reserves (`split_identity_reg_ends`).
+pub(super) fn plain_array_identity_int_pairs(config: Option<&LowererConfig>) -> Vec<(u16, u16)> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    if config.state_arrays.is_empty() {
+        return Vec::new();
+    }
+    let int_base = config.int_identity_base();
+    let mut offset = config.plain_int_scalar_count();
+    let mut pairs = Vec::new();
+    for _ in config.state_array_names_in_order() {
+        let ptr = int_base.saturating_add(offset);
+        pairs.push((ptr, ptr));
+        offset = offset.saturating_add(1);
+        let len = int_base.saturating_add(offset);
+        pairs.push((len, len));
+        offset = offset.saturating_add(1);
+    }
+    pairs
+}
+
+/// `inline_call_grouped` requires a positional I-list (`callee_dst == index`).
+/// Array identity slots sit at `int_identity_base + scalar_count + 2*k`, so
+/// holes below them are filled with `(k, k)`. Those registers are the packed
+/// caller-local prefix or the scalar identity slots, not extra caller-locals
+/// (`assert_no_split_identity_alias`).
+pub(super) fn extend_int_args_with_array_identity(
+    existing: Vec<(u16, u16)>,
+    identity: &[(u16, u16)],
+) -> Vec<(u16, u16)> {
+    if identity.is_empty() {
+        return existing;
+    }
+    let max_callee = existing
+        .iter()
+        .map(|&(_, callee)| callee)
+        .chain(identity.iter().map(|&(_, callee)| callee))
+        .max()
+        .unwrap_or(0);
+    let mut parent_at: Vec<Option<u16>> = vec![None; max_callee as usize + 1];
+    for (parent, callee) in existing {
+        parent_at[callee as usize] = Some(parent);
+    }
+    for &(parent, callee) in identity {
+        parent_at[callee as usize] = Some(parent);
+    }
+    parent_at
+        .into_iter()
+        .enumerate()
+        .map(|(i, parent)| (parent.unwrap_or(i as u16), i as u16))
+        .collect()
+}
+
+pub(super) fn quote_inline_arg_pairs(pairs: &[(u16, u16)]) -> TokenStream {
+    let args = pairs.iter().map(|&(parent, callee)| {
+        quote! { (#parent as u16, #callee as u16) }
     });
     quote! { &[#(#args),*] }
+}
+
+/// Caller registers an inline_call reads, including plain `[int]` identity
+/// slots passed as declared int arguments.
+pub(super) fn inline_call_read_regs(
+    bindings: &[Binding],
+    identity_int_pairs: &[(u16, u16)],
+) -> Vec<Register> {
+    let mut regs: Vec<Register> = bindings.iter().map(Register::from_binding).collect();
+    for &(parent, _) in identity_int_pairs {
+        let reg = Register::int(parent);
+        if !regs.contains(&reg) {
+            regs.push(reg);
+        }
+    }
+    regs
 }
 
 pub(super) fn inline_ref_arg_tokens(bindings: &[Binding]) -> TokenStream {
@@ -229,16 +314,21 @@ pub(super) fn inline_float_arg_tokens(bindings: &[Binding]) -> TokenStream {
 /// `BC_INLINE_CALL` and the trailing `BC_LIVE` marker as two distinct
 /// `OpMeta` entries (RPython `jtransform.py:480-481` emits inline_call
 /// followed by `-live-`).
+///
+/// `identity_int_pairs` are `(slot, slot)` for each plain `[int]` ptr/len.
+/// `MIFrame.setup_call` plants only declared arguments; a callee
+/// `getarrayitem_raw_i` reads the current frame's ptr register.
 pub(super) fn inline_call_tokens(
     bindings: &[Binding],
     result_reg: u16,
+    identity_int_pairs: &[(u16, u16)],
 ) -> (TokenStream, TokenStream) {
-    let args_i = inline_int_arg_tokens(bindings);
+    let args_i_pairs =
+        extend_int_args_with_array_identity(inline_int_arg_pairs(bindings), identity_int_pairs);
+    let args_i = quote_inline_arg_pairs(&args_i_pairs);
     let args_r = inline_ref_arg_tokens(bindings);
     let args_f = inline_float_arg_tokens(bindings);
-    let has_int_args = bindings
-        .iter()
-        .any(|binding| matches!(binding.kind, BindingKind::Int));
+    let has_int_args = !args_i_pairs.is_empty();
     let has_float_args = bindings
         .iter()
         .any(|binding| matches!(binding.kind, BindingKind::Float));
@@ -331,13 +421,16 @@ pub(super) fn inline_call_tokens(
     (call_match, post_live)
 }
 
-pub(super) fn inline_call_tokens_void(bindings: &[Binding]) -> (TokenStream, TokenStream) {
-    let args_i = inline_int_arg_tokens(bindings);
+pub(super) fn inline_call_tokens_void(
+    bindings: &[Binding],
+    identity_int_pairs: &[(u16, u16)],
+) -> (TokenStream, TokenStream) {
+    let args_i_pairs =
+        extend_int_args_with_array_identity(inline_int_arg_pairs(bindings), identity_int_pairs);
+    let args_i = quote_inline_arg_pairs(&args_i_pairs);
     let args_r = inline_ref_arg_tokens(bindings);
     let args_f = inline_float_arg_tokens(bindings);
-    let has_int_args = bindings
-        .iter()
-        .any(|binding| matches!(binding.kind, BindingKind::Int));
+    let has_int_args = !args_i_pairs.is_empty();
     let has_float_args = bindings
         .iter()
         .any(|binding| matches!(binding.kind, BindingKind::Float));

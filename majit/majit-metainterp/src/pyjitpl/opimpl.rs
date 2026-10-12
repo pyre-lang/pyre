@@ -27,8 +27,6 @@ where
             Self::opimpl_load_state_field_float;
         table[jitcode::insns::BC_STORE_STATE_FIELD_FLOAT as usize] =
             Self::opimpl_store_state_field_float;
-        table[jitcode::insns::BC_LOAD_STATE_ARRAY as usize] = Self::opimpl_load_state_array;
-        table[jitcode::insns::BC_STORE_STATE_ARRAY as usize] = Self::opimpl_store_state_array;
         table[jitcode::insns::BC_GETFIELD_VABLE_I as usize] = Self::opimpl_getfield_vable_i;
         table[jitcode::insns::BC_GETFIELD_VABLE_R as usize] = Self::opimpl_getfield_vable_r;
         table[jitcode::insns::BC_GETFIELD_VABLE_F as usize] = Self::opimpl_getfield_vable_f;
@@ -409,52 +407,6 @@ where
             .float_scalar_slot(field_idx)
             .expect("float state field has no identity slot");
         self.set_float_identity_slot(ctx, slot, Some(opref), Some(value));
-        TraceAction::Continue
-    }
-
-    #[inline(never)]
-    #[allow(unused_variables)]
-    fn opimpl_load_state_array(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        _runtime: &R,
-        bytecode: u8,
-    ) -> TraceAction {
-        let array_idx = self.frames.current_mut().next_u16() as usize;
-        let index_reg = self.frames.current_mut().next_reg() as usize;
-        let dest = self.frames.current_mut().next_reg() as usize;
-        let (_, index_concrete) = self.read_int_reg(ctx, index_reg);
-        let elem_idx = index_concrete as usize;
-        let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) else {
-            return TraceAction::Abort;
-        };
-        let (opref, value) = self.read_int_identity_slot(ctx, slot);
-        self.set_int_reg(ctx, dest, Some(opref), Some(value));
-        TraceAction::Continue
-    }
-
-    #[inline(never)]
-    #[allow(unused_variables)]
-    fn opimpl_store_state_array(
-        &mut self,
-        ctx: &mut TraceCtx,
-        sym: &mut S,
-        _runtime: &R,
-        bytecode: u8,
-    ) -> TraceAction {
-        let array_idx = self.frames.current_mut().next_u16() as usize;
-        let index_reg = self.frames.current_mut().next_reg() as usize;
-        let src = self.frames.current_mut().next_reg() as usize;
-        let (_, index_concrete) = self.read_int_reg(ctx, index_reg);
-        let elem_idx = index_concrete as usize;
-        let (opref, value) = self.read_int_reg(ctx, src);
-        // `handler_store_state_array_dii` writes
-        // `registers_i[StateFieldLayout::array_elem_slot]`.
-        let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) else {
-            return TraceAction::Abort;
-        };
-        self.set_int_identity_slot(ctx, slot, Some(opref), Some(value));
         TraceAction::Continue
     }
 

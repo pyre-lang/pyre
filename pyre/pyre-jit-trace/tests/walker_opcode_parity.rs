@@ -237,11 +237,9 @@ fn pyre_walker_keys(root: &Path) -> BTreeSet<String> {
 const MAJIT_ONLY: &[&str] = &[
     // The `#[jit_interp]` state-machine accessors. A machine declares its own
     // `state = T`; a Python portal jitcode declares none.
-    "load_state_array/dii",
     "load_state_field/di",
     "load_state_field_float/df",
     "load_state_field_ref/dr",
-    "store_state_array/dii",
     "store_state_field/di",
     "store_state_field_float/df",
     "store_state_field_ref/dr",

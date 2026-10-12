@@ -342,11 +342,14 @@ pub enum StateFieldKind {
         /// `int(<path>)` syntax.
         rust_type: Option<syn::Path>,
     },
-    /// Array value (e.g., `regs: [int]`) — flattened into inputargs.
+    /// Array value (e.g., `regs: [int]`) — items-pointer then length.
+    /// `rlist.py` `rtype_getitem` uses `dum_nocheck` for a plain `l[i]`;
+    /// `ll_getitem_nonneg`'s only check is `ll_assert`, which translation
+    /// removes. `jtransform.py` `rewrite_op_getarrayitem` raw arm
+    /// (`ARRAY._gckind == 'raw'`) emits `getarrayitem_raw_<kind>`.
     Array(Ident),
-    /// Virtualizable array (e.g., `tape: [int; virt]`) — NOT flattened.
-    /// Only the data pointer and length are tracked as inputargs.
-    /// Element access emits GETARRAYITEM_RAW_I / SETARRAYITEM_RAW IR ops.
+    /// Virtualizable array (e.g., `tape: [int; virt]`) — one vable red.
+    /// Cells live in `virtualizable_boxes` (`getarrayitem_vable_*`).
     VirtArray(Ident),
     /// Opaque pass-through (e.g., `storage: opaque(Storage)`) — the field
     /// keeps its declared type on the state struct but is NOT enumerated
@@ -5251,7 +5254,7 @@ mod tests {
     /// declared, brackets included.
     ///
     /// `parse_state_fields` accepts `[<ident>]` for any element type and
-    /// `codegen_state` is where the int-only restriction on flattened arrays
+    /// `codegen_state` is where the int-only restriction on plain arrays
     /// lives, so `[float]` is refused there. Rendering the element type alone
     /// printed `regs: float` — the scalar spelling the same message lists as
     /// supported — so the reader was told their declaration was both
@@ -5290,7 +5293,7 @@ mod tests {
         let flat_float = expand(quote! { acc: int, regs: [float] });
         assert!(
             flat_float.contains("compile_error"),
-            "a flattened `[float]` array has no lowering and must be refused:\n\
+            "a plain `[float]` array has no lowering and must be refused:\n\
              {flat_float}"
         );
         assert!(
@@ -5306,7 +5309,7 @@ mod tests {
         let flat_int = expand(quote! { acc: int, regs: [int] });
         assert!(
             !flat_int.contains("compile_error"),
-            "`[int]` is the supported flattened array:\n{flat_int}"
+            "`[int]` is the supported plain array:\n{flat_int}"
         );
     }
 

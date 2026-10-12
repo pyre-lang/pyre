@@ -3237,10 +3237,10 @@ impl BlackholeInterpBuilder {
         interp.virtualizable_stack_base = 0;
         interp.last_live_pc = usize::MAX;
         // Same footing: the layout describes the register file of the machine
-        // this run resumed, so it must not outlive it.  A stale one does not
-        // fail loudly — `StateFieldLayout::default()` is all-zero and the
-        // `scalar_slot`/`array_elem_slot` range checks are `debug_assert!`, so
-        // a release build reads whatever slot the arithmetic lands on.
+        // this run resumed, so it must not outlive it.  A stale one trips the
+        // `assert!` range checks in `scalar_slot`/`array_identity_slots`, or,
+        // when a field index happens to be in range, names the previous
+        // machine's slots. Reset it so the next user does not inherit it.
         interp.state_field_layout = StateFieldLayout::default();
         // `record_caught_exception` is a callback the resume path installs on
         // every frame of a chain (`call_jit.rs`), and the chain goes back into
@@ -3910,7 +3910,7 @@ mod tests {
     #[test]
     fn state_field_layout_scalar_slots_are_identity() {
         // No arrays, base 0: scalars fill `[0..num_scalars]`, slot == field_idx.
-        let layout = StateFieldLayout::new(4, vec![], 0, 0);
+        let layout = StateFieldLayout::new(4, 0, 0, 0);
         assert_eq!(layout.total_slots(), 4);
         for i in 0..4 {
             assert_eq!(layout.scalar_slot(i), i);
@@ -3920,49 +3920,36 @@ mod tests {
     #[test]
     fn state_field_layout_int_scalar_base_offsets_slots() {
         // int_scalar_base shifts every int identity slot past the dispatch
-        // JitCode's int arguments (pc at i0): scalars at i1..i3, the array
-        // right after.
-        let layout = StateFieldLayout::new(2, vec![3], 0, 1);
-        assert_eq!(layout.total_slots(), 2 + 3);
+        // JitCode's int arguments (pc at i0): scalars at i1..=i2, then ptr
+        // then len of one plain `[int]`.
+        let layout = StateFieldLayout::new(2, 1, 0, 1);
+        assert_eq!(layout.total_slots(), 2 + 2);
         assert_eq!(layout.scalar_slot(0), 1);
         assert_eq!(layout.scalar_slot(1), 2);
-        assert_eq!(layout.array_elem_slot(0, 0), 3);
-        assert_eq!(layout.array_elem_slot(0, 2), 5);
+        assert_eq!(layout.array_identity_slots(0), (3, 4));
     }
 
     #[test]
-    fn state_field_layout_one_scalar_then_one_fixed_array() {
-        // One `int` scalar (slot 0) followed by one fixed array of 8 cells.
-        //
-        // Deliberately synthetic, and deliberately unattributed: the layout is
-        // built from counts, so this test never reads any crate's declaration
-        // and cannot notice one changing. Naming a crate here would assert a
-        // shape nothing derives — the previous name and comment claimed this
-        // was tlr's `a: int` + `regs: [int]`, while tlr declares
-        // `regs: [int; virt]`, a different `StateFieldKind` on a different
-        // code path. That false attribution outlived the shape it described
-        // and was read as evidence that fixed arrays are common in the corpus;
-        // they are not, and no example crate declares one.
-        let layout = StateFieldLayout::new(1, vec![8], 0, 0);
-        assert_eq!(layout.total_slots(), 1 + 8);
+    fn state_field_layout_one_scalar_then_one_plain_int_array() {
+        // One `int` scalar (slot 0) followed by one plain `[int]` as ptr
+        // then len.
+        let layout = StateFieldLayout::new(1, 1, 0, 0);
+        assert_eq!(layout.total_slots(), 1 + 2);
+        assert_eq!(layout.num_plain_int_arrays, 1);
         assert_eq!(layout.scalar_slot(0), 0);
-        // The array's 8 cells occupy slots 1..9.
-        assert_eq!(layout.array_elem_slot(0, 0), 1);
-        assert_eq!(layout.array_elem_slot(0, 7), 8);
+        assert_eq!(layout.array_identity_slots(0), (1, 2));
     }
 
     #[test]
     fn state_field_layout_total_matches_live_slots_helper() {
         // The struct's total must equal the canonical liveness slot count.
-        for &(s, ref a, v) in &[
-            (1usize, vec![], 1usize),
-            (1, vec![8], 0),
-            (2, vec![3, 5], 2),
-            (0, vec![], 0),
-        ] {
-            let layout = StateFieldLayout::new(s, a.clone(), v, 0);
+        // `live_slots_for_state_field_jit` still takes ptr then len baked
+        // into its `num_scalars` argument with empty `array_lens`.
+        for &(s, n_arrays, v) in &[(1usize, 0usize, 1usize), (1, 1, 0), (2, 2, 2), (0, 0, 0)] {
+            let layout = StateFieldLayout::new(s, n_arrays, v, 0);
+            let int_identity = s + 2 * n_arrays;
             let (live_i, live_r, live_f) =
-                crate::live_slots_for_state_field_jit(s, a, v, 0, 0, 0, 0, 0);
+                crate::live_slots_for_state_field_jit(int_identity, &[], v, 0, 0, 0, 0, 0);
             assert_eq!(layout.total_slots(), live_i.len());
             assert!(live_r.is_empty() && live_f.is_empty());
         }
@@ -3977,7 +3964,7 @@ mod tests {
         // total_live_values() = total_slots() + num_ref_scalars. The
         // trace-start / run-compiled gate compares the flat extract_live count
         // against total_live_values(), not total_slots().
-        let layout = StateFieldLayout::with_ref_scalars(3, vec![], 0, 1, 1, 0);
+        let layout = StateFieldLayout::with_ref_scalars(3, 0, 0, 1, 1, 0);
         assert_eq!(layout.total_slots(), 3);
         assert_eq!(layout.total_live_values(), 4);
         assert_eq!(layout.ref_scalar_slot(0), 1);
@@ -3996,7 +3983,7 @@ mod tests {
         // Two scalars: slot 0, slot 1. load_state_field copies a scalar slot
         // into a working register; store_state_field copies back.
         let mut bh = BlackholeInterpreter::default();
-        bh.state_field_layout = StateFieldLayout::new(2, vec![], 0, 0);
+        bh.state_field_layout = StateFieldLayout::new(2, 0, 0, 0);
         bh.registers_i = vec![10, 20, 0, 0];
 
         // load_state_field/di: field_idx=1 (u16 LE) → dest reg 2.
@@ -4018,7 +4005,7 @@ mod tests {
         // working ref register; store_state_field_ref copies back. Raw
         // pointer bits round-trip.
         let mut bh = BlackholeInterpreter::default();
-        bh.state_field_layout = StateFieldLayout::with_ref_scalars(0, vec![], 0, 2, 1, 0);
+        bh.state_field_layout = StateFieldLayout::with_ref_scalars(0, 0, 0, 2, 1, 0);
         bh.registers_r = vec![0x9999, 0xAAAA, 0xBBBB, 0, 0];
 
         // load_state_field_ref/dr: field_idx=1 (u16 LE) → dest ref reg 3.
@@ -4036,29 +4023,6 @@ mod tests {
 
         // The int bank is untouched by the ref handlers.
         assert!(bh.registers_i.is_empty() || bh.registers_i.iter().all(|&v| v == 0));
-    }
-
-    #[test]
-    fn handler_state_array_indexes_flattened_slots() {
-        // 1 scalar (slot 0) + 1 fixed array of len 4 (slots 1..5).
-        let mut bh = BlackholeInterpreter::default();
-        bh.state_field_layout = StateFieldLayout::new(1, vec![4], 0, 0);
-        // [scalar, a0, a1, a2, a3, idx_reg, dest_reg]
-        bh.registers_i = vec![0, 100, 101, 102, 103, 0, 0];
-
-        // load_state_array/dii: array_idx=0, index_reg=5 (holds 2), dest=6.
-        bh.registers_i[5] = 2;
-        let next = handler_load_state_array_dii(&mut bh, &[0, 0, 5, 6], 0).unwrap();
-        assert_eq!(next, 4);
-        // slot of (array 0, elem 2) = 1 + 2 = 3 → value 102.
-        assert_eq!(bh.registers_i[6], 102);
-
-        // store_state_array/dii: write reg 6 into array elem 0 (slot 1).
-        bh.registers_i[5] = 0;
-        bh.registers_i[6] = 555;
-        let next = handler_store_state_array_dii(&mut bh, &[0, 0, 5, 6], 0).unwrap();
-        assert_eq!(next, 4);
-        assert_eq!(bh.registers_i[1], 555);
     }
 
     // ── Executor opcode tests (bhimpl_* runtime coverage) ──
@@ -6210,18 +6174,17 @@ mod tests {
 
         /// `state_field_layout` describes the register file of the machine one
         /// resume belongs to, so it must not survive into the pool.  The
-        /// range checks in `scalar_slot`/`ref_scalar_slot`/`array_elem_slot`
-        /// are `debug_assert!`, so a release build given the all-zero default
-        /// silently returns `0 + field_idx` — aliasing the dispatch JitCode's
-        /// own argument registers rather than the identity slots
-        /// `ref_scalar_base` exists to keep clear of them.
+        /// `assert!` range checks in `scalar_slot`/`ref_scalar_slot`/
+        /// `array_identity_slots` fire on a stale or all-zero layout, or, when
+        /// a field index happens to be in range, the slot named is the previous
+        /// machine's — not the identity slots `ref_scalar_base` keeps clear of
+        /// the dispatch JitCode's argument registers.
         #[test]
         fn released_interp_does_not_leak_its_state_field_layout_to_the_next_user() {
             let mut builder =
                 super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
             let mut bh = builder.acquire_interp();
-            bh.state_field_layout =
-                super::StateFieldLayout::with_ref_scalars(1, vec![4], 0, 2, 8, 0);
+            bh.state_field_layout = super::StateFieldLayout::with_ref_scalars(1, 0, 0, 2, 8, 0);
             assert_eq!(bh.state_field_layout.ref_scalar_slot(0), 8);
 
             builder.release_interp(bh);
@@ -7718,7 +7681,7 @@ fn handler_abort_result_marker_i(
 ///
 /// Mirrors `live_slots_for_state_field_jit` (`jitcode/assembler.rs`): the
 /// blackhole int register file holds, in flat order,
-/// `[scalars 0..num_scalars | flattened fixed-array elements |
+/// `[scalars 0..num_scalars | ptr then len per plain [int] |
 /// the virtualizable identity]`, seeded by the resume reader via `setarg_i`
 /// (`resume.rs _prepare_next_section` → `blackhole.py setarg_i`).
 ///
@@ -7726,20 +7689,24 @@ fn handler_abort_result_marker_i(
 /// (scalar `field_idx`, array/varray `array_idx`) rather than a flat register
 /// slot. RPython's codewriter assigns register indices directly, so this
 /// mapping is the majit-port adaptation recovering the flat slot a handler
-/// must read/write. `array_lens` are per-instance (a fixed `[int]` array's
-/// length comes from the live state, e.g. tlr's `regs`); the virtualizable,
+/// must read/write. Each plain `[int]` owns two int identity slots immediately
+/// after the scalars (`jtransform.py` `rewrite_op_getarrayitem` raw arm: the
+/// Vec / slice element buffer is a raw `{ptr, len}` view). The virtualizable,
 /// when the state has one, contributes exactly ONE slot — its identity —
-/// however many `[.. ; virt]` arrays it declares. `virtualizable.py:150-153`
-/// reads each array's length off the live object, so a length is never a box,
-/// and `virtualizable.py load_list_of_boxes` names the virtualizable once.
+/// however many `[.. ; virt]` arrays it declares. `virtualizable.py`
+/// `get_array_length` reads each array's length off the live object, so a
+/// length is never a box, and `virtualizable.py` `load_list_of_boxes` names
+/// the virtualizable once.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateFieldLayout {
     pub num_scalars: usize,
-    pub array_lens: Vec<usize>,
+    /// Count of plain `[int]` arrays. Each owns two int identity slots
+    /// (items pointer then length) right after the scalar prefix.
+    pub num_plain_int_arrays: usize,
     /// `1` when the state declares any `[.. ; virt]` array (or an explicit
-    /// virtualizable), else `0`. `pyjitpl.py:2984-2989` carries the
-    /// virtualizable exactly once — it is one red, `warmspot.py:538
-    /// jd.index_of_virtualizable = jitdriver.reds.index(vname)` — so this is
+    /// virtualizable), else `0`. `pyjitpl.py` `reached_loop_header` carries the
+    /// virtualizable exactly once — it is one red, `warmspot.py`
+    /// `jd.index_of_virtualizable = jitdriver.reds.index(vname)` — so this is
     /// a presence flag, not a per-array count.
     pub num_vable_identity_slots: usize,
     /// Ref-typed scalar state fields. They live in the SEPARATE ref
@@ -7773,13 +7740,13 @@ pub struct StateFieldLayout {
 impl StateFieldLayout {
     pub fn new(
         num_scalars: usize,
-        array_lens: Vec<usize>,
+        num_plain_int_arrays: usize,
         num_vable_identity_slots: usize,
         int_scalar_base: usize,
     ) -> Self {
         Self {
             num_scalars,
-            array_lens,
+            num_plain_int_arrays,
             num_vable_identity_slots,
             num_ref_scalars: 0,
             ref_scalar_base: 0,
@@ -7793,7 +7760,7 @@ impl StateFieldLayout {
     /// starting at `ref_scalar_base`.
     pub fn with_ref_scalars(
         num_scalars: usize,
-        array_lens: Vec<usize>,
+        num_plain_int_arrays: usize,
         num_vable_identity_slots: usize,
         num_ref_scalars: usize,
         ref_scalar_base: usize,
@@ -7801,7 +7768,7 @@ impl StateFieldLayout {
     ) -> Self {
         Self {
             num_scalars,
-            array_lens,
+            num_plain_int_arrays,
             num_vable_identity_slots,
             num_ref_scalars,
             ref_scalar_base,
@@ -7824,11 +7791,11 @@ impl StateFieldLayout {
         self
     }
 
-    /// Total int register slots — equals the `live_slots_for_state_field_jit`
-    /// int-bank count `num_scalars + Σ array_lens`. The vable identity is a
-    /// Ref, not an int slot.
+    /// Total int identity slots: the real scalar count plus two words
+    /// (ptr then len) per plain `[int]`. The vable identity is a Ref, not
+    /// an int slot.
     pub fn total_slots(&self) -> usize {
-        self.num_scalars + self.array_lens.iter().sum::<usize>()
+        self.num_scalars + 2 * self.num_plain_int_arrays
     }
 
     /// Total live values `extract_live_values` produces: the int register
@@ -7889,25 +7856,17 @@ impl StateFieldLayout {
         self.float_scalar_base + field_idx
     }
 
-    /// First flat slot of fixed array `array_idx`.
-    fn array_base(&self, array_idx: usize) -> usize {
-        self.int_scalar_base + self.num_scalars + self.array_lens[..array_idx].iter().sum::<usize>()
-    }
-
-    /// Flat slot of element `elem` in fixed array `array_idx`.
-    pub fn array_elem_slot(&self, array_idx: usize, elem: usize) -> usize {
+    /// Int-bank slots of plain `[int]` array `k`: items pointer then length.
+    pub fn array_identity_slots(&self, k: usize) -> (usize, usize) {
         assert!(
-            array_idx < self.array_lens.len(),
-            "array_idx {array_idx} out of range (num_arrays={}); see \
-             `scalar_slot`",
-            self.array_lens.len()
+            k < self.num_plain_int_arrays,
+            "plain [int] array {k} out of range (num_plain_int_arrays={}); \
+             an empty layout here means the frame was never given the \
+             machine's `state_field_layout`",
+            self.num_plain_int_arrays
         );
-        assert!(
-            elem < self.array_lens[array_idx],
-            "array elem {elem} out of range (len={})",
-            self.array_lens[array_idx]
-        );
-        self.array_base(array_idx) + elem
+        let ptr = self.int_scalar_base + self.num_scalars + 2 * k;
+        (ptr, ptr + 1)
     }
 
     /// Ref-bank register of the virtualizable identity, the portal ref
@@ -8091,43 +8050,6 @@ fn handler_store_state_field_float_df(
     let value = bh.registers_f[src];
     portal_registers_f_mut(bh)[slot] = value;
     Ok(position + 3)
-}
-
-/// `load_state_array/dii` — `registers_i[dest] =
-/// registers_i[slot(array_idx, registers_i[index_reg])]`.  Flattened fixed
-/// array element lives in its own register slot.
-/// Encoding: 1× u16 `array_idx` + 1× u8 index register + 1× u8 dest = 4 bytes.
-fn handler_load_state_array_dii(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let array_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    let index_reg = code[position + 2] as usize;
-    let dest = code[position + 3] as usize;
-    let elem = bh.registers_i[index_reg] as usize;
-    let slot = bh.state_field_layout.array_elem_slot(array_idx, elem);
-    let value = portal_registers_i(bh)[slot];
-    bh.registers_i[dest] = value;
-    Ok(position + 4)
-}
-
-/// `store_state_array/dii` — `registers_i[slot(array_idx,
-/// registers_i[index_reg])] = registers_i[src]`.
-/// Encoding: 1× u16 `array_idx` + 1× u8 index register + 1× u8 src = 4 bytes.
-fn handler_store_state_array_dii(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let array_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-    let index_reg = code[position + 2] as usize;
-    let src = code[position + 3] as usize;
-    let elem = bh.registers_i[index_reg] as usize;
-    let slot = bh.state_field_layout.array_elem_slot(array_idx, elem);
-    let value = bh.registers_i[src];
-    portal_registers_i_mut(bh)[slot] = value;
-    Ok(position + 4)
 }
 
 /// Handler for `jit_merge_point/iIRFIRF` — `BC_JIT_MERGE_POINT`.
@@ -10958,14 +10880,6 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             "store_state_field_float/df",
             majit_jitcode::insns::BC_STORE_STATE_FIELD_FLOAT,
         ),
-        (
-            "load_state_array/dii",
-            majit_jitcode::insns::BC_LOAD_STATE_ARRAY,
-        ),
-        (
-            "store_state_array/dii",
-            majit_jitcode::insns::BC_STORE_STATE_ARRAY,
-        ),
         // A3 epic: push/pop family migrated to canonical 1-byte register
         // encoding; handlers wired in `wire_bhimpl_handlers` decode via
         // `code[position]` (`bhhandler_push_*` / `bhhandler_pop_*`).
@@ -11349,6 +11263,13 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         "getarrayitem_gc_i/rid>i".to_string(),
         majit_jitcode::insns::BC_GETARRAYITEM_GC_I,
     );
+    // `blackhole.py` `bhimpl_getarrayitem_raw_i`: int-bank sibling of
+    // `getarrayitem_gc_i/rid>i`. Canonical `BC_GETARRAYITEM_RAW_I`;
+    // `wire_handler` is a no-op until the key is in this map.
+    insns.insert(
+        "getarrayitem_raw_i/iid>i".to_string(),
+        majit_jitcode::insns::BC_GETARRAYITEM_RAW_I,
+    );
     insns.insert(
         "getarrayitem_gc_r/rid>r".to_string(),
         majit_jitcode::insns::BC_GETARRAYITEM_GC_R_RID,
@@ -11642,8 +11563,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         "store_state_field_float/df",
         handler_store_state_field_float_df,
     );
-    builder.wire_handler("load_state_array/dii", handler_load_state_array_dii);
-    builder.wire_handler("store_state_array/dii", handler_store_state_array_dii);
 
     // jit_merge_point + abort_permanent — bodies live on
     // `BlackholeInterpreter::bhimpl_jit_merge_point` / `bhimpl_abort_permanent`
@@ -13829,8 +13748,10 @@ fn reject_unresolved_inline_call(
 ///
 /// `blackhole.py` `bhimpl_inline_call_*` does not build a callee interpreter.
 /// `resume.py` `rebuild_from_resumedata` writes each live register through
-/// `consume_boxes`. The slots `load_state_field` reads are those registers
-/// when the parent already holds them.
+/// `consume_boxes`. The slots `load_state_field` / `store_state_field` address
+/// are those registers when the parent already holds them. A plain `[int]`
+/// ptr/len is a declared `inline_call_*` argument (`MIFrame.setup_call`,
+/// `bhimpl_inline_call_ir_v`), not an implicit copy.
 fn copy_identity_slots_from_parent(
     parent: &BlackholeInterpreter,
     callee: &mut BlackholeInterpreter,

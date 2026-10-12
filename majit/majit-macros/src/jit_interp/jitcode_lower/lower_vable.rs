@@ -992,8 +992,9 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes `state.array[index] = expr` for array state fields.
-    /// Virtualizable arrays bail to the standard vable path; flattened arrays
-    /// emit `store_state_array`.
+    /// Virtualizable arrays bail to the standard vable path. A store to a
+    /// plain `[int]` is refused at expansion (`validate_state_fields`);
+    /// a mutated loop-carried array is `[int; virt]`.
     pub(super) fn lower_state_array_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
         let assign = match expr {
@@ -1021,22 +1022,7 @@ impl<'c> Lowerer<'c> {
         if config.state_virt_arrays.contains_key(&member_name) {
             return None;
         }
-        let idx_binding = self.lower_value_expr(&index_expr.index)?;
-        let idx_reg = idx_binding.reg;
-        let val_binding = self.lower_value_expr(&assign.right)?;
-        let val_reg = val_binding.reg;
-
-        // store_state_array/dii — both reg args are Int per
-        // assembler.py:217 'i' argcode.
-        let idx_r = Register::int(idx_reg);
-        let val_r = Register::int(val_reg);
-        let &array_index = config.state_arrays.get(&member_name)?;
-        let ai = array_index as u16;
-        self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![idx_r, val_r], vec![]),
-            quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); },
-        );
-        Some(())
+        None
     }
 
     /// RPython jtransform.py `hint_force_virtualizable`.
@@ -2902,8 +2888,16 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes `state.array[index]` for array state fields.
-    /// Virtualizable arrays bail to the standard vable path; flattened arrays
-    /// emit `load_state_array`.
+    /// Virtualizable arrays bail to the standard vable path. A plain `[int]`
+    /// is ptr then len. `rlist.py` `rtype_getitem` uses `dum_checkidx`
+    /// (`raise IndexError`) only for `getitem_idx`, i.e. when the source has
+    /// an `except IndexError` handler around the read (`rtype_getitem_idx`).
+    /// A plain `l[i]` uses `dum_nocheck`. In that case `ll_getitem_nonneg`'s
+    /// only check is `ll_assert`, which translation removes, and the JIT
+    /// sees the bare `basegetitem` item read. A Rust slice index has no
+    /// handler: its panic is a debug assertion in that sense. majit-translate
+    /// already strips it the same way (`TermKind::Assert`, citing
+    /// `backendopt/removeassert.py`).
     pub(super) fn lower_state_array_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
         let index_expr = match expr {
@@ -2926,19 +2920,30 @@ impl<'c> Lowerer<'c> {
         if config.state_virt_arrays.contains_key(&member_name) {
             return None;
         }
+        let &array_index = config.state_arrays.get(&member_name)?;
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let reg = self.alloc_reg();
+        // Identity reds are the `{ptr, len}` pair; this op is the
+        // `dum_nocheck` item read off the pointer.
+        let base_reg = config
+            .int_identity_base()
+            .saturating_add(config.plain_int_scalar_count())
+            .saturating_add((array_index as u16).saturating_mul(2));
 
-        let &array_index = config.state_arrays.get(&member_name)?;
-        let ai = array_index as u16;
         self.emit_op(
             OpMeta::linear(
                 OpKind::StateField,
-                vec![Register::int(idx_reg)],
+                vec![Register::int(base_reg), Register::int(idx_reg)],
                 vec![Register::int(reg)],
             ),
-            quote! { __builder.load_state_array(#ai, #idx_reg, #reg); },
+            quote! {
+                let __descr_idx = __builder.add_raw_int_array_descr_signed(
+                    ::core::mem::size_of::<i64>(),
+                    true,
+                );
+                __builder.getarrayitem_raw_i(#reg, #base_reg, #idx_reg, __descr_idx);
+            },
         );
         Some(Binding {
             reg,
@@ -3406,6 +3411,59 @@ mod tests {
         assert!(
             tokens.contains("MIN") && tokens.contains("< 0"),
             "signedness is the element MIN, which is false for bool: {tokens}"
+        );
+    }
+
+    /// A plain `[int]` read is the bare `getarrayitem_raw_i` item read.
+    /// `rlist.py` `rtype_getitem` uses `dum_nocheck`; `ll_getitem_nonneg`'s
+    /// only check is `ll_assert`, which translation removes.
+    #[test]
+    fn plain_int_array_read_is_bare_getarrayitem_raw_i() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_arrays.insert("cells".into(), 0);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: Expr = syn::parse_quote!(state.cells[i]);
+        let binding = lowerer
+            .lower_state_array_read(&expr)
+            .expect("plain [int] read lowers");
+        assert_eq!(binding.kind, BindingKind::Int);
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("getarrayitem_raw_i"), "{emitted}");
+        assert!(
+            !emitted.contains("note_identity_slot_read"),
+            "ptr/len are declared inline-call arguments (`MIFrame.setup_call`), \
+             not an implicit identity-slot latch: {emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if")
+                && !emitted.contains("UintLt")
+                && !emitted.contains("int_lt"),
+            "plain [int] read must not emit a compare or guard: {emitted}"
+        );
+        assert!(
+            !lowerer.op_metadata.iter().any(|m| {
+                matches!(m.kind, OpKind::BinopI | OpKind::GotoIfNot)
+                    || matches!(m.control, ControlFlowClass::ConditionalGuard)
+            }),
+            "plain [int] read must not emit a compare or guard: {:?}",
+            lowerer
+                .op_metadata
+                .iter()
+                .map(|m| format!("{:?}", m.kind))
+                .collect::<Vec<_>>()
         );
     }
 }

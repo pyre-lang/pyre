@@ -39,24 +39,23 @@ mod reexports {
         binding_kind_for_inline_policy, binop_f_emit_tokens, binop_i_accepts_constant,
         binop_i_const_emit_tokens, binop_i_emit_tokens, binop_is_symmetric, block_has_loop_control,
         call_is_null_ptr, expr_has_loop_control, expr_is_literal_call, expr_is_null_ptr,
-        expr_is_ptr_is_null_method, expr_is_unsigned_int, extract_block_tail_int,
-        extract_bool_branch_values, extract_branch_int, extract_pat_switch_case_tokens,
-        extract_pat_value_tokens, extract_stmts, inline_call_tokens, inline_call_tokens_void,
-        inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
-        inline_ref_arg_tokens, inline_shared_path, int_arg_regs, int_literal_value,
-        is_lowercase_binding_pat, is_supported_float_type, is_supported_int_cast,
-        is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens, mirrored_compare_binop,
-        opcode_for_assign_binop, opcode_for_assign_binop_f, opcode_for_binop, opcode_for_binop_f,
-        opcode_for_compare_f, stmt_has_loop_control, type_is_raw_pointer, type_is_unsigned_int,
+        expr_is_ptr_is_null_method, expr_is_unsigned_int, extend_int_args_with_array_identity,
+        extract_block_tail_int, extract_bool_branch_values, extract_branch_int,
+        extract_pat_switch_case_tokens, extract_pat_value_tokens, extract_stmts,
+        inline_call_read_regs, inline_call_tokens, inline_call_tokens_void,
+        inline_float_arg_tokens, inline_prebuild_path, inline_ref_arg_tokens, inline_shared_path,
+        int_arg_regs, int_literal_value, is_lowercase_binding_pat, is_supported_float_type,
+        is_supported_int_cast, is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens,
+        mirrored_compare_binop, opcode_for_assign_binop, opcode_for_assign_binop_f,
+        opcode_for_binop, opcode_for_binop_f, opcode_for_compare_f, plain_array_identity_int_pairs,
+        quote_inline_arg_pairs, stmt_has_loop_control, type_is_raw_pointer, type_is_unsigned_int,
         typed_call_arg_tokens, word_result_addr_for_kind, word_result_addr_tokens,
         word_void_addr_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
-        liveness_prebuild_tokens, liveness_prebuild_tokens_ex, liveness_triple,
-        liveness_triple_from_reads, maybe_dump_liveness, remove_repeated_live,
-        rewrite_live_marker_statements_with_triples,
-        rewrite_live_marker_statements_with_triples_ex,
+        liveness_prebuild_tokens, liveness_triple, liveness_triple_from_reads, maybe_dump_liveness,
+        remove_repeated_live, rewrite_live_marker_statements_with_triples,
     };
     pub(super) use super::lowerer::Lowerer;
 }
@@ -165,7 +164,10 @@ pub struct LowererConfig {
     /// Scalar declarations: field_name → legacy state-slot index. Fields also
     /// present in `vable_fields` use that object's field index instead.
     pub(super) state_scalars: HashMap<String, usize>,
-    /// State field arrays (flattened): field_name → global_array_index.
+    /// Plain `[int]` state arrays: field_name → global_array_index.
+    /// Each is two identity slots: items pointer then length
+    /// (`rlist.py` `rtype_getitem` `dum_nocheck`; the Vec is a raw
+    /// `{ptr, len}` view).
     pub(super) state_arrays: HashMap<String, usize>,
     /// State field virtualizable arrays: field_name → (virt_array_index, item_type).
     /// These emit GETARRAYITEM_RAW_I/SETARRAYITEM_RAW instead of element-level tracking.
@@ -368,7 +370,8 @@ impl LowererConfig {
 
     /// Int scalars that keep an independent identity slot (not redirected
     /// onto the virtualizable). Dense `0..n` indices, so `max(index)+1`
-    /// is the slot count (`typed_array_parts` then places `[int]` cells).
+    /// is the slot count. Plain `[int]` arrays follow as ptr then len
+    /// (`identity_slot_registers`).
     pub(super) fn plain_int_scalar_count(&self) -> u16 {
         self.state_scalars
             .iter()
@@ -378,7 +381,7 @@ impl LowererConfig {
             .unwrap_or(0)
     }
 
-    /// Flattened `[int]` arrays in `state_arrays` index order.
+    /// Plain `[int]` arrays in `state_arrays` index order.
     pub(super) fn state_array_names_in_order(&self) -> Vec<&str> {
         let mut names: Vec<(&str, usize)> = self
             .state_arrays
@@ -387,6 +390,11 @@ impl LowererConfig {
             .collect();
         names.sort_by_key(|(_, idx)| *idx);
         names.into_iter().map(|(name, _)| name).collect()
+    }
+
+    /// Two INT identity slots per plain `[int]`: items pointer then length.
+    pub(super) fn plain_array_identity_slots(&self) -> u16 {
+        (self.state_arrays.len() as u16).saturating_mul(2)
     }
 
     /// Exclusive end of the int-bank and ref-bank identity-slot ranges
@@ -409,17 +417,16 @@ impl LowererConfig {
         // reserve registers the split arm never uses and can overflow
         // the 256-register JitCode ceiling.
         let int_scalars = self.plain_int_scalar_count();
-        // Flattened `[int]` cell count is Meta's runtime length
-        // (`typed_array_parts`). Pin a prefix per array so `alloc_reg`
-        // cannot land on a cell `handle_jit_marker__jit_merge_point`
-        // will list as a red. Live markers list only the runtime-length
-        // prefix of this range (`identity_slot_registers_with_array_lens`).
-        let array_reserve =
-            (self.state_arrays.len() as u16).saturating_mul(FLAT_INT_ARRAY_IDENTITY_RESERVE);
+        // A plain `[int]` is ptr then len (`jtransform.py`
+        // `rewrite_op_getarrayitem` raw arm: the Vec / slice element
+        // buffer is a raw `{ptr, len}` view).
+        // `warmspot.py` reds are a fixed name list, never one register
+        // per cell.
+        let array_slots = self.plain_array_identity_slots();
         let int_end = self
             .int_identity_base()
             .saturating_add(int_scalars)
-            .saturating_add(array_reserve)
+            .saturating_add(array_slots)
             .min(256);
         let ref_scalars = self
             .state_ref_scalars
@@ -445,35 +452,8 @@ impl LowererConfig {
     /// keeps a slot live; a working-register reuse of the same value does
     /// not, and the slot would drop from the parent snapshot.
     ///
-    /// Flattened `[int]` cells follow the int scalars (`typed_array_parts`).
-    /// Compile-time callers have no Meta length, so this lists the scalar
-    /// prefix; `identity_slot_registers_with_array_lens` adds the cells.
+    /// A plain `[int]` is ptr then len after the int scalars.
     pub(super) fn identity_slot_registers(&self) -> Vec<Register> {
-        self.identity_slot_registers_with_array_lens(&[])
-    }
-
-    /// Per-kind counts of the identity-slot reds `resolve_reds` appends
-    /// after the named portal reds (`identity_slot_registers`). Flattened
-    /// `[int]` cells join at JitCode-build from Meta lengths.
-    pub(super) fn identity_scalar_red_kind_counts(&self) -> (usize, usize, usize) {
-        let mut counts = (0usize, 0usize, 0usize);
-        for reg in self.identity_slot_registers() {
-            match reg.kind {
-                BindingKind::Int => counts.0 += 1,
-                BindingKind::Ref => counts.1 += 1,
-                BindingKind::Float => counts.2 += 1,
-            }
-        }
-        counts
-    }
-
-    /// `identity_slot_registers` plus flattened `[int]` cells whose lengths
-    /// are known (`Meta.{name}_len`, `handle_jit_marker__jit_merge_point` /
-    /// `make_three_lists`). Empty `array_lens` lists the scalar prefix only.
-    pub(super) fn identity_slot_registers_with_array_lens(
-        &self,
-        array_lens: &[usize],
-    ) -> Vec<Register> {
         let mut regs = Vec::new();
         let int_base = self.int_identity_base();
         let mut int_scalars: Vec<(usize, &str)> = self
@@ -486,15 +466,12 @@ impl LowererConfig {
         for (index, _) in &int_scalars {
             regs.push(Register::int(int_base + *index as u16));
         }
-        if !array_lens.is_empty() {
-            let mut offset = self.plain_int_scalar_count();
-            for (i, _) in self.state_array_names_in_order().iter().enumerate() {
-                let n = array_lens.get(i).copied().unwrap_or(0);
-                for k in 0..n {
-                    regs.push(Register::int(int_base + offset + k as u16));
-                }
-                offset = offset.saturating_add(n as u16);
-            }
+        let mut offset = self.plain_int_scalar_count();
+        for _ in self.state_array_names_in_order() {
+            regs.push(Register::int(int_base + offset));
+            offset = offset.saturating_add(1);
+            regs.push(Register::int(int_base + offset));
+            offset = offset.saturating_add(1);
         }
         let ref_base = self.ref_identity_base();
         let mut ref_scalars: Vec<(usize, &str)> = self
@@ -520,19 +497,21 @@ impl LowererConfig {
         }
         regs
     }
-}
 
-/// Slots pinned per flattened `[int]` array so `alloc_reg` stays past
-/// `cells[i]` when the runtime length is not visible at lowering.
-/// Live markers and `jit_merge_point` list only Meta's live prefix of
-/// that range (`handle_jit_marker__jit_merge_point`).
-///
-/// The runtime builders in `codegen_trace` refuse a Meta length that
-/// exceeds this prefix: `assembler.py` `emit_const` asserts
-/// `0 <= val < 256`, and the codewriter's regalloc has already assigned
-/// every red a register. Lowering here is fixed at proc-macro time, so a
-/// runtime layout that does not fit cannot be encoded.
-pub(crate) const FLAT_INT_ARRAY_IDENTITY_RESERVE: u16 = 16;
+    /// Per-kind counts of the identity-slot reds `resolve_reds` appends
+    /// after the named portal reds (`identity_slot_registers`).
+    pub(super) fn identity_scalar_red_kind_counts(&self) -> (usize, usize, usize) {
+        let mut counts = (0usize, 0usize, 0usize);
+        for reg in self.identity_slot_registers() {
+            match reg.kind {
+                BindingKind::Int => counts.0 += 1,
+                BindingKind::Ref => counts.1 += 1,
+                BindingKind::Float => counts.2 += 1,
+            }
+        }
+        counts
+    }
+}
 
 pub(super) const MAX_HELPER_CALL_ARITY: usize = 16;
 
@@ -2582,20 +2561,16 @@ mod tests {
     }
 
     #[test]
-    fn identity_slot_registers_list_flattened_int_cells() {
+    fn identity_slot_registers_list_plain_int_array_as_ptr_then_len() {
         let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
         config.state_arrays.insert("cells".into(), 0);
-        let mut regs = config.identity_slot_registers_with_array_lens(&[2]);
+        let mut regs = config.identity_slot_registers();
         regs.sort();
         let base = config.int_identity_base();
         assert_eq!(
             regs,
             vec![Register::int(base), Register::int(base + 1)],
-            "typed_array_parts cells occupy int_identity_base + plain_scalars + i"
-        );
-        assert!(
-            config.identity_slot_registers().is_empty(),
-            "compile-time form has no Meta length, so it lists no cells"
+            "a plain [int] is items-pointer then length after the int scalars"
         );
     }
 
@@ -3130,7 +3105,7 @@ mod tests {
     }
 
     fn inline_call_tokens_combined(bindings: &[Binding], result_reg: u16) -> String {
-        let (call_match, post_live) = inline_call_tokens(bindings, result_reg);
+        let (call_match, post_live) = inline_call_tokens(bindings, result_reg, &[]);
         format!("{} {}", call_match, post_live)
     }
 
@@ -3588,7 +3563,7 @@ mod tests {
 
     #[test]
     fn inline_call_tokens_emit_post_call_live_marker() {
-        let (_, post_live) = inline_call_tokens(&[binding(0, BindingKind::Ref)], 7);
+        let (_, post_live) = inline_call_tokens(&[binding(0, BindingKind::Ref)], 7, &[]);
         let post = post_live.to_string();
         assert!(
             post.contains("live_placeholder"),
