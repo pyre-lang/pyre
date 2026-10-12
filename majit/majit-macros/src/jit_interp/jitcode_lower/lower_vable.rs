@@ -992,14 +992,14 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes `state.array[index] = expr` for array state fields.
-    /// Virtualizable arrays bail to the standard vable path. A plain `[int]`
-    /// store is `setarrayitem_raw_i` off the ptr identity, the store
-    /// counterpart of [`Self::lower_state_array_read`]. `rlist.py`
-    /// `rtype_setitem` takes `dum_nocheck` when there is no IndexError
-    /// handler; majit-translate strips the bounds `Assert`
-    /// (`removeassert.py`). The store writes the native buffer in place
-    /// (`jtransform.py` `rewrite_op_setarrayitem` raw arm), so no writeback
-    /// is needed on exit or abort.
+    /// Virtualizable arrays bail to the standard vable path. A plain
+    /// `[int]`/`[float]` store is `setarrayitem_raw_i` / `setarrayitem_raw_f`
+    /// off the ptr identity, the store counterpart of
+    /// [`Self::lower_state_array_read`]. `rlist.py` `rtype_setitem` takes
+    /// `dum_nocheck` when there is no IndexError handler; majit-translate
+    /// strips the bounds `Assert` (`removeassert.py`). The store writes the
+    /// native buffer in place (`jtransform.py` `rewrite_op_setarrayitem`
+    /// raw arm), so no writeback is needed on exit or abort.
     pub(super) fn lower_state_array_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
         let assign = match expr {
@@ -1027,10 +1027,15 @@ impl<'c> Lowerer<'c> {
         if config.state_virt_arrays.contains_key(&member_name) {
             return None;
         }
-        let &array_index = config.state_arrays.get(&member_name)?;
+        let &(array_index, item_kind) = config.state_arrays.get(&member_name)?;
         // Assignment evaluates the RHS first, then the place (index).
         let value = self.lower_value_expr(&assign.right)?;
-        if !matches!(value.kind, BindingKind::Int) {
+        let value_kind = match item_kind {
+            ValueKind::Float => BindingKind::Float,
+            ValueKind::Int => BindingKind::Int,
+            ValueKind::Ref => return None,
+        };
+        if value.kind != value_kind {
             return None;
         }
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
@@ -1046,22 +1051,37 @@ impl<'c> Lowerer<'c> {
             .saturating_add(config.plain_int_scalar_count())
             .saturating_add((array_index as u16).saturating_mul(2));
 
+        let (value_register, descr, set_raw) = match item_kind {
+            ValueKind::Float => (
+                Register::float(value_reg),
+                quote! { __builder.add_raw_float_array_descr() },
+                format_ident!("setarrayitem_raw_f"),
+            ),
+            ValueKind::Int => (
+                Register::int(value_reg),
+                quote! {
+                    __builder.add_raw_int_array_descr_signed(
+                        ::core::mem::size_of::<i64>(),
+                        true,
+                    )
+                },
+                format_ident!("setarrayitem_raw_i"),
+            ),
+            ValueKind::Ref => return None,
+        };
         self.emit_op(
             OpMeta::linear(
                 OpKind::StateField,
                 vec![
                     Register::int(base_reg),
                     Register::int(idx_reg),
-                    Register::int(value_reg),
+                    value_register,
                 ],
                 vec![],
             ),
             quote! {
-                let __descr_idx = __builder.add_raw_int_array_descr_signed(
-                    ::core::mem::size_of::<i64>(),
-                    true,
-                );
-                __builder.setarrayitem_raw_i(#base_reg, #idx_reg, #value_reg, __descr_idx);
+                let __descr_idx = #descr;
+                __builder.#set_raw(#base_reg, #idx_reg, #value_reg, __descr_idx);
             },
         );
         Some(())
@@ -2930,16 +2950,18 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes `state.array[index]` for array state fields.
-    /// Virtualizable arrays bail to the standard vable path. A plain `[int]`
-    /// is ptr then len. `rlist.py` `rtype_getitem` uses `dum_checkidx`
-    /// (`raise IndexError`) only for `getitem_idx`, i.e. when the source has
-    /// an `except IndexError` handler around the read (`rtype_getitem_idx`).
-    /// A plain `l[i]` uses `dum_nocheck`. In that case `ll_getitem_nonneg`'s
-    /// only check is `ll_assert`, which translation removes, and the JIT
-    /// sees the bare `basegetitem` item read. A Rust slice index has no
-    /// handler: its panic is a debug assertion in that sense. majit-translate
-    /// already strips it the same way (`TermKind::Assert`, citing
-    /// `backendopt/removeassert.py`).
+    /// Virtualizable arrays bail to the standard vable path. A plain
+    /// `[int]`/`[float]` is ptr then len. `rlist.py` `rtype_getitem` uses
+    /// `dum_checkidx` (`raise IndexError`) only for `getitem_idx`, i.e. when
+    /// the source has an `except IndexError` handler around the read
+    /// (`rtype_getitem_idx`). A plain `l[i]` uses `dum_nocheck`. In that
+    /// case `ll_getitem_nonneg`'s only check is `ll_assert`, which
+    /// translation removes, and the JIT sees the bare `basegetitem` item
+    /// read. A Rust slice index has no handler: its panic is a debug
+    /// assertion in that sense. majit-translate already strips it the same
+    /// way (`TermKind::Assert`, citing `backendopt/removeassert.py`).
+    /// `jtransform.py` `rewrite_op_getarrayitem` emits
+    /// `getarrayitem_raw_<kind>` from `getkind(ARRAY.OF)`.
     pub(super) fn lower_state_array_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
         let index_expr = match expr {
@@ -2962,7 +2984,7 @@ impl<'c> Lowerer<'c> {
         if config.state_virt_arrays.contains_key(&member_name) {
             return None;
         }
-        let &array_index = config.state_arrays.get(&member_name)?;
+        let &(array_index, item_kind) = config.state_arrays.get(&member_name)?;
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let reg = self.alloc_reg();
@@ -2973,23 +2995,40 @@ impl<'c> Lowerer<'c> {
             .saturating_add(config.plain_int_scalar_count())
             .saturating_add((array_index as u16).saturating_mul(2));
 
+        let (dst, descr, get_raw, binding_kind) = match item_kind {
+            ValueKind::Float => (
+                Register::float(reg),
+                quote! { __builder.add_raw_float_array_descr() },
+                format_ident!("getarrayitem_raw_f"),
+                BindingKind::Float,
+            ),
+            ValueKind::Int => (
+                Register::int(reg),
+                quote! {
+                    __builder.add_raw_int_array_descr_signed(
+                        ::core::mem::size_of::<i64>(),
+                        true,
+                    )
+                },
+                format_ident!("getarrayitem_raw_i"),
+                BindingKind::Int,
+            ),
+            ValueKind::Ref => return None,
+        };
         self.emit_op(
             OpMeta::linear(
                 OpKind::StateField,
                 vec![Register::int(base_reg), Register::int(idx_reg)],
-                vec![Register::int(reg)],
+                vec![dst],
             ),
             quote! {
-                let __descr_idx = __builder.add_raw_int_array_descr_signed(
-                    ::core::mem::size_of::<i64>(),
-                    true,
-                );
-                __builder.getarrayitem_raw_i(#reg, #base_reg, #idx_reg, __descr_idx);
+                let __descr_idx = #descr;
+                __builder.#get_raw(#reg, #base_reg, #idx_reg, __descr_idx);
             },
         );
         Some(Binding {
             reg,
-            kind: BindingKind::Int,
+            kind: binding_kind,
             depends_on_stack: false,
             struct_type: None,
         })
@@ -3462,7 +3501,9 @@ mod tests {
     #[test]
     fn plain_int_array_read_is_bare_getarrayitem_raw_i() {
         let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
-        config.state_arrays.insert("cells".into(), 0);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Int));
         let mut lowerer = Lowerer::new(Some(&config));
         lowerer.bindings.insert(
             "i".to_string(),
@@ -3515,7 +3556,9 @@ mod tests {
     #[test]
     fn plain_int_array_write_is_bare_setarrayitem_raw_i() {
         let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
-        config.state_arrays.insert("cells".into(), 0);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Int));
         let mut lowerer = Lowerer::new(Some(&config));
         lowerer.bindings.insert(
             "i".to_string(),
@@ -3562,6 +3605,100 @@ mod tests {
                 .iter()
                 .map(|m| format!("{:?}", m.kind))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A plain `[float]` read is the bare `getarrayitem_raw_f` item read.
+    /// `jtransform.py` `rewrite_op_getarrayitem` selects the kind from
+    /// `getkind(ARRAY.OF)`.
+    #[test]
+    fn plain_float_array_read_is_bare_getarrayitem_raw_f() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Float));
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: Expr = syn::parse_quote!(state.cells[i]);
+        let binding = lowerer
+            .lower_state_array_read(&expr)
+            .expect("plain [float] read lowers");
+        assert_eq!(binding.kind, BindingKind::Float);
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("getarrayitem_raw_f"), "{emitted}");
+        assert!(emitted.contains("add_raw_float_array_descr"), "{emitted}");
+        assert!(
+            !emitted.contains("getarrayitem_raw_i"),
+            "float cells must not lower as int: {emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if")
+                && !emitted.contains("UintLt")
+                && !emitted.contains("int_lt"),
+            "plain [float] read must not emit a compare or guard: {emitted}"
+        );
+    }
+
+    /// A plain `[float]` store is the bare `setarrayitem_raw_f` item store.
+    /// `jtransform.py` `rewrite_op_setarrayitem` selects the kind from the
+    /// stored value's type.
+    #[test]
+    fn plain_float_array_write_is_bare_setarrayitem_raw_f() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Float));
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        lowerer.bindings.insert(
+            "v".to_string(),
+            Binding {
+                reg: 3,
+                kind: BindingKind::Float,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: Expr = syn::parse_quote!(state.cells[i] = v);
+        lowerer
+            .lower_state_array_write(&expr)
+            .expect("plain [float] store lowers");
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("setarrayitem_raw_f"), "{emitted}");
+        assert!(emitted.contains("add_raw_float_array_descr"), "{emitted}");
+        assert!(
+            !emitted.contains("setarrayitem_raw_i"),
+            "float cells must not lower as int: {emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if")
+                && !emitted.contains("UintLt")
+                && !emitted.contains("int_lt"),
+            "plain [float] store must not emit a compare or guard: {emitted}"
         );
     }
 }

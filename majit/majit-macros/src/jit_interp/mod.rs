@@ -342,7 +342,8 @@ pub enum StateFieldKind {
         /// `int(<path>)` syntax.
         rust_type: Option<syn::Path>,
     },
-    /// Array value (e.g., `regs: [int]`) — items-pointer then length.
+    /// Array value (e.g., `regs: [int]`, `cells: [float]`) — items-pointer
+    /// then length, two INT identity reds regardless of element kind.
     /// `rlist.py` `rtype_getitem` uses `dum_nocheck` for a plain `l[i]`;
     /// `ll_getitem_nonneg`'s only check is `ll_assert`, which translation
     /// removes. `jtransform.py` `rewrite_op_getarrayitem` raw arm
@@ -1355,7 +1356,7 @@ fn parse_expr_list(input: ParseStream) -> syn::Result<Vec<Expr>> {
 /// Parse virtualizable_fields = { var: IDENT, token_offset: PATH, fields: { ... }, arrays: { ... } }
 ///
 /// Parse `state_fields = { name: type, ... }` where type is `int`, `float`,
-/// `[int]`, `[int; virt]`, `[float; virt]`, or `opaque(TypePath)`.
+/// `[int]`, `[float]`, `[int; virt]`, `[float; virt]`, or `opaque(TypePath)`.
 fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
     let content;
     braced!(content in input);
@@ -5016,15 +5017,13 @@ mod tests {
         }
     }
 
-    /// An unsupported `state_fields` entry is reported the way it was
-    /// declared, brackets included.
+    /// A plain `[float]` expands the same way a plain `[int]` does.
+    /// `jtransform.py` `rewrite_op_getarrayitem` selects `getarrayitem_raw_f`
+    /// from `getkind(ARRAY.OF)`; identity slots stay two INT reds.
     ///
-    /// `parse_state_fields` accepts `[<ident>]` for any element type and
-    /// `codegen_state` is where the int-only restriction on plain arrays
-    /// lives, so `[float]` is refused there. Rendering the element type alone
-    /// printed `regs: float` — the scalar spelling the same message lists as
-    /// supported — so the reader was told their declaration was both
-    /// supported and not.
+    /// An unsupported item type is still reported with the field name and
+    /// the declared brackets, so `regs: [bool]` cannot be misread as the
+    /// scalar form `regs: bool`.
     #[test]
     fn an_unsupported_state_field_is_reported_as_declared() {
         fn expand(fields: proc_macro2::TokenStream) -> String {
@@ -5058,24 +5057,29 @@ mod tests {
 
         let flat_float = expand(quote! { acc: int, regs: [float] });
         assert!(
-            flat_float.contains("compile_error"),
-            "a plain `[float]` array has no lowering and must be refused:\n\
-             {flat_float}"
-        );
-        assert!(
-            flat_float.contains("regs: [float]"),
-            "the refusal must render the declaration, not the element type — \
-             `regs: float` names the supported scalar form instead of the \
-             rejected array one:\n{flat_float}"
+            !flat_float.contains("compile_error"),
+            "`[float]` is a supported plain array:\n{flat_float}"
         );
 
-        // The control: the same array over `int` expands cleanly, so the
-        // assertions above are about the element type and not about the
-        // fixture failing for some other reason.
         let flat_int = expand(quote! { acc: int, regs: [int] });
         assert!(
             !flat_int.contains("compile_error"),
             "`[int]` is the supported plain array:\n{flat_int}"
+        );
+
+        let err = match syn::parse2::<JitInterpConfig>(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [],
+            state_fields = { acc: int, regs: [bool] },
+        }) {
+            Err(err) => err,
+            Ok(_) => panic!("a non-int/non-float item type must fail to parse"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("regs") && msg.contains("bool"),
+            "the refusal must name the field and the declared item type:\n{msg}"
         );
     }
 

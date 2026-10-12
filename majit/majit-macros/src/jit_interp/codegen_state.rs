@@ -214,9 +214,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 StateFieldKind::Scalar { ir_type, .. } => {
                     (format!("{}: {}", f.name, ir_type), is_int_or_float(ir_type))
                 }
-                // A plain `[int]` is int-only: items pointer then length are
-                // INT reds and cells are `getarrayitem_raw_i`.
-                StateFieldKind::Array(tp) => (format!("{}: [{}]", f.name, tp), tp == "int"),
+                // A plain `[int]`/`[float]` is two INT identity reds (items
+                // pointer then length). Cells are `getarrayitem_raw_i` /
+                // `getarrayitem_raw_f` (`jtransform.py` `rewrite_op_getarrayitem`).
+                StateFieldKind::Array(tp) => (
+                    format!("{}: [{}]", f.name, tp),
+                    tp == "int" || tp == "float",
+                ),
                 StateFieldKind::VirtArray(tp) => {
                     (format!("{}: [{}; virt]", f.name, tp), is_int_or_float(tp))
                 }
@@ -232,7 +236,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .collect();
     if !unsupported_fields.is_empty() {
         let message = format!(
-            "state_fields supports int, float, [int], [int; virt], [float; virt], ref(T), opaque(T), and str; unsupported: {}",
+            "state_fields supports int, float, [int], [float], [int; virt], [float; virt], ref(T), opaque(T), and str; unsupported: {}",
             unsupported_fields.join(", ")
         );
         return quote! {
@@ -240,7 +244,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         };
     }
 
-    // Separate int scalars, plain `[int]` arrays, virtualizable arrays, float scalars,
+    // Separate int scalars, plain `[int]`/`[float]` arrays, virtualizable arrays, float scalars,
     // and ref scalars.
     let mut scalars: Vec<_> = sf
         .fields
@@ -326,7 +330,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
     let num_scalars = scalars.len();
     let num_arrays = arrays.len();
-    // Two INT identity slots per plain `[int]`: items pointer then length
+    // Two INT identity slots per plain `[int]`/`[float]`: items pointer then length
     // (`jtransform.py` `rewrite_op_getarrayitem` raw arm: the Vec / slice
     // element buffer is a raw `{ptr, len}` view).
     let num_int_identity = num_scalars + 2 * num_arrays;
@@ -512,6 +516,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .map(|(_, f)| {
             let fname = &f.name;
             let label = f.name.to_string();
+            let item_cast = match &f.kind {
+                StateFieldKind::Array(tp) if tp == "float" => quote! { f64 },
+                _ => quote! { i64 },
+            };
             quote! {
                 let _ = ::std::fmt::Write::write_fmt(
                     &mut out,
@@ -520,7 +528,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 for (__i, __v) in self.#fname.iter().enumerate() {
                     let _ = ::std::fmt::Write::write_fmt(
                         &mut out,
-                        format_args!("    {}[{}] = {}\n", #label, __i, *__v as i64),
+                        format_args!("    {}[{}] = {}\n", #label, __i, *__v as #item_cast),
                     );
                 }
             }
@@ -834,7 +842,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
     // Skip ptr then len. Stores write the native buffer in place
-    // (`setarrayitem_raw_i`), so identity reds are not written back.
+    // (`setarrayitem_raw_i` / `setarrayitem_raw_f`), so identity reds are
+    // not written back.
     let restore_array_parts: Vec<TokenStream> = arrays
         .iter()
         .map(|_| {

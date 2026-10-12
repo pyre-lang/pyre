@@ -11330,6 +11330,18 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         "setarrayitem_raw_i/iiid".to_string(),
         majit_jitcode::insns::BC_SETARRAYITEM_RAW_I,
     );
+    // `blackhole.py` `bhimpl_getarrayitem_raw_f` / `bhimpl_setarrayitem_raw_f`.
+    // `jtransform.py` `rewrite_op_getarrayitem` / `rewrite_op_setarrayitem`
+    // pick these when `getkind(ARRAY.OF)` is float. `wire_handler` is a
+    // no-op until the key is in this map.
+    insns.insert(
+        "getarrayitem_raw_f/iid>f".to_string(),
+        majit_jitcode::insns::BC_GETARRAYITEM_RAW_F,
+    );
+    insns.insert(
+        "setarrayitem_raw_f/iifd".to_string(),
+        majit_jitcode::insns::BC_SETARRAYITEM_RAW_F,
+    );
     insns.insert(
         "getarrayitem_gc_r/rid>r".to_string(),
         majit_jitcode::insns::BC_GETARRAYITEM_GC_R_RID,

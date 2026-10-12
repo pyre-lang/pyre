@@ -199,13 +199,13 @@ pub(super) fn inline_int_arg_pairs(bindings: &[Binding]) -> Vec<(u16, u16)> {
         .collect()
 }
 
-/// Plain `[int]` ptr then len identity slots as `(parent, callee)` pairs.
+/// Plain `[int]`/`[float]` ptr then len identity slots as `(parent, callee)` pairs.
 ///
 /// `MIFrame.setup_call` / `fill_registers` and `bhimpl_inline_call_ir_v`
-/// give the callee only the declared argument boxes. `getarrayitem_raw_i`
-/// reads the ptr register of the current JitCode frame, so that register
-/// must be a declared int argument. Callee register equals the identity
-/// slot the sub-JitCode already reserves (`split_identity_reg_ends`).
+/// give the callee only the declared argument boxes. `getarrayitem_raw_i` /
+/// `getarrayitem_raw_f` read the ptr register of the current JitCode frame,
+/// so that register must be a declared int argument. Callee register equals
+/// the identity slot the sub-JitCode already reserves (`split_identity_reg_ends`).
 pub(super) fn plain_array_identity_int_pairs(config: Option<&LowererConfig>) -> Vec<(u16, u16)> {
     let Some(config) = config else {
         return Vec::new();

@@ -164,11 +164,13 @@ pub struct LowererConfig {
     /// Scalar declarations: field_name → legacy state-slot index. Fields also
     /// present in `vable_fields` use that object's field index instead.
     pub(super) state_scalars: HashMap<String, usize>,
-    /// Plain `[int]` state arrays: field_name → global_array_index.
-    /// Each is two identity slots: items pointer then length
-    /// (`rlist.py` `rtype_getitem` `dum_nocheck`; the Vec is a raw
-    /// `{ptr, len}` view).
-    pub(super) state_arrays: HashMap<String, usize>,
+    /// Plain `[int]`/`[float]` state arrays: field_name →
+    /// (global_array_index, item_type). Each is two INT identity slots:
+    /// items pointer then length (`rlist.py` `rtype_getitem` `dum_nocheck`;
+    /// the Vec is a raw `{ptr, len}` view). `jtransform.py`
+    /// `rewrite_op_getarrayitem` picks `getarrayitem_raw_<kind>` from
+    /// `getkind(ARRAY.OF)`.
+    pub(super) state_arrays: HashMap<String, (usize, ValueKind)>,
     /// State field virtualizable arrays: field_name → (virt_array_index, item_type).
     /// These emit GETARRAYITEM_RAW_I/SETARRAYITEM_RAW instead of element-level tracking.
     pub(super) state_virt_arrays: HashMap<String, (usize, ValueKind)>,
@@ -396,12 +398,12 @@ impl LowererConfig {
             .unwrap_or(0)
     }
 
-    /// Plain `[int]` arrays in `state_arrays` index order.
+    /// Plain `[int]`/`[float]` arrays in `state_arrays` index order.
     pub(super) fn state_array_names_in_order(&self) -> Vec<&str> {
         let mut names: Vec<(&str, usize)> = self
             .state_arrays
             .iter()
-            .map(|(name, idx)| (name.as_str(), *idx))
+            .map(|(name, (idx, _))| (name.as_str(), *idx))
             .collect();
         names.sort_by_key(|(_, idx)| *idx);
         names.into_iter().map(|(name, _)| name).collect()
@@ -1350,8 +1352,11 @@ impl LowererConfig {
                             scalar_idx += 1;
                         }
                     }
-                    StateFieldKind::Array(_) => {
-                        arrays.insert(f.name.to_string(), array_idx);
+                    StateFieldKind::Array(item_type) => {
+                        arrays.insert(
+                            f.name.to_string(),
+                            (array_idx, ValueKind::from_ident(item_type)),
+                        );
                         array_idx += 1;
                     }
                     StateFieldKind::VirtArray(item_type) => {
@@ -2587,7 +2592,9 @@ mod tests {
     #[test]
     fn identity_slot_registers_list_plain_int_array_as_ptr_then_len() {
         let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
-        config.state_arrays.insert("cells".into(), 0);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Int));
         let mut regs = config.identity_slot_registers();
         regs.sort();
         let base = config.int_identity_base();
@@ -2605,7 +2612,9 @@ mod tests {
         config
             .state_ref_scalars
             .insert("frame".into(), (0, syn::parse_quote!(Frame)));
-        config.state_arrays.insert("cells".into(), 0);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Int));
         assert!(config.heap_vable_is_ref_scalar());
         assert_eq!(
             config.ref_identity_base(),

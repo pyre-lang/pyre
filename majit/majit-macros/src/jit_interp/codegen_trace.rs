@@ -17,8 +17,9 @@ use super::jitcode_lower::{
 /// JitCode's remaining arguments are the plain reds (int scalars,
 /// ptr then len per `[int]`, ref scalars, float scalars).
 /// `jtransform.py` `rewrite_op_getarrayitem` raw arm emits
-/// `getarrayitem_raw_<kind>` for a raw (non-GC) array; a Rust slice
-/// is that `{ptr, len}` view, so both words are identity reds.
+/// `getarrayitem_raw_<kind>` for a raw (non-GC) array (`_i` or `_f`
+/// from `getkind(ARRAY.OF)`); a Rust slice is that `{ptr, len}` view,
+/// so both words are INT identity reds regardless of element kind.
 /// Vable-field scalars stay in
 /// `initialize_virtualizable` / `virtualizable_boxes` and are not
 /// pushed here.
