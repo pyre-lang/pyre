@@ -1934,6 +1934,17 @@ impl Trace {
         self.set_concrete_at(opref.raw(), Value::Ref(gcref));
     }
 
+    /// Dense index space for a live-box visited bitset: inputargs plus
+    /// value-slot FrontendOps. `OpRef::raw()` is `_index`; a `Vec<bool>`
+    /// of this length is the recorder-sized marker, not an OpRef side table.
+    pub(crate) fn frontend_visited_len(&self) -> usize {
+        let from_slots = (self.box_prefix() as usize).saturating_add(self.value_slots.len());
+        from_slots
+            .max(self.max_num_inputargs as usize)
+            .max(self.inputarg_heapc.len())
+            .saturating_add(1)
+    }
+
     /// history.py `RefFrontendOp._heapc_deps` — boxes stored on a live
     /// FrontendOp are reachable through that object's fields.
     pub(crate) fn heapc_dep_boxes(&self, opref: OpRef) -> Vec<OpRef> {

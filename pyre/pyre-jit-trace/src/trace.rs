@@ -342,6 +342,7 @@ pub struct TraceRoots {
 }
 
 impl TraceRoots {
+    #[cfg(test)]
     pub(crate) fn enter(owner: &PyreSym) -> Self {
         Self::enter_with(owner, majit_metainterp::FrontendResrefOwner::NONE)
     }

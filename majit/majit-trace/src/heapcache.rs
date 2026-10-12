@@ -1038,33 +1038,35 @@ impl HeapCache {
         self._check_flag(opref, HeapFlags::KNOWN_CLASS, boxes)
     }
 
-    /// Walk every cached *value* slot so a `ConstPtr` ref survives a moving
-    /// minor collection. history.py `ConstPtr.value` is a gcref field
-    /// the Python GC traces through the box object graph; pyre stores cached
-    /// values as flat [`OpRef`] slots and forwards inline `ConstPtr` values in
-    /// place. Every other `OpRef` kind is a no-op.
-    ///
-    /// Only value slots are walked — these are returned on cache hits and
-    /// emitted into the op-graph (`loopinvariant_result` / `CacheEntry`
-    /// field values), so a stale one is a use-after-move. The
-    /// `cache_anything` / `cache_seen_allocation` / `quasiimmut_seen_refs`
-    /// *keys* are deliberately left stale: a forwarded lookup key simply
-    /// misses the stale-keyed entry and the cache repopulates (same contract
-    /// as the `call_pure_results` cache), and an in-place key rewrite would
-    /// break the sorted-`VecMap` ordering.
+    /// Visit every box `CacheEntry` holds so a live FrontendOp's `_resref`
+    /// survives a moving collection. history.py `CacheEntry` stores
+    /// `{from_ref_box: to_field_box}` in `cache_anything` /
+    /// `cache_seen_allocation`, plus `last_const_box` and `quasiimmut_seen`.
+    /// A non-constant key is the Box object itself; its `_resref` is a field
+    /// of that object. ConstPtr *keys* stay in the VecMap at their original
+    /// bits (`walk_const_ptr_refs` does not rewrite them): an in-place key
+    /// rewrite would break sorted-VecMap order, and a stale ConstPtr key
+    /// misses and the cache repopulates.
     ///
     /// `FO_REPLACED_WITH_CONST` and `_heapc_deps` live on the FrontendOp
     /// record; the recorder walks those ConstPtrs.
     pub fn for_each_cached_box(&self, mut visit: impl FnMut(OpRef)) {
         fn visit_entry(entry: &CacheEntry, visit: &mut impl FnMut(OpRef)) {
-            for &value in entry.cache_anything.values() {
+            for (&key, &value) in entry.cache_anything.iter() {
+                visit(key);
                 visit(value);
             }
-            for &value in entry.cache_seen_allocation.values() {
+            for (&key, &value) in entry.cache_seen_allocation.iter() {
+                visit(key);
                 visit(value);
             }
             if let Some(slot) = entry.last_const_box {
                 visit(slot);
+            }
+            if let Some(seen) = &entry.quasiimmut_seen {
+                for &box_op in seen {
+                    visit(box_op);
+                }
             }
         }
         for entry in self.heap_cache.values() {
@@ -2890,6 +2892,41 @@ mod tests {
             cache.getfield_cached(OpRef::const_ptr(GcRef(0x1_2000)), field, IDENTITY_ORACLE),
             None
         );
+    }
+
+    #[test]
+    fn for_each_cached_box_visits_keys_values_and_quasiimmut_seen() {
+        // heapcache.py `CacheEntry.cache_anything` keys are Boxes; the
+        // collector traces them through the dict. `quasiimmut_seen` holds
+        // the same Box objects. ConstPtr VecMap keys are visited too so
+        // the live-set census can skip constants, but `walk_const_ptr_refs`
+        // still leaves those keys un-rewritten.
+        let mut fx = Fixture::new();
+        let key = OpRef::ref_op(3);
+        let value = OpRef::ref_op(4);
+        let seen = OpRef::ref_op(5);
+        let const_key = OpRef::const_ptr(GcRef(0x2000));
+        {
+            let mut cache = fx.view();
+            cache.getfield_now_known(key, 7, value, IDENTITY_ORACLE);
+            cache.getfield_now_known(const_key, 8, OpRef::ref_op(6), IDENTITY_ORACLE);
+        }
+        fx.cache.quasi_immut_now_known(9, seen);
+        let mut visited = Vec::new();
+        fx.cache.for_each_cached_box(|op| visited.push(op));
+        assert!(
+            visited.contains(&key),
+            "field-cache from_ref_box: {visited:?}"
+        );
+        assert!(
+            visited.contains(&value),
+            "field-cache to_field_box: {visited:?}"
+        );
+        assert!(
+            visited.contains(&const_key),
+            "ConstPtr key is reported so the census can skip it: {visited:?}"
+        );
+        assert!(visited.contains(&seen), "quasiimmut_seen box: {visited:?}");
     }
 
     #[test]

@@ -236,6 +236,7 @@ impl WalkFrameState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn root(&self) -> WalkFrameStateRoot {
         self.root_with(majit_metainterp::FrontendResrefOwner::NONE)
     }
