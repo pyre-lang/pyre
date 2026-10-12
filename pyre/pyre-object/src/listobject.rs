@@ -2320,8 +2320,8 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
             &mut needs_write_barrier,
         )
     };
-    // The `std::alloc` header below is the answer for a missing hook, not for
-    // a GC that owns the heap and refused: that one would leave the list's
+    // The `malloc_typed` header below is the answer for a missing hook, not
+    // for a GC that owns the heap and refused: that one would leave the list's
     // managed edges untraced behind a header the collector never walks.
     let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
         .allocated_or_abort(W_LIST_OBJECT_SIZE)
@@ -2337,39 +2337,28 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         ..
     } = storage;
     // Re-read the (possibly relocated) nursery items block before either the
-    // GC-owned or std::alloc fallback header takes ownership of the edge.
+    // GC-owned or `malloc_typed` fallback header takes ownership of the edge.
     if let Some(s) = block_root {
         items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
     }
+    let body = W_ListObject {
+        ob_header: header,
+        allocated: items.len() as isize,
+        length: list_length_cell(length),
+        items: items_block,
+        strategy,
+        int_items,
+        float_items,
+        bytes_items,
+        ascii_items,
+    };
     if raw.is_null() {
-        let boxed = Box::new(W_ListObject {
-            ob_header: header,
-            allocated: items.len() as isize,
-            length: list_length_cell(length),
-            items: items_block,
-            strategy,
-            int_items,
-            float_items,
-            bytes_items,
-            ascii_items,
-        });
-        return Box::into_raw(boxed) as PyObjectRef;
+        // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
+        // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
+        return crate::lltype::malloc_typed(body) as PyObjectRef;
     }
     unsafe {
-        std::ptr::write(
-            raw as *mut W_ListObject,
-            W_ListObject {
-                ob_header: header,
-                allocated: items.len() as isize,
-                length: list_length_cell(length),
-                items: items_block,
-                strategy,
-                int_items,
-                float_items,
-                bytes_items,
-                ascii_items,
-            },
-        );
+        std::ptr::write(raw as *mut W_ListObject, body);
     }
     // A nursery header needs no creation barrier. The collecting allocator can
     // spill to old-gen (for example around pinned nursery gaps); only that
@@ -2495,33 +2484,23 @@ unsafe fn w_list_from_storage_and_strategy(
         ob_type: &LIST_TYPE as *const PyType,
         w_class: get_instantiate(&LIST_TYPE),
     };
+    let body = W_ListObject {
+        ob_header: header,
+        allocated: stored as isize,
+        length: list_length_cell(length),
+        items: items_block,
+        strategy,
+        int_items,
+        float_items,
+        bytes_items,
+        ascii_items,
+    };
     let obj = if raw.is_null() {
-        Box::into_raw(Box::new(W_ListObject {
-            ob_header: header,
-            allocated: stored as isize,
-            length: list_length_cell(length),
-            items: items_block,
-            strategy,
-            int_items,
-            float_items,
-            bytes_items,
-            ascii_items,
-        })) as PyObjectRef
+        // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
+        // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
+        crate::lltype::malloc_typed(body) as PyObjectRef
     } else {
-        std::ptr::write(
-            raw as *mut W_ListObject,
-            W_ListObject {
-                ob_header: header,
-                allocated: stored as isize,
-                length: list_length_cell(length),
-                items: items_block,
-                strategy,
-                int_items,
-                float_items,
-                bytes_items,
-                ascii_items,
-            },
-        );
+        std::ptr::write(raw as *mut W_ListObject, body);
         raw as PyObjectRef
     };
     if matches!(

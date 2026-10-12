@@ -7924,12 +7924,13 @@ impl MiniMarkGC {
     /// `IncrementalMiniMarkGC.visit` reads `hdr.tid & (GCFLAG_VISITED |
     /// GCFLAG_NO_HEAP_PTRS)` first. Every `grey_child` target now carries a
     /// readable `GcHeader`: interned exact-str wrappers, off-heap `rstr.STR`
-    /// / `BytesBlock` payloads (`init_gc_object_immortal`), and
+    /// / `BytesBlock` payloads (`init_gc_object_immortal`),
     /// `Function.name` (the function's name `STR`, which *is* the code's
-    /// name string object). Membership stays for families whose header is
-    /// readable but not an immortal leaf: R2 non-leaf types / modules /
-    /// BuiltinCode (`malloc_typed`, flags=0), and the R7 ItemsBlock
-    /// fallback (zeroed header).
+    /// name string object), and the no-hook `malloc_typed` fallbacks for
+    /// exact `W_ListObject` / `W_TupleObject`. Membership stays for families
+    /// whose header is readable but not an immortal leaf: R2 non-leaf types /
+    /// modules / BuiltinCode / those list and tuple fallbacks (`malloc_typed`,
+    /// flags=0), and the R7 ItemsBlock fallback (zeroed header).
     fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
         if addr == 0 || self.is_tagged_immediate(addr) {
             return;
@@ -14269,24 +14270,21 @@ mod tests {
 
     #[test]
     fn major_mark_skips_unmanaged_field_target() {
-        // An old-gen object's `gc_ptr_offsets` field may point at a
-        // `std::alloc`-backed (non-GC) block while some object fields are
-        // still host allocations rather than managed-GC allocations.
-        // The major-mark walker must skip such fields rather than
-        // dereferencing memory before the unmanaged block as a
-        // `GcHeader`. This test catches regression of the
-        // `is_managed_heap_object` guard in `mark_object`.
+        // `IncrementalMiniMarkGC.visit` returns on
+        // `hdr.tid & (GCFLAG_VISITED | GCFLAG_NO_HEAP_PTRS)`. A prebuilt
+        // immortal (`init_gc_object_immortal`) carries `GCFLAG_NO_HEAP_PTRS`,
+        // so `grey_child` skips it without stamping VISITED and without
+        // putting it on the gray stack.
         let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::simple(ptr_size));
 
-        // Allocate parent in old-gen. Field pointer will be set to a
-        // raw `Box::into_raw` block — what `std::alloc` does for an
-        // unmigrated `wrappeditems` / `items` slot today.
         let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
-        let unmanaged = Box::into_raw(Box::new(0xCAFEBABEu64));
+        let immortal = crate::header::alloc_with_gc_header_immortal(0xCAFEBABEu64, leaf_tid);
+        let immortal_ref = GcRef(immortal as usize);
         unsafe {
-            *(parent.0 as *mut GcRef) = GcRef(unmanaged as usize);
+            *(parent.0 as *mut GcRef) = immortal_ref;
         }
 
         let mut root = parent;
@@ -14294,27 +14292,22 @@ mod tests {
             gc.roots.add(&mut root);
         }
 
-        // Major collection — without the guard this would crash on
-        // `header_of(unmanaged)` reading invalid memory.
         gc.collect_full();
 
-        // Parent survived because it is rooted; the unmanaged target
-        // was correctly skipped.
+        // Parent survived because it is rooted; the immortal target was
+        // skipped by the header test and never stamped VISITED.
         assert_eq!(gc.oldgen.object_count(), 1);
+        assert!(unsafe { (*header_of(immortal_ref.0)).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS) });
+        assert!(!unsafe { (*header_of(immortal_ref.0)).has_flag(GcFlags::GCFLAG_VISITED) });
 
         gc.roots.clear();
-        unsafe {
-            drop(Box::from_raw(unmanaged));
-        }
     }
 
     #[test]
     fn major_mark_skips_unmanaged_varsize_item_target() {
-        // Same scenario, varsize variant: an `items_have_gc_ptrs = true`
-        // array can hold unmanaged pointers while item storage is still
-        // host-allocated. The mark
-        // walker's variable-part loop must also guard with
-        // `is_managed_heap_object`.
+        // Same `IncrementalMiniMarkGC.visit` skip, varsize items: a
+        // prebuilt immortal item (`init_gc_object_immortal`,
+        // `GCFLAG_NO_HEAP_PTRS`) is skipped by the header test.
         let ptr_size = std::mem::size_of::<GcRef>();
         let length_offset = 0;
         let base_size = 8; // length field (Signed)
@@ -14328,17 +14321,18 @@ mod tests {
             true,
             Vec::new(),
         ));
+        let leaf_tid = gc.register_type(TypeInfo::simple(ptr_size));
 
         let total_payload = base_size + ptr_size * length;
         let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + total_payload);
         unsafe {
             *(parent.0 as *mut usize) = length;
         }
-        let unmanaged_a = Box::into_raw(Box::new(0xDEADBEEFu64));
-        let unmanaged_b = Box::into_raw(Box::new(0xFEEDFACEu64));
+        let immortal_a = crate::header::alloc_with_gc_header_immortal(0xDEADBEEFu64, leaf_tid);
+        let immortal_b = crate::header::alloc_with_gc_header_immortal(0xFEEDFACEu64, leaf_tid);
         unsafe {
-            *((parent.0 + base_size) as *mut GcRef) = GcRef(unmanaged_a as usize);
-            *((parent.0 + base_size + ptr_size) as *mut GcRef) = GcRef(unmanaged_b as usize);
+            *((parent.0 + base_size) as *mut GcRef) = GcRef(immortal_a as usize);
+            *((parent.0 + base_size + ptr_size) as *mut GcRef) = GcRef(immortal_b as usize);
         }
 
         let mut root = parent;
@@ -14348,12 +14342,10 @@ mod tests {
 
         gc.collect_full();
         assert_eq!(gc.oldgen.object_count(), 1);
+        assert!(!unsafe { (*header_of(immortal_a as usize)).has_flag(GcFlags::GCFLAG_VISITED) });
+        assert!(!unsafe { (*header_of(immortal_b as usize)).has_flag(GcFlags::GCFLAG_VISITED) });
 
         gc.roots.clear();
-        unsafe {
-            drop(Box::from_raw(unmanaged_a));
-            drop(Box::from_raw(unmanaged_b));
-        }
     }
 
     #[test]

@@ -331,11 +331,13 @@ pub unsafe fn w_tuple_adopt_fixed_items(block: *mut ItemsBlock) -> PyObjectRef {
         return raw as PyObjectRef;
     }
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
-    Box::into_raw(Box::new(W_TupleObject {
+    // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
+    // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
+    crate::lltype::malloc_typed(W_TupleObject {
         ob_header: header(),
         hash: AtomicI64::new(TUPLE_HASH_UNSET),
         wrappeditems: block,
-    })) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// `tupleobject.py wraptuple`. Length 2 is `wraptuple2`. Every other
@@ -555,6 +557,8 @@ fn w_tuple_new_array_backed_impl(
         }
         return raw as PyObjectRef;
     }
+    // No collector hook: `malloc_typed` is `alloc_with_gc_header`, so
+    // `grey_child` can read `header_of` (`IncrementalMiniMarkGC.visit`).
     if user_layout {
         crate::lltype::malloc_typed(W_TupleObjectUser {
             base: W_TupleObject {
@@ -566,11 +570,11 @@ fn w_tuple_new_array_backed_impl(
             storage: std::ptr::null_mut(),
         }) as PyObjectRef
     } else {
-        Box::into_raw(Box::new(W_TupleObject {
+        crate::lltype::malloc_typed(W_TupleObject {
             ob_header: header(),
             hash: AtomicI64::new(TUPLE_HASH_UNSET),
             wrappeditems: items_block,
-        })) as PyObjectRef
+        }) as PyObjectRef
     }
 }
 
