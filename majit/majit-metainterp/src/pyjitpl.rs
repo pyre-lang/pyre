@@ -2546,14 +2546,6 @@ pub struct MetaInterp<M: Clone> {
     /// it before it can publish or mutate one of those fields, and the next
     /// minor root walk consumes it. Major marking still scans everything.
     compiled_graph_minor_scan_pending: bool,
-    /// warmstate.py `JitCell.get_jit_cell_at_key` analog for the
-    /// merge-point green vocabulary: the header greens (`(ints, refs,
-    /// floats)`) each compiled loop was traced under, keyed by
-    /// `(jitdriver_sd.index, cell green_key)` like `compiled_loops`.
-    /// Lets a bridge that closes on a merge point resolve the procedure token
-    /// of the loop living AT that merge point (pyjitpl.py:3005), which the
-    /// cell key alone cannot be inverted to.
-    pub(crate) loop_header_greens: crate::FxIndexMap<(usize, u64), (Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// Recycled `ContinueRunningNormally` banks for compiled-entry FINISH
     /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
     /// six Vec capacities on the pooled interpreter; exits that never enter
@@ -4184,7 +4176,6 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: crate::FxIndexMap::default(),
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
-            loop_header_greens: crate::FxIndexMap::default(),
             portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
             cut_compiled_keys: crate::FxIndexSet::default(),
             speculative_cut_owned_key: None,
@@ -12963,30 +12954,6 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&(jd_no, green_key))
     }
 
-    /// Merge-point greens recorded for `green_key` on the compiling driver.
-    /// `warmstate.py JitCell` is per `jitdriver_sd.warmstate`; two drivers
-    /// may share a numeric cell key.
-    #[cfg(test)]
-    pub(crate) fn loop_header_greens_for(
-        &self,
-        green_key: u64,
-    ) -> Option<&(Vec<i64>, Vec<i64>, Vec<i64>)> {
-        self.loop_header_greens
-            .get(&self.compiled_loop_key(green_key))
-    }
-
-    /// Runtime FINISH / `ContinueRunningNormally` banks for that driver's
-    /// cell. `warmspot.py handle_jitexception` reads the entering
-    /// `jitdriver_sd.warmstate`, not leftover `active_jitdriver_sd`.
-    #[cfg(test)]
-    pub(crate) fn loop_header_greens_for_driver(
-        &self,
-        jd_no: usize,
-        green_key: u64,
-    ) -> Option<&(Vec<i64>, Vec<i64>, Vec<i64>)> {
-        self.loop_header_greens.get(&(jd_no, green_key))
-    }
-
     pub(crate) fn compiled_entry_mut(&mut self, green_key: u64) -> Option<&mut CompiledEntry<M>> {
         let key = self.compiled_loop_key(green_key);
         self.compiled_loops.get_mut(&key)
@@ -13236,17 +13203,6 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|entry| entry.loop_header_pc)
     }
 
-    /// Record the merge-point green constants a compiled loop was traced
-    /// under, so `compiled_key_for_greens` can invert them back to its key.
-    pub fn record_loop_header_greens(
-        &mut self,
-        green_key: u64,
-        greens: (Vec<i64>, Vec<i64>, Vec<i64>),
-    ) {
-        let key = self.compiled_loop_key(green_key);
-        self.loop_header_greens.insert(key, greens);
-    }
-
     /// Take the recycled `ContinueRunningNormally` buffer. Capacity stays
     /// on the returned value; the field is left empty until
     /// [`Self::recycle_portal_resume_args`] puts it back.
@@ -13273,18 +13229,33 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyjitpl.py `ptoken = self.get_procedure_token(greenboxes)` /
-    /// `has_compiled_targets(ptoken)`: the green key of the compiled loop
-    /// whose header greens equal `greens`, or `None` when no loop lives at
-    /// those greens.  Compared element-wise like pyjitpl.py
-    /// `same_greenkey`, over every green rather than the pc alone.
+    /// `has_compiled_targets(ptoken)`: the key of the cell those greens own
+    /// on the compiling driver (`warmstate.py JitCell.get_jitcell`, matched
+    /// by `comparekey`), or `None` when its procedure token has no compiled
+    /// targets.
     pub fn compiled_key_for_greens(&self, greens: &(Vec<i64>, Vec<i64>, Vec<i64>)) -> Option<u64> {
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
-        self.loop_header_greens
-            .iter()
-            .find(|(key, header)| {
-                key.0 == jd_no && *header == greens && self.has_compiled_targets(key.1)
-            })
-            .map(|(key, _)| key.1)
+        let spec = self.staticdata.jitdrivers_sd.get(jd_no)?.green_args_spec();
+        let (mut ints, mut refs, mut floats) = (greens.0.iter(), greens.1.iter(), greens.2.iter());
+        let mut values = Vec::with_capacity(spec.len());
+        for kind in spec.iter() {
+            let value = match majit_ir::green_type_to_ir(*kind) {
+                Type::Int => ints.next(),
+                Type::Ref => refs.next(),
+                Type::Float => floats.next(),
+                Type::Void => None,
+            };
+            values.push(*value?);
+        }
+        if ints.next().is_some() || refs.next().is_some() || floats.next().is_some() {
+            return None;
+        }
+        let key = majit_ir::GreenKey::with_types(values, spec);
+        let cell_key = self
+            .warm_state_ref_for_driver(jd_no)
+            .and_then(|warm| warm.get_cell_for_key(&key))
+            .and_then(|cell| cell.cell_key.get())?;
+        self.has_compiled_targets(cell_key).then_some(cell_key)
     }
 
     /// compile.py:269-270 parity: whether the loop at `green_key` was stored
@@ -14467,21 +14438,12 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Drop the per-loop side tables (`loop_header_greens`,
-    /// `cut_compiled_keys`) when a loop is retired,
-    /// so they cannot outlive `compiled_loops`. `compiled_key_for_greens`
-    /// already skips keys without compiled targets, so a leftover entry could
-    /// not mis-target a bridge — but keeping them would grow the maps without
-    /// bound over a long run. The driver index is part of the key: two
-    /// `WarmEnterState`s may share a numeric cell key
+    /// Drop the `cut_compiled_keys` marker when a loop is retired, so it
+    /// cannot outlive `compiled_loops`. The driver index is part of the key:
+    /// two `WarmEnterState`s may share a numeric cell key
     /// (`warmstate.py JitCell`).
-    ///
-    /// The loop-header pc used to be retired here too; it now lives on
-    /// `CompiledEntry::loop_header_pc` and is dropped with the entry, so no
-    /// caller can forget it.
     fn forget_loop_side_tables(&mut self, jd_no: usize, green_key: u64) {
         let key = (jd_no, green_key);
-        self.loop_header_greens.swap_remove(&key);
         self.cut_compiled_keys.swap_remove(&key);
     }
 
@@ -15343,7 +15305,6 @@ impl<M: Clone> MetaInterp<M> {
     pub fn clear_compiled_loops(&mut self) {
         self.note_compiled_loops_changed();
         self.compiled_loops.clear();
-        self.loop_header_greens.clear();
         self.cut_compiled_keys.clear();
     }
 
@@ -34514,11 +34475,10 @@ mod loop_side_table_tests {
         ));
     }
 
-    /// Register a loop at `green_key` with both side tables populated.
+    /// Register a loop at `green_key` with its header pc recorded.
     fn record_loop(meta: &mut MetaInterp<()>, green_key: u64, root_trace_id: u64) {
         meta.insert_compiled_loop(green_key, compiled_entry(root_trace_id));
         meta.record_loop_header_pc(green_key, green_key as usize);
-        meta.record_loop_header_greens(green_key, (vec![green_key as i64], vec![], vec![]));
     }
 
     #[test]
@@ -34574,19 +34534,9 @@ mod loop_side_table_tests {
         let jd1 = meta.register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![]));
         let green_key = 17;
         meta.active_jitdriver_sd = Some(jd1);
-        meta.record_loop_header_greens(green_key, (vec![11], vec![], vec![]));
         meta.cut_compiled_keys
             .insert(meta.compiled_loop_key(green_key));
         meta.active_jitdriver_sd = Some(jd0);
-        assert!(
-            meta.loop_header_greens_for(green_key).is_none(),
-            "ambient compiled_loop_key still names leftover active_jitdriver_sd"
-        );
-        assert_eq!(
-            meta.loop_header_greens_for_driver(jd1, green_key)
-                .map(|(ints, _, _)| ints.as_slice()),
-            Some([11i64].as_slice()),
-        );
         assert!(
             !meta.is_cross_loop_cut_key(green_key),
             "ambient cut gate follows leftover active_jitdriver_sd"
@@ -34880,12 +34830,10 @@ mod loop_side_table_tests {
         meta.insert_compiled_loop_on_driver(jd1, green_key, jd1_entry);
 
         meta.active_jitdriver_sd = Some(jd0);
-        meta.record_loop_header_greens(green_key, (vec![10], vec![], vec![]));
         let jd0_key = meta.compiled_loop_key(green_key);
         meta.cut_compiled_keys.insert(jd0_key);
 
         meta.active_jitdriver_sd = Some(jd1);
-        meta.record_loop_header_greens(green_key, (vec![11], vec![], vec![]));
         let jd1_key = meta.compiled_loop_key(green_key);
         meta.cut_compiled_keys.insert(jd1_key);
 
@@ -34897,8 +34845,6 @@ mod loop_side_table_tests {
             .set_max_age(1, 1);
 
         meta.active_jitdriver_sd = Some(jd0);
-        assert!(meta.loop_header_greens.contains_key(&(jd0, green_key)));
-        assert!(meta.loop_header_greens.contains_key(&(jd1, green_key)));
         assert!(meta.cut_compiled_keys.contains(&(jd0, green_key)));
         assert!(meta.cut_compiled_keys.contains(&(jd1, green_key)));
 
@@ -34915,16 +34861,8 @@ mod loop_side_table_tests {
             "evicting the jd1 token must drop the jd1 compiled_loops row while leftover active_jitdriver_sd is 0"
         );
         assert!(
-            !meta.loop_header_greens.contains_key(&(jd1, green_key)),
-            "jd1 header greens must go with the evicted row"
-        );
-        assert!(
             !meta.cut_compiled_keys.contains(&(jd1, green_key)),
             "jd1 cut marker must go with the evicted row"
-        );
-        assert!(
-            meta.loop_header_greens.contains_key(&(jd0, green_key)),
-            "same-key jd0 header greens must stay"
         );
         assert!(
             meta.cut_compiled_keys.contains(&(jd0, green_key)),
@@ -34935,9 +34873,6 @@ mod loop_side_table_tests {
 
     fn has_side_tables(meta: &MetaInterp<()>, green_key: u64) -> bool {
         meta.loop_header_pc_for(green_key).is_some()
-            || meta
-                .loop_header_greens
-                .contains_key(&meta.compiled_loop_key(green_key))
     }
 
     #[test]
@@ -35005,7 +34940,6 @@ mod loop_side_table_tests {
         assert!(meta.compiled_loops.is_empty());
         assert!(meta.loop_header_pc_for(7).is_none());
         assert!(meta.loop_header_pc_for(8).is_none());
-        assert!(meta.loop_header_greens.is_empty());
     }
 
     #[test]

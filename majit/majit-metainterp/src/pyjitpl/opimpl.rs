@@ -4532,13 +4532,12 @@ where
                 // pyjitpl.py `same_greenkey` over the greens of the merge
                 // point just reached. A bridge's trace-start header is
                 // the guard, not the parent loop, so the reference is
-                // the compiled loop those greens name
-                // (`compiled_key_for_greens` / `loop_header_greens`).
+                // the cell those greens own (`compiled_key_for_greens`,
+                // `warmstate.py JitCell.get_jitcell`).
                 // It has to be this bridge's source loop: the same pc
                 // in another code object is a different green key.
-                // `None` means that loop was compiled without stored
-                // greens; the pc check above stays the only
-                // discriminator, which is what this arm used to be.
+                // `None` means no compiled targets live at those greens;
+                // the pc check above stays the only discriminator.
                 let greens = (
                     mp_green_ints.to_vec(),
                     mp_green_refs.to_vec(),
