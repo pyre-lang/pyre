@@ -82,6 +82,547 @@ pub const FLAG_STORE: i64 = 1;
 /// RPython `DICT_INITSIZE = 16` (`rordereddict.py`).
 pub const DICT_INITSIZE: i64 = 16;
 
+/// Shared lookup-chain helpers minted by [`OrderedDictRepr::lookup_chain_helpers`].
+/// `hash_takes_dict` is true for `ll_keyhash_custom(d, key)` (`rordereddict.py`);
+/// plain dicts call the key repr hash as `keyhash(key)`.
+struct LookupChainHelpers {
+    hash_fn_const: Constant,
+    call_lookup_const: Constant,
+    hash_takes_dict: bool,
+}
+
+fn keyhash_call_args(
+    hash_fn: Constant,
+    d: &Variable,
+    key: &Variable,
+    hash_takes_dict: bool,
+) -> Vec<Hlvalue> {
+    if hash_takes_dict {
+        vec![
+            Hlvalue::Constant(hash_fn),
+            Hlvalue::Variable(d.clone()),
+            Hlvalue::Variable(key.clone()),
+        ]
+    } else {
+        vec![Hlvalue::Constant(hash_fn), Hlvalue::Variable(key.clone())]
+    }
+}
+
+fn keyeq_call_args(
+    eq_fn: Constant,
+    d: &Variable,
+    ckey: &Variable,
+    key: &Variable,
+    eq_takes_dict: bool,
+) -> Vec<Hlvalue> {
+    if eq_takes_dict {
+        vec![
+            Hlvalue::Constant(eq_fn),
+            Hlvalue::Variable(d.clone()),
+            Hlvalue::Variable(ckey.clone()),
+            Hlvalue::Variable(key.clone()),
+        ]
+    } else {
+        vec![
+            Hlvalue::Constant(eq_fn),
+            Hlvalue::Variable(ckey.clone()),
+            Hlvalue::Variable(key.clone()),
+        ]
+    }
+}
+
+/// FunctionRepr (Void unique) bakes `get_unique_llfn` into a
+/// `direct_call` constant. FunctionsPBCRepr / Ptr-typed callables store
+/// the funcptr on `DICT.fnkeyhash` / `fnkeyeq` and
+/// `ll_keyhash_custom` / `ll_keyeq_custom` `getfield` + `indirect_call`
+/// it (`hlinvoke` of `r_rdict_hashfn` / `r_rdict_eqfn`).
+fn baked_callable_from_repr(
+    r: &dyn Repr,
+    _hop: &HighLevelOp,
+    _arity: usize,
+) -> Result<Option<Constant>, TyperError> {
+    use crate::translator::rtyper::pairtype::ReprClassId;
+    use crate::translator::rtyper::rpbc::FunctionRepr;
+
+    if r.repr_class_id() == ReprClassId::FunctionRepr {
+        let fr = (r as &dyn std::any::Any)
+            .downcast_ref::<FunctionRepr>()
+            .ok_or_else(|| {
+                TyperError::message("baked_callable_from_repr: FunctionRepr downcast failed")
+            })?;
+        match fr.get_unique_llfn()? {
+            Hlvalue::Constant(c) => Ok(Some(c)),
+            other => Err(TyperError::message(format!(
+                "FunctionRepr.get_unique_llfn did not return a Constant, got {other:?}"
+            ))),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+/// `ll_keyhash_custom(d, key)` (`rordereddict.py`):
+/// `objectmodel.hlinvoke(DICT.r_rdict_hashfn, d.fnkeyhash, key)`.
+fn build_ll_keyhash_custom_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    hash_fn_lltype: LowLevelType,
+    baked: Option<Constant>,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let key = variable_with_lltype("key", key_lltype);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(key.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let hash = variable_with_lltype("hash", LowLevelType::Signed);
+    emit_hlinvoke_of_stored_callable(
+        &startblock,
+        baked,
+        &d,
+        "fnkeyhash",
+        hash_fn_lltype,
+        vec![Hlvalue::Variable(key)],
+        &hash,
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(hash)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "key".to_string()],
+        func,
+    ))
+}
+
+/// `ll_keyeq_custom(d, key1, key2)` (`rordereddict.py`):
+/// `objectmodel.hlinvoke(DICT.r_rdict_eqfn, d.fnkeyeq, key1, key2)`.
+fn build_ll_keyeq_custom_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+    eq_fn_lltype: LowLevelType,
+    baked: Option<Constant>,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let key1 = variable_with_lltype("key1", key_lltype.clone());
+    let key2 = variable_with_lltype("key2", key_lltype);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(key1.clone()),
+        Hlvalue::Variable(key2.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let found = variable_with_lltype("found", LowLevelType::Bool);
+    emit_hlinvoke_of_stored_callable(
+        &startblock,
+        baked,
+        &d,
+        "fnkeyeq",
+        eq_fn_lltype,
+        vec![Hlvalue::Variable(key1), Hlvalue::Variable(key2)],
+        &found,
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(found)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "key1".to_string(), "key2".to_string()],
+        func,
+    ))
+}
+
+/// FunctionRepr Void unique: `direct_call(baked, *args)`.
+/// FunctionsPBCRepr: `getfield(d, field)` then `indirect_call(fn, *args, c_graphs)`.
+fn emit_hlinvoke_of_stored_callable(
+    block: &BlockRef,
+    baked: Option<Constant>,
+    d: &Variable,
+    field: &str,
+    fn_lltype: LowLevelType,
+    args: Vec<Hlvalue>,
+    result: &Variable,
+) {
+    if let Some(baked_fn) = baked {
+        let mut call_args = vec![Hlvalue::Constant(baked_fn)];
+        call_args.extend(args);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            call_args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    } else {
+        let fnptr = variable_with_lltype(field, fn_lltype);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(d.clone()), void_field_const(field)],
+            Hlvalue::Variable(fnptr.clone()),
+        ));
+        let mut call_args = vec![Hlvalue::Variable(fnptr)];
+        call_args.extend(args);
+        call_args.push(Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        )));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "indirect_call",
+            call_args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    }
+}
+
+/// After `found = d.keyeq(...)`. Without paranoia, switch on `found`.
+/// With paranoia, restart the lookup (`return ll_dict_lookup(...)`) if
+/// the user eq mutated the table; chained exitswitches because there is
+/// no `bool_or`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors the ll_dict_lookup paranoia predicate operands"
+)]
+fn close_keyeq_found_or_paranoia(
+    keyeq_block: &BlockRef,
+    found: &Variable,
+    d: &Variable,
+    entries: &Variable,
+    indexes: &Variable,
+    key: &Variable,
+    hash: &Variable,
+    sf: &Variable,
+    slot: &Variable,
+    ckey: &Variable,
+    miss_args: Vec<Hlvalue>,
+    miss_target: BlockRef,
+    startblock: BlockRef,
+    returnblock: BlockRef,
+    dict_ptr_lltype: &LowLevelType,
+    entries_ptr_lltype: &LowLevelType,
+    indexes_ptr_lltype: &LowLevelType,
+    key_lltype: &LowLevelType,
+    eq_op: &str,
+    paranoia: bool,
+) {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    if !paranoia {
+        keyeq_block.borrow_mut().exitswitch = Some(var(found));
+        keyeq_block.closeblock(vec![
+            Link::new(vec![var(slot)], Some(returnblock), Some(bool_true())).into_ref(),
+            Link::new(miss_args, Some(miss_target), Some(bool_false())).into_ref(),
+        ]);
+        return;
+    }
+
+    let carry = vec![
+        var(d),
+        var(entries),
+        var(indexes),
+        var(key),
+        var(hash),
+        var(sf),
+        var(slot),
+        var(ckey),
+        var(found),
+    ];
+
+    let pe_d = new_var("d", dict_ptr_lltype.clone());
+    let pe_entries = new_var("entries", entries_ptr_lltype.clone());
+    let pe_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let pe_key = new_var("key", key_lltype.clone());
+    let pe_hash = new_var("hash", LowLevelType::Signed);
+    let pe_sf = new_var("store_flag", LowLevelType::Signed);
+    let pe_slot = new_var("slot", LowLevelType::Signed);
+    let pe_ckey = new_var("checkingkey", key_lltype.clone());
+    let pe_found = new_var("found", LowLevelType::Bool);
+    let block_para_entries = Block::shared(vec![
+        var(&pe_d),
+        var(&pe_entries),
+        var(&pe_indexes),
+        var(&pe_key),
+        var(&pe_hash),
+        var(&pe_sf),
+        var(&pe_slot),
+        var(&pe_ckey),
+        var(&pe_found),
+    ]);
+
+    let pi_d = new_var("d", dict_ptr_lltype.clone());
+    let pi_entries = new_var("entries", entries_ptr_lltype.clone());
+    let pi_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let pi_key = new_var("key", key_lltype.clone());
+    let pi_hash = new_var("hash", LowLevelType::Signed);
+    let pi_sf = new_var("store_flag", LowLevelType::Signed);
+    let pi_slot = new_var("slot", LowLevelType::Signed);
+    let pi_ckey = new_var("checkingkey", key_lltype.clone());
+    let pi_found = new_var("found", LowLevelType::Bool);
+    let block_para_indexes = Block::shared(vec![
+        var(&pi_d),
+        var(&pi_entries),
+        var(&pi_indexes),
+        var(&pi_key),
+        var(&pi_hash),
+        var(&pi_sf),
+        var(&pi_slot),
+        var(&pi_ckey),
+        var(&pi_found),
+    ]);
+
+    let pv_d = new_var("d", dict_ptr_lltype.clone());
+    let pv_entries = new_var("entries", entries_ptr_lltype.clone());
+    let pv_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let pv_key = new_var("key", key_lltype.clone());
+    let pv_hash = new_var("hash", LowLevelType::Signed);
+    let pv_sf = new_var("store_flag", LowLevelType::Signed);
+    let pv_slot = new_var("slot", LowLevelType::Signed);
+    let pv_ckey = new_var("checkingkey", key_lltype.clone());
+    let pv_found = new_var("found", LowLevelType::Bool);
+    let block_para_valid = Block::shared(vec![
+        var(&pv_d),
+        var(&pv_entries),
+        var(&pv_indexes),
+        var(&pv_key),
+        var(&pv_hash),
+        var(&pv_sf),
+        var(&pv_slot),
+        var(&pv_ckey),
+        var(&pv_found),
+    ]);
+
+    let pk_d = new_var("d", dict_ptr_lltype.clone());
+    let pk_entries = new_var("entries", entries_ptr_lltype.clone());
+    let pk_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let pk_key = new_var("key", key_lltype.clone());
+    let pk_hash = new_var("hash", LowLevelType::Signed);
+    let pk_sf = new_var("store_flag", LowLevelType::Signed);
+    let pk_slot = new_var("slot", LowLevelType::Signed);
+    let pk_ckey = new_var("checkingkey", key_lltype.clone());
+    let pk_found = new_var("found", LowLevelType::Bool);
+    let block_para_key = Block::shared(vec![
+        var(&pk_d),
+        var(&pk_entries),
+        var(&pk_indexes),
+        var(&pk_key),
+        var(&pk_hash),
+        var(&pk_sf),
+        var(&pk_slot),
+        var(&pk_ckey),
+        var(&pk_found),
+    ]);
+
+    let pf_found = new_var("found", LowLevelType::Bool);
+    let pf_slot = new_var("slot", LowLevelType::Signed);
+    let block_para_found = Block::shared(vec![var(&pf_found), var(&pf_slot)]);
+
+    keyeq_block.closeblock(vec![
+        Link::new(carry, Some(block_para_entries.clone()), None).into_ref(),
+    ]);
+
+    let pe_entries2 = new_var("entries2", entries_ptr_lltype.clone());
+    push(
+        &block_para_entries,
+        "getfield",
+        vec![var(&pe_d), void_field_const("entries")],
+        &pe_entries2,
+    );
+    let pe_ne = new_var("entries_ne", LowLevelType::Bool);
+    push(
+        &block_para_entries,
+        "ptr_ne",
+        vec![var(&pe_entries), var(&pe_entries2)],
+        &pe_ne,
+    );
+    block_para_entries.borrow_mut().exitswitch = Some(var(&pe_ne));
+    let pe_cont = vec![
+        var(&pe_d),
+        var(&pe_entries),
+        var(&pe_indexes),
+        var(&pe_key),
+        var(&pe_hash),
+        var(&pe_sf),
+        var(&pe_slot),
+        var(&pe_ckey),
+        var(&pe_found),
+    ];
+    block_para_entries.closeblock(vec![
+        Link::new(
+            vec![var(&pe_d), var(&pe_key), var(&pe_hash), var(&pe_sf)],
+            Some(startblock.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            pe_cont,
+            Some(block_para_indexes.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let pi_gcref_now = new_var("indexes_gcref", GCREF.clone());
+    push(
+        &block_para_indexes,
+        "getfield",
+        vec![var(&pi_d), void_field_const("indexes")],
+        &pi_gcref_now,
+    );
+    let pi_gcref_old = new_var("indexes_gcref_old", GCREF.clone());
+    push(
+        &block_para_indexes,
+        "cast_pointer",
+        vec![var(&pi_indexes)],
+        &pi_gcref_old,
+    );
+    let pi_ne = new_var("indexes_ne", LowLevelType::Bool);
+    push(
+        &block_para_indexes,
+        "ptr_ne",
+        vec![var(&pi_gcref_old), var(&pi_gcref_now)],
+        &pi_ne,
+    );
+    block_para_indexes.borrow_mut().exitswitch = Some(var(&pi_ne));
+    let pi_cont = vec![
+        var(&pi_d),
+        var(&pi_entries),
+        var(&pi_indexes),
+        var(&pi_key),
+        var(&pi_hash),
+        var(&pi_sf),
+        var(&pi_slot),
+        var(&pi_ckey),
+        var(&pi_found),
+    ];
+    block_para_indexes.closeblock(vec![
+        Link::new(
+            vec![var(&pi_d), var(&pi_key), var(&pi_hash), var(&pi_sf)],
+            Some(startblock.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(pi_cont, Some(block_para_valid.clone()), Some(bool_false())).into_ref(),
+    ]);
+
+    let pv_valid = new_var("valid", LowLevelType::Bool);
+    push(
+        &block_para_valid,
+        "getinteriorfield",
+        vec![var(&pv_entries), var(&pv_slot), void_field_const("f_valid")],
+        &pv_valid,
+    );
+    let pv_not_valid = new_var("not_valid", LowLevelType::Bool);
+    push(
+        &block_para_valid,
+        "bool_not",
+        vec![var(&pv_valid)],
+        &pv_not_valid,
+    );
+    block_para_valid.borrow_mut().exitswitch = Some(var(&pv_not_valid));
+    let pv_cont = vec![
+        var(&pv_d),
+        var(&pv_entries),
+        var(&pv_indexes),
+        var(&pv_key),
+        var(&pv_hash),
+        var(&pv_sf),
+        var(&pv_slot),
+        var(&pv_ckey),
+        var(&pv_found),
+    ];
+    block_para_valid.closeblock(vec![
+        Link::new(
+            vec![var(&pv_d), var(&pv_key), var(&pv_hash), var(&pv_sf)],
+            Some(startblock.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(pv_cont, Some(block_para_key.clone()), Some(bool_false())).into_ref(),
+    ]);
+
+    let pk_now = new_var("key_now", key_lltype.clone());
+    push(
+        &block_para_key,
+        "getinteriorfield",
+        vec![var(&pk_entries), var(&pk_slot), void_field_const("key")],
+        &pk_now,
+    );
+    let pk_same = new_var("key_same", LowLevelType::Bool);
+    push(
+        &block_para_key,
+        eq_op,
+        vec![var(&pk_now), var(&pk_ckey)],
+        &pk_same,
+    );
+    let pk_changed = new_var("key_changed", LowLevelType::Bool);
+    push(
+        &block_para_key,
+        "bool_not",
+        vec![var(&pk_same)],
+        &pk_changed,
+    );
+    block_para_key.borrow_mut().exitswitch = Some(var(&pk_changed));
+    block_para_key.closeblock(vec![
+        Link::new(
+            vec![var(&pk_d), var(&pk_key), var(&pk_hash), var(&pk_sf)],
+            Some(startblock),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&pk_found), var(&pk_slot)],
+            Some(block_para_found.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    block_para_found.borrow_mut().exitswitch = Some(var(&pf_found));
+    block_para_found.closeblock(vec![
+        Link::new(vec![var(&pf_slot)], Some(returnblock), Some(bool_true())).into_ref(),
+        Link::new(miss_args, Some(miss_target), Some(bool_false())).into_ref(),
+    ]);
+}
+
 /// RPython `class OrderedDictRepr(AbstractDictRepr)`
 /// (`lltypesystem/rordereddict.py`).
 #[derive(Debug)]
@@ -140,13 +681,30 @@ impl OrderedDictRepr {
             ("lookup_function_no".into(), LowLevelType::Signed),
             ("entries".into(), entries_ptr),
         ];
+        let mut adtmeths = Vec::new();
         if let Some((r_rdict_eqfn, r_rdict_hashfn)) = &custom_eq_hash_repr {
+            // get_ll_dict (`rordereddict.py`): fnkeyeq / fnkeyhash hold the
+            // runtime PBC funcptrs; DICT adtmeths carry r_rdict_eqfn /
+            // r_rdict_hashfn (the Repr objects hlinvoke reads), keyhash /
+            // keyeq (ll_keyhash_custom / ll_keyeq_custom), and paranoia.
             fields.push(("fnkeyeq".into(), r_rdict_eqfn.lowleveltype().clone()));
             fields.push(("fnkeyhash".into(), r_rdict_hashfn.lowleveltype().clone()));
+            adtmeths.push(("keyhash".into(), ConstValue::byte_str("ll_keyhash_custom")));
+            adtmeths.push(("keyeq".into(), ConstValue::byte_str("ll_keyeq_custom")));
+            adtmeths.push((
+                "r_rdict_eqfn".into(),
+                ConstValue::LowLevelType(Box::new(r_rdict_eqfn.lowleveltype().clone())),
+            ));
+            adtmeths.push((
+                "r_rdict_hashfn".into(),
+                ConstValue::LowLevelType(Box::new(r_rdict_hashfn.lowleveltype().clone())),
+            ));
+            adtmeths.push(("paranoia".into(), ConstValue::Bool(!simple_hash_eq)));
         }
-        let dict = Struct::gc_with_hints(
+        let dict = Struct::gc_with_adtmeths_and_hints(
             "dicttable",
             fields,
+            adtmeths,
             vec![("dict".into(), ConstValue::Bool(true))],
         );
         let lowleveltype = LowLevelType::Ptr(Box::new(Ptr {
@@ -220,66 +778,108 @@ impl OrderedDictRepr {
         }))
     }
 
-    /// Fail-closed gate for the still-unported `custom_eq_hash` (`r_dict`)
-    /// path: `get_ll_dict` (`rordereddict.py`) wires `d.keyeq` to
-    /// `ll_keyeq_custom`, which reads the runtime `d.fnkeyeq` PBC funcptr
-    /// field, and `d.paranoia` is `True` (`not simple_hash_eq`) — the
-    /// mutation-restart branch (`ll_dict_lookup`'s recursive
-    /// `return ll_dict_lookup(d, key, hash, store_flag, T)`) is genuinely
-    /// live for that case and unported here. Plain (`not custom_eq_hash`)
-    /// dicts route entirely through `self.base.key_repr.get_ll_eq_function`
-    /// instead (`rordereddict.py`) — see
-    /// [`build_ll_dict_lookup_helper_graph`]'s doc comment for how that
-    /// `d.keyeq` value (e.g. `StringRepr::ll_streq` for str keys, `None` for
-    /// identity keys) is wired into the direct-compare fallback.
-    fn require_direct_compare_key(&self, hop: &HighLevelOp) -> Result<(), TyperError> {
-        let _ = hop;
-        if self.base.custom_eq_hash {
-            return Err(TyperError::message(format!(
-                "OrderedDictRepr: custom_eq_hash (r_dict) dict key eq function not wired into \
-                 build_ll_dict_lookup_helper_graph (key repr {} uses the runtime d.fnkeyeq PBC \
-                 funcptr + d.paranoia mutation-restart — not yet ported)",
-                self.base.key_repr.class_name()
-            )));
-        }
-        Ok(())
-    }
-
     /// Mint the shared lookup chain (`ll_dict_lookup` ->
     /// `ll_malloc_indexes_and_choose_lookup` -> `ll_dict_create_initial_index`
     /// -> `ll_ensure_indexes` -> `ll_call_lookup_function`) plus the key
-    /// repr's hash helper, returning both as callable `direct_call` funcptr
+    /// hash helper, returning both as callable `direct_call` funcptr
     /// constants for [`Repr::rtype_getitem`] / [`pair_ordereddict_repr_rtype_contains`]
     /// to bake into their own getitem/contains helper graphs.
-    fn lookup_chain_helpers(&self, hop: &HighLevelOp) -> Result<(Constant, Constant), TyperError> {
-        self.require_direct_compare_key(hop)?;
+    ///
+    /// Custom `r_dict` (`custom_eq_hash`) uses `ll_keyhash_custom` /
+    /// `ll_keyeq_custom` (`rordereddict.py`) instead of the key repr's
+    /// `get_ll_hash_function` / `get_ll_eq_function`. Those helpers
+    /// hlinvoke the stored `fnkeyhash` / `fnkeyeq` fields; `d.paranoia`
+    /// is `not simple_hash_eq` and enables the mutation-restart path
+    /// in `ll_dict_lookup`.
+    fn lookup_chain_helpers(&self, hop: &HighLevelOp) -> Result<LookupChainHelpers, TyperError> {
         let rtyper = &hop.rtyper;
-
-        let hash_fn: LowLevelFunction = self
-            .base
-            .key_repr
-            .get_ll_hash_function(rtyper)?
-            .ok_or_else(|| {
-                TyperError::message(
-                    "OrderedDictRepr: key repr has no ll hash function — dict key eq function not wired",
-                )
-            })?;
-        let hash_fn_const = sub_helper_funcptr_constant(rtyper, &hash_fn)?;
-
-        // `d.keyeq` for a plain (non-custom_eq_hash) dict is the key repr's
-        // own `get_ll_eq_function` result — `None` for identity keys
-        // (int/bool/char/unichar/instance-without-__eq__), `Some(ll_streq)`
-        // for str keys (`rordereddict.py:150-157`).
-        let eq_fn_const = self
-            .base
-            .key_repr
-            .get_ll_eq_function(rtyper)?
-            .map(|eq_fn| sub_helper_funcptr_constant(rtyper, &eq_fn))
-            .transpose()?;
-
         let dict_ptr = self.lowleveltype.clone();
         let entries_ptr = self.entries_ptr_lltype();
         let key_lltype = self.DICTKEY.clone();
+
+        let (hash_fn_const, eq_fn_const, hash_takes_dict, eq_takes_dict, paranoia) = if self
+            .base
+            .custom_eq_hash
+        {
+            let (r_eqfn, r_hashfn) = self.base.custom_eq_hash_repr.as_ref().ok_or_else(|| {
+                TyperError::message(
+                    "OrderedDictRepr: custom_eq_hash reprs missing for r_dict lookup",
+                )
+            })?;
+            let hash_fn_lltype = r_hashfn.lowleveltype().clone();
+            let eq_fn_lltype = r_eqfn.lowleveltype().clone();
+            let baked_hash = baked_callable_from_repr(r_hashfn.as_ref(), hop, 1)?;
+            let baked_eq = baked_callable_from_repr(r_eqfn.as_ref(), hop, 2)?;
+            let hash_fn = {
+                let dict_ptr = dict_ptr.clone();
+                let key_lltype = key_lltype.clone();
+                let hash_fn_lltype = hash_fn_lltype.clone();
+                let baked_hash = baked_hash.clone();
+                rtyper.lowlevel_helper_function_with_builder(
+                    "ll_keyhash_custom",
+                    vec![dict_ptr.clone(), key_lltype.clone()],
+                    LowLevelType::Signed,
+                    move |_rtyper, _args, _result| {
+                        build_ll_keyhash_custom_helper_graph(
+                            "ll_keyhash_custom",
+                            dict_ptr.clone(),
+                            key_lltype.clone(),
+                            hash_fn_lltype.clone(),
+                            baked_hash.clone(),
+                        )
+                    },
+                )?
+            };
+            let eq_fn = {
+                let dict_ptr = dict_ptr.clone();
+                let key_lltype = key_lltype.clone();
+                let eq_fn_lltype = eq_fn_lltype.clone();
+                let baked_eq = baked_eq.clone();
+                rtyper.lowlevel_helper_function_with_builder(
+                    "ll_keyeq_custom",
+                    vec![dict_ptr.clone(), key_lltype.clone(), key_lltype.clone()],
+                    LowLevelType::Bool,
+                    move |_rtyper, _args, _result| {
+                        build_ll_keyeq_custom_helper_graph(
+                            "ll_keyeq_custom",
+                            dict_ptr.clone(),
+                            key_lltype.clone(),
+                            eq_fn_lltype.clone(),
+                            baked_eq.clone(),
+                        )
+                    },
+                )?
+            };
+            (
+                sub_helper_funcptr_constant(rtyper, &hash_fn)?,
+                Some(sub_helper_funcptr_constant(rtyper, &eq_fn)?),
+                true,
+                true,
+                !self.base.simple_hash_eq,
+            )
+        } else {
+            let hash_fn: LowLevelFunction = self
+                    .base
+                    .key_repr
+                    .get_ll_hash_function(rtyper)?
+                    .ok_or_else(|| {
+                        TyperError::message(
+                            "OrderedDictRepr: key repr has no ll hash function — dict key eq function not wired",
+                        )
+                    })?;
+            let hash_fn_const = sub_helper_funcptr_constant(rtyper, &hash_fn)?;
+            // `d.keyeq` for a plain (non-custom_eq_hash) dict is the key repr's
+            // own `get_ll_eq_function` result — `None` for identity keys
+            // (int/bool/char/unichar/instance-without-__eq__), `Some(ll_streq)`
+            // for str keys (`rordereddict.py`).
+            let eq_fn_const = self
+                .base
+                .key_repr
+                .get_ll_eq_function(rtyper)?
+                .map(|eq_fn| sub_helper_funcptr_constant(rtyper, &eq_fn))
+                .transpose()?;
+            (hash_fn_const, eq_fn_const, false, false, false)
+        };
 
         let lookup_fn = {
             let dict_ptr = dict_ptr.clone();
@@ -303,6 +903,8 @@ impl OrderedDictRepr {
                         LowLevelType::Unsigned,
                         key_lltype.clone(),
                         eq_fn_const.clone(),
+                        eq_takes_dict,
+                        paranoia,
                     )
                 },
             )?
@@ -385,7 +987,11 @@ impl OrderedDictRepr {
         };
         let call_lookup_const = sub_helper_funcptr_constant(rtyper, &call_lookup_fn)?;
 
-        Ok((hash_fn_const, call_lookup_const))
+        Ok(LookupChainHelpers {
+            hash_fn_const,
+            call_lookup_const,
+            hash_takes_dict,
+        })
     }
 
     /// Mint the shared setitem insert/overwrite tail:
@@ -666,7 +1272,7 @@ impl OrderedDictRepr {
     /// Mint `ll_dict_setitem` (fused with `ll_dict_setitem_with_hash`) around
     /// the shared `_ll_dict_setitem_lookup_done` tail.
     fn ll_dict_setitem_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
-        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let chain = self.lookup_chain_helpers(hop)?;
         let rtyper = &hop.rtyper;
         let dict_ptr = self.lowleveltype.clone();
         let key_lltype = self.DICTKEY.clone();
@@ -685,9 +1291,10 @@ impl OrderedDictRepr {
                     dict_ptr.clone(),
                     key_lltype.clone(),
                     value_lltype.clone(),
-                    hash_fn_const.clone(),
-                    call_lookup_const.clone(),
+                    chain.hash_fn_const.clone(),
+                    chain.call_lookup_const.clone(),
                     lookup_done_const.clone(),
+                    chain.hash_takes_dict,
                 )
             },
         )
@@ -731,7 +1338,7 @@ impl OrderedDictRepr {
     /// `ll_dict_delete_by_entry_index` -> `_ll_dict_del_entry`, with
     /// `ll_dict_resize` available for the 87.5%-dead shrink rule.
     fn ll_dict_delitem_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
-        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let chain = self.lookup_chain_helpers(hop)?;
         let rtyper = &hop.rtyper;
         let dict_ptr = self.lowleveltype.clone();
         let entries_ptr = self.entries_ptr_lltype();
@@ -985,16 +1592,17 @@ impl OrderedDictRepr {
                     "ll_dict_delitem",
                     dict_ptr.clone(),
                     key_lltype.clone(),
-                    hash_fn_const.clone(),
-                    call_lookup_const.clone(),
+                    chain.hash_fn_const.clone(),
+                    chain.call_lookup_const.clone(),
                     del_const.clone(),
+                    chain.hash_takes_dict,
                 )
             },
         )
     }
 
     fn ll_dict_get_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
-        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let chain = self.lookup_chain_helpers(hop)?;
         let rtyper = &hop.rtyper;
         let dict_ptr = self.lowleveltype.clone();
         let entries_ptr = self.entries_ptr_lltype();
@@ -1011,15 +1619,16 @@ impl OrderedDictRepr {
                     entries_ptr.clone(),
                     key_lltype.clone(),
                     value_lltype.clone(),
-                    hash_fn_const.clone(),
-                    call_lookup_const.clone(),
+                    chain.hash_fn_const.clone(),
+                    chain.call_lookup_const.clone(),
+                    chain.hash_takes_dict,
                 )
             },
         )
     }
 
     fn ll_dict_setdefault_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
-        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let chain = self.lookup_chain_helpers(hop)?;
         let rtyper = &hop.rtyper;
         let dict_ptr = self.lowleveltype.clone();
         let entries_ptr = self.entries_ptr_lltype();
@@ -1038,9 +1647,10 @@ impl OrderedDictRepr {
                     entries_ptr.clone(),
                     key_lltype.clone(),
                     value_lltype.clone(),
-                    hash_fn_const.clone(),
-                    call_lookup_const.clone(),
+                    chain.hash_fn_const.clone(),
+                    chain.call_lookup_const.clone(),
                     lookup_done_const.clone(),
+                    chain.hash_takes_dict,
                 )
             },
         )
@@ -1169,7 +1779,7 @@ impl Repr for OrderedDictRepr {
         }
         hop.exception_is_here()?;
 
-        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let chain = self.lookup_chain_helpers(hop)?;
         let dict_ptr = self.lowleveltype.clone();
         let entries_ptr = self.entries_ptr_lltype();
         let key_lltype = self.DICTKEY.clone();
@@ -1185,8 +1795,9 @@ impl Repr for OrderedDictRepr {
                     entries_ptr.clone(),
                     key_lltype.clone(),
                     value_lltype.clone(),
-                    hash_fn_const.clone(),
-                    call_lookup_const.clone(),
+                    chain.hash_fn_const.clone(),
+                    chain.call_lookup_const.clone(),
+                    chain.hash_takes_dict,
                 )
             },
         )?;
@@ -1888,25 +2499,23 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 /// identity keys (int/bool/char/unichar/instance-without-`__eq__`, matching
 /// `get_ll_eq_function() -> None`, `rordereddict.py`), or the key
 /// repr's `get_ll_eq_function()` result for keys with real structural
-/// equality (`Some(ll_streq)` for str). When `eq_fn_const` is `Some`, a
-/// direct-compare miss falls through to `direct_call(eq_fn_const,
-/// checkingkey, key)` at both comparison sites, exactly mirroring `d.keyeq(
-/// checkingkey, key)`. `d.paranoia` is `False` for every dict this repr
-/// builds (`custom_eq_hash` is rejected earlier by
-/// [`OrderedDictRepr::require_direct_compare_key`]), so the mutation-restart
-/// branch is statically dead and stays unported, exactly as RPython folds it.
+/// equality (`Some(ll_streq)` for str) or `ll_keyeq_custom` for
+/// `custom_eq_hash` r_dicts. When `eq_fn_const` is `Some`, a
+/// direct-compare miss falls through to `direct_call(eq_fn_const, ...)`
+/// at both comparison sites. Custom ADT methods take `(d, checkingkey,
+/// key)` (`eq_takes_dict`); plain keyeq takes `(checkingkey, key)`.
+/// `d.paranoia` (`not simple_hash_eq` on a custom r_dict) restarts the
+/// lookup after a user eq call if the table mutated
+/// (`entries != d.entries or cast_opaque_ptr(GCREF, indexes) != d.indexes
+/// or not entries.valid(slot) or entries[slot].key != checkingkey`).
+/// `hash` is loop-carried so an in-loop restart still has it.
 ///
 /// **Simplification (disclosed, correctness-preserving):** the
 /// `entries.entry_hash(d, index) == hash` precheck ahead of `d.keyeq(...)`
-/// is a pure performance short-circuit — `ll_streq` (or any `get_ll_eq_function`
-/// result) is a full, hash-independent content-equality function, so calling
+/// is a pure performance short-circuit — `ll_streq` / `ll_keyeq_custom`
+/// is a full, hash-independent content-equality function, so calling
 /// it unconditionally on every direct-compare miss cannot change the boolean
-/// outcome, only skip a possible early-out. This graph omits the precheck
-/// rather than threading the original `hash` value through the in-loop
-/// `perturb`-carrying block cycle (`loop_body`/`loop_notfree`/`loop_valid`/
-/// `loop_deleted`/`perturb_shift`), which drops `hash` after `loop_init`
-/// derives `perturb = r_uint(hash)` and never carries it further. Revisit if
-/// dict lookups become hot on the corpus.
+/// outcome, only skip a possible early-out.
 ///
 /// All `DICTINDEX_*` widths collapse to `Ptr(GcArray(Unsigned))`, so this one
 /// graph serves every `FUNC_*` width (the `T`/`ll_call_lookup_function`
@@ -1929,10 +2538,15 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 ///
 /// 13-block CFG (plus the returnblock) when `eq_fn_const` is `None`, 15-block
 /// when `Some` (one extra `direct_call(eq_fn_const, ...)` block per
-/// comparison site). First-try-before-loop mirrors the "do the first try
+/// comparison site). `paranoia` adds the mutation-restart chain after
+/// each keyeq call. First-try-before-loop mirrors the "do the first try
 /// before any looping" optimisation; the loop body re-derives `i`, reads the
 /// slot, and 3-way branches FREE / VALID / DELETED before the `perturb`
 /// shift back-edge.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors ll_dict_lookup; grouping would obscure line-by-line parity"
+)]
 pub fn build_ll_dict_lookup_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -1940,6 +2554,8 @@ pub fn build_ll_dict_lookup_helper_graph(
     index_elem_lltype: LowLevelType,
     key_lltype: LowLevelType,
     eq_fn_const: Option<Constant>,
+    eq_takes_dict: bool,
+    paranoia: bool,
 ) -> Result<PyGraph, TyperError> {
     let indexes_ptr_lltype = _ll_ptr_to_array_of(index_elem_lltype.clone());
     let eq_op = direct_compare_op(&key_lltype)?;
@@ -2052,8 +2668,10 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&li_ds),
     ]);
 
-    // block_loop_body: (d, entries, indexes, mask_u, key, store_flag, perturb, i, deletedslot).
+    // block_loop_body: (d, entries, indexes, mask_u, key, store_flag, hash, perturb, i, deletedslot).
+    // `hash` is loop-carried so a paranoia restart after user eq still has it.
     let (lb_d, lb_entries, lb_indexes, lb_mask, lb_key, lb_sf) = make_inv("");
+    let lb_hash = new_var("hash", sig());
     let lb_perturb = new_var("perturb", uns());
     let lb_i = new_var("i", uns());
     let lb_ds = new_var("deletedslot", sig());
@@ -2064,6 +2682,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&lb_mask),
         var(&lb_key),
         var(&lb_sf),
+        var(&lb_hash),
         var(&lb_perturb),
         var(&lb_i),
         var(&lb_ds),
@@ -2071,6 +2690,7 @@ pub fn build_ll_dict_lookup_helper_graph(
 
     // block_loop_notfree: loop_body + index.
     let (nf_d, nf_entries, nf_indexes, nf_mask, nf_key, nf_sf) = make_inv("");
+    let nf_hash = new_var("hash", sig());
     let nf_perturb = new_var("perturb", uns());
     let nf_i = new_var("i", uns());
     let nf_ds = new_var("deletedslot", sig());
@@ -2082,6 +2702,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&nf_mask),
         var(&nf_key),
         var(&nf_sf),
+        var(&nf_hash),
         var(&nf_perturb),
         var(&nf_i),
         var(&nf_ds),
@@ -2090,6 +2711,7 @@ pub fn build_ll_dict_lookup_helper_graph(
 
     // block_loop_valid: loop_body + index.
     let (lv_d, lv_entries, lv_indexes, lv_mask, lv_key, lv_sf) = make_inv("");
+    let lv_hash = new_var("hash", sig());
     let lv_perturb = new_var("perturb", uns());
     let lv_i = new_var("i", uns());
     let lv_ds = new_var("deletedslot", sig());
@@ -2101,6 +2723,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&lv_mask),
         var(&lv_key),
         var(&lv_sf),
+        var(&lv_hash),
         var(&lv_perturb),
         var(&lv_i),
         var(&lv_ds),
@@ -2109,6 +2732,7 @@ pub fn build_ll_dict_lookup_helper_graph(
 
     // block_loop_deleted: loop_body shape.
     let (ld_d, ld_entries, ld_indexes, ld_mask, ld_key, ld_sf) = make_inv("");
+    let ld_hash = new_var("hash", sig());
     let ld_perturb = new_var("perturb", uns());
     let ld_i = new_var("i", uns());
     let ld_ds = new_var("deletedslot", sig());
@@ -2119,6 +2743,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&ld_mask),
         var(&ld_key),
         var(&ld_sf),
+        var(&ld_hash),
         var(&ld_perturb),
         var(&ld_i),
         var(&ld_ds),
@@ -2126,6 +2751,7 @@ pub fn build_ll_dict_lookup_helper_graph(
 
     // block_perturb_shift: loop_body shape.
     let (sh_d, sh_entries, sh_indexes, sh_mask, sh_key, sh_sf) = make_inv("");
+    let sh_hash = new_var("hash", sig());
     let sh_perturb = new_var("perturb", uns());
     let sh_i = new_var("i", uns());
     let sh_ds = new_var("deletedslot", sig());
@@ -2136,6 +2762,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&sh_mask),
         var(&sh_key),
         var(&sh_sf),
+        var(&sh_hash),
         var(&sh_perturb),
         var(&sh_i),
         var(&sh_ds),
@@ -2330,34 +2957,41 @@ pub fn build_ll_dict_lookup_helper_graph(
         push(
             &block_first_keyeq_call,
             "direct_call",
-            vec![Hlvalue::Constant(eq_fn), var(&fkc_ckey), var(&fkc_key)],
+            keyeq_call_args(eq_fn, &fkc_d, &fkc_ckey, &fkc_key, eq_takes_dict),
             &fkc_found,
         );
-        block_first_keyeq_call.borrow_mut().exitswitch = Some(var(&fkc_found));
-        block_first_keyeq_call.closeblock(vec![
-            Link::new(
-                vec![var(&fkc_slot)],
-                Some(graph.returnblock.clone()),
-                Some(bool_true()),
-            )
-            .into_ref(),
-            Link::new(
-                vec![
-                    var(&fkc_d),
-                    var(&fkc_entries),
-                    var(&fkc_indexes),
-                    var(&fkc_mask),
-                    var(&fkc_key),
-                    var(&fkc_sf),
-                    var(&fkc_hash),
-                    var(&fkc_i),
-                    signed(-1),
-                ],
-                Some(block_loop_init.clone()),
-                Some(bool_false()),
-            )
-            .into_ref(),
-        ]);
+        close_keyeq_found_or_paranoia(
+            &block_first_keyeq_call,
+            &fkc_found,
+            &fkc_d,
+            &fkc_entries,
+            &fkc_indexes,
+            &fkc_key,
+            &fkc_hash,
+            &fkc_sf,
+            &fkc_slot,
+            &fkc_ckey,
+            vec![
+                var(&fkc_d),
+                var(&fkc_entries),
+                var(&fkc_indexes),
+                var(&fkc_mask),
+                var(&fkc_key),
+                var(&fkc_sf),
+                var(&fkc_hash),
+                var(&fkc_i),
+                signed(-1),
+            ],
+            block_loop_init.clone(),
+            startblock.clone(),
+            graph.returnblock.clone(),
+            &dict_ptr_lltype,
+            &entries_ptr_lltype,
+            &indexes_ptr_lltype,
+            &key_lltype,
+            eq_op,
+            paranoia,
+        );
     } else {
         block_first_valid.closeblock(vec![
             Link::new(
@@ -2497,6 +3131,7 @@ pub fn build_ll_dict_lookup_helper_graph(
                 var(&li_mask),
                 var(&li_key),
                 var(&li_sf),
+                var(&li_hash),
                 var(&li_perturb),
                 var(&li_i),
                 var(&li_ds),
@@ -2593,6 +3228,7 @@ pub fn build_ll_dict_lookup_helper_graph(
                 var(&lb_mask),
                 var(&lb_key),
                 var(&lb_sf),
+                var(&lb_hash),
                 var(&lb_perturb),
                 var(&lb_inew),
                 var(&lb_ds),
@@ -2620,6 +3256,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&nf_mask),
         var(&nf_key),
         var(&nf_sf),
+        var(&nf_hash),
         var(&nf_perturb),
         var(&nf_i),
         var(&nf_ds),
@@ -2671,6 +3308,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&lv_mask),
         var(&lv_key),
         var(&lv_sf),
+        var(&lv_hash),
         var(&lv_perturb),
         var(&lv_i),
         var(&lv_ds),
@@ -2684,6 +3322,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         let lkc_mask = new_var("mask_u", uns());
         let lkc_key = new_var("key", key_lltype.clone());
         let lkc_sf = new_var("store_flag", sig());
+        let lkc_hash = new_var("hash", sig());
         let lkc_perturb = new_var("perturb", uns());
         let lkc_i = new_var("i", uns());
         let lkc_ds = new_var("deletedslot", sig());
@@ -2696,6 +3335,7 @@ pub fn build_ll_dict_lookup_helper_graph(
             var(&lkc_mask),
             var(&lkc_key),
             var(&lkc_sf),
+            var(&lkc_hash),
             var(&lkc_perturb),
             var(&lkc_i),
             var(&lkc_ds),
@@ -2717,6 +3357,7 @@ pub fn build_ll_dict_lookup_helper_graph(
                     var(&lv_mask),
                     var(&lv_key),
                     var(&lv_sf),
+                    var(&lv_hash),
                     var(&lv_perturb),
                     var(&lv_i),
                     var(&lv_ds),
@@ -2733,34 +3374,42 @@ pub fn build_ll_dict_lookup_helper_graph(
         push(
             &block_loop_keyeq_call,
             "direct_call",
-            vec![Hlvalue::Constant(eq_fn), var(&lkc_ckey), var(&lkc_key)],
+            keyeq_call_args(eq_fn, &lkc_d, &lkc_ckey, &lkc_key, eq_takes_dict),
             &lkc_found,
         );
-        block_loop_keyeq_call.borrow_mut().exitswitch = Some(var(&lkc_found));
-        block_loop_keyeq_call.closeblock(vec![
-            Link::new(
-                vec![var(&lkc_slot)],
-                Some(graph.returnblock.clone()),
-                Some(bool_true()),
-            )
-            .into_ref(),
-            Link::new(
-                vec![
-                    var(&lkc_d),
-                    var(&lkc_entries),
-                    var(&lkc_indexes),
-                    var(&lkc_mask),
-                    var(&lkc_key),
-                    var(&lkc_sf),
-                    var(&lkc_perturb),
-                    var(&lkc_i),
-                    var(&lkc_ds),
-                ],
-                Some(block_perturb_shift.clone()),
-                Some(bool_false()),
-            )
-            .into_ref(),
-        ]);
+        close_keyeq_found_or_paranoia(
+            &block_loop_keyeq_call,
+            &lkc_found,
+            &lkc_d,
+            &lkc_entries,
+            &lkc_indexes,
+            &lkc_key,
+            &lkc_hash,
+            &lkc_sf,
+            &lkc_slot,
+            &lkc_ckey,
+            vec![
+                var(&lkc_d),
+                var(&lkc_entries),
+                var(&lkc_indexes),
+                var(&lkc_mask),
+                var(&lkc_key),
+                var(&lkc_sf),
+                var(&lkc_hash),
+                var(&lkc_perturb),
+                var(&lkc_i),
+                var(&lkc_ds),
+            ],
+            block_perturb_shift.clone(),
+            startblock.clone(),
+            graph.returnblock.clone(),
+            &dict_ptr_lltype,
+            &entries_ptr_lltype,
+            &indexes_ptr_lltype,
+            &key_lltype,
+            eq_op,
+            paranoia,
+        );
     } else {
         block_loop_valid.closeblock(vec![
             Link::new(
@@ -2801,6 +3450,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         var(&ld_mask),
         var(&ld_key),
         var(&ld_sf),
+        var(&ld_hash),
         var(&ld_perturb),
         var(&ld_i),
     ];
@@ -2840,6 +3490,7 @@ pub fn build_ll_dict_lookup_helper_graph(
                 var(&sh_mask),
                 var(&sh_key),
                 var(&sh_sf),
+                var(&sh_hash),
                 var(&sh_perturb_new),
                 var(&sh_i),
                 var(&sh_ds),
@@ -3397,6 +4048,10 @@ pub(crate) fn build_ll_call_lookup_function_helper_graph(
 /// KeyError` exceptblock link in the same graph that emits it — the same
 /// byte-equivalent-fusion precedent as `build_ll_dict_lookup_helper_graph`'s
 /// "Store path inlined" note.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Parameter order mirrors ll_dict_getitem; hash_takes_dict selects ll_keyhash_custom(d, key)"
+)]
 pub(crate) fn build_ll_dict_getitem_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -3405,6 +4060,7 @@ pub(crate) fn build_ll_dict_getitem_helper_graph(
     value_lltype: LowLevelType,
     hash_fn: Constant,
     call_lookup_fn: Constant,
+    hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
     let exc_args = exception_args("KeyError")?;
 
@@ -3431,7 +4087,7 @@ pub(crate) fn build_ll_dict_getitem_helper_graph(
     let hash = variable_with_lltype("hash", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
-        vec![Hlvalue::Constant(hash_fn), Hlvalue::Variable(key.clone())],
+        keyhash_call_args(hash_fn, &d, &key, hash_takes_dict),
         Hlvalue::Variable(hash.clone()),
     ));
     let index = variable_with_lltype("index", LowLevelType::Signed);
@@ -3539,6 +4195,7 @@ pub(crate) fn build_ll_dict_contains_helper_graph(
     key_lltype: LowLevelType,
     hash_fn: Constant,
     call_lookup_fn: Constant,
+    hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
     let d = variable_with_lltype("d", dict_ptr_lltype);
     let key = variable_with_lltype("key", key_lltype);
@@ -3556,7 +4213,7 @@ pub(crate) fn build_ll_dict_contains_helper_graph(
     let hash = variable_with_lltype("hash", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
-        vec![Hlvalue::Constant(hash_fn), Hlvalue::Variable(key.clone())],
+        keyhash_call_args(hash_fn, &d, &key, hash_takes_dict),
         Hlvalue::Variable(hash.clone()),
     ));
     let index = variable_with_lltype("index", LowLevelType::Signed);
@@ -3626,7 +4283,7 @@ pub fn pair_ordereddict_repr_rtype_contains(
     ])?;
     hop.exception_is_here()?;
 
-    let (hash_fn_const, call_lookup_const) = r_dict.lookup_chain_helpers(hop)?;
+    let chain = r_dict.lookup_chain_helpers(hop)?;
     let dict_ptr = r_dict.lowleveltype().clone();
     let key_lltype = r_dict.DICTKEY.clone();
     let helper = hop.rtyper.lowlevel_helper_function_with_builder(
@@ -3638,8 +4295,9 @@ pub fn pair_ordereddict_repr_rtype_contains(
                 "ll_dict_contains",
                 dict_ptr.clone(),
                 key_lltype.clone(),
-                hash_fn_const.clone(),
-                call_lookup_const.clone(),
+                chain.hash_fn_const.clone(),
+                chain.call_lookup_const.clone(),
+                chain.hash_takes_dict,
             )
         },
     )?;
@@ -6483,6 +7141,10 @@ pub(crate) fn build_ll_dict_del_helper_graph(
 /// if index < 0: raise KeyError
 /// _ll_dict_del(d, hash, index)
 /// ```
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Parameter order mirrors ll_dict_delitem; hash_takes_dict selects ll_keyhash_custom(d, key)"
+)]
 pub(crate) fn build_ll_dict_delitem_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -6490,6 +7152,7 @@ pub(crate) fn build_ll_dict_delitem_helper_graph(
     hash_fn: Constant,
     call_lookup_fn: Constant,
     del_fn: Constant,
+    hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
     let exc_args = exception_args("KeyError")?;
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
@@ -6522,7 +7185,7 @@ pub(crate) fn build_ll_dict_delitem_helper_graph(
     push(
         &startblock,
         "direct_call",
-        vec![Hlvalue::Constant(hash_fn), var(&key)],
+        keyhash_call_args(hash_fn, &d, &key, hash_takes_dict),
         &hash,
     );
     let index = new_var("index", sig());
@@ -6589,6 +7252,10 @@ pub(crate) fn build_ll_dict_delitem_helper_graph(
 }
 
 /// Synthesise `ll_dict_get(dict, key, default)` (`rordereddict.py`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Parameter order mirrors ll_dict_get; hash_takes_dict selects ll_keyhash_custom(d, key)"
+)]
 pub(crate) fn build_ll_dict_get_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -6597,6 +7264,7 @@ pub(crate) fn build_ll_dict_get_helper_graph(
     value_lltype: LowLevelType,
     hash_fn: Constant,
     call_lookup_fn: Constant,
+    hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
@@ -6623,7 +7291,7 @@ pub(crate) fn build_ll_dict_get_helper_graph(
     push(
         &startblock,
         "direct_call",
-        vec![Hlvalue::Constant(hash_fn), var(&key)],
+        keyhash_call_args(hash_fn, &d, &key, hash_takes_dict),
         &hash,
     );
     let index = new_var("index", sig());
@@ -6711,6 +7379,7 @@ pub(crate) fn build_ll_dict_setdefault_helper_graph(
     hash_fn: Constant,
     call_lookup_fn: Constant,
     lookup_done_fn: Constant,
+    hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
@@ -6737,7 +7406,7 @@ pub(crate) fn build_ll_dict_setdefault_helper_graph(
     push(
         &startblock,
         "direct_call",
-        vec![Hlvalue::Constant(hash_fn), var(&key)],
+        keyhash_call_args(hash_fn, &d, &key, hash_takes_dict),
         &hash,
     );
     let index = new_var("index", sig());
@@ -7426,6 +8095,10 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
 ///     index = d.lookup_function(d, key, hash, FLAG_STORE)
 ///     _ll_dict_setitem_lookup_done(d, key, value, hash, index)
 /// ```
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Parameter order mirrors ll_dict_setitem; hash_takes_dict selects ll_keyhash_custom(d, key)"
+)]
 pub(crate) fn build_ll_dict_setitem_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -7434,6 +8107,7 @@ pub(crate) fn build_ll_dict_setitem_helper_graph(
     hash_fn: Constant,
     call_lookup_fn: Constant,
     lookup_done_fn: Constant,
+    hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
     let d = variable_with_lltype("d", dict_ptr_lltype);
     let key = variable_with_lltype("key", key_lltype);
@@ -7453,7 +8127,7 @@ pub(crate) fn build_ll_dict_setitem_helper_graph(
     let hash = variable_with_lltype("hash", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
-        vec![Hlvalue::Constant(hash_fn), Hlvalue::Variable(key.clone())],
+        keyhash_call_args(hash_fn, &d, &key, hash_takes_dict),
         Hlvalue::Variable(hash.clone()),
     ));
     let index = variable_with_lltype("index", LowLevelType::Signed);
@@ -8310,6 +8984,8 @@ pub fn ll_dict_lookup(
         index_elem_lltype,
         key_lltype,
         eq_fn_const,
+        false,
+        false,
     )
 }
 
@@ -8778,6 +9454,7 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::dictdef::DictDef;
     use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+    use crate::translator::rtyper::lltypesystem::lltype::FuncType;
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rint::signed_repr;
     use crate::translator::rtyper::rstr::string_repr;
@@ -9561,6 +10238,8 @@ mod tests {
             LowLevelType::Unsigned,
             key_lltype,
             None,
+            false,
+            false,
         )
         .expect("build_ll_dict_lookup_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_lookup");
@@ -9690,6 +10369,8 @@ mod tests {
             LowLevelType::Unsigned,
             key_lltype,
             Some(eq_fn),
+            false,
+            false,
         )
         .expect("build_ll_dict_lookup_helper_graph");
         let inner = helper.graph.borrow();
@@ -9940,6 +10621,7 @@ mod tests {
             LowLevelType::Signed,
             dummy_funcptr_const(),
             dummy_funcptr_const(),
+            false,
         )
         .expect("build_ll_dict_getitem_helper_graph");
         let inner = helper.graph.borrow();
@@ -10007,6 +10689,7 @@ mod tests {
             key_lltype,
             dummy_funcptr_const(),
             dummy_funcptr_const(),
+            false,
         )
         .expect("build_ll_dict_contains_helper_graph");
         let inner = helper.graph.borrow();
@@ -10713,6 +11396,7 @@ mod tests {
             dummy_funcptr_const(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
+            false,
         )
         .expect("build_ll_dict_delitem_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_delitem");
@@ -10753,6 +11437,7 @@ mod tests {
             LowLevelType::Signed,
             dummy_funcptr_const(),
             dummy_funcptr_const(),
+            false,
         )
         .expect("build_ll_dict_get_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_get");
@@ -10788,6 +11473,7 @@ mod tests {
             dummy_funcptr_const(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
+            false,
         )
         .expect("build_ll_dict_setdefault_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_setdefault");
@@ -11252,8 +11938,7 @@ mod tests {
     }
 
     /// The eq-gate lets plain str keys through on setitem too — same
-    /// `lookup_chain_helpers`/`require_direct_compare_key` gate as
-    /// getitem/contains/delitem.
+    /// `lookup_chain_helpers` wiring as getitem/contains/delitem.
     #[test]
     fn ordereddictrepr_rtype_setitem_str_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
@@ -11334,5 +12019,366 @@ mod tests {
             panic!("expected Constant funcptr as direct_call arg 0");
         };
         assert!(format!("{:?}", c.value).contains("ll_dict_setitem"));
+    }
+
+    fn funcptr_repr(args: Vec<LowLevelType>, result: LowLevelType) -> Arc<dyn Repr> {
+        use crate::translator::rtyper::rmodel::PtrRepr;
+        Arc::new(PtrRepr::new(Ptr {
+            TO: PtrTarget::Func(FuncType { args, result }),
+        })) as Arc<dyn Repr>
+    }
+
+    fn custom_eq_hash_reprs() -> (Arc<dyn Repr>, Arc<dyn Repr>) {
+        (
+            funcptr_repr(
+                vec![LowLevelType::Signed, LowLevelType::Signed],
+                LowLevelType::Bool,
+            ),
+            funcptr_repr(vec![LowLevelType::Signed], LowLevelType::Signed),
+        )
+    }
+
+    fn make_custom_eq_hash_dict_repr(rtyper: Rc<RPythonTyper>) -> Arc<OrderedDictRepr> {
+        let (eq, hash) = custom_eq_hash_reprs();
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Integer(SomeInteger::default()),
+            true,
+            false,
+            false,
+        );
+        Arc::new(
+            OrderedDictRepr::new(
+                rtyper,
+                signed_repr() as Arc<dyn Repr>,
+                signed_repr() as Arc<dyn Repr>,
+                dictdef,
+                Some((eq, hash)),
+                false,
+                false,
+            )
+            .expect("custom eq/hash ordered dict repr"),
+        )
+    }
+
+    /// `get_ll_dict` (`rordereddict.py`) stores `fnkeyeq` / `fnkeyhash`
+    /// and the `keyhash`/`keyeq`/`paranoia` adtmeths on a custom r_dict.
+    #[test]
+    fn ordereddictrepr_custom_eq_hash_installs_fnkey_fields_and_adtmeths() {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_custom_eq_hash_dict_repr(rtyper);
+        assert!(repr.base.custom_eq_hash);
+        assert!(
+            repr.DICT._names.iter().any(|n| n == "fnkeyeq"),
+            "DICT must hold fnkeyeq, got {:?}",
+            repr.DICT._names
+        );
+        assert!(
+            repr.DICT._names.iter().any(|n| n == "fnkeyhash"),
+            "DICT must hold fnkeyhash, got {:?}",
+            repr.DICT._names
+        );
+        assert!(
+            repr.DICT._adtmeths.get("keyhash").is_some(),
+            "DICT adtmeths must name ll_keyhash_custom"
+        );
+        assert!(
+            repr.DICT._adtmeths.get("keyeq").is_some(),
+            "DICT adtmeths must name ll_keyeq_custom"
+        );
+        assert_eq!(
+            repr.DICT._adtmeths.get("paranoia"),
+            Some(&ConstValue::Bool(true)),
+            "paranoia is not simple_hash_eq"
+        );
+    }
+
+    /// `ll_keyhash_custom` (`rordereddict.py`): FunctionsPBCRepr path
+    /// `getfield(d, fnkeyhash)` then `indirect_call`.
+    #[test]
+    fn build_ll_keyhash_custom_getfields_then_indirect_calls() {
+        let (dict_ptr, _entries, key_lltype) = sample_dict_lookup_lltypes();
+        let fn_lltype = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![key_lltype.clone()],
+                result: LowLevelType::Signed,
+            }),
+        }));
+        let helper = build_ll_keyhash_custom_helper_graph(
+            "ll_keyhash_custom",
+            dict_ptr,
+            key_lltype,
+            fn_lltype,
+            None,
+        )
+        .expect("build_ll_keyhash_custom_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["getfield", "indirect_call"]);
+        let field = &startblock.operations[0].args[1];
+        assert!(
+            matches!(field, Hlvalue::Constant(c) if c.value == ConstValue::byte_str("fnkeyhash")),
+            "must read d.fnkeyhash, got {field:?}"
+        );
+    }
+
+    /// `ll_keyeq_custom` (`rordereddict.py`): `getfield(d, fnkeyeq)` then
+    /// `indirect_call(fn, key1, key2, c_graphs)`.
+    #[test]
+    fn build_ll_keyeq_custom_getfields_then_indirect_calls() {
+        let (dict_ptr, _entries, key_lltype) = sample_dict_lookup_lltypes();
+        let fn_lltype = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![key_lltype.clone(), key_lltype.clone()],
+                result: LowLevelType::Bool,
+            }),
+        }));
+        let helper = build_ll_keyeq_custom_helper_graph(
+            "ll_keyeq_custom",
+            dict_ptr,
+            key_lltype,
+            fn_lltype,
+            None,
+        )
+        .expect("build_ll_keyeq_custom_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["getfield", "indirect_call"]);
+        let field = &startblock.operations[0].args[1];
+        assert!(
+            matches!(field, Hlvalue::Constant(c) if c.value == ConstValue::byte_str("fnkeyeq")),
+            "must read d.fnkeyeq, got {field:?}"
+        );
+        let call_args = &startblock.operations[1].args;
+        assert_eq!(
+            call_args.len(),
+            4,
+            "indirect_call(fn, key1, key2, c_graphs), got {call_args:?}"
+        );
+    }
+
+    /// Custom `d.keyeq` is `ll_keyeq_custom(d, checkingkey, key)` so the
+    /// lookup `direct_call` passes `d`. `d.paranoia` restarts after a
+    /// user eq that mutated the table (`ll_dict_lookup`).
+    #[test]
+    fn build_ll_dict_lookup_custom_eq_takes_dict_and_paranoia_restarts() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_lookup_helper_graph(
+            "ll_dict_lookup",
+            dict_ptr,
+            entries_ptr,
+            LowLevelType::Unsigned,
+            key_lltype,
+            Some(dummy_funcptr_const()),
+            true,
+            true,
+        )
+        .expect("build_ll_dict_lookup_helper_graph");
+        let inner = helper.graph.borrow();
+        let start_ptr = Rc::as_ptr(&inner.startblock) as usize;
+        let (block_count, ops) = walk_blocks(&inner.startblock);
+        assert!(
+            block_count > 16,
+            "paranoia restart chain adds check blocks, got {block_count}"
+        );
+        assert!(
+            ops.iter().any(|o| o == "ptr_ne"),
+            "paranoia checks entries/indexes pointer identity, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|o| o == "bool_not"),
+            "paranoia checks not valid / key changed, got {ops:?}"
+        );
+
+        let mut restart_links = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![inner.startblock.clone()];
+        let mut keyeq_call_arg_lens = Vec::new();
+        while let Some(b) = stack.pop() {
+            if !seen.insert(Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            let bb = b.borrow();
+            for op in &bb.operations {
+                if op.opname == "direct_call" {
+                    keyeq_call_arg_lens.push(op.args.len());
+                }
+            }
+            for link in &bb.exits {
+                let l = link.borrow();
+                if let Some(t) = l.target.clone() {
+                    if Rc::as_ptr(&t) as usize == start_ptr && Rc::as_ptr(&b) as usize != start_ptr
+                    {
+                        restart_links += 1;
+                        assert_eq!(
+                            l.args.len(),
+                            4,
+                            "restart is ll_dict_lookup(d, key, hash, store_flag)"
+                        );
+                    }
+                    stack.push(t);
+                }
+            }
+        }
+        assert!(
+            restart_links >= 8,
+            "four mutation checks at each of two keyeq sites, got {restart_links}"
+        );
+        assert_eq!(
+            keyeq_call_arg_lens,
+            vec![4, 4],
+            "custom keyeq is direct_call(eq_fn, d, ckey, key) at both sites"
+        );
+    }
+
+    /// Custom r_dict lookup helpers rtype setitem / getitem / contains
+    /// through the normal OrderedDictRepr hop pipeline. Annotating a
+    /// user graph of `r_dict(eq, hash)` still needs FunctionRepr
+    /// `get_unique_llfn` (hlinvoke of the unique eq/hash); this test
+    /// uses Ptr-typed callables so the helpers `getfield` + `indirect_call`
+    /// the stored `fnkeyeq` / `fnkeyhash`.
+    #[test]
+    fn ordereddictrepr_custom_eq_hash_rtypes_setitem_getitem_contains() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_custom_eq_hash_dict_repr(rtyper.clone());
+        let dict_lltype = repr.lowleveltype().clone();
+
+        let llops_set = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype.clone()));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_value = Variable::new();
+        v_value.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "setitem".to_string(),
+                vec![
+                    Hlvalue::Variable(v_dict),
+                    Hlvalue::Variable(v_key),
+                    Hlvalue::Variable(v_value),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops_set.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+        let result = repr
+            .rtype_setitem(&hop)
+            .unwrap_or_else(|err| panic!("custom rtype_setitem: {err:?}"));
+        assert!(result.is_none());
+        assert!(
+            llops_set.borrow()._called_exception_is_here_or_cannot_occur,
+            "custom_eq_hash setitem uses hop.exception_is_here()"
+        );
+        let Hlvalue::Constant(c) = &llops_set.borrow().ops[0].args[0] else {
+            panic!("setitem funcptr");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_setitem"));
+
+        let llops_get = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype.clone()));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "getitem".to_string(),
+                vec![Hlvalue::Variable(v_dict), Hlvalue::Variable(v_key)],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops_get.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Impossible, SomeValue::Impossible]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+        let result = repr
+            .rtype_getitem(&hop)
+            .unwrap_or_else(|err| panic!("custom rtype_getitem: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let Hlvalue::Constant(c) = &llops_get.borrow().ops[0].args[0] else {
+            panic!("getitem funcptr");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_getitem"));
+
+        let llops_in = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(rtyper, None)));
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Bool));
+        let hop = HighLevelOp::new(
+            repr.base.rtyper.clone(),
+            SpaceOperation::new(
+                "contains".to_string(),
+                vec![Hlvalue::Variable(v_dict), Hlvalue::Variable(v_key)],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops_in.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::Impossible, SomeValue::Impossible]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+        let result =
+            pair_ordereddict_repr_rtype_contains(repr.as_ref(), signed_repr().as_ref(), &hop)
+                .unwrap_or_else(|err| panic!("custom rtype_contains: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let Hlvalue::Constant(c) = &llops_in.borrow().ops[0].args[0] else {
+            panic!("contains funcptr");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_contains"));
     }
 }
