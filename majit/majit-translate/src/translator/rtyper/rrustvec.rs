@@ -456,6 +456,14 @@ pub fn pair_rustvec_integer_convert_from_to(
 
 /// `newrustvec(kind)` / `newrustvec(kind, lengthhint)` — `ll_newemptylist` /
 /// `ll_newlist_hint` for the result repr.
+///
+/// `newrustvec(kind, count, item)` follows `rtype_alloc_and_set`: the fill
+/// value converts through the result repr's `item_repr`. `ListRepr._setup_repr`
+/// and `FixedSizeListRepr._setup_repr` keep that field from `s_item` when it
+/// is missing; [`RustVecRepr`] stores the same field from `SomeRustVec.s_item`
+/// (`rtyper_makerepr`). An instance item then takes
+/// `pair_instance_instance_convert_from_to` (upcast to the root `item_repr`)
+/// instead of `getprimitiverepr` on the item pointer.
 pub fn rtype_newrustvec(hop: &HighLevelOp) -> RTypeResult {
     let r_result = hop
         .r_result
@@ -664,6 +672,157 @@ mod tests {
                 assert_only_direct_call_to(&llops, vec_helper_path(op, kind));
             }
         }
+    }
+
+    /// `newrustvec(kind, count, item)` converts the fill value through the
+    /// result `RustVecRepr.item_repr` (`rtype_alloc_and_set`). A classdef-less
+    /// `SomeRustVec.s_item` is the root `InstanceRepr`; a concrete instance
+    /// argument upcasts with `pair_instance_instance_convert_from_to`. `Int`
+    /// and `Float` items stay on their own item repr.
+    #[test]
+    fn translate_operation_newrustvec_alloc_and_set_converts_through_item_repr() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInstance, SomeRustVec, SomeValue};
+        use crate::translator::rtyper::rclass::InstanceRepr;
+        use std::collections::BTreeMap;
+
+        let (_ann, rtyper) = setup_rtyper();
+        let r_signed = rtyper
+            .getprimitiverepr(&LowLevelType::Signed)
+            .expect("Signed primitive repr");
+
+        // Result `s_item` is a classdef-less instance. Its pointer has no
+        // primitive repr, so `inputarg(LowLevelType(item_ll))` cannot rtype it.
+        let s_item = SomeValue::Instance(SomeInstance::new(None, false, BTreeMap::new()));
+        let r_vec = rtyper
+            .getrepr(&SomeValue::RustVec(SomeRustVec::new(s_item)))
+            .expect("classdef-less RustVec repr");
+        let item_repr = {
+            let any_r: &dyn std::any::Any = r_vec.as_ref();
+            any_r
+                .downcast_ref::<RustVecRepr>()
+                .expect("RustVecRepr")
+                .item_repr
+                .clone()
+        };
+        let item_any: &dyn std::any::Any = item_repr.as_ref();
+        let root = item_any
+            .downcast_ref::<InstanceRepr>()
+            .expect("classdef-less s_item is an InstanceRepr");
+        assert!(root.classdef().is_none());
+        let item_ll = item_repr.lowleveltype().clone();
+        assert!(
+            rtyper.getprimitiverepr(&item_ll).is_err(),
+            "root instance pointer must not have a primitive repr"
+        );
+
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let r_src = rtyper
+            .getrepr(&SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                true,
+                BTreeMap::new(),
+            )))
+            .expect("PyObject instance repr");
+        let llops = rtype_alloc_and_set(&rtyper, r_vec, r_signed.clone(), r_src);
+        let ops = llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "cast_pointer"),
+            "instance item must upcast to the root item repr, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        let direct = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .expect("alloc_and_set direct_call");
+        let Hlvalue::Constant(func) = &direct.args[0] else {
+            panic!("expected Constant funcptr, got {:?}", direct.args[0]);
+        };
+        let dbg = format!("{:?}", func.value);
+        let path = vec_helper_path(VecOp::AllocAndSet, VecItemKind::Ref);
+        assert!(
+            dbg.contains(&format!("\"{path}\"")),
+            "expected funcptr {path} in {dbg}"
+        );
+        // The fill argument is the upcast, whose concretetype is `item_repr`.
+        match &direct.args[2] {
+            Hlvalue::Variable(var) => {
+                assert_eq!(var.concretetype().as_ref(), Some(&item_ll));
+            }
+            other => panic!("expected upcast Variable, got {other:?}"),
+        }
+        drop(ops);
+
+        for kind in [VecItemKind::Int, VecItemKind::Float] {
+            let r_vec = rust_vec_repr(&rtyper, kind);
+            let r_item = {
+                let any_r: &dyn std::any::Any = r_vec.as_ref();
+                any_r
+                    .downcast_ref::<RustVecRepr>()
+                    .expect("RustVecRepr")
+                    .item_repr
+                    .clone()
+            };
+            let llops = rtype_alloc_and_set(&rtyper, r_vec, r_signed.clone(), r_item);
+            assert_only_direct_call_to(&llops, vec_helper_path(VecOp::AllocAndSet, kind));
+        }
+    }
+
+    /// Build `newrustvec(kind, count, item)` and rtype it. `r_item` is the
+    /// source repr of the fill value; the result repr supplies `item_repr`.
+    fn rtype_alloc_and_set(
+        rtyper: &std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        r_vec: Arc<dyn Repr>,
+        r_count: Arc<dyn Repr>,
+        r_item: Arc<dyn Repr>,
+    ) -> std::rc::Rc<std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>> {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(r_vec.lowleveltype().clone()));
+        let kind = rust_vec_item_kind(r_vec.lowleveltype()).expect("RustVec item kind");
+        let kind_letter = Hlvalue::Constant(crate::flowspace::model::Constant::new(
+            ConstValue::byte_str(kind.kind_char().to_string()),
+        ));
+        let v_count = Variable::new();
+        v_count.set_concretetype(Some(LowLevelType::Signed));
+        let v_item = Variable::new();
+        v_item.set_concretetype(Some(r_item.lowleveltype().clone()));
+        let v_count_h = Hlvalue::Variable(v_count);
+        let v_item_h = Hlvalue::Variable(v_item);
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "newrustvec".to_string(),
+                vec![kind_letter.clone(), v_count_h.clone(), v_item_h.clone()],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v
+            .borrow_mut()
+            .extend([kind_letter, v_count_h, v_item_h]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([None, Some(r_count), Some(r_item)]);
+        *hop.r_result.borrow_mut() = Some(r_vec);
+        rtyper
+            .translate_operation(&hop)
+            .unwrap_or_else(|err| panic!("translate_operation newrustvec alloc_and_set: {err:?}"));
+        llops
     }
 
     /// `rbuiltin.py rtype_cast_ptr_to_int` always yields `Signed`.

@@ -77,7 +77,9 @@
 //!     `Call(SyntheticTransparentCtor)` for later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
-//!     / __len / __nullary_*)`.
+//!     / __len / __nullary_*)`. `new_array_clear` is produced later by
+//!     `do_fixed_newlist_clear`, after the rtyper, so a `[i64; N]`
+//!     repeat stays the `__array_repeat(fill, count)` call here.
 //!
 //! ### Terminators
 //!   - `Return` → `returnblock`.
@@ -15180,20 +15182,21 @@ impl<'a> Lowering<'a> {
                 self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
             }
-            // `Repeat(elem, ty, count)` — `[v; N]` literal. The decodable
-            // shape follows upstream `transform.py:36-50` and
-            // `rlist.py`: `newlist(fill)` followed by
-            // `mul(list, count)`, which the transform pass collapses to
-            // `alloc_and_set(count, fill)`.
+            // `Repeat(elem, elem_ty, count)` — `[v; N]` literal. The
+            // decodable shape follows upstream `transform.py` and
+            // `rlist.py`: `newlist(fill)` followed by `mul(list, count)`,
+            // which the transform pass collapses to `alloc_and_set`.
+            // `do_fixed_newlist_clear`'s `new_array_clear` is that later
+            // pass, so the repeat reaches the rtyper as
+            // `__array_repeat(fill, count)`. The transparent `Array` ctor
+            // is not equivalent: `Repeat` carries one fill value and a
+            // count, not per-slot `__pos_N` writes.
             //
-            // `__array_repeat` remains deliberately unregistered for the
-            // fallback shape when Charon supplies a const-generic reference
-            // that cannot be decoded. In that case the old 1-arg call is
-            // preserved verbatim and the graph follows its existing legacy
-            // walker path. The transparent `Array` ctor is not equivalent:
-            // `Repeat` carries one fill value and a count, not per-slot
-            // `__pos_N` writes.
-            Rvalue::Repeat(elem, _ty, count, _) => {
+            // The result is the list object (`newlist` / `OpKind::NewList`
+            // is `ValueType::Ref`). `rtype_alloc_and_set` concretetypes
+            // that pointer `GcRef`. Declaring `Int` makes the legacy
+            // walker `Signed` on the same variable.
+            Rvalue::Repeat(elem, _elem_ty, count, _) => {
                 let arg = self.resolve_operand(mir_bb, elem)?;
                 let res = self
                     .graph
@@ -28449,7 +28452,7 @@ impl<'a> Lowering<'a> {
                             }
                         } else {
                             OpKind::ArrayLen {
-                                base: args[0].clone(),
+                                base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
                                 array_type_id: self.slice_object_array_type_id(&reg),
                                 nolength: false,
                             }
@@ -28524,7 +28527,7 @@ impl<'a> Lowering<'a> {
                             }
                         } else {
                             OpKind::ArrayLen {
-                                base: args[0].clone(),
+                                base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
                                 array_type_id: self.slice_object_array_type_id(&reg),
                                 nolength: false,
                             }
@@ -28679,6 +28682,11 @@ impl<'a> Lowering<'a> {
                 // list annotation.  Same routing
                 // [`is_concrete_iter_constructor`] gives the container
                 // `iter`.
+                // `IntArray::len` / `FloatArray::len` are the same call:
+                // the receiver is the `{ block, len }` struct, so `__len`
+                // becomes `getattr("__len__")`. [`Self::is_container_len`]
+                // emits the `FieldRead` of `len` (`typed_array_len_owner`)
+                // instead of entering that body.
                 if args.len() == 1 && self.is_container_len(&reg) {
                     let res = self
                         .graph
@@ -37412,14 +37420,17 @@ impl<'a> Lowering<'a> {
     /// The length-prefixed containers `IntArray` / `FloatArray`
     /// (`pyre-object/src/int_array.rs` / `float_array.rs`) expose the same
     /// inherent `len()` whose body reads the nested LIST `length` word
-    /// (`rlist.py` `("length", Signed)`).  Entering the body dead-ends at
-    /// `AtomicUsize::load`; recognising the call emits a `FieldRead` of
-    /// `len` (`jtransform.py` `_handle_list_call` `list.int_len`).
+    /// (`rlist.py` `("length", Signed)`).  The receiver is the
+    /// `{ block, len }` struct, not a `SomeList`, so the read is that
+    /// field ([`Self::typed_array_len_owner`]), not `ListRepr.rtype_len`.
+    /// Entering the body dead-ends at `AtomicUsize::load`; recognising
+    /// the call emits a `FieldRead` of `len`
+    /// (`jtransform.py` `_handle_list_call` `list.int_len`).
     ///
     /// `FixedObjectArray::len` is *not* here: it goes to [`OpKind::ArrayLen`]
     /// via [`Self::is_object_array_len`], because its receiver is the
     /// virtualizable array and a `__len` call would pass that array as a
-    /// call argument. `Vec::len` is included: `rlist.ll_length` reads
+    /// call argument. `Vec::len` stays here: `rlist.ll_length` reads
     /// `l.length`, and a field named `"len"` is not that attribute.
     ///
     /// The FunDecl path is the container (`alloc::vec::<Impl>::len` /
@@ -37632,6 +37643,24 @@ impl<'a> Lowering<'a> {
     /// ARRAY identity of a `<[T]>::len` / `is_empty` receiver whose `T` is
     /// an object pointer. Every other slice keeps the identity-less length
     /// read. The identity string itself comes from [`slice_array_type_id`].
+    /// `<[PyObject]>::len` / `is_empty` sees the list, so `len` is
+    /// `AbstractListRepr.rtype_len`. A classdef-less receiver takes
+    /// `len_SomeInstance`, which looks up `__len__`.
+    fn object_slice_arraylen_base(
+        &mut self,
+        bb_id: BlockId,
+        reg: &RegularCall,
+        base: Variable,
+    ) -> Variable {
+        if self.slice_object_array_type_id(reg).is_none() {
+            return base;
+        }
+        self.narrow_value_to_instance_root(bb_id, crate::model::LinkArg::Value(base), "[PyObject]")
+            .as_variable()
+            .expect("an object-pointer slice base stays a Variable")
+            .clone()
+    }
+
     fn slice_object_array_type_id(&self, reg: &RegularCall) -> Option<String> {
         self.slice_swap_elem_tyref(reg)
             .is_some_and(|ty| output_type_is_objectptr(&ty, self.llbc))
@@ -64527,6 +64556,14 @@ fn dont_look_inside_return_class_root(
 /// `List ∪ Instance` is a phi `pairtype` never builds. The spelling is the
 /// same string `published_struct_field_layout` stores, so the stub and the
 /// field project one list.
+///
+/// A one-word `Vec<T>` is the raw `{ptr, len, cap}` header (`RustVecRepr`).
+/// [`tyref_to_field_layout_string`] spells that word `isize`, which this
+/// filter drops, so the `dont_look_inside` trampoline of `look_inside_iff`
+/// (`rlib/jit.py`) would annotate as `SomeInteger` while `func(...)`
+/// annotates as `SomeRustVec`. [`annotation_struct_field_type`] is the
+/// spelling `Bookkeeper::project_rust_vec` reads. The FUNC.RESULT token
+/// stays `i64`: `history.getkind` of the header is `int`.
 fn dont_look_inside_return_container_root(
     output: &TyRef,
     llbc: &Llbc,
@@ -101571,6 +101608,47 @@ mod tests {
         );
         let graph = super::lower_function(&llbc, "vec_header_i").expect("lower vec_header_i");
         assert_cast_ptr_to_int_then_r_uint(&graph, "&mut Vec as *mut Vec as usize");
+    }
+
+    /// `look_inside_iff` (`rlib/jit.py`) emits a `dont_look_inside` trampoline
+    /// that returns the same `Vec` as the original. Lowering records the
+    /// `*mut Vec<…>` container root `project_rust_vec` reads. The `i64`
+    /// FUNC.RESULT token is stamped later by `SemanticFunctionHeader` (`getkind`
+    /// of the raw header is `int`); the marker set is what makes that stamp
+    /// unconditional.
+    #[test]
+    fn look_inside_iff_vec_trampoline_records_rust_vec_root() {
+        let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+        let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+        let context = super::LowerContext::new(&llbc);
+        let opaque = super::dont_look_inside_set_of(&llbc);
+        for (name, root) in [
+            (
+                "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
+                "*mut Vec<*mut u8>",
+            ),
+            (
+                "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_i_trampoline",
+                "*mut Vec<usize>",
+            ),
+            (
+                "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_f_trampoline",
+                "*mut Vec<f64>",
+            ),
+        ] {
+            let fd = llbc
+                .iter_local_fns()
+                .find(|fd| fd.item_meta.name_path() == name)
+                .unwrap_or_else(|| panic!("{name} in majit-rlib LLBC"));
+            let policy = super::strip_crate_prefix(name);
+            assert!(
+                opaque.contains(&policy),
+                "{policy} is the dont_look_inside trampoline"
+            );
+            let graph =
+                super::lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+            assert_eq!(graph.return_container_root.as_deref(), Some(root), "{name}");
+        }
     }
 
     /// `*mut u8 as usize` is the type-erased address (`tyref_is_raw_byte_ptr`);

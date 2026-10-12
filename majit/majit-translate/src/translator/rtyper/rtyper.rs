@@ -1804,7 +1804,13 @@ impl RPythonTyper {
         }
 
         // `block.operations[:] = newops` — replace in place, matching
-        // upstream's slice assignment.
+        // upstream's slice assignment. Upstream `specialize_block` then
+        // calls `insert_link_conversions` and lets the error leave
+        // `specialize` / `specialize_more_blocks` with no handler.
+        // Phase B catches that failure, so a later `Err` or a panic
+        // restores this pre-image instead of keeping the partial write.
+        let preimage = BlockPreimage::capture(block);
+        let mut restore_on_failure = BlockPreimageGuard::arm(block.clone(), preimage);
         let new_ops_vec = std::mem::take(&mut newops.borrow_mut().ops);
         block.borrow_mut().operations = new_ops_vec;
         block.borrow_mut().renamevariables(&varmapping);
@@ -1864,6 +1870,7 @@ impl RPythonTyper {
             self.insert_link_conversions(block, 0)?;
         }
 
+        restore_on_failure.disarm();
         Ok(())
     }
 
@@ -2355,12 +2362,13 @@ impl RPythonTyper {
                     .ok_or_else(|| TyperError::message("raw_store: missing value repr"))?;
                 let v_value = hop.inputarg(&r_value, 2)?;
                 hop.exception_cannot_occur()?;
-                // `_LLOpEntry.specialize_call` passes
-                // `resulttype=hop.r_result.lowleveltype`. For Void that
-                // is still a typed result (`lltype_to_annotation(Void)`
-                // is `s_None`), so `genop` returns a Variable — not
-                // `resulttype=None`, which would hit
-                // `translate_no_return_value` and reject `s_None`.
+                // `Entry.specialize_call` passes
+                // `resulttype=hop.r_result.lowleveltype`.  For `raw_store`
+                // that type is `Void` (`lltype_to_annotation(Void)` is
+                // `s_None`), and `genop` then returns the result Variable.
+                // `resulttype=None` (`GenopResult::Void`) returns no
+                // Variable, and `translate_no_return_value` rejects every
+                // result that is not `s_ImpossibleValue`.
                 let result_lltype = hop
                     .r_result
                     .borrow()
@@ -2526,6 +2534,128 @@ impl RPythonTyper {
             "unimplemented operation: '{}'",
             hop.spaceop.opname
         )))
+    }
+}
+
+/// Pre-image of the block fields `specialize_block` mutates after
+/// `block.operations[:] = newops` (`RPythonTyper.specialize_block`).
+///
+/// `Link` objects are mutated in place (`Block.renamevariables`,
+/// `insert_link_conversions`, `insert_empty_block`), so the `exits`
+/// list is stored together with each link's fields. `inputargs` is
+/// included because `renamevariables` rewrites it in the same step.
+pub(crate) struct BlockPreimage {
+    inputargs: Vec<Hlvalue>,
+    operations: Vec<SpaceOperation>,
+    exits: Vec<LinkRef>,
+    exit_bodies: Vec<LinkPreimage>,
+    exitswitch: Option<Hlvalue>,
+    concretetypes: Vec<(Variable, Option<LowLevelType>)>,
+}
+
+struct LinkPreimage {
+    args: Vec<crate::flowspace::model::LinkArg>,
+    target: Option<BlockRef>,
+    exitcase: Option<Hlvalue>,
+    llexitcase: Option<Hlvalue>,
+    prevblock: Option<Weak<RefCell<Block>>>,
+    last_exception: Option<Hlvalue>,
+    last_exc_value: Option<Hlvalue>,
+}
+
+impl BlockPreimage {
+    pub(crate) fn capture(block: &BlockRef) -> Self {
+        let (inputargs, operations, exits, exitswitch, concretetypes) = {
+            let borrowed = block.borrow();
+            let concretetypes = borrowed
+                .getvariables()
+                .into_iter()
+                .map(|var| {
+                    let concretetype = var.concretetype();
+                    (var, concretetype)
+                })
+                .collect();
+            (
+                borrowed.inputargs.clone(),
+                borrowed.operations.clone(),
+                borrowed.exits.clone(),
+                borrowed.exitswitch.clone(),
+                concretetypes,
+            )
+        };
+        let exit_bodies = exits
+            .iter()
+            .map(|link| {
+                let borrowed = link.borrow();
+                LinkPreimage {
+                    args: borrowed.args.clone(),
+                    target: borrowed.target.clone(),
+                    exitcase: borrowed.exitcase.clone(),
+                    llexitcase: borrowed.llexitcase.clone(),
+                    prevblock: borrowed.prevblock.clone(),
+                    last_exception: borrowed.last_exception.clone(),
+                    last_exc_value: borrowed.last_exc_value.clone(),
+                }
+            })
+            .collect();
+        Self {
+            inputargs,
+            operations,
+            exits,
+            exit_bodies,
+            exitswitch,
+            concretetypes,
+        }
+    }
+
+    pub(crate) fn restore(&self, block: &BlockRef) {
+        for (link, body) in self.exits.iter().zip(&self.exit_bodies) {
+            let mut borrowed = link.borrow_mut();
+            borrowed.args = body.args.clone();
+            borrowed.target = body.target.clone();
+            borrowed.exitcase = body.exitcase.clone();
+            borrowed.llexitcase = body.llexitcase.clone();
+            borrowed.prevblock = body.prevblock.clone();
+            borrowed.last_exception = body.last_exception.clone();
+            borrowed.last_exc_value = body.last_exc_value.clone();
+        }
+        for (var, concretetype) in &self.concretetypes {
+            var.set_concretetype(concretetype.clone());
+        }
+        let mut borrowed = block.borrow_mut();
+        borrowed.inputargs = self.inputargs.clone();
+        borrowed.operations = self.operations.clone();
+        borrowed.exits = self.exits.clone();
+        borrowed.exitswitch = self.exitswitch.clone();
+    }
+}
+
+/// Restores [`BlockPreimage`] unless `specialize_block` finishes.
+/// Phase B observes a panic through `catch_unwind`; `Drop` runs
+/// during unwind, before that caller resumes.
+struct BlockPreimageGuard {
+    block: BlockRef,
+    preimage: Option<BlockPreimage>,
+}
+
+impl BlockPreimageGuard {
+    fn arm(block: BlockRef, preimage: BlockPreimage) -> Self {
+        Self {
+            block,
+            preimage: Some(preimage),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.preimage = None;
+    }
+}
+
+impl Drop for BlockPreimageGuard {
+    fn drop(&mut self) {
+        if let Some(preimage) = self.preimage.take() {
+            preimage.restore(&self.block);
+        }
     }
 }
 
@@ -8417,6 +8547,140 @@ mod tests {
             rendered.contains("block-entry"),
             "expected 'block-entry' position in where-op: {rendered}",
         );
+    }
+
+    #[test]
+    fn specialize_block_restores_preimage_when_insert_link_conversions_fails() {
+        // `RPythonTyper.specialize_block` assigns `block.operations[:] = newops`
+        // and then runs `insert_link_conversions`. A later error restores the
+        // block from the snapshot taken immediately before that assignment:
+        // operations, exits (including in-place `Link` fields), exitswitch,
+        // and each `getvariables()` concretetype. `signext` lowers to
+        // `int_signext` and, on a canraise block, records
+        // `LlopRaisingExceptions::Removed`, which clears `exitswitch` and
+        // keeps only the no-exception exit. That exit's target inputarg is
+        // `SomeObject`, so `setup_block_entry` inside `insert_link_conversions`
+        // returns `MissingRTypeOperation` after those writes. `_convert_link`
+        // has already cleared a pre-seeded `llexitcase`.
+        use crate::annotator::model::{KnownType, SomeObject};
+        use crate::flowspace::model::c_last_exception;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let signed_var = || {
+            let var = Variable::new();
+            var.annotation
+                .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                    false, false,
+                )))));
+            var.set_concretetype(Some(LowLevelType::Signed));
+            var
+        };
+        let arg0 = signed_var();
+        let arg1 = signed_var();
+        let result = signed_var();
+
+        let startblock = Block::shared(vec![]);
+        let graph = Rc::new(RefCell::new(FunctionGraph::new(
+            "signext_restore",
+            startblock,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        if let Hlvalue::Variable(var) = returnblock.borrow().inputargs[0].clone() {
+            var.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        }
+
+        let obj = Variable::new();
+        obj.annotation
+            .replace(Some(Rc::new(SomeValue::Object(SomeObject::new(
+                KnownType::Other,
+                false,
+            )))));
+        let normal_target = Block::shared(vec![Hlvalue::Variable(obj)]);
+        let exc_target = Block::shared(vec![]);
+        let noexclink = Link::new(
+            vec![Hlvalue::Variable(result.clone())],
+            Some(normal_target),
+            None,
+        )
+        .into_ref();
+        let junk_llexitcase = Hlvalue::Constant(Constant::new(ConstValue::Bool(true)));
+        noexclink.borrow_mut().llexitcase = Some(junk_llexitcase.clone());
+        let exclink = Link::new(vec![], Some(exc_target), None).into_ref();
+
+        let block = Block::shared(vec![
+            Hlvalue::Variable(arg0.clone()),
+            Hlvalue::Variable(arg1.clone()),
+        ]);
+        block.borrow_mut().operations = vec![SpaceOperation::new(
+            "signext",
+            vec![
+                Hlvalue::Variable(arg0.clone()),
+                Hlvalue::Variable(arg1.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        )];
+        block.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        block.closeblock(vec![noexclink.clone(), exclink.clone()]);
+        assert!(block.borrow().canraise());
+        assert!(!block.borrow().is_final_block());
+
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&block), Some(graph));
+
+        let ops_before = block.borrow().operations.clone();
+        let exits_before = block.borrow().exits.clone();
+        let exitswitch_before = block.borrow().exitswitch.clone();
+        let concretes_before: Vec<(Variable, Option<LowLevelType>)> = block
+            .borrow()
+            .getvariables()
+            .into_iter()
+            .map(|var| {
+                let concretetype = var.concretetype();
+                (var, concretetype)
+            })
+            .collect();
+        assert_eq!(concretes_before.len(), 3);
+        let noexclink_args_before = noexclink.borrow().args.clone();
+        let exclink_args_before = exclink.borrow().args.clone();
+        let noexclink_target = noexclink.borrow().target.clone();
+        let exclink_target = exclink.borrow().target.clone();
+
+        let err = rtyper.specialize_block(&block).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            err.is_missing_rtype_operation(),
+            "expected MissingRTypeOperation from the link target, got {rendered}",
+        );
+        assert!(
+            rendered.contains("SomeObject"),
+            "failure must be the SomeObject target inside insert_link_conversions, got {rendered}",
+        );
+
+        assert_eq!(block.borrow().operations, ops_before);
+        assert_eq!(block.borrow().operations[0].opname, "signext");
+        assert_eq!(block.borrow().exitswitch, exitswitch_before);
+        assert!(block.borrow().canraise());
+        let exits_after = block.borrow().exits.clone();
+        assert_eq!(exits_after.len(), exits_before.len());
+        for (before, after) in exits_before.iter().zip(&exits_after) {
+            assert!(Rc::ptr_eq(before, after));
+        }
+        assert_eq!(noexclink.borrow().args, noexclink_args_before);
+        assert_eq!(exclink.borrow().args, exclink_args_before);
+        assert_eq!(noexclink.borrow().llexitcase, Some(junk_llexitcase));
+        assert!(match (&noexclink.borrow().target, &noexclink_target) {
+            (Some(left), Some(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        });
+        assert!(match (&exclink.borrow().target, &exclink_target) {
+            (Some(left), Some(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        });
+        for (var, concretetype) in &concretes_before {
+            assert_eq!(&var.concretetype(), concretetype);
+        }
     }
 
     #[test]
