@@ -14,12 +14,23 @@
 use crate::GcFlags;
 
 /// Number of bits reserved for the type ID in the lower half.
-pub const TYPE_ID_BITS: u32 = usize::BITS / 2;
+/// Defined in `majit-ir` so `FailDescrCell` can stamp the same word.
+pub const TYPE_ID_BITS: u32 = majit_ir::GC_TYPE_ID_BITS;
 pub const TYPE_ID_MASK: u64 = (1u64 << TYPE_ID_BITS) - 1;
 
 /// Shift applied to `GcFlags` to position it in the upper half of the
 /// logical header word. `GcFlags` declares each flag at position 0..N.
-pub const FLAG_SHIFT: u32 = TYPE_ID_BITS;
+pub const FLAG_SHIFT: u32 = majit_ir::GC_FLAG_SHIFT;
+
+/// One definition of the immortal-leaf header word, re-exported from
+/// `majit-ir` (`init_gc_object_immortal` for type id 0).
+pub use majit_ir::{
+    GC_FLAG_SHIFT, GC_HEADER_WORD_SIZE, GC_IMMORTAL_LEAF_HEADER, GC_TYPE_ID_BITS,
+    GCFLAG_NO_HEAP_PTRS, GCFLAG_TRACK_YOUNG_PTRS,
+};
+
+const _: () = assert!(GcHeader::SIZE == GC_HEADER_WORD_SIZE);
+const _: () = assert!(FLAG_SHIFT == GC_FLAG_SHIFT);
 
 /// `llarena.round_up_for_allocation` / `memory_alignment()`: objects align
 /// to the wider of the physical header and a machine word.
@@ -436,6 +447,16 @@ mod tests {
         };
         assert!(!host.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
         assert!(!host.is_forwarded());
+    }
+
+    #[test]
+    fn immortal_leaf_header_matches_init_gc_object_immortal() {
+        let hdr = GcHeader::with_flags(
+            0,
+            GcFlags::GCFLAG_NO_HEAP_PTRS | GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
+        );
+        assert_eq!(hdr.tid_and_flags, GC_IMMORTAL_LEAF_HEADER);
+        assert_eq!(GcHeader::SIZE, GC_HEADER_WORD_SIZE);
     }
 
     #[test]

@@ -7926,8 +7926,10 @@ impl MiniMarkGC {
     /// readable `GcHeader`: interned exact-str wrappers, off-heap `rstr.STR`
     /// / `BytesBlock` payloads (`init_gc_object_immortal`),
     /// `Function.name` (the function's name `STR`, which *is* the code's
-    /// name string object), and the no-hook `malloc_typed` fallbacks for
-    /// exact `W_ListObject` / `W_TupleObject`. Membership stays for families
+    /// name string object), the no-hook `malloc_typed` fallbacks for
+    /// exact `W_ListObject` / `W_TupleObject`, and `FailDescrCell` /
+    /// `descr_instance_ptr` cells (`init_gc_object_immortal` flags, the
+    /// word `jf_descr` / `jf_force_descr` name). Membership stays for families
     /// whose header is readable but not an immortal leaf: R2 non-leaf types /
     /// modules / BuiltinCode / those list and tuple fallbacks (`malloc_typed`,
     /// flags=0), and the R7 ItemsBlock fallback (zeroed header).

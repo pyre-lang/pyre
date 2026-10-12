@@ -125,6 +125,34 @@ use serde::{Deserialize, Serialize};
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
 pub type DescrRef = Arc<dyn Descr>;
 
+/// Width of the type-id half of the GC header word (`LONG_BIT // 2`).
+/// `incminimark.py` places `first_gcflag` at this shift.
+pub const GC_TYPE_ID_BITS: u32 = usize::BITS / 2;
+
+/// Flag half of the GC header word. `GcHeader` applies this shift when it
+/// writes `tid_and_flags`.
+pub const GC_FLAG_SHIFT: u32 = GC_TYPE_ID_BITS;
+
+/// Physical size of the GC header word (`GcHeader::SIZE`). The prefix is a
+/// `u64` even on wasm32, so a payload with eight-byte alignment stays aligned.
+pub const GC_HEADER_WORD_SIZE: usize = std::mem::size_of::<u64>();
+
+/// incminimark `GCFLAG_TRACK_YOUNG_PTRS` (`first_gcflag << 0`).
+pub const GCFLAG_TRACK_YOUNG_PTRS: u64 = 1 << 0;
+
+/// incminimark `GCFLAG_NO_HEAP_PTRS` (`first_gcflag << 1`).
+pub const GCFLAG_NO_HEAP_PTRS: u64 = 1 << 1;
+
+/// Header word `init_gc_object_immortal` writes for type id 0:
+/// `GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`.
+///
+/// `jf_descr` / `jf_force_descr` cells are prebuilt leaves (`AbstractDescr`
+/// is a GC object whose header `IncrementalMiniMarkGC.visit` reads). Type id
+/// 0 is enough: the `NO_HEAP_PTRS` test returns before membership or the
+/// type table.
+pub const GC_IMMORTAL_LEAF_HEADER: u64 =
+    (GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS) << GC_FLAG_SHIFT;
+
 /// Thin-pointer wrapper for descrs whose address is baked into JIT-emitted
 /// code.  `history.py AbstractDescr.{hide,show}` parity: PyPy bakes
 /// the GCREF of an `AbstractFailDescr` directly and recovers via
@@ -134,21 +162,35 @@ pub type DescrRef = Arc<dyn Descr>;
 /// Rust's `Arc<dyn Descr>` is a fat pointer (data + vtable).  Codegen can
 /// only bake the data half, so reconstructing the fat Arc at recovery
 /// time needs a side-channel for the vtable.  `FailDescrCell` is a
-/// concrete-typed wrapper: the cell is the 16 B fat `DescrRef`, and
-/// [`FailDescrStore`] keeps many cells in one `Vec` so `thin_ptr` still
-/// bakes a complete identity without a 16 B `Box` per guard.
-/// [`recover_fail_descr_cell`] reads the descr back without a registry.
+/// concrete-typed wrapper: the cell is the 16 B fat `DescrRef` behind an
+/// immortal GC header word, and [`FailDescrStore`] keeps many cells in one
+/// `Vec` so `thin_ptr` still bakes a complete identity without a 16 B `Box`
+/// per guard. [`recover_fail_descr_cell`] reads the descr back without a
+/// registry.
 ///
 /// The cell is the unit kept alive by
 /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`);
 /// the inner `DescrRef` carries the dynamic trait dispatch.
+///
+/// Layout: `[immortal header word][DescrRef]`. [`thin_ptr`] is the address
+/// of the `DescrRef`, so `header_of` / `IncrementalMiniMarkGC.visit` read
+/// the prefix and `recover_fail_descr_cell` still sees a `FailDescrCell`
+/// payload at that address minus the header.
+#[repr(C)]
 pub struct FailDescrCell {
+    header: u64,
     pub descr: DescrRef,
 }
 
+const _: () = assert!(std::mem::offset_of!(FailDescrCell, descr) == GC_HEADER_WORD_SIZE);
+const _: () = assert!(std::mem::align_of::<FailDescrCell>() <= GC_HEADER_WORD_SIZE);
+
 impl FailDescrCell {
     pub fn new(descr: DescrRef) -> Self {
-        Self { descr }
+        Self {
+            header: GC_IMMORTAL_LEAF_HEADER,
+            descr,
+        }
     }
 
     pub fn wrap(descr: DescrRef) -> Box<Self> {
@@ -156,17 +198,30 @@ impl FailDescrCell {
     }
 
     /// Address baked into `jf_descr` / `jf_force_descr`.
+    ///
+    /// This is the payload address (after the immortal header word), so
+    /// readers that cast it to a `DescrRef` / recover through
+    /// [`from_thin_ptr`] stay valid and `header_of` is in-bounds.
     pub fn thin_ptr(cell: &Self) -> usize {
-        cell as *const Self as usize
+        std::ptr::addr_of!(cell.descr) as usize
+    }
+
+    /// Inverse of [`thin_ptr`]: the cell whose payload address is `addr`.
+    ///
+    /// # Safety
+    /// `addr` must be [`thin_ptr`] of a live cell.
+    pub unsafe fn from_thin_ptr<'a>(addr: usize) -> &'a Self {
+        unsafe { &*((addr - GC_HEADER_WORD_SIZE) as *const Self) }
     }
 }
 
 /// Keep-alive for baked [`FailDescrCell`] addresses.
 ///
-/// One `Vec` of inline 16 B fat pointers instead of one `Box` per guard:
-/// `with_capacity(n)` is a single `n * 16` heap, so the 16-byte class
-/// is not hit on every guard. Chunks never reallocate once a thin
-/// pointer has been handed out.
+/// One `Vec` of inline headed cells instead of one `Box` per guard:
+/// `with_capacity(n)` is a single `n * (header + 16)` heap, so the 16-byte
+/// class is not hit on every guard. Chunks never reallocate once a thin
+/// pointer has been handed out. Each element's header word sits immediately
+/// before its [`FailDescrCell::thin_ptr`].
 #[derive(Default)]
 pub struct FailDescrStore {
     chunks: Vec<Vec<FailDescrCell>>,
@@ -211,7 +266,7 @@ impl std::fmt::Debug for FailDescrCell {
         write!(
             f,
             "FailDescrCell(cell={:p}, descr={:p})",
-            self as *const Self,
+            FailDescrCell::thin_ptr(self) as *const (),
             Arc::as_ptr(&self.descr) as *const ()
         )
     }
@@ -226,7 +281,7 @@ impl std::fmt::Debug for FailDescrCell {
 /// references this address.  Calling with any other address — including
 /// the address of a different concrete type — is undefined behavior.
 pub unsafe fn recover_fail_descr_cell(addr: usize) -> DescrRef {
-    let cell = unsafe { &*(addr as *const FailDescrCell) };
+    let cell = unsafe { FailDescrCell::from_thin_ptr(addr) };
     cell.descr.clone()
 }
 
@@ -10161,8 +10216,16 @@ mod tests {
     fn wrap_bakes_a_thin_ptr_that_recovers_the_same_descr() {
         let descr: DescrRef = Arc::new(SimpleFailDescr::new(1, 2, vec![Type::Int]));
         let cell = FailDescrCell::wrap(descr.clone());
-        assert!(std::mem::size_of_val(&*cell) <= 16);
+        assert_eq!(std::mem::size_of::<DescrRef>(), 16);
+        assert_eq!(
+            std::mem::offset_of!(FailDescrCell, descr),
+            GC_HEADER_WORD_SIZE
+        );
         let ptr = FailDescrCell::thin_ptr(&cell);
+        assert_eq!(
+            unsafe { *(ptr as *const u64).sub(1) },
+            GC_IMMORTAL_LEAF_HEADER
+        );
         let recovered = unsafe { recover_fail_descr_cell(ptr) };
         assert!(Arc::ptr_eq(&descr, &recovered));
     }
@@ -10174,10 +10237,31 @@ mod tests {
         let mut store = FailDescrStore::with_capacity(2);
         let pa = store.push(a.clone());
         let pb = store.push(b.clone());
+        assert_eq!(
+            unsafe { *(pa as *const u64).sub(1) },
+            GC_IMMORTAL_LEAF_HEADER
+        );
+        assert_eq!(
+            unsafe { *(pb as *const u64).sub(1) },
+            GC_IMMORTAL_LEAF_HEADER
+        );
         let ra = unsafe { recover_fail_descr_cell(pa) };
         let rb = unsafe { recover_fail_descr_cell(pb) };
         assert!(Arc::ptr_eq(&a, &ra));
         assert!(Arc::ptr_eq(&b, &rb));
+    }
+
+    #[test]
+    fn descr_instance_ptr_stamps_the_immortal_header() {
+        let descr: DescrRef = Arc::new(SimpleFailDescr::new(5, 6, vec![Type::Int]));
+        let ptr = descr_instance_ptr(&descr);
+        assert_eq!(
+            unsafe { *(ptr as *const u64).sub(1) },
+            GC_IMMORTAL_LEAF_HEADER
+        );
+        let recovered = unsafe { recover_fail_descr_cell(ptr) };
+        assert!(Arc::ptr_eq(&descr, &recovered));
+        assert_eq!(descr_instance_ptr(&descr), ptr);
     }
 
     /// `class_word_field()` is the layout's own answer, and "this layout has
