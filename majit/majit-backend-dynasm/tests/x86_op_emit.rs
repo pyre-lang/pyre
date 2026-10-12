@@ -2103,6 +2103,127 @@ fn call_assembler_returns_int_and_float_from_the_dead_frame() {
     let _keep = (int_callee, float_callee);
 }
 
+extern "C" fn call_assembler_return_const(_force_token: i64) -> i64 {
+    7
+}
+
+extern "C" fn force_caller_and_return(force_token: i64) -> i64 {
+    let ptr = FORCE_BACKEND.with(Cell::get);
+    if ptr.is_null() {
+        FORCE_SEEN.with(|cell| cell.set(Some(i64::MIN)));
+        return 7;
+    }
+    let backend = unsafe { &*ptr };
+    let recorded = catch_unwind(AssertUnwindSafe(|| {
+        match backend.force(GcRef(force_token as usize)) {
+            Some(frame) => backend.get_int_value(&frame, 0),
+            None => -2,
+        }
+    }));
+    let value = match recorded {
+        Ok(value) => value,
+        Err(_) => -3,
+    };
+    FORCE_SEEN.with(|cell| cell.set(Some(value)));
+    7
+}
+
+fn compile_call_assembler_force_callee(
+    backend: &mut DynasmBackend,
+    helper: extern "C" fn(i64) -> i64,
+) -> Arc<JitCellToken> {
+    let token = Arc::new(JitCellToken::new(next_token_id()));
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let token_arg = inputargs[0].opref();
+    let call = Op::new(
+        OpCode::CallI,
+        &[rb(OpRef::const_int(helper as usize as i64)), rb(token_arg)],
+    );
+    call.pos().set(OpRef::int_op(1));
+    call.setdescr(call_descr(vec![Type::Ref], Type::Int, true, 8));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER callee: {err:?}"));
+    assert_ne!(token.ll_function_addr(), 0, "callee entry was not baked");
+    token
+}
+
+fn compile_call_assembler_force_caller(
+    backend: &mut DynasmBackend,
+    callee: &Arc<JitCellToken>,
+) -> JitCellToken {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let token = JitCellToken::new(next_token_id());
+    let force_token = Op::new(OpCode::ForceToken, &[]);
+    force_token.pos().set(OpRef::ref_op(1));
+    let call = Op::new(OpCode::CallAssemblerI, &[rb(OpRef::ref_op(1))]);
+    call.pos().set(OpRef::int_op(2));
+    call.setdescr(Arc::new(AssemblerLoopDescr {
+        token: Arc::clone(callee),
+    }) as DescrRef);
+    let guard = Op::new(OpCode::GuardNotForced, &[]);
+    guard.pos().set(OpRef::void_op(3));
+    guard.setdescr(make_resume_guard_descr_typed(vec![Type::Int, Type::Int]));
+    guard.set_fail_arg_types(vec![Type::Int, Type::Int]);
+    guard.setfailargs(vec![rb(i0), rb(OpRef::int_op(2))].into());
+    let ops: Vec<OpRc> = vec![
+        force_token,
+        call,
+        guard,
+        finish_of(OpRef::int_op(2), Type::Int, 4),
+    ]
+    .into_iter()
+    .map(OpRc::new)
+    .collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER caller: {err:?}"));
+    token
+}
+
+#[test]
+fn call_assembler_async_force_reads_spilled_failarg() {
+    // `call_assembler` leaves the result register's jitframe home alone.
+    // `AbstractLLCPU.force` only copies `jf_force_descr` into `jf_descr`.
+    // The live fail arg spilled by `before_call(SAVE_ALL_REGS)` is what
+    // `force` can read while the callee is still inside the call. Once the
+    // callee returns, `_call_assembler_load_result` has the result and
+    // `GUARD_NOT_FORCED` fails into the recovery stub, which saves it.
+    let _lock = lock_exception_cells();
+    let mut backend = backend_with_call_assembler_layout();
+    let quiet = compile_call_assembler_force_callee(&mut backend, call_assembler_return_const);
+    let forcing = compile_call_assembler_force_callee(&mut backend, force_caller_and_return);
+    let quiet_caller = compile_call_assembler_force_caller(&mut backend, &quiet);
+    let forcing_caller = compile_call_assembler_force_caller(&mut backend, &forcing);
+
+    let quiet_frame = backend.execute_token(&quiet_caller, &[Value::Int(42)]);
+    assert!(backend.get_latest_descr(&quiet_frame).is_finish());
+    assert_eq!(backend.get_int_value(&quiet_frame, 0), 7);
+
+    FORCE_SEEN.with(|cell| cell.set(None));
+    FORCE_BACKEND.with(|cell| cell.set(&backend as *const DynasmBackend));
+    let _clear = ClearForceBackend;
+    let forced = backend.execute_token(&forcing_caller, &[Value::Int(42)]);
+    let during = FORCE_SEEN.with(Cell::get);
+    assert_eq!(
+        during,
+        Some(42),
+        "force() must observe the spilled fail arg"
+    );
+    assert!(
+        !backend.get_latest_descr(&forced).is_finish(),
+        "GUARD_NOT_FORCED must fail after force()"
+    );
+    assert_eq!(backend.get_int_value(&forced, 0), 42);
+    assert_eq!(backend.get_int_value(&forced, 1), 7);
+    let _keep = (quiet, forcing);
+}
+
 fn errno_ptr() -> *mut i32 {
     #[cfg(target_os = "windows")]
     unsafe {

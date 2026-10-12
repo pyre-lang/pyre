@@ -6832,24 +6832,6 @@ impl<'a> AssemblerARM64<'a> {
             let helper_addr = crate::call_assembler_helper_addr() as i64;
             let green_key = self.header_pc as i64;
 
-            // `MIFrame.get_list_of_active_boxes(in_a_call)` clears the
-            // not-yet-defined result register before a suspended caller is
-            // snapshotted.  GUARD_NOT_FORCED's async path observes this
-            // caller while CALL_ASSEMBLER is still running, before x0/d0
-            // contains the result.  Unlike the ordinary guard-failure stub,
-            // `LLGraphCPU.force`/`AbstractLLCPU.force` only switches
-            // `jf_descr`; it cannot save the caller's hardware registers.
-            // Seed the result's jitframe register slot with the same null
-            // placeholder now.  A normal return puts the real value in the
-            // register, and any later guard stub saves that value as usual.
-            if result_type != Type::Void {
-                let result_loc = result_loc.expect("non-void CALL_ASSEMBLER needs a result loc");
-                let slot = deadframe_slot_for_loc(result_loc)
-                    .expect("CALL_ASSEMBLER result must have a deadframe register slot");
-                let offset = Self::slot_offset(slot as usize) as u32;
-                dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, offset]);
-            }
-
             if !is_resolved {
                 let force_addr = crate::call_assembler_force_fn_addr() as i64;
                 if force_addr != 0 {
