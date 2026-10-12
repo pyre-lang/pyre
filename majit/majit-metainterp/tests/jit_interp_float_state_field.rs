@@ -647,10 +647,11 @@ mod virt_array_with_float_scalar {
         let mut sym = <MixedState as JitState>::create_sym(&meta, 0);
         state.initialize_sym(&mut sym, &meta);
 
-        // Plain reds live in the portal frame; `__JitSym` keeps `{name}_len`
-        // for is_compatible / fresh-entry sizing and virt-array length
-        // mirrors (fresh-callee capacity).
-        assert_eq!(sym.cells_len, 2);
+        // Plain reds live in the portal frame, including the `[int]`
+        // length (`extract_live` ptr then len). `__JitSym` keeps only
+        // virt-array length mirrors (fresh-callee capacity);
+        // `warmstate.py` `maybe_compile_and_run` does not copy a plain
+        // `[int]` length onto the dispatcher handle.
         assert_eq!(sym.stack_len_value, 2);
         assert_eq!(
             <MixedState as JitState>::count_bound_sym_inputargs(&sym),

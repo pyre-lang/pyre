@@ -436,32 +436,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {}
     };
 
-    // `__JitMeta_<fn>` fields: one `{name}_len: usize` per plain `[int]`
-    // (compatibility / fresh-entry Vec sizing, not identity layout).
-    // Virt arrays do NOT store length in meta: `virtualizable.py` `get_array_length`
-    // reads each one off the live object, so it is neither a meta field nor a box.
-    let meta_fields: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let len_name = quote::format_ident!("{}_len", f.name);
-            quote! { #len_name: usize, }
-        })
-        .collect();
-
     // `__JitSym_<fn>` holds dispatcher bookkeeping, not reds. Plain reds
     // live in the portal frame's identity slots (`MIFrame.setup_call`);
     // vable fields live in `virtualizable_boxes`; the vable identity lives
     // in the ref bank / `virtualizable_boxes[-1]`.
-    // Plain `[int]` lengths are a compatibility check and fresh-entry Vec
-    // sizing, copied from meta at `create_sym`. They are not identity layout.
     // Virt-array length mirrors feed `recursive_fresh_entry_vable_capacities`.
-    let sym_array_len_fields: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let len_name = quote::format_ident!("{}_len", f.name);
-            quote! { #len_name: usize, }
-        })
-        .collect();
     // Per virt array only a plain `i64` length mirror survives: it feeds the
     // fresh-callee capacity, and is NEVER an inputarg
     // (`virtualizable.py VirtualizableInfo` reads the length off the live object).
@@ -477,16 +456,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // num_scalars + ptr then len per plain `[int]`. The vable
     // identity is a Ref in the ref bank / `virtualizable_boxes[-1]`, not
     // an int slot.
-
-    // ── build_meta: capture plain `[int]` lengths (compat / fresh-entry) ──
-    let build_meta_fields: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let len_name = quote::format_ident!("{}_len", f.name);
-            quote! { #len_name: self.#fname.len(), }
-        })
-        .collect();
 
     // ── extract_live: scalars, then ptr then len per `[int]`, then the vable identity ──
     let extract_scalar_parts: Vec<TokenStream> = scalars
@@ -621,26 +590,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // Recursive CALL_ASSEMBLER portal entry on the JitCodeSym side
     // A recursive callee runs as its own compiled loop with a fresh frame.
     // `recursive_fresh_entry_reds` allocates a fresh `#state_type` (scalars
-    // zeroed = empty frame; arrays re-allocated at the caller's live
-    // capacity) and emits its reds in `extract_live` order.  Capacities come
-    // from this symbolic state: a fixed array's `{name}_len` layout field,
-    // and a virt array's `{name}_len_value` (seeded at
-    // `JitState::initialize_sym`).  The whole
-    // struct equals `state_fields`, so these inits build a complete fresh
-    // `#state_type`.
+    // zeroed = empty frame) and emits its reds in `extract_live` order.
+    // Capacities come from this symbolic state: a virt array's
+    // `{name}_len_value` (seeded at `JitState::initialize_sym`).
+    // A plain `[int]` has no cached length here — the live len red is on
+    // the portal frame, not on `JitCodeSym` — so the override is omitted
+    // when one is declared (matching `recursive_fresh_alloc_free_targets`).
+    // The whole struct equals `state_fields`, so these inits build a
+    // complete fresh `#state_type`.
     let fresh_entry_scalar_inits: Vec<TokenStream> = declared_scalars
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
             quote! { #fname: 0, }
-        })
-        .collect();
-    let fresh_entry_array_inits: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let len_name = quote::format_ident!("{}_len", f.name);
-            quote! { #fname: ::std::vec![0i64; self.#len_name], }
         })
         .collect();
     let fresh_entry_virt_array_inits: Vec<TokenStream> = virt_arrays
@@ -672,16 +634,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .iter()
         .map(|_| quote! { __values.push(majit_ir::Value::Int(0)); })
         .collect();
-    let fresh_entry_array_value_pushes: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! {
-                __values.push(majit_ir::Value::Int(__fresh.#fname.as_ptr() as i64));
-                __values.push(majit_ir::Value::Int(__fresh.#fname.len() as i64));
-            }
-        })
-        .collect();
     let fresh_entry_vable_identity_push: TokenStream = if has_vable_identity {
         quote! {
             __values.push(majit_ir::Value::Ref(majit_ir::GcRef(__base as usize)));
@@ -702,28 +654,29 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // generic fresh value, and the `#state_type` struct literal below omits
     // opaque fields).  Other shapes fall back to the `JitCodeSym` default
     // (`None`) and the recursive dispatcher aborts to the interpreter.
-    let recursive_fresh_entry_reds_override: TokenStream =
-        if declared_ref_count == 0 && declared_float_count == 0 && opaque_fields.is_empty() {
-            quote! {
-                fn recursive_fresh_entry_reds(
-                    &self,
-                ) -> Option<(Vec<majit_ir::Value>, Box<dyn ::core::any::Any>)> {
-                    let __fresh: Box<#state_type> = Box::new(#state_type {
-                        #(#fresh_entry_scalar_inits)*
-                        #(#fresh_entry_array_inits)*
-                        #(#fresh_entry_virt_array_inits)*
-                    });
-                    #fresh_entry_base_let
-                    let mut __values: Vec<majit_ir::Value> = Vec::new();
-                    #(#fresh_entry_scalar_value_pushes)*
-                    #(#fresh_entry_array_value_pushes)*
-                    #fresh_entry_vable_identity_push
-                    Some((__values, __fresh as Box<dyn ::core::any::Any>))
-                }
+    let recursive_fresh_entry_reds_override: TokenStream = if declared_ref_count == 0
+        && declared_float_count == 0
+        && opaque_fields.is_empty()
+        && arrays.is_empty()
+    {
+        quote! {
+            fn recursive_fresh_entry_reds(
+                &self,
+            ) -> Option<(Vec<majit_ir::Value>, Box<dyn ::core::any::Any>)> {
+                let __fresh: Box<#state_type> = Box::new(#state_type {
+                    #(#fresh_entry_scalar_inits)*
+                    #(#fresh_entry_virt_array_inits)*
+                });
+                #fresh_entry_base_let
+                let mut __values: Vec<majit_ir::Value> = Vec::new();
+                #(#fresh_entry_scalar_value_pushes)*
+                #fresh_entry_vable_identity_push
+                Some((__values, __fresh as Box<dyn ::core::any::Any>))
             }
-        } else {
-            quote! {}
-        };
+        }
+    } else {
+        quote! {}
+    };
     let fresh_entry_vable_capacity_pushes: Vec<TokenStream> = virt_arrays
         .iter()
         .map(|(_, f)| {
@@ -731,18 +684,21 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { __capacities.push(self.#len_value_name); }
         })
         .collect();
-    let recursive_fresh_entry_vable_capacities_override: TokenStream =
-        if declared_ref_count == 0 && declared_float_count == 0 && opaque_fields.is_empty() {
-            quote! {
-                fn recursive_fresh_entry_vable_capacities(&self) -> Option<Vec<i64>> {
-                    let mut __capacities = Vec::new();
-                    #(#fresh_entry_vable_capacity_pushes)*
-                    Some(__capacities)
-                }
+    let recursive_fresh_entry_vable_capacities_override: TokenStream = if declared_ref_count == 0
+        && declared_float_count == 0
+        && opaque_fields.is_empty()
+        && arrays.is_empty()
+    {
+        quote! {
+            fn recursive_fresh_entry_vable_capacities(&self) -> Option<Vec<i64>> {
+                let mut __capacities = Vec::new();
+                #(#fresh_entry_vable_capacity_pushes)*
+                Some(__capacities)
             }
-        } else {
-            quote! {}
-        };
+        }
+    } else {
+        quote! {}
+    };
 
     // Recursive CALL_ASSEMBLER portal entry for host allocation and release
     // The compiled caller loop cannot `New` a host `#state_type` through the
@@ -815,15 +771,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
     // ── create_sym: dispatcher handle only. Plain reds are planted by
     // `MIFrame.setup_call` from `__trace_*` argboxes; this no longer mints
-    // InputArgs for them. Plain `[int]` lengths copy from meta for
-    // `is_compatible` and fresh-entry Vec sizing.
-    let create_sym_array_len_inits: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let len_name = quote::format_ident!("{}_len", f.name);
-            quote! { let #len_name: usize = meta.#len_name; }
-        })
-        .collect();
+    // InputArgs for them.
     let create_sym_virt_array_inits: Vec<TokenStream> = virt_arrays
         .iter()
         .map(|(_, f)| {
@@ -831,23 +779,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { let #len_value_name = 0i64; }
         })
         .collect();
-    let create_sym_array_len_names: Vec<syn::Ident> = arrays
-        .iter()
-        .map(|(_, f)| quote::format_ident!("{}_len", f.name))
-        .collect();
     let create_sym_virt_array_len_value_names: Vec<syn::Ident> = virt_arrays
         .iter()
         .map(|(_, f)| quote::format_ident!("{}_len_value", f.name))
-        .collect();
-    // ── is_compatible: check plain `[int]` lengths match meta ──
-    // Virt arrays always compatible (their length is read off the live object).
-    let compat_checks: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let len_name = quote::format_ident!("{}_len", f.name);
-            quote! { && self.#fname.len() == meta.#len_name }
-        })
         .collect();
 
     // ── restore: write values back to state fields ──
@@ -950,17 +884,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             let fname = &f.name;
             let len_value_name = quote::format_ident!("{}_len_value", f.name);
             quote! { sym.#len_value_name = self.#fname.len() as i64; }
-        })
-        .collect();
-
-    // ── validate_close: plain `[int]` lengths in sym match meta ──
-    // Virt arrays always validate (their length is read off the live object).
-    let validate_array_checks: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let len_name = quote::format_ident!("{}_len", f.name);
-            quote! { && sym.#len_name == meta.#len_name }
         })
         .collect();
 
@@ -1179,10 +1102,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         } else {
             quote! {}
         };
-    // No flattened-array length check and the extract override ignores
-    // meta, so the steady entry does not probe `compiled_loops`.
-    let steady_entry_without_meta = compat_checks.is_empty()
-        && (num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0);
+    // `is_compatible` does not read meta, so the steady entry does not probe
+    // `compiled_loops`.
+    let steady_entry_without_meta =
+        num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 || num_arrays > 0;
     let fill_entry_reds_without_meta_override: TokenStream = if steady_entry_without_meta {
         quote! {
             fn fill_entry_reds_without_meta(
@@ -1202,13 +1125,24 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     };
     // Same words as `fill_entry_reds_without_meta`, as `unspecialize_value`
     // results: Int is the value, Ref is the address, Float is `to_bits()`.
-    // Static runs are one `extend_from_slice`; a flattened array's length is
-    // read off the state, so those elements stay a loop.
+    // A plain `[int]` is the live items pointer then `Vec::len()`, two
+    // words in `extract_live` order (`jtransform.py`
+    // `rewrite_op_getarrayitem` raw arm).
     let raw_int_words: Vec<TokenStream> = scalars
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
             quote! { self.#fname as i64 }
+        })
+        .collect();
+    let raw_array_words: Vec<TokenStream> = arrays
+        .iter()
+        .flat_map(|(_, f)| {
+            let fname = &f.name;
+            [
+                quote! { self.#fname.as_ptr() as i64 },
+                quote! { self.#fname.len() as i64 },
+            ]
         })
         .collect();
     let raw_ref_words: Vec<TokenStream> = ref_scalars
@@ -1225,9 +1159,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { (self.#fname as f64).to_bits() as i64 }
         })
         .collect();
-    // `compat_checks` is one `&& self.<arr>.len() == meta.<arr>_len` per
-    // flattened array, so an empty check list is an empty `arrays` list.
-    // The array-push arm under that condition was unreachable.
     let fill_entry_raw_reds_override: TokenStream = if steady_entry_without_meta {
         // A separate `extend_from_slice` of a fixed word list lowers to a
         // handful of stores when this function is outlined. Inlined into
@@ -1242,6 +1173,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         let raw_words: Vec<TokenStream> = raw_int_words
             .iter()
             .cloned()
+            .chain(raw_array_words.iter().cloned())
             .chain(has_vable_identity.then_some(raw_vable_expr))
             .chain(raw_ref_words.iter().cloned())
             .chain(raw_float_words.iter().cloned())
@@ -1775,14 +1707,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     };
 
     quote! {
-        /// Compiled loop metadata for state_fields mode: per-array length
-        /// fields are is_compatible / recursive fresh-entry Vec sizing,
-        /// not identity layout.
+        /// Compiled loop metadata for state_fields mode.
+        /// `warmstate.py` `maybe_compile_and_run`: greens select the cell; a plain `[int]` length is a red.
         #[derive(Clone)]
         #[allow(non_camel_case_types)]
-        struct #meta_ty {
-            #(#meta_fields)*
-        }
+        struct #meta_ty {}
 
         impl #meta_ty {
             /// RPython `assembler.py get_liveness_info(insn, kind)`
@@ -2017,7 +1946,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         /// frame; vable fields live in `virtualizable_boxes`.
         #[allow(non_camel_case_types)]
         struct #sym_ty {
-            #(#sym_array_len_fields)*
             #(#sym_virt_array_fields)*
             loop_header_pc: usize,
             trace_started: bool,
@@ -2125,9 +2053,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
 
             fn build_meta(&self, _header_pc: usize, _program: &#env_type) -> #meta_ty {
-                #meta_ty {
-                    #(#build_meta_fields)*
-                }
+                #meta_ty {}
             }
 
             // The buffer-filling form is the primary one and the owning form
@@ -2155,11 +2081,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             #fill_entry_reds_without_meta_override
             #fill_entry_raw_reds_override
 
-            fn create_sym(meta: &#meta_ty, header_pc: usize) -> #sym_ty {
-                #(#create_sym_array_len_inits)*
+            fn create_sym(_meta: &#meta_ty, header_pc: usize) -> #sym_ty {
                 #(#create_sym_virt_array_inits)*
                 #sym_ty {
-                    #(#create_sym_array_len_names,)*
                     #(#create_sym_virt_array_len_value_names,)*
                     loop_header_pc: header_pc,
                     trace_started: false,
@@ -2388,8 +2312,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             }
 
-            fn is_compatible(&self, meta: &#meta_ty) -> bool {
-                true #(#compat_checks)*
+            // `warmstate.py` `maybe_compile_and_run`: greens select the cell; a plain `[int]` length is a red.
+            fn is_compatible(&self, _meta: &#meta_ty) -> bool {
+                true
             }
 
             fn restore(&mut self, _meta: &#meta_ty, values: &[i64]) {
@@ -2474,8 +2399,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             #collect_jump_args_with_boxes_method
 
-            fn validate_close(sym: &#sym_ty, meta: &#meta_ty) -> bool {
-                true #(#validate_array_checks)*
+            fn validate_close(_sym: &#sym_ty, _meta: &#meta_ty) -> bool {
+                true
             }
 
             // `pyjitpl.py MetaInterp.capture_resumedata` for jitdriver-level
