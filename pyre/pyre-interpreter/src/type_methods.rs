@@ -2149,6 +2149,23 @@ pub fn descr_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     str_method_format_core(args[0], positional, kwargs_dict, None)
 }
 
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+pub fn descr_format_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    str_method_format_core(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
+        None,
+    )
+}
+
 /// Shared core for `str.format` (`{name}` looks up the trailing
 /// CALL_KW dict) and `str.format_map` (`{name}` looks up the
 /// mapping via `space.getitem(mapping, w_key)`).  PyPy folds both
@@ -7058,21 +7075,53 @@ pub fn dict_init_or_update(
         .collect::<Vec<_>>();
     require_receiver(&rooted_args, "update")?;
     let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&rooted_args);
+    dict_init_or_update_from(
+        positional[0],
+        positional.get(1..).unwrap_or(&[]),
+        kwargs_dict,
+        name,
+    )
+}
+
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+pub fn dict_init_or_update_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    dict_init_or_update_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
+        name,
+    )
+}
+
+fn dict_init_or_update_from(
+    self_: PyObjectRef,
+    rest: &[PyObjectRef],
+    kwargs_dict: Option<PyObjectRef>,
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = _roots.pin_roots(&[self_]);
+    let rest_slot = _roots.pin_roots(rest);
     let has_kwargs = kwargs_dict.is_some();
     let kwargs_slot = _roots.pin_roots(&[kwargs_dict.unwrap_or(pyre_object::PY_NULL)]);
-    if positional.len() > 2 {
+    if rest.len() > 1 {
         return Err(crate::PyError::type_error(format!(
             "{name} expected at most 1 argument, got {}",
-            positional.len() - 1
+            rest.len()
         )));
     }
-    if positional.len() > 1 {
-        dict_update1(
-            pyre_object::gc_roots::shadow_stack_get(root_base),
-            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
-        )?;
+    if rest.len() == 1 {
+        dict_update1(_roots.get(self_slot), _roots.get(rest_slot))?;
     }
-    let backing = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(root_base));
+    let backing = resolve_dict_backing(_roots.get(self_slot));
     if backing.is_null() {
         // A dict subclass declared with `__slots__` has no attribute storage
         // for its item backing (pyre keeps a dict subclass's items in an
@@ -7092,9 +7141,11 @@ pub fn dict_init_or_update(
             let items_base = pyre_object::gc_roots::pin_roots(&flat);
             for i in 0..items.len() {
                 let k = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i);
-                if pyre_object::is_str(k)
-                    && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__")
-                {
+                let v = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i + 1);
+                // A leftover packed marker dict still carries the sentinel
+                // under `__pyre_kw__`. Skip that identity, not the key name:
+                // a caller keyword spelled `__pyre_kw__` is a real item.
+                if pyre_object::kw_marker::is_kw_marker_sentinel(v) {
                     continue;
                 }
                 dict_store_checked(
@@ -7113,6 +7164,25 @@ pub fn dict_init_or_update(
 pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "update")?;
     dict_init_or_update(args, "update")
+}
+
+pub fn dict_method_update_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    require_receiver(&[self_], "update")?;
+    dict_init_or_update_args(self_, args, "update")
+}
+
+pub fn dict_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_init_or_update(args, "dict")
+}
+
+pub fn dict_descr_init_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    dict_init_or_update_args(self_, args, "dict")
 }
 
 /// `dictmultiobject.py update1` —

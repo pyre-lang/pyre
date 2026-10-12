@@ -4,9 +4,9 @@
 
 use crate::executioncontext::ActionFlagOps;
 use crate::{
-    Signature, make_builtin_function, make_builtin_function_with_arity,
-    make_builtin_function_with_arity_and_maybe_sig, make_builtin_function_with_signature,
-    module_ns_store,
+    Signature, make_builtin_function, make_builtin_function_passthrough0,
+    make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,
+    make_builtin_function_with_signature, module_ns_store,
 };
 use pyre_object::*;
 use std::sync::OnceLock;
@@ -202,7 +202,11 @@ fn sys_namespace_type() -> PyObjectRef {
                 crate::__pyre_put_new!(
                     ns_slot,
                     "__init__",
-                    crate::make_builtin_function("__init__", sys_namespace_init)
+                    crate::gateway::make_builtin_function_passthrough1(
+                        "__init__",
+                        sys_namespace_init,
+                        sys_namespace_init_args,
+                    )
                 )
             };
         });
@@ -229,6 +233,24 @@ fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
         ));
     }
     namespace_apply_kwargs(self_obj, kwargs)
+}
+
+fn sys_namespace_init_args(
+    self_obj: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    if !args.arguments_w.is_empty() {
+        return Err(crate::PyError::type_error(
+            "types.SimpleNamespace() takes no positional arguments",
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    namespace_apply_kwargs(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        crate::builtins::arguments_as_kwargs_dict(args)?,
+    )
 }
 
 /// Copy the keyword arguments into a namespace instance's dict, skipping the
@@ -436,6 +458,43 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
     )
 }
 
+fn simple_namespace_init_args(
+    self_obj: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    if args.arguments_w.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "SimpleNamespace expected at most 1 argument, got {}",
+            args.arguments_w.len()
+        )));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = _roots.pin_roots(&[self_obj]);
+    let (rest, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    let rest_slot = _roots.pin_roots(&rest);
+    let kwargs_slot = _roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    if rest.len() == 1 {
+        let temporary = w_dict_new();
+        let _ = pyre_object::gc_roots::pin_root(temporary);
+        let temporary_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        crate::type_methods::dict_update1(
+            pyre_object::gc_roots::shadow_stack_get(temporary_slot),
+            _roots.get(rest_slot),
+        )?;
+        namespace_update_dict(
+            _roots.get(self_slot),
+            pyre_object::gc_roots::shadow_stack_get(temporary_slot),
+            false,
+        )?;
+    }
+    let w_kwargs = if kwargs.is_some() {
+        Some(_roots.get(kwargs_slot))
+    } else {
+        None
+    };
+    namespace_apply_kwargs(_roots.get(self_slot), w_kwargs)
+}
+
 fn simple_namespace_method(
     name: &'static str,
     function: fn(&[PyObjectRef]) -> crate::PyResult,
@@ -457,12 +516,14 @@ fn simple_namespace_method(
 fn simple_namespace_variadic_method(
     name: &'static str,
     function: fn(&[PyObjectRef]) -> crate::PyResult,
+    func_args: crate::gateway::BuiltinCodePassThroughFn1,
     doc: &'static str,
     text_signature: &'static str,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    let method = crate::gateway::make_builtin_function_with_doc(name, function, doc);
+    let method =
+        crate::gateway::make_builtin_function_passthrough1_with_doc(name, function, func_args, doc);
     let _ = pyre_object::gc_roots::pin_root(method);
     let signature = w_str_new(text_signature);
     let method = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -557,6 +618,7 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
                     simple_namespace_variadic_method(
                         "__init__",
                         simple_namespace_init,
+                        simple_namespace_init_args,
                         "Initialize self.  See help(type(self)) for accurate signature.",
                         "($self, /, *args, **kwargs)",
                     )
@@ -636,6 +698,7 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
                     simple_namespace_variadic_method(
                         "__replace__",
                         simple_namespace_replace,
+                        simple_namespace_replace_args,
                         "Return a copy of the namespace object with new values for the specified attributes.",
                         "($self, /, **changes)",
                     )
@@ -827,6 +890,24 @@ fn simple_namespace_reduce(args: &[PyObjectRef]) -> crate::PyResult {
 /// CPython 3.14 `namespace_replace`: construct `type(self)()` first, require
 /// that its actual type remains a SimpleNamespace subtype, copy the source
 /// dict, then overlay keyword changes.
+fn simple_namespace_replace_args(
+    self_obj: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    if !args.arguments_w.is_empty() {
+        return Err(crate::PyError::type_error(
+            "__replace__() takes no positional arguments",
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    simple_namespace_replace_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        crate::builtins::arguments_as_kwargs_dict(args)?,
+    )
+}
+
 fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let Some(&self_obj) = positional.first() else {
@@ -839,6 +920,13 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
             "__replace__() takes no positional arguments",
         ));
     }
+    simple_namespace_replace_from(self_obj, kwargs)
+}
+
+fn simple_namespace_replace_from(
+    self_obj: PyObjectRef,
+    kwargs: Option<PyObjectRef>,
+) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let self_obj = pyre_object::gc_roots::pin_root(self_obj);
@@ -1311,6 +1399,52 @@ fn sys_breakpointhook(args: &[PyObjectRef]) -> crate::PyResult {
         live_args.push(_roots.get(base + i));
     }
     crate::builtins::call_forwarding_args(hook, &live_args)
+}
+
+/// Keyword path: `space.call_args(hook, __args__)`.
+fn sys_breakpointhook_args(args: &crate::argument::Arguments) -> crate::PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pos = &args.arguments_w;
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let pos_base = _roots.pin_roots(pos);
+    let names_base = _roots.pin_roots(names);
+    let values_base = _roots.pin_roots(values);
+    let npos = pos.len();
+    let nnames = names.len();
+    let hookname = match crate::importing::host::os::var("PYTHONBREAKPOINT") {
+        Ok(name) if name == "0" => return Ok(w_none()),
+        Ok(name) if !name.is_empty() => name,
+        _ => "pdb.set_trace".to_string(),
+    };
+    let (modname, funcname) = match hookname.rsplit_once('.') {
+        Some((modname, funcname)) => (modname, funcname),
+        None => ("builtins", hookname.as_str()),
+    };
+    let hook = crate::importing::dunder_import(
+        modname,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        0,
+        std::ptr::null(),
+    )
+    .ok()
+    .and_then(|_| crate::importing::get_sys_module(modname))
+    .and_then(|module| crate::baseobjspace::getattr_str(module, funcname).ok());
+    let Some(hook) = hook else {
+        crate::warn::warn_category(
+            &format!("Ignoring unimportable $PYTHONBREAKPOINT: \"{hookname}\""),
+            "RuntimeWarning",
+            1,
+        )?;
+        return Ok(w_none());
+    };
+    let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| _roots.get(pos_base + i)).collect();
+    let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| _roots.get(names_base + i)).collect();
+    let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| _roots.get(values_base + i)).collect();
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    crate::call::call_args(hook, &forwarded)
 }
 
 /// `sys._baserepl` — `PyRun_AnyFileExFlags(stdin, "<stdin>", 0, &cf)`: read
@@ -3605,7 +3739,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(roots.get(ns_slot), "__excepthook__", excepthook_fn);
     // sys.breakpointhook — `app.py breakpointhook`, called by `breakpoint()`.
     // `__breakpointhook__` keeps the original so code can restore it.
-    let breakpointhook_fn = make_builtin_function("breakpointhook", sys_breakpointhook);
+    let breakpointhook_fn = make_builtin_function_passthrough0(
+        "breakpointhook",
+        sys_breakpointhook,
+        sys_breakpointhook_args,
+    );
     module_ns_store(roots.get(ns_slot), "breakpointhook", breakpointhook_fn);
     module_ns_store(roots.get(ns_slot), "__breakpointhook__", breakpointhook_fn);
     // sys.unraisablehook(unraisable) — handles exceptions raised where they

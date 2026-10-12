@@ -35,27 +35,46 @@ use pyre_object::{PyObjectRef, is_none};
 const S_IFDIR: i64 = 0o040000;
 const S_IFREG: i64 = 0o100000;
 
-fn kwargs_from_bound_kwonly(
-    args: &[PyObjectRef],
+/// Keyword-only tail of a bound `Signature` scope, rebuilt as a dict so
+/// existing `kwarg_get` readers keep working.
+///
+/// `w_dict_new` / `w_dict_setitem_str` collect, so the bound slice and
+/// the dict are published first and read back at each store, matching
+/// `collect_keyword_args`.
+fn kwargs_from_bound_kwonly_at(
+    args_base: usize,
+    args_len: usize,
     start: usize,
     names: &[&str],
 ) -> Option<PyObjectRef> {
-    if names.is_empty() {
-        return None;
-    }
-    let mut w_dict = pyre_object::PY_NULL;
+    let mut dict_slot = None;
     for (index, name) in names.iter().enumerate() {
-        let Some(value) = args.get(start + index).copied().filter(|o| !o.is_null()) else {
+        let slot = start + index;
+        if slot >= args_len {
             continue;
-        };
-        if w_dict.is_null() {
-            w_dict = pyre_object::w_dict_new();
         }
+        let value = pyre_object::gc_roots::shadow_stack_get(args_base + slot);
+        if value.is_null() {
+            continue;
+        }
+        let dict = match dict_slot {
+            Some(pinned) => pyre_object::gc_roots::shadow_stack_get(pinned),
+            None => {
+                let pinned = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+                dict_slot = Some(pinned);
+                pyre_object::gc_roots::shadow_stack_get(pinned)
+            }
+        };
         unsafe {
-            pyre_object::w_dict_setitem_str(w_dict, name, value);
+            pyre_object::w_dict_setitem_str(
+                dict,
+                name,
+                pyre_object::gc_roots::shadow_stack_get(args_base + slot),
+            );
         }
     }
-    if w_dict.is_null() { None } else { Some(w_dict) }
+    dict_slot.map(pyre_object::gc_roots::shadow_stack_get)
 }
 
 fn wasm_sig(params: &[&'static str], kwonly: &[&'static str]) -> crate::gateway::Signature {
@@ -101,20 +120,31 @@ fn wasm_builtin(
 /// answers.
 fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate::PyError> {
     let name = if default_follow { "stat" } else { "lstat" };
-    let Some(w_path) = args.get(0).copied().filter(|o| !o.is_null()) else {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let w_path = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(args_base)
+    };
+    if w_path.is_null() {
         return Err(crate::PyError::type_error(format!(
             "{name}() missing required argument 'path' (pos 1)"
         )));
-    };
+    }
     let kwonly: &[&str] = if default_follow {
         &["dir_fd", "follow_symlinks"]
     } else {
         &["dir_fd"]
     };
-    let kwargs = kwargs_from_bound_kwonly(args, 1, kwonly);
     // Unwrapped in signature order, because `__fspath__` for `path` and
     // `__index__` for `dir_fd` can both raise and both run user code.
-    let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, name, false)?;
+    let resolved = crate::gateway::fsencode_path_or_fd_w(
+        pyre_object::gc_roots::shadow_stack_get(args_base),
+        name,
+        false,
+    )?;
+    let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), 1, kwonly);
     if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
         return Err(crate::PyError::not_implemented(
             "dir_fd unavailable on this platform",
@@ -796,13 +826,24 @@ fn path_arg(
     args: &[PyObjectRef],
     name: &'static str,
 ) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
-    let Some(w_path) = args.get(0).copied().filter(|o| !o.is_null()) else {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let w_path = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(args_base)
+    };
+    if w_path.is_null() {
         return Err(crate::PyError::type_error(format!(
             "{name}() missing required argument 'path' (pos 1)"
         )));
-    };
-    let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, name, false)?;
-    let kwargs = kwargs_from_bound_kwonly(args, 1, &["dir_fd"]);
+    }
+    let resolved = crate::gateway::fsencode_path_or_fd_w(
+        pyre_object::gc_roots::shadow_stack_get(args_base),
+        name,
+        false,
+    )?;
+    let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), 1, &["dir_fd"]);
     if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
         return Err(crate::PyError::not_implemented(
             "dir_fd unavailable on this platform",
@@ -819,25 +860,40 @@ fn path_arg(
 /// bytes can live.  `mode` is accepted and unused — it describes a file that
 /// is about to be created, and this seam creates none.
 fn open_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let Some(w_path) = args.get(0).copied().filter(|o| !o.is_null()) else {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let w_path = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(args_base)
+    };
+    if w_path.is_null() {
         return Err(crate::PyError::type_error(
             "open() missing required argument 'path' (pos 1)",
         ));
+    }
+    let w_flags = if args.len() < 2 {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(args_base + 1)
     };
-    let Some(w_flags) = args.get(1).copied().filter(|o| !o.is_null()) else {
+    if w_flags.is_null() {
         return Err(crate::PyError::type_error(
             "open() missing required argument 'flags' (pos 2)",
         ));
-    };
-    let _ = args.get(2).copied().filter(|o| !o.is_null());
-    let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, "open", false)?;
-    let kwargs = kwargs_from_bound_kwonly(args, 3, &["dir_fd"]);
+    }
+    let resolved = crate::gateway::fsencode_path_or_fd_w(
+        pyre_object::gc_roots::shadow_stack_get(args_base),
+        "open",
+        false,
+    )?;
+    let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), 3, &["dir_fd"]);
     if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
         return Err(crate::PyError::not_implemented(
             "dir_fd unavailable on this platform",
         ));
     }
-    let flags = crate::baseobjspace::int_w(w_flags)?;
+    let flags = crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(args_base + 1))?;
     // Every bit that asks to change the mount, refused where the file is
     // named rather than at the write that would discover it.
     if flags & oflag::ACCMODE != oflag::RDONLY
@@ -1254,16 +1310,25 @@ fn write_path_arg(
     name: &'static str,
     sig: &WriteSig,
 ) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
     let mut first_path = None;
-    let mut utime_times = None;
+    let mut utime_times_slot = None;
     let mut has_utime_pair = false;
     for (slot, param) in sig.params.iter().enumerate() {
-        let bound = args.get(slot).copied().filter(|o| !o.is_null());
+        let bound = if slot >= args.len() {
+            None
+        } else {
+            let value = pyre_object::gc_roots::shadow_stack_get(args_base + slot);
+            if value.is_null() { None } else { Some(value) }
+        };
         if matches!(param, Param::UTimePair(_)) {
             has_utime_pair = true;
-            utime_times = bound;
+            if bound.is_some() {
+                utime_times_slot = Some(args_base + slot);
+            }
         }
-        let Some(w_value) = bound else {
+        if bound.is_none() {
             if slot < sig.required {
                 return Err(crate::PyError::type_error(format!(
                     "{name}() missing required argument '{}' (pos {})",
@@ -1272,27 +1337,36 @@ fn write_path_arg(
                 )));
             }
             continue;
-        };
+        }
         match param {
             Param::Path(_) => {
-                let resolved = crate::gateway::fsencode_path_or_fd_w(w_value, name, false)?;
+                let resolved = crate::gateway::fsencode_path_or_fd_w(
+                    pyre_object::gc_roots::shadow_stack_get(args_base + slot),
+                    name,
+                    false,
+                )?;
                 if first_path.is_none() {
                     first_path = Some(resolved);
                 }
             }
             Param::Int(_) => {
-                crate::baseobjspace::c_int_w(w_value)?;
+                crate::baseobjspace::c_int_w(pyre_object::gc_roots::shadow_stack_get(
+                    args_base + slot,
+                ))?;
             }
             Param::Offset(_) => {
-                crate::builtins::space_index_w(w_value)?;
+                crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(
+                    args_base + slot,
+                ))?;
             }
             Param::UTimePair(_) => {}
             Param::Unread(_) => {}
         }
     }
-    let kwargs = kwargs_from_bound_kwonly(args, sig.params.len(), sig.kwonly);
+    let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), sig.params.len(), sig.kwonly);
     check_kwonly(kwargs, name, sig.kwonly)?;
     if has_utime_pair {
+        let utime_times = utime_times_slot.map(pyre_object::gc_roots::shadow_stack_get);
         validate_utime_args(utime_times, crate::builtins::kwarg_get(kwargs, "ns"))?;
     }
     first_path.ok_or_else(|| {
@@ -1398,19 +1472,42 @@ const R_OK: i64 = 4;
 /// for a directory, which is the permission that makes one traversable, and
 /// false for a file, since nothing here can be executed.
 fn access(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let Some(w_path) = args.get(0).copied().filter(|o| !o.is_null()) else {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let w_path = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(args_base)
+    };
+    if w_path.is_null() {
         return Err(crate::PyError::type_error(
             "access() missing required argument 'path' (pos 1)",
         ));
+    }
+    let w_mode = if args.len() < 2 {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(args_base + 1)
     };
-    let Some(w_mode) = args.get(1).copied().filter(|o| !o.is_null()) else {
+    if w_mode.is_null() {
         return Err(crate::PyError::type_error(
             "access() missing required argument 'mode' (pos 2)",
         ));
-    };
-    let mode = i64::from(crate::baseobjspace::c_int_w(w_mode)?);
-    let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, "access", false)?;
-    let kwargs = kwargs_from_bound_kwonly(args, 2, &["dir_fd", "effective_ids", "follow_symlinks"]);
+    }
+    let mode = i64::from(crate::baseobjspace::c_int_w(
+        pyre_object::gc_roots::shadow_stack_get(args_base + 1),
+    )?);
+    let resolved = crate::gateway::fsencode_path_or_fd_w(
+        pyre_object::gc_roots::shadow_stack_get(args_base),
+        "access",
+        false,
+    )?;
+    let kwargs = kwargs_from_bound_kwonly_at(
+        args_base,
+        args.len(),
+        2,
+        &["dir_fd", "effective_ids", "follow_symlinks"],
+    );
     check_kwonly(kwargs, "access", &["dir_fd", "follow_symlinks"])?;
     // The seam answers for the caller, and there is no second identity here
     // to answer for instead.  Do not turn an exception from a caller's

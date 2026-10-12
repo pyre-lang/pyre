@@ -2195,6 +2195,20 @@ pub fn make_method_descriptor_with_doc(
     crate::function_new_method_descriptor(code as *const (), name.to_string())
 }
 
+/// Method-descriptor `PassThroughArguments1` carrying a docstring.
+pub fn make_method_descriptor_passthrough1_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    unsafe {
+        (*(code as *mut BuiltinCode)).docstring = Some(docstring);
+    }
+    crate::function_new_method_descriptor(code as *const (), name.to_string())
+}
+
 /// `make_builtin_function` with `fast_natural_arity = PASSTHROUGHARGS1` —
 /// PyPy `BuiltinCodePassThroughArguments1` registration shape.
 pub fn make_builtin_function_passthrough_args1(
@@ -2215,6 +2229,71 @@ pub fn make_module_builtin_function_passthrough0(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `make_builtin_function` carrying `BuiltinCodePassThroughArguments0`.
+///
+/// Used for module-namespace functions that were already registered as
+/// `Function` (not `BuiltinFunction`) and must keep that carrier while
+/// keyword calls go through `func_args`.
+pub fn make_builtin_function_passthrough0(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough0(name, func, func_args);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// Module-level passthrough0 carrying `BuiltinCode.docstring`.
+pub fn make_module_builtin_function_passthrough0_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
+    unsafe {
+        (*(code as *mut BuiltinCode)).func_args0 = Some(func_args);
+    }
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// `make_builtin_function_as_builtin` carrying `PassThroughArguments1`.
+///
+/// Builtin `__new__` stays a `BuiltinFunction` (`copyreg` identity) while
+/// keyword calls take `Arguments` out of band.
+pub fn make_builtin_function_as_builtin_passthrough1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// [`make_builtin_function_as_builtin_passthrough1`] carrying `BuiltinCode.docstring`.
+pub fn make_builtin_function_as_builtin_passthrough1_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    unsafe {
+        (*(code as *mut BuiltinCode)).docstring = Some(docstring);
+    }
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// Slot-wrapper `PassThroughArguments1`.
+pub fn make_slot_wrapper_passthrough1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    crate::function_new_slot_wrapper(code as *const (), name.to_string())
+}
+
 /// Method-descriptor `BuiltinCodePassThroughArguments1`.
 pub fn make_builtin_function_passthrough1(
     name: &'static str,
@@ -2222,6 +2301,20 @@ pub fn make_builtin_function_passthrough1(
     func_args: BuiltinCodePassThroughFn1,
 ) -> PyObjectRef {
     let code = builtin_code_new_passthrough1(name, func, func_args);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// [`make_builtin_function_passthrough1`] carrying `BuiltinCode.docstring`.
+pub fn make_builtin_function_passthrough1_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    unsafe {
+        (*(code as *mut BuiltinCode)).docstring = Some(docstring);
+    }
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 

@@ -9,7 +9,10 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
-use crate::{PyError, make_builtin_function, make_builtin_function_with_arity};
+use crate::{
+    PyError, make_builtin_function, make_builtin_function_passthrough1,
+    make_builtin_function_with_arity,
+};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 
@@ -467,7 +470,11 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__call__",
-            make_builtin_function("__call__", callable_proxy_descr__call__)
+            make_builtin_function_passthrough1(
+                "__call__",
+                callable_proxy_descr__call__,
+                callable_proxy_descr__call_args,
+            )
         )
     };
     // **callable_proxy_typedef_dict — interp__weakref.py, plus the
@@ -1468,6 +1475,29 @@ pub fn callable_proxy_descr__call__(args: &[PyObjectRef]) -> Result<PyObjectRef,
         forwarded.push(_roots.get(base + i));
     }
     crate::builtins::call_forwarding_args(w_obj, &forwarded)
+}
+
+/// Keyword path: `space.call_args(force(self), __args__)`.
+fn callable_proxy_descr__call_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_base = _roots.pin_roots(&[self_]);
+    let pos = &args.arguments_w;
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let pos_base = _roots.pin_roots(pos);
+    let names_base = _roots.pin_roots(names);
+    let values_base = _roots.pin_roots(values);
+    let npos = pos.len();
+    let nnames = names.len();
+    let w_obj = force(_roots.get(self_base))?;
+    let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| _roots.get(pos_base + i)).collect();
+    let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| _roots.get(names_base + i)).collect();
+    let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| _roots.get(values_base + i)).collect();
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    crate::call::call_args(w_obj, &forwarded)
 }
 
 /// pypy/module/_weakref/interp__weakref.py proxy

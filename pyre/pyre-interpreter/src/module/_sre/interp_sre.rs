@@ -202,7 +202,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "match",
                 sre_pattern_match,
                 Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
-            ),
+            )
         )
     };
     unsafe {
@@ -213,7 +213,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "fullmatch",
                 sre_pattern_fullmatch,
                 Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
-            ),
+            )
         )
     };
     unsafe {
@@ -224,7 +224,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "search",
                 sre_pattern_search,
                 Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
-            ),
+            )
         )
     };
     unsafe {
@@ -235,7 +235,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "findall",
                 sre_pattern_findall,
                 Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
-            ),
+            )
         )
     };
     unsafe {
@@ -246,7 +246,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "finditer",
                 sre_pattern_finditer,
                 Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
-            ),
+            )
         )
     };
     // interp_sre.py `scanner = interp2app(W_SRE_Pattern.finditer_w)`
@@ -259,7 +259,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "scanner",
                 sre_pattern_finditer,
                 Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
-            ),
+            )
         )
     };
     unsafe {
@@ -270,7 +270,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "sub",
                 sre_pattern_sub,
                 Signature::new(vec!["self", "repl", "string", "count"], None, None, 0, 1),
-            ),
+            )
         )
     };
     unsafe {
@@ -281,7 +281,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "subn",
                 sre_pattern_subn,
                 Signature::new(vec!["self", "repl", "string", "count"], None, None, 0, 1),
-            ),
+            )
         )
     };
     unsafe {
@@ -292,7 +292,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
                 "split",
                 sre_pattern_split,
                 Signature::new(vec!["self", "string", "maxsplit"], None, None, 0, 1),
-            ),
+            )
         )
     };
     // interp_sre.py:651-653 `__repr__`/`__copy__`/`__deepcopy__`

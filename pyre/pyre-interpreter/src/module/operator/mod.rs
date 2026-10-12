@@ -175,6 +175,33 @@ fn op_iconcat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     )
 }
 
+/// `interp_operator.py call`: `call(obj, /, *args, **kwargs)` forwards
+/// to `obj(*args, **kwargs)`. The positional body still peels a leftover
+/// packed marker so HOPELESS callers of the same helper keep working.
+fn op_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "call expected at least 1 argument, got 0",
+        ));
+    }
+    crate::builtins::call_forwarding_args(args[0], &args[1..])
+}
+
+/// Keyword path: names stay on `Arguments` (`gateway.py` `func__args__`).
+fn op_call_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError> {
+    let Some((&callable, rest)) = args.arguments_w.split_first() else {
+        return Err(crate::PyError::type_error(
+            "call expected at least 1 argument, got 0",
+        ));
+    };
+    let forwarded = crate::argument::Arguments::with_kw(
+        rest,
+        args.keyword_names_w.as_deref().unwrap_or(&[]),
+        args.keywords_w.as_deref().unwrap_or(&[]),
+    );
+    crate::call::call_args(callable, &forwarded)
+}
+
 // Binary arithmetic / comparison thunks share one shape — call
 // `baseobjspace::OP(args[0], args[1])` and unwrap-or-none the result.
 // Inline closures below preserve the per-name `assert!` checks.
@@ -203,6 +230,12 @@ crate::py_module! {
         // `functions:` entries otherwise: declared arity 1, own arity check.
         "index" => crate::gateway::make_module_builtin_function_with_arity(
             "index", op_index_entry, 1,
+        ),
+        // `call(obj, /, *args, **kwargs)` == `obj(*args, **kwargs)`.
+        // Keyword calls keep names on `Arguments` (`func__args__`);
+        // a no-keyword call stays on the traced slice ABI.
+        "call" => crate::gateway::make_module_builtin_function_passthrough0(
+            "call", op_call, op_call_args,
         ),
     },
     appleveldefs: {
@@ -257,17 +290,6 @@ crate::py_module! {
         "contains" / 2 = |args| Ok(w_bool_from(contains(args[0], args[1])?)),
         "indexOf"  / 2 = |args| baseobjspace::sequence_index(args[0], args[1]),
         "countOf"  / 2 = |args| baseobjspace::sequence_count(args[0], args[1]),
-        // `call(obj, /, *args, **kwargs)` == `obj(*args, **kwargs)`.
-        // `call_forwarding_args` re-splits the `__pyre_kw__` marker back into
-        // keyword arguments before dispatching.
-        "call"     / * = |args: &[PyObjectRef]| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error(
-                    "call expected at least 1 argument, got 0",
-                ));
-            }
-            crate::builtins::call_forwarding_args(args[0], &args[1..])
-        },
         "getitem"  / 2 = |args| getitem(args[0], args[1]),
         "setitem"  / 3 = |args| { setitem(args[0], args[1], args[2])?; Ok(w_none()) },
         "delitem"  / 2 = |args| { delitem(args[0], args[1])?; Ok(w_none()) },

@@ -16,11 +16,24 @@
 /// `set_param_enable_opts` with the whole string. Every other keyword is an
 /// integer (`space.int_w`) whose name is in `unroll_parameters`, then one
 /// `name=value` list through the same string parser.
+pub(super) fn set_param_args(
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    set_param_from(&pos, kwargs)
+}
+
 pub(super) fn set_param(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let (pos, mut kwds) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    let (pos, kwds) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    set_param_from(pos, kwds)
+}
 
+fn set_param_from(
+    pos: &[pyre_object::PyObjectRef],
+    mut kwds: Option<pyre_object::PyObjectRef>,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     // interp_jit.py:147-148 — at most one non-keyword argument.
     if pos.len() > 1 {
         return Err(pyre_interpreter::PyError::type_error(format!(

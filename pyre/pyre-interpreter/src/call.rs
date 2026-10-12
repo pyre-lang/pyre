@@ -3233,8 +3233,14 @@ pub fn parse_builtin_signature(
     // against 3.14.6: `sum([1], **{K:0, "start":3})` is
     // `takes at most 2 arguments (3 given)`; `int("5", 10, 1)` is
     // `int expected at most 2 arguments, got 3` (`_PyArg_CheckPositional`
-    // on `descr_new`, cls excluded).
-    if signature_accepts_keywords(sig) && !sig.has_vararg() && npos + nkw > sig.argnames.len() {
+    // on `descr_new`, cls excluded).  A `**kwargs` slot packs unmatched
+    // names (`argument.py` `_collect_keyword_args`), so this overlay
+    // stays off when `has_kwarg`.
+    if signature_accepts_keywords(sig)
+        && !sig.has_vararg()
+        && !sig.has_kwarg()
+        && npos + nkw > sig.argnames.len()
+    {
         let skip = usize::from(signature_cls_constructor(sig));
         let n = sig.argnames.len() - skip;
         let m = npos + nkw - skip;
@@ -3438,6 +3444,26 @@ pub fn call_with_kwargs(
 ) -> PyResult {
     let _ = frame;
     call_with_kwargs_in_ctx(getexecutioncontext(), callable, pos_args, kwargs)
+}
+
+/// `space.call_args(w_func, args)` — keywords stay on `Arguments`
+/// (`keyword_names_w` / `keywords_w`) instead of a trailing marker dict.
+pub fn call_args(callable: PyObjectRef, args: &crate::argument::Arguments) -> PyResult {
+    let pos = args.arguments_w.as_slice();
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    if names.is_empty() {
+        return call_function_impl_result(callable, pos);
+    }
+    call_with_kwargs_in_ctx_impl(
+        getexecutioncontext(),
+        callable,
+        pos,
+        names,
+        values,
+        true,
+        std::ptr::null_mut(),
+    )
 }
 
 /// Call a user function with positional args + keyword args from a dict.
@@ -4392,7 +4418,9 @@ fn call_with_kwargs_in_ctx_impl(
             // pre-lookup addresses.
             new_args.push(current_metaclass());
             extend_current_args(&mut new_args);
-            if unsafe { crate::is_function(new_fn) } && nkw > 0 {
+            // typeobject.py descr_call: `space.call_obj_args(w_newfunc, self, __args__)`.
+            // The same Arguments object reaches both `__new__` and `__init__`.
+            if nkw > 0 {
                 forward_kw(new_fn, &new_args, true, std::ptr::null_mut())?
             } else {
                 call_callable_in_ctx(execution_context, new_fn, &new_args)?
@@ -5459,15 +5487,29 @@ fn call_metaclass_with_kwargs(
                 }
             }
         } else {
-            // Builtin type.__new__ (the metaclass defines no __new__): pass
-            // the class-definition keywords through the `__pyre_kw__`
-            // trailing-dict ABI so type.__new__ fires __init_subclass__
-            // with them, matching the default-metaclass path.
+            // Builtin type.__new__: the same Arguments shape as
+            // `space.call_obj_args(w_newfunc, self, __args__)`.
             let mut new_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
-            if !kw_items.is_empty() {
-                new_args.push(pack_pyre_kwargs(&kw_items));
-            }
-            match call_function_impl_result(new_fn, &new_args) {
+            let result = if kw_items.is_empty() {
+                call_function_impl_result(new_fn, &new_args)
+            } else {
+                let mut names = Vec::with_capacity(kw_items.len());
+                let mut values = Vec::with_capacity(kw_items.len());
+                for &(k, v) in &kw_items {
+                    names.push(k);
+                    values.push(v);
+                }
+                call_with_kwargs_in_ctx_impl(
+                    take_last_exec_ctx(),
+                    new_fn,
+                    &new_args,
+                    &names,
+                    &values,
+                    true,
+                    std::ptr::null_mut(),
+                )
+            };
+            match result {
                 Ok(obj) => obj,
                 Err(e) => {
                     set_call_error(e);
@@ -6098,31 +6140,6 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             "__build_class__: not enough arguments",
         ));
     }
-    let mut body_fn = args[0];
-    let mut name_obj = args[1];
-
-    // compiling.py:163-167 — the body must be a Python function carrying a
-    // `PyCode`.  Its code object is read directly below, so anything else is
-    // rejected here rather than reaching that read.
-    if !unsafe { crate::is_function(body_fn) }
-        || unsafe { crate::function_has_builtin_code(body_fn) }
-    {
-        return Err(crate::PyError::type_error(
-            "__build_class__: func must be a function",
-        ));
-    }
-
-    // Check if last arg is a kwargs dict (from CALL_KW)
-    // PyPy: __build_class__(func, name, *bases, metaclass=None, **kwds)
-    //
-    // The class-definition keywords are collected into a fresh dict that only
-    // `build_class_inner` consumes, so the guard is opened before the arm that
-    // fills it: `update_bases` and both `w_tuple_new` calls run between the
-    // two, and a guard scoped to the arm would unpin the dict across them.
-    // `build_class_inner` re-pins its own parameter copy. A class statement
-    // without keywords opens no scope at all — `pin_root` is
-    // `dont_look_inside`, so an unconditional one would residualise in every
-    // traced class body.
     let kwds_dict = if args.len() > 2 {
         let last = args[args.len() - 1];
         let is_kwds = unsafe { pyre_object::is_dict(last) }
@@ -6134,6 +6151,54 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     } else {
         None
     };
+    let base_end = if kwds_dict.is_some() {
+        args.len() - 1
+    } else {
+        args.len()
+    };
+    real_build_class_from(args[0], args[1], &args[2..base_end], kwds_dict)
+}
+
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+pub(crate) fn real_build_class_args(
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.arguments_w.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "__build_class__: not enough arguments",
+        ));
+    }
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    real_build_class_from(pos[0], pos[1], &pos[2..], kwargs)
+}
+
+fn real_build_class_from(
+    mut body_fn: PyObjectRef,
+    mut name_obj: PyObjectRef,
+    base_args: &[PyObjectRef],
+    kwds_dict: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    // compiling.py:163-167 — the body must be a Python function carrying a
+    // `PyCode`.  Its code object is read directly below, so anything else is
+    // rejected here rather than reaching that read.
+    if !unsafe { crate::is_function(body_fn) }
+        || unsafe { crate::function_has_builtin_code(body_fn) }
+    {
+        return Err(crate::PyError::type_error(
+            "__build_class__: func must be a function",
+        ));
+    }
+
+    // PyPy: __build_class__(func, name, *bases, metaclass=None, **kwds)
+    //
+    // The class-definition keywords are collected into a fresh dict that only
+    // `build_class_inner` consumes, so the guard is opened before the arm that
+    // fills it: `update_bases` and both `w_tuple_new` calls run between the
+    // two, and a guard scoped to the arm would unpin the dict across them.
+    // `build_class_inner` re-pins its own parameter copy. A class statement
+    // without keywords opens no scope at all — `pin_root` is
+    // `dont_look_inside`, so an unconditional one would residualise in every
+    // traced class body.
     // Open the keyword-dict bracket in this function, not in a `map`
     // closure: `compiling.py build_class` roots `kwds_w` on `build_class`
     // itself, and a generated `FnOnce` would own a `push_roots` that cannot
@@ -6143,7 +6208,7 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     } else {
         None
     };
-    let (base_args, metaclass, extra_kwargs) = if let Some(last) = kwds_dict {
+    let (metaclass, extra_kwargs) = if let Some(last) = kwds_dict {
         {
             let extra_roots = extra_roots.as_ref().expect("opened for a kwargs dict");
             let extra_slot = extra_roots.base();
@@ -6165,14 +6230,10 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
                     }
                 }
             }
-            (
-                &args[2..args.len() - 1],
-                w_metaclass,
-                Some(extra_roots.get(extra_slot)),
-            )
+            (w_metaclass, Some(extra_roots.get(extra_slot)))
         }
     } else {
-        (&args[2..], None, None)
+        (None, None)
     };
 
     // `type(name, bases, namespace)` rejects a lone surrogate. `str_utf8_w`

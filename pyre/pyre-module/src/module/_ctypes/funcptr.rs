@@ -94,7 +94,11 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "__call__",
-        pyre_interpreter::make_builtin_function("__call__", cfuncptr_call)
+        pyre_interpreter::make_builtin_function_passthrough1(
+            "__call__",
+            cfuncptr_call,
+            cfuncptr_call_args,
+        ),
     );
     // `restype` / `argtypes` — settable data descriptors with class-attr
     // fallback to `_restype_` / `_argtypes_`.
@@ -1303,9 +1307,33 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
             "__call__ requires self",
         ));
     }
+    let (inargs, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
+    cfuncptr_call_from(args[0], inargs, kwargs)
+}
+
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+fn cfuncptr_call_args(
+    self_: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    cfuncptr_call_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+fn cfuncptr_call_from(
+    self_: PyObjectRef,
+    inargs: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // A keyword argument only ever names a paramflag, and one that names
     // nothing is not an error — it simply goes unread.
-    let (inargs, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
     // self, the positional arguments, and the keyword dict are published
     // before the first allocating call.  Later steps read those slots; the
     // originals are not.
@@ -1313,7 +1341,7 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
     let has_kwargs = kwargs.is_some();
     let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
     let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::publish_roots(&[args[0]]);
+    let self_slot = pyre_object::gc_roots::publish_roots(&[self_]);
     let inargs_base = pyre_object::gc_roots::publish_roots(inargs);
     let kwargs_slot = pyre_object::gc_roots::publish_roots(&[kwargs_word]);
     pyre_object::gc_roots::normalize_roots(self_slot, 1 + n_inargs + 1);

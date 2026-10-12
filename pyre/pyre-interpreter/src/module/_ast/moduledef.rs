@@ -104,6 +104,25 @@ static AST_METHOD_OWNER: crate::gateway::MethodOwner = crate::gateway::MethodOwn
     is_instance: Some(is_ast_instance),
 };
 
+fn ast_slot_wrapper_passthrough1(
+    name: &'static str,
+    function: crate::gateway::BuiltinCodeFn,
+    func_args: crate::gateway::BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let wrapper = crate::gateway::make_slot_wrapper_passthrough1(name, function, func_args);
+    let wrapper_slot = roots.base();
+    let _ = roots.pin_root(wrapper);
+    let code = unsafe { crate::function::getcode(roots.get(wrapper_slot)) } as PyObjectRef;
+    unsafe { crate::gateway::builtin_code_set_owner(code, &AST_METHOD_OWNER) };
+    let qualname = pyre_object::w_str_new(&format!("AST.{name}"));
+    unsafe {
+        crate::function::function_set_qualname(roots.get(wrapper_slot), qualname);
+        crate::function::function_set_objclass(roots.get(wrapper_slot), ast_type());
+    }
+    roots.get(wrapper_slot)
+}
+
 fn ast_slot_wrapper(
     name: &'static str,
     function: crate::gateway::BuiltinCodeFn,
@@ -129,11 +148,14 @@ fn ast_slot_wrapper(
 fn ast_method_descriptor(
     name: &'static str,
     function: crate::gateway::BuiltinCodeFn,
+    func_args: crate::gateway::BuiltinCodePassThroughFn1,
     docstring: &'static str,
     text_signature: &'static str,
 ) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
-    let wrapper = crate::gateway::make_method_descriptor_with_doc(name, function, docstring);
+    let wrapper = crate::gateway::make_method_descriptor_passthrough1_with_doc(
+        name, function, func_args, docstring,
+    );
     let wrapper_slot = roots.base();
     let _ = roots.pin_root(wrapper);
     let code = unsafe { crate::function::getcode(roots.get(wrapper_slot)) } as PyObjectRef;
@@ -500,8 +522,23 @@ fn expr_context_type() -> PyObjectRef {
 /// missing-field defaults/deprecations and unexpected-keyword deprecation.
 /// Keep PyPy's generated-type owner and general object-space dispatch while
 /// porting that constructor decision tree here.
+fn ast_init_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    let mut positional = Vec::with_capacity(pos.len() + 1);
+    positional.push(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    positional.extend_from_slice(&pos);
+    ast_init_from(&positional, kwargs)
+}
+
 fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    ast_init_from(positional, kwargs)
+}
+
+fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> crate::PyResult {
     let Some((_, values)) = positional.split_first() else {
         return Err(crate::PyError::type_error("AST.__init__() missing self"));
     };
@@ -687,6 +724,21 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
 /// `ast_type_replace` through those PyPy object-space surfaces: validate the
 /// declared names, copy only declared instance entries, overlay keywords, and
 /// invoke the live node type so subclass construction remains observable.
+fn ast_replace_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
+    if !args.arguments_w.is_empty() {
+        return Err(crate::PyError::type_error(
+            "__replace__() takes no positional arguments",
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    ast_replace_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        crate::builtins::arguments_as_kwargs_dict(args)?,
+    )
+}
+
 fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if positional.is_empty() {
@@ -697,10 +749,13 @@ fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
             "__replace__() takes no positional arguments",
         ));
     }
+    ast_replace_from(positional[0], kwargs)
+}
 
+fn ast_replace_from(zelf: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let zelf_slot = roots.base();
-    let _ = roots.pin_root(positional[0]);
+    let _ = roots.pin_root(zelf);
     let kwargs_slot = kwargs.map(|kwargs| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(kwargs);
@@ -1447,13 +1502,18 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
     {
         let method_roots = pyre_object::gc_roots::push_roots();
         let init_slot = method_roots.base();
-        let _ = method_roots.pin_root(ast_slot_wrapper("__init__", ast_init, None));
+        let _ = method_roots.pin_root(ast_slot_wrapper_passthrough1(
+            "__init__",
+            ast_init,
+            ast_init_args,
+        ));
         let repr_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = method_roots.pin_root(ast_slot_wrapper("__repr__", ast_repr, Some(1)));
         let replace_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = method_roots.pin_root(ast_method_descriptor(
             "__replace__",
             ast_replace,
+            ast_replace_args,
             "Return a copy of the AST node with new values for the specified fields.",
             "($self, /, **fields)",
         ));

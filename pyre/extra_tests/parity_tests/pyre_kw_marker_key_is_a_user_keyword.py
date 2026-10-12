@@ -180,7 +180,6 @@ def print_rejects_the_marker_key():
             "TypeError",
             "print() got an unexpected keyword argument '%s'" % K,
         ),
-        xfail=("ok", None),
     )
 
 

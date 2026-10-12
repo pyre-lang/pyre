@@ -3655,6 +3655,15 @@ pub fn descr_method_call(args: &[PyObjectRef]) -> crate::PyResult {
     })
 }
 
+/// `function.py Method.descr_call` keyword path — `space.call_args`.
+pub fn descr_method_call_args(
+    method: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let method = require_method(method, "__call__")?;
+    crate::call::call_args(method, args)
+}
+
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

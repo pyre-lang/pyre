@@ -94,6 +94,24 @@ fn match_args_names(cls: PyObjectRef) -> Result<Vec<String>, PyError> {
 /// named-only fields, overlay keyword changes, and return the same structseq
 /// type.  Types with unnamed positional fields cannot map every tuple slot
 /// back to a keyword and therefore reject replacement altogether.
+fn structseq_replace_args(
+    inst: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    if !args.arguments_w.is_empty() {
+        return Err(PyError::type_error(
+            "__replace__() takes no positional arguments",
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let inst_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(inst);
+    structseq_replace_from(
+        pyre_object::gc_roots::shadow_stack_get(inst_slot),
+        crate::builtins::arguments_as_kwargs_dict(args)?,
+    )
+}
+
 fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let Some(&inst) = positional.first() else {
@@ -106,6 +124,13 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             "__replace__() takes no positional arguments",
         ));
     }
+    structseq_replace_from(inst, kwargs)
+}
+
+fn structseq_replace_from(
+    inst: PyObjectRef,
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, PyError> {
     // The class reads below can allocate; the instance is reloaded from its
     // root afterwards, and the class is re-read through it.
     let has_kwargs = kwargs.is_some();
@@ -550,7 +575,11 @@ fn make_struct_seq_impl(
     );
     store(
         "__replace__",
-        crate::make_builtin_function("__replace__", structseq_replace),
+        crate::gateway::make_builtin_function_passthrough1(
+            "__replace__",
+            structseq_replace,
+            structseq_replace_args,
+        ),
     );
 
     let bases_slot = roots.pin_roots(&[pyre_object::w_tuple_new(Vec::new())]);

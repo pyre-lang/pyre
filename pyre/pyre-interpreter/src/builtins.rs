@@ -3,7 +3,8 @@ use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 use num_traits::ToPrimitive;
 
 use crate::{
-    make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
+    make_builtin_function, make_builtin_function_passthrough0, make_builtin_function_with_arity,
+    make_module_builtin_function, make_module_builtin_function_passthrough0,
     make_module_builtin_function_with_arity, make_module_builtin_function_with_doc,
 };
 use pyre_object::*;
@@ -3436,9 +3437,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "min",
         || {
-            make_module_builtin_function_with_doc(
+            crate::gateway::make_module_builtin_function_passthrough0_with_doc(
                 "min",
                 __majit_wrap_builtin_min,
+                builtin_min_args,
                 "min(iterable, *[, default=obj, key=func]) -> value\n\
              min(arg1, arg2, *args, *[, key=func]) -> value\n\
              \n\
@@ -3453,9 +3455,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "max",
         || {
-            make_module_builtin_function_with_doc(
+            crate::gateway::make_module_builtin_function_passthrough0_with_doc(
                 "max",
                 __majit_wrap_builtin_max,
+                builtin_max_args,
                 "max(iterable, *[, default=obj, key=func]) -> value\n\
              max(arg1, arg2, *args, *[, key=func]) -> value\n\
              \n\
@@ -3695,7 +3698,13 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "breakpoint",
-        || make_module_builtin_function("breakpoint", builtin_breakpoint),
+        || {
+            make_module_builtin_function_passthrough0(
+                "breakpoint",
+                builtin_breakpoint,
+                builtin_breakpoint_args,
+            )
+        },
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -3729,7 +3738,13 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__build_class__",
-        || make_module_builtin_function("__build_class__", builtin_build_class),
+        || {
+            make_module_builtin_function_passthrough0(
+                "__build_class__",
+                builtin_build_class,
+                builtin_build_class_args,
+            )
+        },
     );
     // bytearrayobject.py W_BytearrayObject — register the real type
     // (callable as a constructor and usable in isinstance(x, bytearray)).
@@ -6122,6 +6137,85 @@ pub fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyO
     (args, None)
 }
 
+/// Build a real kwargs dict from `Arguments.keyword_names_w` / `keywords_w`.
+///
+/// Keyword passthrough bodies reuse the existing dict-shaped helpers
+/// (`kwarg_get`, `init_or_update`, format field lookup) without packing
+/// the `__pyre_kw__` marker.
+///
+/// `w_dict_new` / `setitem` collect, so the names, values and dict sit on
+/// the shadow stack the way `collect_keyword_args` (`argument.py`
+/// `_collect_keyword_args`) publishes every pair before the first store.
+pub fn arguments_as_kwargs_dict(
+    args: &crate::argument::Arguments,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let _roots = pyre_object::gc_roots::push_roots();
+    fill_kwargs_dict(names, values)
+}
+
+/// Reload `arguments_w` after building the kwargs dict, which allocates.
+///
+/// `BuiltinCodePassThroughArguments0.funcrun` hands an `Arguments` whose
+/// lists are traced upstream. The native copies are not, so a body that
+/// rebuilds a dict must read the positionals back from the same roots.
+pub fn arguments_pos_and_kwargs(
+    args: &crate::argument::Arguments,
+) -> Result<(Vec<PyObjectRef>, Option<PyObjectRef>), crate::PyError> {
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let npos = args.arguments_w.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pos_base = pyre_object::gc_roots::pin_roots(&args.arguments_w);
+    let kwargs = fill_kwargs_dict(names, values)?;
+    let mut pos = vec![pyre_object::PY_NULL; npos];
+    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos);
+    Ok((pos, kwargs))
+}
+
+/// True when `Arguments` carries at least one keyword name
+/// (`keyword_names_w`).
+pub fn arguments_has_keywords(args: &crate::argument::Arguments) -> bool {
+    args.keyword_names_w
+        .as_ref()
+        .is_some_and(|names| !names.is_empty())
+}
+
+/// `[w_obj, ...arguments_w]` for a `PassThroughArguments1` constructor that
+/// still walks a flat slice. Keywords stay on `args`.
+pub fn passthrough1_positional_slice(
+    w_obj: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Vec<PyObjectRef> {
+    let mut slice = Vec::with_capacity(1 + args.arguments_w.len());
+    slice.push(w_obj);
+    slice.extend_from_slice(&args.arguments_w);
+    slice
+}
+
+fn fill_kwargs_dict(
+    names: &[PyObjectRef],
+    values: &[PyObjectRef],
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    debug_assert_eq!(names.len(), values.len());
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let names_base = pyre_object::gc_roots::pin_roots(names);
+    let values_base = pyre_object::gc_roots::pin_roots(values);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new());
+    for i in 0..names.len() {
+        crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(names_base + i),
+            pyre_object::gc_roots::shadow_stack_get(values_base + i),
+        )?;
+    }
+    Ok(Some(pyre_object::gc_roots::shadow_stack_get(dict_slot)))
+}
+
 /// Whether `last` is the trailing keyword dict [`split_builtin_kwargs`]
 /// strips.
 ///
@@ -6943,12 +7037,31 @@ crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_min_target, __majit_wrap
 
 crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_max_target, __majit_wrap_builtin_max);
 
+fn builtin_min_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = arguments_pos_and_kwargs(args)?;
+    min_max_from_parts(&pos, kwargs, false, "min")
+}
+
+fn builtin_max_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = arguments_pos_and_kwargs(args)?;
+    min_max_from_parts(&pos, kwargs, true, "max")
+}
+
 fn min_max_dispatch(
     args: &[PyObjectRef],
     want_max: bool,
     fn_name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
+    min_max_from_parts(positional, kwargs, want_max, fn_name)
+}
+
+fn min_max_from_parts(
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+    want_max: bool,
+    fn_name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
     // `min_max` unpacks its positionals before it looks at the keywords, so a
     // keywords-only call is reported against the missing operand.
     if positional.is_empty() {
@@ -7223,9 +7336,30 @@ pub fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             "type.__new__(): not enough arguments",
         ));
     }
+    type_descr_new_from(pos[0], &pos[1..], kwargs)
+}
 
-    let w_typetype = pos[0];
-    let arguments_w = &pos[1..];
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+pub fn type_descr_new_args(
+    w_typetype: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ty_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_typetype);
+    let (pos, kwargs) = arguments_pos_and_kwargs(args)?;
+    type_descr_new_from(
+        pyre_object::gc_roots::shadow_stack_get(ty_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+fn type_descr_new_from(
+    w_typetype: PyObjectRef,
+    arguments_w: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     // `type_new` is entered only after `tp_new_wrapper` has established that
     // the first argument is a type.  This check therefore precedes parsing
     // `(name, bases, dict)`, regardless of that tuple's arity.
@@ -7929,19 +8063,16 @@ fn type_create_new_type(
         // dict).  This is the single site for the metaclass path; the
         // default-metaclass `__build_class__` shortcut fires it itself
         // because it bypasses type.__new__.
-        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match has_kwargs
-            .then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot))
-        {
-            Some(kw) => unsafe {
-                pyre_object::w_dict_items(kw)
-                    .into_iter()
-                    .filter(|(k, _)| {
-                        is_str(*k) && pyre_object::w_str_get_wtf8(*k).as_str() != Ok("__pyre_kw__")
-                    })
-                    .collect()
-            },
-            None => Vec::new(),
-        };
+        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> =
+            match has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot)) {
+                Some(kw) => unsafe {
+                    pyre_object::w_dict_items(kw)
+                        .into_iter()
+                        .filter(|(_, v)| !pyre_object::kw_marker::is_kw_marker_sentinel(*v))
+                        .collect()
+                },
+                None => Vec::new(),
+            };
         crate::call::call_init_subclass_on_bases(
             w_type(),
             pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
@@ -13450,9 +13581,20 @@ fn builtin_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     crate::call::real_build_class(args)
 }
 
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+fn builtin_build_class_args(
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    crate::call::real_build_class_args(args)
+}
+
 /// Get a reference to the `__build_class__` builtin function.
 pub fn get_build_class_func() -> PyObjectRef {
-    make_builtin_function("__build_class__", builtin_build_class)
+    make_builtin_function_passthrough0(
+        "__build_class__",
+        builtin_build_class,
+        builtin_build_class_args,
+    )
 }
 
 /// Is `obj` the `__build_class__` builtin?
@@ -27316,6 +27458,32 @@ fn builtin_breakpoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         live_args.push(roots.get(base + index));
     }
     call_forwarding_args(hook, &live_args)
+}
+
+/// Keyword path: `space.call_args(sys.breakpointhook, __args__)`.
+fn builtin_breakpoint_args(
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let pos = &args.arguments_w;
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let pos_base = roots.pin_roots(pos);
+    let names_base = roots.pin_roots(names);
+    let values_base = roots.pin_roots(values);
+    let npos = pos.len();
+    let nnames = names.len();
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
+        return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
+    };
+    let Ok(hook) = crate::baseobjspace::getattr_str(sys, "breakpointhook") else {
+        return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
+    };
+    let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
+    let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(names_base + i)).collect();
+    let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(values_base + i)).collect();
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    crate::call::call_args(hook, &forwarded)
 }
 
 /// — PyPy: `_frozen_importlib/interp_import.py:interp___import__`.
