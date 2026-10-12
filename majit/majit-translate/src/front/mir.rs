@@ -1962,12 +1962,6 @@ impl<'l> CrateLowering<'l> {
             &self.state.tombstoned_leaves,
             &cells,
             &self.state.gc_struct_ids,
-            fundecl_keeps_zst_self(
-                self.llbc,
-                fd,
-                &self.state.tombstoned_leaves,
-                &self.state.gc_struct_ids,
-            ),
         );
         if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
@@ -2163,12 +2157,6 @@ impl<'l> CrateLowering<'l> {
             &self.state.tombstoned_leaves,
             &cells,
             &self.state.gc_struct_ids,
-            fundecl_keeps_zst_self(
-                self.llbc,
-                fd,
-                &self.state.tombstoned_leaves,
-                &self.state.gc_struct_ids,
-            ),
         );
         if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
@@ -5869,7 +5857,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             accum,
             root_stack,
             self_dont_look_inside,
-            fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
         )?;
         lo.struct_fields = Some(struct_fields);
         if builder_mode {
@@ -5925,7 +5912,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         accum,
         root_stack,
         self_dont_look_inside,
-        fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
     )?;
     lo.struct_fields = Some(struct_fields);
     if builder_mode {
@@ -5967,7 +5953,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 accum,
                 root_stack,
                 self_dont_look_inside,
-                fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
             )?;
             lo.struct_fields = Some(struct_fields);
             if builder_mode {
@@ -8926,7 +8911,6 @@ fn pygraph_initial_block(
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_mut_ref_params: &std::collections::HashSet<usize>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    keep_zst_self: bool,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
@@ -8999,11 +8983,15 @@ fn pygraph_initial_block(
         // A raw pointer to a wider scalar is `int` (`getkind` of a raw
         // `Ptr`). A byte pointer stays `Ref`: pyre erases a GC
         // reference to `*mut u8`. See [`tyref_scalar_pointee_value_type`].
-        //
-        // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref:
-        // rustc still passes the pointer, and RPython method
-        // `indirect_call` always has self. See [`fundecl_keeps_zst_self`].
-        let mut ty = input_param_value_type(ty, &local.ty, llbc, keep_zst_self, i == 1);
+        let mut ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
+            ValueType::Void
+        } else if matches!(ty, ValueType::Ref(None))
+            && let Some(scalar) = tyref_scalar_pointee_value_type(&local.ty, llbc)
+        {
+            scalar
+        } else {
+            ty
+        };
         // Same membership as [`gc_mut_ref_param_locals`], including the
         // residual exclusion: a cell parameter is the `MutRef<T>` the
         // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
@@ -9158,7 +9146,6 @@ impl<'a> Lowering<'a> {
         accum: &AccumulatorFacts,
         root_stack: &RootStackAnalyzer<'_>,
         self_dont_look_inside: bool,
-        keep_zst_self: bool,
     ) -> Result<Self, LowerError> {
         let gc_mut_ref_params = gc_mut_ref_param_locals(
             &body.locals,
@@ -9242,10 +9229,16 @@ impl<'a> Lowering<'a> {
             // primitive is the scalar word (`history.py` `getkind` of
             // `&i64` is `int`), and a raw pointer to a wider scalar is
             // `int`. A byte pointer stays `Ref`.
-            //
-            // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref.
-            // See [`fundecl_keeps_zst_self`].
-            let mut ty = input_param_value_type(ty, &local.ty, llbc, keep_zst_self, i == 1);
+            let mut ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc)
+            {
+                ValueType::Void
+            } else if matches!(ty, ValueType::Ref(None))
+                && let Some(scalar) = tyref_scalar_pointee_value_type(&local.ty, llbc)
+            {
+                scalar
+            } else {
+                ty
+            };
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
             // `ClassDef`; only `Ref`-typed params consume it there.  A
@@ -18339,34 +18332,6 @@ impl<'a> Lowering<'a> {
             kind: OpKind::ConstNone,
         });
         unit
-    }
-
-    /// Keep a dyn-call / ICT-method receiver as a Ref word.
-    ///
-    /// `resolve_operand` of `&ZST` yields `emit_unit` (Void). rustc still
-    /// passes that pointer; RPython method `indirect_call` always has self.
-    /// Recast only a Void first argument — a fat-pointer data word that is
-    /// already `Ref` is left alone.
-    fn keep_dyn_call_receiver(&mut self, mir_bb: usize, args: &mut [Variable]) {
-        let Some(recv) = args.first_mut() else {
-            return;
-        };
-        if crate::model::FunctionGraph::concretetype_of(recv) != crate::model::ConcreteType::Void {
-            return;
-        }
-        let recast = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let bb_id = self.block_id[mir_bb];
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(recast.clone()),
-            kind: OpKind::UnaryOp {
-                op: "same_as".to_string(),
-                operand: recv.clone(),
-                result_ty: ValueType::Ref(None),
-            },
-        });
-        *recv = recast;
     }
 
     /// Fold a `TraitConst` whose trait ref is one selected impl.
@@ -28062,17 +28027,6 @@ impl<'a> Lowering<'a> {
                     } else {
                         result_ty
                     };
-                    if let Some(id) = fun_decl_id
-                        && let Some(fd) = self.llbc.fn_by_id(id)
-                        && fundecl_keeps_zst_self(
-                            self.llbc,
-                            fd,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                        )
-                    {
-                        self.keep_dyn_call_receiver(mir_bb, &mut args);
-                    }
                     OpKind::Call {
                         target,
                         args: crate::model::call_args(args),
@@ -28091,11 +28045,9 @@ impl<'a> Lowering<'a> {
                 // by `FunctionReprBase.call`, instead of routing through the
                 // synthetic `__dyn_call`.  The
                 // call args already carry the receiver in `args[0]` (the
-                // fat-pointer data word). RPython method `indirect_call`
-                // always has self: keep that word as Ref even when the
-                // strategy type is ZST (`keep_dyn_call_receiver`). The
-                // callee ICT jitcode keeps the matching unused `self`
-                // inputarg (`fundecl_keeps_zst_self`).
+                // operand projection's base local), which is exactly the
+                // receiver slot `IndirectCall` expects, so the arg list
+                // passes through unchanged.
                 //
                 // A stored fn-ptr — the one-hop `Option<fn-ptr>` deref, a
                 // host-registered callback table, a settable hook — is not a
@@ -28119,7 +28071,7 @@ impl<'a> Lowering<'a> {
                     .unwrap_or_else(|| dyn_operand.clone());
                 let indirect = self.dyn_indirect_target(&vtable_slot);
                 let passes_pairs = !pair_lens.is_empty();
-                let mut args = splice_pair_lens(args, pair_lens);
+                let args = splice_pair_lens(args, pair_lens);
                 if let Some((trait_root, method_name)) = indirect {
                     // `SetStrategy::{add,remove,has_key}` take
                     // `(&self, w_set, ObjectKey)`. The flow graph drops the
@@ -28127,8 +28079,7 @@ impl<'a> Lowering<'a> {
                     // the residual words are `(w_set, &ObjectKey)`. The vtable
                     // slot is the rustc method, which reads those words as
                     // `self` and `w_set`. Call the word trampoline that
-                    // matches the residual instead. Do not recast the
-                    // receiver before this trampoline.
+                    // matches the residual instead.
                     if trait_root == "SetStrategy"
                         && matches!(method_name.as_str(), "add" | "remove" | "has_key")
                         && (args.len() == 2 || args.len() == 3)
@@ -28155,9 +28106,6 @@ impl<'a> Lowering<'a> {
                         // already lowers this exact MIR Field projection, so keep
                         // it instead of replacing it with a blackhole-only
                         // name-based lookup that has no upstream counterpart.
-                        // Keep the fat-pointer data word as the first Ref
-                        // argument so the residual matches rustc `(&self, ...)`.
-                        self.keep_dyn_call_receiver(mir_bb, &mut args);
                         let funcptr = self.resolve_operand(mir_bb, vtable_slot)?;
                         OpKind::IndirectCall {
                             funcptr,
@@ -55524,57 +55472,6 @@ fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u64> {
     impl_payload.as_object()?.get("Trait")?.as_u64()
 }
 
-/// A local trait-impl method whose first parameter is `&ZST`.
-///
-/// rustc still passes that `&self` in a pointer register (`ResidualSlot`
-/// for `&T`). RPython method `indirect_call` always has self. Keep the
-/// word as `Ref` on graphs reached as `indirectcalltargets` so the
-/// recorded/executed call matches rustc's `(&self, ...)` arity. By-value
-/// ZST (`From::from`) stays `Void`. Core/std impls stay peeled.
-fn fundecl_keeps_zst_self(
-    llbc: &Llbc,
-    fd: &FunDecl,
-    tombstoned: &std::collections::HashSet<String>,
-    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-) -> bool {
-    if trait_impl_trait_path_for_fundecl(llbc, fd).is_none() {
-        return false;
-    }
-    let Some(locals) = fd.unstructured_locals() else {
-        return false;
-    };
-    let Some(local) = locals.locals.get(1) else {
-        return false;
-    };
-    let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned, gc_struct_ids);
-    matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc)
-}
-
-/// Declared-parameter ValueType, matching [`pygraph_initial_block`] /
-/// [`Lowering::new`]. A ZST `&self` on an `indirectcalltarget` trait impl
-/// stays `Ref`; every other void-ZST parameter is `Void`.
-fn input_param_value_type(
-    ty: ValueType,
-    local_ty: &TyRef,
-    llbc: &Llbc,
-    keep_zst_self: bool,
-    is_first_param: bool,
-) -> ValueType {
-    if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(local_ty, llbc) {
-        if keep_zst_self && is_first_param {
-            ty
-        } else {
-            ValueType::Void
-        }
-    } else if matches!(ty, ValueType::Ref(None))
-        && let Some(scalar) = tyref_scalar_pointee_value_type(local_ty, llbc)
-    {
-        scalar
-    } else {
-        ty
-    }
-}
-
 /// The `From::from` body selected for `error_ty` into `carrier_path`.
 ///
 /// `impl From<T> for U` stores `[U, T]` on `impl_trait.generics.types`,
@@ -80492,7 +80389,6 @@ mod tests {
                 &accum,
                 &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
                 false,
-                false,
             )
             .unwrap();
             assert_eq!(
@@ -87902,7 +87798,6 @@ mod tests {
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
-            false,
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -89012,7 +88907,6 @@ mod tests {
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
-            false,
         )
         .unwrap();
         let kind = serde_json::json!({"Adt": [0, 1]});
@@ -89159,7 +89053,6 @@ mod tests {
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
-            false,
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -89231,7 +89124,6 @@ mod tests {
             &gc_struct_ids_llbc,
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
-            false,
             false,
         )
         .unwrap();
@@ -89367,7 +89259,6 @@ mod tests {
             &accum_a,
             &super::RootStackAnalyzer::new(&a, &super::RootStackState::new(&a)),
             false,
-            false,
         )
         .unwrap();
         let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
@@ -89410,7 +89301,6 @@ mod tests {
             &gc_struct_ids_b,
             &accum_b,
             &super::RootStackAnalyzer::new(&b, &super::RootStackState::new(&b)),
-            false,
             false,
         )
         .unwrap();
@@ -95223,7 +95113,6 @@ mod tests {
             tomb,
             &cells,
             &gc_struct_ids,
-            false,
         );
         let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
             panic!("slot op is an input");
@@ -95242,7 +95131,6 @@ mod tests {
             tomb,
             &residual,
             &gc_struct_ids,
-            false,
         );
         let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
             panic!("slot op is an input");
@@ -95353,7 +95241,6 @@ mod tests {
             &gc_struct_ids,
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
-            false,
             false,
         )
         .unwrap();

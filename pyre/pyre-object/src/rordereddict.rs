@@ -332,11 +332,7 @@ pub struct RDict<K, V, S = RandomState> {
     /// `length` is the allocation.
     entries: *mut GcEntries<K, V>,
     /// `d.num_live_items`.
-    ///
-    /// Public so `AbstractTypedStrategy.length` can read the header the way
-    /// `rordereddict.rtype_len` emits `getfield(d, "num_live_items")` when the
-    /// table has no custom eq/hash. A getter call would residualize.
-    pub num_live_items: usize,
+    num_live_items: usize,
     /// `d.num_ever_used_items`.
     num_ever_used_items: usize,
     /// `d.resize_counter`.  Signed because upstream tests `rc <= 0` after
@@ -413,17 +409,6 @@ impl<K, V, S> RDict<K, V, S> {
             generation: 0,
             hash_builder,
         }
-    }
-
-    /// `d.num_live_items` — the number of pairs, not the number of slots.
-    ///
-    /// `rordereddict.rtype_len` emits `getfield(d, "num_live_items")` when the
-    /// table has no custom eq/hash. `ll_dict_len` (`look_inside_iff(isvirtual(d))`)
-    /// residualizes to `ll_dict_len_trampoline` (`dont_look_inside`) otherwise,
-    /// so traced `AbstractTypedStrategy.length` reads this field directly.
-    #[inline]
-    pub fn num_live_items(&self) -> usize {
-        self.num_live_items
     }
 
     /// `d.num_live_items` — the number of pairs, not the number of slots.

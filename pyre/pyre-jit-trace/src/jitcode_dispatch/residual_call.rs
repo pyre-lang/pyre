@@ -7656,135 +7656,6 @@ fn try_walker_lower_getexecutioncontext<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Seed one register bank's concrete shadows from the live boxes.
-///
-/// `MIFrame.setup_call` (`pyjitpl.py`) copies each `argbox` into the
-/// matching bank; a Const box keeps its recording-time value, which the
-/// callee body then folds.
-fn residual_arg_concretes<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    args: &[OpRef],
-) -> Vec<ConcreteValue> {
-    args.iter()
-        .map(|&b| match ctx.trace_ctx.box_value(b) {
-            Some(majit_ir::Value::Int(n)) => ConcreteValue::Int(n),
-            Some(majit_ir::Value::Float(n)) => ConcreteValue::Float(n),
-            Some(majit_ir::Value::Ref(gc_ref)) => {
-                crate::state::concrete_value_from_slot(gc_ref.0 as pyre_object::PyObjectRef)
-            }
-            Some(majit_ir::Value::Void) | None => ConcreteValue::Null,
-        })
-        .collect()
-}
-
-/// `pyjitpl.py` `MIFrame.do_residual_or_indirect_call` ICT half:
-/// Const `funcbox` → `bytecode_for_address` → `perform_call`.
-///
-/// The residual opcode's int/ref/float lists are the `argboxes` that
-/// `setup_call` splits by type into the callee banks. A miss, a symbolic
-/// hash, a recursive helper, or an un-lowered callee body with nothing
-/// applied falls through to `do_residual_call`.
-fn try_do_residual_or_indirect_call<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    next_pc: usize,
-    funcptr: OpRef,
-    i_args: &[OpRef],
-    r_args: &[OpRef],
-    f_args: &[OpRef],
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor || !funcptr.is_constant() {
-        return Ok(None);
-    }
-    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcptr) else {
-        return Ok(None);
-    };
-    if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
-        return Ok(None);
-    }
-    let Some(jitcode) = crate::state::bytecode_for_address(addr as usize) else {
-        return Ok(None);
-    };
-    if ctx.fbw_mode.transparent_helper_jitcode_index == Some(jitcode.index()) {
-        return Ok(None);
-    }
-    let Some(sub_body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
-        return Ok(None);
-    };
-    if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
-        return Ok(None);
-    }
-    if i_args.len() > sub_body.num_regs_i
-        || r_args.len() > sub_body.num_regs_r
-        || f_args.len() > sub_body.num_regs_f
-    {
-        return Ok(None);
-    }
-    if fbw_debug_abort_enabled() {
-        eprintln!(
-            "[residual-indirect-call] pc={op_pc} addr={addr:#x} jitcode={} name={}",
-            jitcode.index(),
-            jitcode.name
-        );
-    }
-    let int_concretes = residual_arg_concretes(ctx, i_args);
-    let ref_concretes = residual_arg_concretes(ctx, r_args);
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let effects_before = fbw_executed_effect_count();
-    let unjournaled_before = fbw_has_unjournaled_effect();
-    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
-    ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
-    let exc_before = ctx.last_exc_value();
-    let walk = run_codewriter_helper_inline_call(
-        ctx,
-        op_pc,
-        &sub_body,
-        i_args,
-        &int_concretes,
-        r_args,
-        &ref_concretes,
-        f_args,
-    );
-    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
-    let walk_outcome = match walk {
-        Ok(outcome) => outcome,
-        Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
-            cut_declined_subwalk(ctx, pre_fold_pos);
-            return Ok(None);
-        }
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. }) => {
-            let nothing_applied = fbw_executed_effect_count() == effects_before
-                && !unjournaled_before
-                && !fbw_has_unjournaled_effect();
-            if nothing_applied {
-                cut_declined_subwalk(ctx, pre_fold_pos);
-                return Ok(None);
-            }
-            return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
-                pc: op_pc,
-                symbolic,
-            });
-        }
-        Err(error) => return Err(error),
-    };
-    match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before)? {
-        DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
-            let _ = finish_inline_callee_return(ctx, None);
-            Ok(Some((DispatchOutcome::Continue, next_pc)))
-        }
-        DispatchOutcome::SubReturn { result } => {
-            let result = finish_inline_callee_return(ctx, result)
-                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?;
-            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-            Ok(Some((DispatchOutcome::Continue, next_pc)))
-        }
-        DispatchOutcome::Continue => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-        other => Ok(Some((other, next_pc))),
-    }
-}
-
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -8944,7 +8815,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     } else {
         None
     };
-    let skip_indirect = direct_subst.is_some();
     let (funcptr, descr, allboxes) = match direct_subst {
         Some(subst) => (subst.funcptr, subst.descr, subst.allboxes),
         None => (funcptr, descr, allboxes),
@@ -8957,22 +8827,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })?;
     let descr_key = descr.index();
     let ei = call_descr.get_extra_info();
-    // `do_residual_or_indirect_call` (`pyjitpl.py`) before `do_residual_call`.
-    if !skip_indirect
-        && let Some(outcome) = try_do_residual_or_indirect_call(
-            ctx,
-            op.pc,
-            op.next_pc,
-            funcptr,
-            &[],
-            &r_args,
-            &[],
-            dst,
-            dst_bank,
-        )?
-    {
-        return Ok(outcome);
-    }
 
     // pyjitpl.py forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
@@ -10532,20 +10386,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    // `do_residual_or_indirect_call` (`pyjitpl.py`) before `do_residual_call`.
-    if let Some(outcome) = try_do_residual_or_indirect_call(
-        ctx,
-        op.pc,
-        op.next_pc,
-        funcptr,
-        &i_args,
-        &r_args,
-        &[],
-        dst,
-        dst_bank,
-    )? {
-        return Ok(outcome);
-    }
 
     // pyjitpl.py forces-branch sub-case: route release-gil through
     // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
@@ -10871,12 +10711,6 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
 
     if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
         return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    // `do_residual_or_indirect_call` (`pyjitpl.py`) before `do_residual_call`.
-    if let Some(outcome) = try_do_residual_or_indirect_call(
-        ctx, op.pc, op.next_pc, funcptr, &i_args, &r_args, &f_args, dst, dst_bank,
-    )? {
-        return Ok(outcome);
     }
 
     // pyjitpl.py forces-branch sub-case, ahead of the release-gil one:
