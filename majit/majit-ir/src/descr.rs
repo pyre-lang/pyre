@@ -476,16 +476,20 @@ pub fn size_descr_agrees_with_spec(sd: &dyn SizeDescr, size: usize, vtable: usiz
 
 /// Whether `sd` and an incoming field list describe the same STRUCT.
 ///
-/// `descr.py get_size_descr` keys `_cache_size` on the lltype object, not
-/// on vtable-presence. A serialized `BhDescr::Size` often carries
-/// `vtable == 0` (`bh_size_spec_from_callcontrol` does not intern a
-/// process-local typeptr); that is the same STRUCT as the published
-/// group, not a second layout. Offset overlap is the layout identity:
-/// one list may be a prefix the other has not accumulated yet
-/// (`register_struct_layout` merge), and `heaptracker.all_fielddescrs`
-/// may include nested leaves the other spelling flattened differently.
-/// An empty list cannot prove identity (the fieldless-shell path uses
-/// [`size_descr_agrees_with_spec`]).
+/// Upstream identity is the lltype STRUCT object (`descr.py get_size_descr`
+/// `cache[STRUCT]`; `gc.py init_size_descr` stamps `gctypelayout.py
+/// get_type_id` for that same TYPE). pyre keys the cache on a `path_hash`,
+/// so a collision can put two same-sized layouts in one slot. A serialized
+/// `BhDescr::Size` often carries `vtable == 0` (`bh_size_spec_from_callcontrol`
+/// does not intern a process-local typeptr); that is still the published
+/// STRUCT when the positional lists agree, not a second layout.
+///
+/// Offset *overlap* is not that identity: two unrelated STRUCTs can share
+/// a prefix of field offsets and still have different pointer maps. Equal
+/// size, equal field count, and equal offset bags (duplicates kept, so a
+/// flattened aggregate and its first leaf at one address still match) are
+/// the evidence this hash-key stand-in can offer. An empty list cannot
+/// prove identity (the fieldless-shell path uses [`size_descr_agrees_with_spec`]).
 pub fn size_descr_same_struct_layout(
     sd: &dyn SizeDescr,
     size: usize,
@@ -498,13 +502,14 @@ pub fn size_descr_same_struct_layout(
     if cached.is_empty() || incoming_offsets.is_empty() {
         return false;
     }
-    let cached_offsets: Vec<usize> = cached.iter().map(|field| field.offset()).collect();
-    incoming_offsets
-        .iter()
-        .all(|offset| cached_offsets.contains(offset))
-        || cached_offsets
-            .iter()
-            .all(|offset| incoming_offsets.contains(offset))
+    if cached.len() != incoming_offsets.len() {
+        return false;
+    }
+    let mut cached_offsets: Vec<usize> = cached.iter().map(|field| field.offset()).collect();
+    let mut incoming = incoming_offsets.to_vec();
+    cached_offsets.sort_unstable();
+    incoming.sort_unstable();
+    cached_offsets == incoming
 }
 
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
@@ -3234,8 +3239,20 @@ impl GcCache {
                 .as_size_descr()
                 .map(|sd| sd.all_fielddescrs().to_vec())
                 .unwrap_or_default();
+            // `make_descr_from_bh` already gates this path with
+            // `size_descr_agrees_with_spec`; other `register_keyed_size`
+            // callers must not assign a different size or vtable-kind onto
+            // the shell (`gc.py init_size_descr` / `gctypelayout.py
+            // get_type_id` are per STRUCT).
+            let agrees = descr
+                .as_size_descr()
+                .zip(existing.as_size_descr())
+                .is_some_and(|(new, old)| {
+                    size_descr_agrees_with_spec(old, new.size(), new.vtable())
+                });
             if existing_empty
                 && !new_fields.is_empty()
+                && agrees
                 && !(descr_carries_collector_tid(&descr) && !descr_carries_collector_tid(&existing))
             {
                 if let Some(sd) = existing
@@ -9899,6 +9916,50 @@ mod tests {
             .all_fielddescrs();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].offset(), 0);
+    }
+
+    #[test]
+    fn register_keyed_size_does_not_assign_a_different_size_onto_a_shell() {
+        let key = LLType::Struct(0xf1b1_5000_f0b0_0004);
+        let shell = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(key.clone(), 16, 0, false)
+        };
+        let foreign: DescrRef = Arc::new(
+            SimpleSizeDescr::new(u32::MAX, 72, 0).with_all_fielddescrs(vec![
+                Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false)) as Arc<dyn FieldDescr>,
+                Arc::new(SimpleFieldDescr::new(1, 64, 8, Type::Ref, false)) as Arc<dyn FieldDescr>,
+            ]),
+        );
+        {
+            let mut gc = gc_cache().lock();
+            gc.register_keyed_size(key, foreign);
+        }
+        let fields = shell
+            .as_size_descr()
+            .expect("shell remains a SizeDescr")
+            .all_fielddescrs();
+        assert!(
+            fields.is_empty(),
+            "a size-72 layout must not freeze onto a size-16 shell"
+        );
+    }
+
+    #[test]
+    fn size_descr_same_struct_layout_requires_equal_offset_bags() {
+        let sd = SimpleSizeDescr::new(0, 32, 0).with_all_fielddescrs(vec![
+            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Int, false)) as Arc<dyn FieldDescr>,
+            Arc::new(SimpleFieldDescr::new(1, 8, 8, Type::Int, false)) as Arc<dyn FieldDescr>,
+        ]);
+        assert!(size_descr_same_struct_layout(&sd, 32, &[0, 8]));
+        assert!(size_descr_same_struct_layout(&sd, 32, &[8, 0]));
+        assert!(
+            !size_descr_same_struct_layout(&sd, 32, &[0]),
+            "a proper subset of offsets is not STRUCT identity"
+        );
+        assert!(!size_descr_same_struct_layout(&sd, 32, &[0, 8, 16]));
+        assert!(!size_descr_same_struct_layout(&sd, 16, &[0, 8]));
+        assert!(!size_descr_same_struct_layout(&sd, 32, &[0, 16]));
     }
 
     #[test]

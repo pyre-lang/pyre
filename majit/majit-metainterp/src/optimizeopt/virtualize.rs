@@ -5645,14 +5645,18 @@ mod tests {
                 spec("pycode", 8, Type::Ref, majit_ir::ArrayFlag::Pointer, 1),
             ],
         );
+        let last_instr_fd = group.field_descrs[0].clone() as DescrRef;
         let pycode_fd = group.field_descrs[1].clone() as DescrRef;
         let pycode = majit_ir::GcRef(0xCAFE);
+        let last_instr = Value::Int(7);
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewWithVtable,
                 &[],
                 group.size_descr.clone() as DescrRef,
             ),
+            // Store in reverse of `all_fielddescrs` order. `_force_elements`
+            // must emit in descriptor order (`info.py` enumerate walk).
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
@@ -5660,6 +5664,14 @@ mod tests {
                     Operand::const_from_value(Value::Ref(pycode)),
                 ],
                 pycode_fd,
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    Operand::const_from_value(last_instr),
+                ],
+                last_instr_fd,
             ),
             Op::new(
                 OpCode::CallN,
@@ -5671,26 +5683,24 @@ mod tests {
         ];
         assign_positions(&mut ops);
         let result = run_pass(&ops);
-        let ref_stores: Vec<_> = result
+        let stores: Vec<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::SetfieldGc)
-            .filter(|op| op.arg(1).const_value() == Some(Value::Ref(pycode)))
+            .collect();
+        let keys: Vec<String> = stores
+            .iter()
+            .filter_map(|op| {
+                op.getdescr()
+                    .and_then(|d| d.as_field_descr().map(|f| f.field_key().to_string()))
+            })
             .collect();
         assert_eq!(
-            ref_stores.len(),
-            1,
-            "forced Ref store should be one SETFIELD_GC: {:?}",
+            keys,
+            vec!["last_instr".to_string(), "pycode".to_string()],
+            "force_box must emit SETFIELD_GC in all_fielddescrs order: {:?}",
             result.iter().map(|op| op.opcode).collect::<Vec<_>>()
         );
-        let fd = ref_stores[0]
-            .getdescr()
-            .and_then(|d| d.as_field_descr().map(|f| f.field_key().to_string()));
-        assert_eq!(
-            fd.as_deref(),
-            Some("pycode"),
-            "force_box must emit the Ref under the shared parent's pycode descr"
-        );
-        let parent = ref_stores[0]
+        let parent = stores[1]
             .getdescr()
             .and_then(|d| d.as_field_descr().and_then(|f| f.get_parent_descr()));
         assert!(

@@ -779,14 +779,18 @@ impl JitCodeBuilder {
             // struct to read it off.  Deciding on offsets alone would keep
             // whichever site happened to arrive first.
             Self::apply_immutable_ranks(&mut existing.all_fielddescrs, &ranks);
-            let existing = &*existing;
             let mut every_offset_known = true;
             for &field in fields {
-                if !Self::record_layout_conflicts(existing, type_id, field) {
+                if !Self::record_layout_conflicts(&*existing, type_id, field) {
                     every_offset_known = false;
                 }
             }
             if every_offset_known {
+                // `descr.py get_size_descr` is one ranking per STRUCT. A
+                // first registration may have ranked by offset before the
+                // parent SizeDescr was cached; re-rank now so
+                // `index_in_parent` follows `all_fielddescrs`.
+                Self::rank_field_specs(type_id, &mut existing.all_fielddescrs);
                 return;
             }
         }
@@ -1048,6 +1052,29 @@ impl JitCodeBuilder {
         specs
     }
 
+    /// Position of `spec` in the published SizeDescr list.
+    ///
+    /// `heaptracker.get_fielddescr_index_in(STRUCT, fieldname)` keys on the
+    /// name. An offset is only used when it identifies one cached field: a
+    /// flattened aggregate and its first leaf share an address, so matching
+    /// `key == field_key || offset == spec.offset` would give both the
+    /// aggregate's index.
+    fn rank_of_cached_field(ranks: &[(String, usize)], spec: &BhFieldSpec) -> usize {
+        if let Some(idx) = ranks.iter().position(|(key, _)| key == &spec.field_key) {
+            return idx;
+        }
+        let mut found = None;
+        for (i, (_, offset)) in ranks.iter().enumerate() {
+            if *offset == spec.offset {
+                if found.is_some() {
+                    return ranks.len();
+                }
+                found = Some(i);
+            }
+        }
+        found.unwrap_or(ranks.len())
+    }
+
     /// Rank `specs` with the published SizeDescr's `all_fielddescrs` order
     /// (`descr.py get_size_descr` / `heaptracker.all_fielddescrs`) when that
     /// STRUCT is already in `gc_cache`. Otherwise rank by offset, the
@@ -1055,10 +1082,7 @@ impl JitCodeBuilder {
     fn rank_field_specs(type_id: u64, specs: &mut [BhFieldSpec]) {
         if let Some(ranks) = Self::cached_parent_ranks(type_id) {
             for spec in specs.iter_mut() {
-                spec.index_in_parent = ranks
-                    .iter()
-                    .position(|(key, offset)| key == &spec.field_key || *offset == spec.offset)
-                    .unwrap_or(ranks.len());
+                spec.index_in_parent = Self::rank_of_cached_field(&ranks, spec);
             }
             specs.sort_by_key(|spec| (spec.index_in_parent, spec.offset));
             let n_cached = ranks.len();
@@ -7672,6 +7696,110 @@ mod tests {
              mint's `unwrap_or((None, String::new()))` fallback stands — and \
              `None` rather than `0` is the point: the miss must not spell \
              itself as a claim on the parent's first slot",
+        );
+    }
+
+    fn publish_parent_layout(type_id: u64, size: usize, fields: &[(&str, usize)]) {
+        let specs: Vec<_> = fields
+            .iter()
+            .enumerate()
+            .map(
+                |(i, (name, offset))| majit_ir::descr::SimpleFieldDescrSpec {
+                    index: i as u32,
+                    field_key: (*name).to_string(),
+                    name: (*name).to_string(),
+                    offset: *offset,
+                    field_size: 8,
+                    field_type: majit_ir::value::Type::Int,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    virtualizable: false,
+                    index_in_parent: i,
+                    is_class_word: Some(false),
+                },
+            )
+            .collect();
+        let _ = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            size,
+            0,
+            type_id,
+            0,
+            true,
+            false,
+            &specs,
+            &[],
+        );
+    }
+
+    #[test]
+    fn rank_field_specs_matches_exact_key_before_shared_offset() {
+        const TID: u64 = 0x4B45_5946_4952_5354;
+        publish_parent_layout(TID, 24, &[("agg", 8), ("leaf", 8)]);
+        let fields = [
+            (8, false, "agg", 8, true, false),
+            (8, true, "leaf", 8, false, false),
+        ];
+        let specs = JitCodeBuilder::field_specs_from_layout(TID, &fields, &[]);
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| (spec.field_key.as_str(), spec.index_in_parent))
+                .collect::<Vec<_>>(),
+            vec![("agg", 0), ("leaf", 1)],
+            "exact field_key must win over a shared offset"
+        );
+    }
+
+    #[test]
+    fn register_struct_layout_reranks_known_offsets_after_cache_publication() {
+        const TID: u64 = 0x5245_5241_4E4B_504F;
+        let mut builder = JitCodeBuilder::new();
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[
+                (8, false, "lo", 8, true, false),
+                (16, false, "hi", 8, true, false),
+            ],
+            "",
+        );
+        let before: Vec<_> = builder
+            .struct_size_specs
+            .get(&TID)
+            .unwrap()
+            .all_fielddescrs
+            .iter()
+            .map(|spec| (spec.field_key.clone(), spec.index_in_parent))
+            .collect();
+        assert_eq!(before, vec![("lo".into(), 0), ("hi".into(), 1)]);
+        publish_parent_layout(TID, 24, &[("hi", 16), ("lo", 8)]);
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[
+                (8, false, "lo", 8, true, false),
+                (16, false, "hi", 8, true, false),
+            ],
+            "",
+        );
+        let after: Vec<_> = builder
+            .struct_size_specs
+            .get(&TID)
+            .unwrap()
+            .all_fielddescrs
+            .iter()
+            .map(|spec| (spec.field_key.clone(), spec.index_in_parent))
+            .collect();
+        assert_eq!(
+            after,
+            vec![("hi".into(), 0), ("lo".into(), 1)],
+            "re-registration after cache publication must adopt all_fielddescrs order"
         );
     }
 
