@@ -9434,14 +9434,9 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
 /// `DELETE_NAME` (or the `GLOBAL` pair).
 ///
 /// The tail's handler entry reads `last_exc_value` (`pyjitpl.py
-/// opimpl_last_exc_value`). A bridge that starts on that read used to walk
-/// with no standing exception and abort (`LastExcValueWithoutActiveException`),
-/// and an abort with a `FOR_ITER` item in flight dropped the iteration. The
-/// bridge now seeds that slot from the frame's current exception
-/// (`seed_standing_exception_for_walk`), which is the value the metainterp
-/// already holds when it continues past the guard. `can_enter_jit`
-/// (`interp_jit.py`) therefore traces the loop. This predicate only names
-/// the shape.
+/// opimpl_last_exc_value`) right behind its `catch_exception`, so the
+/// exception it reads is the one the trace itself recorded. `can_enter_jit`
+/// (`interp_jit.py`) traces the loop. This predicate only names the shape.
 ///
 /// A handler that binds no name (`except E:`) emits no cleanup tail, and a
 /// binding handler that cannot raise never reaches its own tail; both keep
