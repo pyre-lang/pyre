@@ -606,8 +606,8 @@ pub fn pypy_faulthandler_unregister(signum: INT) -> INT {
 /// `faulthandler_suppress_crash_report` Unix half: disable core dumps.
 pub fn faulthandler_suppress_crash_report() {
     let mut rl = unsafe { std::mem::zeroed::<libc::rlimit>() };
-    if unsafe { ll::c_getrlimit(libc::RLIMIT_CORE, &mut rl) } == 0 {
+    if unsafe { ll::c_getrlimit(libc::RLIMIT_CORE as INT, &mut rl) } == 0 {
         rl.rlim_cur = 0;
-        let _ = unsafe { ll::c_setrlimit(libc::RLIMIT_CORE, &rl) };
+        let _ = unsafe { ll::c_setrlimit(libc::RLIMIT_CORE as INT, &rl) };
     }
 }
