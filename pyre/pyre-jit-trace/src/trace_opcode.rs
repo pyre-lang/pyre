@@ -428,7 +428,7 @@ use crate::descr::{
     float_floatval_descr, int_intval_descr, list_strategy_descr, slice_w_start_descr,
     slice_w_step_descr, slice_w_stop_descr, w_float_size_descr, w_int_size_descr,
 };
-use crate::frame_layout::{PYFRAME_DEBUGDATA_OFFSET, PYFRAME_PYCODE_OFFSET};
+use crate::frame_layout::PYFRAME_PYCODE_OFFSET;
 
 /// pyjitpl.py `_opimpl_setfield_vable` parity helper.
 ///
@@ -1792,15 +1792,10 @@ impl MIFrame {
                 frame_addr
             }
         };
-        let (code_ptr, debugdata) = if statics_addr != 0 {
-            unsafe {
-                (
-                    *((statics_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
-                    *((statics_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
-                )
-            }
+        let code_ptr = if statics_addr != 0 {
+            unsafe { *((statics_addr + PYFRAME_PYCODE_OFFSET) as *const usize) }
         } else {
-            (0, 0)
+            0
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
         // Read from the concrete `PyFrame.valuestackdepth` rather than the
@@ -1812,26 +1807,36 @@ impl MIFrame {
         let vsd = self
             .concrete_valuestackdepth()
             .unwrap_or_else(|| self.sym().valuestackdepth) as i64;
-        // `debugdata` keeps the box `read_boxes` seeded instead of being
-        // re-published as a recording-time ConstPtr.  DELETE_NAME resolves the
-        // name through `debugdata.w_locals`, so a constant pins the recording
-        // frame's mapping and the compiled loop then deletes through it once
-        // `exec(code, globals)` reuses the same code object with a fresh
-        // namespace.  virtualizable.py `read_boxes` carries every static
-        // as a loop-carried box for exactly this reason; the remaining pointer
-        // statics keep their promoted-constant representation because the
-        // bytecode path cannot rebind them mid-loop.
+        // `debugdata` keeps the box `virtualizable.py` `read_boxes` /
+        // `initialize_virtualizable` (and a crossed-frame
+        // `gen_load_from_other_virtualizable`) installed on
+        // `virtualizable_boxes`. DELETE_NAME resolves the name through
+        // `debugdata.w_locals`, so a recording-time ConstPtr pins the
+        // origin frame's mapping. `pyjitpl.py` `reached_loop_header`
+        // concatenates that shadow (`live_arg_boxes += virtualizable_boxes;
+        // pop()`); `s.vable_debugdata` is only the origin-frame seed and
+        // is not rebased when those loads replace the shadow. Writing it
+        // back here made the closing JUMP name a pre-cut `InputArgRef`
+        // that `original_boxes` no longer held (`history.py`
+        // `cut_trace_from` / `opencoder.py` `TraceIterator._get`).
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
         let pycode_op = ctx.const_ref(code_ptr as i64);
         let vsd_op = ctx.const_int(vsd);
-        let debugdata_op = self.sym().vable_debugdata;
+        let debugdata_idx = ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_index_by_name("debugdata"));
+        let debugdata_op = debugdata_idx
+            .and_then(|i| ctx.virtualizable_box_at(i))
+            .filter(|&op| !op.is_none() && !ctx.opref_is_void_producer(op))
+            .unwrap_or_else(|| self.sym().vable_debugdata);
         let w_globals_op = ctx.const_ref(ns_ptr);
         let owns = {
             let s = self.sym_mut();
             s.vable_last_instr = last_instr_op;
             s.vable_pycode = pycode_op;
             s.vable_valuestackdepth = vsd_op;
+            s.vable_debugdata = debugdata_op;
             s.frame_w_globals = w_globals_op;
             s.owns_virtualizable_shadow()
         };
@@ -1839,7 +1844,8 @@ impl MIFrame {
         // mirror the republished statics into the canonical
         // `metainterp.virtualizable_boxes` shadow so subsequent readers
         // (snapshot, JUMP-arg dedup) see the same identity that
-        // `s.vable_*` carries.
+        // `s.vable_*` carries. Leave `debugdata` on the shadow box
+        // `read_boxes` already installed — it is not republished.
         if owns {
             mirror_vable_static_to_boxes(
                 ctx,
@@ -1849,12 +1855,6 @@ impl MIFrame {
             );
             mirror_vable_static_to_boxes(ctx, "pycode", pycode_op, Value::Ref(GcRef(code_ptr)));
             mirror_vable_static_to_boxes(ctx, "valuestackdepth", vsd_op, Value::Int(vsd));
-            mirror_vable_static_to_boxes(
-                ctx,
-                "debugdata",
-                debugdata_op,
-                Value::Ref(GcRef(debugdata)),
-            );
         }
     }
 
