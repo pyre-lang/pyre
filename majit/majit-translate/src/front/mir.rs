@@ -5709,21 +5709,23 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             );
         }
-        // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
-        // the residual `contains` method call in place with
-        // `int_between(a, x, b + 1)` (two comparisons when `b` is
-        // `i64::MAX`) and removes the paired
-        // residual `RangeInclusive::new` call in its predecessor block.  It
-        // threads the `new` bounds into the `contains` block via
-        // `ensure_variable_at_block` (touching predecessor link args /
-        // inputargs only — no fresh blocks, no detached edges).  Removing the
-        // cross-block `new` producer leaves its threaded range value dangling
-        // on the predecessor link arg, so a rewrite MUST be followed by
-        // `prune_dead_phis` to reclaim the dead threaded range inputarg /
-        // link args (the folded predicate never reads them) — run it unconditionally
-        // on any rewrite rather than relying on the gated sweep in
-        // `simplify_lowered_graph`.  Fail-safe: a structural mismatch leaves
-        // BOTH residual calls (rtyper Skip) and touches nothing.
+        // The `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold
+        // (`front::range_contains`) splices the residual `contains` call
+        // in place with `int_between` (two comparisons when the
+        // `int_between` contract cannot be proved) and removes the paired
+        // construction — residual `RangeInclusive::new`, or the exclusive
+        // `Range { start, end }` ctor + FieldWrites — in its predecessor
+        // block.  It threads the construction bounds into the `contains`
+        // block via `ensure_variable_at_block` (touching predecessor link
+        // args / inputargs only — no fresh blocks, no detached edges).
+        // Removing the cross-block producer leaves its threaded range
+        // value dangling on the predecessor link arg, so a rewrite MUST
+        // be followed by `prune_dead_phis` to reclaim the dead threaded
+        // range inputarg / link args (the folded predicate never reads
+        // them) — run it unconditionally on any rewrite rather than
+        // relying on the gated sweep in `simplify_lowered_graph`.
+        // Fail-safe: a structural mismatch leaves BOTH residual calls
+        // (rtyper Skip) and touches nothing.
         let range_contains_rewritten = if lo.range_contains_sites.is_empty() {
             0
         } else {
@@ -8850,8 +8852,9 @@ struct Lowering<'a> {
     /// for the unsigned high-word clamp diamond `front::saturating_mul`
     /// synthesizes after body lowering.
     saturating_mul_sites: Vec<Variable>,
-    /// `RangeInclusive::new(lo, hi)` call sites recorded for the
-    /// `(a..=b).contains(&x)` → `int_between(lo, x, hi + 1)` fold the
+    /// `RangeInclusive::new(lo, hi)` and exclusive int-`Range { start, end }`
+    /// construction sites recorded for the
+    /// `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold the
     /// `front::range_contains` post-pass synthesizes (see
     /// [`crate::front::range_contains::RangeInclusiveNewSite`]).
     range_inclusive_new_sites: Vec<crate::front::range_contains::RangeInclusiveNewSite>,
@@ -8873,9 +8876,9 @@ struct Lowering<'a> {
     /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
     /// `range_iter` candidate; both passes are consumer-gated.
     slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `RangeInclusive::contains(&self, &x)` call sites paired with the
-    /// `new` sites above by the `front::range_contains` post-pass (see
-    /// [`crate::front::range_contains::RangeContainsSite`]).
+    /// `RangeInclusive::contains` / `Range::contains` call sites paired
+    /// with the construction sites above by the `front::range_contains`
+    /// post-pass (see [`crate::front::range_contains::RangeContainsSite`]).
     range_contains_sites: Vec<crate::front::range_contains::RangeContainsSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
@@ -14961,6 +14964,24 @@ impl<'a> Lowering<'a> {
                                     end: arg_vars[1].clone(),
                                 },
                             );
+                            // Word-sized signed exclusive `(a..b).contains(&x)`
+                            // — the same I64/Isize gate as RangeInclusive.
+                            // Captured here because exclusive Range is a
+                            // struct aggregate, not a `new` call.  The
+                            // contains post-pass pairs this with
+                            // `Range::contains` and is consumer-gated, so
+                            // a for-loop / slice-index range stays the
+                            // ordinary ctor + FieldWrite path.
+                            if tyref_is_int_range(dest_ty, self.llbc) {
+                                self.range_inclusive_new_sites.push(
+                                    crate::front::range_contains::RangeInclusiveNewSite {
+                                        result_var: res.clone(),
+                                        lo: arg_vars[0].clone(),
+                                        hi: arg_vars[1].clone(),
+                                        exclusive: true,
+                                    },
+                                );
+                            }
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
                             && ctor
@@ -21764,6 +21785,7 @@ impl<'a> Lowering<'a> {
                 result_var: res.clone(),
                 lo: lo_v,
                 hi: hi_v,
+                exclusive: false,
             });
         res
     }
@@ -30112,6 +30134,7 @@ impl<'a> Lowering<'a> {
                     result_var: result_var.clone(),
                     lo: args[0].clone().into_variable(),
                     hi: args[1].clone().into_variable(),
+                    exclusive: false,
                 },
             );
         }
@@ -30136,6 +30159,34 @@ impl<'a> Lowering<'a> {
             && first_arg_ty
                 .as_ref()
                 .is_some_and(|t| tyref_is_int_range_inclusive(t, self.llbc))
+        {
+            self.range_contains_sites
+                .push(crate::front::range_contains::RangeContainsSite {
+                    result_var: result_var.clone(),
+                });
+        }
+        // Capture `Range::contains(&self, &x)` for the exclusive
+        // `(a..b).contains(&x)` fold.  Exclusive Range is a struct ADT,
+        // so `first_is_self` routes the call as a 2-arg
+        // `CallTarget::Method { name: "contains" }` (receiver `args[0]`,
+        // value `args[1]`).  A FunctionPath spelling ending
+        // `["range", "Range", "contains"]` is recorded too.  Gate on the
+        // receiver resolving to `Range` over I64/Isize — the same
+        // element types as RangeInclusive — so a float range, a
+        // narrower-width range, and a same-named `contains` on any other
+        // type are never recorded.
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && match target {
+                CallTarget::Method { name, .. } => name == "contains",
+                CallTarget::FunctionPath { segments, .. } => {
+                    fmt_path_ends_with(segments, &["range", "Range", "contains"])
+                }
+                _ => false,
+            }
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_int_range(t, self.llbc))
         {
             self.range_contains_sites
                 .push(crate::front::range_contains::RangeContainsSite {
@@ -59038,16 +59089,15 @@ fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
-/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
-/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
-/// both the `new` and the `contains` recording of the
-/// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
-/// type — and a float / narrower-width range — is never folded to
-/// integer compares.  The element type is read from the ADT reference's
-/// `generics.types[0]`, so it is available even when the `new` bounds are
-/// literal constants (whose operand types the front does not carry);
-/// float ranges decline cleanly (both calls stay residual, census Skip).
-fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+/// `adt_path` whose sole element type is a word-sized signed integer
+/// (`I64` / `Isize`).  `require_opaque` is the RangeInclusive extraction
+/// shape; exclusive `Range` is a struct ADT and must not require it.
+fn tyref_is_word_signed_range_adt(
+    ty: &TyRef,
+    llbc: &Llbc,
+    adt_path: &str,
+    require_opaque: bool,
+) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
         return false;
     };
@@ -59061,8 +59111,8 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
     let is_range = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
-            matches!(td.kind, TypeDeclKind::Opaque)
-                && td.item_meta.name_path() == "core::ops::range::RangeInclusive"
+            (!require_opaque || matches!(td.kind, TypeDeclKind::Opaque))
+                && td.item_meta.name_path() == adt_path
         });
     if !is_range {
         return false;
@@ -59081,6 +59131,29 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
             .and_then(serde_json::Value::as_str),
         Some("I64" | "Isize")
     )
+}
+
+/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
+/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
+/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
+/// both the `new` and the `contains` recording of the
+/// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
+/// type — and a float / narrower-width range — is never folded to
+/// integer compares.  The element type is read from the ADT reference's
+/// `generics.types[0]`, so it is available even when the `new` bounds are
+/// literal constants (whose operand types the front does not carry);
+/// float ranges decline cleanly (both calls stay residual, census Skip).
+fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::RangeInclusive", true)
+}
+
+/// True when `ty` resolves to exclusive `core::ops::range::Range` over
+/// `I64` / `Isize` — the same integer element gate as
+/// [`tyref_is_int_range_inclusive`].  Exclusive Range is a struct ADT
+/// (not Opaque).  Float exclusive ranges decline the same way inclusive
+/// float ranges do.
+fn tyref_is_int_range(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::Range", false)
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
@@ -80895,6 +80968,118 @@ mod tests {
         assert!(
             range_call("contains") >= 1,
             "float range contains stays residual (fold out of scope)"
+        );
+    }
+
+    /// Exclusive `(1..EXACT_FLOAT_INT).contains(&n)` in
+    /// `__majit_wrap_math_isqrt` (pyre-module) folds to
+    /// `int_between(1, n, 1<<53)`.  Ignored by default (loads the real
+    /// module LLBC); run with `cargo test -p majit-translate --lib
+    /// range_contains_fold_real -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn range_contains_fold_real_exclusive_int_isqrt() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::MODULE_ULLBC;
+        let llbc = Llbc::load(path).expect("load real module LLBC");
+        let graph = super::lower_function(&llbc, "__majit_wrap_math_isqrt")
+            .unwrap_or_else(|e| panic!("lower __majit_wrap_math_isqrt: {e:?}"));
+
+        let range_call = |leaf: &str| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => super::fmt_path_ends_with(segments, &["range", "Range", leaf]),
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } => leaf == "contains" && name == "contains",
+                    _ => false,
+                })
+                .count()
+        };
+        let int_between = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, args }
+                        if opname == "int_between" && args.len() == 3
+                )
+            })
+            .count();
+
+        assert_eq!(
+            range_call("contains"),
+            0,
+            "__majit_wrap_math_isqrt: residual Range::contains removed"
+        );
+        assert!(
+            int_between >= 1,
+            "__majit_wrap_math_isqrt: int_between(1, n, 1<<53) emitted"
+        );
+    }
+
+    /// Exclusive float `Range<f64>::contains` is out of the int-only
+    /// fold's scope, the same element gate as RangeInclusive float.
+    /// `__majit_wrap_math_asin` is `(-1.0..=1.0)` (inclusive float) and
+    /// stays residual; no exclusive float Range is rewritten to integer
+    /// compares.  Ignored by default (loads the real module LLBC).
+    #[test]
+    #[ignore]
+    fn range_contains_fold_real_declines_float_exclusive_range() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::MODULE_ULLBC;
+        let llbc = Llbc::load(path).expect("load real module LLBC");
+        let graph = super::lower_function(&llbc, "__majit_wrap_math_asin")
+            .unwrap_or_else(|e| panic!("lower __majit_wrap_math_asin: {e:?}"));
+
+        let exclusive_contains = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if super::fmt_path_ends_with(
+                            segments,
+                            &["range", "Range", "contains"],
+                        )
+                )
+            })
+            .count();
+        let inclusive_contains = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if super::fmt_path_ends_with(
+                            segments,
+                            &["range", "RangeInclusive", "contains"],
+                        )
+                )
+            })
+            .count();
+        assert_eq!(
+            exclusive_contains, 0,
+            "asin has no exclusive Range::contains (float pin is RangeInclusive)"
+        );
+        assert!(
+            inclusive_contains >= 1,
+            "float RangeInclusive::contains stays residual (fold out of scope)"
         );
     }
 
