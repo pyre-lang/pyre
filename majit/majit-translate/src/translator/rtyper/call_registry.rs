@@ -772,22 +772,6 @@ impl CallRegistry {
         if let Some(entry) = self.lookup_registered(key) {
             return Some(entry);
         }
-        // `populate_call_registry_from_call_graphs` dedupes by
-        // `canonical_dedup_key`, stripping a leading `crate` / local
-        // crate root. A callsite that still spells the crate-qualified
-        // path must hit the same FunctionDesc (`bookkeeper.getdesc`
-        // identity on the callable).
-        if let Some(stripped) = strip_local_crate_prefix(key.segments()) {
-            let stripped_key = FunctionPathKey::from_segments(stripped);
-            if let Some(entry) = self.lookup_registered(&stripped_key) {
-                return Some(entry);
-            }
-            if let Some(getdesc) = self.getdesc.borrow().clone()
-                && let Some(entry) = getdesc(&stripped_key)
-            {
-                return Some(entry);
-            }
-        }
         let getdesc = self.getdesc.borrow().clone()?;
         getdesc(key)
     }
@@ -1211,17 +1195,6 @@ impl CallRegistry {
     // function_desc.cache`.
 }
 
-/// Strip a leading `crate` / local crate root the way
-/// `populate_call_registry_from_call_graphs` dedupes. `None` when the
-/// path has no such prefix.
-fn strip_local_crate_prefix(segments: &[String]) -> Option<Vec<String>> {
-    let first = segments.first()?;
-    if first != "crate" && !crate::local_crates::is_local_crate_root(first) {
-        return None;
-    }
-    Some(segments[1..].to_vec())
-}
-
 /// Rust naming convention shape check: PascalCase / leading-uppercase
 /// idents are type / struct / enum names (impl method receivers); all-
 /// snake_case idents are modules / functions / primitives.  Used by
@@ -1255,36 +1228,6 @@ mod tests {
             "unregistered path must return None"
         );
         assert!(registry.is_empty());
-    }
-
-    #[test]
-    fn lookup_hits_a_stripped_local_crate_prefix() {
-        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
-            let bk = Rc::new(Bookkeeper::new());
-            let registry = CallRegistry::new(bk);
-            let registered = registry.get_or_register(
-                FunctionPathKey::from_segments(["call", "call_with_kwargs_in_ctx_impl"]),
-                signature(&["ctx", "callable"]),
-            );
-            let crate_hit = registry
-                .lookup(&FunctionPathKey::from_segments([
-                    "crate",
-                    "call",
-                    "call_with_kwargs_in_ctx_impl",
-                ]))
-                .expect("`crate::` callsite must share the stripped FunctionDesc");
-            let local_hit = registry
-                .lookup(&FunctionPathKey::from_segments([
-                    "pyre_interpreter",
-                    "call",
-                    "call_with_kwargs_in_ctx_impl",
-                ]))
-                .expect("local-crate callsite must share the stripped FunctionDesc");
-            assert!(
-                Rc::ptr_eq(&registered, &crate_hit) && Rc::ptr_eq(&registered, &local_hit),
-                "stripped lookup must return the same FunctionEntry"
-            );
-        });
     }
 
     #[test]

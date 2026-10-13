@@ -6827,9 +6827,11 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// `__getattr__` on miss (objspace.py:707 / descroperation.py), while the
 /// `object.__getattribute__` slot (`false`) raises straight away
 /// (descroperation.py) — the `__getattr__` fallback is space.getattr's job.
-/// `suppress` is `_PyObject_LookupAttr`'s flag: the caller swallows the
-/// AttributeError, so a terminal module miss skips the `__spec__` shadowing
-/// diagnosis that exists only to phrase the surfaced message.
+/// `suppress` is `_PyObject_LookupAttr`'s flag: a terminal miss answers
+/// `Ok(null)` without building an AttributeError. A user `__getattr__` /
+/// `__getattribute__` still runs (`space.findattr` = `getattr` + catch
+/// AttributeError). A terminal module miss also skips the `__spec__`
+/// shadowing diagnosis that exists only to phrase the surfaced message.
 /// The caller must have an active `push_roots()` scope. `StdObjSpace.getattr`
 /// keeps `w_obj` in that one bracket
 /// (`ShadowStackFrameworkGCTransformer.push_roots`).
@@ -7147,6 +7149,7 @@ pub fn getattr_str_impl(
                         pyre_object::gc_roots::shadow_stack_get(obj_slot),
                         name,
                         call_getattr,
+                        suppress,
                     );
                 }
                 let _name_roots = pyre_object::gc_roots::push_roots();
@@ -7280,19 +7283,23 @@ pub fn getattr_str_impl(
             // miss, `__getattr__` is the last resort.  Used by every wrapper
             // class that delegates attribute lookup to a backing stream/buffer
             // (unittest._WritelnDecorator, pathlib, etc.).
-            return instance_getattr_hook_or_err(
-                w_type,
+            // `_PyObject_LookupAttr` (`suppress`): the hook still runs; the
+            // absent result is `Ok(null)` so the AttributeError is not built.
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if let Some(result) = unsafe { try_instance_getattr_hook(w_type, obj, name) } {
+                return result;
+            }
+            if suppress {
+                return Ok(pyre_object::PY_NULL);
+            }
+            return Err(PyError::attribute_error_with_context(
+                format!(
+                    "'{}' object has no attribute '{name}'",
+                    w_type_get_name(w_type)
+                ),
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 name,
-                PyError::attribute_error_with_context(
-                    format!(
-                        "'{}' object has no attribute '{name}'",
-                        w_type_get_name(w_type)
-                    ),
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                    name,
-                ),
-            );
+            ));
         } else if call_getattr && is_type(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
             // objspace.py runs the `__getattribute__` gate on
             // `space.type(w_obj)` for every receiver kind.  For a type receiver
@@ -7356,6 +7363,7 @@ pub fn getattr_str_impl(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             name,
             false,
+            false,
         ) {
             Ok(value) => return Ok(value),
             Err(e) => e,
@@ -7377,6 +7385,7 @@ pub fn getattr_str_impl(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
         name,
         call_getattr,
+        suppress,
     ) {
         Ok(value) => return Ok(value),
         Err(e) => e,
@@ -7484,7 +7493,7 @@ fn super_getattribute_str(mut obj: PyObjectRef, name: &str, w_name: PyObjectRef)
             return Ok(value);
         }
     }
-    object_getattr_miss(obj, name, false)
+    object_getattr_miss(obj, name, false, false)
 }
 
 /// Wrapped-name entry point for the builtin `super.__getattribute__`
@@ -7628,7 +7637,7 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     let operands = pyre_object::gc_roots::pin_roots(&[obj, w_name]);
     let w_name = pyre_object::gc_roots::shadow_stack_get(operands + 1);
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+    let result = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
         getattr_str_impl(
             pyre_object::gc_roots::shadow_stack_get(operands),
             unsafe {
@@ -7649,6 +7658,14 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
                 true,
             )
         }
+    };
+    // `getattr_str_impl(..., suppress=true)` is `_PyObject_LookupAttr` and
+    // answers `Ok(null)` on a terminal miss. This PyResult wrapper is
+    // `operation.py hasattr` / `getattr` with a default /
+    // `PyObject_GetOptionalAttr`, which still match AttributeError.
+    match result {
+        Ok(value) if value.is_null() => Err(PyError::attribute_error("attribute not found")),
+        other => other,
     }
 }
 
@@ -7816,6 +7833,12 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, suppress: boo
                     && let Some(getattr_fn) = lookup_in_type_where(w_objtype, "__getattr__")
                 {
                     return get_and_call_function(getattr_fn, obj(), w_objtype, &[w_name()]);
+                }
+                // `_PyObject_LookupAttr` (`suppress`): the hook still ran;
+                // the absent result is `Ok(null)` so the AttributeError is
+                // not returned to a caller that would only swallow it.
+                if suppress {
+                    return Ok(pyre_object::PY_NULL);
                 }
                 Err(e)
             }
@@ -8341,7 +8364,7 @@ pub fn object_getattribute(mut obj: PyObjectRef, name: &str) -> PyResult {
 /// typeobject.py `W_TypeObject.descr_getattribute` — the canonical
 /// metatype-data-descriptor, class-MRO, metatype-non-data-descriptor lookup.
 pub(crate) fn type_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
-    object_getattr_miss(obj, name, false)
+    object_getattr_miss(obj, name, false, false)
 }
 
 /// module.py `Module.descr_getattribute` — run the object-default descriptor
@@ -8581,6 +8604,75 @@ unsafe fn module_getattr_fallback(
     };
     let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
     instance_getattr_hook_or_err(w_type, obj, name, err)
+}
+
+/// Call `__getattr__` when the type defines it. `None` means there is no
+/// hook, so the caller emits the terminal miss — `Ok(null)` when `suppress`,
+/// otherwise AttributeError. Used before constructing that error so
+/// `_PyObject_LookupAttr` does not build one to throw away.
+unsafe fn try_instance_getattr_hook(
+    w_type: PyObjectRef,
+    obj: PyObjectRef,
+    name: &str,
+) -> Option<PyResult> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let live = pyre_object::gc_roots::pin_roots(&[w_type, obj]);
+    let getattr_fn =
+        lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(live), "__getattr__")?;
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(getattr_fn);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+    // objspace.py `space.get_and_call_function(w_descr, w_obj, w_name)` —
+    // bind `__getattr__` through `__get__`.
+    Some(get_and_call_function(
+        pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        pyre_object::gc_roots::shadow_stack_get(live + 1),
+        pyre_object::gc_roots::shadow_stack_get(live),
+        &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
+    ))
+}
+
+/// Metaclass `__getattr__` walk used on a type-receiver terminal miss,
+/// without first building the AttributeError `type_getattr_hook_or_err`
+/// takes as fallback.
+unsafe fn try_type_getattr_hook(
+    obj: PyObjectRef,
+    w_metaclasses: &[Option<PyObjectRef>; 2],
+    name: &str,
+) -> Option<PyResult> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let mut mc_vals: Vec<PyObjectRef> = Vec::new();
+    let mut mc_i = 0usize;
+    while mc_i < w_metaclasses.len() {
+        if let Some(w_metaclass) = w_metaclasses[mc_i] {
+            mc_vals.push(w_metaclass);
+        }
+        mc_i += 1;
+    }
+    let mc_base = pyre_object::gc_roots::pin_roots(&mc_vals);
+    for i in 0..mc_vals.len() {
+        let w_metaclass = pyre_object::gc_roots::shadow_stack_get(mc_base + i);
+        if is_type(w_metaclass)
+            && let Some(getattr_fn) = lookup_in_type_where(w_metaclass, "__getattr__")
+        {
+            let meta_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_metaclass);
+            let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(getattr_fn);
+            let name_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+            return Some(get_and_call_function(
+                pyre_object::gc_roots::shadow_stack_get(hook_slot),
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                pyre_object::gc_roots::shadow_stack_get(meta_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
+            ));
+        }
+    }
+    None
 }
 
 /// `descroperation.py` `_handle_getattribute` tail: on an
@@ -9341,7 +9433,12 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
 /// callback are opaque to the annotator; it returns the blessed `PyResult`
 /// carrier, so the whole cold path is residualised behind one boundary.
 #[majit_macros::dont_look_inside]
-pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
+pub(crate) fn object_getattr_miss(
+    obj: PyObjectRef,
+    name: &str,
+    call_getattr: bool,
+    suppress: bool,
+) -> PyResult {
     // The receiver may be a nursery exception (or another moving object).
     // Several arms below allocate — instance dict, AttributeError name,
     // bound methods — so the word is published here and reloaded after
@@ -9693,20 +9790,22 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             // miss, consult `__getattr__` on the metaclass (gated off for the
             // bare object.__getattribute__ slot by `call_getattr`); otherwise
             // raise. The terminal AttributeError carries the obj/name context.
-            return type_getattr_hook_or_err(
-                obj,
-                &w_metaclasses,
-                name,
-                PyError::attribute_error_with_context(
-                    format!(
-                        "type object '{}' has no attribute '{name}'",
-                        w_type_get_name(obj)
-                    ),
-                    obj,
-                    name,
+            // `_PyObject_LookupAttr` (`suppress`): the hook still runs; the
+            // absent result is `Ok(null)` so the AttributeError is not built.
+            if call_getattr && let Some(result) = try_type_getattr_hook(obj, &w_metaclasses, name) {
+                return result;
+            }
+            if suppress {
+                return Ok(pyre_object::PY_NULL);
+            }
+            return Err(PyError::attribute_error_with_context(
+                format!(
+                    "type object '{}' has no attribute '{name}'",
+                    w_type_get_name(obj)
                 ),
-                call_getattr,
-            );
+                obj,
+                name,
+            ));
         }
     }
 
@@ -10194,24 +10293,31 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
         // Name the object's type via the tag-safe `typedef::r#type`
         // (a tagged immediate has no `ob_type` slot to deref).
         let w_type = crate::typedef::r#type(obj);
-        let tp_name = match w_type {
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-            None => "NULL".to_string(),
-        };
         obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let e = PyError::attribute_error_with_context(
-            format!("'{tp_name}' object has no attribute '{name}'"),
-            obj,
-            name,
-        );
         // descroperation.py `_handle_getattribute`: on the terminal
         // miss, `__getattr__` is the last resort.  Gate on `call_getattr` so
         // `space.getattr` consults the hook while internal lookups propagate
         // the AttributeError unchanged.
-        if call_getattr && let Some(w_type) = w_type {
-            return instance_getattr_hook_or_err(w_type.as_ptr(), obj, name, e);
+        // `_PyObject_LookupAttr` (`suppress`): return the absent result
+        // before `attribute_error_with_context` runs.
+        if call_getattr
+            && let Some(w_type) = w_type
+            && let Some(result) = try_instance_getattr_hook(w_type.as_ptr(), obj, name)
+        {
+            return result;
         }
-        Err(e)
+        if suppress {
+            return Ok(pyre_object::PY_NULL);
+        }
+        let tp_name = match w_type {
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+            None => "NULL".to_string(),
+        };
+        Err(PyError::attribute_error_with_context(
+            format!("'{tp_name}' object has no attribute '{name}'"),
+            obj,
+            name,
+        ))
     }
 }
 

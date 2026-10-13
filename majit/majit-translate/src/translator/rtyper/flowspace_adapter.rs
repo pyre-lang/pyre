@@ -1268,8 +1268,10 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // and emits no op — a Constant raises nothing.  Matched before the
         // general `Call` arm, same as the string-literal elision.
         kind if is_const_prebuilt_array_define(kind) => false,
-        // `rlib/jit.py Entry.specialize_call` is
-        // `exception_cannot_occur`; promote kinds lower to `same_as`.
+        // A `hint(x, **kwds)` op (`OpKind::Hint`) lowers to a non-raising
+        // `same_as(value)` (`rtyper.py:478-481` internal renaming) in
+        // `translate_op` — it emits no raising op.  Matched before the
+        // general `Call` arm, same as the elisions above.
         OpKind::Hint { .. } => false,
         // `raw_load` / `raw_store` are llops with empty `canraise`
         // (`LL_OPERATIONS['raw_load']` / `['raw_store']`).
@@ -1660,43 +1662,6 @@ fn dyn_trait_dispatch_ops(
     Ok(ops)
 }
 
-/// `rlib/jit.py` `hint` ExtRegistryEntry analyser name for a kwarg kind
-/// that mutates `SomeInstance.flags`. Promote kinds are annotation
-/// identities and return `None`.
-fn virtualizable_hint_analyser_name(kind: crate::hints::HintKind) -> Option<&'static str> {
-    match kind {
-        crate::hints::HintKind::AccessDirectly => Some("majit_metainterp.jit.hint_access_directly"),
-        crate::hints::HintKind::FreshVirtualizable => {
-            Some("majit_metainterp.jit.hint_fresh_virtualizable")
-        }
-        crate::hints::HintKind::NoAccessDirectly => {
-            Some("majit_metainterp.jit.hint_no_access_directly")
-        }
-        _ => None,
-    }
-}
-
-fn builtin_simple_call(analyser: &str, args: Vec<Hlvalue>, result: Hlvalue) -> Vec<FlowspaceOp> {
-    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-        HostObject::new_builtin_callable(analyser),
-    )));
-    let mut call_args = Vec::with_capacity(args.len() + 1);
-    call_args.push(callable);
-    call_args.extend(args);
-    vec![FlowspaceOp::new("simple_call", call_args, result)]
-}
-
-fn virtualizable_hint_ops(
-    kind: crate::hints::HintKind,
-    value: Hlvalue,
-    result: Hlvalue,
-) -> Vec<FlowspaceOp> {
-    match virtualizable_hint_analyser_name(kind) {
-        Some(analyser) => builtin_simple_call(analyser, vec![value], result),
-        None => vec![FlowspaceOp::new("same_as", vec![value], result)],
-    }
-}
-
 /// `objectmodel.instantiate(cls)`: allocate an instance of the constant
 /// class `cls` without calling its `__init__` (`robjmodel_instantiate`,
 /// `rtype_instantiate`).
@@ -1894,16 +1859,17 @@ pub fn translate_op(
         | OpKind::GuardValue { .. }
         | OpKind::VableForce { .. } => Ok(Vec::new()),
 
-        // `hint(x, **kwds)` (`OpKind::Hint`): promote kinds are an
-        // annotation identity (`rtyper.py` internal renaming / genc no-op).
-        // `access_directly` / `fresh_virtualizable` / `access_directly=False`
-        // are `rlib/jit.py` `hint` ExtRegistryEntry — they mint or strip
-        // flags. The front lowered the call to `OpKind::Hint`; reify the
-        // Entry as `simple_call` so `default_specialize` sees the flag.
-        OpKind::Hint { value, kind } => {
+        // `hint(x, **kwds)` (`OpKind::Hint`) is an identity outside the JIT:
+        // the flowspace oracle types its result as `same_as(value)` — the
+        // `rtyper.py:478-481` internal-renaming op — exactly as RPython's
+        // `hint` op is a no-op in the genc/non-JIT build, while the JIT
+        // codewriter (`jtransform::rewrite_op_hint`) is what rewrites it to
+        // the `<kind>_guard_value` family.  `jit::promote(x)` and
+        // `#[elidable_promote]`'s `hint_promote_or_string` both land here.
+        OpKind::Hint { value, .. } => {
             let value_hl = lookup_operand(value_map, value, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
-            Ok(virtualizable_hint_ops(*kind, value_hl, result))
+            Ok(vec![FlowspaceOp::new("same_as", vec![value_hl], result)])
         }
 
         // ─── pyre-only `OpKind::Abort` marker ───
@@ -2534,37 +2500,6 @@ pub fn translate_op(
                         majit_ir::rvec::vec_helper_for_path(&segments.join("::"))
                     {
                         return rust_vec_helper_ops(op, kind, arg_hls, result);
-                    }
-                    // Front may leave a hint-marker as a Call (unit tests;
-                    // `jtransform` classifies the same way). Virtualizable
-                    // kwargs go through the `hint` Entry, not `same_as`.
-                    if let Some(kind) =
-                        crate::hints::classify_hint_segments(segments.iter().map(String::as_str))
-                        && virtualizable_hint_analyser_name(kind).is_some()
-                    {
-                        let source = arg_hls.first().cloned().ok_or_else(|| {
-                            TyperError::message(
-                                "virtualizable hint call requires a value argument".to_string(),
-                            )
-                        })?;
-                        return Ok(virtualizable_hint_ops(kind, source, result));
-                    }
-                    // `gctransform` inserts `reload_top_root` after annotate.
-                    // Pyre spells them in source; the annotator must see the
-                    // identity (`rlib/jit.py` flag on the original value).
-                    if crate::front::result_exc::is_gc_root_reload(&op.kind)
-                        && matches!(
-                            segments.last().map(String::as_str),
-                            Some("reload_top_root" | "reload_top_root_at")
-                        )
-                    {
-                        let analyser =
-                            if segments.last().map(String::as_str) == Some("reload_top_root_at") {
-                                "pyre_object.gc_roots.reload_top_root_at"
-                            } else {
-                                "pyre_object.gc_roots.reload_top_root"
-                            };
-                        return Ok(builtin_simple_call(analyser, arg_hls, result));
                     }
                     if segments.as_slice() == ["type"] {
                         if arg_hls.len() != 1 {
@@ -4969,16 +4904,6 @@ pub(crate) fn derive_subject_inputcells(
              the Input op alongside the inputargs registration; see \
              `front::mir`)"
         )));
-    }
-    // AccessDirect two-phase subjects are independent roots: there is no
-    // caller pycall carrying flagged `args_s`. `specialize.py
-    // default_specialize` would have seen those flags; stamp them on
-    // virtualizable formals so this subject's body is the AccessDirect
-    // specialization (`rlib/jit.py` hint / `_virtualizable_`).
-    if legacy.access_directly {
-        for cell in &mut cells {
-            crate::annotator::builtin::stamp_access_directly_on_virtualizable(cell);
-        }
     }
     Ok(cells)
 }
@@ -8054,92 +7979,6 @@ mod tests {
         assert!(crate::translator::rtyper::extregistry::is_registered(
             &callable.value
         ));
-    }
-
-    #[test]
-    fn translate_op_hint_access_directly_is_the_hint_entry_simple_call() {
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let mut graph = LegacyGraph::new("translate_hint_access_directly_fixture");
-        let vars = mint_vars(&mut graph, 3);
-        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
-        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-        let op = SpaceOperation {
-            result: Some(vars[2].clone()),
-            kind: OpKind::Hint {
-                value: vars[1].clone(),
-                kind: crate::hints::HintKind::AccessDirectly,
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("access_directly hint must reify the rlib/jit.py Entry");
-        assert_eq!(translated.len(), 1);
-        let lowered = &translated[0];
-        assert_eq!(lowered.opname, "simple_call");
-        let Hlvalue::Constant(callable) = &lowered.args[0] else {
-            panic!("hint callable must be constant");
-        };
-        let ConstValue::HostObject(host) = &callable.value else {
-            panic!("hint callable must be a HostObject");
-        };
-        assert_eq!(host.qualname(), "majit_metainterp.jit.hint_access_directly");
-        assert!(crate::annotator::builtin::is_registered(host.qualname()));
-    }
-
-    #[test]
-    fn translate_op_hint_promote_stays_same_as() {
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let mut graph = LegacyGraph::new("translate_hint_promote_fixture");
-        let vars = mint_vars(&mut graph, 3);
-        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
-        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-        let op = SpaceOperation {
-            result: Some(vars[2].clone()),
-            kind: OpKind::Hint {
-                value: vars[1].clone(),
-                kind: crate::hints::HintKind::Promote,
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("promote hint is an annotation identity");
-        assert_eq!(translated.len(), 1);
-        assert_eq!(translated[0].opname, "same_as");
-    }
-
-    #[test]
-    fn translate_op_reload_top_root_is_the_annotator_identity() {
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let mut graph = LegacyGraph::new("translate_reload_top_root_fixture");
-        let vars = mint_vars(&mut graph, 3);
-        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
-        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-        let op = SpaceOperation {
-            result: Some(vars[2].clone()),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "pyre_object".into(),
-                        "gc_roots".into(),
-                        "reload_top_root".into(),
-                    ],
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![vars[1].clone()]),
-                result_ty: ValueType::Ref(None),
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("reload_top_root must not walk the residual body");
-        assert_eq!(translated.len(), 1);
-        let lowered = &translated[0];
-        assert_eq!(lowered.opname, "simple_call");
-        let Hlvalue::Constant(callable) = &lowered.args[0] else {
-            panic!("reload callable must be constant");
-        };
-        let ConstValue::HostObject(host) = &callable.value else {
-            panic!("reload callable must be a HostObject");
-        };
-        assert_eq!(host.qualname(), "pyre_object.gc_roots.reload_top_root");
-        assert!(crate::annotator::builtin::is_registered(host.qualname()));
     }
 
     #[test]

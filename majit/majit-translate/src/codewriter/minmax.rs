@@ -227,6 +227,94 @@ pub fn build_ll_minmax_graph(name: &str, is_max: bool, value_ty: &ValueType) -> 
     graph
 }
 
+/// `rint.py` non-ovf `int_abs` in the rich model: `if x < 0: return -x; return x`.
+/// `checked_abs` uses this as the unread-on-None wrapping payload.
+pub const LL_INT_ABS: &str = "ll_int_abs";
+
+pub fn int_abs_path(cc: &mut CallControl) -> CallPath {
+    let path = CallPath::from_segments([LL_INT_ABS]);
+    if !cc.has_function_graph(&path) {
+        let graph = build_ll_int_abs_graph(LL_INT_ABS);
+        cc.register_function_graph(path.clone(), graph);
+        cc.add_candidate_graph(path.clone());
+    }
+    path
+}
+
+pub fn build_ll_int_abs_graph(name: &str) -> FunctionGraph {
+    let mut graph = FunctionGraph::new(name);
+    let start_block = graph.startblock;
+    let x = graph.alloc_value_var();
+    graph.push_inputarg_var(start_block, x.clone());
+    graph.push_op_with_result_var(
+        start_block,
+        OpKind::Input {
+            name: "arg0".to_string(),
+            ty: ValueType::Int,
+            class_root: None,
+        },
+        x.clone(),
+    );
+    let zero = {
+        let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        graph
+            .block_mut(start_block)
+            .operations
+            .push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+        res
+    };
+    let cond = {
+        let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        graph
+            .block_mut(start_block)
+            .operations
+            .push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::BinOp {
+                    op: "lt".into(),
+                    lhs: x.clone(),
+                    rhs: zero,
+                    result_ty: ValueType::Bool,
+                },
+            });
+        res
+    };
+    let (take_neg, take_neg_args) = graph.create_block_with_arg_vars(1);
+    let (take_id, take_id_args) = graph.create_block_with_arg_vars(1);
+    graph.set_branch(
+        start_block,
+        cond,
+        take_neg,
+        vec![x.clone()],
+        take_id,
+        vec![x],
+    );
+    let [neg_x] = take_neg_args.as_slice() else {
+        unreachable!("take_neg was created with one inputarg")
+    };
+    let negated = {
+        let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        graph.block_mut(take_neg).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::UnaryOp {
+                op: "neg".into(),
+                operand: neg_x.clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+        res
+    };
+    graph.set_return(take_neg, Some(negated));
+    let [id_x] = take_id_args.as_slice() else {
+        unreachable!("take_id was created with one inputarg")
+    };
+    graph.set_return(take_id, Some(id_x.clone()));
+    graph
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +415,30 @@ mod tests {
                 .iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "uint_lt"))
         );
+    }
+
+    #[test]
+    fn int_abs_helper_negates_when_negative() {
+        let graph = build_ll_int_abs_graph("ll_int_abs");
+        let start = graph.block(graph.startblock);
+        assert_eq!(start.inputargs.len(), 1);
+        assert!(
+            start
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lt"))
+        );
+        assert_eq!(start.exits.len(), 2);
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg"))
+        }));
+        let mut cc = CallControl::new();
+        let first = int_abs_path(&mut cc);
+        let again = int_abs_path(&mut cc);
+        assert_eq!(first, again);
     }
 
     #[test]

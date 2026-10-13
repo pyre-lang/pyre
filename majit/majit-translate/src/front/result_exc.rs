@@ -4917,16 +4917,9 @@ fn catch_and_rewrap(
         let payload_dead = err_payload_is_dead(graph, &orig, r);
         if payload_dead {
             // Nothing reads a dead payload, so the shell is the discriminant
-            // ctor alone — the same shape `Ok(())` already collapses. A
-            // match consumer (`Err(_)` / `except ValueError:` without
-            // `as e`, `interp_math.py math1`) still has to drop that
-            // switch (`flowcontext.py` `FlowContext.guessexception`).
-            // `let _ = f()` has no match; leave the ctor and skip collapse.
+            // ctor alone and the collapse below does not run.
             let shell = push_shell_ctor(graph, e_id, "Err", suffix);
-            let dummy = match_discriminant(graph, orig.target.0)
-                .ok()
-                .map(|_| e_exc_value_in.clone());
-            (Some(shell), dummy)
+            (Some(shell), None)
         } else {
             let v_err = e_exc_value_in;
             let shell = build_shell(
@@ -5177,7 +5170,7 @@ fn arm_shell_vars_from_args(
 /// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
 /// match they feed only reads `__pos_0` and forwards that payload.
 /// An arm that does not receive the shell is a discarded payload
-/// (`Ok(_)` / `Err(_)`); there is no `__pos_0` to collapse on that edge.
+/// (`Ok(_)`); there is no `__pos_0` to collapse on that edge.
 ///
 /// `getindex_w` is `try: int_w(...) except OperationError`. The rebuilt
 /// shell plus the discriminant switch is that `try` spelled as a `Result`.
@@ -5346,16 +5339,7 @@ fn collapse_rebuilt_shell_match(
     let ok_payload_is_void = ok_payload.concretetype()
         == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void);
     let ok_build = shell_build_ops(graph, normal, ok_shell, ok_payload_is_void)?;
-    // `Err(_)` rebuilds the discriminant ctor and stores nothing, matching
-    // a Void payload (`shell_build_ops` `payload_is_void`).
-    let err_payload_is_void = !graph.blocks[handler].operations.iter().any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::FieldWrite { base, field, .. }
-                if base == err_shell && field.name == "__pos_0"
-        )
-    });
-    let err_build = shell_build_ops(graph, handler, err_shell, err_payload_is_void)?;
+    let err_build = shell_build_ops(graph, handler, err_shell, false)?;
     // Every check has run. The edits below do not fail.
     apply_remove_identical_inputargs(graph, m, &merge);
     let n_exit = single_exit(graph, normal).expect("normal still has one exit");
@@ -7485,7 +7469,7 @@ fn peel_recast_to_source(graph: &FunctionGraph, block: usize, mut arg: LinkArg) 
     }
 }
 
-pub(crate) fn is_gc_root_reload(kind: &OpKind) -> bool {
+fn is_gc_root_reload(kind: &OpKind) -> bool {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments, .. },
         ..
@@ -7493,14 +7477,10 @@ pub(crate) fn is_gc_root_reload(kind: &OpKind) -> bool {
     else {
         return false;
     };
-    // `reload_top_root_at` is the same GC-erasure identity as
-    // `reload_top_root`: the gctransformer inserts these reloads after
-    // the codewriter (`rpython/memory/gctransform/shadowstack.py`,
-    // `framework.py push_roots/pop_roots`). pyre writes them in source.
     segments.iter().any(|segment| segment == "gc_roots")
         && matches!(
             segments.last().map(String::as_str),
-            Some("get" | "shadow_stack_get" | "reload_top_root" | "reload_top_root_at")
+            Some("get" | "shadow_stack_get" | "reload_top_root")
         )
 }
 
@@ -9843,11 +9823,10 @@ pub(crate) fn collapse_pos0_read(
 /// `int_floordiv` / `int_mod` bodies contribute the literal-message
 /// `zero_division` sites; `long_lshift` / `long_rshift` / `int_lshift` /
 /// `int_rshift` contribute the literal-message `value_error` sites;
-/// `ll_math_sqrt` contributes the same-block `"math domain error"`
-/// `value_error` site; `getitem_str` contributes a literal-message
-/// `index_error` site.  Each entry removes the Rust carrier aggregate from
-/// the generated JitCode while preserving the interpreter's exception-object
-/// materialisation as one opaque call.
+/// `getitem_str` contributes a literal-message `index_error` site.  Each
+/// entry removes the Rust carrier aggregate from the generated JitCode while
+/// preserving the interpreter's exception-object materialisation as one
+/// opaque call.
 const FUSED_KIND_CTORS: &[(&str, &str)] = &[
     ("type_error", "pyerror_type_error_to_exc_object"),
     ("zero_division", "pyerror_zero_division_to_exc_object"),
@@ -9901,17 +9880,15 @@ fn instance_cast_source(op: &OpKind) -> Option<Variable> {
 /// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes
 /// it into a single published call.
 ///
-/// The carrier raise conversion (`codewriter::error_carrier_edges`) inserts
-/// `to_exc_object` into the raising block (`lower_carrier_raises`), so a
-/// `return Err(PyError::<kind>("literal"))` site is constructor and
-/// materialisation in the *same* block. A constructor forwarded into a
-/// successor that only materialises is the two-block twin. The constructor is
+/// The carrier raise conversion (`codewriter::error_carrier_edges`) leaves
+/// each raise site as a constructor in one block feeding a materialisation in
+/// its successor. The constructor is
 /// `PyError::new` once inlined — a transparent constructor with no host
 /// symbol, so it can never be given an address, and the descent that reaches
 /// it is refused. Rewriting the pair to one opaque call removes it from the
 /// caller's JitCode altogether.
 ///
-/// Two-block shape, all of it verified before anything is mutated:
+/// The shape required, all of it verified before anything is mutated:
 ///
 /// ```text
 ///   pred:  v_msg = <string literal>          (may be several blocks back)
@@ -9920,17 +9897,6 @@ fn instance_cast_source(op: &OpKind) -> Option<Variable> {
 ///   succ:  inputargs[pos] = v_payload        (pred is succ's only predecessor)
 ///          v_exc = pyerror_to_exc_object(v_payload)   (succ's only operation)
 ///          -> exceptblock, args = [v_exc, v_exc]
-/// ```
-///
-/// Same-block shape (`ll_math.py ll_math_sqrt` / `flowcontext.py
-/// exc_from_raise` after `lower_carrier_raises`):
-///
-/// ```text
-///   block: v_msg = <string literal>
-///          v_err = PyError::<kind>(v_msg)
-///          v_exc = pyerror_to_exc_object(v_err)   (optional instance cast)
-///          etype = type(v_exc)
-///          -> exceptblock, args = [etype, v_exc]
 /// ```
 ///
 /// `v_msg` must resolve to a string literal: the helper reads it as a
@@ -10093,127 +10059,6 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
             .operations
             .retain(|op| is_frame_exit_cleanup(&op.kind));
         crate::front::exc_from_raise::set_raise_from_instance(graph, graph.blocks[si].id, payload);
-    }
-    fuse_same_block_kind_ctor_raise(graph);
-}
-
-/// Same-block twin of the two-block loop above: constructor, optional
-/// instance cast, `pyerror_to_exc_object`, and `op.type` live in the
-/// raising block (`error_carrier_edges.lower_carrier_raises`).
-fn fuse_same_block_kind_ctor_raise(graph: &mut FunctionGraph) {
-    // (block, ctor op index, helper leaf, indices to drop: high to low)
-    let mut fusions: Vec<(usize, usize, &'static str, Vec<usize>)> = Vec::new();
-    for bi in 0..graph.blocks.len() {
-        let block = &graph.blocks[bi];
-        if block.id == graph.exceptblock || block.exitswitch.is_some() {
-            continue;
-        }
-        let [exit] = block.exits.as_slice() else {
-            continue;
-        };
-        if exit.target != graph.exceptblock {
-            continue;
-        }
-        let [LinkArg::Value(etype), LinkArg::Value(evalue)] = exit.args.as_slice() else {
-            continue;
-        };
-        let Some(type_idx) = block.operations.iter().position(|op| {
-            op.result.as_ref() == Some(etype)
-                && matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        args,
-                        ..
-                    } if segments.as_slice() == ["type"]
-                        && args.len() == 1
-                        && args[0].as_variable() == Some(evalue)
-                )
-        }) else {
-            continue;
-        };
-        let Some(mat_idx) = block.operations.iter().position(|op| {
-            op.result.as_ref() == Some(evalue)
-                && matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments.last().map(String::as_str) == Some("pyerror_to_exc_object")
-                )
-        }) else {
-            continue;
-        };
-        let OpKind::Call { args: mat_args, .. } = &block.operations[mat_idx].kind else {
-            continue;
-        };
-        let [LinkArg::Value(v_payload)] = mat_args.as_slice() else {
-            continue;
-        };
-        let payload_uses = count_var_uses(graph, v_payload);
-        if payload_uses.op_uses != 1 || payload_uses.link_uses != 0 {
-            continue;
-        }
-        let Some(payload_idx) = block
-            .operations
-            .iter()
-            .position(|o| o.result.as_ref() == Some(v_payload))
-        else {
-            continue;
-        };
-        let produced = &block.operations[payload_idx].kind;
-        let (ctor_idx, helper, v_msg, mut drop_idxs) = if let Some((helper, v_msg)) =
-            fused_kind_ctor(produced)
-        {
-            (payload_idx, helper, v_msg, vec![type_idx, mat_idx])
-        } else if let Some(cast_src) = instance_cast_source(produced) {
-            let src_uses = count_var_uses(graph, &cast_src);
-            if src_uses.op_uses != 1 || src_uses.link_uses != 0 {
-                continue;
-            }
-            let Some(real_idx) = block
-                .operations
-                .iter()
-                .position(|o| o.result.as_ref() == Some(&cast_src))
-            else {
-                continue;
-            };
-            let Some((helper, v_msg)) = fused_kind_ctor(&block.operations[real_idx].kind) else {
-                continue;
-            };
-            (
-                real_idx,
-                helper,
-                v_msg,
-                vec![type_idx, mat_idx, payload_idx],
-            )
-        } else {
-            continue;
-        };
-        if !message_is_str_literal(graph, bi, ctor_idx, &v_msg) {
-            continue;
-        }
-        drop_idxs.sort_unstable_by(|a, b| b.cmp(a));
-        drop_idxs.dedup();
-        fusions.push((bi, ctor_idx, helper, drop_idxs));
-    }
-    for (bi, ctor_idx, helper, drop_idxs) in fusions {
-        if let OpKind::Call { target, .. } = &mut graph.blocks[bi].operations[ctor_idx].kind {
-            *target = CallTarget::FunctionPath {
-                segments: [crate::runtime_names::crates::INTERPRETER, "error", helper]
-                    .map(str::to_string)
-                    .to_vec(),
-                fun_decl_id: None,
-            };
-        }
-        let payload = graph.blocks[bi].operations[ctor_idx]
-            .result
-            .clone()
-            .expect("fused constructor produces the exception object");
-        for idx in drop_idxs {
-            graph.blocks[bi].operations.remove(idx);
-        }
-        crate::front::exc_from_raise::set_raise_from_instance(graph, graph.blocks[bi].id, payload);
     }
 }
 
@@ -11776,35 +11621,6 @@ mod rebuilt_shell_collapse_tests {
         assert!(
             matches!(&exit.args[0], LinkArg::Value(v) if *v == fix.ok_payload),
             "the normal edge carries the unwrapped payload"
-        );
-    }
-
-    /// `Err(_)` / `except ValueError:` without `as e`: the handler rebuilds
-    /// the discriminant ctor and stores nothing. Collapse still splices
-    /// the match onto the exception link.
-    #[test]
-    fn discarded_err_arm_drops_the_rebuilt_shells() {
-        let mut fix = fixture();
-        fix.graph.blocks[fix.handler].operations.retain(
-            |op| !matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "__pos_0"),
-        );
-        let err_arm = fix.err_arm;
-        fix.graph.blocks[err_arm].operations.clear();
-        fix.graph.blocks[err_arm].inputargs.clear();
-        fix.graph.set_return(BlockId(err_arm), None);
-        let match_id = fix.graph.blocks[fix.normal].exits[0].target.0;
-        for exit in &mut fix.graph.blocks[match_id].exits {
-            if exit.target.0 == err_arm {
-                exit.args.clear();
-            }
-        }
-        collapse(&mut fix).expect("Err(_) match collapses");
-        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
-        let exit = &fix.graph.blocks[fix.normal].exits[0];
-        assert_eq!(exit.target.0, fix.ok_arm);
-        assert_eq!(
-            fix.graph.blocks[fix.handler].exits[0].target.0, fix.err_arm,
-            "the exception edge is the handler as written"
         );
     }
 

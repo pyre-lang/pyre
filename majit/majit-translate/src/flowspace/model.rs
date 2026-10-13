@@ -2193,22 +2193,6 @@ impl HostEnv {
             "we_are_jitted",
             HostObject::new_builtin_callable("majit_metainterp.jit.we_are_jitted"),
         );
-        // `rlib/jit.py` `hint` ExtRegistryEntry. Pyre's front lowers each
-        // kwarg spelling to `OpKind::Hint`; the adapter reifies these as
-        // `simple_call` of the matching builtin so `compute_result_annotation`
-        // mints `access_directly` (`specialize.py default_specialize`).
-        majit_metainterp_jit.module_set(
-            "hint_access_directly",
-            HostObject::new_builtin_callable("majit_metainterp.jit.hint_access_directly"),
-        );
-        majit_metainterp_jit.module_set(
-            "hint_fresh_virtualizable",
-            HostObject::new_builtin_callable("majit_metainterp.jit.hint_fresh_virtualizable"),
-        );
-        majit_metainterp_jit.module_set(
-            "hint_no_access_directly",
-            HostObject::new_builtin_callable("majit_metainterp.jit.hint_no_access_directly"),
-        );
         let majit_rlib_jit = HostObject::new_module("majit_rlib.jit");
         majit_rlib_jit.module_set(
             "we_are_jitted",
@@ -4569,6 +4553,12 @@ pub struct GraphFunc {
     /// can apply the same default as upstream's
     /// `getattr(func, '_jit_look_inside_', True)`.
     pub _jit_look_inside_: Option<bool>,
+    /// Upstream function attribute set by `rlib/jit.py unroll_safe`
+    /// (`func._jit_unroll_safe_ = True`). `look_inside_iff` marks the
+    /// original this way so a backedge is not treated as an unsafe
+    /// loop. `false` mirrors the "attribute absent" default
+    /// (`getattr(func, '_jit_unroll_safe_', False)`).
+    pub _jit_unroll_safe_: bool,
     /// Upstream function attribute consulted by
     /// `description.py:222-224`.
     ///
@@ -4706,6 +4696,7 @@ impl GraphFunc {
             host_call: None,
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
+            _jit_unroll_safe_: false,
             relax_sig_check: None,
             _dont_reach_me_in_del_: false,
             _always_inline_: AlwaysInline::Absent,

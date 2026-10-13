@@ -61,8 +61,6 @@ pub trait SharedOpcodeHandler {
     fn store_attr(&mut self, obj: Self::Value, name: &str, value: Self::Value) -> OpcodeResult<()>;
 }
 
-/// `pyframe.py popvalues` is `@jit.unroll_safe`; the count is an opcode argument.
-#[majit_macros::unroll_safe]
 fn pop_n<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     count: usize,
@@ -185,9 +183,6 @@ pub fn opcode_list_append<H: SharedOpcodeHandler + ?Sized>(
     handler.list_append(list, value)
 }
 
-/// `pyframe.py pushrevvalues` is `@jit.unroll_safe`; UNPACK_SEQUENCE pushes
-/// through it, and the count is the opcode argument.
-#[majit_macros::unroll_safe]
 pub fn opcode_unpack_sequence<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     count: usize,

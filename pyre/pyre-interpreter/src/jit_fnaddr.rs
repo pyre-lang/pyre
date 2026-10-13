@@ -133,21 +133,6 @@ extern "C" fn bh_code_unit_at(code: *const crate::CodeObject, index: i64) -> i64
     i64::from(crate::pyopcode::code_unit_at(code, index as usize))
 }
 
-/// Residual ABI for `ll_math.py ll_math_sqrt` / `support.py`
-/// `_ll_1_ll_math_ll_math_sqrt`. The graph is the `Result` body; this
-/// trampoline returns the Ok `f64` and publishes Err through
-/// `ResidualError`.
-extern "C" fn _ll_1_ll_math_ll_math_sqrt_word(x: f64) -> f64 {
-    majit_ir::icf_identity!("jit_fnaddr::_ll_1_ll_math_ll_math_sqrt_word");
-    match crate::objspace::descroperation::ll_math_sqrt(x) {
-        Ok(y) => y,
-        Err(err) => {
-            majit_ir::helper_fnaddr::ResidualError::publish_residual(err);
-            0.0
-        }
-    }
-}
-
 /// `extern "C"` bridge for the loop-header predicate, widening its `bool`
 /// result to a word.
 extern "C" fn code_pc_is_loop_header_word(code: pyre_object::PyObjectRef, pc: i64) -> i64 {
@@ -1690,12 +1675,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_roots::reload_top_root",
         "pyre_object::reload_top_root",
         pyre_object::gc_roots::reload_top_root_jit_abi,
-    );
-    cpa2(
-        &mut entries,
-        "pyre_object::gc_roots::reload_top_root_at",
-        "pyre_object::reload_top_root_at",
-        pyre_object::gc_roots::reload_top_root_at_jit_abi,
     );
     // `&[PyObjectRef]` arrives as one length-prefixed array word.
     cpa1(
@@ -5062,20 +5041,28 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // shape jtransform produces.
     //
     // The Rust-source graphs are `objspace::descroperation`'s
-    // `_ll_1_int_abs` / `_ll_2_int_floordiv` / `_ll_2_int_mod`
-    // (`support.py` bodies) and `ll_math_sqrt` (`ll_math.py
-    // ll_math_sqrt`). The last is seeded as `_ll_1_ll_math_ll_math_sqrt`
-    // (`support.py` alias of that function object; `builtin_graphs`
-    // shares the graph). `find_all_graphs_bfs` seeds those canonical
-    // names, and a route-(a) call whose graph is a candidate is an
-    // `inline_call`. The fnaddrs below are the residual/blackhole
-    // address for a call that stays residual.
-    cpa1(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::_ll_1_int_abs",
-        "_ll_1_int_abs",
-        crate::objspace::descroperation::_ll_1_int_abs,
-    );
+    // `_ll_2_int_floordiv` / `_ll_2_int_mod` (`support.py` bodies).
+    // `find_all_graphs_bfs` seeds those canonical names, and a
+    // route-(a) call whose graph is a candidate is an `inline_call`.
+    // The fnaddrs below are the residual/blackhole address for a call
+    // that stays residual.  Two `inline_calls_to` entries are
+    // intentionally NOT bound:
+    //   * `_ll_1_int_abs` — RPython `inline_calls_to` seeds the
+    //     `int_abs` helper *graph* into the BFS for actual inlining
+    //     at `call.py todo.append(c_func.value._obj.graph)`.
+    //     Pyre can register the fnaddr but cannot fabricate the
+    //     helper body graph from an `extern "C"` function pointer
+    //     (no `MixLevelHelperAnnotator.constfunc` analogue), so a
+    //     fnaddr-only binding would make `int_abs` an opaque extern
+    //     helper — the opposite of the upstream inlining intent.
+    //     No production pyre rewrite emits `direct_call(_ll_1_int_abs)`
+    //     so the binding is omitted until the rtyper-equivalent
+    //     can synthesise the body graph.
+    //   * `_ll_1_ll_math_ll_math_sqrt` — `ll_math.py ll_math_sqrt` raises
+    //     `ValueError("math domain error")` on negative input, and
+    //     Rust's `f64::sqrt()` returns NaN; making the fnaddr
+    //     reachable would be a silent semantic regression.
+    // `int_abs` and `ll_math_sqrt` stay out of this table.
     cpa2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::_ll_2_int_floordiv",
@@ -5087,17 +5074,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::_ll_2_int_mod",
         "_ll_2_int_mod",
         crate::objspace::descroperation::_ll_2_int_mod,
-    );
-    // `ll_math.py ll_math_sqrt` raises; the residual ABI is the Ok `f64`
-    // with `PyError` published out of band (`ResidualError`). One function
-    // object (`support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`);
-    // the host publishes the source path and `pin_builtin_graphs` aliases
-    // the canonical seed name onto the same GraphKey.
-    cpa1(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::ll_math_sqrt",
-        "ll_math_sqrt",
-        _ll_1_ll_math_ll_math_sqrt_word,
     );
     p2(
         &mut entries,

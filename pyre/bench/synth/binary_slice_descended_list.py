@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=18.6
+# pyre-check: max-pypy-ratio=13
 # Exact-int BINARY_SLICE on a list: the walker descends
 # `binary_slice_values_inner` (no residual CallMayForceR).
 # N is large enough that pypy's execution-only time clears
