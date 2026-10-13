@@ -13588,6 +13588,15 @@ impl<'a> Lowering<'a> {
     /// is narrowed to, or `None` when the declaration names no class.
     fn typed_ref_field_narrow_root(&self, declared_ty: Option<&TyRef>) -> Option<String> {
         let ty = declared_ty?;
+        // A fieldless enum is its discriminant integer (`tyref_to_value_type`
+        // / `type_decl_is_fieldless_enum`). A store of that word — including
+        // through a borrow, which is the identity on the tag — is already
+        // the int; `cast_pointer` has no integer operand
+        // (`rclass.py` `pairtype(InstanceRepr, InstanceRepr).convert_from_to`).
+        // Same decision as [`Self::instance_narrow_for_type`].
+        if tyref_fieldless_enum_pointee(ty, self.llbc).is_some() {
+            return None;
+        }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
         if let Some(reference) = node.as_object()?.get("Ref") {
             let pointee = reference.as_array()?.get(1)?;
@@ -15060,13 +15069,6 @@ impl<'a> Lowering<'a> {
                         res,
                     ));
                 }
-                // `*p` on a raw address is the enum's bytes, not the
-                // explicit sum shell. Load the host tag and decode it to
-                // the variant index `host_variant_index` returns;
-                // `SwitchInt` on this `Discriminant` compares that index.
-                if let Some(decoded) = self.lower_raw_pointer_discriminant(mir_bb, &place)? {
-                    return Ok((None, decoded));
-                }
                 // A standalone fieldless (C-like) enum is represented
                 // by-value as its discriminant integer, so
                 // `Discriminant(enum)` is the identity on that value — alias
@@ -15079,9 +15081,24 @@ impl<'a> Lowering<'a> {
                 // no rtype clsfield.  The INLINE-field case is handled above
                 // (the tag is read from the container at the field offset),
                 // so this only fires for a standalone enum value.
-                if self.tyref_is_fieldless_enum(&place.ty) {
+                //
+                // This identity must win over `lower_raw_pointer_discriminant`:
+                // a borrow of a fieldless enum is the same tag
+                // (`tyref_is_borrowed_fieldless_enum`), and loading the tag
+                // *from* that word treats the integer as an address
+                // (`rewrite_op_raw_load`).
+                if self.tyref_is_fieldless_enum(&place.ty)
+                    || self.tyref_is_borrowed_fieldless_enum(&place.ty)
+                {
                     let base = self.resolve_place(mir_bb, place)?;
                     return Ok((None, base));
+                }
+                // `*p` on a raw address is the enum's bytes, not the
+                // explicit sum shell. Load the host tag and decode it to
+                // the variant index `host_variant_index` returns;
+                // `SwitchInt` on this `Discriminant` compares that index.
+                if let Some(decoded) = self.lower_raw_pointer_discriminant(mir_bb, &place)? {
+                    return Ok((None, decoded));
                 }
                 // A one-word niche `Option` is represented by its payload
                 // pointer: `None`
@@ -57296,6 +57313,9 @@ fn ty_is_raw_address(
     // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
     // struct borrow stays `Ref`. Classifying it as an address makes
     // `RootScope::get` a `[Ref, Int]` signature called with `[Int, Int]`.
+    // A fieldless enum is the tag integer (`type_decl_is_fieldless_enum`);
+    // `Rvalue::Ref` is the identity on that word, so the borrow is not
+    // an address (`rclass.py` has no `cast_pointer` of an int).
     if is_borrow
         && one_level_pointer_pointee(node, llbc)
             .is_some_and(|pointee| borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids))
@@ -57330,6 +57350,7 @@ fn borrowed_pointee_is_raw_enum(
         return false;
     };
     matches!(td.kind, TypeDeclKind::Enum(_))
+        && !type_decl_is_fieldless_enum(td, llbc)
         && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
 }
 
@@ -58295,6 +58316,23 @@ fn tyref_fieldless_enum_def<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l TypeDe
         .filter(|td| type_decl_is_fieldless_enum(td, llbc))
 }
 
+/// Discriminant-scalar spelling of a fieldless enum field, including a
+/// borrow of one.  `known_struct_names` still contains the enum
+/// declaration for switch/debug metadata; treating an inline field of
+/// that declaration as a nested Struct makes `all_fielddescrs` drop it
+/// (there are no payload fields) and the fallback mints an eight-byte
+/// Ref descriptor.  Charon's branching discriminator is the physical
+/// low-level type RPython would put in this field (`tyref_to_value_type`
+/// colors the same enum `Int`).
+fn fieldless_enum_field_layout_spelling(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let decl = tyref_fieldless_enum_def(ty, llbc)
+        .or_else(|| tyref_borrowed_fieldless_enum_def(ty, llbc))?;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    decl.layout_for_target(llbc, &target)
+        .and_then(|layout| layout.discriminant_int_type())
+        .map(str::to_string)
+}
+
 /// The integer-comparison `BinOp` opname a derived `PartialEq` method on
 /// a fieldless enum folds to, or `None` for any other method leaf.  Only
 /// the two equality halves the `#[derive(PartialEq)]` expansion provides
@@ -58820,6 +58858,13 @@ fn tyref_to_attr_value_type_with(
     // write (`err.kind = PyErrorKind::…`) unions `Integer ∪ Instance` with
     // no `pair(SomeInteger, SomeInstance).union()` handler and walls.
     if tyref_is_fieldless_enum_free(ty, llbc) {
+        return ValueType::Int;
+    }
+    // Matching [`tyref_to_value_type`]: a borrow of a fieldless enum is
+    // the same tag word (`tyref_is_borrowed_fieldless_enum_free`). FORCE
+    // must seed Integer so a closure-env capture of `&E` setattr's the
+    // int (`rclass.py` `InstanceRepr.setfield`), not `Integer ∪ Instance`.
+    if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
     // A `str`/`String`/`Wtf8` field seeds a `SomeString` attr shell (via
@@ -62077,6 +62122,13 @@ fn tyref_to_field_layout_string(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> String {
+    // A borrow of a fieldless enum is the tag word
+    // (`tyref_to_value_type` / `tyref_is_borrowed_fieldless_enum_free`).
+    // Spell it as the discriminant scalar before the reference arm, which
+    // would otherwise keep `&E` as a pointer row against an Int FORCE.
+    if let Some(spelling) = fieldless_enum_field_layout_spelling(ty, llbc) {
+        return spelling;
+    }
     // A reference field is one pointer repr, not an inline copy of its
     // referent.  `tyref_to_ast_string` intentionally erases `&T` for nominal
     // annotation lookup, but feeding that erased spelling to the physical
@@ -62137,22 +62189,6 @@ fn tyref_to_field_layout_string(
     // the containing struct's descriptor instead of treating it as a Ref.
     if let Some(niche) = tyref_option_fieldless_niche(ty, llbc) {
         return niche.storage_ty.to_string();
-    }
-    // A fieldless enum is the tag scalar itself.  Do this before the generic
-    // named-ADT path: `known_struct_names` contains the enum declaration for
-    // switch/debug metadata, but treating an inline field of that declaration
-    // as a nested Struct makes `all_fielddescrs` drop it (there are no payload
-    // fields) and the fallback mints an eight-byte Ref descriptor.  Charon's
-    // branching discriminator is the physical low-level type RPython would
-    // put in this field.
-    if let Some(decl) = tyref_fieldless_enum_def(ty, llbc) {
-        let target = std::env::var("TARGET").unwrap_or_default();
-        if let Some(discr_ty) = decl
-            .layout_for_target(llbc, &target)
-            .and_then(|layout| layout.discriminant_int_type())
-        {
-            return discr_ty.to_string();
-        }
     }
     let Some(node) = tyref_node(ty, llbc) else {
         return tyref_to_ast_string(ty, llbc);
@@ -86052,6 +86088,307 @@ mod tests {
                 1,
             )
         );
+    }
+
+    /// A closure env whose capture is a fieldless enum (by shared
+    /// borrow, the rustc capture of a `Copy` tag) keeps that word as
+    /// the discriminant integer. `typed_ref_field_narrow_root` must
+    /// not emit `__cast_instance_intrinsic` against the enum class
+    /// (`rclass.py` `pairtype(InstanceRepr, InstanceRepr).convert_from_to`
+    /// has no integer operand), and the lowered graph must annotate.
+    #[test]
+    fn closure_capturing_fieldless_enum_annotates() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+        use std::rc::Rc;
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 32}
+        }});
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let enum_adt = serde_json::json!({"Adt": {"id": 1, "generics": generics}});
+        let borrowed_enum = serde_json::json!({"Ref": ["_", enum_adt.clone(), "Shared"]});
+        let closure_adt = serde_json::json!({"Adt": {"id": 2, "generics": generics}});
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let place =
+            |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        // rustc `call_once` of a capturing closure reads the tag as
+        // `Discriminant(*&E)`. The place type after Deref is the enum;
+        // the inner is the captured borrow.
+        let deref_enum = serde_json::json!({
+            "kind": {"Projection": [place(1, &borrowed_enum), "Deref"]},
+            "ty": enum_adt
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    null,
+                    {
+                        "def_id": 1,
+                        "item_meta": {
+                            "name": [{"Ident": ["fixture", 0]}, {"Ident": ["AccessMode", 0]}],
+                            "span": span, "source_text": "enum AccessMode { ReadWrite, ReadOnly }",
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                            "is_local": true
+                        },
+                        "kind": {"Enum": [
+                            {"name": "ReadWrite", "fields": [], "discriminant": 0, "attr_info": null},
+                            {"name": "ReadOnly", "fields": [], "discriminant": 1, "attr_info": null}
+                        ]},
+                        "layout": [{
+                            "key": "x86_64-unknown-linux-gnu",
+                            "value": {
+                                "size": 1, "align": 1,
+                                "discriminator": {"Branch": {
+                                    "offset": 0,
+                                    "int_ty": {"Unsigned": "U8"}
+                                }},
+                                "variant_layouts": [
+                                    {"field_offsets": []},
+                                    {"field_offsets": []}
+                                ],
+                                "repr": {"repr_algo": "Rust", "transparent": false}
+                            }
+                        }]
+                    },
+                    {
+                        "def_id": 2,
+                        "item_meta": {
+                            "name": [
+                                {"Ident": ["fixture", 0]},
+                                {"Ident": ["capture", 0]},
+                                {"Ident": ["closure", 0]}
+                            ],
+                            "span": span, "source_text": null,
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                            "is_local": true
+                        },
+                        "kind": {"Struct": [{
+                            "name": null,
+                            "ty": borrowed_enum.clone(),
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                        }]},
+                        "layout": [{
+                            "key": "x86_64-unknown-linux-gnu",
+                            "value": {
+                                "size": 1, "align": 1,
+                                "variant_layouts": [{"field_offsets": [0]}],
+                                "repr": {"repr_algo": "Rust", "transparent": false}
+                            }
+                        }],
+                        "src": {"Closure": {"info": {"kind": "FnOnce"}}}
+                    }
+                ],
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["capture", 0]}],
+                        "span": span, "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [borrowed_enum.clone()],
+                        "output": closure_adt.clone()
+                    },
+                    "body": {"Unstructured": {
+                        "span": span,
+                        "locals": {"arg_count": 1, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": closure_adt.clone()},
+                            {"index": 1, "name": "op", "span": span, "ty": borrowed_enum.clone()}
+                        ]},
+                        "body": [
+                            {"statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &closure_adt),
+                                    {"Aggregate": [
+                                        {"Adt": [2, null, null, generics.clone()]},
+                                        [{"Copy": place(1, &borrowed_enum)}]
+                                    ]}
+                                ]}
+                            }],
+                            "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [],
+                             "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                }, {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["tag", 0]}],
+                        "span": span, "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [borrowed_enum.clone()],
+                        "output": u8_ty.clone()
+                    },
+                    "body": {"Unstructured": {
+                        "span": span,
+                        "locals": {"arg_count": 1, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": u8_ty.clone()},
+                            {"index": 1, "name": "op", "span": span, "ty": borrowed_enum.clone()}
+                        ]},
+                        "body": [
+                            {"statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(0, &u8_ty),
+                                    {"Discriminant": deref_enum}
+                                ]}
+                            }],
+                            "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [],
+                             "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                    }}
+                }],
+                "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let borrowed_ty = serde_json::from_value::<super::TyRef>(borrowed_enum.clone())
+            .expect("borrowed fieldless TyRef parses");
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let env = llbc.type_by_id(2).expect("closure env");
+
+        assert!(
+            !super::ty_is_raw_address(&borrowed_ty, &llbc, &gc_struct_ids),
+            "a borrow of a fieldless enum is the tag integer, not a raw address"
+        );
+        assert_eq!(
+            super::tyref_to_field_layout_string(&borrowed_ty, &llbc, &gc_struct_ids),
+            "u8",
+            "a borrow of a fieldless enum is the discriminant scalar"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type(&borrowed_ty, &llbc),
+            ValueType::Int,
+            "FORCE must seed Integer for a captured &E tag"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type_for_struct_field(&borrowed_ty, env, &llbc, &gc_struct_ids),
+            ValueType::Int,
+            "closure-env FORCE rows match the Int-banked capture"
+        );
+
+        let graph = super::lower_function(&llbc, "capture").expect("lower capture");
+        let cast_roots: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+            .collect();
+        assert!(
+            cast_roots.is_empty(),
+            "fieldless-enum capture must not emit __cast_instance_intrinsic; roots={cast_roots:?}"
+        );
+
+        let tag_graph = super::lower_function(&llbc, "tag").expect("lower tag");
+        let tag_ops: Vec<&crate::model::OpKind> = tag_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| &op.kind)
+            .collect();
+        assert!(
+            tag_ops
+                .iter()
+                .all(|kind| !matches!(kind, crate::model::OpKind::RawLoad { .. })),
+            "Discriminant(*&E) of a fieldless enum is the tag, not a raw_load; ops={tag_ops:?}"
+        );
+        assert!(
+            tag_ops.iter().all(|kind| {
+                !matches!(
+                    kind,
+                    crate::model::OpKind::BinOp { op, .. } if op == "and_" || op == "&" || op == "and"
+                )
+            }),
+            "fieldless Discriminant must not mask a loaded tag; ops={tag_ops:?}"
+        );
+        let tag_cast_roots: Vec<&str> = tag_ops
+            .iter()
+            .filter_map(|kind| crate::model::cast_instance_root(kind))
+            .collect();
+        assert!(
+            tag_cast_roots.is_empty(),
+            "fieldless Discriminant must not emit __cast_instance_intrinsic; roots={tag_cast_roots:?}"
+        );
+
+        let (_, _, fields, _, _, attrs, _, _) =
+            super::derive_program_metadata(&llbc, &gc_struct_ids);
+        let closure_key = "fixture::capture::closure";
+        let attr_rows = attrs
+            .get("capture::closure")
+            .or_else(|| attrs.get(closure_key))
+            .expect("closure FORCE rows");
+        let layout_rows = fields
+            .fields
+            .get(closure_key)
+            .or_else(|| fields.fields.get("capture::closure"))
+            .cloned()
+            .expect("closure layout rows");
+        assert!(
+            fields.fields.contains_key(closure_key),
+            "intern keys the full closure path; keys={:?}",
+            fields.fields.keys().collect::<Vec<_>>()
+        );
+        crate::annotator::classdesc::register_struct_fields_with_layout(
+            closure_key,
+            attr_rows,
+            Some(layout_rows.as_slice()),
+        );
+        crate::annotator::classdesc::register_struct_fields_with_layout(
+            "capture::closure",
+            attr_rows,
+            Some(layout_rows.as_slice()),
+        );
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = &ann.bookkeeper;
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk.clone());
+        let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift capture");
+        crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+        let start = lifted.graph.borrow().startblock.clone();
+        let n_inputs = start.borrow().inputargs.len();
+        let cells: Vec<Option<SomeValue>> = (0..n_inputs)
+            .map(|_| Some(SomeValue::Integer(SomeInteger::new(true, false))))
+            .collect();
+        ann.addpendingblock(&lifted.graph, &start, &cells);
+        ann.complete_pending_blocks()
+            .expect("a closure capturing a fieldless-enum tag annotates");
+
+        let tag_ann = RPythonAnnotator::new(None, None, None, false);
+        let tag_bk = &tag_ann.bookkeeper;
+        tag_bk.set_struct_fields(Rc::new(
+            super::derive_program_metadata(&llbc, &gc_struct_ids).2,
+        ));
+        let tag_registry = CallRegistry::new(tag_bk.clone());
+        let tag_lifted = function_graph_to_flowspace(&tag_graph, &tag_registry).expect("lift tag");
+        crate::translator::simplify::simplify_graph(&tag_lifted.graph.borrow(), None);
+        let tag_start = tag_lifted.graph.borrow().startblock.clone();
+        let tag_n = tag_start.borrow().inputargs.len();
+        let tag_cells: Vec<Option<SomeValue>> = (0..tag_n)
+            .map(|_| Some(SomeValue::Integer(SomeInteger::new(true, false))))
+            .collect();
+        tag_ann.addpendingblock(&tag_lifted.graph, &tag_start, &tag_cells);
+        tag_ann
+            .complete_pending_blocks()
+            .expect("Discriminant of a borrowed fieldless-enum tag annotates");
     }
 
     #[test]
