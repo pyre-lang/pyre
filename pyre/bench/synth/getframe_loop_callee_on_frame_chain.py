@@ -15,6 +15,9 @@
 #   gen  -- `gen` is resumed by the `for` in `use_gen`, and `force` reads
 #           `use_gen`'s `i` and `t` two frames up from inside the generator.
 #
+# After a call that forced, `use_loop` counts the frames above it: the loop
+# callee is no longer among them.
+#
 # The call counter must equal what an interpreter counts, and the checksum
 # over the locals read must match.
 import sys
@@ -51,8 +54,22 @@ def inner(i, on):
     return s
 
 
+def depth():
+    # Frames on the chain above this one.
+    n = 0
+    f = sys._getframe(1)
+    while f is not None:
+        n += 1
+        f = f.f_back
+    return n
+
+
 def use_loop(i, on):
     r = inner(i, on)
+    if on:
+        # `inner` has returned, so it is off the chain again: use_loop,
+        # run_loop, report, main, <module>.
+        seen[0] += depth()
     return r * 3 + i
 
 

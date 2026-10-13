@@ -2621,6 +2621,53 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     }
 }
 
+/// `pyframe.py execute_frame`'s `finally: ec.leave(self, ...)` for a frame
+/// whose portal call returned into a guard that then failed.
+///
+/// Upstream's merge point sits on `PyFrame.dispatch`, so the frame that made
+/// the recursive portal call is `execute_frame`, and a guard failing behind the
+/// CALL_ASSEMBLER resumes a blackhole frame that still runs that `finally`.
+/// pyre's portal is `execute_frame` itself: the trace records the `enter` ahead
+/// of the call and the `leave` behind `GUARD_NOT_FORCED`
+/// (`record_ec_leave_frame_chain`), and the resume data names only the caller.
+/// A failing `GUARD_NOT_FORCED` therefore resumes past a `leave` nothing runs,
+/// with the returned frame still in `topframeref`.
+///
+/// Such a frame is recognised by what it is not: it sits above every frame
+/// this resume rebuilds, and it has finished executing.  A frame an inlined
+/// call entered and the snapshot still holds open is one of the rebuilt frames;
+/// one that is neither is left alone.
+fn leave_frames_handed_to_portal_call(
+    bh: &majit_metainterp::blackhole::BlackholeInterpreter,
+    got_exception: bool,
+) {
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    if ec.is_null() {
+        return;
+    }
+    let resumed = |frame: *mut PyFrame| {
+        let mut current = Some(bh);
+        while let Some(interp) = current {
+            if std::ptr::eq(interp.virtualizable_ptr as *mut PyFrame, frame) {
+                return true;
+            }
+            current = interp.nextblackholeinterp.as_deref();
+        }
+        false
+    };
+    // The exception the guard grabbed belongs to the innermost call alone.
+    let mut got_exception = got_exception;
+    loop {
+        let top = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+        if top.is_null() || resumed(top) || !unsafe { (*top).frame_finished_execution() } {
+            return;
+        }
+        leave_compiled_frame_chain(top, got_exception);
+        got_exception = false;
+    }
+}
+
 /// The escape-propagation arm of `ExecutionContext.leave`, for the portal
 /// activation whose chain restore is emitted by the compiled trace.
 ///
@@ -3002,6 +3049,8 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             frame_index += 1;
         }
     }
+
+    leave_frames_handed_to_portal_call(&bh, guard_exc != 0);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
