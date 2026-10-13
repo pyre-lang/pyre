@@ -1166,6 +1166,15 @@ fn real_main() {
                     "intobject",
                     "format_int_decimal",
                 ]),
+                // GET_ITER residual `bh_get_iter_fn`. The portal never
+                // calls `W_Range.descr_iter`, so the descent looks the body
+                // up by this graph key (`specialize.rs
+                // try_walker_orthodox_get_iter`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_range_iter",
+                ]),
                 // Step-1 range `FOR_ITER` descends this body. `space.next`
                 // calls it, and that call stays residual, so the graph is
                 // seeded here for the path lookup.

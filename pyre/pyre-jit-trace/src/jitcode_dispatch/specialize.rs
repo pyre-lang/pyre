@@ -6730,6 +6730,55 @@ pub(crate) fn try_walker_orthodox_binary_slice<Sym: WalkSym>(
     )
 }
 
+/// GET_ITER residual: walk `W_Range.descr_iter` (`functional.py`).
+///
+/// Flatten / the bytecode codewriter lower GET_ITER to `bh_get_iter_fn`, a
+/// MayForce pointer with no jitcode of its own. The interpreter body is
+/// `opcode_get_iter` → `space.iter` → `W_Range.descr_iter`; this walks the
+/// last of those (`w_range_iter`), seeded in `helper_graphs` so the path
+/// lookup finds a graph. Tracing it records `new_with_vtable` of
+/// `W_IntRangeOneArgIterator` (or the sibling machine-int shapes) plus the
+/// field stores, the same ops PyPy inlines. Admission is an exact `range`
+/// so a user `__iter__` stays residual. `inline_subwalk` is allowed: the
+/// GET_ITER that needs this path lives in the inlined caller of a list-comp
+/// (`f` on `comprehension_param_range_call_flush`). Not a spec-fold row.
+const GET_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_range_iter",
+    commit_label: "get_iter_commit",
+    call_site_label: "get_iter_call_site",
+    decline_tag: "GET-ITER-SUBWALK",
+};
+
+/// Walk `w_range_iter` for GET_ITER. Declines when the body is missing or
+/// the walk does not finish; the residual stays.
+pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if unsafe { !pyre_object::functional::is_exact_w_range(obj) } {
+        return Ok(None);
+    }
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[(r_args[0], obj)],
+        &[],
+        dst,
+        dst_bank,
+        &GET_ITER_DESCENT,
+    )
+}
+
 const WRITE_CELL_DESCENT: HelperDescent = HelperDescent {
     path: "write_cell",
     commit_label: "write_cell_commit",

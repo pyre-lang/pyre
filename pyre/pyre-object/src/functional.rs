@@ -1196,32 +1196,43 @@ pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
 /// A promoted step picks one of the two `step == 1` shapes, whose `stop` is
 /// immutable and whose cursor needs no separate countdown.
 ///
+/// `#[inline(never)]` is load-bearing: rustc otherwise folds this body into
+/// `space.iter` and the codewriter never mints the graph a GET_ITER descent
+/// looks up (`specialize.rs try_walker_orthodox_get_iter`). Same split as
+/// `w_range_iter_one_arg_next`.
+///
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
+#[inline(never)]
 pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        // `descr_iter` takes the machine-int iterator only when start, stop,
-        // step AND length all fit a machine word. `W_IntRangeIterator` stops
-        // by counting down `remaining`, but still advances `current` once
-        // after the final yielded item. Keep the word iterator only if that
-        // one-past cursor also fits.
+        // `descr_iter`: `space.int_w` of start/stop/step/length, then
+        // `W_IntRangeOneArgIterator(stop)` / `W_IntRangeStepOneIterator(start, stop)`
+        // / `W_IntRangeIterator(start, length, step)`. A bignum bound is
+        // `W_LongRangeIterator`.
         if let (Some((start, _stop, step)), Some(length)) =
             (w_range_fields_i64(obj), w_range_length_i64(obj))
         {
+            if w_range_promote_step(obj) {
+                // Step is 1, so the walk ends at `start + length`, which is
+                // `max(start, stop)` and fits a machine word. An empty or
+                // backwards span would make `stop` unreachable from `start`
+                // by +1 steps and turn the length hint negative, so the
+                // bound is rebuilt from the length rather than read back.
+                let end = start + length;
+                if start == 0 {
+                    return w_range_iter_one_arg_new(end);
+                }
+                return w_range_iter_step_one_new(start, end);
+            }
+            // `W_IntRangeIterator` advances `current` once past the last
+            // item, and `__reduce__` rebuilds
+            // `range(current, current + remaining * step, step)`. Keep the
+            // word iterator only when that one-past bound still fits.
+            // After the promote_step returns so a `range(n)` walk never
+            // records the i128 residual.
             let one_past = start as i128 + length as i128 * step as i128;
             if i64::try_from(one_past).is_ok() {
-                if w_range_promote_step(obj) {
-                    // The promotion is only spelled by `descr_new`'s missing
-                    // step argument, so `step` is one and `start + length` is
-                    // the end of the walk. An empty or backwards span would
-                    // make `stop` unreachable from `start` by +1 steps, so the
-                    // bound is rebuilt from the length rather than read back.
-                    let end = start + length;
-                    if start == 0 {
-                        return w_range_iter_one_arg_new(end);
-                    }
-                    return w_range_iter_step_one_new(start, end);
-                }
                 return w_range_iter_new(start, length, step);
             }
         }
