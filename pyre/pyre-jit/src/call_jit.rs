@@ -1851,6 +1851,33 @@ fn materialize_str_call_for_cranelift(
     result.0 as i64
 }
 
+/// Interpreter hooks for `MetaInterpStaticData.host`. One constructor
+/// replaces the former `register_*` / `set_*` scatter.
+pub fn publish_pyre_host_hooks() {
+    fn criticalcode_start_adapter() {
+        pyre_interpreter::stack_check::pyre_stack_criticalcode_start();
+    }
+    fn criticalcode_stop_adapter() {
+        pyre_interpreter::stack_check::pyre_stack_criticalcode_stop();
+    }
+    fn stack_almost_full_adapter() -> bool {
+        pyre_interpreter::stack_check::stack_almost_full()
+    }
+    majit_metainterp::publish_host_hooks(majit_metainterp::HostHooks {
+        stack_almost_full: Some(stack_almost_full_adapter),
+        criticalcode_start: Some(criticalcode_start_adapter),
+        criticalcode_stop: Some(criticalcode_stop_adapter),
+        record_application_traceback: Some(record_caught_blackhole_traceback),
+        record_inline_application_traceback: Some(record_inline_traceback_for_recording),
+        record_discarded_level_traceback: Some(record_discarded_level_traceback),
+        resolve_exception_context: Some(resolve_exception_context),
+        force_quasi_immutable: Some(force_quasi_immutable),
+        symbolic_fnaddr_path_resolver: Some(
+            pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path,
+        ),
+    });
+}
+
 pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
@@ -1897,31 +1924,7 @@ pub fn install_jit_call_bridge() {
         majit_backend::register_memory_error_provider(|| {
             pyre_object::interp_exceptions::memory_error_singleton() as i64
         });
-        // rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start
-        // /stop hooks — wrap blackhole_from_resumedata,
-        // handle_async_forcing, and handle_guard_failure_in_trace so
-        // StackOverflow doesn't interrupt those critical sections.
-        // The pyre helpers are `extern "C" fn()`; thin wrappers adapt
-        // them to the Rust `fn()` signature register_criticalcode_hooks
-        // expects.
-        fn criticalcode_start_adapter() {
-            pyre_interpreter::stack_check::pyre_stack_criticalcode_start();
-        }
-        fn criticalcode_stop_adapter() {
-            pyre_interpreter::stack_check::pyre_stack_criticalcode_stop();
-        }
-        majit_metainterp::register_criticalcode_hooks(
-            criticalcode_start_adapter,
-            criticalcode_stop_adapter,
-        );
-        // rpython/rlib/rstack.py stack_almost_full hook — lets
-        // compile.py:702-703 and warmstate.py:430 query the recursion-
-        // limit-driven PYRE_STACKTOOBIG budget instead of the OS thread
-        // stack.
-        fn stack_almost_full_adapter() -> bool {
-            pyre_interpreter::stack_check::stack_almost_full()
-        }
-        majit_metainterp::register_stack_almost_full_hook(stack_almost_full_adapter);
+        publish_pyre_host_hooks();
         #[cfg(feature = "cranelift")]
         {
             majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
