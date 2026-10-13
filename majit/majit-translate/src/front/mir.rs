@@ -5581,6 +5581,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         } else {
             crate::front::slice_get::rewire_slice_get_call_sites(&mut lo.graph, &lo.slice_get_sites)
         };
+        // The `<[u8]>::is_ascii(slice)` rewrite (`front::slice_ascii`)
+        // replaces the residual with `first_non_ascii_char(s) < 0`
+        // (`rutf8.check_ascii`).  The scan loop lives in the helper graph,
+        // not the caller; gate the reachability sweep on an actual rewrite.
+        let slice_is_ascii_rewritten = if lo.slice_is_ascii_sites.is_empty() {
+            0
+        } else {
+            crate::front::slice_ascii::rewire_slice_is_ascii_call_sites(
+                &mut lo.graph,
+                &lo.slice_is_ascii_sites,
+            )
+        };
         // Header-view `slice::from_raw_parts{,_mut}` (`front::from_raw_parts`)
         // aliases the residual fat slice to the length-prefixed GC string
         // header.  In-place `same_as`; no new blocks.
@@ -5787,6 +5799,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
+            || slice_is_ascii_rewritten > 0
             || saturating_sub_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
@@ -8859,6 +8872,11 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_get::SliceGetSite`]).
     slice_get_sites: Vec<crate::front::slice_get::SliceGetSite>,
+    /// `<[u8]>::is_ascii(slice)` call sites recorded for the
+    /// `rutf8.check_ascii` rewrite (`first_non_ascii_char(s) < 0`) the
+    /// `front::slice_ascii` post-pass applies after body lowering (see
+    /// [`crate::front::slice_ascii::SliceIsAsciiSite`]).
+    slice_is_ascii_sites: Vec<crate::front::slice_ascii::SliceIsAsciiSite>,
     /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
     /// diamond (`if a < b { 0 } else { a - b }`) the
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
@@ -9697,6 +9715,7 @@ impl<'a> Lowering<'a> {
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),
+            slice_is_ascii_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
             saturating_add_sites: Vec::new(),
             saturating_mul_sites: Vec::new(),
@@ -30299,6 +30318,28 @@ impl<'a> Lowering<'a> {
         {
             site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_get_sites.push(site);
+        }
+        // Capture `<[u8]>::is_ascii(slice)` sites for the
+        // `rutf8.check_ascii` rewrite (`first_non_ascii_char(s) < 0`).
+        // `is_ascii` is a foreign leaf on the primitive `[u8]` (FunDecl
+        // `core::slice::ascii::<Impl>::is_ascii`), residualized as an
+        // unregistered callee the rtyper census Skips; a resolution miss
+        // leaves the residual call.  The receiver's `as_bytes()` mark
+        // picks the StringRepr helper vs the `[u8]` GcArray helper.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && crate::front::slice_ascii::is_slice_is_ascii_segments(segments)
+        {
+            let string_byte_view = self.slice_receiver_is_string_byte_view(&arg_locals);
+            self.slice_is_ascii_sites
+                .push(crate::front::slice_ascii::SliceIsAsciiSite {
+                    result_var: result_var.clone(),
+                    string_byte_view,
+                });
         }
         // `<[T]>::get(slice, start..)` returns an Option subslice.  Preserve
         // that Option shape with the same guarded diamond as scalar `get`, but

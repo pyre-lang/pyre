@@ -2621,6 +2621,14 @@ fn analyze_pipeline_from_module_paths(
         "str.str2unicode(str)".to_string(),
     );
 
+    // `rutf8.first_non_ascii_char` owns `@jit.elidable` in `rutf8.py` and
+    // no oopspec.  The helper graphs are minted in the rich model
+    // (`build_ll_minmax_graph` / `minmax_path`) because the `is_ascii`
+    // rewrite runs on the front spine before prepass; `mark_elidable` is
+    // the harvested `#[majit_macros::elidable]` stamp
+    // (`func._elidable_function_`, `call.py`).
+    front::slice_ascii::register_first_non_ascii_char_helpers(&mut call_control);
+
     // `ll_math.sqrt_nonneg` assigns
     // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function
     // definition. The interpreter owner is `sqrt_nonneg` in
