@@ -2221,6 +2221,18 @@ fn jit_blackhole_resume_from_guard(
         } else {
             None
         };
+        // `warmspot.py assembler_call_helper` is built per jitdriver and
+        // passes its own `jitdriver_sd` to `handle_fail`, so
+        // `resume_in_blackhole` reads that driver's `virtualizable_info`.
+        // One helper serves every driver here; the failing guard's
+        // `rd_loop_token.outermost_jitdriver_sd` names the same driver. A
+        // `generatorentry` callee has no virtualizable.
+        let novable = descr_arc
+            .as_fail_descr()
+            .and_then(majit_backend::descr_owning_jct)
+            .and_then(|token| token.outermost_jitdriver_index)
+            .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
+            .is_some_and(|has_vinfo| !has_vinfo);
         let result = blackhole_resume_via_rd_numb(
             storage.rd_numb_ref().expect("rd_numb"),
             storage.rd_consts().unwrap_or(&[]),
@@ -2229,7 +2241,7 @@ fn jit_blackhole_resume_from_guard(
             storage.rd_virtuals(),
             Some(deadframe_types.as_slice()),
             guard_exc,
-            false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
+            novable,
             all_virtuals,
             None, // `raw_deadframe` is rooted only by the copy made inside
         );
@@ -4519,6 +4531,21 @@ fn jit_ca_handle_guard_failure(
     let descr_fd = descr_arc
         .as_fail_descr()
         .expect("fail_descr_arc_from_addr returned non-FailDescr");
+    // `compile.py handle_fail` receives the failing loop's `jitdriver_sd`
+    // and `_trace_and_compile_from_bridge` rebuilds that driver's frames.
+    // The bridge start below rebuilds a `pypyjit` frame from failarg 0, its
+    // virtualizable. A `generatorentry` guard has the generator there and
+    // no virtualizable; like `run_compiled_generatorentry`, it resumes in
+    // the blackhole.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        let has_vinfo = majit_backend::descr_owning_jct(descr_fd)
+            .and_then(|token| token.outermost_jitdriver_index)
+            .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx));
+        if has_vinfo == Some(false) {
+            return None;
+        }
+    }
     let n_fail_args = descr_fd.fail_arg_types().len();
     let fail0 = unsafe { majit_backend::get_int_value(deadframe, descr_fd, 0) };
     let guard_value_operand = guard_value_operand_present.then_some(guard_value_operand);

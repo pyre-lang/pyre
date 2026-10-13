@@ -8495,6 +8495,18 @@ fn finish_generatorentry_after_walk_abort(
     // and recorded the yield or the exception. Resuming again would run
     // the body twice.
     if let Some(done) = pyre_interpreter::call::genentry_body_result_for(live_gen) {
+        // The note is `_invoke_execute_frame`'s result. `_send_ex` still
+        // tests `frame.frame_finished_execution` on it: a frame that
+        // RETURNed raises StopIteration.
+        if let Ok(value) = done {
+            let frame = unsafe { pyre_object::generator::w_generator_get_frame(live_gen) }
+                as *mut pyre_interpreter::pyframe::PyFrame;
+            if !frame.is_null() && unsafe { (*frame).frame_finished_execution() } {
+                return pyre_interpreter::baseobjspace::genentry_raise_returned(
+                    live_gen, frame, value, 0,
+                );
+            }
+        }
         return done;
     }
     // The `ptr::read` residual aborts after `w_generator_set_running` and
@@ -8510,7 +8522,7 @@ fn finish_generatorentry_after_walk_abort(
             }
         }
     }
-    pyre_interpreter::generator_send_ex_body(live_gen, live_arg, None, None, false)
+    pyre_interpreter::generator_send_ex_body(live_gen, live_arg, 0)
 }
 
 /// Exception word from a jd2 FINISH, including `StopIteration`.

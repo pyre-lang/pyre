@@ -1374,7 +1374,6 @@ fn real_main() {
     // `dont_look_inside` residuals the portal walk still executes.
     // Unbound, each one is a symbolic path hash and
     // `refuse_reachable_symbolic_residuals` aborts the trace.
-    fnaddr_bindings.extend(pyre_interpreter::baseobjspace::generatorentry_fnaddrs());
     #[cfg(feature = "pyre-module")]
     if !fnaddr_bindings
         .iter()

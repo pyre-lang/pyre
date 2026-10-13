@@ -137,13 +137,13 @@ fn w_generator_or_coroutine_new(
     let pycode_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(pycode);
     let frame_owned = !frame_ptr.is_null() && crate::gc_hook::try_gc_owns_object(frame_ptr);
-    let frame_slot = if frame_owned {
-        let slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(frame_ptr as PyObjectRef);
-        Some(slot)
+    // A static pin: an unmanaged frame's slot holds null.
+    let frame_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(if frame_owned {
+        frame_ptr as PyObjectRef
     } else {
-        None
-    };
+        PY_NULL
+    });
     let (ob_type, w_class) = match kind {
         GeneratorKind::Generator => (
             &GENERATOR_TYPE as *const PyType,
@@ -159,9 +159,11 @@ fn w_generator_or_coroutine_new(
         ),
     };
     let pycode = crate::gc_roots::shadow_stack_get(pycode_slot);
-    let frame_ptr = frame_slot
-        .map(|slot| crate::gc_roots::shadow_stack_get(slot) as crate::gc_hook::GCREF)
-        .unwrap_or(frame_ptr);
+    let frame_ptr = if frame_owned {
+        crate::gc_roots::shadow_stack_get(frame_slot) as crate::gc_hook::GCREF
+    } else {
+        frame_ptr
+    };
     let value = GeneratorIterator {
         ob: PyObject { ob_type, w_class },
         frame_ptr,

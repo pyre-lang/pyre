@@ -163,9 +163,8 @@ fn runtime_static_addr_by_name(name: &str) -> Option<i64> {
 /// residual by its callee compares the call's funcbox against this.
 ///
 /// Tagged reloc lookup uses this same set as the old value-based
-/// correspondence / disarm: `fnaddr_bindings.bin` also serialises
-/// `generatorentry_fnaddrs`, but those names were never in the runtime
-/// map, so the old pipeline zeroed their slots.
+/// correspondence / disarm: `fnaddr_bindings.bin` serialises exactly
+/// these names, so every bound slot has a runtime address.
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
@@ -1534,10 +1533,13 @@ mod tests {
     /// used to be zeroed by the value scan. Provenance disarm leaves it.
     #[test]
     fn untagged_constants_i_equal_to_unpaired_build_addr_survives_disarm() {
-        let (&unpaired_addr, _) = UNPAIRED_BUILD_ADDRS
-            .iter()
-            .find(|(addr, _)| **addr != 0)
-            .expect("need a nonzero unpaired build address");
+        // Every build binding is paired today, so the set is normally
+        // empty; a word no binding names is then as untagged as any.
+        let unpaired_addr = UNPAIRED_BUILD_ADDRS
+            .keys()
+            .copied()
+            .find(|addr| *addr != 0)
+            .unwrap_or(0x5eed_0000_1000);
 
         let jc = JitCode::new("untagged_unpaired_collision");
         jc.set_body(JitCodeBody {
@@ -1983,9 +1985,11 @@ mod tests {
         );
     }
 
-    /// A tagged FnAddr the old pipeline would leave live must exact-match a
-    /// published `jit_trace_fnaddrs` key. Slots that pipeline zeroed are
-    /// unpaired names (`generatorentry_fnaddrs` residuals) and stay unresolved.
+    /// Every bound tagged FnAddr must exact-match a published
+    /// `jit_trace_fnaddrs` key, and no residual-call target may be null:
+    /// neither as built nor after the runtime patch. A null target is a
+    /// build-time binding with no runtime address, which the walker can
+    /// only abort on.
     #[test]
     fn tagged_live_fnaddr_paths_resolve_exactly() {
         let orig = unpatched_production_jitcodes();
@@ -2004,10 +2008,14 @@ mod tests {
                 };
                 let idx = desc.constants_i_index;
                 let value = orig_body.constants_i[idx];
-                if value == 0 || *symbolic {
+                if *symbolic {
                     continue;
                 }
-                if old_body.constants_i[idx] == 0 {
+                if value == 0 || old_body.constants_i[idx] == 0 {
+                    unresolved_live.push(format!(
+                        "{path} in {} constants_i[{idx}] is null (built {value:#x})",
+                        orig_jc.name
+                    ));
                     continue;
                 }
                 if runtime_fnaddr_for_reloc_path(path).is_none() {
@@ -2018,11 +2026,28 @@ mod tests {
                 }
             }
         }
+        for jc in crate::jitcode_runtime::all_jitcodes() {
+            let Some(body) = jc.try_body() else {
+                continue;
+            };
+            for desc in &body.reloc_consts_i {
+                let ConstIRelocKind::FnAddr { path, .. } = &desc.kind else {
+                    continue;
+                };
+                let idx = desc.constants_i_index;
+                if body.constants_i[idx] == 0 {
+                    unresolved_live.push(format!(
+                        "{path} in {} constants_i[{idx}] is null after the runtime patch",
+                        jc.name
+                    ));
+                }
+            }
+        }
         unresolved_live.sort();
         unresolved_live.dedup();
         assert!(
             unresolved_live.is_empty(),
-            "live tagged fnaddr path is not a published registry key: {unresolved_live:?}"
+            "tagged fnaddr path is null or not a published registry key: {unresolved_live:?}"
         );
     }
 
