@@ -526,7 +526,7 @@ mod tests {
     fn collecting_with_a_live_field_borrow_is_rejected() {
         let state = WalkFrameState::default();
         let _borrow = state.borrow();
-        let payload = super::FrontendBoxArea::new(
+        let payload = super::super::FrontendBoxArea::new(
             Rc::as_ptr(&state.0),
             majit_metainterp::FrontendResrefOwner::NONE,
         );
