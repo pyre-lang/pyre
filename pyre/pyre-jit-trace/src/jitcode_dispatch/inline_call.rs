@@ -2845,6 +2845,12 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             None => return Ok(None),
         }
     };
+    // Nursery-born `W_Code` must survive the empty-vararg tuple and the
+    // kwargs dict below. `walker_pin_function_code` compares
+    // `Function.getcode` after `QuasiImmutDescr.__init__` against this slot.
+    let _assembler_code_roots = pyre_object::gc_roots::push_roots();
+    let assembler_code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
     let empty_vararg = if has_varargs {
         let concrete = pyre_object::w_tuple_new_array_backed(Vec::new());
         if concrete.is_null() || majit_gc::can_move(majit_ir::GcRef(concrete as usize)) {
@@ -2854,6 +2860,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     } else {
         None
     };
+    let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     // The callee's globals OBJECT (`function.w_func_globals_obj`) for the
     // `frame_stores_global` stamp.
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
@@ -2995,6 +3002,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // invalidates the trace instead. The pin re-reads `function_get_code`
     // after installing the watcher (`QuasiImmutDescr.__init__`) and aborts
     // if it no longer matches the `w_code` already used for the token.
+    // The kwargs dict above can collect; compare against the forwarded slot.
+    let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     walker_pin_function_code(ctx, op.pc, callable, w_code)?;
 
     // Build the callee PyFrame inline (Branch A): a single positional
@@ -8401,7 +8410,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // here: the guard arm below reads the field off the pinned operand,
         // which this arm either cannot do (the operand is not the callee) or
         // must not do (a baked `ConstPtr`).
-        walker_pin_function_code(ctx, op.pc, callable, w_code)?;
+        // `emit_pair_tuple_item` boxes a pair-int through `wrapint`, which
+        // can collect and forward the nursery `W_Code` rooted above.
+        // `Function.getcode` after `QuasiImmutDescr.__init__` compares
+        // against that live pointer; the pre-collection local would abort
+        // as `FunctionCodeRacedRecord` even when the field did not change.
+        walker_pin_function_code(
+            ctx,
+            op.pc,
+            callable,
+            pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
+        )?;
     } else {
         // `function.py getcode()` promotes `self.code`, never `self`.
         // The code object below and globals namespace in `InlineCalleeConsts`
@@ -8940,7 +8959,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // not pin local-i inputargs to identity colors, so the register the
     // body reads param i from is its per-PC pcdep color at the callee entry
     // (`pcdep_color_slots[0]`), not `r{i}`; an empty fixture map is identity.
-    let entry_colors = crate::state::sub_jitcode_entry_param_colors(w_code);
+    let entry_colors = crate::state::sub_jitcode_entry_param_colors(
+        pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
+    );
     for i in 0..seeded_locals {
         // RPython passes the same RefFrontendOp into the callee MIFrame, so
         // the Box keeps its recording-time pointer across the frame boundary.
@@ -9210,7 +9231,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             for i in 0..npure_cellvars {
                 let family = unsafe {
                     pyre_interpreter::pycode::w_code_cell_family(
-                        w_code as pyre_object::PyObjectRef,
+                        pyre_object::gc_roots::shadow_stack_get(inline_code_slot),
                         nlocals + i,
                     )
                 };
@@ -9291,7 +9312,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let inline_w_globals = callee_state.borrow().inline_w_globals;
         let mut frame = pyre_interpreter::pyframe::FrameBox::new(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
-                w_code,
+                pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
                 &concrete_args,
                 inline_w_globals as pyre_object::PyObjectRef,
                 concrete_ec,
@@ -9818,7 +9839,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.
                 Some(crate::driver::make_green_key_typed(
-                    w_code,
+                    pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
                     0,
                     is_being_profiled,
                 )),
@@ -9933,9 +9954,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
                     if prologue_cannot_call_assembler =>
                 {
-                    crate::state::pyjitcode_for_code(w_code)
-                        .and_then(|pjc| pjc.merge_entry_for(*target_pc))
-                        .map(|pc| (pc, MidBodyAbortKind::Structural))
+                    crate::state::pyjitcode_for_code(pyre_object::gc_roots::shadow_stack_get(
+                        inline_code_slot,
+                    ) as *const ())
+                    .and_then(|pjc| pjc.merge_entry_for(*target_pc))
+                    .map(|pc| (pc, MidBodyAbortKind::Structural))
                 }
                 _ => None,
             }
@@ -9982,8 +10005,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 let payload = (|| {
                     let (outer_jitcode_index, call_jitcode_pc) =
                         abort_flush_call_jitcode_coord.ok_or("no call jitcode coord")?;
-                    let callee_pjc =
-                        crate::state::pyjitcode_for_code(w_code).ok_or("no callee pyjitcode")?;
+                    let callee_pjc = crate::state::pyjitcode_for_code(
+                        pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
+                    )
+                    .ok_or("no callee pyjitcode")?;
                     let metadata = &callee_pjc.metadata;
                     let callee_py_pc =
                         crate::py_coord::containing_py_pc_for_jitcode_pc(metadata, abort_pc)
@@ -10018,8 +10043,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         return Err("abort pc is not an exact segment anchor");
                     }
                     let raw = unsafe {
-                        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                            as *const pyre_interpreter::CodeObject
+                        pyre_interpreter::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(
+                            inline_code_slot,
+                        )) as *const pyre_interpreter::CodeObject
                     };
                     if raw.is_null() {
                         return Err("null callee code ptr");
@@ -10123,7 +10149,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         callee_jitcode_index: callee_pjc.jitcode.index() as u32,
                         abort_jitcode_pc: abort_pc,
                         callee_py_pc,
-                        w_code: w_code as pyre_object::PyObjectRef,
+                        w_code: pyre_object::gc_roots::shadow_stack_get(inline_code_slot),
                         w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) },
                         live_locals,
                         live_stack,
@@ -10597,7 +10623,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_nlocals,
                 token,
                 target_pc,
-                w_code,
+                pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
                 is_being_profiled,
             )
         }
