@@ -896,14 +896,10 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
 /// follows. `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
 ///
-/// `celldict::object_mutable_cell_write_barrier` is `write_cell`'s
-/// spelling of the barrier on `w_cell.w_value = w_value`. A cell is
-/// outside the collector only when `lltype::malloc_typed_managed` ran
-/// before the GC alloc hook was installed; the product installs every
-/// pyre-object hook at boot (`init_jit_hooks` phase A →
-/// `init_gc_subsystem` → `install_pyre_object_hooks`), before any
-/// interpreter state exists, so every cell compiled code can store into
-/// is collector-owned and the call is the `gc_hook` barrier.
+/// Source-level helpers (`typeobject::type_write_barrier`,
+/// `celldict::object_mutable_cell_write_barrier`) are erased in
+/// `front/mir.rs` `is_source_write_barrier_call`, the same point the
+/// LLBC call becomes a unit constant before the following `setfield`.
 fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     let [.., module, leaf] = segments else {
         return false;
@@ -913,14 +909,41 @@ fn is_gc_write_barrier_path(segments: &[String]) -> bool {
         (
             "gc_hook",
             "try_gc_write_barrier" | "try_gc_write_barrier_managed"
-        ) | ("celldict", "object_mutable_cell_write_barrier")
+        )
     )
+}
+
+/// Unary ops `optimize_block` drops as `same_as`.
+///
+/// `jtransform.py rewrite_op_same_as`, `rewrite_op_cast_bool_to_*` /
+/// `cast_int_to_uint` / `cast_uint_to_int` (explicit no-ops),
+/// `rewrite_op_cast_opaque_ptr`, and the `deref` reborrow (`&mut *p`).
+pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
+    matches!(
+        name,
+        "same_as"
+            | "deref"
+            | "cast_opaque_ptr"
+            | "cast_bool_to_int"
+            | "cast_bool_to_uint"
+            | "cast_int_to_uint"
+            | "cast_uint_to_int"
+    )
+}
+
+/// Call paths `rewrite_op_direct_call` folds to the operand alias, the
+/// same `same_as` drop as [`is_same_as_identity_unary`].
+pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
+    is_identity_cast_path(segments)
+        || is_ptr_from_ref_path(segments)
+        || is_lltype_cast_path(segments, "cast_opaque_ptr")
+        || is_current_gc_ref_path(segments)
 }
 
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
 /// (`__cast_pointer`, `__cast_instance_intrinsic`,
 /// `__cast_address_intrinsic`).
-fn is_identity_cast_path(segments: &[String]) -> bool {
+pub(crate) fn is_identity_cast_path(segments: &[String]) -> bool {
     let [leaf] = segments else {
         return false;
     };
@@ -937,7 +960,7 @@ fn is_identity_cast_path(segments: &[String]) -> bool {
 ///
 /// Not `slice::from_ref` (one-element slice) and not `NonNull::from_ref`
 /// (wrapper struct).
-fn is_ptr_from_ref_path(segments: &[String]) -> bool {
+pub(crate) fn is_ptr_from_ref_path(segments: &[String]) -> bool {
     let Some(leaf) = segments.last() else {
         return false;
     };
@@ -1008,18 +1031,14 @@ fn canonical_gc_base(
 /// call the JIT rewriter does not keep: `rewrite.py
 /// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
 /// `SETFIELD_GC` / `SETARRAYITEM_GC` of a pointer. The interpreter spells
-/// that barrier as an explicit `try_gc_write_barrier(obj)` (or
-/// `celldict::object_mutable_cell_write_barrier` from `write_cell`) right
+/// that barrier as an explicit `try_gc_write_barrier(obj)` right
 /// before the store it guards, so the call is dropped only when a GC
 /// `FieldWrite` / `ArrayWrite` of the same base follows it in the same
 /// block: that store lowers to the op the backend barriers. Any other
 /// barrier stays residual.
 ///
 /// The bool-returning `gc_hook` result becomes `true`: the hook is
-/// installed before any compiled code runs. The unit-returning
-/// `celldict::object_mutable_cell_write_barrier` result becomes
-/// `ConstNone`, the unit-constant binding `front/mir.rs` uses for
-/// `type_write_barrier`.
+/// installed before any compiled code runs.
 fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     let aliases = std::collections::HashMap::new();
     let mut drops: Vec<(usize, usize)> = Vec::new();
@@ -1056,14 +1075,7 @@ fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
         }
     }
     for (bi, oi) in drops {
-        let op = &mut graph.blocks[bi].operations[oi];
-        op.kind = match &op.kind {
-            OpKind::Call {
-                result_ty: ValueType::Void,
-                ..
-            } => OpKind::ConstNone,
-            _ => OpKind::ConstBool(true),
-        };
+        graph.blocks[bi].operations[oi].kind = OpKind::ConstBool(true);
     }
 }
 
@@ -3659,16 +3671,14 @@ impl<'a> Transformer<'a> {
             OpKind::Call { target, args, .. } if is_jit_force_virtualizable_target(target) => {
                 self.rewrite_op_jit_force_virtualizable(args, graph_name)
             }
-            // RPython `Transformer.rewrite_op_cast_opaque_ptr` aliases
-            // only the explicit low-level operation. A ptr/int roundtrip
-            // remains two casts; it is not an opaque-pointer cast.
-            // The Rust `p as usize as *mut T` spelling is the Call pair
-            // folded in `rewrite_op_direct_call`.
+            // RPython `Transformer.rewrite_op_same_as` / `rewrite_op_cast_*`
+            // drop the op and alias the result to the operand. `deref` is
+            // the `&mut *p` reborrow of the same pointer.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
                 ..
-            } if unop_name == "cast_opaque_ptr" => RewriteResult::Identity(operand.clone()),
+            } if is_same_as_identity_unary(unop_name) => RewriteResult::Identity(operand.clone()),
             // ── fold of the `_we_are_jitted` symbolic ──
             //
             // Inside the tracer / blackhole interpreter `we_are_jitted()`
@@ -4007,59 +4017,6 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if unop_name == "bool" && variable_has_bool_repr(graph, operand) => {
-                RewriteResult::Identity(operand.clone())
-            }
-            OpKind::UnaryOp {
-                op: unop_name,
-                operand,
-                ..
-            } if unop_name == "same_as"
-                || unop_name == "deref"
-                || unop_name == "cast_bool_to_int"
-                || unop_name == "cast_bool_to_uint"
-                || unop_name == "cast_int_to_uint"
-                || unop_name == "cast_uint_to_int" =>
-            {
-                // RPython `jtransform.py rewrite_op_same_as`:
-                //
-                //     def rewrite_op_same_as(self, op):
-                //         if op.args[0] in self.vable_array_vars:
-                //             self.vable_array_vars[op.result] = \
-                //                 self.vable_array_vars[op.args[0]]
-                //
-                // `rewrite_op_same_as` returns `None` implicitly.  In
-                // `optimize_block` that means "remove the op and rename
-                // the result to args[0]" (`jtransform.py`).
-                //
-                // `cast_bool_to_int` / `cast_bool_to_uint` /
-                // `cast_int_to_uint` / `cast_uint_to_int` follow the
-                // same drop-and-alias shape — RPython
-                // `jtransform.py`:
-                //
-                //     def rewrite_op_cast_bool_to_int(self, op): pass
-                //     def rewrite_op_cast_bool_to_uint(self, op): pass
-                //     def rewrite_op_cast_int_to_uint(self, op): pass
-                //     def rewrite_op_cast_uint_to_int(self, op): pass
-                //
-                // are explicit no-ops.  Each cast is identity at LL
-                // level because `getkind(lltype.Bool) == getkind(
-                // lltype.Signed) == getkind(lltype.Unsigned) == 'int'`
-                // (`history.py:45-63`), so backend opcodes need not
-                // grow separate handlers.
-                //
-                // Pyre instead drops the op (`RewriteResult::Identity`)
-                // and records `op.result -> *operand` in `self.aliases`
-                // (line 446-450). Subsequent ops in the same block
-                // (and `block.exitswitch` / `link.args` via
-                // `remap_control_flow_metadata`) go through `remap_op`
-                // at line 441 before dispatch, so a consumer that
-                // originally referenced `op.result` is rewritten to
-                // reference `*operand` directly. The later
-                // `vable_array_vars.get(&base)` lookup in
-                // `rewrite_op_getarrayitem`/`_setarrayitem` then hits
-                // the original `(*operand)` entry — same outcome as
-                // upstream's explicit propagation, without keeping a
-                // redundant alias key.
                 RewriteResult::Identity(operand.clone())
             }
             // `ll_str` on a string is identity (`rpython/rtyper/
@@ -4675,25 +4632,16 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if unop_name == "abs" && self.get_value_kind_var(operand) == 'i' => {
-                // `rint.py rtype_abs` → `int_abs`.  There is no `int_abs`
-                // opcode; mint `ll_int_abs` (`if x < 0: -x else x`) the
-                // same way `ll_min` is minted for `core::cmp::min`.
-                let Some(cc) = self.callcontrol.as_deref_mut() else {
-                    return RewriteResult::Keep;
-                };
-                let path = crate::codewriter::minmax::int_abs_path(cc);
-                let helper_call = SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: path.segments.clone(),
-                            fun_decl_id: None,
-                        },
-                        args: crate::model::call_args(std::iter::once(operand.clone())),
-                        result_ty: ValueType::Int,
-                    },
-                };
-                self.rewrite_operation(&helper_call, graph_name, graph)
+                // `rint.py rtype_abs` → `int_abs`.  `jtransform.py
+                // rewrite_op_int_abs = _do_builtin_call` emits
+                // `direct_call(_ll_1_int_abs, x)`.  A candidate helper
+                // graph is `inline_call`; otherwise residual.
+                RewriteResult::Replace(self.emit_int_abs(
+                    graph,
+                    operand,
+                    op.result.clone(),
+                    graph_name,
+                ))
             }
             OpKind::UnaryOp {
                 op: unop_name,
@@ -5511,6 +5459,65 @@ impl<'a> Transformer<'a> {
             return false;
         };
         self.get_value_type(var) == Some(ValueType::Int)
+    }
+
+    /// Emit `direct_call(_ll_1_int_abs, x)` —
+    /// `jtransform.py rewrite_op_int_abs = _do_builtin_call`.
+    /// `try_lower_checked_neg`'s wrapping `checked_abs` payload is this
+    /// same UnaryOp `abs`; overflow is the `i64::MIN` discriminant
+    /// (`rint.py rtype_abs_ovf` / `ll_int_abs_ovf`).
+    fn emit_int_abs(
+        &mut self,
+        graph: &mut FunctionGraph,
+        operand: &crate::flowspace::model::Variable,
+        result: Option<crate::flowspace::model::Variable>,
+        graph_name: &str,
+    ) -> Vec<SpaceOperation> {
+        let target = CallTarget::function_path(["_ll_1_int_abs"]);
+        let direct_call = SpaceOperation {
+            result: result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(std::iter::once(operand.clone())),
+                result_ty: ValueType::Int,
+            },
+        };
+        let regular = self
+            .callcontrol
+            .as_ref()
+            .is_some_and(|cc| cc.guess_call_kind(&direct_call) == crate::call::CallKind::Regular);
+        if regular
+            && let RewriteResult::Replace(ops) = self.handle_regular_call(
+                &direct_call,
+                &target,
+                std::slice::from_ref(operand),
+                &ValueType::Int,
+                graph_name,
+                graph,
+            )
+        {
+            return ops;
+        }
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        vec![
+            funcptr_op,
+            SpaceOperation {
+                result,
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::from_signature(
+                        &[majit_ir::value::Type::Int],
+                        majit_ir::value::Type::Int,
+                        EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
+                    ),
+                    args_i: vec![operand.clone()],
+                    args_r: vec![],
+                    args_f: vec![],
+                    result_kind: 'i',
+                    indirect_targets: None,
+                },
+            },
+        ]
     }
 
     /// Emit the `_ll_2_int_mod` / `_ll_2_int_floordiv` call shared by
@@ -7336,16 +7343,12 @@ impl<'a> Transformer<'a> {
             if crate::translator::rtyper::cutover::is_no_effect_external(segments) {
                 return RewriteResult::Replace(Vec::new());
             }
-            // `current_gc_ref` is the residual stand-in for the GC
+            // `rewrite_op_same_as` / `rewrite_op_cast_pointer` /
+            // `rewrite_op_cast_opaque_ptr`: one operand alias, no jitcode
+            // op. `current_gc_ref` is the residual stand-in for the GC
             // transform's livevar reload (`rgc` rewrites the same box
-            // in place). A new SSA box here lets heap CSE keep the
-            // pre-reload `int_items.block` while setitem writes through
-            // the reloaded box, and the optimizer reorders the later
-            // getitem onto the uninitialized NewArray.
-            if segments.last().is_some_and(|s| s == "current_gc_ref") && args.len() == 1 {
-                return RewriteResult::Identity(args[0].clone());
-            }
-            if is_lltype_cast_path(segments, "cast_opaque_ptr") && args.len() == 1 {
+            // in place) and folds the same way.
+            if is_same_as_identity_call_path(segments) && args.len() == 1 {
                 return RewriteResult::Identity(args[0].clone());
             }
             if is_lltype_cast_path(segments, "cast_ptr_to_int")
@@ -8114,28 +8117,8 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::ConstRefNull,
             }]);
         }
-        // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
-        // (jtransform.py): the JIT does not distinguish a
-        // down-cast pointer from its source, so the
-        // `__cast_pointer/<Root>` marker (front::mir's carrier for the
-        // upstream `cast_pointer` op, see `cast_pointer_marker_op`)
-        // folds back to the operand alias and emits no jitcode op.
-        if let CallTarget::FunctionPath { segments, .. } = target
-            && segments.as_slice() == ["__cast_pointer"]
-            && args.len() == 1
-        {
-            return RewriteResult::Identity(args[0].clone());
-        }
-        // `ptr::from_ref` / `from_mut` is rustc's `r as *const T` /
-        // `*mut T` (`ptr/mod.rs from_ref` returns `r`). Same
-        // `rewrite_op_cast_pointer` → `same_as` alias as the marker
-        // above: no jitcode op, not a residual helper.
-        if let CallTarget::FunctionPath { segments, .. } = target
-            && is_ptr_from_ref_path(segments)
-            && args.len() == 1
-        {
-            return RewriteResult::Identity(args[0].clone());
-        }
+        // `__cast_pointer` / `ptr::from_ref` fold through
+        // `is_same_as_identity_call_path` above.
         // Skip-path graphs never run `rtype_type`. Flatten's raise tail
         // reads only evalue (`flatten.py make_return`), so fold
         // `op.type(v)` to the operand and leave no residual call.
@@ -8145,26 +8128,9 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `__cast_instance_intrinsic` — front::mir's pointer-downcast
-        // narrow (`cast_instance_call`: operand + const(root)).  The rtyper
-        // lowers it to `cast_pointer` (`rbuiltin.rs rtype_cast_instance_intrinsic`,
-        // `exception_cannot_occur`), which jtransform folds to `same_as`;
-        // the charon front-end skips the rtyper, so fold the marker to the
-        // operand alias here too.  The JIT does not distinguish a downcast
-        // pointer from its source, so this emits no jitcode op.
-        // `__cast_address_intrinsic` — the erasing twin (`p as *mut u8`), which
-        // carries no root and so is single-segment.  It reinterprets the
-        // same pointer too, and the JIT distinguishes a pointer no more
-        // from its erasure than from its downcast, so it folds the same
-        // way: the operand alias, no jitcode op.
-        if let CallTarget::FunctionPath { segments, .. } = target
-            && ((segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE]
-                && args.len() == 1)
-                || (segments.as_slice() == [crate::runtime_names::shims::CAST_ADDRESS]
-                    && args.len() == 1))
-        {
-            return RewriteResult::Identity(args[0].clone());
-        }
+        // `__cast_instance_intrinsic` / `__cast_address_intrinsic` fold
+        // through `is_same_as_identity_call_path` above (`rewrite_op_cast_pointer`
+        // → `same_as`).
         // `<*mut T>::is_null` / `<*const T>::is_null` — the raw-pointer null
         // test.  `front::mir`'s `impl_method_owner` routes it to
         // `CallTarget::Method { name: "is_null", receiver_root }` through the
@@ -13816,8 +13782,14 @@ fn path_segments_end_with(segments: &[String], tail: &[&str]) -> bool {
 /// emits, and the `pyre_*::lltype::cast_*` spelling of the same helpers.
 /// A user function named `cast_int_to_ptr` is an ordinary call
 /// (`pointer_cast_function_names_do_not_alias`).
-fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
+pub(crate) fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
     path_segments_end_with(segments, &["lltype", name])
+}
+
+/// Residual stand-in for the GC transform's livevar reload. `rewrite_op_direct_call`
+/// folds it to the operand alias (`current_gc_ref`).
+pub(crate) fn is_current_gc_ref_path(segments: &[String]) -> bool {
+    segments.last().is_some_and(|s| s == "current_gc_ref")
 }
 
 /// `direct_ptradd`'s pointer argument as the front emitted it, before
@@ -19526,6 +19498,82 @@ mod tests {
         );
     }
 
+    /// Route (a): `rewrite_op_int_abs = _do_builtin_call`.  Once the
+    /// `_ll_1_int_abs` graph is a candidate, the i64 `abs` UnaryOp
+    /// is an `inline_call`.
+    #[test]
+    fn int_abs_registered_graph_lowers_to_inline_call() {
+        let mut helper = FunctionGraph::new("_ll_1_int_abs");
+        helper.set_return(helper.startblock, None);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.register_function_graph(
+            crate::parse::CallPath::from_segments(["_ll_1_int_abs"]),
+            helper,
+        );
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("abs_body");
+        let operand = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "abs".to_string(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&operand, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "abs") }),
+            "bare abs must not survive: {ops:?}"
+        );
+        let inline = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::InlineCall {
+                    args_i,
+                    result_kind,
+                    ..
+                } => Some((args_i, *result_kind)),
+                _ => None,
+            })
+            .expect("registered abs must rewrite to inline_call");
+        assert_eq!(inline.1, 'i');
+        assert_eq!(inline.0, &vec![operand]);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            "inline_call is followed by -live-: {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "a candidate helper is not a residual call: {ops:?}"
+        );
+    }
+
     #[test]
     fn residual_direct_call_materializes_funcptr_const() {
         let mut cc = crate::call::CallControl::new();
@@ -24192,18 +24240,6 @@ mod tests {
         }
     }
 
-    fn cell_wb_call(obj: &crate::flowspace::model::Variable) -> OpKind {
-        OpKind::Call {
-            target: CallTarget::function_path([
-                "pyre_object",
-                "celldict",
-                "object_mutable_cell_write_barrier",
-            ]),
-            args: crate::model::call_args(vec![obj.clone()]),
-            result_ty: ValueType::Void,
-        }
-    }
-
     fn wb_store(
         obj: &crate::flowspace::model::Variable,
         stored: &crate::flowspace::model::Variable,
@@ -24261,8 +24297,9 @@ mod tests {
     }
 
     /// Only the `gc_hook` barrier is this op: a same-named leaf in another
-    /// module is an ordinary call. Same for
-    /// `celldict::object_mutable_cell_write_barrier`.
+    /// module is an ordinary call. Source-level helpers such as
+    /// `celldict::object_mutable_cell_write_barrier` are erased in
+    /// `front/mir.rs` `is_source_write_barrier_call`.
     #[test]
     fn gc_write_barrier_path_requires_gc_hook_module() {
         let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -24277,55 +24314,11 @@ mod tests {
             "try_gc_write_barrier"
         ])));
         assert!(!is_gc_write_barrier_path(&path(&["try_gc_write_barrier"])));
-        assert!(is_gc_write_barrier_path(&path(&[
+        assert!(!is_gc_write_barrier_path(&path(&[
             "pyre_object",
             "celldict",
             "object_mutable_cell_write_barrier"
         ])));
-        assert!(!is_gc_write_barrier_path(&path(&[
-            "pyre_object",
-            "other",
-            "object_mutable_cell_write_barrier"
-        ])));
-    }
-
-    /// `rewrite.py handle_write_barrier_setfield` owns the barrier on
-    /// SETFIELD_GC: `write_cell`'s explicit celldict barrier right
-    /// before the GC store it guards does not survive as a residual
-    /// helper. The call returns `()`; the dropped op is `ConstNone`.
-    #[test]
-    fn celldict_write_barrier_before_its_store_is_dropped() {
-        let mut graph = FunctionGraph::new("cell_wb_drop");
-        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let entry = graph.startblock;
-        graph.push_op_var(entry, cell_wb_call(&obj), false);
-        graph.push_op_var(entry, wb_store(&obj, &stored), false);
-        drop_guarded_gc_write_barriers(&mut graph);
-        let ops = &graph.blocks[entry.0].operations;
-        assert!(matches!(ops[0].kind, OpKind::ConstNone));
-        assert!(matches!(ops[1].kind, OpKind::FieldWrite { .. }));
-    }
-
-    /// A celldict barrier whose argument has no GC store after it in
-    /// its block stays a residual call — dropping it would be a GC hole.
-    #[test]
-    fn celldict_write_barrier_without_following_store_stays_residual() {
-        let mut graph = FunctionGraph::new("cell_wb_keep");
-        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let entry = graph.startblock;
-        graph.push_op_var(entry, wb_store(&obj, &stored), false);
-        graph.push_op_var(entry, cell_wb_call(&obj), false);
-        drop_guarded_gc_write_barriers(&mut graph);
-        assert!(is_wb_call(&graph.blocks[entry.0].operations[1].kind));
-
-        let mut graph = FunctionGraph::new("cell_wb_keep_alone");
-        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let entry = graph.startblock;
-        graph.push_op_var(entry, cell_wb_call(&obj), false);
-        drop_guarded_gc_write_barriers(&mut graph);
-        assert!(is_wb_call(&graph.blocks[entry.0].operations[0].kind));
     }
 
     #[test]

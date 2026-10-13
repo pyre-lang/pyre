@@ -1013,6 +1013,11 @@ fn reraise_diag_enabled() -> bool {
 /// was corrupted in between — never a program error. Report enough to tell the
 /// two shapes apart: a NULL slot (a live slot that was cleared) versus a live
 /// pointer whose object is no longer an exception (a stale or swept address).
+///
+/// `pyopcode.py RERAISE` has no diagnostic. The slot walk lives here so the
+/// opcode graph stays loop-free (`look_inside_graph`) and does not pass
+/// `locals_cells_stack_w` (`jtransform.py check_no_vable_array`).
+#[majit_macros::dont_look_inside]
 fn reraise_bad_operand_diag(
     w_exc: PyObjectRef,
     oparg: u32,
@@ -1021,7 +1026,7 @@ fn reraise_bad_operand_diag(
     opcode: &str,
     stack_base: usize,
     depth: usize,
-    slots: &[(usize, PyObjectRef)],
+    frame: &PyFrame,
 ) {
     // Addresses only. The operand that fails `is_exception` is often not a
     // PyObject, and reading `ob_type` there is the segfault this diag used to
@@ -1033,9 +1038,12 @@ fn reraise_bad_operand_diag(
     } else {
         u32::MAX
     };
-    let stack = slots
-        .iter()
-        .map(|(index, value)| format!("{index}:{:#x}", *value as usize))
+    let locals = locals_w!(frame).as_slice();
+    let stack = (0..depth)
+        .map(|index| {
+            let value = locals.get(index).copied().unwrap_or(pyre_object::PY_NULL);
+            format!("{index}:{:#x}", value as usize)
+        })
         .collect::<Vec<_>>()
         .join(", ");
     // Through the seam, not `eprintln!`: under sandbox the interpreter reaches
@@ -3841,6 +3849,12 @@ impl PyFrame {
     /// and the call run Python, so all three collect: root the operands the
     /// way `build_interpolation_op` roots its pops and read the forwarded
     /// words back for the call.
+    ///
+    /// Each call site passes a fixed 1- or 2-operand slice (`BUILD_TEMPLATE`,
+    /// `_typing` intrinsics). The shadow-stack reload is that same length and
+    /// lives in `gc_roots::shadow_stack_copy_range_into_vec`
+    /// (`framework.py pop_roots`), so this helper stays loop-free the way an
+    /// upstream opcode body is.
     fn call_module_helper(
         &mut self,
         module_name: &str,
@@ -3856,9 +3870,8 @@ impl PyFrame {
         let func = getattr_str(pyre_object::gc_roots::shadow_stack_get(module_slot), helper)?;
         let func_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(func);
-        let live: Vec<PyObjectRef> = (0..args.len())
-            .map(|index| pyre_object::gc_roots::shadow_stack_get(args_base + index))
-            .collect();
+        let mut live = vec![pyre_object::PY_NULL; args.len()];
+        pyre_object::gc_roots::shadow_stack_copy_range_into_vec(args_base, &mut live);
         let result = call_callable(
             self,
             pyre_object::gc_roots::shadow_stack_get(func_slot),
@@ -5439,9 +5452,6 @@ impl OpcodeStepExecutor for PyFrame {
                 // is NULL; a non-object bit pattern is the address itself.
                 let depth = self.valuestackdepth;
                 let stack_base = self.stack_base();
-                let slots: Vec<(usize, PyObjectRef)> = (0..depth)
-                    .map(|index| (index, locals_w!(self)[index]))
-                    .collect();
                 let code_ptr = unsafe { crate::pyframe::pyframe_get_pycode(self) };
                 let code_name = if code_ptr.is_null() {
                     "?"
@@ -5463,7 +5473,7 @@ impl OpcodeStepExecutor for PyFrame {
                     &opcode,
                     stack_base,
                     depth,
-                    &slots,
+                    self,
                 );
             }
             return Err(PyError::type_error(
@@ -6386,12 +6396,11 @@ impl OpcodeStepExecutor for PyFrame {
         }
 
         // Slow path: method call or non-Function callable.
-        // Must allocate Vec for args.
-        let mut args = Vec::with_capacity(nargs);
-        for _ in 0..nargs {
-            args.push(self.pop());
-        }
-        args.reverse();
+        // `baseobjspace.py call_valuestack` builds args through
+        // `frame.make_arguments` (`peekvalues`) then `dropvalues`.
+        // The CALL stack is `[callable, null_or_self, arg0..]`, so the
+        // explicit args pop through `popvalues` (`pyframe.py popvalues`).
+        let args = self.popvalues(nargs);
         let null_or_self = self.pop();
         let callable = self.pop();
 

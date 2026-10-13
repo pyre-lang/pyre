@@ -252,10 +252,47 @@ pub fn atanh(args: &[PyObjectRef]) -> PyResult {
 }
 
 // Exponential / logarithmic
+/// interp_math.py `math1` catches the low-level `ValueError` from
+/// `ll_math.py ll_math_sqrt` and raises the app-level error.
+/// `math1` uses `"math domain error"`; the observable is
+/// `test_math.py test_exception_messages`:
+/// `expected a nonnegative input, got {float_repr(x)}`.
+fn sqrt_from_double(x: f64) -> PyResult {
+    // interp_math.py `math1`: `y = f(x)` then `space.newfloat(y)`, with
+    // `except ValueError` translating the low-level carrier. The `return`
+    // on the Err arm is that except body; the Ok arm is the `newfloat`.
+    // `except ValueError:` does not bind the carrier, so this arm is
+    // `Err(_)`: `error_carrier_edges land_from_exc_object` emits no
+    // `from_exc_object` landing when the handler drops the value.
+    let y = match pyre_interpreter::objspace::descroperation::ll_math_sqrt(x) {
+        Ok(y) => y,
+        Err(_) => return sqrt_translate_ll_error(x),
+    };
+    pyre_interpreter::objspace::descroperation::_float_pos(y)
+}
+
+/// `math1`'s `except ValueError: raise oefmt(...)`. The message builder
+/// is the except body, not the recorded success path.
+///
+/// The residual trampoline is `f64 -> PyResult` (`helper_arg_from_i64`);
+/// a `PyError` argument is not a word, so that spelling would be a
+/// symbolic fnaddr on the catch path.
+#[majit_macros::dont_look_inside]
+fn sqrt_translate_ll_error(x: f64) -> PyResult {
+    Err(pyre_interpreter::PyError::value_error(format!(
+        "expected a nonnegative input, got {}",
+        float_repr(x)
+    )))
+}
+
+/// interp_math.py `sqrt` = `math1(space, math.sqrt, w_x)`.
 pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
-    math1_pymath("sqrt", args, pymath::math::sqrt, |v| {
-        format!("expected a nonnegative input, got {}", float_repr(v))
-    })
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "sqrt() takes exactly one argument",
+        ));
+    }
+    sqrt_from_double(try_get_double(args[0])?)
 }
 
 /// Arity / keyword / domain residual of `sqrt`. The positional-count check is
@@ -285,13 +322,7 @@ pub fn __majit_wrap_math_sqrt(args: &[PyObjectRef]) -> PyResult {
                 None
             };
         if let Some(x) = x {
-            // ll_math.py `ll_math_sqrt`: `x < 0.0` raises; NaN fails `x >= 0.0`.
-            if x >= 0.0 {
-                if x.is_finite() {
-                    return pyre_interpreter::objspace::descroperation::_float_sqrt(x);
-                }
-                return Ok(pyre_object::floatobject::w_float_new(x));
-            }
+            return sqrt_from_double(x);
         }
     }
     sqrt_slow(args)

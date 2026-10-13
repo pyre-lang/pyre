@@ -22885,6 +22885,14 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .and_then(|value| value.one().ok())
         {
+            // The residual ABI is the depth word (`frame_anchor_release`
+            // / lock-release). `FUNC.ARGS` is Int; stamp the cell so a
+            // later Skip-arm `s_None` projection cannot Void it before
+            // `getcalldescr` (`call.py`).
+            crate::model::FunctionGraph::set_concretetype_of_inline(
+                &arg,
+                crate::model::ConcreteType::Signed,
+            );
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Call {
@@ -35233,13 +35241,18 @@ impl<'a> Lowering<'a> {
             self.cast_ptr_to_int_src
                 .insert(res.clone(), operand.clone());
         }
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(res.clone()),
-            kind: OpKind::UnaryOp {
+        let kind = match op {
+            "cast_int_to_ptr" => cast_int_to_ptr_call(operand),
+            "cast_ptr_to_int" => cast_ptr_to_int_call(operand),
+            _ => OpKind::UnaryOp {
                 op: op.to_string(),
                 operand,
                 result_ty,
             },
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind,
         });
         self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
@@ -44360,7 +44373,11 @@ fn gc_root_gcref_result_path(name: &str) -> bool {
     segments.contains(&"gc_roots")
         && matches!(
             segments.last(),
-            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get") | Some(&"reload_top_root")
+            Some(&"pin_root")
+                | Some(&"shadow_stack_get")
+                | Some(&"get")
+                | Some(&"reload_top_root")
+                | Some(&"reload_top_root_at")
         )
 }
 
@@ -57222,6 +57239,22 @@ pub(crate) fn cast_int_to_ptr_call(operand: crate::flowspace::model::Variable) -
         ]),
         args: crate::model::call_args(vec![operand]),
         result_ty: ValueType::Ref(None),
+    }
+}
+
+/// `lltype.cast_ptr_to_int` as the host call the rtyper accepts.
+/// `normalize_unary_op_name` rejects a unary op of this name.
+pub(crate) fn cast_ptr_to_int_call(operand: crate::flowspace::model::Variable) -> OpKind {
+    OpKind::Call {
+        target: CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]),
+        args: crate::model::call_args(vec![operand]),
+        result_ty: ValueType::Int,
     }
 }
 
@@ -85986,13 +86019,34 @@ mod tests {
         );
     }
 
+    fn assert_lltype_cast_call(ops: &[&SpaceOperation], name: &str) {
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == name)
+                    && segments.windows(2).any(|w| w[0] == "lltype" && w[1] == name)
+            )),
+            "{name} host call missing; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == name
+            )),
+            "{name} must not be a UnaryOp; ops={ops:?}"
+        );
+    }
+
     #[test]
     fn host_scalar_calls_project_to_llops() {
         let ptr_ty =
             serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]});
         let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
-        let cases = [
+        let unary_cases = [
             (
                 "float2longlong",
                 "pyre_float2longlong",
@@ -86006,19 +86060,31 @@ mod tests {
                 "longlong2float",
                 "pyre_longlong2float",
                 ["pyre_interpreter", "longlong2float", "longlong2float"],
-                i64_ty,
+                i64_ty.clone(),
                 serde_json::json!({"Scalar": {"Float": "F64"}}),
                 "convert_longlong_bytes_to_float",
                 ValueType::Float,
             ),
+        ];
+        for (name, func, path, arg_ty, ret_ty, llop, result_ty) in unary_cases {
+            let llbc = scalar_method_call_fixture(func, &path, arg_ty, ret_ty);
+            let lowered = format!("case {name}: lower {func}");
+            let graph = super::lower_function(&llbc, func).expect(&lowered);
+            let ops = graph_ops(&graph);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_unary_llop(&ops, llop, result_ty);
+            }));
+            if let Err(payload) = result {
+                panic!("case {name}: {}", panic_payload_mir(&payload));
+            }
+        }
+        let cast_cases = [
             (
                 "cast_ptr_to_int",
                 "pyre_cast_ptr_to_int",
                 ["pyre_object", "lltype", "cast_ptr_to_int"],
                 ptr_ty.clone(),
                 serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
-                "cast_ptr_to_int",
-                ValueType::Int,
             ),
             (
                 "cast_int_to_ptr",
@@ -86026,17 +86092,15 @@ mod tests {
                 ["pyre_object", "lltype", "cast_int_to_ptr"],
                 serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
                 ptr_ty,
-                "cast_int_to_ptr",
-                ValueType::Ref(None),
             ),
         ];
-        for (name, func, path, arg_ty, ret_ty, llop, result_ty) in cases {
+        for (name, func, path, arg_ty, ret_ty) in cast_cases {
             let llbc = scalar_method_call_fixture(func, &path, arg_ty, ret_ty);
             let lowered = format!("case {name}: lower {func}");
             let graph = super::lower_function(&llbc, func).expect(&lowered);
             let ops = graph_ops(&graph);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                assert_unary_llop(&ops, llop, result_ty);
+                assert_lltype_cast_call(&ops, name);
             }));
             if let Err(payload) = result {
                 panic!("case {name}: {}", panic_payload_mir(&payload));

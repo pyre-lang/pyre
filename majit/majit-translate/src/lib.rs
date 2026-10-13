@@ -811,6 +811,9 @@ fn register_function_graph_alias(
 /// entry, so this runs after that pass. The seed lookup in
 /// `CallControl::find_all_graphs_bfs` and the route-(a) `function_path`
 /// are that one segment; nothing looks up `crate::name` for these helpers.
+/// Residual fnaddr lookup of the seed name follows the shared `GraphKey`
+/// (`CallControl::lookup_function_fnaddr`); the host publishes the source
+/// path once (`support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt`).
 fn pin_builtin_graphs(
     graphs: &std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
     bindings: &[(String, crate::parse::CallPath)],
@@ -2906,9 +2909,17 @@ fn register_configured_jitdrivers(
         let portal_path = if !spec.split_portal {
             spec.portal.clone()
         } else {
-            // Ends the `call_control` borrow the `register_function_graph`
-            // below needs mutably; also the `warmspot.py:441` copy source.
-            let original = portal_graph.clone();
+            // `warmspot.py split_graph_and_record_jitdriver` copies the portal
+            // after the annotator has already flagged the merge-point reds.
+            // Run the annotator analog on the original graph first so
+            // inherit reads converged `access_directly_call_results`
+            // (`annrpython.py recursivecall`), not the pre-fixpoint set.
+            drop(portal_graph);
+            call_control.annotate_access_directly(&[spec.portal.clone()]);
+            let original = call_control
+                .function_graphs()
+                .get(&spec.portal)
+                .expect("portal graph remains after annotate_access_directly");
             let mut portal = crate::model::copygraph(&original);
             let original_identity = original
                 .source_identity
@@ -2987,6 +2998,17 @@ fn register_configured_jitdrivers(
                 &spec.green_kinds,
                 &spec.red_kinds,
                 &spec.red_types,
+            );
+            // `warmspot.py split_graph_and_record_jitdriver` copies the
+            // portal after the annotator has already flagged the merge-point
+            // reds (`interp_jit.py dispatch` `hint(self, access_directly=True)`
+            // in the same function as `jit_merge_point`). The copy keeps
+            // those annotations; bind the flagged reds onto the new
+            // startblock formals (`annrpython.py bindinputargs`).
+            crate::codewriter::call::inherit_split_portal_access_directly(
+                &mut portal,
+                split_start,
+                numreds,
             );
             // `warmspot.py WarmRunnerDesc.split_graph_and_record_jitdriver`:
             // keep the copied portal as a backend-inlining boundary and let
@@ -4165,6 +4187,411 @@ mod portal_driver_tests {
         let jd0 = &call_control.jitdrivers_sd()[0];
         assert!(!jd0.autoreds);
         assert_eq!(jd0.numreds, Some(2));
+    }
+
+    /// `interp_jit.py dispatch` hints `self` in the same function as
+    /// `jit_merge_point`. After `split_graph_and_record_jitdriver` the
+    /// portal copy's red `frame` formal keeps that flag
+    /// (`inherit_split_portal_access_directly`).
+    #[test]
+    fn split_portal_inherits_access_directly_on_the_hinted_red() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let mut graph = FunctionGraph::new("pyre_jit::eval::eval_loop_jit");
+        let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let is_being_profiled = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let pycode = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let frame = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let ec = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0].inputargs = vec![
+            next_instr.clone(),
+            is_being_profiled.clone(),
+            pycode.clone(),
+            frame.clone(),
+            ec.clone(),
+        ];
+        let hinted = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["hint_access_directly"]),
+                    args: crate::model::call_args(vec![frame.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        let aliased = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(aliased.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: hinted,
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                    args: crate::model::call_args(vec![
+                        aliased.clone(),
+                        next_instr,
+                        is_being_profiled,
+                        pycode,
+                        aliased,
+                        ec,
+                    ]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.set_return(graph.startblock, None);
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![pipeline::JitDriverSpec {
+                portal: portal.clone(),
+                portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                greens: vec![
+                    "next_instr".into(),
+                    "is_being_profiled".into(),
+                    "pycode".into(),
+                ],
+                reds: vec!["frame".into(), "ec".into()],
+                green_kinds: Vec::new(),
+                red_kinds: Vec::new(),
+                autoreds: false,
+                virtualizables: vec!["frame".into()],
+                red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
+                split_portal: true,
+            }],
+            register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
+        };
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+        let split_portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let split_graph = call_control
+            .function_graphs()
+            .get(&split_portal)
+            .expect("split portal graph must be registered");
+        let frame_red = &split_graph.block(split_graph.startblock).inputargs[3];
+        let ec_red = &split_graph.block(split_graph.startblock).inputargs[4];
+        assert_eq!(
+            split_graph.access_directly_inputs.as_deref(),
+            Some([frame_red.id()].as_slice()),
+            "hinted merge-point red must bind the portal copy's frame formal"
+        );
+        let flags = frame_red.annotation.borrow();
+        match flags.as_ref().map(|rc| rc.as_ref()) {
+            Some(crate::annotator::model::SomeValue::Instance(inst)) => {
+                assert_eq!(inst.flags.get("access_directly"), Some(&true));
+            }
+            other => panic!("portal red frame must carry SomeInstance flags, got {other:?}"),
+        }
+        assert!(
+            !call::CallControl::access_directly_result_ids(split_graph.as_ref())
+                .contains(&ec_red.id()),
+            "unhinted ec red must not inherit access_directly"
+        );
+    }
+
+    /// `eval_loop_jit` reloads the hinted frame through
+    /// `gc_roots::reload_top_root` inside the loop that holds
+    /// `jit_merge_point`. The reload is a GC-erasure identity of its first
+    /// argument (`peel_recast_to_source`), so the split portal red still
+    /// inherits the flag.
+    #[test]
+    fn split_portal_inherits_access_directly_through_identity_wrapper_loop() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let mut graph = FunctionGraph::new("pyre_jit::eval::eval_loop_jit");
+        let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let is_being_profiled = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let pycode = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let frame = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let ec = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0].inputargs = vec![
+            next_instr.clone(),
+            is_being_profiled.clone(),
+            pycode.clone(),
+            frame.clone(),
+            ec.clone(),
+        ];
+        let hinted = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["hint_access_directly"]),
+                    args: crate::model::call_args(vec![frame]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        let f0 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(f0.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["gc_roots", "reload_top_root"]),
+                    args: crate::model::call_args(vec![hinted]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        let (loop_block, loop_ins) = graph.create_block_with_arg_vars(5);
+        graph.set_goto(
+            graph.startblock,
+            loop_block,
+            vec![next_instr, is_being_profiled, pycode, f0, ec],
+        );
+        let loop_next = loop_ins[0].clone();
+        let loop_profiled = loop_ins[1].clone();
+        let loop_pycode = loop_ins[2].clone();
+        let loop_f = loop_ins[3].clone();
+        let loop_ec = loop_ins[4].clone();
+        let f1 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.block_mut(loop_block).operations.push(SpaceOperation {
+            result: Some(f1.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["gc_roots", "reload_top_root"]),
+                args: crate::model::call_args(vec![loop_f]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        graph.block_mut(loop_block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                args: crate::model::call_args(vec![
+                    f1.clone(),
+                    loop_next.clone(),
+                    loop_profiled.clone(),
+                    loop_pycode.clone(),
+                    f1.clone(),
+                    loop_ec.clone(),
+                ]),
+                result_ty: ValueType::Void,
+            },
+        });
+        graph.set_goto(
+            loop_block,
+            loop_block,
+            vec![loop_next, loop_profiled, loop_pycode, f1, loop_ec],
+        );
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![pipeline::JitDriverSpec {
+                portal: portal.clone(),
+                portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                greens: vec![
+                    "next_instr".into(),
+                    "is_being_profiled".into(),
+                    "pycode".into(),
+                ],
+                reds: vec!["frame".into(), "ec".into()],
+                green_kinds: Vec::new(),
+                red_kinds: Vec::new(),
+                autoreds: false,
+                virtualizables: vec!["frame".into()],
+                red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
+                split_portal: true,
+            }],
+            register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
+        };
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+        let split_portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let split_graph = call_control
+            .function_graphs()
+            .get(&split_portal)
+            .expect("split portal graph must be registered");
+        let n_inputs = split_graph.block(split_graph.startblock).inputargs.len();
+        let frame_red = &split_graph.block(split_graph.startblock).inputargs[n_inputs - 2];
+        let ec_red = &split_graph.block(split_graph.startblock).inputargs[n_inputs - 1];
+        assert_eq!(
+            split_graph.access_directly_inputs.as_deref(),
+            Some([frame_red.id()].as_slice()),
+            "identity wrapper in the loop must not drop the merge-point frame flag"
+        );
+        assert!(
+            !call::CallControl::access_directly_result_ids(&split_graph).contains(&ec_red.id()),
+            "unhinted ec red must not inherit access_directly"
+        );
+    }
+
+    /// Prefix `reload_cached(slot, frame)` is not a GC-reload identity
+    /// (first argument is the slot). The annotator analog must run on the
+    /// original graph before the split so inherit reads the callee's
+    /// `access_directly_return` (`annrpython.py recursivecall`). The loop
+    /// reload is `reload_top_root` so the join keeps the flag the way
+    /// `unionof` keeps a backedge that still carries it.
+    #[test]
+    fn split_portal_inherits_access_directly_through_callee_return_binding() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let mut cached = FunctionGraph::new("reload_cached");
+        let slot_in = cached.alloc_value_var_with_type(ConcreteType::Signed);
+        let frame_in = cached.alloc_value_var_with_type(ConcreteType::GcRef);
+        cached.blocks[cached.startblock.0].inputargs = vec![slot_in, frame_in.clone()];
+        let cached_out = cached.alloc_value_var_with_type(ConcreteType::GcRef);
+        cached.blocks[cached.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(cached_out.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["gc_roots", "reload_top_root"]),
+                    args: crate::model::call_args(vec![frame_in]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        cached.set_return(cached.startblock, Some(cached_out));
+        call_control.register_function_graph(CallPath::from_segments(["reload_cached"]), cached);
+
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let mut graph = FunctionGraph::new("pyre_jit::eval::eval_loop_jit");
+        let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let is_being_profiled = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let pycode = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let frame = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let ec = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0].inputargs = vec![
+            next_instr.clone(),
+            is_being_profiled.clone(),
+            pycode.clone(),
+            frame.clone(),
+            ec.clone(),
+        ];
+        let hinted = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["hint_access_directly"]),
+                    args: crate::model::call_args(vec![frame]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        let f0 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(f0.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["reload_cached"]),
+                    args: crate::model::call_args(vec![is_being_profiled.clone(), hinted]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        let (loop_block, loop_ins) = graph.create_block_with_arg_vars(5);
+        graph.set_goto(
+            graph.startblock,
+            loop_block,
+            vec![next_instr, is_being_profiled, pycode, f0, ec],
+        );
+        let loop_next = loop_ins[0].clone();
+        let loop_profiled = loop_ins[1].clone();
+        let loop_pycode = loop_ins[2].clone();
+        let loop_f = loop_ins[3].clone();
+        let loop_ec = loop_ins[4].clone();
+        let f1 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.block_mut(loop_block).operations.push(SpaceOperation {
+            result: Some(f1.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["gc_roots", "reload_top_root"]),
+                args: crate::model::call_args(vec![loop_f]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        graph.block_mut(loop_block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                args: crate::model::call_args(vec![
+                    f1.clone(),
+                    loop_next.clone(),
+                    loop_profiled.clone(),
+                    loop_pycode.clone(),
+                    f1.clone(),
+                    loop_ec.clone(),
+                ]),
+                result_ty: ValueType::Void,
+            },
+        });
+        graph.set_goto(
+            loop_block,
+            loop_block,
+            vec![loop_next, loop_profiled, loop_pycode, f1, loop_ec],
+        );
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![pipeline::JitDriverSpec {
+                portal: portal.clone(),
+                portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                greens: vec![
+                    "next_instr".into(),
+                    "is_being_profiled".into(),
+                    "pycode".into(),
+                ],
+                reds: vec!["frame".into(), "ec".into()],
+                green_kinds: Vec::new(),
+                red_kinds: Vec::new(),
+                autoreds: false,
+                virtualizables: vec!["frame".into()],
+                red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
+                split_portal: true,
+            }],
+            register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
+        };
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+        let split_portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let split_graph = call_control
+            .function_graphs()
+            .get(&split_portal)
+            .expect("split portal graph must be registered");
+        let n_inputs = split_graph.block(split_graph.startblock).inputargs.len();
+        let frame_red = &split_graph.block(split_graph.startblock).inputargs[n_inputs - 2];
+        let ec_red = &split_graph.block(split_graph.startblock).inputargs[n_inputs - 1];
+        assert_eq!(
+            split_graph.access_directly_inputs.as_deref(),
+            Some([frame_red.id()].as_slice()),
+            "callee return binding must flag the merge-point frame red"
+        );
+        assert!(
+            !call::CallControl::access_directly_result_ids(&split_graph).contains(&ec_red.id()),
+            "unhinted ec red must not inherit access_directly"
+        );
     }
 
     #[test]

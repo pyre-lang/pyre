@@ -1613,6 +1613,69 @@ pub(super) fn rtype_non_constant(
     Ok(Some(hop.inputarg(&r_result, 0)?))
 }
 
+/// rlib/jit.py `Entry(_about_=hint).specialize_call`:
+///
+/// ```python
+/// v = hop.inputarg(hop.args_r[0], arg=0)
+/// c_hint = hop.inputconst(lltype.Void, hints)
+/// hop.exception_cannot_occur()
+/// return hop.genop('hint', [v, c_hint], resulttype=v.concretetype)
+/// ```
+fn rtype_hint_with(hop: &HighLevelOp, pairs: &[(&str, bool)]) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = hop
+        .args_r
+        .borrow()
+        .first()
+        .and_then(Clone::clone)
+        .ok_or_else(|| TyperError::message("rtype_hint: missing argument repr".to_string()))?;
+    let v = hop.inputarg(r_arg.as_ref(), 0)?;
+    let result_lltype = match &v {
+        Hlvalue::Variable(var) => var.concretetype().ok_or_else(|| {
+            TyperError::message("rtype_hint: argument has no concretetype".to_string())
+        })?,
+        Hlvalue::Constant(c) => c.concretetype.clone().ok_or_else(|| {
+            TyperError::message("rtype_hint: argument has no concretetype".to_string())
+        })?,
+    };
+    let mut hints = HashMap::new();
+    for (key, value) in pairs {
+        hints.insert(ConstValue::byte_str(*key), ConstValue::Bool(*value));
+    }
+    let c_hint = Constant::with_concretetype(ConstValue::Dict(hints), LowLevelType::Void);
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "hint",
+        vec![v, Hlvalue::Constant(c_hint)],
+        GenopResult::LLType(result_lltype),
+    ))
+}
+
+pub(super) fn rtype_hint_access_directly(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_hint_with(hop, &[("access_directly", true)])
+}
+
+pub(super) fn rtype_hint_fresh_virtualizable(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_hint_with(
+        hop,
+        &[("access_directly", true), ("fresh_virtualizable", true)],
+    )
+}
+
+pub(super) fn rtype_hint_no_access_directly(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_hint_with(hop, &[("access_directly", false)])
+}
+
 /// Rust source marker for RPython
 /// `VirtualizableInstanceRepr.hook_access_field`.
 ///
