@@ -202,6 +202,14 @@ pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef
 /// the remembered-set entry and reset the flag before the young pointer
 /// lands.
 ///
+/// The barrier is `gc_hook::try_gc_write_barrier_from_array`
+/// (`dont_look_inside`): `GCFLAG_TRACK_YOUNG_PTRS` is mutable, and looking
+/// inside `majit_gc::gc_write_barrier_from_array` can fold the clear bit
+/// from a young birth and skip the barrier after the array is promoted.
+/// `remember_frame_locals_array` is residual for the same reason. The
+/// from_array call stays residual: `framework.py transform_generic_set`
+/// emits it as `direct_call` and `jtransform.py` does not drop it.
+///
 /// # Safety
 /// `block` is a live `ItemsBlock` and `index` is in range.
 #[inline]
@@ -213,7 +221,7 @@ pub unsafe fn items_block_set_ref(block: *mut ItemsBlock, index: usize, value: P
     {
         stale_array_abort(block as usize, index);
     }
-    majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(block as usize), index);
+    crate::gc_hook::try_gc_write_barrier_from_array(block as crate::gc_hook::GCREF, index);
     unsafe { *items_block_items_base(block).add(index) = value };
 }
 
@@ -1750,12 +1758,10 @@ impl FixedObjectArray {
         unsafe { std::slice::from_raw_parts_mut(self.items_mut_ptr(), self.len) }
     }
 
-    /// Store a GC reference through the host interpreter's equivalent of the
-    /// GC transform's `setarrayitem_gc` rewrite.
-    ///
-    /// `transform_generic_set` emits the inline `TRACK_YOUNG_PTRS` test, the
-    /// conditional array write barrier, then the store. The barrier is not a
-    /// collection point, so `value` needs no root across it.
+    /// Store a GC reference through the host interpreter's equivalent of
+    /// `setarrayitem_gc`: `write_barrier_from_array` then the store
+    /// (`items_block_set_ref`). The barrier is not a collection point, so
+    /// `value` needs no root across it.
     #[inline]
     #[expect(
         clippy::not_unsafe_ptr_arg_deref,
@@ -1770,43 +1776,22 @@ impl FixedObjectArray {
             unsafe { self.items_mut_ptr().add(index).write(value) };
             return;
         }
-        // The ordinary `setarrayitem_gc` rewrite: inspect TRACK_YOUNG_PTRS
-        // inline and enter the barrier slow path only while the old array
-        // still needs to be remembered.  The barrier clears this bit, so every
-        // later store into the same array is a plain write.  Nursery arrays and
-        // the header-prefixed `std::alloc` fallback arrays carry a zero flag
-        // word and take this arm.
+        // `setarrayitem_gc` / `items_block_set_ref`: the barrier is
+        // `gc_hook::try_gc_write_barrier_from_array` (`dont_look_inside`).
+        // An inlined TRACK_YOUNG_PTRS test can fold the clear bit from a
+        // young birth and skip the barrier after the array is promoted
+        // (`incminimark.py write_barrier` reads it at the store).
+        // `remember_frame_locals_array` is residual for the same reason.
         let header = unsafe { majit_gc::header::header_of(self as *mut Self as usize) };
-        if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
-            unsafe { self.items_mut_ptr().add(index).write(value) };
-            return;
-        }
-        self.set_ref_remembering(index, value);
-    }
-
-    /// The flagged half of [`Self::set_ref`], kept out of line the way the GC
-    /// transform inlines only the `TRACK_YOUNG_PTRS` test of `setarrayitem_gc`
-    /// and calls `remember_young_pointer_from_array` for the rest.
-    #[cold]
-    #[inline(never)]
-    fn set_ref_remembering(&mut self, index: usize, value: PyObjectRef) {
-        let header = unsafe { majit_gc::header::header_of(self as *mut Self as usize) };
-        // `FORWARDED_MARKER` sets every flag bit, so `set_ref`'s flag test cannot
-        // tell an array a minor collection already moved from a live old one.
-        // Report it here, where the array and the store that reached it are
-        // both still named, instead of one frame deeper where the barrier sees
-        // only a type id past the end of the type table.
-        if unsafe { (*header).is_forwarded() } {
+        if unsafe { (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) }
+            && unsafe { (*header).is_forwarded() }
+        {
             stale_array_abort(self as *mut Self as usize, index);
         }
-        // incminimark.py `write_barrier` / `remember_young_pointer`:
-        // append to `old_objects_pointing_to_young` and clear
-        // `TRACK_YOUNG_PTRS`. That helper is not a collection point;
-        // `setarrayitem_gc` does not `push_roots` around it. A pin here
-        // used to wait on `try_gc_current_object_address` and consume
-        // the birth remembered-set entry mid-fill, after which later
-        // stores took the no-barrier arm.
-        crate::gc_hook::try_gc_write_barrier_managed(self as *mut Self as crate::gc_hook::GCREF);
+        crate::gc_hook::try_gc_write_barrier_from_array(
+            self as *mut Self as crate::gc_hook::GCREF,
+            index,
+        );
         unsafe { self.items_mut_ptr().add(index).write(value) };
     }
 
