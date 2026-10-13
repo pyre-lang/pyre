@@ -289,12 +289,10 @@ mod imp {
         for i in 0..argtypes.len() {
             let at = pyre_object::gc_roots::shadow_stack_get(argtypes_slot + i);
             let p = unsafe { *args.add(i) };
-            match decode_arg(at, p) {
-                Ok(value) => {
-                    decoded_slots.push(pyre_object::gc_roots::shadow_stack_len());
-                    let _ = pyre_object::gc_roots::pin_root(value);
-                }
-                Err(error) => return Err(error),
+            {
+                let value = decode_arg(at, p)?;
+                decoded_slots.push(pyre_object::gc_roots::shadow_stack_len());
+                let _ = pyre_object::gc_roots::pin_root(value);
             }
         }
         Ok(decoded_slots
@@ -364,7 +362,7 @@ mod imp {
                 // than the CIF's own type may be written.  `g` is the case that
                 // overruns — it encodes to a long double while
                 // `ffi_type_from_code` maps it to the `f64` the slot holds.
-                let ret = funcptr::Ret::Code(c.clone());
+                let ret = funcptr::Ret::Code(c);
                 let n = bytes.len().min(ffi_result_width(&ret));
                 unsafe {
                     std::ptr::copy_nonoverlapping(

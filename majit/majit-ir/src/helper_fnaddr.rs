@@ -95,7 +95,7 @@ pub trait ResidualError {
 pub fn for_each_helper_fnaddr(mut visit: impl FnMut(&HelperFnAddr)) {
     #[cfg(not(target_arch = "wasm32"))]
     for desc in HELPER_FNADDRS {
-        visit(&desc);
+        visit(desc);
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -203,7 +203,7 @@ pub unsafe fn rstr_payload(word: i64) -> &'static [u8] {
 pub fn for_each_prebuilt_class_static(mut visit: impl FnMut(&PrebuiltStaticAddr)) {
     #[cfg(not(target_arch = "wasm32"))]
     for desc in PREBUILT_CLASS_STATICS {
-        visit(&desc);
+        visit(desc);
     }
     #[cfg(target_arch = "wasm32")]
     {

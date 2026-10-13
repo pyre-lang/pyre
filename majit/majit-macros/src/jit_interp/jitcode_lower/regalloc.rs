@@ -61,8 +61,8 @@ impl UnionFind {
     }
 
     fn find_rep(&mut self, reg: Register) -> Register {
-        if !self.parent.contains_key(&reg) {
-            self.parent.insert(reg, reg);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.parent.entry(reg) {
+            e.insert(reg);
             self.weight.insert(reg, 1);
             return reg;
         }

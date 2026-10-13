@@ -320,12 +320,11 @@ pub fn merge_hints_into_graph(graph: &mut crate::model::FunctionGraph, hints: &[
         // harvester spells that attribute as an `oopspec:` hint token;
         // `call.py` `hasattr(func, 'oopspec')` reads the attribute, not
         // the token list.
-        if graph.func.oopspec.is_none() {
-            if let Some(spec) = hint.strip_prefix("oopspec:") {
-                if !spec.is_empty() {
-                    graph.func.oopspec = Some(spec.to_string());
-                }
-            }
+        if graph.func.oopspec.is_none()
+            && let Some(spec) = hint.strip_prefix("oopspec:")
+            && !spec.is_empty()
+        {
+            graph.func.oopspec = Some(spec.to_string());
         }
     }
 }

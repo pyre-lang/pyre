@@ -282,12 +282,12 @@ impl NumbHeap {
     }
 
     fn fresh_cell(&mut self) -> *mut NumbCell {
-        if let Some((ptr, used)) = self.chunks.last_mut() {
-            if *used < NUMB_CHUNK {
-                let cell = unsafe { (*ptr).add(*used) };
-                *used += 1;
-                return cell;
-            }
+        if let Some((ptr, used)) = self.chunks.last_mut()
+            && *used < NUMB_CHUNK
+        {
+            let cell = unsafe { (*ptr).add(*used) };
+            *used += 1;
+            return cell;
         }
         let layout = std::alloc::Layout::array::<NumbCell>(NUMB_CHUNK).expect("numb slab");
         let ptr = unsafe { std::alloc::alloc(layout) as *mut NumbCell };

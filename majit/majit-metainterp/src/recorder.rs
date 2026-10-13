@@ -1028,14 +1028,14 @@ impl Trace {
         for op in &ops {
             for i in 0..op.num_args() {
                 let arg = op.arg(i);
-                if arg.is_inputarg() {
-                    if let Some(idx) = arg.position() {
-                        // `ByteTraceIter` remints the live list densely from
-                        // `start_fresh=0`, so the reminted index is the live
-                        // list index. Rebind onto the recorder's `InputArgRc`.
-                        if let Some(ours) = self.inputargs.get(idx as usize) {
-                            op.setarg(i, Operand::from_bound_inputarg(ours));
-                        }
+                if arg.is_inputarg()
+                    && let Some(idx) = arg.position()
+                {
+                    // `ByteTraceIter` remints the live list densely from
+                    // `start_fresh=0`, so the reminted index is the live
+                    // list index. Rebind onto the recorder's `InputArgRc`.
+                    if let Some(ours) = self.inputargs.get(idx as usize) {
+                        op.setarg(i, Operand::from_bound_inputarg(ours));
                     }
                 }
             }
@@ -1100,7 +1100,7 @@ impl Trace {
             start_fresh,
         );
         let mut ops = Vec::with_capacity(self.slots.len());
-        while let Some(op) = iter.next() {
+        for op in iter.by_ref() {
             ops.push(op);
         }
         debug_assert_eq!(ops.len(), self.slots.len());
@@ -1231,14 +1231,16 @@ impl Trace {
         // at `value_slots[_index - _start]`. A materialized producer is
         // the op whose result position is that `_index`
         // (`opencoder.py` `TraceIterator._cache[_index]` / `get_op_by_pos`).
-        if !r.is_none() && r.ty() != Some(Type::Void) && !matches!(r, OpRef::VoidOp(_)) {
-            if self.value_slot(r.raw()).is_some() {
-                if let Some(op) = self.ops.iter().find(|op| op.pos().get() == r) {
-                    return Operand::from_bound_op(op);
-                }
-                if self.byte_mode() {
-                    return Operand::bound_from_opref(r);
-                }
+        if !r.is_none()
+            && r.ty() != Some(Type::Void)
+            && !matches!(r, OpRef::VoidOp(_))
+            && self.value_slot(r.raw()).is_some()
+        {
+            if let Some(op) = self.ops.iter().find(|op| op.pos().get() == r) {
+                return Operand::from_bound_op(op);
+            }
+            if self.byte_mode() {
+                return Operand::bound_from_opref(r);
             }
         }
         // S3/#124: a ResOp operand always has a dense producer in `ops`
@@ -1791,10 +1793,10 @@ impl Trace {
                     visitor(&mut gcref);
                     op.set_value(Value::Ref(gcref));
                 }
-                if let Some(descr) = op.getdescr() {
-                    if let Some(qd) = descr.as_quasi_immut_descr() {
-                        qd.walk_const_ptr_refs(visitor);
-                    }
+                if let Some(descr) = op.getdescr()
+                    && let Some(qd) = descr.as_quasi_immut_descr()
+                {
+                    qd.walk_const_ptr_refs(visitor);
                 }
             }
         }

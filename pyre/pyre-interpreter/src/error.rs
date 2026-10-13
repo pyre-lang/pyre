@@ -2252,12 +2252,13 @@ impl PyError {
         // and the instance is `w_type(w_value)`. `PyError::new` still carries
         // a display-message rstr and uses the kind path below, which does
         // not run application-level constructors.
-        if !self.w_type.is_null() && !self.has_display_message() {
-            if let Ok(w_value) = self.normalize_exception(pyre_object::PY_NULL) {
-                if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
-                    return w_value;
-                }
-            }
+        if !self.w_type.is_null()
+            && !self.has_display_message()
+            && let Ok(w_value) = self.normalize_exception(pyre_object::PY_NULL)
+            && !w_value.is_null()
+            && unsafe { pyre_object::is_exception(w_value) }
+        {
+            return w_value;
         }
         // Root the deferred name/obj context references across the exception
         // allocation below: they live only in this Rust `PyError`, which the
@@ -5835,10 +5836,10 @@ pub fn wrap_oserror2(
     // the retry to check for — the same gate `builtins::eintr_retry_with`
     // carries.
     #[cfg(not(target_arch = "wasm32"))]
-    if errno == libc::EINTR {
-        if let Err(err) = crate::module::signal::interp_signal::checksignals_now() {
-            return err;
-        }
+    if errno == libc::EINTR
+        && let Err(err) = crate::module::signal::interp_signal::checksignals_now()
+    {
+        return err;
     }
     let msg = PyError::clean_strerror(errno);
     let Some(w_exc) = w_exception_class else {

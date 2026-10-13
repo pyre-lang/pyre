@@ -1272,16 +1272,13 @@ impl Optimizer {
                 let imported_items = items
                     .iter()
                     .map(|item_info| match item_info {
-                        Some(item_info) => {
-                            let item_ref = Self::import_virtual_state_from_label_args_recurse(
-                                item_info,
-                                imported_label_args,
-                                label_slot,
-                                ctx,
-                                walk_visited,
-                            );
-                            item_ref
-                        }
+                        Some(item_info) => Self::import_virtual_state_from_label_args_recurse(
+                            item_info,
+                            imported_label_args,
+                            label_slot,
+                            ctx,
+                            walk_visited,
+                        ),
                         // virtualstate.py:272-280: absent fieldstate remains
                         // an unwritten virtual-array slot on import.
                         None => Operand::None,
@@ -1357,15 +1354,13 @@ impl Optimizer {
                             .map(|(field_idx, field_info)| {
                                 let field = match field_info {
                                     Some(field_info) => {
-                                        let field_ref =
-                                            Self::import_virtual_state_from_label_args_recurse(
-                                                field_info,
-                                                imported_label_args,
-                                                label_slot,
-                                                ctx,
-                                                walk_visited,
-                                            );
-                                        field_ref
+                                        Self::import_virtual_state_from_label_args_recurse(
+                                            field_info,
+                                            imported_label_args,
+                                            label_slot,
+                                            ctx,
+                                            walk_visited,
+                                        )
                                     }
                                     // virtualstate.py _enum: retain the
                                     // dense unwritten element-field slot.
@@ -1833,7 +1828,7 @@ impl Optimizer {
             })
             .collect();
         let preview_virtual_state =
-            crate::optimizeopt::virtualstate::export_state_operands(&preview_end_arg_boxes, &ctx);
+            crate::optimizeopt::virtualstate::export_state_operands(&preview_end_arg_boxes, ctx);
         let vs_args = &post_force_args;
         // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
         // mismatch here raises `VirtualStatesCantMatch` and the outer
@@ -1846,7 +1841,7 @@ impl Optimizer {
         // and reroutes instead of crashing the worker thread.
         let (preview_label_args, preview_virtuals, preview_label_source_positions) =
             match preview_virtual_state
-                .make_inputargs_and_virtuals_with_source_positions(vs_args, self, &mut ctx, false)
+                .make_inputargs_and_virtuals_with_source_positions(vs_args, self, ctx, false)
             {
                 Ok(pair) => {
                     let (label_boxes, virtuals, positions) = pair;
@@ -1928,14 +1923,14 @@ impl Optimizer {
                  (shortpreamble.py:255-259)"
                 );
             }
-            short_boxes.add_short_input_arg(&mut ctx, arg, raw_type);
+            short_boxes.add_short_input_arg(ctx, arg, raw_type);
         }
-        self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
-        let produced = short_boxes.produced_ops(&mut ctx);
+        self.produce_potential_short_preamble_ops(&mut short_boxes, ctx);
+        let produced = short_boxes.produced_ops(ctx);
         // shortpreamble.py:272-281 — the `for short_op in
         // self.const_short_boxes:` half of `create_short_boxes`, which
         // upstream runs on every unroll with no condition on it.
-        let produced_const = short_boxes.produced_const_ops(&mut ctx);
+        let produced_const = short_boxes.produced_const_ops(ctx);
         // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
         // label_args + virtuals)` — read off the ShortBoxes object and
         // carry to export_state through the ctx channel, together with
@@ -5623,7 +5618,7 @@ impl Optimizer {
             if opcode == OpCode::GuardException {
                 self.last_guard_op_idx = None;
             }
-            return replaced;
+            replaced
         } else {
             // optimizer.py:630-631 + resume.py:428-445 + 520-558:
             // RPython passes `pendingfields` INTO finish() so
@@ -5748,7 +5743,7 @@ impl Optimizer {
             if opcode == OpCode::GuardException {
                 self.last_guard_op_idx = None;
             }
-            return replaced;
+            replaced
         }
     }
 

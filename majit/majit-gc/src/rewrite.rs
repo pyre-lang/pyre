@@ -1370,12 +1370,12 @@ impl GcRewriterImpl {
                 self.gen_malloc_fixedsize(size, descr.type_id(), false, result_pos, st)
             };
             st.replace_op_with(op, &obj_ref);
-            if op.opcode == OpCode::NewWithVtable {
-                if let Some(vtable_fd_ref) = self.fielddescr_vtable.as_ref() {
-                    let vtable = descr.vtable();
-                    if vtable != 0 {
-                        self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
-                    }
+            if op.opcode == OpCode::NewWithVtable
+                && let Some(vtable_fd_ref) = self.fielddescr_vtable.as_ref()
+            {
+                let vtable = descr.vtable();
+                if vtable != 0 {
+                    self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
                 }
             }
             self.clear_gc_fields(descr, obj_ref, st);
@@ -1412,12 +1412,12 @@ impl GcRewriterImpl {
                 )
             };
             st.replace_op_with(op, &obj_ref);
-            if op.opcode == OpCode::NewWithVtable {
-                if let Some(vtable_fd_ref) = self.fielddescr_vtable.as_ref() {
-                    let vtable = descr.vtable();
-                    if vtable != 0 {
-                        self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
-                    }
+            if op.opcode == OpCode::NewWithVtable
+                && let Some(vtable_fd_ref) = self.fielddescr_vtable.as_ref()
+            {
+                let vtable = descr.vtable();
+                if vtable != 0 {
+                    self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
                 }
             }
             self.clear_gc_fields(descr, obj_ref, st);
@@ -3529,7 +3529,7 @@ impl GcRewriterImpl {
     /// One pass of `GcRewriterAssembler.rewrite` over a single segment.
     /// The caller supplies a fresh `RewriteState`; only `next_pos` and
     /// `gcrefs_output_list` are carried across segments.
-    fn rewrite_ops_with_state(&self, ops: &[OpRc], mut st: &mut RewriteState<'_>) {
+    fn rewrite_ops_with_state(&self, ops: &[OpRc], st: &mut RewriteState<'_>) {
         for (i, orig_op) in ops.iter().enumerate() {
             // rewrite.py `if op is self._changed_op: op = self._changed_op_to`.
             let op_rc: OpRc = match (&st._changed_op, &st._changed_op_to) {
@@ -3545,7 +3545,7 @@ impl GcRewriterImpl {
             // must be called regardless of whether the flush path is
             // taken — the flush only fires when one of the two branches
             // returns true.
-            let merges = self.could_merge_with_next_guard(op, i, ops, &mut st);
+            let merges = self.could_merge_with_next_guard(op, i, ops, st);
             if op.opcode.is_guard() || merges {
                 st.emit_pending_zeros();
             }
@@ -3554,7 +3554,7 @@ impl GcRewriterImpl {
             // accessors to GC_LOAD / GC_STORE forms.  Returns true only
             // for the GETFIELD_GC fast-path, which also emits the
             // forwarded op itself.
-            if self.transform_to_gc_load(op, &mut st) {
+            if self.transform_to_gc_load(op, st) {
                 continue;
             }
 
@@ -3574,29 +3574,29 @@ impl GcRewriterImpl {
 
                 // ── Allocation ──
                 OpCode::New | OpCode::NewWithVtable => {
-                    self.handle_new(op, &mut st);
+                    self.handle_new(op, st);
                 }
                 // rewrite.py:485-494 — descr source per opcode mirrors
                 // upstream: NEW_ARRAY threads op.getdescr(); NEWSTR /
                 // NEWUNICODE thread self.gc_ll_descr.{str,unicode}_descr.
                 OpCode::NewArray | OpCode::NewArrayClear => {
                     let descr_ref = op.getdescr().expect("NEW_ARRAY must carry an ArrayDescr");
-                    self.handle_new_array(descr_ref, op, &mut st, 0); // FLAG_ARRAY
+                    self.handle_new_array(descr_ref, op, st, 0); // FLAG_ARRAY
                 }
                 OpCode::Newstr => {
                     // rewrite.py `handle_new_array(self.gc_ll_descr.str_descr, op, FLAG_STR)`.
-                    self.handle_new_array(self.str_descr.clone(), op, &mut st, 1);
+                    self.handle_new_array(self.str_descr.clone(), op, st, 1);
                 }
                 OpCode::Newunicode => {
                     // rewrite.py `handle_new_array(self.gc_ll_descr.unicode_descr, op, FLAG_UNICODE)`.
-                    self.handle_new_array(self.unicode_descr.clone(), op, &mut st, 2);
+                    self.handle_new_array(self.unicode_descr.clone(), op, st, 2);
                 }
 
                 // ── COPYSTRCONTENT / COPYUNICODECONTENT → memcpy CALL_N ──
                 // rewrite.py `rewrite_copy_str_content` replaces
                 // the copy op with LOAD_EFFECTIVE_ADDRESS × 2 + CALL_N.
                 OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
-                    self.rewrite_copy_str_content(op, &mut st);
+                    self.rewrite_copy_str_content(op, st);
                 }
 
                 // ── Stores that may need a write barrier ──
@@ -3612,22 +3612,22 @@ impl GcRewriterImpl {
                 OpCode::SetfieldGc if self.wb_descr.is_some() => {
                     // rewrite.py — consider_setfield_gc clears the
                     // pending zero-init entry before WB emission.
-                    self.consider_setfield_gc(op, &mut st);
-                    self.handle_write_barrier_setfield(op, &mut st);
+                    self.consider_setfield_gc(op, st);
+                    self.handle_write_barrier_setfield(op, st);
                     st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
                 OpCode::SetinteriorfieldGc if self.wb_descr.is_some() => {
                     // rewrite.py:946 `handle_write_barrier_setinteriorfield
                     // = handle_write_barrier_setarrayitem`.
-                    self.handle_write_barrier_setarrayitem(op, &mut st);
+                    self.handle_write_barrier_setarrayitem(op, st);
                     st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
                 OpCode::SetarrayitemGc if self.wb_descr.is_some() => {
                     // rewrite.py:401-404
-                    self.consider_setarrayitem_gc(op, &mut st);
-                    self.handle_write_barrier_setarrayitem(op, &mut st);
+                    self.consider_setarrayitem_gc(op, st);
+                    self.handle_write_barrier_setarrayitem(op, st);
                     st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
@@ -3640,12 +3640,12 @@ impl GcRewriterImpl {
                 // `SETINTERIORFIELD_GC` gets no `consider_*` there, so it
                 // falls to the catch-all unchanged.
                 OpCode::SetfieldGc => {
-                    self.consider_setfield_gc(op, &mut st);
+                    self.consider_setfield_gc(op, st);
                     st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
                 OpCode::SetarrayitemGc => {
-                    self.consider_setarrayitem_gc(op, &mut st);
+                    self.consider_setarrayitem_gc(op, st);
                     st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
@@ -3657,7 +3657,7 @@ impl GcRewriterImpl {
                 | OpCode::CallAssemblerN => {
                     // rewrite.py always `handle_call_assembler` →
                     // `gen_malloc_frame` → `gen_malloc_nursery_varsize_frame`.
-                    self.handle_call_assembler(op, &mut st);
+                    self.handle_call_assembler(op, st);
                     continue;
                 }
 

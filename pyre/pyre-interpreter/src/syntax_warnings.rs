@@ -694,7 +694,7 @@ fn scan_tokenizer_warnings(
                 {
                     let raw = bytes[name_start..index]
                         .iter()
-                        .any(|byte| byte.to_ascii_lowercase() == b'r');
+                        .any(|byte| byte.eq_ignore_ascii_case(&b'r'));
                     index = scan_interpolated_string(source, filename, index, end, raw)?;
                 }
             }

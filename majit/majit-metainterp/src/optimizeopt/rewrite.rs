@@ -1909,9 +1909,7 @@ impl Optimization for OptRewrite {
                     // deserialized descr carries only its structural cache key,
                     // and reading the 0 that stands for "not yet resolved" as a
                     // tid would report a type conflict against every real one.
-                    if let Some(type_id) =
-                        info.get_descr().and_then(|descr| descr_gc_type_id(descr))
-                    {
+                    if let Some(type_id) = info.get_descr().and_then(descr_gc_type_id) {
                         if i64::from(type_id) != expected {
                             return raise_invalid_loop("wrong GC types passed around!", op, ctx);
                         }

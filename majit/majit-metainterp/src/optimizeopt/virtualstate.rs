@@ -599,7 +599,7 @@ impl VirtualState {
         visited: &mut smallvec::SmallVec<[usize; 8]>,
     ) {
         let key = Rc::as_ptr(node) as usize;
-        if visited.iter().any(|&k| k == key) {
+        if visited.contains(&key) {
             return;
         }
         visited.push(key);
@@ -2527,7 +2527,7 @@ impl GuardRequirement {
                 let arg_b = ctx.materialize_operand_at(arg);
                 let val_b = match expected_value {
                     Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
-                    v => majit_ir::operand::Operand::const_from_value(v.clone()),
+                    v => majit_ir::operand::Operand::const_from_value(*v),
                 };
                 let mut op = Op::new(OpCode::GuardValue, &[arg_b.clone(), val_b.clone()]);
                 op.setfailargs(Default::default());

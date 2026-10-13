@@ -325,7 +325,7 @@ impl Repr for RustVecRepr {
                 }
                 let v = hop.inputargs(vec![
                     ConvertedTo::Repr(self),
-                    ConvertedTo::LowLevelType(&*GCREF),
+                    ConvertedTo::LowLevelType(&GCREF),
                 ])?;
                 hop.exception_cannot_occur()?;
                 self.call_helper(

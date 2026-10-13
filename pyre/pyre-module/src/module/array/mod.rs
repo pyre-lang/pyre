@@ -1365,12 +1365,12 @@ fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
 
         let obj = pyre_object::gc_roots::shadow_stack_get(base);
         let live_len = unsafe { arr::w_array_len(obj) };
-        if let Some(slot) = slot {
-            if slot < live_len {
-                let start = slot * itemsize;
-                let vec = unsafe { arr::w_array_vec_mut(obj) };
-                vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
-            }
+        if let Some(slot) = slot
+            && slot < live_len
+        {
+            let start = slot * itemsize;
+            let vec = unsafe { arr::w_array_vec_mut(obj) };
+            vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
         }
 
         let w_list = pyre_object::gc_roots::shadow_stack_get(base + 1);

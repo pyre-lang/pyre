@@ -5669,7 +5669,6 @@ impl MiniMarkGC {
                         if deferred.is_none() {
                             deferred = Some((slot_ptr as usize, field_ref.0));
                         }
-                        return;
                     } else if self.is_young_rawmalloced(field_ref.0) {
                         self.visit_young_rawmalloced_object(field_ref.0);
                     }
@@ -7370,7 +7369,7 @@ impl MiniMarkGC {
              field={field} value={value:#x} value_state={} {parent_desc} {root_desc} \
              enclosing={enclosing} {holder_layout} holder_words={:?}",
             self.debug_describe_bad_value(value),
-            &holder_words,
+            holder_words,
         );
     }
 

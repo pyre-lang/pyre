@@ -949,12 +949,11 @@ fn intern_publish_const(obj: PyObjectRef, replace_managed: bool) -> PyObjectRef 
     let key = crate::celldict::StrKey(unsafe { w_str_storage(obj) });
     let mut table = lock_intern();
     let dict = intern_dict(&mut table);
-    if let Some(existing) = dict.ll_get(key) {
-        if !replace_managed
-            || !crate::gc_hook::try_gc_owns_object(existing as crate::gc_hook::GCREF)
-        {
-            return existing;
-        }
+    if let Some(existing) = dict.ll_get(key)
+        && (!replace_managed
+            || !crate::gc_hook::try_gc_owns_object(existing as crate::gc_hook::GCREF))
+    {
+        return existing;
     }
     dict.ll_set_nonnull_valueref(key, valueref);
     obj
@@ -1108,10 +1107,10 @@ pub fn interned_size_immortal() -> usize {
 /// immortal exact str, weakly, keyed by that object's own STR.
 #[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
-    if let Some(existing) = intern_lookup(value) {
-        if !crate::gc_hook::try_gc_owns_object(existing as crate::gc_hook::GCREF) {
-            return existing;
-        }
+    if let Some(existing) = intern_lookup(value)
+        && !crate::gc_hook::try_gc_owns_object(existing as crate::gc_hook::GCREF)
+    {
+        return existing;
     }
     // convert_const shape: pyre roots by hand and has no get_livevars_for_roots
     // insertion. Convergence is gctransformer root insertion, then newtext.

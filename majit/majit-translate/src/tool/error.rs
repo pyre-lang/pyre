@@ -211,7 +211,7 @@ fn graph_repr(graph: &GraphRef) -> String {
     let g = graph.borrow();
     format!(
         "<FunctionGraph of {} at 0x{:x}>",
-        &*g,
+        *g,
         Rc::as_ptr(graph) as usize
     )
 }

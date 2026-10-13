@@ -1217,7 +1217,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 {
                     let text = majit_rlib::rsocket::inet_ntoa(data)
                         .map_err(|error| pyre_interpreter::PyError::os_error(error.message))?;
-                    return Ok(pyre_object::w_str_new_managed(&text));
+                    Ok(pyre_object::w_str_new_managed(&text))
                 }
                 #[cfg(not(any(unix, windows)))]
                 {
@@ -1586,7 +1586,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 {
                     let port = majit_rlib::rsocket::getservbyname(&c_name, proto_c.as_deref())
                         .map_err(|error| socket_converted_error("error", None, error.message))?;
-                    return Ok(pyre_object::w_int_new(port));
+                    Ok(pyre_object::w_int_new(port))
                 }
                 #[cfg(windows)]
                 {
@@ -1656,7 +1656,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             .map_err(|error| {
                                 socket_converted_error("error", None, error.message)
                             })?;
-                    return Ok(pyre_object::w_str_new_managed(&name));
+                    Ok(pyre_object::w_str_new_managed(&name))
                 }
                 #[cfg(windows)]
                 {
@@ -4472,7 +4472,7 @@ pub fn __majit_wrap_socket_bind(
         let bytes =
             unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, slen as usize) };
         majit_rlib::rsocket::bind(fd, bytes).map_err(rsocket_os_error)?;
-        return Ok(pyre_object::w_none());
+        Ok(pyre_object::w_none())
     }
     #[cfg(windows)]
     {
@@ -4507,7 +4507,7 @@ pub fn __majit_wrap_socket_listen(
     #[cfg(unix)]
     {
         majit_rlib::rsocket::listen(fd, backlog).map_err(rsocket_os_error)?;
-        return Ok(pyre_object::w_none());
+        Ok(pyre_object::w_none())
     }
     #[cfg(windows)]
     {
@@ -4543,7 +4543,7 @@ pub fn __majit_wrap_socket_shutdown(
     #[cfg(unix)]
     {
         majit_rlib::rsocket::shutdown(fd, how).map_err(rsocket_os_error)?;
-        return Ok(pyre_object::w_none());
+        Ok(pyre_object::w_none())
     }
     #[cfg(windows)]
     {
@@ -4573,7 +4573,7 @@ pub fn __majit_wrap_socket_getsockname(
         let (bytes, slen) = majit_rlib::rsocket::getsockname(fd)
             .map_err(|error| socket_io_err(std::io::Error::from_raw_os_error(error.errno)))?;
         let (storage, slen) = storage_from_rsocket(&bytes, slen);
-        return Ok(unpack_inet_addr(&storage, slen));
+        Ok(unpack_inet_addr(&storage, slen))
     }
     #[cfg(windows)]
     {
@@ -4607,7 +4607,7 @@ pub fn __majit_wrap_socket_getpeername(
         let (bytes, slen) = majit_rlib::rsocket::getpeername(fd)
             .map_err(|error| socket_io_err(std::io::Error::from_raw_os_error(error.errno)))?;
         let (storage, slen) = storage_from_rsocket(&bytes, slen);
-        return Ok(unpack_inet_addr(&storage, slen));
+        Ok(unpack_inet_addr(&storage, slen))
     }
     #[cfg(windows)]
     {
@@ -4683,7 +4683,7 @@ pub fn __majit_wrap_socket_setsockopt(
                 ));
             }
         }
-        return Ok(pyre_object::w_none());
+        Ok(pyre_object::w_none())
     }
     #[cfg(windows)]
     {
@@ -4772,7 +4772,7 @@ pub fn __majit_wrap_socket_getsockopt(
         #[cfg(unix)]
         {
             let v = socket_getsockopt_int(fd, level, name)?;
-            return Ok(pyre_object::w_int_new(v as i64));
+            Ok(pyre_object::w_int_new(v as i64))
         }
         #[cfg(windows)]
         {
@@ -4803,7 +4803,7 @@ pub fn __majit_wrap_socket_getsockopt(
         {
             let buf = majit_rlib::rsocket::getsockopt(fd, level, name, buflen)
                 .map_err(rsocket_os_error)?;
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf));
+            Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
         }
         #[cfg(windows)]
         {

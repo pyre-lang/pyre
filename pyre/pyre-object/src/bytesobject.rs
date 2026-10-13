@@ -387,7 +387,8 @@ fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
         len,
         ctypes_keepalive_refs: 0,
     };
-    let w_bytes = if !raw.is_null() {
+
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut W_BytesObject, body);
         }
@@ -395,8 +396,7 @@ fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
         raw as PyObjectRef
     } else {
         crate::lltype::malloc_typed(body) as PyObjectRef
-    };
-    w_bytes
+    }
 }
 
 /// Wrap an existing PyPy `rpython str` payload for

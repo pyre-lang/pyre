@@ -931,10 +931,10 @@ fn fail_cell_capacity(ra_ops: &[RegAllocOp], ops: &[OpRc]) -> usize {
             RegAllocOp::Perform { op_index, .. }
             | RegAllocOp::Perform1 { op_index, .. }
             | RegAllocOp::PerformDiscard { op_index, .. }
-            | RegAllocOp::PerformDiscardGcStore { op_index, .. } => {
-                if ops[*op_index].opcode == OpCode::Finish {
-                    n += 1;
-                }
+            | RegAllocOp::PerformDiscardGcStore { op_index, .. }
+                if ops[*op_index].opcode == OpCode::Finish =>
+            {
+                n += 1;
             }
             _ => {}
         }
@@ -4270,7 +4270,7 @@ impl<'a> AssemblerARM64<'a> {
             // rewrite.py turns COPYSTRCONTENT into LEA + memcpy; a silent
             // no-op here leaves the memcpy address in an unwritten register.
             OpCode::LoadEffectiveAddress => {
-                self.genop_load_effective_address(&arglocs, result_loc);
+                self.genop_load_effective_address(arglocs, result_loc);
             }
             // ── Misc ──
             OpCode::ForceToken => {

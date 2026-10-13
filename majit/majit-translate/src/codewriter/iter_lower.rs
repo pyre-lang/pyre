@@ -318,7 +318,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
             if is_anchor || is_range || is_next {
                 continue;
             }
-            if op_operand_vars(&op.kind).iter().any(|v| in_class(v)) {
+            if op_operand_vars(&op.kind).iter().any(&in_class) {
                 return Err(format!("iterator read by op {oi} of block {bi}"));
             }
             if op.result.as_ref().is_some_and(|v| *v != it && in_class(v)) {
@@ -329,7 +329,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
             Some(ExitSwitch::Value(v)) if in_class(v) => {
                 return Err(format!("iterator is the exitswitch of block {bi}"));
             }
-            Some(ExitSwitch::Fused { args, .. }) if args.iter().any(|v| in_class(v)) => {
+            Some(ExitSwitch::Fused { args, .. }) if args.iter().any(&in_class) => {
                 return Err(format!(
                     "iterator is a fused exitswitch operand of block {bi}"
                 ));
@@ -444,10 +444,11 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         // needs, plus the container and the index.
         let mut sources: Vec<Variable> = Vec::new();
         for arg in &site.some_link.args {
-            if let LinkArg::Value(v) = arg {
-                if *v != site.item && !sources.contains(v) {
-                    sources.push(v.clone());
-                }
+            if let LinkArg::Value(v) = arg
+                && *v != site.item
+                && !sources.contains(v)
+            {
+                sources.push(v.clone());
             }
         }
         for v in [&site.iter_arg, &idx_a] {
@@ -592,7 +593,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
     }
 
     // Thread the index through every block that carries the iterator.
-    for (&bi, _) in &member_positions {
+    for &bi in member_positions.keys() {
         graph.push_inputarg_var(BlockId(bi), idx_of[&bi].clone());
     }
     let init_arg = match &kind {

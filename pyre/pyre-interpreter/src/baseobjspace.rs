@@ -656,6 +656,12 @@ impl SpaceAttr {
     }
 }
 
+impl Default for SpaceAttr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// baseobjspace.py ObjSpace.__init__: own InternalSpaceCache, whose callable
 /// keys construct per-space caches. The process-wide instance is a prebuilt
 /// static (`OBJECT_SPACE`); isolated test spaces keep an `Arc`.
@@ -2191,18 +2197,14 @@ pub(crate) fn base_exception_add_note(exc: PyObjectRef, note: PyObjectRef) -> Re
             pyre_object::gc_roots::shadow_stack_get(notes_slot),
         )?;
     } else {
-        match lookup {
-            Ok(existing) => {
-                let _ = pyre_object::gc_roots::pin_root(existing);
-                if !unsafe {
-                    isinstance_list_w(pyre_object::gc_roots::shadow_stack_get(notes_slot))
-                } {
-                    return Err(PyError::type_error(
-                        "Cannot add note: __notes__ is not a list",
-                    ));
-                }
+        {
+            let existing = lookup?;
+            let _ = pyre_object::gc_roots::pin_root(existing);
+            if !unsafe { isinstance_list_w(pyre_object::gc_roots::shadow_stack_get(notes_slot)) } {
+                return Err(PyError::type_error(
+                    "Cannot add note: __notes__ is not a list",
+                ));
             }
-            Err(err) => return Err(err),
         }
     }
     // Append the list this function holds. A `__setattr__` that stored a
@@ -4232,8 +4234,8 @@ pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let current_b = RBigIntGcRoot::new(BigInt::from(current));
         let remaining_b = RBigIntGcRoot::new(BigInt::from(remaining));
         let step_b = RBigIntGcRoot::new(BigInt::from(step));
-        let product = RBigIntGcRoot::new(remaining_b.mul(&*step_b));
-        let stop = RBigIntGcRoot::new(current_b.add(&*product));
+        let product = RBigIntGcRoot::new(remaining_b.mul(&step_b));
+        let stop = RBigIntGcRoot::new(current_b.add(&product));
         // Python evaluates and keeps all three wrapped arguments before
         // W_Range construction. Mirror the GC transform's root slots between
         // those allocating expressions.
@@ -4399,11 +4401,11 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
             let index = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
                 pyre_object::gc_roots::shadow_stack_get(field_base + 1),
             ));
-            let remaining = RBigIntGcRoot::new(len.sub(&*index));
+            let remaining = RBigIntGcRoot::new(len.sub(&index));
             if *state > *remaining {
                 state.set((*remaining).clone());
             }
-            let new_index = pyre_object::range_bigint_to_obj(index.add(&*state));
+            let new_index = pyre_object::range_bigint_to_obj(index.add(&state));
             pyre_object::w_long_range_iter_set_index(
                 pyre_object::gc_roots::shadow_stack_get(iter_slot),
                 new_index,
@@ -15871,10 +15873,9 @@ unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyE
     let current = || pyre_object::gc_roots::shadow_stack_get(slot);
     if is_tuple(current())
         && builtin_iter_replacement(current(), &pyre_object::TUPLE_TYPE).is_none()
+        && let Some(block) = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(current()) }
     {
-        if let Some(block) = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(current()) } {
-            return Ok(block as PyObjectRef);
-        }
+        return Ok(block as PyObjectRef);
     }
     let items = fixedview(current(), -1)?;
     Ok(pyre_object::interp_exceptions::w_exception_args_new(items))
@@ -19225,7 +19226,8 @@ pub(crate) unsafe fn tuple_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
     let _ = pyre_object::gc_roots::pin_root(obj);
     // One return so the RootScope Drop is a regular close, not an
     // unwind-only cleanup `body_is_depth_neutral` misses.
-    let result = {
+
+    {
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let seq = pyre_object::w_tuple_iter_seq(obj);
         if seq.is_null() {
@@ -19247,8 +19249,7 @@ pub(crate) unsafe fn tuple_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
                 }
             }
         }
-    };
-    result
+    }
 }
 
 /// `W_TupleObject.wrappeditems[index]` with the unsigned miss
@@ -19286,7 +19287,8 @@ unsafe fn tuple_iter_descr_next_other(obj: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
-    let result = {
+
+    {
         let seq = pyre_object::w_tuple_iter_seq(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         if seq.is_null() {
             PY_NULL
@@ -19309,8 +19311,7 @@ unsafe fn tuple_iter_descr_next_other(obj: PyObjectRef) -> PyObjectRef {
                 PY_NULL
             }
         }
-    };
-    result
+    }
 }
 
 /// Exact object-strategy list of two iterators: `W_Zip.next_w`'s
@@ -19374,7 +19375,8 @@ unsafe fn zip_two_tuple_next(zip_obj: PyObjectRef) -> PyObjectRef {
     let _ = pyre_object::gc_roots::pin_root(zip_obj);
     // One return so the RootScope Drop is a regular close, not an
     // unwind-only cleanup `body_is_depth_neutral` misses.
-    let result = {
+
+    {
         let iterators = pyre_object::functional::w_zip_get_iterators(
             pyre_object::gc_roots::shadow_stack_get(zip_slot),
         );
@@ -19424,8 +19426,7 @@ unsafe fn zip_two_tuple_next(zip_obj: PyObjectRef) -> PyObjectRef {
                 }
             }
         }
-    };
-    result
+    }
 }
 
 /// First `next` stopped before progress advanced (`W_Zip.next_w`, progress
@@ -19437,7 +19438,8 @@ unsafe fn zip_two_tuple_first_stopped(zip_obj: PyObjectRef, it1: PyObjectRef) ->
     let _roots = pyre_object::gc_roots::push_roots();
     let zip_slot = pyre_object::gc_roots::pin_roots(&[zip_obj, it1]);
     let it1_slot = zip_slot + 1;
-    let result = {
+
+    {
         if !pyre_object::functional::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(
             zip_slot,
         )) {
@@ -19452,8 +19454,7 @@ unsafe fn zip_two_tuple_first_stopped(zip_obj: PyObjectRef, it1: PyObjectRef) ->
                 zip_strict_longer()
             }
         }
-    };
-    result
+    }
 }
 
 /// Second `next` stopped after the first yielded (`W_Zip.next_w`, progress
@@ -19492,7 +19493,8 @@ unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
     );
     let _ = pyre_object::gc_roots::pin_root(iterators);
     let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let result = {
+
+    {
         let n = pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(iterators_slot))
             as usize;
         if n != 2 {
@@ -19601,8 +19603,7 @@ unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
                 _ => PY_NULL,
             }
         }
-    };
-    result
+    }
 }
 
 /// Interpreter entry for the same shape the walker admits, except a strict
@@ -22035,8 +22036,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_index_slot = eo::w_enumerate_get_w_index(obj);
             let mut w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
             let mut result_item_slot: Option<usize> = None;
-            let w_index: PyObjectRef;
-            if w_index_slot.is_null() {
+
+            let w_index: PyObjectRef = if w_index_slot.is_null() {
                 // i64 fast-path branch.
                 let index = eo::w_enumerate_get_index(obj);
                 if !w_iter_or_list.is_null() && pyre_object::is_list(w_iter_or_list) {
@@ -22086,7 +22087,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         eo::w_enumerate_set_index(obj, -1);
                     }
                 }
-                w_index = pyre_object::w_int_new(index);
+                pyre_object::w_int_new(index)
             } else {
                 // Bigint slot active — bump via `space.add`.
                 let _ = pyre_object::gc_roots::pin_root(w_index_slot);
@@ -22105,8 +22106,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     obj,
                     pyre_object::gc_roots::shadow_stack_get(bumped_slot),
                 );
-                w_index = pyre_object::gc_roots::shadow_stack_get(w_index_slot_root);
-            }
+                pyre_object::gc_roots::shadow_stack_get(w_index_slot_root)
+            };
             let _ = pyre_object::gc_roots::pin_root(w_index);
             let result_index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let result_item_slot = if let Some(slot) = result_item_slot {
@@ -22645,10 +22646,7 @@ pub unsafe fn generator_invoke_execute_frame(
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
-    let w_inputvalue = match input_slot {
-        Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
-        None => None,
-    };
+    let w_inputvalue = input_slot.map(pyre_object::gc_roots::shadow_stack_get);
     if let Some(slot) = operr_slot
         && let Some(err) = operr.as_mut()
     {
@@ -23623,18 +23621,19 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
     let gen_obj = reload(0);
     let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let thrown_kind = unsafe { PyError::from_exc_object(w_value) }.kind;
-    if thrown_kind == PyErrorKind::GeneratorExit && !generator_get_delegate(gen_obj).is_null() {
-        if let Err(e) = generator_close_iter(gen_obj, true) {
-            // `reload` does not allocate. `e` is consumed by `generator_send_ex`;
-            // the resume pins that carrier across the calls that collect.
-            return generator_send_ex(
-                reload(0),
-                w_none(),
-                Some(e),
-                Some(([reload(1), reload(2), reload(3)], argc)),
-                false,
-            );
-        }
+    if thrown_kind == PyErrorKind::GeneratorExit
+        && !generator_get_delegate(gen_obj).is_null()
+        && let Err(e) = generator_close_iter(gen_obj, true)
+    {
+        // `reload` does not allocate. `e` is consumed by `generator_send_ex`;
+        // the resume pins that carrier across the calls that collect.
+        return generator_send_ex(
+            reload(0),
+            w_none(),
+            Some(e),
+            Some(([reload(1), reload(2), reload(3)], argc)),
+            false,
+        );
     }
     let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let err = unsafe { PyError::from_exc_object(w_value) };
@@ -24738,10 +24737,10 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             )?;
             return is_true(result);
         }
-        return contains_slot(
+        contains_slot(
             pyre_object::gc_roots::shadow_stack_get(contains_base),
             pyre_object::gc_roots::shadow_stack_get(contains_base + 1),
-        );
+        )
     }
 }
 

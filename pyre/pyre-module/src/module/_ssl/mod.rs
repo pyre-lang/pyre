@@ -714,7 +714,7 @@ mod context_methods {
                 pyre_interpreter::PyError::value_error("invalid or unsupported protocol version")
             })?;
             let backend = pyre_native::ssl::context_new(protocol)
-                .map_err(|message| pyre_interpreter::PyError::value_error(message))?;
+                .map_err(pyre_interpreter::PyError::value_error)?;
             if matches!(
                 protocol,
                 PROTOCOL_TLS | PROTOCOL_TLSV1 | PROTOCOL_TLSV1_1 | PROTOCOL_TLSV1_2
@@ -1278,7 +1278,7 @@ mod context_methods {
                 ));
             }
             let cipherlist = pyre_interpreter::baseobjspace::str_utf8_w(cipherlist)?;
-            unsafe { pyre_native::ssl::context_set_cipher_list(self.backend, cipherlist.as_ref()) }
+            unsafe { pyre_native::ssl::context_set_cipher_list(self.backend, cipherlist) }
                 .map_err(ssl_error)
         }
 
@@ -3252,7 +3252,7 @@ fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErro
         .map(pyre_interpreter::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
-    let name: &str = value.as_ref();
+    let name: &str = value;
     let entry = if name
         .bytes()
         .next()

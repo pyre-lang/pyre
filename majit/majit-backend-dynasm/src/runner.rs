@@ -77,7 +77,7 @@ thread_local! {
     /// thread-local scope never narrows what production (single-threaded) can
     /// reach.
     static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<u64, DynasmCaTarget, rustc_hash::FxBuildHasher>> =
-        RefCell::new(IndexMap::with_hasher(rustc_hash::FxBuildHasher));
+        const { RefCell::new(IndexMap::with_hasher(rustc_hash::FxBuildHasher)) };
 }
 
 fn unregister_dynasm_ca_target(number: u64) {
@@ -3725,7 +3725,7 @@ impl Backend for DynasmBackend {
             cond_call_slowpath,
             #[cfg(target_arch = "x86_64")]
             failure_recovery_code,
-            &inputargs,
+            inputargs,
             &prepared_ops,
         );
         // `assembler.py assemble_bridge`: `reserve_gcref_table(allgcrefs)`

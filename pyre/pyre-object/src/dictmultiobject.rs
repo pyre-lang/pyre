@@ -568,10 +568,7 @@ pub unsafe fn dict_entries_key_obj_at(
     entries: &ObjectDictStorage,
     index: usize,
 ) -> Option<PyObjectRef> {
-    match entries.slot_key(index) {
-        Some(stored) => Some(stored.obj),
-        None => None,
-    }
+    entries.slot_key(index).map(|stored| stored.obj)
 }
 
 /// The stored key's cached digest at an entry index — `rordereddict.py:1053
@@ -6020,10 +6017,10 @@ pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)>
     let source = w_dict_items(obj);
     let mut entries = Vec::with_capacity(source.len());
     for (key, value) in source {
-        if crate::is_str(key) {
-            if let Some(key) = crate::w_str_get_value_opt(key) {
-                entries.push((key.to_string(), value));
-            }
+        if crate::is_str(key)
+            && let Some(key) = crate::w_str_get_value_opt(key)
+        {
+            entries.push((key.to_string(), value));
         }
     }
     entries

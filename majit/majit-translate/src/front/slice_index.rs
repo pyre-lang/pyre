@@ -768,12 +768,12 @@ pub(crate) fn range_feeds_only_index(
                 .last_exception
                 .as_ref()
                 .and_then(LinkArg::as_variable)
-                .is_some_and(&in_closure)
+                .is_some_and(in_closure)
                 || link
                     .last_exc_value
                     .as_ref()
                     .and_then(LinkArg::as_variable)
-                    .is_some_and(&in_closure)
+                    .is_some_and(in_closure)
             {
                 return false;
             }
@@ -818,7 +818,7 @@ fn slice_marker_suffix(graph: &FunctionGraph, slice: &Variable) -> Option<String
             OpKind::Input {
                 class_root: Some(root),
                 ..
-            } if from_input.is_none() && op.result.as_ref().is_some_and(|v| same(v)) => {
+            } if from_input.is_none() && op.result.as_ref().is_some_and(&same) => {
                 from_input = identity_from_list_spelling(root);
             }
             _ => {}
@@ -841,13 +841,11 @@ fn identity_from_list_spelling(spelling: &str) -> Option<(ValueType, Option<Stri
             Some(i) => rest[..i].trim(),
             None => rest.trim(),
         }
-    } else if let Some(rest) = stripped
-        .strip_prefix("Vec<")
-        .or_else(|| stripped.strip_prefix("VecDeque<"))
-    {
-        rest.strip_suffix('>')?.trim()
     } else {
-        return None;
+        let rest = stripped
+            .strip_prefix("Vec<")
+            .or_else(|| stripped.strip_prefix("VecDeque<"))?;
+        rest.strip_suffix('>')?.trim()
     };
     if elem.is_empty() {
         return None;

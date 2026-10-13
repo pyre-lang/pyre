@@ -1184,9 +1184,9 @@ fn std_gc_array_layout(size: usize) -> Layout {
 const _: () = assert!(
     GC_ARRAY_HEADER_SIZE == majit_gc::header::GcHeader::SIZE
         && GC_ARRAY_HEADER_ALIGN == majit_gc::header::GcHeader::ALIGN
-        && GC_ARRAY_HEADER_SIZE % std::mem::align_of::<ItemsBlock>() == 0
-        && GC_ARRAY_HEADER_SIZE % std::mem::align_of::<TypedItemsBlock>() == 0
-        && GC_ARRAY_HEADER_SIZE % std::mem::align_of::<FixedObjectArray>() == 0
+        && GC_ARRAY_HEADER_SIZE.is_multiple_of(std::mem::align_of::<ItemsBlock>())
+        && GC_ARRAY_HEADER_SIZE.is_multiple_of(std::mem::align_of::<TypedItemsBlock>())
+        && GC_ARRAY_HEADER_SIZE.is_multiple_of(std::mem::align_of::<FixedObjectArray>())
         && std::mem::align_of::<ItemsBlock>() <= GC_ARRAY_HEADER_ALIGN
         && std::mem::align_of::<TypedItemsBlock>() <= GC_ARRAY_HEADER_ALIGN
         && std::mem::align_of::<FixedObjectArray>() <= GC_ARRAY_HEADER_ALIGN,
@@ -1232,7 +1232,7 @@ unsafe fn std_dealloc_gc_array(block: *mut u8, payload: Layout) {
 /// header, the same stand-in [`alloc_typed_items_block`] uses.
 pub fn items_block_alloc_failed(cap: usize) -> ! {
     std::alloc::handle_alloc_error(
-        try_items_block_layout(cap).unwrap_or_else(|| Layout::new::<ItemsBlock>()),
+        try_items_block_layout(cap).unwrap_or_else(Layout::new::<ItemsBlock>),
     )
 }
 
@@ -1502,14 +1502,14 @@ fn alloc_prebuilt_empty_typed_items_block() -> usize {
 /// `len(l.items)` reads a real header.
 #[inline]
 pub fn ll_prebuilt_empty_int_items_block() -> *mut TypedItemsBlock {
-    *PREBUILT_EMPTY_INT_ITEMS_BLOCK.get_or_init(|| alloc_prebuilt_empty_typed_items_block())
+    *PREBUILT_EMPTY_INT_ITEMS_BLOCK.get_or_init(alloc_prebuilt_empty_typed_items_block)
         as *mut TypedItemsBlock
 }
 
 /// [`ll_prebuilt_empty_int_items_block`] for `GcArray(Float)`.
 #[inline]
 pub fn ll_prebuilt_empty_float_items_block() -> *mut TypedItemsBlock {
-    *PREBUILT_EMPTY_FLOAT_ITEMS_BLOCK.get_or_init(|| alloc_prebuilt_empty_typed_items_block())
+    *PREBUILT_EMPTY_FLOAT_ITEMS_BLOCK.get_or_init(alloc_prebuilt_empty_typed_items_block)
         as *mut TypedItemsBlock
 }
 

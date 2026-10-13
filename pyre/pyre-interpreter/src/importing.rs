@@ -2181,7 +2181,7 @@ fn set_extension_module_spec(
     let ext = pyre_object::with_roots!(
         module, bootstrap_root => importlib_bootstrap_external_module()
     );
-    let bootstrap = has_bootstrap.then(|| bootstrap_root);
+    let bootstrap = has_bootstrap.then_some(bootstrap_root);
     let (Some(bootstrap), Some(ext)) = (bootstrap, ext) else {
         return Ok(());
     };
@@ -3136,7 +3136,6 @@ fn compute_startup_path_config_from(
             starts
                 .iter()
                 .find_map(|start| find_stdlib_from(start))
-                .map(|(paths, stdlib_dir, prefix)| (paths, stdlib_dir, prefix))
                 .unwrap_or_else(|| (Vec::new(), None, PathBuf::new()))
         };
 
@@ -3519,10 +3518,11 @@ pub(crate) fn check_sys_modules_w(w_name: PyObjectRef) -> Option<PyObjectRef> {
 /// check does not drag lock/hash helpers into `__import__`.
 #[majit_macros::dont_look_inside]
 pub(crate) fn sys_modules_registry_get(name: &str) -> Option<PyObjectRef> {
-    match SYS_MODULES.lock().get(name).copied() {
-        Some(module) => Some(module as PyObjectRef),
-        None => None,
-    }
+    SYS_MODULES
+        .lock()
+        .get(name)
+        .copied()
+        .map(|module| module as PyObjectRef)
 }
 
 /// Whether `sys.modules[name]` is bound to `None`, the sentinel that marks
@@ -3711,10 +3711,11 @@ pub fn release_sys_modules_for_shutdown() -> ReleasedSysModules {
         } else {
             None
         };
-        if !module.is_null() && unsafe { pyre_object::is_module(module) } {
-            if let Some(name) = &name {
-                modules.push((name.clone(), module));
-            }
+        if !module.is_null()
+            && unsafe { pyre_object::is_module(module) }
+            && let Some(name) = &name
+        {
+            modules.push((name.clone(), module));
         }
         let keep_entry = name.as_deref().is_some_and(|name| {
             let bytes = name.as_bytes();
@@ -5319,10 +5320,7 @@ pub fn init_importlib_bootstrap(
     // otherwise a codec the streams could not build is reported rather than
     // leaving a stream that reports itself unreadable. The `Result` is
     // consumed first; a live handle is pinned across the codec init.
-    let mut bootstrap_err = match bootstrapped {
-        Ok(()) => None,
-        Err(err) => Some(err),
-    };
+    let mut bootstrap_err = bootstrapped.err();
     if let Some(mut err) = bootstrap_err.take() {
         let _roots = pyre_object::gc_roots::push_roots();
         let mut err = err;
@@ -5890,10 +5888,7 @@ fn absolute_import(
         // `load_part`, which answers the cache and cannot be asked afterwards.
         let was_cached =
             pyre_object::with_roots!(w_fromlist => modules_cached(&full_name)).is_some();
-        let parent_live = match parent_slot {
-            Some(slot) => Some(loop_roots.get(slot)),
-            None => None,
-        };
+        let parent_live = parent_slot.map(|slot| loop_roots.get(slot));
         let parent_dirs = match parent_live {
             None => None,
             Some(_) if was_cached || modules_block(&full_name) => None,
@@ -5920,10 +5915,7 @@ fn absolute_import(
         // A child whose name is not UTF-8 was answered from `sys.modules`
         // (`was_cached`) or not found; the attribute bind is a `&str` store.
         if !was_cached
-            && let Some(mut parent_mod) = match parent_slot {
-                Some(slot) => Some(loop_roots.get(slot)),
-                None => None,
-            }
+            && let Some(mut parent_mod) = parent_slot.map(|slot| loop_roots.get(slot))
             && let Some(part_utf8) = name_utf8(part)
             && let Err(err) = pyre_object::with_roots!(module, parent_mod, w_fromlist => {
                 crate::setattr_str(parent_mod, part_utf8, module)
@@ -5947,10 +5939,7 @@ fn absolute_import(
         }
         parent_slot = Some(module_slot);
     }
-    let mut first = match first_slot {
-        Some(slot) => Some(loop_roots.get(slot)),
-        None => None,
-    };
+    let mut first = first_slot.map(|slot| loop_roots.get(slot));
     drop(loop_roots);
 
     // PyPy: if w_fromlist is not None, return the leaf module.
@@ -6414,10 +6403,7 @@ fn rpython_str_find_char(value: &str, needle: char, start: i64) -> i64 {
     let Some(offset) = tail.find(needle) else {
         return -1;
     };
-    match i64::try_from(start + offset) {
-        Ok(index) => index,
-        Err(_) => -1,
-    }
+    i64::try_from(start + offset).unwrap_or(-1)
 }
 
 /// Native counterpart of RPython `s[:stop]`.
@@ -8154,10 +8140,11 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<Wtf8Buf>, crate
         }
         // Otherwise `rpartition('.')[0]` is also the empty string for a
         // top-level module such as __main__.
-        let end = match name.as_bytes().iter().rposition(|&byte| byte == b'.') {
-            Some(dot) => dot,
-            None => 0,
-        };
+        let end = name
+            .as_bytes()
+            .iter()
+            .rposition(|&byte| byte == b'.')
+            .unwrap_or(0);
         package_name.push_wtf8(unsafe { Wtf8::from_bytes_unchecked(&name.as_bytes()[..end]) });
         return Ok(Some(package_name));
     }

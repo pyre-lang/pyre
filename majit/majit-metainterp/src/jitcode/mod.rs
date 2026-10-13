@@ -1113,10 +1113,10 @@ impl JitCode {
                 if start >= end_pc {
                     continue;
                 }
-                if let Some((site, end)) = decode_typed_inline_call(code, start) {
-                    if end == end_pc {
-                        return Some(site);
-                    }
+                if let Some((site, end)) = decode_typed_inline_call(code, start)
+                    && end == end_pc
+                {
+                    return Some(site);
                 }
             }
         }

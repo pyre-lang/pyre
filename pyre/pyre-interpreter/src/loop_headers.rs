@@ -50,10 +50,10 @@ pub fn code_successors(code: &CodeObject) -> Vec<Vec<usize>> {
     let mut scan_state = OpArgState::default();
     for pc in 0..num_instrs {
         let (instr, op_arg) = scan_state.get(code.instructions[pc]);
-        if let Some(target) = backward_jump_target(code, pc, instr, op_arg) {
-            if target < num_instrs {
-                succ[pc].push(target);
-            }
+        if let Some(target) = backward_jump_target(code, pc, instr, op_arg)
+            && target < num_instrs
+        {
+            succ[pc].push(target);
         }
         let forward_delta = match instr {
             Instruction::PopJumpIfFalse { delta }
@@ -143,10 +143,11 @@ pub fn find_loop_header_pcs(code: &CodeObject) -> HashSet<usize> {
     let mut scan_state = OpArgState::default();
     for scan_pc in 0..num_instrs {
         let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
-        if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
-            if target < num_instrs && target_dominates(&succ, target, scan_pc) {
-                loop_header_pcs.insert(target);
-            }
+        if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg)
+            && target < num_instrs
+            && target_dominates(&succ, target, scan_pc)
+        {
+            loop_header_pcs.insert(target);
         }
     }
     loop_header_pcs

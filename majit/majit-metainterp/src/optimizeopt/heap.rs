@@ -342,12 +342,10 @@ impl CachedField {
         let b2 = ctx.resolve_operand_operand(box2);
         let class1 = ctx
             .getptrinfo_handle(&b1)
-            .map(|h| h.borrow().get_known_class(ctx.cpu.as_ref()))
-            .flatten();
+            .and_then(|h| h.borrow().get_known_class(ctx.cpu.as_ref()));
         let class2 = ctx
             .getptrinfo_handle(&b2)
-            .map(|h| h.borrow().get_known_class(ctx.cpu.as_ref()))
-            .flatten();
+            .and_then(|h| h.borrow().get_known_class(ctx.cpu.as_ref()));
         matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2)
     }
 
@@ -2369,7 +2367,7 @@ impl OptHeap {
                     // Force first (use_box / potential_extra_ops side
                     // effects) and store the returned `preamble_op.op`,
                     // then walk forwarding for the body replace.
-                    let cached = ctx.force_op_from_preamble_op(&pop);
+                    let cached = ctx.force_op_from_preamble_op(pop);
                     ctx.structinfo_setfield(op, field_idx, &cached);
                     let obj_box = ctx.resolve_operand_operand(&obj_box);
                     self.cached_fields[pos].2.register_info(&obj_box);
@@ -2449,7 +2447,7 @@ impl OptHeap {
                 crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                     // heap.py:185-186: force the preamble op, then write the
                     // forced value back into the struct info.
-                    let cached = ctx.force_op_from_preamble_op(&pop);
+                    let cached = ctx.force_op_from_preamble_op(pop);
                     ctx.structinfo_setfield(op, field_idx, &cached);
                     let obj_box = ctx.resolve_operand_operand(&obj_box);
                     self.cached_fields[pos].2.register_info(&obj_box);
@@ -2634,7 +2632,7 @@ impl OptHeap {
                     let cached_seen = ctx.resolve_operand_operand(&pop.op);
                     // heap.py:88 not cached_field.same_box(arg1)
                     if cached_seen.same_box(&arg1) {
-                        let cached = ctx.force_op_from_preamble_op(&pop);
+                        let cached = ctx.force_op_from_preamble_op(pop);
                         ctx.structinfo_setfield(op, field_idx, &cached);
                         let obj_box = ctx.resolve_operand_operand(obj_box);
                         self.cached_fields[pos].2.register_info(&obj_box);
@@ -2766,7 +2764,7 @@ impl OptHeap {
                     let cached_seen = ctx.resolve_operand_operand(&pop.op);
                     // heap.py:88 not cached_field.same_box(arg1)
                     if cached_seen.same_box(&arg1) {
-                        let cached = ctx.force_op_from_preamble_op(&pop);
+                        let cached = ctx.force_op_from_preamble_op(pop);
                         let array_box = ctx.resolve_operand_operand(array_box);
                         self.arrayitem_cache(descr, const_index)
                             .register_info(&array_box);
@@ -2981,7 +2979,7 @@ impl OptHeap {
                             // heap.py ArrayCachedItem._getfield:
                             //   res = optheap.optimizer.force_op_from_preamble(res)
                             //   opinfo.setitem(descr, index, None, res, optheap=optheap)
-                            let cached = ctx.force_op_from_preamble_op(&pop);
+                            let cached = ctx.force_op_from_preamble_op(pop);
                             let array_box = ctx.resolve_operand_operand(&array_ref);
                             self.arrayitem_cache(&descr, const_index)
                                 .register_info(&array_box);
@@ -3068,7 +3066,7 @@ impl OptHeap {
                     crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                         // heap.py:243-249: force the preamble op, then write
                         // the forced value back into the array info.
-                        let cached = ctx.force_op_from_preamble_op(&pop);
+                        let cached = ctx.force_op_from_preamble_op(pop);
                         let array_box = ctx.resolve_operand_operand(&array_ref);
                         self.arrayitem_cache(&descr, const_index)
                             .register_info(&array_box);

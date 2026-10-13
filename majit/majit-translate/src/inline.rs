@@ -405,7 +405,7 @@ fn caller_passon_vars(
                     .as_ref()
                     .is_some_and(|exc| exc.as_variable().as_ref() == Some(&var));
             if !carried_exception {
-                push(&var);
+                push(var);
             }
         }
     }
@@ -507,7 +507,7 @@ fn retarget_var_uses(
             op.kind = remap_op_kind(&op.kind, &remap);
         }
         let (exitswitch, exits) =
-            remap_control_flow_metadata_var(&block.exitswitch, &block.exits, &remap, |block_id| {
+            remap_control_flow_metadata_var(&block.exitswitch, &block.exits, remap, |block_id| {
                 block_id
             });
         block.exitswitch = exitswitch;
@@ -611,7 +611,7 @@ fn remap_op(
     let remap_var = |var: &crate::flowspace::model::Variable| {
         value_map.get(var).cloned().unwrap_or_else(|| var.clone())
     };
-    let result = op.result.as_ref().map(&remap_var);
+    let result = op.result.as_ref().map(remap_var);
     let kind = remap_op_kind(&op.kind, &remap_var);
     SpaceOperation { result, kind }
 }
@@ -1291,7 +1291,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         } => vec![clone_var(base), clone_var(index), clone_var(value)],
         OpKind::Call { args, .. } => args
             .iter()
-            .filter_map(|arg| arg.as_variable().map(&clone_var))
+            .filter_map(|arg| arg.as_variable().map(clone_var))
             .collect(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![clone_var(cond)],
         OpKind::GuardValue { value, .. } => vec![clone_var(value)],

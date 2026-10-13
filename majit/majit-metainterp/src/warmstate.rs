@@ -996,10 +996,10 @@ impl WarmEnterState {
 
     /// warmstate.py:467: jitcounter.tick(hash, increment_threshold).
     pub fn counter_tick(&mut self, cell_key: u64) {
-        if let Some(cell) = self.cell_by_key(cell_key) {
-            if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
-                return;
-            }
+        if let Some(cell) = self.cell_by_key(cell_key)
+            && cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE)
+        {
+            return;
         }
         let bucket = self.bucket_of(cell_key);
         let _ = self.counter.tick(bucket, self.increment_threshold);

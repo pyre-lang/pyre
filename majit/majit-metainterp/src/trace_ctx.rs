@@ -1882,7 +1882,9 @@ impl TraceCtx {
             return None;
         }
         self.virtualref_boxes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .rev()
             .find(|pair| self.virtualref_entry_ptr(pair[1]) == vref_ptr)
             .map(|pair| (pair[0].0, pair[1].0))
@@ -1897,7 +1899,9 @@ impl TraceCtx {
             return None;
         }
         self.virtualref_boxes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .rev()
             .find(|pair| self.virtualref_entry_ptr(pair[0]) == object_ptr)
             .map(|pair| pair[0].0)
@@ -3171,13 +3175,13 @@ impl TraceCtx {
             indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
         self.remove_consts_and_duplicates_with(redboxes, &mut duplicates);
         let mut live: Vec<(OpRef, Type)> = redboxes.to_vec();
-        if let Some(mut typed) = self.collect_virtualizable_typed_boxes() {
-            if let Some(end) = typed.len().checked_sub(1) {
-                self.remove_consts_and_duplicates_with(&mut typed[..end], &mut duplicates);
-                let elements: Vec<OpRef> = typed[..end].iter().map(|(opref, _)| *opref).collect();
-                self.adopt_normalized_virtualizable_elements(&elements);
-                live.extend_from_slice(&typed[..end]);
-            }
+        if let Some(mut typed) = self.collect_virtualizable_typed_boxes()
+            && let Some(end) = typed.len().checked_sub(1)
+        {
+            self.remove_consts_and_duplicates_with(&mut typed[..end], &mut duplicates);
+            let elements: Vec<OpRef> = typed[..end].iter().map(|(opref, _)| *opref).collect();
+            self.adopt_normalized_virtualizable_elements(&elements);
+            live.extend_from_slice(&typed[..end]);
         }
         self.close_jump_boxes = Some(live.clone());
         live
@@ -4587,10 +4591,10 @@ impl TraceCtx {
                 }
             }
         };
-        if let Some(n) = new_len {
-            if let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut() {
-                live_null_slots.resize(n, false);
-            }
+        if let Some(n) = new_len
+            && let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut()
+        {
+            live_null_slots.resize(n, false);
         }
         let hole_indices: Vec<usize> = {
             let Some(boxes) = self.virtualizable_boxes.as_ref() else {
@@ -4622,10 +4626,10 @@ impl TraceCtx {
         for idx in dead_tail {
             let ty = self.virtualizable_slot_type(idx).unwrap_or(Type::Ref);
             let null = self.typed_null_box(ty);
-            if let Some(boxes) = self.virtualizable_boxes.as_mut() {
-                if let Some(slot) = boxes.get_mut(idx) {
-                    *slot = null;
-                }
+            if let Some(boxes) = self.virtualizable_boxes.as_mut()
+                && let Some(slot) = boxes.get_mut(idx)
+            {
+                *slot = null;
             }
         }
         if !live_holes.is_empty() {
@@ -6837,7 +6841,7 @@ impl TraceCtx {
             false,
             majit_ir::descr::ArrayFlag::Pointer,
             "buf".to_string(),
-            "buf".to_string(),
+            "buf",
         ));
         let mut parent = majit_ir::descr::SimpleSizeDescr::new(0, word * 3, 0);
         parent.set_gc_managed(false);

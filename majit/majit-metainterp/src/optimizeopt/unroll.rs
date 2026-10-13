@@ -2161,14 +2161,13 @@ impl UnrollOptimizer {
                     body_ops = replace_terminal_jump(&body_ops, end_jump);
                 }
             } else {
-                if let Some(end_jump) = body_ops.iter().rfind(|op| op.opcode == OpCode::Jump) {
-                    if jump_and_preamble_slot_kinds_disagree(end_jump, &exported_renamed_inputargs)
-                    {
-                        crate::mc_diag_bump(57);
-                        return Err(crate::optimize::InvalidLoop(
-                            "jump_to_preamble: JUMP/LABEL slot kinds disagree",
-                        ));
-                    }
+                if let Some(end_jump) = body_ops.iter().rfind(|op| op.opcode == OpCode::Jump)
+                    && jump_and_preamble_slot_kinds_disagree(end_jump, &exported_renamed_inputargs)
+                {
+                    crate::mc_diag_bump(57);
+                    return Err(crate::optimize::InvalidLoop(
+                        "jump_to_preamble: JUMP/LABEL slot kinds disagree",
+                    ));
                 }
                 body_ops = Self::jump_to_preamble(
                     &body_ops,
@@ -6209,7 +6208,7 @@ fn apply_preamble_shape_to_jump(jump: &mut Op, preamble_args: &[OpRef]) {
     if jump_args.len() == old_len {
         return;
     }
-    let mut boxes: Vec<Operand> = jump.args_slice().iter().cloned().collect();
+    let mut boxes: Vec<Operand> = jump.args_slice().to_vec();
     if jump_args.len() < old_len {
         boxes.truncate(jump_args.len());
     } else {

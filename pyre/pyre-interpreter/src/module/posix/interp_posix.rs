@@ -4086,7 +4086,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     dst.w_path(),
                 ));
             }
-            return Ok(pyre_object::w_none());
+            Ok(pyre_object::w_none())
         }
         #[cfg(not(unix))]
         {
@@ -6210,11 +6210,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             } else {
                 pyre_object::with_roots!(w_path => libc_stat_path(&path, follow))
             };
-            return match st {
+            match st {
                 Ok(st) => Ok(Some(st.st_mode as u32 & S_IFMT)),
                 Err(errno) if errno == libc::ENOENT => Ok(None),
                 Err(errno) => Err(errno_err_with_filename(errno, w_path)),
-            };
+            }
         }
         #[cfg(feature = "sandbox")]
         {
@@ -6314,10 +6314,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             } else {
                 pyre_object::with_roots!(w_path => libc_stat_path(&path, false))
             };
-            return match st {
+            match st {
                 Ok(st) => Ok(pyre_object::w_int_new(st.st_ino as i64)),
                 Err(errno) => Err(errno_err_with_filename(errno, w_path)),
-            };
+            }
         }
         // `posixmodule.c DirEntry_inode` reads the same file index `os.stat`
         // reports, so the 0 this used to answer with on Windows disagreed with
@@ -6360,7 +6360,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             let st = pyre_object::with_roots!(w_path => libc_stat_path(path, follow))
                 .map_err(|errno| errno_err_with_filename(errno, w_path))?;
-            return Ok(stat_result_from_libc_stat(&st));
+            Ok(stat_result_from_libc_stat(&st))
         }
         #[cfg(not(all(unix, not(feature = "sandbox"))))]
         let _ = dir_fd;
@@ -6669,7 +6669,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
     /// One enumeration step, with the step already claimed.
     fn scandir_iter_next_entry(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let result = with_scandir_iter(self_obj, |iterator| {
+        
+        with_scandir_iter(self_obj, |iterator| {
             let idx = iterator.index;
             let entries = iterator.entries;
             let len = unsafe { pyre_object::w_list_len(entries) } as i64;
@@ -6688,8 +6689,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             Err(crate::PyError::type_error(
                 "expected a 'posix.ScandirIterator' object",
             ))
-        });
-        result
+        })
     }
 
     fn scandir_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6718,7 +6718,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // is the same answer the prompt-finalization census needs so a
         // consumer still holding the iterator (`os.fwalk` after its
         // `for entry` loop) does not pay a whole-heap collect on `gen.close()`.
-        let result = match result {
+        
+        match result {
             Err(error) => {
                 let _stop_roots = pyre_object::gc_roots::push_roots();
                 let self_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -6730,8 +6731,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Err(error)
             }
             other => other,
-        };
-        result
+        }
     }
     fn scandir_iter_is_open(self_obj: PyObjectRef) -> bool {
         with_scandir_iter(self_obj, |iterator| iterator.open).unwrap_or(false)
@@ -13331,7 +13331,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         /// hosts that do not implement them, and `None` is neither the value
         /// nor the type the caller can compare against a limit.
         fn indeterminate_limit(limit: Option<libc::c_long>) -> i64 {
-            limit.map_or(-1, |v| v)
+            limit.unwrap_or(-1)
         }
 
         /// `-1` with errno 0 is the indeterminate answer `pathconf` spells

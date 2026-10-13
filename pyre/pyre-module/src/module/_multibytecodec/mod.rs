@@ -279,11 +279,9 @@ fn encode_rust_codec_with_state(
             }
         }
     }
-    if final_input {
-        if let Some((bytes, length)) = cjkcodecs::encode_reset(codec, &mut state) {
-            output.extend_from_slice(&bytes[..length]);
-            export_rust_codec_state(state_sink_slot, &state);
-        }
+    if final_input && let Some((bytes, length)) = cjkcodecs::encode_reset(codec, &mut state) {
+        output.extend_from_slice(&bytes[..length]);
+        export_rust_codec_state(state_sink_slot, &state);
     }
     Ok((output, position, state))
 }

@@ -1571,7 +1571,7 @@ impl GuardVirtualInfos<'_> {
     }
 }
 
-fn shaped_virtual_infos<'a>(fd: &'a dyn majit_ir::FailDescr) -> Option<&'a [VirtualInfo]> {
+fn shaped_virtual_infos(fd: &dyn majit_ir::FailDescr) -> Option<&[VirtualInfo]> {
     let infos = fd
         .shaped_virtuals_any()?
         .downcast_ref::<Vec<VirtualInfo>>()?;
@@ -6518,19 +6518,19 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
             .base_size()
             .saturating_add(length.saturating_mul(ad.item_size()));
         let ptr = llmodel_alloc(ad.type_id(), size);
-        if ptr != 0 {
-            if let Some(ld) = ad.len_descr() {
-                // `llmodel.py bh_new_array` → `gc_malloc_array` writes
-                // `length` at `arraydescr.lendescr`. Dynasm does the same
-                // via `dynasm_alloc_oldgen_varsize_typed_and_set_len`.
-                unsafe {
-                    majit_backend::llmodel::write_int_at_mem(
-                        ptr as usize,
-                        ld.offset(),
-                        ld.field_size(),
-                        length as i64,
-                    );
-                }
+        if ptr != 0
+            && let Some(ld) = ad.len_descr()
+        {
+            // `llmodel.py bh_new_array` → `gc_malloc_array` writes
+            // `length` at `arraydescr.lendescr`. Dynasm does the same
+            // via `dynasm_alloc_oldgen_varsize_typed_and_set_len`.
+            unsafe {
+                majit_backend::llmodel::write_int_at_mem(
+                    ptr as usize,
+                    ld.offset(),
+                    ld.field_size(),
+                    length as i64,
+                );
             }
         }
         ptr

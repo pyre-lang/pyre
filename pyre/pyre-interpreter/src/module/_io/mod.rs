@@ -140,7 +140,6 @@ pub(crate) fn iobase_write_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
     }
     if let Some(inst) = W_BufferedRWPair::from_obj(obj) {
         inst.w_dict = w_dict;
-        return;
     }
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     if let Some(inst) = W_WinConsoleIO::from_obj(obj) {

@@ -49,7 +49,7 @@ pub fn gil_ready_word() -> i64 {
     // SAFETY: the cell is published once, from 0 to 1, before any other
     // thread exists (`setup_threads` runs on the parent before `spawn`).
     // After that the word is only read.
-    unsafe { (*(&raw const GIL_READY_STATE)).gil_ready }
+    unsafe { GIL_READY_STATE.gil_ready }
 }
 
 #[inline]
@@ -65,7 +65,7 @@ pub fn publish_gil_ready() {
         // SAFETY: same single-writer protocol as [`gil_ready_word`]. The
         // watcher lock is held across the store.
         unsafe {
-            (*(&raw mut GIL_READY_STATE)).gil_ready = 1;
+            GIL_READY_STATE.gil_ready = 1;
         }
     });
 }

@@ -184,13 +184,12 @@ pub fn new_primitive_type(name: &str) -> Result<PyObjectRef, PyError> {
                 flags |= ctypeobj::CTypeFlags::VALUE_FITS_ULONG.bits();
             }
         }
-        ctypeobj::KIND_PRIM_UNICHAR => {
+        ctypeobj::KIND_PRIM_UNICHAR
             // `char16_t` and `char32_t` are always unsigned; only `wchar_t`
             // follows the platform's signedness.
-            if key == "wchar_t" && wchar_is_signed() {
+            if key == "wchar_t" && wchar_is_signed() => {
                 flags |= ctypeobj::CTypeFlags::SIGNED_WCHAR.bits();
             }
-        }
         _ => {}
     }
     let obj = ctypeobj::new_ctype(
@@ -220,7 +219,7 @@ fn wchar_is_signed() -> bool {
 /// `newtype.py new_void_type`.
 pub fn new_void_type() -> PyObjectRef {
     VOID_TYPE.get_or_init(|| {
-        let obj = ctypeobj::new_ctype(
+        ctypeobj::new_ctype(
             ctypeobj::KIND_VOID,
             -1,
             "void",
@@ -229,8 +228,7 @@ pub fn new_void_type() -> PyObjectRef {
             pyre_object::PY_NULL,
             -1,
             0,
-        );
-        obj
+        )
     })
 }
 

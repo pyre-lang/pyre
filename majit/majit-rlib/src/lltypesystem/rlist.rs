@@ -451,7 +451,7 @@ impl Digits {
                     .unwrap_or_else(|| {
                         std::alloc::handle_alloc_error(
                             try_typed_items_block_layout(count.max(1))
-                                .unwrap_or_else(|| Layout::new::<TypedItemsBlock>()),
+                                .unwrap_or_else(Layout::new::<TypedItemsBlock>),
                         )
                     });
             // The zeroing stores follow the malloc with no collection point

@@ -4829,10 +4829,10 @@ impl CallControl {
             if root == "crate" || crate::local_crates::is_local_crate_root(root) {
                 let stripped =
                     CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
-                if let Some(alt) = self.func_effects(&stripped) {
-                    if alt.recorded_oopspec().is_some() || direct.is_none() {
-                        return Some(alt);
-                    }
+                if let Some(alt) = self.func_effects(&stripped)
+                    && (alt.recorded_oopspec().is_some() || direct.is_none())
+                {
+                    return Some(alt);
                 }
             }
         }
@@ -7040,18 +7040,18 @@ fn replace_force_virtualizable_in(graph: &mut FunctionGraph) -> usize {
     for block in &mut graph.blocks {
         let mut newops = Vec::with_capacity(block.operations.len());
         for mut op in block.operations.drain(..) {
-            if let OpKind::Call { target, args, .. } = &op.kind {
-                if is_residual_jit_force_virtualizable(target) {
-                    if args.last().is_some_and(link_arg_access_directly) {
-                        continue;
-                    }
-                    if let OpKind::Call { args, .. } = &mut op.kind {
-                        if args.len() > 1 {
-                            args.truncate(1);
-                        }
-                    }
-                    count += 1;
+            if let OpKind::Call { target, args, .. } = &op.kind
+                && is_residual_jit_force_virtualizable(target)
+            {
+                if args.last().is_some_and(link_arg_access_directly) {
+                    continue;
                 }
+                if let OpKind::Call { args, .. } = &mut op.kind
+                    && args.len() > 1
+                {
+                    args.truncate(1);
+                }
+                count += 1;
             }
             newops.push(op);
         }

@@ -190,14 +190,11 @@ impl MIFrame {
     /// `freeze_values_into_const_boxes`; an unfrozen live box defaults to
     /// 0 as `IntOp.getint` does for an unstamped `_resint`.
     pub fn int_value_for_blackhole(&self, index: usize) -> Option<i64> {
-        match self.int_regs.get(index).copied().flatten() {
-            Some(op) => Some(
-                op.inline_const_to_value()
-                    .map(|v| v.as_raw_i64())
-                    .unwrap_or(0),
-            ),
-            None => None,
-        }
+        self.int_regs.get(index).copied().flatten().map(|op| {
+            op.inline_const_to_value()
+                .map(|v| v.as_raw_i64())
+                .unwrap_or(0)
+        })
     }
 
     pub fn ref_value_for_blackhole(&self, index: usize) -> Option<i64> {
@@ -213,14 +210,11 @@ impl MIFrame {
     /// `_copy_data_from_miframe` `box.getfloatstorage()`. Same box-owner
     /// rule as [`Self::int_value_for_blackhole`].
     pub fn float_value_for_blackhole(&self, index: usize) -> Option<i64> {
-        match self.float_regs.get(index).copied().flatten() {
-            Some(op) => Some(
-                op.inline_const_to_value()
-                    .map(|v| v.as_raw_i64())
-                    .unwrap_or(0),
-            ),
-            None => None,
-        }
+        self.float_regs.get(index).copied().flatten().map(|op| {
+            op.inline_const_to_value()
+                .map(|v| v.as_raw_i64())
+                .unwrap_or(0)
+        })
     }
 
     /// Publish a forwarding update into a Ref register's ConstPtr box.

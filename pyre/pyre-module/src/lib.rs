@@ -195,7 +195,7 @@ fn hook_mini_buffer_params(obj: pyre_object::PyObjectRef) -> Option<(*mut u8, us
         not(target_arch = "wasm32")
     ))]
     {
-        return module::_cffi_backend::cbuffer::mini_buffer_params(obj);
+        module::_cffi_backend::cbuffer::mini_buffer_params(obj)
     }
     #[cfg(not(all(
         feature = "host_env",
@@ -217,11 +217,11 @@ fn hook_ctype_size_qmut(
         not(target_arch = "wasm32")
     ))]
     {
-        return Some(unsafe {
+        Some(unsafe {
             (*(ptr as *const module::_cffi_backend::ctypeobj::W_CType))
                 .size_watchers
                 .get_current_qmut_instance()
-        });
+        })
     }
     #[cfg(not(all(
         feature = "host_env",
@@ -241,7 +241,7 @@ fn hook_cdata_is_function_pointer(obj: pyre_object::PyObjectRef) -> bool {
         not(target_arch = "wasm32")
     ))]
     {
-        return module::_cffi_backend::cdataobj::is_function_pointer_cdata(obj);
+        module::_cffi_backend::cdataobj::is_function_pointer_cdata(obj)
     }
     #[cfg(not(all(
         feature = "host_env",
@@ -261,7 +261,7 @@ fn hook_cffi_finalizer_kind(obj: pyre_object::PyObjectRef) -> Option<bool> {
         not(target_arch = "wasm32")
     ))]
     {
-        return module::_cffi_backend::cdataobj::ec_finalizer_kind(obj);
+        module::_cffi_backend::cdataobj::ec_finalizer_kind(obj)
     }
     #[cfg(not(all(
         feature = "host_env",
@@ -324,7 +324,7 @@ fn hook_ctypes_buffer_view(
 )> {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     {
-        return module::_ctypes::cdata::cdata_buffer_view(obj);
+        module::_ctypes::cdata::cdata_buffer_view(obj)
     }
     #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
     {
@@ -336,7 +336,7 @@ fn hook_ctypes_buffer_view(
 fn hook_ctypes_bytes_object(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     {
-        return module::_ctypes::cdata::cdata_bytes_object(obj);
+        module::_ctypes::cdata::cdata_bytes_object(obj)
     }
     #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
     {
@@ -348,7 +348,7 @@ fn hook_ctypes_bytes_object(obj: pyre_object::PyObjectRef) -> Option<pyre_object
 fn hook_ctypes_array_instance(obj: pyre_object::PyObjectRef) -> bool {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     {
-        return module::_ctypes::metaclass::is_array_instance(obj);
+        module::_ctypes::metaclass::is_array_instance(obj)
     }
     #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
     {
@@ -360,7 +360,7 @@ fn hook_ctypes_array_instance(obj: pyre_object::PyObjectRef) -> bool {
 fn hook_ctypes_pointer_instance(obj: pyre_object::PyObjectRef) -> bool {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     {
-        return module::_ctypes::metaclass::is_pointer_instance(obj);
+        module::_ctypes::metaclass::is_pointer_instance(obj)
     }
     #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
     {
@@ -380,7 +380,7 @@ fn hook_load_cffi1_module(
         not(target_arch = "wasm32")
     ))]
     {
-        return module::_cffi_backend::cffi1_module::load_cffi1_module(name, path, init_address);
+        module::_cffi_backend::cffi1_module::load_cffi1_module(name, path, init_address)
     }
     #[cfg(not(all(
         feature = "host_env",
@@ -464,7 +464,7 @@ unsafe fn hook_libffi_cif_shape(
             },
         };
         let nargs = unsafe { jit_libffi::nargs(cif_description) };
-        return Some(LibffiCifShape {
+        Some(LibffiCifShape {
             rtype: read(unsafe { jit_libffi::rtype(cif_description) }),
             args: (0..nargs)
                 .map(|i| {
@@ -474,7 +474,7 @@ unsafe fn hook_libffi_cif_shape(
                     )
                 })
                 .collect(),
-        });
+        })
     }
     #[cfg(not(all(
         feature = "host_env",
