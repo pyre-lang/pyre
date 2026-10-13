@@ -1306,7 +1306,7 @@ impl OrderedDictRepr {
     /// The same pieces `ll_dict_setitem_with_hash` (`rordereddict.py`)
     /// composes, plus the value-or-None read `ll_dict_get` produces.
     fn ll_dict_insert_helper(&self, hop: &HighLevelOp) -> Result<LowLevelFunction, TyperError> {
-        let (hash_fn_const, call_lookup_const) = self.lookup_chain_helpers(hop)?;
+        let chain = self.lookup_chain_helpers(hop)?;
         let rtyper = &hop.rtyper;
         let dict_ptr = self.lowleveltype.clone();
         let entries_ptr = self.entries_ptr_lltype();
@@ -1325,9 +1325,10 @@ impl OrderedDictRepr {
                     entries_ptr.clone(),
                     key_lltype.clone(),
                     value_lltype.clone(),
-                    hash_fn_const.clone(),
-                    call_lookup_const.clone(),
+                    chain.hash_fn_const.clone(),
+                    chain.call_lookup_const.clone(),
                     lookup_done_const.clone(),
+                    chain.hash_takes_dict,
                 )
             },
         )
@@ -8186,7 +8187,7 @@ pub(crate) fn build_ll_dict_setitem_helper_graph(
 /// the new value (overwrite or insert).
 #[expect(
     clippy::too_many_arguments,
-    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    reason = "Parameter order mirrors ll_dict_insert; hash_takes_dict selects ll_keyhash_custom(d, key)"
 )]
 pub(crate) fn build_ll_dict_insert_helper_graph(
     name: &str,
@@ -8197,6 +8198,7 @@ pub(crate) fn build_ll_dict_insert_helper_graph(
     hash_fn: Constant,
     call_lookup_fn: Constant,
     lookup_done_fn: Constant,
+    hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
@@ -8223,7 +8225,7 @@ pub(crate) fn build_ll_dict_insert_helper_graph(
     push(
         &startblock,
         "direct_call",
-        vec![Hlvalue::Constant(hash_fn), var(&key)],
+        keyhash_call_args(hash_fn, &d, &key, hash_takes_dict),
         &hash,
     );
     let index = new_var("index", sig());
@@ -11512,6 +11514,7 @@ mod tests {
             dummy_funcptr_const(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
+            false,
         )
         .expect("build_ll_dict_insert_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_insert");
@@ -11578,6 +11581,34 @@ mod tests {
         assert!(
             ops.iter().any(|o| o == "getinteriorfield"),
             "found arm reads entries[index].value"
+        );
+    }
+
+    /// Custom r_dict hash is `ll_keyhash_custom(d, key)`, so the hash
+    /// `direct_call` receives the dict (`rordereddict.py`).
+    #[test]
+    fn build_ll_dict_insert_custom_keyhash_takes_dict() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_insert_helper_graph(
+            "ll_dict_insert",
+            dict_ptr,
+            entries_ptr,
+            key_lltype,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            true,
+        )
+        .expect("build_ll_dict_insert_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let hash_call = &startblock.operations[0];
+        assert_eq!(hash_call.opname, "direct_call");
+        assert_eq!(
+            hash_call.args.len(),
+            3,
+            "custom keyhash is direct_call(hash_fn, d, key)"
         );
     }
 
@@ -12380,5 +12411,69 @@ mod tests {
             panic!("contains funcptr");
         };
         assert!(format!("{:?}", c.value).contains("ll_dict_contains"));
+    }
+
+    /// Custom r_dict `insert` uses the same `lookup_chain_helpers` hash
+    /// wiring as `setitem` (`ll_keyhash_custom(d, key)`) and
+    /// `hop.exception_is_here()` because the key comparison can raise.
+    #[test]
+    fn ordereddictrepr_custom_eq_hash_rtypes_insert() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_custom_eq_hash_dict_repr(rtyper.clone());
+        let dict_lltype = repr.lowleveltype().clone();
+
+        let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_dict = Variable::new();
+        v_dict.set_concretetype(Some(dict_lltype));
+        let v_key = Variable::new();
+        v_key.set_concretetype(Some(LowLevelType::Signed));
+        let v_value = Variable::new();
+        v_value.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![
+                    Hlvalue::Variable(v_dict),
+                    Hlvalue::Variable(v_key),
+                    Hlvalue::Variable(v_value),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            vec![],
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(repr.clone() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+            Some(signed_repr() as Arc<dyn Repr>),
+        ]);
+        let result = repr
+            .rtype_method("insert", &hop)
+            .unwrap_or_else(|err| panic!("custom rtype_method insert: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert!(
+            llops.borrow()._called_exception_is_here_or_cannot_occur,
+            "custom_eq_hash insert uses hop.exception_is_here()"
+        );
+        let Hlvalue::Constant(c) = &llops.borrow().ops[0].args[0] else {
+            panic!("insert funcptr");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_insert"));
     }
 }
