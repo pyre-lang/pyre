@@ -3083,6 +3083,26 @@ impl SharedOpcodeHandler for PyFrame {
         Ok(build_list_from_refs(items))
     }
 
+    fn newlist_from_iter_hint(
+        &mut self,
+        last_val: Self::Value,
+    ) -> Result<(Self::Value, Self::Value), PyError> {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(last_val);
+        let hint = match crate::length_hint(pyre_object::gc_roots::shadow_stack_get(iter_slot), 0) {
+            Ok(h) => h,
+            Err(mut e) => {
+                if e.r#async(pyre_object::PY_NULL) {
+                    return Err(e);
+                }
+                0
+            }
+        };
+        let list = w_list_new_with_sizehint(hint);
+        Ok((list, pyre_object::gc_roots::shadow_stack_get(iter_slot)))
+    }
+
     fn build_tuple(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
         Ok(build_tuple_from_refs(items))
     }

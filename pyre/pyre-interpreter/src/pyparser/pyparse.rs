@@ -118,6 +118,11 @@ pub fn compile_source_with_opts(
     opts: CompileOpts,
 ) -> Result<CodeObject, CompileError> {
     crate::module::thread::ensure_runtime_thread();
+    // pyopcode.py BUILD_LIST_FROM_ARG: ast.ListComp.build_container_and_load_iter.
+    let opts = CompileOpts {
+        build_list_from_arg: true,
+        ..opts
+    };
     let source = universal_newline(source);
     match rp_compile(&source, mode, filename, opts.clone()) {
         Ok(code) => Ok(code),

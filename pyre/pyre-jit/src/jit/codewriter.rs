@@ -10373,6 +10373,27 @@ impl CodeWriter {
                             emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
                         }
 
+                        // pyopcode.py BUILD_LIST_FROM_ARG: pop iterator, push
+                        // empty list, push iterator. Same operand-stack shape
+                        // as BUILD_LIST 0; SWAP 2. Hinted allocation is the
+                        // interpreter path; this arm residualizes the empty
+                        // newlist the flowspace records.
+                        Instruction::BuildListFromArg => {
+                            let _iter_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let iter_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let result_value = emit_frontend_newlist(
+                                &mut graph,
+                                &current_block.block(),
+                                Vec::new(),
+                                py_pc as i64,
+                            );
+                            let pushed: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(pushed.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
+                            current_state.stack.push(iter_value.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, iter_value, py_pc);
+                        }
+
                         // pyopcode.py BUILD_SLICE:
                         //   if numargs == 3: w_step = popvalue()
                         //   elif numargs == 2: w_step = space.w_None

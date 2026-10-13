@@ -838,6 +838,8 @@ pub(crate) fn stack_effects(
             let s = count.get(op_arg) as usize as i32;
             (d - s + 1, d - s + 1)
         }
+        // BUILD_LIST_FROM_ARG: pop iterator, push list, push iterator. Net +1.
+        Instruction::BuildListFromArg => (d + 1, d + 1),
         Instruction::BuildSet { count } => {
             let s = count.get(op_arg) as usize as i32;
             (d - s + 1, d - s + 1)

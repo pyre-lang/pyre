@@ -731,6 +731,11 @@ pub fn compile_with_codegen_warnings(
     filename: &Wtf8,
     opts: CompileOpts,
 ) -> Result<CodeObject, SourceCompileError> {
+    // pyopcode.py BUILD_LIST_FROM_ARG: ast.ListComp.build_container_and_load_iter.
+    let opts = CompileOpts {
+        build_list_from_arg: true,
+        ..opts
+    };
     crate::module::thread::ensure_runtime_thread();
     let source = crate::compile::universal_newline(source);
     emit_tokenizer_syntax_warnings(&source, filename).map_err(SourceCompileError::Warning)?;
@@ -797,6 +802,11 @@ pub fn compile_ast_with_codegen_warnings(
     mode: Mode,
     opts: CompileOpts,
 ) -> Result<CodeObject, SourceCompileError> {
+    // pyopcode.py BUILD_LIST_FROM_ARG: ast.ListComp.build_container_and_load_iter.
+    let opts = CompileOpts {
+        build_list_from_arg: true,
+        ..opts
+    };
     crate::module::thread::ensure_runtime_thread();
     let escalated = core::cell::Cell::new(None);
     let mut handler = |location: crate::compile::SourceLocation, message: String| {

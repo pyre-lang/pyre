@@ -2639,6 +2639,13 @@ impl FlowContext {
                     self.pushvalue(StackElem::Value(result));
                     Ok(None)
                 }
+                Instruction::BuildListFromArg => {
+                    let last_val = self.popvalue();
+                    let result = self.record_pure_op("newlist", vec![])?;
+                    self.pushvalue(StackElem::Value(result));
+                    self.pushvalue(last_val);
+                    Ok(None)
+                }
                 Instruction::BuildSet { .. } => {
                     let items = self.pop_hlvalues(oparg as usize)?;
                     let result = self.record_pure_op("newset", items)?;
