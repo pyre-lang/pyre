@@ -11,7 +11,7 @@
 //! sees the callee body, where both words are still field reads. This
 //! pass does the same when that body is in this LLBC: splice it
 //! (`inline::splice_direct_call`), then retarget each `method_*` read so
-//! its base is the metadata word (`FatLen`) of the fat field. The data
+//! its base is the metadata word (`FatMeta`) of the fat field. The data
 //! word stays the call's receiver. `dont_look_inside` and a splice cycle
 //! stay residual. A cross-crate fat return has no body here and is left
 //! unchanged. A size cutoff is not a substitute: the one-word return
@@ -606,8 +606,18 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
     if !graph.variable_defined_in_block(fat.block, &fat.base) {
         let _ = graph.try_ensure_variable_at_block(fat.block, &fat.base);
     }
+    // `lookup_operand` requires the FieldRead base in this block
+    // (`w_set_insert_key_checked` reads `strategy.imp` FatMeta after a
+    // passthrough of the set pointer). A dominating definition is not a
+    // definition (`ensure_meta` already threads the metadata word the
+    // same way).
+    if !graph.variable_defined_in_block(fat.block, &fat.base) {
+        graph.ensure_variable_at_block(fat.block, &fat.base);
+    }
     let meta = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    let field = fat.field.clone().with_vec_part(VecFieldPart::FatLen);
+    // `FatMeta` is the vtable word as Int (`GetfieldGcI`). Slice `FatLen`
+    // stays `len(getattr)`; the adapter keys this tag, not the field name.
+    let field = fat.field.clone().with_vec_part(VecFieldPart::FatMeta);
     let op = SpaceOperation {
         result: Some(meta.clone()),
         kind: OpKind::FieldRead {
@@ -655,7 +665,8 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{OpKind, SpaceOperation, ValueType};
+    use crate::model::{FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType};
+    use std::collections::{HashMap, HashSet};
 
     fn hit(id_hit: bool, rank: Option<OwnerPathRank>) -> OwnerHit {
         OwnerHit { id_hit, rank }
@@ -668,6 +679,41 @@ mod tests {
             hit(false, Some(OwnerPathRank::Leaf)),
         ];
         assert_eq!(choose_owner_hits(true, &hits), vec![0]);
+    }
+
+    #[test]
+    fn emit_fat_len_threads_base_into_the_fieldread_block() {
+        // `w_set_insert_key_checked` FieldRead of `strategy.imp` FatMeta
+        // after a passthrough: the owner lives in a predecessor.
+        // `lookup_operand` rejects a dominating use.
+        let mut graph = FunctionGraph::new("insert_key");
+        let entry = graph.startblock;
+        let merge = graph.create_block();
+        let base = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        graph.set_goto(entry, merge, vec![]);
+        assert!(
+            !graph.variable_defined_in_block(merge, &base),
+            "base is defined in the predecessor only"
+        );
+        let fat = FatField {
+            block: merge,
+            var_id: u64::MAX,
+            base: base.clone(),
+            field: FieldDescriptor::new("imp", Some("SetStrategyRef".into())),
+            pure: true,
+        };
+        let mut env = MetaEnv {
+            fat_fields: HashMap::new(),
+            copies: HashMap::new(),
+            fat_len: HashMap::new(),
+            memo: HashMap::new(),
+            visiting: HashSet::new(),
+        };
+        let _meta = emit_fat_len(&mut graph, &mut env, &fat);
+        assert!(
+            graph.variable_defined_in_block(merge, &base),
+            "FatMeta FieldRead base must be an inputarg of the consuming block"
+        );
     }
 
     #[test]

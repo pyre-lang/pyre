@@ -722,8 +722,9 @@ pub struct FieldDescriptor {
     pub inline_vec: bool,
     /// Which word of an inline aggregate this read loads. `None` is the
     /// field's own value. `Buf` / `Len` add `vec_layout::probe`'s offset;
-    /// `FatData` / `FatLen` / `FatVtable` add `fat_ptr_layout::probe`'s offset.
-    /// The add sits on top of the field's own offset.
+    /// `FatData` / `FatLen` / `FatMeta` / `FatVtable` add
+    /// `fat_ptr_layout::probe`'s offset. The add sits on top of the
+    /// field's own offset.
     pub vec_part: Option<VecFieldPart>,
     /// Declared `Struct._gckind` of the owning struct or enum, recorded
     /// where the container type is still in hand. `Some(false)` is Raw:
@@ -749,14 +750,18 @@ pub struct FieldDescriptor {
 ///
 /// `Buf` / `Len` are `alloc::vec::Vec<T>` (`vec_layout`). `FatData` /
 /// `FatLen` are the two words of `Box<[T]>` (`fat_ptr_layout`).
-/// `FatVtable` is that same metadata word typed as a pointer: `&dyn Trait`
-/// stores the data pointer, then the vtable.
+/// `FatMeta` is the metadata word of `&dyn Trait` typed as Int (the
+/// vtable pointer as `GetfieldGcI`); `FatVtable` is that same slot typed
+/// as a pointer. Slice `FatLen` stays `len(getattr)` (`ListRepr.rtype_len`);
+/// dyn `FatMeta` is `getitem` of `two_word_fat_struct` (`rtuple.py`
+/// `rtype_getitem`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VecFieldPart {
     Buf,
     Len,
     FatData,
     FatLen,
+    FatMeta,
     FatVtable,
 }
 

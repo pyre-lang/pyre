@@ -3376,6 +3376,33 @@ mod tests {
     }
 
     #[test]
+    fn consider_tuple_getitem_hlvalue_constant_index_picks_item() {
+        // binaryop.py getitem((tup1, int2)): when the index is a
+        // flowspace Constant, annotator.annotation (annrpython.py)
+        // computes SomeInteger via bookkeeper.immutablevalue — the
+        // Constant has no stored annotation. Dispatch must still pick
+        // items[const], matching the Variable+const_box sibling above.
+        let ann = mk_ann();
+        let mut v0 = Variable::named("t");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::Tuple(SomeTuple::new(vec![
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::String(SomeString::new(false, false)),
+            ])),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![
+                Hlvalue::Variable(v0),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(1))),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
+    }
+
+    #[test]
     fn consider_tuple_integer_getitem_nonconst_unions() {
         // binaryop.py:567-568 — nonconst index returns unionof(*items).
         let ann = mk_ann();

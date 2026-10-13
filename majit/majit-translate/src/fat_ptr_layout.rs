@@ -35,18 +35,34 @@ pub fn layout_for_word(word: usize) -> FatPtrLayout {
 /// `get_type_flag` uses this arm. Raw `*mut dyn` / `Option<*mut dyn>` stay
 /// off it: those spellings are two-word `lltype.Struct` fields in the
 /// bookkeeper, not FLAG_POINTER descrs of size two words.
+///
+/// A lifetime on the reference (`&'static dyn DictStrategy`) is the same
+/// two-word value: [`pointer_pointee`] strips it the way `spelling_is_fat_ptr`
+/// already does.
 pub fn spelling_is_dyn_fat_ptr(s: &str) -> bool {
     let s = s.trim();
-    let inner = s
-        .strip_prefix("&mut ")
-        .or_else(|| s.strip_prefix('&'))
-        .or_else(|| {
-            s.strip_prefix("Box<")
-                .and_then(|rest| rest.strip_suffix('>'))
-        })
-        .unwrap_or(s)
-        .trim();
-    inner.starts_with("dyn ")
+    if s.starts_with("*const ") || s.starts_with("*mut ") {
+        return false;
+    }
+    if let Some(inner) = wrapper_inner(s, &["Box"]) {
+        return spelling_is_dyn_trait_pointee(inner);
+    }
+    if pointer_pointee(s).is_some_and(spelling_is_dyn_trait_pointee) {
+        return true;
+    }
+    // Layout rows may spell a `&dyn Trait` field as the pointee after
+    // `charon_dyn_trait_to_ast_string` (`dyn DictStrategy`): the field is
+    // still the two-word fat pointer.
+    spelling_is_dyn_trait_pointee(s)
+}
+
+/// Pointee of a fat `&dyn Trait`. Charon's DynTrait fallback
+/// (`charon_dyn_trait_to_ast_string`) emits `"dyn"` when the trait id is
+/// unresolved; `tyref_to_field_layout_string` then keeps the `&` as
+/// `"&dyn"`. Both are `two_word_fat_struct`.
+fn spelling_is_dyn_trait_pointee(s: &str) -> bool {
+    let t = s.trim();
+    t == "dyn" || t.starts_with("dyn ")
 }
 
 /// A pointer to an unsized pointee (`dyn Trait`, `[T]`, `str`) is two
@@ -107,7 +123,7 @@ fn pointer_pointee(s: &str) -> Option<&str> {
 
 fn is_unsized_pointee(inner: &str) -> bool {
     let inner = inner.trim();
-    if inner == "str" || inner.ends_with("::str") || inner.starts_with("dyn ") {
+    if inner == "str" || inner.ends_with("::str") || spelling_is_dyn_trait_pointee(inner) {
         return true;
     }
     inner
@@ -170,6 +186,13 @@ mod tests {
         assert!(super::spelling_is_dyn_fat_ptr("&dyn Storage"));
         assert!(super::spelling_is_dyn_fat_ptr("&mut dyn Storage"));
         assert!(super::spelling_is_dyn_fat_ptr("Box<dyn Storage>"));
+        assert!(super::spelling_is_dyn_fat_ptr("&'static dyn DictStrategy"));
+        assert!(super::spelling_is_dyn_fat_ptr("&'a dyn Storage"));
+        assert!(super::spelling_is_dyn_fat_ptr("dyn DictStrategy"));
+        assert!(super::spelling_is_dyn_fat_ptr("dyn"));
+        assert!(super::spelling_is_dyn_fat_ptr("&dyn"));
+        assert!(super::spelling_is_dyn_fat_ptr("Box<dyn>"));
+        assert!(super::spelling_is_dyn_fat_ptr("&'static dyn"));
         assert!(!super::spelling_is_dyn_fat_ptr("*mut dyn Storage"));
         assert!(!super::spelling_is_dyn_fat_ptr(
             "Option<*mut dyn AsyncActionOps>"
@@ -188,6 +211,7 @@ mod tests {
             "Option<*mut dyn AsyncActionOps>"
         ));
         assert!(super::spelling_is_fat_ptr("Option<&dyn Storage>"));
+        assert!(super::spelling_is_fat_ptr("&dyn"));
         assert!(!super::spelling_is_fat_ptr("*mut u8"));
         assert!(!super::spelling_is_fat_ptr("Option<*mut u8>"));
         assert!(!super::spelling_is_fat_ptr("&Holder"));

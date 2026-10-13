@@ -3396,12 +3396,12 @@ impl InstanceRepr {
     /// `ExceptionData.get_standard_ll_exc_instance` to materialise the
     /// canonical instance for a given exception class. Multiple calls
     /// return the same `_ptr` value (same `_identity`).
-    pub fn get_reusable_prebuilt_instance(self: &Arc<Self>) -> Result<_ptr, TyperError> {
+    pub fn get_reusable_prebuilt_instance(&self) -> Result<_ptr, TyperError> {
         if let Some(cached) = self.reusable_prebuilt_instance.borrow().clone() {
             return Ok(cached);
         }
         // upstream: `self.setup()`. Repr::setup is idempotent.
-        Repr::setup(self.as_ref() as &dyn Repr)?;
+        Repr::setup(self as &dyn Repr)?;
         // upstream rclass.py:810-813:
         //     result = self.create_instance()
         //     self._reusable_prebuilt_instance = result
@@ -4847,6 +4847,34 @@ pub(super) fn pair_opaque_ptr_instance_convert_from_to(
         return Ok(None);
     }
     super::lltypesystem::rgcref::pair_gcref_repr_convert_from_to(r_from, r_to, v, llops)
+}
+
+/// ZST method `self` is `Void` in MIR; RPython empty class instances
+/// still have a pointer (`rclass.py` `InstanceRepr.get_reusable_prebuilt_instance`).
+/// `kwargsdict.py` `self.switch_to_object_strategy(w_dict)` is a method
+/// call whose receiver is that instance; pyre's unit-struct strategy
+/// lowers the same slot as `SomeImpossibleValue` / `VoidRepr`.
+pub(super) fn pair_void_instance_convert_from_to(
+    _r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    _v: &Hlvalue,
+    _llops: &mut LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let Some(r_ins) = (r_to as &dyn std::any::Any).downcast_ref::<InstanceRepr>() else {
+        return Ok(None);
+    };
+    // `initialize_prebuilt_data` walks to root and `getvtable`; the
+    // matching ClassRepr's ForwardReference must be resolved first
+    // (`rclass.py` `InstanceRepr.get_reusable_prebuilt_instance`).
+    if let Some(rtyper) = r_ins.rtyper.upgrade() {
+        let rclass = getclassrepr_arc(&rtyper, r_ins.classdef.as_ref())?;
+        Repr::setup(&*rclass.as_repr())?;
+    }
+    let example = r_ins.get_reusable_prebuilt_instance()?;
+    Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::LLPtr(Box::new(example)),
+        r_ins.lowleveltype.clone(),
+    ))))
 }
 
 /// RPython `pairtype(InstanceRepr, InstanceRepr).rtype_is_`

@@ -2738,6 +2738,85 @@ mod tests {
         );
     }
 
+    /// HighLevelOp.setup (rtyper.py) fills `args_s` via
+    /// `rtyper.binding(a)`, and `RPythonAnnotator.annotation`
+    /// (annrpython.py) returns `bookkeeper.immutablevalue(arg.value)`
+    /// for a Constant. A tuple getitem whose index is
+    /// `Constant(Int(0))` with no stored annotation / concretetype
+    /// therefore rtypes through `pair(TupleRepr, IntegerRepr).rtype_getitem`.
+    #[test]
+    fn hop_setup_binds_constant_tuple_index_through_immutablevalue() {
+        use crate::annotator::model::{SomeInteger, SomeObjectTrait, SomeTuple, SomeValue};
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = fresh_rtyper_live();
+        let mut v_tuple = Variable::named("t");
+        ann.setbinding(
+            &mut v_tuple,
+            SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(
+                SomeInteger::default(),
+            )])),
+        );
+        let mut v_result = Variable::named("item");
+        ann.setbinding(&mut v_result, SomeValue::Integer(SomeInteger::default()));
+        let spaceop = SpaceOperation::new(
+            OpKind::GetItem.opname(),
+            vec![
+                Hlvalue::Variable(v_tuple.clone()),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+            ],
+            Hlvalue::Variable(v_result),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.setup().expect("HighLevelOp.setup");
+
+        let args_s = hop.args_s.borrow();
+        match &args_s[1] {
+            SomeValue::Integer(i) => {
+                assert!(
+                    i.is_immutable_constant(),
+                    "Constant index must be SomeInteger via immutablevalue"
+                );
+                assert_eq!(
+                    i.base.const_box.as_ref().map(|c| &c.value),
+                    Some(&ConstValue::Int(0))
+                );
+            }
+            other => panic!("args_s[1] must be SomeInteger, got {other:?}"),
+        }
+        assert!(matches!(args_s[0], SomeValue::Tuple(_)));
+        drop(args_s);
+
+        let r_tup = hop.args_r.borrow()[0]
+            .clone()
+            .expect("tuple arg repr from setup");
+        // convertvar (rtyper.py) is identity when the reprs match and
+        // does not fill concretetype; specialize_block writes it on
+        // already-rtyped vars before genop. Same write as the sibling
+        // pair_tuple_int_rtype_getitem tests.
+        v_tuple.set_concretetype(Some(r_tup.lowleveltype().clone()));
+        pair_tuple_int_rtype_getitem(r_tup.as_ref(), &hop)
+            .expect("pair_tuple_int_rtype_getitem")
+            .unwrap();
+        assert!(
+            hop.llops
+                .borrow()
+                .ops
+                .iter()
+                .any(|op| op.opname == "getfield"),
+            "expected getfield from rtype_getitem, got {:?}",
+            hop.llops
+                .borrow()
+                .ops
+                .iter()
+                .map(|op| &op.opname)
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// upstream rtuple.py rtype_getitem — tuple constant indexing flows
     /// through `self.fieldnames[index]` which is a Python list and
     /// supports negative indexing (`fieldnames[-1]` returns the

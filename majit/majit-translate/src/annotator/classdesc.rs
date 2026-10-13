@@ -63,7 +63,8 @@ use std::sync::{Arc, LazyLock};
 use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
 use super::description::ClassAttrFamily;
 use super::model::{
-    AnnotatorError, DescKind, KnownType, SomeInteger, SomeObject, SomeString, SomeValue, union,
+    AnnotatorError, DescKind, KnownType, SomeInteger, SomeObject, SomeString, SomeTuple, SomeValue,
+    union,
 };
 use crate::flowspace::model::{
     ConstValue, Constant, HOST_ENV, HostGetAttrError, HostObject, host_getattr,
@@ -238,6 +239,9 @@ enum ForceAnnotation {
         can_be_none: bool,
         flags: std::collections::BTreeMap<String, bool>,
     },
+    /// Two-word fat-dyn (`two_word_fat_struct`): data then metadata, or
+    /// the reverse when the host lays the vtable word first.
+    Tuple(Vec<ForceAnnotation>),
 }
 
 impl ForceAnnotation {
@@ -262,6 +266,14 @@ impl ForceAnnotation {
                     can_be_none: inst.can_be_none,
                     flags: inst.flags.clone(),
                 })
+            }
+            SomeValue::Tuple(t) => {
+                let items: Option<Vec<_>> = t
+                    .items
+                    .iter()
+                    .map(ForceAnnotation::from_somevalue)
+                    .collect();
+                items.map(ForceAnnotation::Tuple)
             }
             _ => None,
         }
@@ -295,6 +307,9 @@ impl ForceAnnotation {
             ForceAnnotation::InstanceNone { can_be_none, flags } => SomeValue::Instance(
                 super::model::SomeInstance::new(None, *can_be_none, flags.clone()),
             ),
+            ForceAnnotation::Tuple(items) => SomeValue::Tuple(SomeTuple::new(
+                items.iter().map(ForceAnnotation::to_somevalue).collect(),
+            )),
         }
     }
 }
@@ -417,6 +432,32 @@ fn someshell_from_primitive_layout(ty: &str) -> Option<SomeValue> {
     }
 }
 
+/// Annotator shell of a fat `&dyn Trait` field: the two-word struct
+/// [`crate::annotator::bookkeeper`]'s `two_word_fat_struct` rtypes as
+/// `{data: Address, len: Signed}` (or the reverse when the host lays the
+/// vtable word first). `SomeTuple` is that pair so `getitem` of FatLen /
+/// FatData is `rtuple.py` `rtype_getitem`, not `len_SomeInstance` →
+/// `getattr("__len__")` on a classdef-less dyn.
+pub(crate) fn dyn_fat_field_annotation() -> SomeValue {
+    crate::codewriter::annotation_state::record_classdef_less_mint(
+        "dyn_fat_field_annotation.data",
+        "dyn fat data word",
+    );
+    let data = SomeValue::Instance(super::model::SomeInstance::new(
+        None,
+        false,
+        std::collections::BTreeMap::new(),
+    ));
+    let len = super::model::s_int();
+    let layout = crate::fat_ptr_layout::probe();
+    let items = if layout.len_offset < layout.data_offset {
+        vec![len, data]
+    } else {
+        vec![data, len]
+    };
+    SomeValue::Tuple(SomeTuple::new(items))
+}
+
 /// Charon lays a fieldless-enum value out as `u8`/`u32` while every
 /// value site colours it `ValueType::Int` (`tyref_is_fieldless_enum_free`).
 /// `scalar_value_type` maps an unsigned integer to `Unsigned`, so the
@@ -455,6 +496,13 @@ pub(crate) fn register_struct_fields_with_layout(
             && let Some((_, ty)) = rows.iter().find(|(n, _)| n == name)
         {
             if majit_ir::rvec::rust_vec_item_kind_for_spelling(ty, word).is_some() {
+                continue;
+            }
+            if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(ty) {
+                entry.insert(
+                    name.clone(),
+                    force_annotation_from_shell(&dyn_fat_field_annotation()),
+                );
                 continue;
             }
             // Instantiated layout spelling (`i64`, `f64`) is the
@@ -3601,6 +3649,43 @@ mod tests {
                 "fieldless enum kind must stay Signed, got unsigned"
             ),
             other => panic!("expected Signed Integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dyn_fat_layout_seeds_tuple_force() {
+        // `DictStrategyRef.imp` is `&'static dyn DictStrategy`. Layout
+        // rows may spell the pointee (`dyn DictStrategy`) after
+        // `charon_dyn_trait_to_ast_string`; FORCE still seeds the
+        // `two_word_fat_struct` SomeTuple so getattr is not
+        // classdef-less (`dyn_fat_field_annotation`).
+        register_struct_fields_with_layout(
+            "force_test_dyn_fat::DictStrategyRef",
+            &[("imp".into(), crate::model::ValueType::Ref(None))],
+            Some(&[("imp".into(), "dyn DictStrategy".into())]),
+        );
+        let entry = forced_attributes_for("force_test_dyn_fat::DictStrategyRef")
+            .expect("FORCE row for dyn-fat imp");
+        match entry.get("imp") {
+            Some(SomeValue::Tuple(t)) => {
+                assert_eq!(t.items.len(), 2, "dyn-fat FORCE is two_word_fat_struct")
+            }
+            other => panic!("expected Tuple FORCE for dyn-fat imp, got {other:?}"),
+        }
+        // Production Charon layout of `DictStrategyRef.imp` is `"&dyn"`
+        // when the DynTrait trait id is unresolved.
+        register_struct_fields_with_layout(
+            "force_test_dyn_fat::DictStrategyRefBare",
+            &[("imp".into(), crate::model::ValueType::Ref(None))],
+            Some(&[("imp".into(), "&dyn".into())]),
+        );
+        let entry = forced_attributes_for("force_test_dyn_fat::DictStrategyRefBare")
+            .expect("FORCE row for &dyn imp");
+        match entry.get("imp") {
+            Some(SomeValue::Tuple(t)) => {
+                assert_eq!(t.items.len(), 2, "&dyn FORCE is two_word_fat_struct")
+            }
+            other => panic!("expected Tuple FORCE for &dyn imp, got {other:?}"),
         }
     }
 

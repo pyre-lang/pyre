@@ -59,12 +59,129 @@ pub struct ConcreteCallTableRow {
 
 type ConcreteCallTableRowRef = Rc<RefCell<ConcreteCallTableRow>>;
 
+/// True when every `graph.getargs()` Variable carries an annotation.
+/// Unbound slots are skip-subject holes (`LLCallTable.lookup`);
+/// `getfunctionptr` / `callparse.getrinputs` `bindingrepr` them.
+/// The return var may be unbound: `getrresult` maps that to `lltype.Void`.
+fn hlvalue_is_bound(v: &crate::flowspace::model::Hlvalue) -> bool {
+    match v {
+        crate::flowspace::model::Hlvalue::Variable(var) => var.annotation.borrow().is_some(),
+        _ => true,
+    }
+}
+
+fn graph_args_are_bound(graph: &Rc<PyGraph>) -> bool {
+    graph.graph.borrow().getargs().iter().all(hlvalue_is_bound)
+}
+
+fn graph_return_is_bound(graph: &Rc<PyGraph>) -> bool {
+    hlvalue_is_bound(&graph.graph.borrow().getreturnvar())
+}
+
+/// True when the startblock still has operations. A
+/// `dont_look_inside` / skip-subject stub is a signature shell
+/// (`build_stub_pygraph_with_result_shell`): empty startblock, one
+/// return link. `FunctionReprBase.call` `anygraph` is a `callparse`
+/// witness (`rpbc.py` `itervalues().next()`); prefer a body so a
+/// residual stub of one family member does not parse the hop.
+fn graph_has_body(graph: &Rc<PyGraph>) -> bool {
+    !graph
+        .graph
+        .borrow()
+        .startblock
+        .borrow()
+        .operations
+        .is_empty()
+}
+
+/// `FunctionReprBase.call` witness (`rpbc.py` `anygraph = row_of_graphs.itervalues().next()`).
+/// Prefer a graph whose inputs are bound. An all-unbound row is a
+/// hole (`LLCallTable.lookup`); `select_call_family_row` then falls back
+/// to the first graph and [`seed_impossible_on_unbound_hop_void_args`]
+/// fills ZST/`Impossible` holes from the hop.
+fn pick_call_family_witness(row: &CallTableRow) -> Option<Rc<PyGraph>> {
+    row.values()
+        .find(|graph| {
+            graph_args_are_bound(graph) && graph_return_is_bound(graph) && graph_has_body(graph)
+        })
+        .cloned()
+        .or_else(|| {
+            row.values()
+                .find(|graph| graph_args_are_bound(graph) && graph_return_is_bound(graph))
+                .cloned()
+        })
+        .or_else(|| {
+            row.values()
+                .find(|graph| graph_args_are_bound(graph) && graph_has_body(graph))
+                .cloned()
+        })
+        .or_else(|| {
+            row.values()
+                .find(|graph| graph_args_are_bound(graph))
+                .cloned()
+        })
+}
+
+/// A HostObject `simple_call` of a concrete method still carries the ZST
+/// `self` as `SomeImpossibleValue` (`hop.args_s[1]`, concretetype Void).
+/// Skip-subject family graphs and ZST-erased templates leave that slot
+/// unbound; `callparse.getrinputs` then `bindingrepr` panics
+/// `KeyError: no binding for arg`. Write the hop's annotation onto those
+/// holes — the annotation `pycall` / `bindinputargs` records
+/// (`description.py` `recursivecall`). A lifted graph may drop the Void
+/// `self` Input; align remaining getargs on the trailing hop slots.
+/// Unbound return stays unbound: `getrresult` maps that to `lltype.Void`.
+fn seed_impossible_on_unbound_hop_void_args(
+    graph: &Rc<PyGraph>,
+    args_s: &[crate::annotator::model::SomeValue],
+) {
+    use crate::flowspace::model::Hlvalue;
+    let args = graph.graph.borrow().getargs();
+    let hop_args = args_s.get(1..).unwrap_or(&[]);
+    // Hop longer: lifted startblock dropped a Void ZST `self`.
+    // Getargs longer: the method graph kept Instance `self` the hop erased.
+    let hop_offset = hop_args.len().saturating_sub(args.len());
+    let getargs_offset = args.len().saturating_sub(hop_args.len());
+    for (i, hl) in args.iter().enumerate() {
+        let Hlvalue::Variable(v) = hl else {
+            continue;
+        };
+        if v.annotation.borrow().is_some() {
+            continue;
+        }
+        let src = if i < getargs_offset {
+            crate::annotator::model::SomeValue::Impossible
+        } else if let Some(s) = hop_args.get(i - getargs_offset + hop_offset) {
+            s.clone()
+        } else {
+            continue;
+        };
+        v.annotation.replace(Some(Rc::new(src)));
+    }
+}
+
 impl ConcreteCallTableRow {
     /// RPython `ConcreteCallTableRow.from_row(cls, rtyper, row)`.
+    ///
+    /// Skip-subject family graphs have unbound args (`LLCallTable.lookup`
+    /// holes). `getcallable` on those panics `KeyError: no binding for arg`;
+    /// omit them as long as one bound graph remains (`assert len > 0`).
     pub fn from_row(rtyper: &RPythonTyper, row: &CallTableRow) -> Result<Self, TyperError> {
         let mut concrete_row = HashMap::new();
         let mut last_llfn = None;
-        for (funcdesc, graph) in row {
+        let bound: Vec<_> = row
+            .iter()
+            .filter(|(_, graph)| graph_args_are_bound(graph))
+            .collect();
+        // `LLCallTable.lookup` allows holes. An all-unbound family is a
+        // residual row — `getcallable` on those graphs panics
+        // `KeyError: no binding for arg`.
+        if bound.is_empty() {
+            return Err(TyperError::message(
+                "ConcreteCallTableRow::from_row: no family graph has bound args",
+            ));
+        }
+        for (funcdesc, graph) in bound {
             let llfn = rtyper.getcallable(graph)?;
             last_llfn = Some(llfn.clone());
             concrete_row.insert(*funcdesc, llfn);
@@ -306,11 +423,14 @@ pub(crate) fn select_call_family_row(
         .and_then(|table| table.get(index))
         .cloned()
         .ok_or_else(|| AnnotatorError::new("FunctionReprBase.call: missing calltable row"))?;
-    let anygraph = row_of_graphs
-        .values()
-        .next()
-        .cloned()
-        .ok_or_else(|| AnnotatorError::new("FunctionReprBase.call: empty row_of_graphs"))?;
+    // `FunctionReprBase.call` (`rpbc.py`): `anygraph = row_of_graphs.itervalues().next()`
+    // — pick any witness. Prefer a bound graph (`LLCallTable.lookup` holes);
+    // an all-unbound row still has a witness (upstream `next()`), and
+    // `seed_impossible_on_unbound_hop_void_args` fills ZST/`Impossible`
+    // slots from the hop before `callparse`.
+    let anygraph = pick_call_family_witness(&row_of_graphs)
+        .or_else(|| row_of_graphs.values().next().cloned())
+        .ok_or_else(|| AnnotatorError::new("FunctionReprBase.call: empty calltable row"))?;
     Ok(SelectedCallFamilyRow {
         shape,
         index,
@@ -576,7 +696,8 @@ pub(crate) mod tests {
     use crate::flowspace::model::{
         Block as FlowBlock, BlockRefExt as FlowBlockRefExt, ConstValue as FlowConstValue,
         Constant as FlowConstant, FunctionGraph as FlowFunctionGraph, GraphFunc as FlowGraphFunc,
-        Hlvalue as FlowHlvalue, Link as FlowLink, Variable as FlowVariable,
+        Hlvalue as FlowHlvalue, Link as FlowLink, SpaceOperation as FlowSpaceOperation,
+        Variable as FlowVariable,
     };
     use crate::model::{OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType, functionptr};
@@ -880,6 +1001,182 @@ pub(crate) mod tests {
         assert_eq!(selected.index, 0);
         assert_eq!(selected.row_of_graphs.len(), 1);
         assert!(Rc::ptr_eq(&selected.anygraph.graph, &cached_graph.graph));
+    }
+
+    #[test]
+    fn pick_call_family_witness_skips_unbound_family_graphs() {
+        let bound = make_pygraph("bound");
+        let unbound = make_pygraph("unbound");
+        for arg in unbound.graph.borrow().getargs() {
+            if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
+                v.annotation.replace(None);
+            }
+        }
+        let mut row = CallTableRow::new();
+        row.insert(DescKey(1), unbound.clone());
+        row.insert(DescKey(2), bound.clone());
+        let picked = pick_call_family_witness(&row).expect("bound witness");
+        assert!(Rc::ptr_eq(&picked.graph, &bound.graph));
+        assert!(!graph_args_are_bound(&unbound));
+        assert!(graph_args_are_bound(&bound));
+
+        let mut only_unbound = CallTableRow::new();
+        only_unbound.insert(DescKey(1), unbound);
+        assert!(
+            pick_call_family_witness(&only_unbound).is_none(),
+            "an all-unbound family row is a hole"
+        );
+    }
+
+    #[test]
+    fn pick_call_family_witness_prefers_bound_return_stub_over_unbound_return_body() {
+        // Residual skip-subject stub is signature-only with a result
+        // shell. The failed lift keeps a body and an unbound return
+        // (`getrresult` → Void). `anygraph` is the callparse witness:
+        // pick the stub so `FunctionReprBase.call` does not
+        // `bindingrepr` that unbound return (`RDict::new` → `with_hasher`).
+        let stub = make_pygraph("stub");
+        let body = make_pygraph("body");
+        {
+            let g = body.graph.borrow();
+            let arg = g.getargs()[0].clone();
+            g.startblock
+                .borrow_mut()
+                .operations
+                .push(FlowSpaceOperation::new("same_as", vec![arg.clone()], arg));
+            let FlowHlvalue::Variable(ret) = g.getreturnvar() else {
+                panic!("return is a Variable");
+            };
+            ret.annotation.replace(None);
+        }
+        assert!(graph_has_body(&body));
+        assert!(!graph_has_body(&stub));
+        assert!(!graph_return_is_bound(&body));
+        assert!(graph_return_is_bound(&stub));
+
+        let mut row = CallTableRow::new();
+        row.insert(DescKey(1), body);
+        row.insert(DescKey(2), stub.clone());
+        let picked = pick_call_family_witness(&row).expect("bound-return witness");
+        assert!(Rc::ptr_eq(&picked.graph, &stub.graph));
+    }
+
+    #[test]
+    fn seed_impossible_fills_unbound_zst_self_from_the_hop() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::Hlvalue;
+        let graph = make_pygraph("switch_to_object_strategy");
+        for arg in graph.graph.borrow().getargs() {
+            if let Hlvalue::Variable(v) = arg {
+                v.annotation.replace(None);
+            }
+        }
+        assert!(!graph_args_are_bound(&graph));
+
+        // hop.args_s[0] is the callable; getargs maps onto [1..].
+        seed_impossible_on_unbound_hop_void_args(
+            &graph,
+            &[SomeValue::Impossible, SomeValue::Impossible],
+        );
+        assert!(graph_args_are_bound(&graph));
+    }
+
+    #[test]
+    fn seed_aligns_trailing_hop_slots_when_zst_self_is_dropped() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::Hlvalue;
+        let graph = make_pygraph("switch_to_object_strategy");
+        for arg in graph.graph.borrow().getargs() {
+            if let Hlvalue::Variable(v) = arg {
+                v.annotation.replace(None);
+            }
+        }
+        // hop.args_s = [fn, Impossible ZST self, w_dict]; getargs is [w_dict].
+        let w_dict = SomeValue::Integer(crate::annotator::model::SomeInteger::new(false, false));
+        seed_impossible_on_unbound_hop_void_args(
+            &graph,
+            &[SomeValue::Impossible, SomeValue::Impossible, w_dict.clone()],
+        );
+        let args = graph.graph.borrow().getargs();
+        let Hlvalue::Variable(v) = &args[0] else {
+            panic!("getargs[0] is a Variable");
+        };
+        assert!(
+            matches!(
+                v.annotation.borrow().as_deref(),
+                Some(SomeValue::Integer(_))
+            ),
+            "trailing hop slot binds the remaining getarg, not the dropped ZST self"
+        );
+    }
+
+    #[test]
+    fn seed_fills_leading_instance_self_when_hop_dropped_zst() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::{
+            Block as FlowBlock, ConstValue as FlowConstValue, Constant as FlowConstant,
+            FunctionGraph as FlowFunctionGraph, GraphFunc as FlowGraphFunc, Hlvalue,
+            Variable as FlowVariable,
+        };
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        fn var(name: &str) -> FlowVariable {
+            let v = FlowVariable::named(name);
+            v.set_concretetype(Some(LowLevelType::Signed));
+            v.annotation.replace(None);
+            v
+        }
+        let self_v = var("self");
+        let dict_v = var("w_dict");
+        let startblock =
+            FlowBlock::shared(vec![Hlvalue::Variable(self_v), Hlvalue::Variable(dict_v)]);
+        let ret_var = FlowVariable::new();
+        ret_var.set_concretetype(Some(LowLevelType::Void));
+        ret_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
+        let graph = FlowFunctionGraph::with_return_var(
+            "switch_to_object_strategy",
+            startblock,
+            Hlvalue::Variable(ret_var),
+        );
+        let py = Rc::new(PyGraph {
+            graph: Rc::new(std::cell::RefCell::new(graph)),
+            func: FlowGraphFunc::new(
+                "switch_to_object_strategy",
+                FlowConstant::new(FlowConstValue::Dict(Default::default())),
+            ),
+            signature: std::cell::RefCell::new(crate::flowspace::argument::Signature::new(
+                vec!["self".to_string(), "w_dict".to_string()],
+                None,
+                None,
+            )),
+            defaults: std::cell::RefCell::new(None),
+            access_directly: std::cell::Cell::new(false),
+        });
+        let w_dict = SomeValue::Integer(crate::annotator::model::SomeInteger::new(false, false));
+        // hop.args_s = [fn, w_dict]; getargs is [self, w_dict].
+        seed_impossible_on_unbound_hop_void_args(&py, &[SomeValue::Impossible, w_dict.clone()]);
+        let args = py.graph.borrow().getargs();
+        let Hlvalue::Variable(self_arg) = &args[0] else {
+            panic!("getargs[0]");
+        };
+        assert!(
+            matches!(
+                self_arg.annotation.borrow().as_deref(),
+                Some(SomeValue::Impossible)
+            ),
+            "leading Instance self the hop erased is Impossible"
+        );
+        let Hlvalue::Variable(dict_arg) = &args[1] else {
+            panic!("getargs[1]");
+        };
+        assert!(
+            matches!(
+                dict_arg.annotation.borrow().as_deref(),
+                Some(SomeValue::Integer(_))
+            ),
+            "remaining hop slot binds w_dict"
+        );
     }
 
     fn build_indirect_graph() -> crate::model::FunctionGraph {
@@ -1861,6 +2158,14 @@ where
 
     // upstream: `vfn = hop.inputarg(self, arg=0)`.
     let vfn = hop.inputarg(self_repr, 0)?;
+
+    // ZST `self` / Void return holes on a skip-subject family graph —
+    // before `convert_to_concrete_llfn` (`getcallable` / `bindingrepr`)
+    // and `callparse.getrinputs`. Seed every row graph: `anygraph` is
+    // the callparse witness, `row[funcdesc]` is the getcallable graph.
+    for graph in row.row_of_graphs.values() {
+        seed_impossible_on_unbound_hop_void_args(graph, &args_s_full);
+    }
 
     // upstream: `vlist = [self.convert_to_concrete_llfn(vfn, shape, index, hop.llops)]`.
     //

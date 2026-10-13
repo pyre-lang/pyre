@@ -3775,6 +3775,11 @@ impl Bookkeeper {
     /// entry; unknown bare names fall to `Impossible`.
     pub fn project_struct_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
         let t = field_ty.trim();
+        // Fat `&dyn Trait` is `two_word_fat_struct` (`{data, len}`), not a
+        // classdef-less instance. `getitem` of that pair is FatData / FatLen.
+        if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(t) {
+            return super::classdesc::dyn_fat_field_annotation();
+        }
         // A `Vec` of one-word items is the raw `{ptr, len, cap}` header
         // `RustVecRepr` lowers, not an RPython list.
         if let Some(s_vec) = self.project_rust_vec(t) {
@@ -6178,6 +6183,24 @@ mod tests {
                 SomeValue::String(_)
             ),
             "Wtf8Buf shares the immutable string annotation"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("dyn DictStrategy"),
+                SomeValue::Tuple(_)
+            ),
+            "bare dyn Trait layout is two_word_fat_struct, not InstanceNone"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("&'static dyn DictStrategy"),
+                SomeValue::Tuple(_)
+            ),
+            "fat &dyn Trait layout is two_word_fat_struct"
+        );
+        assert!(
+            matches!(bk.project_struct_field_type("&dyn"), SomeValue::Tuple(_)),
+            "unresolved-trait &dyn layout is two_word_fat_struct"
         );
 
         let SomeValue::Instance(complex) = bk.project_struct_field_type("Complex<f64>") else {
