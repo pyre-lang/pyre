@@ -10142,6 +10142,17 @@ fn fuse_same_block_kind_ctor_raise(graph: &mut FunctionGraph) {
         }) else {
             continue;
         };
+        // The materialised exception is consumed by `op.type(evalue)` and
+        // the exceptblock link. Any other use would keep reading `evalue`
+        // after the materialiser is dropped.
+        let evalue_uses = count_var_uses(graph, evalue);
+        if evalue_uses.op_uses != 1 || evalue_uses.link_uses != 1 {
+            continue;
+        }
+        let etype_uses = count_var_uses(graph, etype);
+        if etype_uses.op_uses != 0 || etype_uses.link_uses != 1 {
+            continue;
+        }
         let OpKind::Call { args: mat_args, .. } = &block.operations[mat_idx].kind else {
             continue;
         };

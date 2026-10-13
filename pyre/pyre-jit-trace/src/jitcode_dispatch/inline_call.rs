@@ -1553,30 +1553,48 @@ fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> O
     None
 }
 
+/// Whether `info` is the static form of a residual the walk would not have
+/// to undo: no random effects, no `forces_virtual_or_virtualizable`, and
+/// empty write-descr sets (`writeanalyze.py` / `effectinfo.py`).
+///
+/// `effectinfo.py` blanks write descrs for elidable / loop-invariant
+/// (`EffectInfo.__new__`), so those extraeffects are already the empty
+/// write-set case. Match them first so a descr whose raw lists are still
+/// `None` (the `frozenset_or_none` image of no writes) stays rewindable.
+/// A `not_in_trace` callee is exempt for a different reason: what has to
+/// hold is not that the call left nothing behind, but that calling it
+/// again is harmless, because a rolled-back walk is another trace attempt
+/// and the region will be walked again.  `rlib/jit.py not_in_trace` states
+/// the contract that makes that true — the call is still made "by the jit
+/// tracing and blackholing, but not by the final assembler".
+pub(crate) fn extra_info_is_rewindable_allocation(info: &majit_ir::EffectInfo) -> bool {
+    if info.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
+        return true;
+    }
+    if matches!(
+        info.extraeffect,
+        majit_ir::ExtraEffect::ElidableCannotRaise
+            | majit_ir::ExtraEffect::ElidableCanRaise
+            | majit_ir::ExtraEffect::ElidableOrMemoryError
+            | majit_ir::ExtraEffect::LoopInvariant
+    ) {
+        return true;
+    }
+    if info.has_random_effects() || info.check_forces_virtual_or_virtualizable() {
+        return false;
+    }
+    let empty_writes = |s: &Option<Vec<_>>| s.as_ref().is_none_or(|v| v.is_empty());
+    empty_writes(&info._write_descrs_fields)
+        && empty_writes(&info._write_descrs_arrays)
+        && empty_writes(&info._write_descrs_interiorfields)
+}
+
 /// Whether the residual call behind `descr_index` applies no effect the walk
 /// would have to undo, by the call's own effectinfo.
 ///
-/// An elidable or loop-invariant callee writes no live heap.  A
-/// `not_in_trace` callee is exempt for a different reason: what has to hold
-/// is not that the call left nothing behind, but that calling it again is
-/// harmless, because a rolled-back walk is another trace attempt and the
-/// region will be walked again.  `rlib/jit.py not_in_trace` states the
-/// contract that makes that true — the call is still made "by the jit tracing
-/// and blackholing, but not by the final assembler", so a callee already owes
-/// the same answer once per attempt whether or not any attempt is undone, and
-/// the tracer alone decides how many attempts there are.  pyre's one such
-/// callee, `ensure_object_subclass_ranges_initialized`, is a `OnceLock`
-/// initializer, which is that property in its strongest form.
-///
-/// A `CanRaise` residual with a known-empty write set is a rewindable
-/// allocation: the call may allocate (and the raise consumes the result) but
-/// it does not mutate existing heap, so a rewind discards the object.
-/// Identity-elidable folding is a separate property (`EF_ELIDABLE_*`);
-/// constructors stay `CanRaise` so `record_result_of_call_pure` cannot
-/// ConstPtr-fold the recording-time instance.
-///
-/// Anything else keeps the scan's conservative reading of an executed
-/// residual call as effectful.
+/// The walk's odometer (`fbw_bump_executed_effect`) counts an executed
+/// residual that writes live heap, has random effects, or forces a frame.
+/// [`extra_info_is_rewindable_allocation`] is the static form of that.
 fn residual_call_is_effect_free(descr_index: usize) -> bool {
     let descrs = crate::jitcode_runtime::descr_ref_table();
     let Some(descr) = descrs.at(descr_index) else {
@@ -1586,31 +1604,6 @@ fn residual_call_is_effect_free(descr_index: usize) -> bool {
         return false;
     };
     extra_info_is_rewindable_allocation(call.get_extra_info())
-}
-
-/// Effectinfo shape of a residual the descent scan may rewind: elidable /
-/// loop-invariant / `not_in_trace`, or `CanRaise` with known-empty writes.
-pub(crate) fn extra_info_is_rewindable_allocation(info: &majit_ir::EffectInfo) -> bool {
-    info.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace
-        || matches!(
-            info.extraeffect,
-            majit_ir::ExtraEffect::ElidableCannotRaise
-                | majit_ir::ExtraEffect::ElidableCanRaise
-                | majit_ir::ExtraEffect::ElidableOrMemoryError
-                | majit_ir::ExtraEffect::LoopInvariant
-        )
-        || (info.extraeffect == majit_ir::ExtraEffect::CanRaise
-            && !info.can_invalidate
-            && write_descr_sets_known_empty(info))
-}
-
-fn write_descr_sets_known_empty(info: &majit_ir::EffectInfo) -> bool {
-    fn known_empty(set: &Option<Vec<majit_ir::DescrRef>>) -> bool {
-        matches!(set, Some(v) if v.is_empty())
-    }
-    known_empty(&info._write_descrs_fields)
-        && known_empty(&info._write_descrs_arrays)
-        && known_empty(&info._write_descrs_interiorfields)
 }
 
 /// The arm targets of the `switch/id` whose descr is `descr_index`, in key
@@ -15431,17 +15424,16 @@ fn descend_generatorentry<Sym: WalkSym>(
     if raised != 0 {
         // A returning generator raises `StopIteration` out of `send_ex`.
         // The executor already returned that exception word.
-        // `execute_raised(..., constant=False)` then
-        // `handle_possible_exception`: SubRaise carries the GUARD_EXCEPTION
-        // result, not ConstPtr of the recording-time instance.
-        let exc = ctx.trace_ctx.const_ref(raised);
+        // `execute_ll_raised(..., constant=False)` then
+        // `handle_possible_exception`: `last_exc_box` is the
+        // `GUARD_EXCEPTION` result.
         let exc_concrete = ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
-        ctx.set_last_exc_value(exc, exc_concrete);
+        ctx.set_last_exc_value_concrete(exc_concrete);
         ctx.fbw_mode.class_of_last_exc_is_const = false;
         walker_record_guard_exception(ctx, op.pc)?;
         let exc = ctx
             .last_exc_value()
-            .expect("walker_record_guard_exception seeds last_exc_value");
+            .expect("handle_possible_exception seeds last_exc_value");
         let exc_concrete = ctx.last_exc_value_concrete();
         return Ok(Some((
             DispatchOutcome::SubRaise { exc, exc_concrete },

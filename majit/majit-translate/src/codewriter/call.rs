@@ -26,7 +26,6 @@ use crate::parse::CallPath;
 use crate::policy::JitPolicy;
 use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{AnalyzerResult, Dependency, DependencyTracker};
-use crate::translator::rtyper::call_registry::{FunctionPathKey, is_exception_object_materializer};
 
 // Decline-census gate names.  Declared in `crate::decline::gate` so a
 // gate name cannot exist without the recorder that consumes it; aliased
@@ -679,6 +678,10 @@ struct FreshMallocs {
 }
 
 impl FreshMallocs {
+    /// `FreshMallocs.__init__(self, graph)` (`writeanalyze.py`): only
+    /// `malloc` / `malloc_varsize` / `new` results, and `cast_pointer` /
+    /// `same_as` of them, stay fresh. Every other op result, calls included,
+    /// is `nonfresh`. There is no interprocedural freshness.
     fn new(graph: &FunctionGraph) -> Self {
         let mut this = Self {
             graph_name: graph.name.clone(),
@@ -8091,16 +8094,6 @@ impl CallControl {
         Some((path, graph))
     }
 
-    /// `call_registry::is_exception_object_materializer` on the spelled path.
-    fn target_is_exception_object_materializer(&self, target: &CallTarget) -> bool {
-        let Some(path) = self.target_to_path(target) else {
-            return false;
-        };
-        is_exception_object_materializer(&FunctionPathKey::from_segments(
-            path.segments.iter().cloned(),
-        ))
-    }
-
     /// Convert a CallTarget to a CallPath for lookup.
     ///
     /// A direct call resolves by the canonical path the caller's FunDecl
@@ -10193,37 +10186,13 @@ impl CallControl {
         }
 
         // RPython call.py:282-286: random_effects + can_invalidate.
-        //
-        // Exception-object materialisers (`pyerror_*_to_exc_object`) are the
-        // fused residual of `PyError::<kind>(msg)` + `to_exc_object`. They
-        // allocate a fresh exception instance the raise consumes. A rewind
-        // discards the allocation, and the raise uses the result so the call
-        // is not dropped — the rewindable-allocation contract
-        // `residual_call_is_effect_free` gives a CanRaise residual with a
-        // known-empty write set. They are not identity-elidable: folding
-        // them to ConstPtr reuses the recording-time instance across
-        // compiled iterations (`history.rs record_result_of_call_pure`).
-        // `RandomEffectsAnalyzer` of the `dont_look_inside` stub, or a top
-        // write set, would otherwise force `EF_RANDOM_EFFECTS` and the
-        // descent scan would treat the fused residual as an effect.
-        let materializer = match shape {
-            CallShape::Direct(target) => self.target_is_exception_object_materializer(target),
-            CallShape::Indirect(_) => false,
-        };
-        let random_effects = if materializer {
-            false
-        } else {
-            match shape {
-                CallShape::Direct(target) => self.cached_random_effects(target, cache),
-                CallShape::Indirect(graphs) => self.cached_random_effects_family(graphs, cache),
-            }
+        let random_effects = match shape {
+            CallShape::Direct(target) => self.cached_random_effects(target, cache),
+            CallShape::Indirect(graphs) => self.cached_random_effects_family(graphs, cache),
         };
         let mut extraeffect = extraeffect;
         if random_effects {
             extraeffect = Some(ExtraEffect::RandomEffects);
-        }
-        if materializer && extraeffect.is_none() {
-            extraeffect = Some(ExtraEffect::CanRaise);
         }
         let can_invalidate = random_effects
             || match shape {
@@ -10368,23 +10337,13 @@ impl CallControl {
                     .join(",")
             ),
         };
-        let effects = if materializer {
-            // Empty write set: a top image would force `EF_RANDOM_EFFECTS`
-            // in `effectinfo_from_writeanalyze` and undo the CanRaise mark.
-            ReadWriteEffects::bottom_result()
-        } else {
-            match shape {
-                CallShape::Direct(target) => self.cached_readwrite(target, cache),
-                CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
-            }
+        let effects = match shape {
+            CallShape::Direct(target) => self.cached_readwrite(target, cache),
+            CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
         };
-        let can_collect = if materializer {
-            true
-        } else {
-            match shape {
-                CallShape::Direct(target) => self.cached_can_collect(target, cache),
-                CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
-            }
+        let can_collect = match shape {
+            CallShape::Direct(target) => self.cached_can_collect(target, cache),
+            CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
         };
         // `call.py` `getcalldescr`: `tgt_func, tgt_saveerr =
         // func._call_aroundstate_target_` then
@@ -16595,19 +16554,44 @@ mod tests {
         );
     }
 
-    /// Fused `pyerror_*_to_exc_object` residuals are rewindable allocations
-    /// (`residual_call_is_effect_free`): `getcalldescr` must not collapse
-    /// them to `EF_RANDOM_EFFECTS`, and must not mark them identity-elidable
-    /// (`record_result_of_call_pure` would ConstPtr-fold the recording instance).
+    /// `getcalldescr` (`call.py`) derives extraeffect from the callee:
+    /// a fused `pyerror_*_to_exc_object` residual is not elidable. A
+    /// `setfield` on the object the callee just allocated is not a write
+    /// (`WriteAnalyzer.analyze_simple_operation` / `is_fresh_malloc`).
     #[test]
-    fn exception_object_materializer_is_can_raise() {
+    fn exception_object_materializer_derives_effects_from_callee() {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments([
             "pyre_interpreter",
             "error",
             "pyerror_value_error_to_exc_object",
         ]);
-        cc.register_function_graph(path, simple_graph("pyerror_value_error_to_exc_object"));
+        let mut graph = FunctionGraph::new("pyerror_value_error_to_exc_object");
+        let entry = graph.startblock;
+        let fresh = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "W_ValueError".to_string(),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: fresh.clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "w_msg",
+                    Some("W_ValueError".to_string()),
+                ),
+                value: LinkArg::Value(fresh.clone()),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(entry, Some(fresh));
+        cc.register_function_graph(path, graph);
         cc.find_all_graphs_for_tests();
 
         let target = CallTarget::function_path([
@@ -16619,21 +16603,27 @@ mod tests {
         let descriptor = cc.getcalldescr(
             &direct_call_op(target),
             Vec::new(),
-            Type::Void,
+            Type::Ref,
             OopSpecIndex::None,
             None,
             &mut cache,
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+        assert!(!descriptor.extra_info.has_random_effects());
+        assert!(
+            !descriptor
+                .extra_info
+                .check_forces_virtual_or_virtualizable()
+        );
+        assert!(
+            descriptor
+                .extra_info
+                ._write_descrs_fields
+                .as_ref()
+                .is_some_and(|v| v.is_empty())
+        );
         assert!(descriptor.extra_info.can_collect);
-        assert!(!descriptor.extra_info.can_invalidate);
-        let writes = descriptor
-            .extra_info
-            ._write_descrs_fields
-            .as_ref()
-            .expect("materializer write set is known, not the random-effects wildcard");
-        assert!(writes.is_empty());
     }
 
     #[test]

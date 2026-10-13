@@ -2129,24 +2129,6 @@ fn instance_is_virtualizable(inst: &SomeInstance) -> bool {
     })
 }
 
-/// Seed `access_directly` on a virtualizable instance the way
-/// `specialize.py default_specialize` sees flagged `args_s` from a caller.
-///
-/// AccessDirect two-phase subjects are annotated as independent roots;
-/// there is no pycall carrying the flag. A graph cloned with
-/// `access_directly = True` still has to mint the same flag on its
-/// virtualizable formals so the subject's body is the AccessDirect
-/// specialization.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn stamp_access_directly_on_virtualizable(s: &mut SomeValue) {
-    let SomeValue::Instance(inst) = s else {
-        return;
-    };
-    if instance_is_virtualizable(inst) {
-        inst.flags.insert("access_directly".to_string(), true);
-    }
-}
-
 /// Bind `access_directly` / `fresh_virtualizable` onto a reconstructed
 /// startblock cell the way `annrpython.py bindinputargs` copies the
 /// actual's `SomeInstance.flags`. The recorded formal ids
@@ -3172,22 +3154,6 @@ mod tests {
         let s = instance_of(&bk, "PyFrame", true, &[]);
         let out = hint_virtualizable_flags(&[Some(s)], false);
         assert_eq!(flags_of(&out), vec!["access_directly".to_string()]);
-    }
-
-    #[test]
-    fn stamp_access_directly_flags_a_virtualizable_instance() {
-        let bk = bk();
-        let mut s = instance_of(&bk, "PyFrame", true, &[]);
-        stamp_access_directly_on_virtualizable(&mut s);
-        assert_eq!(flags_of(&s), vec!["access_directly".to_string()]);
-    }
-
-    #[test]
-    fn stamp_access_directly_leaves_a_non_virtualizable_instance() {
-        let bk = bk();
-        let mut s = instance_of(&bk, "Plain", false, &[]);
-        stamp_access_directly_on_virtualizable(&mut s);
-        assert!(flags_of(&s).is_empty());
     }
 
     /// `annrpython.py bindinputargs` copies the actual's flags onto the

@@ -6148,11 +6148,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // consumed value into TLS as well.  An
             // uncaught raise is carried by the trace's exception FINISH; an
             // aborted walk re-executes the live opcode.
-            let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
-            ctx.set_last_exc_value(
-                bh_exc_box,
-                ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
-            );
+            //
+            // `execute_ll_raised(llexception, constant=False)` writes only
+            // `last_exc_value` (the concrete) and the flag.  `last_exc_box` is
+            // the `GUARD_EXCEPTION` result `handle_possible_exception` assigns
+            // when the class is not already const — never `ConstPtr` of this
+            // recording-time object.
+            ctx.set_last_exc_value_concrete(ConcreteValue::Ref(
+                bh_exc as usize as pyre_object::PyObjectRef,
+            ));
             // `execute_raised(..., constant=False)`:
             // a residual exception has not had its class proven by a guard yet.
             ctx.fbw_mode.class_of_last_exc_is_const = false;
@@ -11297,11 +11301,12 @@ fn cond_record_handle_exception<Sym: WalkSym>(
         v
     });
     if bh_exc != 0 {
-        let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
-        ctx.set_last_exc_value(
-            bh_exc_box,
-            ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
-        );
+        // `execute_ll_raised(..., constant=False)`: concrete + flag only.
+        // `handle_possible_exception` then sets `last_exc_box` to the
+        // `GUARD_EXCEPTION` result.
+        ctx.set_last_exc_value_concrete(ConcreteValue::Ref(
+            bh_exc as usize as pyre_object::PyObjectRef,
+        ));
         ctx.fbw_mode.class_of_last_exc_is_const = false;
         if let Some(cb) = crate::callbacks::try_get() {
             (cb.drain_backend_jit_exc)();
