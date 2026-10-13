@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use majit_charon_reader::ullbc::{Signature, TyRef, strip_cleanup_blocks};
+use majit_charon_reader::ullbc::{Signature, TyRef};
 use majit_charon_reader::{FunDecl, Llbc, Unstructured};
 use serde::Deserialize;
 use serde_json::Value;
@@ -256,14 +256,16 @@ pub(crate) fn substituted_unstructured(
         #[serde(rename = "Unstructured")]
         unstructured: Unstructured,
     }
-    // FunDecl::unstructured runs strip_cleanup_blocks before the template
-    // lowers. A spec copy deserializes substituted JSON and would keep
-    // rustc unwind cleanup, so the i64 instantiation of
-    // RDict::lookup_for_store never becomes a graph. getkind banks the
-    // substituted &i64 key as int (lltype.Ptr with _gckind == 'raw').
+    // FunDecl::unstructured keeps cleanup blocks at their original
+    // indices; every scan uses `forward_reachable_mask`. A spec copy
+    // that stripped them would lower a different CFG than the template.
+    // Unreachable cleanup is skipped the same way on both paths, so the
+    // i64 instantiation of RDict::lookup_for_store still becomes a graph.
+    // getkind banks the substituted &i64 key as int (lltype.Ptr with
+    // _gckind == 'raw').
     serde_json::from_value::<Proj>(value)
         .ok()
-        .map(|proj| strip_cleanup_blocks(proj.unstructured))
+        .map(|proj| proj.unstructured)
 }
 
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
@@ -1736,11 +1738,11 @@ mod tests {
         assert_eq!(llbc.dedup_const_body(11), Some(&const_body));
     }
 
-    /// FunDecl::unstructured strips rustc unwind cleanup. A spec copy
-    /// that skipped that strip kept lookup_for_store's i64 body as
-    /// unwind cleanup and never built a graph.
+    /// FunDecl::unstructured keeps rustc unwind cleanup at its original
+    /// indices. A spec copy must keep the same CFG; `forward_reachable_mask`
+    /// skips unreachable cleanup on both paths.
     #[test]
-    fn substituted_unstructured_strips_cleanup_blocks() {
+    fn substituted_unstructured_keeps_cleanup_blocks() {
         let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
         let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let body = json!({
@@ -1778,12 +1780,14 @@ mod tests {
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
         let fd = llbc.fn_by_id(0).expect("lookup_for_store");
+        let template = fd.unstructured().expect("template");
         let copied =
             substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[]).expect("substituted body");
-        assert!(
-            copied.body.iter().all(|bb| !bb.is_cleanup),
-            "spec copy must strip cleanup the way FunDecl::unstructured does"
-        );
+        assert_eq!(copied.body.len(), template.body.len());
+        assert_eq!(copied.body.len(), 2);
+        assert!(!copied.body[0].is_cleanup);
+        assert!(copied.body[1].is_cleanup);
+        assert!(template.body[1].is_cleanup);
     }
 
     /// Nested `type T = U` aliases expand on the residual path only.
