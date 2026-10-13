@@ -56,3 +56,20 @@ pub const ARGUMENTS_GPR: &[RegLoc] = &[ECX, EDX, R8, R9];
 pub const ARGUMENTS_XMM: &[RegLoc] = &[XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7];
 #[cfg(target_os = "windows")]
 pub const ARGUMENTS_XMM: &[RegLoc] = &[XMM0, XMM1, XMM2, XMM3];
+
+/// `follow_jump`: if `addr` starts with `E9 rel32`, step to that target
+/// and repeat. Any other leading byte, including `EB`, stops the walk.
+/// `CallBuilderX86.__init__` does this for an immediate `fnloc`.
+pub fn follow_jump(addr: i64) -> i64 {
+    let mut addr = addr as u64;
+    loop {
+        let ptr = addr as *const u8;
+        let byte = unsafe { ptr.read() };
+        if byte != 0xE9 {
+            break;
+        }
+        let rel = unsafe { ptr.add(1).cast::<i32>().read_unaligned() };
+        addr = addr.wrapping_add(5).wrapping_add(i64::from(rel) as u64);
+    }
+    addr as i64
+}

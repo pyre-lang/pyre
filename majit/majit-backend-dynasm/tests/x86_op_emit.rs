@@ -3200,9 +3200,24 @@ fn bridge_frame_depth_skips_when_deep() {
 }
 
 /// Enter a finish loop from inline asm and check every callee-saved GPR
-/// `_call_header` / `_call_footer` own. Win64 includes r13 (`SAVED_R13_OFS`).
+/// `_call_header` / `_call_footer` own. Win64's set is ebx, esi, edi, r12,
+/// r14, r15. r13 is not in that set (`arch.py` "never use r13") and the
+/// trace does not write it, so the caller's value survives without a home.
 /// The 32-byte shadow is inside the `sub rsp, 128` area.
 fn call_finish_preserves_callee_saves(token: &JitCellToken, depth: usize, input: i64) {
+    #[cfg(target_os = "windows")]
+    {
+        // Old r13 home: `(FRAME_FIXED_SIZE - 1) * WORD` == 0xA0.
+        // `mov [rsp+0xA0], r13` / `mov r13, [rsp+0xA0]`.
+        let code = compiled_bytes(token);
+        assert!(
+            !code.windows(8).any(|window| {
+                window == [0x4C, 0x89, 0xAC, 0x24, 0xA0, 0x00, 0x00, 0x00]
+                    || window == [0x4C, 0x8B, 0xAC, 0x24, 0xA0, 0x00, 0x00, 0x00]
+            }),
+            "Win64 frame must not save or restore r13"
+        );
+    }
     let clt = token.compiled_loop_token().expect("compiled loop token");
     let bytes = majit_backend::jitframe::JitFrame::alloc_size(depth);
     let head = majit_backend::llmodel::take_or_alloc_parked_entry_frame(token, bytes);
@@ -4798,5 +4813,553 @@ fn singlefloat_casts_round_trip_bits() {
         singlefloat_roundtrip(0.1).to_bits(),
         0.1f64.to_bits(),
         "0.1 must take the f32 rounding, not pass the f64 through"
+    );
+}
+
+/// `mov r11, imm; call r11` (`_load_scratch` + `CALL_r(X86_64_SCRATCH_REG)`),
+/// matching `rx86::mov_ri` into r11.
+fn r11_imm_call(addr: i64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if (0..=0xFFFF_FFFF).contains(&addr) {
+        // `MOV_riu32` of r11: REX.B, `B8+3`, imm32.
+        bytes.extend_from_slice(&[0x41, 0xBB]);
+        bytes.extend_from_slice(&(addr as u32).to_le_bytes());
+    } else if (i32::MIN as i64..=i32::MAX as i64).contains(&addr) {
+        // `MOV_ri32` of r11: REX.W|REX.B, `C7 /0`, imm32.
+        bytes.extend_from_slice(&[0x49, 0xC7, 0xC3]);
+        bytes.extend_from_slice(&(addr as i32).to_le_bytes());
+    } else {
+        // `MOV_ri64` of r11: REX.W|REX.B, `B8+3`, imm64.
+        bytes.extend_from_slice(&[0x49, 0xBB]);
+        bytes.extend_from_slice(&addr.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0x41, 0xFF, 0xD3]);
+    bytes
+}
+
+/// Thread-local load immediately followed by the callee call. `_load_scratch`
+/// is `MOV_ri` when r11 is unknown and `LEA r11, [r11+disp]` when a cached
+/// scratch value is near the target.
+fn threadlocal_then_scratch_call(code: &[u8], addr: i64) -> bool {
+    let threadlocal = threadlocal_arg1_load();
+    let exact = r11_imm_call(addr);
+    let need = threadlocal.len() + exact.len();
+    code.windows(need).any(|window| {
+        if !window.starts_with(&threadlocal) {
+            return false;
+        }
+        let rest = &window[threadlocal.len()..];
+        rest.starts_with(&exact)
+            || matches!(
+                rest,
+                [0x4D, 0x8D, 0x5B, _, 0x41, 0xFF, 0xD3, ..]
+                    | [0x4D, 0x8D, 0x9B, _, _, _, _, 0x41, 0xFF, 0xD3, ..]
+            )
+    })
+}
+
+/// `mov ARGUMENTS_GPR[1], [rsp + THREADLOCAL_OFS]`.
+fn threadlocal_arg1_load() -> Vec<u8> {
+    use majit_backend_dynasm::x86::arch::THREADLOCAL_OFS;
+    use majit_backend_dynasm::x86::callbuilder::ARGUMENTS_GPR;
+    let reg = ARGUMENTS_GPR[1].value;
+    let modrm = 0x80 | ((reg & 7) << 3) | 0x04;
+    let mut bytes = vec![0x48, 0x8B, modrm, 0x24];
+    bytes.extend_from_slice(&(THREADLOCAL_OFS as i32).to_le_bytes());
+    bytes
+}
+
+#[test]
+fn call_assembler_frame_goes_straight_into_arg0() {
+    // `_call_assembler_emit_call` → `simple_call(addr, [argloc, threadlocal_loc])`.
+    // `handle_call_assembler` leaves the callee frame in ecx. On Win64 that
+    // register is `ARGUMENTS_GPR[0]`, so the remap is a self-move and the
+    // bytes before the callee call are only the thread-local load.
+    let mut backend = backend_with_call_assembler_layout();
+    let int_callee = compile_identity_loop(&mut backend, Type::Int);
+    let int_inputs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = int_inputs[0].opref();
+    let int_token = JitCellToken::new(next_token_id());
+    let int_call = Op::new(OpCode::CallAssemblerI, &[rb(i0)]);
+    int_call.pos().set(OpRef::int_op(1));
+    int_call.setdescr(Arc::new(AssemblerLoopDescr {
+        token: Arc::clone(&int_callee),
+    }) as DescrRef);
+    let int_ops = vec![
+        OpRc::new(int_call),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&int_inputs, &int_ops, &int_token)
+        .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER_I: {err:?}"));
+    let int_frame = backend.execute_token(&int_token, &[Value::Int(42)]);
+    assert!(backend.get_latest_descr(&int_frame).is_finish());
+    assert_eq!(backend.get_int_value(&int_frame, 0), 42);
+
+    let code = compiled_bytes(&int_token);
+    let addr =
+        majit_backend_dynasm::x86::callbuilder::follow_jump(int_callee.ll_function_addr() as i64);
+    let threadlocal = threadlocal_arg1_load();
+    assert!(
+        threadlocal_then_scratch_call(code, addr),
+        "thread-local load must sit directly against the callee call"
+    );
+    for hop in [[0x48, 0x89, 0xC8], [0x48, 0x89, 0xC1], [0x48, 0x89, 0xC9]] {
+        let mut prefixed = hop.to_vec();
+        prefixed.extend_from_slice(&threadlocal);
+        assert!(
+            !code
+                .windows(prefixed.len())
+                .any(|window| window == prefixed.as_slice()),
+            "frame must not hop through rax ahead of the thread-local load: {hop:02x?}"
+        );
+    }
+    let _keep = int_callee;
+}
+
+extern "C" fn indirect_const() -> i64 {
+    99
+}
+
+extern "C" fn indirect_id(x: i64) -> i64 {
+    x
+}
+
+extern "C" fn indirect_sum4(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    a + b + c + d
+}
+
+extern "C" fn read_errno_and_stamp(stamp: i64) -> i64 {
+    let old = unsafe { *errno_ptr() } as i64;
+    unsafe {
+        *errno_ptr() = (stamp as i32).wrapping_add(1);
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        majit_rlib::rwin32::_SetLastError((stamp as u32).wrapping_add(3));
+    }
+    old.wrapping_add(stamp)
+}
+
+fn indirect_errno_flags() -> i64 {
+    let flags = majit_jitcode::rffi::RFFI_READSAVED_ERRNO | majit_jitcode::rffi::RFFI_SAVE_ERRNO;
+    #[cfg(target_os = "windows")]
+    {
+        flags
+            | majit_jitcode::rffi::RFFI_READSAVED_LASTERROR
+            | majit_jitcode::rffi::RFFI_SAVE_LASTERROR
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        flags
+    }
+}
+
+/// `mov r13, rax` / `mov rax, r13`: the per-call park around `write_real_errno`.
+fn assert_no_rax_fnloc_park(code: &[u8]) {
+    assert!(
+        !code.windows(3).any(|window| window == [0x49, 0x89, 0xC5]),
+        "mov r13, rax must not park the call target"
+    );
+    assert!(
+        !code.windows(3).any(|window| window == [0x4C, 0x89, 0xE8]),
+        "mov rax, r13 must not reload the call target"
+    );
+}
+
+fn assert_has(code: &[u8], needle: &[u8], what: &str) {
+    assert!(
+        code.windows(needle.len()).any(|window| window == needle),
+        "{what} missing: {needle:02x?}"
+    );
+}
+
+fn assert_no_call_rax(code: &[u8]) {
+    for (i, window) in code.windows(2).enumerate() {
+        if window == [0xFF, 0xD0] {
+            let rex = i > 0 && code[i - 1] == 0x41;
+            assert!(rex, "residual fnloc must not be `call rax` at {i}");
+        }
+    }
+}
+
+/// `CALL reg` (`FF /2`). `r8`–`r15` take a REX.B prefix.
+fn call_reg_bytes(reg: u8) -> Vec<u8> {
+    if reg < 8 {
+        vec![0xFF, 0xD0 + reg]
+    } else {
+        vec![0x41, 0xFF, 0xD0 + (reg - 8)]
+    }
+}
+
+fn arg_gpr_call(index: usize) -> Vec<u8> {
+    call_reg_bytes(majit_backend_dynasm::x86::callbuilder::ARGUMENTS_GPR[index].value)
+}
+
+/// `CALL [rbp+ofs]` for input 0 (`get_ebp_ofs` / `CALL_b`).
+fn call_input0_frame() -> Vec<u8> {
+    let offset = majit_backend_dynasm::regalloc::get_ebp_ofs(
+        majit_backend::jitframe::FIRST_ITEM_OFFSET as i32,
+        0,
+    );
+    let mut bytes = vec![0xFF];
+    if (-128..=127).contains(&offset) {
+        bytes.push(0x55);
+        bytes.push(offset as u8);
+    } else {
+        bytes.push(0x95);
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+    bytes
+}
+
+/// `func_in_reg` is `IntAdd(input, 0)`, which `_consider_lea` leaves in a
+/// register. Otherwise the input stays a frame slot.
+fn compile_indirect_call(
+    func_in_reg: bool,
+    release_flags: Option<i64>,
+    real_args: &[Operand],
+    arg_types: Vec<Type>,
+) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let (add, func) = if func_in_reg {
+        let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(0))]);
+        add.pos().set(OpRef::int_op(1));
+        (Some(add), OpRef::int_op(1))
+    } else {
+        (None, i0)
+    };
+    let result = OpRef::int_op(2);
+    let mut args = Vec::new();
+    if let Some(flags) = release_flags {
+        args.push(rb(OpRef::const_int(flags)));
+    }
+    args.push(rb(func));
+    args.extend_from_slice(real_args);
+    let opcode = if release_flags.is_some() {
+        OpCode::CallReleaseGilI
+    } else {
+        OpCode::CallI
+    };
+    let call = Op::new(opcode, &args);
+    call.pos().set(result);
+    call.setdescr(call_descr(arg_types, Type::Int, true, 8));
+    let mut ops = Vec::new();
+    if let Some(add) = add {
+        ops.push(OpRc::new(add));
+    }
+    ops.push(OpRc::new(call));
+    ops.push(OpRc::new(finish_of(result, Type::Int, 3)));
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile indirect call: {err:?}"));
+    (backend, token)
+}
+
+#[test]
+fn residual_call_register_fnloc_is_call_reg() {
+    // No integer arguments: `prepare_arguments` places the fnloc in
+    // `ARGUMENTS_GPR[0]` (ecx on Win64). The `IntAdd` result already lives
+    // there, so the call is `call rcx` with no `mov rax`.
+    let (backend, token) = compile_indirect_call(true, None, &[], vec![]);
+    let frame = backend.execute_token(&token, &[Value::Int(indirect_const as usize as i64)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 99);
+    let code = compiled_bytes(&token);
+    assert_no_rax_fnloc_park(code);
+    assert_no_call_rax(code);
+    assert_has(code, &arg_gpr_call(0), "call ARGUMENTS_GPR[0]");
+
+    // One integer argument takes `ARGUMENTS_GPR[0]`, so the fnloc moves to
+    // `ARGUMENTS_GPR[1]` and the call is that register.
+    let (backend, token) =
+        compile_indirect_call(true, None, &[rb(OpRef::const_int(42))], vec![Type::Int]);
+    let frame = backend.execute_token(&token, &[Value::Int(indirect_id as usize as i64)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 42);
+    let code = compiled_bytes(&token);
+    assert_no_rax_fnloc_park(code);
+    assert_no_call_rax(code);
+    assert_has(code, &arg_gpr_call(1), "call ARGUMENTS_GPR[1]");
+
+    // Four integer arguments fill the Win64 GPRs, so the fnloc spills to
+    // `[rsp+32]`. SysV still has `r8` free (`ARGUMENTS_GPR[4]`).
+    let (backend, token) = compile_indirect_call(
+        true,
+        None,
+        &[
+            rb(OpRef::const_int(1)),
+            rb(OpRef::const_int(2)),
+            rb(OpRef::const_int(3)),
+            rb(OpRef::const_int(4)),
+        ],
+        vec![Type::Int; 4],
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(indirect_sum4 as usize as i64)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 10);
+    let code = compiled_bytes(&token);
+    assert_no_rax_fnloc_park(code);
+    assert_no_call_rax(code);
+    #[cfg(target_os = "windows")]
+    let spilled = vec![0xFF, 0x54, 0x24, 0x20];
+    #[cfg(not(target_os = "windows"))]
+    let spilled = arg_gpr_call(4);
+    assert_has(code, &spilled, "call spilled or fifth GPR fnloc");
+}
+
+#[test]
+fn residual_call_frame_fnloc_is_call_rbp() {
+    // The function pointer is an untouched input, so its location stays the
+    // frame slot. `emit_raw_call` is `CALL [rbp+ofs]`.
+    let expect = call_input0_frame();
+    let (backend, token) = compile_indirect_call(false, None, &[], vec![]);
+    let frame = backend.execute_token(&token, &[Value::Int(indirect_const as usize as i64)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 99);
+    let code = compiled_bytes(&token);
+    assert_no_rax_fnloc_park(code);
+    assert_no_call_rax(code);
+    assert_has(code, &expect, "call [rbp+input0]");
+
+    let (backend, token) =
+        compile_indirect_call(false, None, &[rb(OpRef::const_int(42))], vec![Type::Int]);
+    let frame = backend.execute_token(&token, &[Value::Int(indirect_id as usize as i64)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 42);
+    let code = compiled_bytes(&token);
+    assert_no_rax_fnloc_park(code);
+    assert_no_call_rax(code);
+    assert_has(code, &expect, "call [rbp+input0]");
+}
+
+#[test]
+fn residual_call_fnloc_survives_errno_and_lasterror() {
+    // `write_real_errno` / `read_real_errno`, including Win64
+    // `RFFI_READSAVED_LASTERROR` / `RFFI_SAVE_LASTERROR`. The fnloc is not
+    // sitting in rax across that sequence.
+    let stamp = 100;
+    let flags = indirect_errno_flags();
+    unsafe {
+        *errno_ptr() = 7;
+    }
+    majit_rlib::rposix::set_saved_errno(41);
+    #[cfg(target_os = "windows")]
+    majit_rlib::rwin32::SetLastError_saved(41);
+
+    let (backend, token) = compile_indirect_call(
+        true,
+        Some(flags),
+        &[rb(OpRef::const_int(stamp))],
+        vec![Type::Int],
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(read_errno_and_stamp as usize as i64)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 41 + stamp);
+    assert_eq!(majit_rlib::rposix::get_saved_errno(), (stamp as i32) + 1);
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        majit_rlib::rwin32::GetLastError_saved(),
+        i64::from(stamp as u32 + 3)
+    );
+    let code = compiled_bytes(&token);
+    assert_no_rax_fnloc_park(code);
+    assert_has(
+        code,
+        &arg_gpr_call(1),
+        "call ARGUMENTS_GPR[1] after write_real_errno",
+    );
+
+    unsafe {
+        *errno_ptr() = 7;
+    }
+    majit_rlib::rposix::set_saved_errno(41);
+    #[cfg(target_os = "windows")]
+    majit_rlib::rwin32::SetLastError_saved(41);
+    let (backend, token) = compile_indirect_call(
+        false,
+        Some(flags),
+        &[rb(OpRef::const_int(stamp))],
+        vec![Type::Int],
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(read_errno_and_stamp as usize as i64)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 41 + stamp);
+    assert_eq!(majit_rlib::rposix::get_saved_errno(), (stamp as i32) + 1);
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        majit_rlib::rwin32::GetLastError_saved(),
+        i64::from(stamp as u32 + 3)
+    );
+    let code = compiled_bytes(&token);
+    assert_no_rax_fnloc_park(code);
+    assert_has(code, &call_input0_frame(), "call [rbp+input0]");
+}
+
+fn e9_rel32(from: u64, to: u64) -> [u8; 5] {
+    let rel = (to as i64).wrapping_sub(from.wrapping_add(5) as i64) as i32;
+    let mut bytes = [0xE9, 0, 0, 0, 0];
+    bytes[1..].copy_from_slice(&rel.to_le_bytes());
+    bytes
+}
+
+fn mov_eax_imm32_ret(value: i32) -> [u8; 6] {
+    let mut bytes = [0xB8, 0, 0, 0, 0, 0xC3];
+    bytes[1..5].copy_from_slice(&value.to_le_bytes());
+    bytes
+}
+
+fn alloc_rwx(size: usize) -> *mut u8 {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        unsafe extern "system" {
+            fn VirtualAlloc(
+                addr: *mut core::ffi::c_void,
+                size: usize,
+                alloc_type: u32,
+                protect: u32,
+            ) -> *mut u8;
+        }
+        let page = VirtualAlloc(core::ptr::null_mut(), size, 0x1000 | 0x2000, 0x40);
+        assert!(!page.is_null(), "VirtualAlloc");
+        page
+    }
+    #[cfg(not(target_os = "windows"))]
+    unsafe {
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut core::ffi::c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut u8;
+        }
+        #[cfg(target_os = "linux")]
+        const MAP_ANON: i32 = 0x20;
+        #[cfg(target_os = "macos")]
+        const MAP_ANON: i32 = 0x1000;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        const MAP_ANON: i32 = 0x20;
+        let page = mmap(core::ptr::null_mut(), size, 1 | 2 | 4, 2 | MAP_ANON, -1, 0);
+        assert!(!page.is_null() && page as usize != usize::MAX, "mmap");
+        page
+    }
+}
+
+fn publish_code(page: *mut u8, bytes: &[u8]) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), page, bytes.len());
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        unsafe extern "system" {
+            fn FlushInstructionCache(
+                process: *mut core::ffi::c_void,
+                addr: *const u8,
+                size: usize,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        }
+        FlushInstructionCache(GetCurrentProcess(), page, bytes.len());
+    }
+}
+
+fn run_immediate_call(func: i64) -> (i64, Vec<u8>) {
+    let (backend, token) = compile_call(
+        OpCode::CallI,
+        func,
+        &[],
+        vec![],
+        OpRef::int_op(1),
+        Type::Int,
+        true,
+        8,
+    );
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    (
+        backend.get_int_value(&frame, 0),
+        compiled_bytes(&token).to_vec(),
+    )
+}
+
+#[test]
+fn follow_jump_calls_the_final_e9_target() {
+    // Two leading `E9 rel32` jumps, then `mov eax, 123; ret`.
+    // `follow_jump` calls the body, not either thunk.
+    let page = alloc_rwx(4096);
+    let base = page as u64;
+    let mut bytes = vec![0x90u8; 64];
+    bytes[0..5].copy_from_slice(&e9_rel32(base, base + 16));
+    bytes[16..21].copy_from_slice(&e9_rel32(base + 16, base + 32));
+    bytes[32..38].copy_from_slice(&mov_eax_imm32_ret(123));
+    publish_code(page, &bytes);
+
+    let thunk = base as i64;
+    let mid = base.wrapping_add(16) as i64;
+    let final_addr = base.wrapping_add(32) as i64;
+    assert_eq!(
+        majit_backend_dynasm::x86::callbuilder::follow_jump(thunk),
+        final_addr
+    );
+    let (got, code) = run_immediate_call(thunk);
+    assert_eq!(got, 123);
+    assert_has(&code, &r11_imm_call(final_addr), "call followed E9 target");
+    assert!(
+        !code
+            .windows(r11_imm_call(thunk).len())
+            .any(|window| window == r11_imm_call(thunk)),
+        "call must not use the first thunk"
+    );
+    assert!(
+        !code
+            .windows(r11_imm_call(mid).len())
+            .any(|window| window == r11_imm_call(mid)),
+        "call must not stop after one E9"
+    );
+}
+
+#[test]
+fn follow_jump_stops_on_a_non_e9_prefix() {
+    // `EB 05` skips an `E9` to the wrong body and lands on an `E9` to
+    // `mov eax, 123; ret`. Only a leading `E9` is followed, so the
+    // immediate is the thunk itself.
+    let page = alloc_rwx(4096);
+    let base = page as u64;
+    let mut bytes = vec![0x90u8; 64];
+    bytes[0] = 0xEB;
+    bytes[1] = 0x05;
+    bytes[2..7].copy_from_slice(&e9_rel32(base + 2, base + 48));
+    bytes[7..12].copy_from_slice(&e9_rel32(base + 7, base + 32));
+    bytes[32..38].copy_from_slice(&mov_eax_imm32_ret(123));
+    bytes[48..54].copy_from_slice(&mov_eax_imm32_ret(456));
+    publish_code(page, &bytes);
+
+    let thunk = base as i64;
+    let wrong = base.wrapping_add(48) as i64;
+    let real = base.wrapping_add(32) as i64;
+    assert_eq!(
+        majit_backend_dynasm::x86::callbuilder::follow_jump(thunk),
+        thunk
+    );
+    let (got, code) = run_immediate_call(thunk);
+    assert_eq!(got, 123);
+    assert_has(&code, &r11_imm_call(thunk), "call keeps the non-E9 thunk");
+    assert!(
+        !code
+            .windows(r11_imm_call(wrong).len())
+            .any(|window| window == r11_imm_call(wrong)),
+        "the skipped E9 must not become the call target"
+    );
+    assert!(
+        !code
+            .windows(r11_imm_call(real).len())
+            .any(|window| window == r11_imm_call(real)),
+        "the E9 after EB must not become the call target"
     );
 }

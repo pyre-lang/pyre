@@ -116,19 +116,6 @@ const X86_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
 /// repaired later.
 const MIN_RELOCATED_JUMP_TARGET: usize = 4096;
 
-/// Win64 deviation from `arch.py` ("never use r13"). `emit_call_from_arglocs`
-/// parks a register call target in r13 across `write_real_errno`, so the
-/// prologue has to keep the caller's r13. `genop_call_assembler` returns
-/// through this same frame, and that nested call must still see the register.
-/// The home is `(FRAME_FIXED_SIZE - 1) * WORD`, outside `PASS_ON_MY_FRAME`.
-#[cfg(target_os = "windows")]
-const SAVED_R13_OFS: i32 = ((FRAME_FIXED_SIZE - 1) * WORD) as i32;
-
-#[cfg(target_os = "windows")]
-const _: () = assert!(SAVED_R13_OFS as usize >= PASS_ON_MY_FRAME * WORD);
-#[cfg(target_os = "windows")]
-const _: () = assert!((SAVED_R13_OFS as usize) < FRAME_FIXED_SIZE * WORD);
-
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
 enum ResolvedArg {
     /// Frame-pointer-relative byte offset: [rbp + offset] on x64, [x29, #offset] on aarch64.
@@ -690,6 +677,16 @@ enum AbiArgPlacement {
     Stack(i32),
 }
 
+/// Where `emit_raw_call` calls. A register fnloc has already been placed by
+/// `prepare_arguments`; a frame fnloc is still its `[rbp+ofs]` slot.
+#[derive(Clone, Copy)]
+enum PreparedFnLoc {
+    Immediate(i64),
+    Reg(u8),
+    Stack(i32),
+    Frame(i32),
+}
+
 /// `AddressLoc` from `addr_add`: `'m'` is `[base+ofs]`, `'a'` is
 /// `[base + index*scale + ofs]`.
 #[derive(Clone, Copy)]
@@ -818,10 +815,6 @@ fn emit_save_callee_saves(asm: &mut Assembler) {
     for (index, reg) in callee_save_regs().iter().copied().enumerate() {
         rx86::mov_sr(asm, callee_save_ofs(index), reg);
     }
-    // See `SAVED_R13_OFS`. Restored just before `ebp` in
-    // `emit_restore_callee_saves`.
-    #[cfg(target_os = "windows")]
-    rx86::mov_sr(asm, SAVED_R13_OFS, 13);
 }
 
 /// `_call_footer` restore: callee-saves in reverse, then `ebp`, then
@@ -831,8 +824,6 @@ fn emit_restore_callee_saves(asm: &mut Assembler) {
     for index in (0..regs.len()).rev() {
         rx86::mov_rs(asm, regs[index], callee_save_ofs(index));
     }
-    #[cfg(target_os = "windows")]
-    rx86::mov_rs(asm, 13, SAVED_R13_OFS);
     rx86::mov_rs(asm, rx86::EBP, (PASS_ON_MY_FRAME * WORD) as i32);
     rx86::add_ri(asm, rx86::ESP, (FRAME_FIXED_SIZE * WORD) as i32);
 }
@@ -3009,9 +3000,7 @@ impl<'a> Assembler386<'a> {
         // `(PASS_ON_MY_FRAME + i + 1) * WORD`; Win64 i == 4/5 use
         // `SHADOWSTORE2_OFS` / `SHADOWSTORE3_OFS`. `FRAME_FIXED_SIZE` is
         // odd, so the 8-mod-16 entry rsp becomes a 0-mod-16 body.
-        //
-        // Win64 also saves r13 at `SAVED_R13_OFS` (see that constant).
-        // `arch.py` says "never use r13".
+        // `arch.py` says "never use r13", so Win64 does not save it.
         let frame = (FRAME_FIXED_SIZE * WORD) as i32;
         rx86::sub_ri(&mut self.mc, rx86::ESP, frame);
         rx86::mov_sr(&mut self.mc, (PASS_ON_MY_FRAME * WORD) as i32, rx86::EBP);
@@ -8749,9 +8738,11 @@ impl<'a> Assembler386<'a> {
     /// `CallBuilderX86.write_real_errno`, just before the raw call.
     ///
     /// `esp_ofs` is how far rsp sits below the body rsp. eax carries the
-    /// errno word (and Win64 `SetLastError` clobbers rax), so the caller
-    /// reloads the callee pointer afterwards. r12 keeps the thread-local
-    /// address for `read_real_errno`.
+    /// errno word, and Win64 `SetLastError` clobbers rax and the argument
+    /// registers. `win64_save_register_args` spills every used argument
+    /// GPR — a register fnloc included — and restores it before
+    /// `emit_raw_call`. r12 keeps the thread-local address for
+    /// `read_real_errno`.
     fn write_real_errno(
         &mut self,
         save_err: i64,
@@ -8794,9 +8785,8 @@ impl<'a> Assembler386<'a> {
             }
             dynasm!(self.mc ; .arch x64 ; sub rsp, 32);
             rx86::mov32_rm(&mut self.mc, rx86::ECX, (rx86::R12, lasterror));
-            rx86::mov_ri(&mut self.mc, rx86::EAX, set_last_error);
-            dynasm!(self.mc ; .arch x64 ; call rax);
-            self.forget_after_call_or_jmp();
+            // `CALL(imm(follow_jump(SetLastError_addr)))`.
+            self.emit_immediate_call(set_last_error);
             dynasm!(self.mc ; .arch x64 ; add rsp, 32);
             // `CallBuilder64.win64_restore_register_args`.
             for i in 0..4 {
@@ -8886,11 +8876,9 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64
                         ; movsd [rsp + 40], xmm0
                 );
-                rx86::mov_ri(&mut self.mc, rx86::EAX, get_last_error);
-                dynasm!(self.mc ; .arch x64
-                        ; call rax
-                );
-                self.forget_after_call_or_jmp();
+                // `CALL(imm(follow_jump(GetLastError_addr)))`. rax/xmm0
+                // stay saved across it; the result comes back in eax.
+                self.emit_immediate_call(get_last_error);
                 rx86::mov32_mr(&mut self.mc, (rx86::R12, lasterror), rx86::EAX);
                 dynasm!(self.mc ; .arch x64
                 ; mov rax, [rsp + 32]
@@ -8936,7 +8924,8 @@ impl<'a> Assembler386<'a> {
             .map(|descr| descr.arg_classes())
             .filter(|classes| classes.len() == call_arg_count)
             .unwrap_or_default();
-        let (placements, stack_slots) = Self::build_abi_arg_placements(&arg_types, &arg_classes);
+        let (placements, mut stack_slots) =
+            Self::build_abi_arg_placements(&arg_types, &arg_classes);
         // `CallBuilder64._unused_gpr` / `_unused_xmm` record which of the
         // first four Win64 argument slots were used (`win64_arg_gpr` /
         // `win64_arg_xmm`). SysV ignores the mask.
@@ -8949,6 +8938,26 @@ impl<'a> Assembler386<'a> {
                 AbiArgPlacement::Stack(_) => {}
             }
         }
+
+        // `CallBuilderX86.__init__` appends a non-immediate register fnloc
+        // as one more integer argument. `CallBuilder64.prepare_arguments`
+        // puts that word in the next unused GPR (`_unused_gpr`), or in a
+        // `RawEspLoc` once those GPRs are full, and records the Win64
+        // argument bit so `win64_save_register_args` keeps it across
+        // `SetLastError`. The extra stack slot is counted here, before
+        // `subtract_esp_aligned`, because the offset is from the final rsp.
+        //
+        // A frame fnloc stays `CALL [rbp+ofs]`. That slot is not an
+        // argument register, so `write_real_errno` does not clobber it.
+        // An immediate is not an argument: `_relative_unaryop` loads it
+        // at the call.
+        let prepared = Self::prepare_call_fnloc(
+            arglocs.get(func_index).copied(),
+            &arg_types,
+            &arg_classes,
+            &mut stack_slots,
+            &mut win64_arg_gpr,
+        );
 
         // `CallBuilder64.prepare_arguments` then
         // `subtract_esp_aligned(on_stack - stack_max)`. `stack_max` is
@@ -8994,13 +9003,20 @@ impl<'a> Assembler386<'a> {
                 other => panic!("call argument {abi_idx} has unsupported location {other:?}"),
             }
         }
+        // Spilled register fnloc: same pass, before any argument GPR is
+        // overwritten. `CALL_s` uses this `[rsp+ofs]` after `write_real_errno`.
+        if let PreparedFnLoc::Stack(offset) = prepared {
+            let Some(Loc::Reg(r)) = arglocs.get(func_index).copied() else {
+                panic!("spilled call target is not a register");
+            };
+            self.emit_abi_arg_from_reg(AbiArgPlacement::Stack(offset), r, Type::Int);
+        }
 
         // Pass 2: parallel-move register-bound args (GPR and XMM groups
-        // separately).  If the call target itself is a register, append
-        // it to the int group with rax as the dst so the move algorithm
-        // sees the dependency — otherwise loading the target after the
-        // move could read a register whose old value has just been
-        // overwritten by Gpr(reg)-placed args.
+        // separately). A register fnloc joins the integer group with its
+        // `prepare_arguments` GPR as the destination, so a source that is
+        // also an argument register is copied before that register is
+        // overwritten. `remap_frame_layout` emits nothing for a self-move.
         let mut int_src: Vec<Loc> = Vec::new();
         let mut int_dst: Vec<Loc> = Vec::new();
         let mut xmm_src: Vec<Loc> = Vec::new();
@@ -9031,13 +9047,15 @@ impl<'a> Assembler386<'a> {
                 AbiArgPlacement::Stack(_) => {}
             }
         }
+        if let PreparedFnLoc::Reg(dst) = prepared {
+            let Some(Loc::Reg(r)) = arglocs.get(func_index).copied() else {
+                panic!("register call target is not a register");
+            };
+            int_src.push(Loc::Reg(r));
+            int_dst.push(Loc::Reg(crate::regloc::RegLoc::new(dst, false)));
+        }
         for (src, dst) in single_src.iter().zip(&single_dst) {
             self.emit_singlefloat_movd(*src, *dst);
-        }
-        let func_in_rax_after_move = matches!(arglocs.get(func_index), Some(Loc::Reg(_)));
-        if let Some(Loc::Reg(r)) = arglocs.get(func_index) {
-            int_src.push(Loc::Reg(*r));
-            int_dst.push(Loc::Reg(crate::regloc::RegLoc::new(0, false))); // rax
         }
         let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
         let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
@@ -9045,27 +9063,10 @@ impl<'a> Assembler386<'a> {
             self, &int_src, &int_dst, tmpreg1, &xmm_src, &xmm_dst, tmpreg2,
         );
 
-        // `write_real_errno` puts the errno word in eax and, on Win64,
-        // calls SetLastError. Both clobber rax. A register target was
-        // moved into rax above and its source may already be dead, so
-        // keep it in r13 (callee-saved, not an argument register).
-        // `CallBuilder64.emit_raw_call` calls `fnloc` directly.
-        let write_clobbers_rax = (save_err
-            & (majit_jitcode::rffi::RFFI_READSAVED_ERRNO
-                | majit_jitcode::rffi::RFFI_ZERO_ERRNO_BEFORE))
-            != 0
-            || (cfg!(target_os = "windows")
-                && (save_err & majit_jitcode::rffi::RFFI_READSAVED_LASTERROR) != 0);
-        if write_clobbers_rax && func_in_rax_after_move {
-            dynasm!(self.mc ; .arch x64 ; mov r13, rax);
-        } else if !write_clobbers_rax && !func_in_rax_after_move {
-            // Immed/Frame targets: the parallel move never touches rax or
-            // rbp. Load now when `write_real_errno` will not clobber rax.
-            self.emit_rax_call_target(arglocs, func_index);
-        }
         // llsupport/callbuilder.py `emit_call_release_gil`:
         // write_real_errno(); emit_raw_call(); restore_stack_pointer();
-        // read_real_errno().
+        // read_real_errno(). `emit_raw_call` is `CALL(self.fnloc)` and
+        // runs after `write_real_errno`, which clobbers rax.
         let mut tlofs_loaded = false;
         self.write_real_errno(
             save_err,
@@ -9074,37 +9075,93 @@ impl<'a> Assembler386<'a> {
             win64_arg_gpr,
             win64_arg_xmm,
         );
-        if write_clobbers_rax {
-            if func_in_rax_after_move {
-                dynasm!(self.mc ; .arch x64 ; mov rax, r13);
-            } else {
-                self.emit_rax_call_target(arglocs, func_index);
-            }
-        }
-        dynasm!(self.mc ; .arch x64 ; call rax);
-        self.forget_after_call_or_jmp();
+        self.emit_raw_call(prepared);
         // `CallBuilderX86.load_result` reads the one return word in rax.
 
         self.restore_stack_pointer(call_area_adjust);
         self.read_real_errno(save_err, 0, &mut tlofs_loaded);
     }
 
-    /// Load an immediate or frame call target into rax. The register case
-    /// is the parallel move's last integer destination.
-    fn emit_rax_call_target(&mut self, arglocs: &[Loc], func_index: usize) {
-        match arglocs.get(func_index) {
-            Some(Loc::Frame(f)) => {
-                let offset = f.ebp_loc.value;
-                rx86::mov_rb(&mut self.mc, rx86::EAX, offset);
+    /// `CallBuilder64.prepare_arguments`: Win64's next integer slot is the
+    /// shared positional index (`arg_types` length). SysV counts only the
+    /// arguments that did not take an XMM.
+    fn fnloc_gpr_index(arg_types: &[Type], arg_classes: &str) -> usize {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = arg_classes;
+            arg_types.len()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            arg_types
+                .iter()
+                .enumerate()
+                .filter(|(idx, tp)| {
+                    **tp != Type::Float && arg_classes.as_bytes().get(*idx) != Some(&b'S')
+                })
+                .count()
+        }
+    }
+
+    /// Place `fnloc` the way `CallBuilderX86.__init__` and
+    /// `CallBuilder64.prepare_arguments` do. Register targets consume the
+    /// next integer argument slot. Frame targets do not: `emit_raw_call`
+    /// calls `[rbp+ofs]` directly. Immediates do not consume a slot either.
+    fn prepare_call_fnloc(
+        func: Option<Loc>,
+        arg_types: &[Type],
+        arg_classes: &str,
+        stack_slots: &mut usize,
+        win64_arg_gpr: &mut u8,
+    ) -> PreparedFnLoc {
+        #[cfg(not(target_os = "windows"))]
+        let _ = win64_arg_gpr;
+        match func {
+            Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => PreparedFnLoc::Immediate(i.value),
+            Some(ebp_loc_pat!(slot)) => PreparedFnLoc::Frame(slot.value),
+            Some(Loc::Reg(r)) if !r.is_xmm => {
+                let index = Self::fnloc_gpr_index(arg_types, arg_classes);
+                if index < super::callbuilder::ARGUMENTS_GPR.len() {
+                    #[cfg(target_os = "windows")]
+                    {
+                        *win64_arg_gpr |= 1u8 << index;
+                    }
+                    PreparedFnLoc::Reg(super::callbuilder::ARGUMENTS_GPR[index].value)
+                } else {
+                    let offset =
+                        super::callbuilder::outgoing_stack_words(*stack_slots) * WORD as i32;
+                    *stack_slots += 1;
+                    PreparedFnLoc::Stack(offset)
+                }
             }
-            Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
-                let val = i.value;
-                rx86::mov_ri(&mut self.mc, rx86::EAX, val);
-            }
-            // `call rax` is emitted unconditionally, so leaving rax
-            // unwritten here would call whatever it happened to hold.
             other => panic!("unsupported x86-64 call target {other:?}"),
         }
+    }
+
+    /// `_relative_unaryop` for `CALL` of an immediate: `follow_jump`, then
+    /// `_load_scratch`, then `CALL_r(X86_64_SCRATCH_REG)`. r11 is marked
+    /// unknown first, so `_load_scratch` emits `MOV_ri` of the followed
+    /// address.
+    fn emit_immediate_call(&mut self, addr: i64) {
+        self.forget_scratch_register();
+        self.load_scratch(super::callbuilder::follow_jump(addr));
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
+        self.forget_after_call_or_jmp();
+    }
+
+    /// `CallBuilderX86.emit_raw_call`: `CALL(self.fnloc)`. An immediate is
+    /// `follow_jump` then `_load_scratch` / `CALL_r`.
+    fn emit_raw_call(&mut self, fnloc: PreparedFnLoc) {
+        match fnloc {
+            PreparedFnLoc::Immediate(addr) => self.emit_immediate_call(addr),
+            PreparedFnLoc::Reg(reg) => {
+                dynasm!(self.mc ; .arch x64 ; call Rq(reg));
+            }
+            PreparedFnLoc::Stack(offset) => rx86::call_s(&mut self.mc, offset),
+            PreparedFnLoc::Frame(offset) => rx86::call_b(&mut self.mc, offset),
+        }
+        self.forget_after_call_or_jmp();
     }
 
     /// `CallBuilderX86.load_result` + `Assembler386.load_from_mem`: the
@@ -9520,23 +9577,29 @@ impl<'a> Assembler386<'a> {
             return;
         }
 
-        // ── x86/assembler.py _call_assembler_emit_call ──
-        // simple_call(target, [argloc]).  Branch directly to the
-        // resolved callee entry — skip the Rust trampoline, which
+        // ── x86/assembler.py `_call_assembler_emit_call` ──
+        // `simple_call(addr, [argloc, threadlocal_loc])`. Branch directly
+        // to the resolved callee entry — skip the Rust trampoline, which
         // would otherwise add an extra indirect call and (when
         // MAJIT_LOG was probed) a `std::env::var_os` per recursion.
+        //
+        // `CallBuilder64.prepare_arguments` remaps `argloc` straight into
+        // `ARGUMENTS_GPR[0]` and the thread-local word into
+        // `ARGUMENTS_GPR[1]`. `remap_frame_layout` emits nothing for a
+        // self-move, so a frame already in the first argument register
+        // is not copied. The frame moves before the thread-local load:
+        // that load writes `ARGUMENTS_GPR[1]`.
         let pushed_gcmap = self.push_pending_call_gcmap();
-        self.emit_load_to_rax(frame_loc); // rax = callee jf_ptr
-        self.emit_abi_int_arg_from_reg(0, 0); // arg0 = jf (Windows: rcx = rax)
-        // `simple_call(addr, [argloc, threadlocal_loc])`: the callee's
-        // `_call_header` saves its own copy of the thread-local address.
-        #[cfg(not(target_os = "windows"))]
-        rx86::mov_rs(&mut self.mc, rx86::ESI, THREADLOCAL_OFS as i32);
-        #[cfg(target_os = "windows")]
-        rx86::mov_rs(&mut self.mc, rx86::EDX, THREADLOCAL_OFS as i32);
+        let arg0 = super::callbuilder::ARGUMENTS_GPR[0].value;
+        let arg1 = super::callbuilder::ARGUMENTS_GPR[1].value;
+        self.regalloc_mov(
+            &frame_loc,
+            &Loc::Reg(crate::regloc::RegLoc::new(arg0, false)),
+        );
+        rx86::mov_rs(&mut self.mc, arg1, THREADLOCAL_OFS as i32);
         if let Some(addr) = target_addr.immediate {
-            rx86::mov_ri(&mut self.mc, rx86::EAX, addr as i64);
-            self.emit_abi_call_rax_aligned();
+            // `simple_call` → `CALL(imm(follow_jump(addr)))`.
+            self.emit_immediate_call(addr as i64);
         } else {
             let addr_ptr = self.self_entry_addr_ptr as i64;
             rx86::mov_ri(&mut self.mc, rx86::EAX, addr_ptr);
@@ -9576,9 +9639,10 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_int_arg_from_imm(0, cpu_ptr);
         self.emit_abi_int_arg_from_reg(1, 0); // arg1 = rax (callee jf)
         self.emit_abi_int_arg_from_imm(2, green_key);
-        rx86::mov_ri(&mut self.mc, rx86::EAX, helper_addr);
+        // `push_gcmap` writes r11, so `_load_scratch` of the helper
+        // (`follow_jump` + `CALL_r`) runs after that push.
         let pushed_gcmap = self.push_pending_call_gcmap();
-        self.emit_abi_call_rax_aligned();
+        self.emit_immediate_call(helper_addr);
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         self.forget_scratch_register();
         if result_type == Type::Float {

@@ -965,6 +965,18 @@ pub(crate) fn push_b(mc: &mut Assembler, offset: i32) {
     encode_stack_bp(mc, offset, false, 6 << 3);
 }
 
+/// `CALL_b` — `call qword [rbp + ofs]`. No REX.W (`rx86.py` `CALL_b`).
+pub fn call_b(mc: &mut Assembler, offset: i32) {
+    DynasmApi::push(mc, 0xFF);
+    encode_stack_bp(mc, offset, false, 2 << 3);
+}
+
+/// `CALL_s` — `call qword [rsp + ofs]`. No REX.W (`rx86.py` `CALL_s`).
+pub fn call_s(mc: &mut Assembler, offset: i32) {
+    DynasmApi::push(mc, 0xFF);
+    encode_stack_sp(mc, offset, 2 << 3);
+}
+
 /// `PO1_b` — `pop qword [rbp + ofs]`.
 pub(crate) fn pop_b(mc: &mut Assembler, offset: i32) {
     DynasmApi::push(mc, 0x8F);
