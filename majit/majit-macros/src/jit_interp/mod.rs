@@ -226,6 +226,62 @@ pub struct JitInterpConfig {
     pub switch_dispatch: bool,
 }
 
+/// Whether the state struct itself is the virtualizable identity.
+///
+/// `jtransform.py` `rewrite_op_getfield` / `rewrite_op_setfield` on a
+/// virtualizable field: the live object is the vable argument, shared by
+/// every frame of the portal (`pyjitpl.py` `opimpl_getfield_vable_*` /
+/// `opimpl_setfield_vable_*` on `metainterp.virtualizable_boxes`;
+/// `blackhole.py` `bhimpl_getfield_vable_*` / `bhimpl_setfield_vable_*`
+/// on the live object).
+///
+/// A `[.. ; virt]` array is always the state-as-vable path, even when a
+/// `virtualizable_fields` heap object is also declared. `split_dispatch`,
+/// or a classified Lowerable arm that stays on the sub-JitCode path
+/// because it has an inferred-policy or `inline_pipeline_*` call
+/// (`arm_body_has_infer_call`), takes the same path when that declaration
+/// is absent and a scalar, `ref(_)`, or `str` field is present, so a
+/// callee JitCode writes the same boxes the caller reads. A `str` field
+/// is a GC ref field of the virtualizable (`jtransform.py`
+/// `rewrite_op_getfield` on a virtualizable field of kind `r`;
+/// `virtualizable.py` `VirtualizableInfo` static fields of any kind).
+pub(super) fn state_is_vable_identity(
+    virtualizable_decl: Option<&VirtualizableDecl>,
+    state_fields: Option<&StateFieldsConfig>,
+    split_dispatch: bool,
+    has_infer_call_arm: bool,
+) -> bool {
+    let Some(sf) = state_fields else {
+        return false;
+    };
+    let mut has_virt = false;
+    let mut has_vable_field = false;
+    for f in &sf.fields {
+        match &f.kind {
+            StateFieldKind::VirtArray(_) => has_virt = true,
+            StateFieldKind::Scalar { .. } | StateFieldKind::Ref(_) | StateFieldKind::Str => {
+                has_vable_field = true
+            }
+            _ => {}
+        }
+    }
+    let sub_jitcode_arm = split_dispatch || has_infer_call_arm;
+    has_virt || (virtualizable_decl.is_none() && sub_jitcode_arm && has_vable_field)
+}
+
+/// True when a classified Lowerable dispatch arm would stay on the
+/// sub-JitCode path because it contains an inferred-policy or
+/// `inline_pipeline_*` call. Same predicate as
+/// `Lowerer::arm_body_has_infer_call`. A matchless portal has no
+/// classified arms and is false.
+pub(super) fn machine_has_infer_call_arm(config: &JitInterpConfig, func: &ItemFn) -> bool {
+    let Some(match_expr) = codegen_trace::find_dispatch_match(&func.block) else {
+        return false;
+    };
+    let classified = classify::classify_arms(&match_expr.arms);
+    jitcode_lower::classified_arms_have_infer_call(&classified, &config.calls, config.auto_calls)
+}
+
 /// Virtualizable frame field declaration for `#[jit_interp]`.
 ///
 /// RPython equivalent: VirtualizableInfo from virtualizable.py, combined
@@ -706,6 +762,18 @@ pub(crate) enum CallPolicyKind {
     /// side effects (e.g. returning a node to a free-list -- RPython's `del`
     /// generates zero IR ops).
     ConcreteOnlyVoid,
+}
+
+impl CallPolicyKind {
+    pub(crate) fn is_inline_pipeline(self) -> bool {
+        matches!(
+            self,
+            Self::InlinePipelineInt
+                | Self::InlinePipelineRef
+                | Self::InlinePipelineFloat
+                | Self::InlinePipelineVoid
+        )
+    }
 }
 
 pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
@@ -1670,8 +1738,9 @@ pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStrea
     if let Err(err) = validate_merge_point_forms(&func) {
         return err.to_compile_error();
     }
-    let trace_fn = codegen_trace::generate_trace_fn(&config, &func);
-    let state_impl = codegen_state::generate_jit_state(&config, &func);
+    let has_infer_call_arm = machine_has_infer_call_arm(&config, &func);
+    let trace_fn = codegen_trace::generate_trace_fn(&config, &func, has_infer_call_arm);
+    let state_impl = codegen_state::generate_jit_state(&config, &func, has_infer_call_arm);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
     let green_key_fn = generate_green_key_fn(&config, &func);
     let transformed_fn = transform_function(&config, &func, true);

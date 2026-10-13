@@ -170,8 +170,12 @@ fn heap_frame_virtualizable_methods(
 }
 
 /// Generate the JitState types and implementation.
-pub fn generate_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
-    generate_state_fields_jit_state(config, func)
+pub fn generate_jit_state(
+    config: &JitInterpConfig,
+    func: &ItemFn,
+    has_infer_call_arm: bool,
+) -> TokenStream {
+    generate_state_fields_jit_state(config, func, has_infer_call_arm)
 }
 
 /// Generate JitState types for state_fields mode (register/tape machines).
@@ -181,7 +185,11 @@ pub fn generate_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
 /// items-pointer then length (two INT reds), and virtualizable arrays (`[int; virt]`) track only a data
 /// pointer + length OpRef pair (array stays on heap, accessed via raw memory ops).
 #[allow(unused_variables, unused_assignments)]
-fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+fn generate_state_fields_jit_state(
+    config: &JitInterpConfig,
+    func: &ItemFn,
+    has_infer_call_arm: bool,
+) -> TokenStream {
     let state_type = &config.state_type;
     let env_type = &config.env_type;
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", func.sig.ident);
@@ -298,7 +306,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let declared_scalars = scalars.clone();
     let declared_ref_count = ref_scalars.len();
     let declared_float_count = float_scalars.len();
-    let vable_scalars: Vec<_> = if virt_arrays.is_empty() {
+    // Same gate as `LowererConfig::new`: a `[.. ; virt]` array, or a
+    // sub-JitCode arm (`split_dispatch` / infer / `inline_pipeline_*`)
+    // with a scalar/`ref(_)`/`str` field and no `virtualizable_fields`
+    // heap object. `jtransform.py` `rewrite_op_getfield` /
+    // `rewrite_op_setfield`. A `str` field is a GC ref
+    // (`rewrite_op_getfield` kind `r`; `virtualizable.py`
+    // `VirtualizableInfo` static fields of any kind).
+    let state_is_vable_identity = super::state_is_vable_identity(
+        config.virtualizable_decl.as_ref(),
+        config.state_fields.as_ref(),
+        config.split_dispatch,
+        has_infer_call_arm,
+    );
+    let vable_scalars: Vec<_> = if !state_is_vable_identity {
         Vec::new()
     } else {
         sf.fields
@@ -306,12 +327,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             .filter(|f| {
                 matches!(
                     f.kind,
-                    StateFieldKind::Scalar { .. } | StateFieldKind::Ref(_)
+                    StateFieldKind::Scalar { .. } | StateFieldKind::Ref(_) | StateFieldKind::Str
                 )
             })
             .collect()
     };
-    if !virt_arrays.is_empty() {
+    if state_is_vable_identity {
         scalars.clear();
         ref_scalars.clear();
         float_scalars.clear();
@@ -336,13 +357,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let num_int_identity = num_scalars + 2 * num_arrays;
     let num_virt_arrays = virt_arrays.len();
     // `pyjitpl.py reached_loop_header` carries the virtualizable
-    // exactly ONCE: it is a single red (`warmspot.py:529-538
-    // jd.index_of_virtualizable = jitdriver.reds.index(vname)`), and
-    // `virtualizable.py:150-153` reads every `[.. ; virt]` array's length off
-    // the live object instead of boxing it.  So a state contributes one
-    // identity slot however many virt arrays it declares — a presence flag,
-    // not a per-array count.
-    let has_vable_identity = num_virt_arrays > 0;
+    // exactly ONCE: it is a single red (`warmspot.py` `index_of_virtualizable`),
+    // and `virtualizable.py` reads every `[.. ; virt]` array's length off
+    // the live object instead of boxing it.  A sub-JitCode scalar/`str`
+    // machine (`split_dispatch` / infer / `inline_pipeline_*`) uses the
+    // same one-identity slot so a callee's `setfield_vable_*` is visible
+    // to the caller.
+    let has_vable_identity = state_is_vable_identity;
     let num_vable_identity_slots = usize::from(has_vable_identity);
     // Int-bank slots the inline-frame snapshot trim may blank. The
     // alloc_reg floor always skips the identity range; the trim stays
@@ -403,7 +424,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // is a ref scalar, so `num_vable_identity_slots` stays 0. Restore
     // reads it from the ref bank at `ref_pos`; that bank starts at the
     // vable input register because the object IS that named red.
-    let heap_vable_index: Option<usize> = if num_virt_arrays == 0 {
+    let heap_vable_index: Option<usize> = if !state_is_vable_identity {
         config.virtualizable_decl.as_ref().map(|decl| {
             let name = decl.var_name.to_string();
             let ref_pos = ref_scalars
@@ -417,7 +438,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     } else {
         None
     };
-    let carry_vable_boxes = num_virt_arrays >= 1 || heap_vable_index.is_some();
+    let carry_vable_boxes = state_is_vable_identity || heap_vable_index.is_some();
     // First ref-bank register available for ref-scalar identity slots.
     // `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
     // from r0 (`program` at r0, the virtualizable identity at r1 when
@@ -430,7 +451,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let vable_input_ref_reg: usize = 1 + portal_ref_greens + carried_ref_greens;
     let ref_identity_base: usize = vable_input_ref_reg
         + usize::from(
-            (config.virtualizable_decl.is_some() || num_virt_arrays > 0)
+            (config.virtualizable_decl.is_some() || state_is_vable_identity)
                 && heap_vable_index.is_none(),
         );
     // First int-bank register available for scalar/array identity slots —
@@ -657,8 +678,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {}
     };
     // The freshly-boxed `&state` identity feeds the one vable Ref slot; only
-    // bound when there is at least one virt array (fixed-array-only reds carry
-    // no pointer).
+    // bound when the state is the virtualizable identity.
     let fresh_entry_base_let: TokenStream = if has_vable_identity {
         quote! { let __base = &*__fresh as *const #state_type as i64; }
     } else {
@@ -1098,7 +1118,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
     let extract_live_values_into_override: TokenStream =
-        if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
+        if num_ref_scalars > 0 || has_vable_identity || num_float_scalars > 0 {
             quote! {
                 fn extract_live_values_into(
                     &self,
@@ -1121,7 +1141,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `is_compatible` does not read meta, so the steady entry does not probe
     // `compiled_loops`.
     let steady_entry_without_meta =
-        num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 || num_arrays > 0;
+        num_ref_scalars > 0 || has_vable_identity || num_float_scalars > 0 || num_arrays > 0;
     let fill_entry_reds_without_meta_override: TokenStream = if steady_entry_without_meta {
         quote! {
             fn fill_entry_reds_without_meta(
@@ -1237,7 +1257,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         None => quote! {},
     };
     let live_value_types_override: TokenStream =
-        if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
+        if num_ref_scalars > 0 || has_vable_identity || num_float_scalars > 0 {
             quote! {
                 // A bank with no scalars emits `0..0`, which is data, not the
                 // `for i in 10..0` typo `reversed_empty_ranges` is aimed at —
@@ -1398,8 +1418,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // a `[.. ; virt]` array whose length can vary while the greens stay fixed
     // must not be block-backed — and it cannot be checked here: the lengths live
     // on state instances that do not exist at install time.
-    let arm_flat_entry_contract: TokenStream = if num_virt_arrays > 0 || heap_vable_index.is_some()
-    {
+    let arm_flat_entry_contract: TokenStream = if has_vable_identity || heap_vable_index.is_some() {
         let entry_len =
             num_int_identity + num_vable_identity_slots + num_ref_scalars + num_float_scalars;
         let index_of_virtualizable = heap_vable_index.unwrap_or(num_int_identity);
@@ -1422,7 +1441,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // rebuild the shadow so the bridge traces with the same virtualizable
     // the parent loop had. Without it `virtualizable_boxes` stays None and
     // `__trace_*` aborts at `standard_virtualizable_jitcode_argbox`.
-    let seed_bridge_vable: TokenStream = if num_virt_arrays > 0 || heap_vable_index.is_some() {
+    let seed_bridge_vable: TokenStream = if has_vable_identity || heap_vable_index.is_some() {
         quote! {
             if let Some(__vinfo) = Self::__build_virtualizable_info() {
                 let __seeded = majit_metainterp::seed_bridge_virtualizable_boxes(
@@ -1473,14 +1492,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // compiled entry sees — only a field holding a pointer to a block with a
     // fixed payload offset can be reloaded by `compile.py:441-457`, and a `Vec`
     // embedded by value is not one.
-    let build_vinfo_override: TokenStream = if num_virt_arrays > 0 {
+    let build_vinfo_override: TokenStream = if has_vable_identity {
         let outer_executor_owns_state = !super::has_single_pass_close(func);
         let scalar_field_parts: Vec<_> = vable_scalars
             .iter()
             .map(|f| {
                 let name = &f.name;
                 let (kind, ty, signed) = match &f.kind {
-                    StateFieldKind::Ref(_) => {
+                    StateFieldKind::Ref(_) | StateFieldKind::Str => {
                         (quote!(majit_ir::Type::Ref), quote!(usize), quote!(false))
                     }
                     StateFieldKind::Scalar { ir_type, .. } if ir_type == "float" => {

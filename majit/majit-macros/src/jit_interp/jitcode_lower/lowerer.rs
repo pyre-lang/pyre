@@ -599,24 +599,9 @@ impl<'c> Lowerer<'c> {
     }
 
     pub(super) fn resolve_call_policy(&self, func: &Expr) -> Option<CallPolicySpec> {
-        let func_segments = canonical_expr_segments(func)?;
-        if let Some((_, policy)) = self
-            .call_policies
-            .iter()
-            .find(|(path, _)| *path == func_segments)
-        {
-            return Some(policy.clone());
-        }
-        match self.inference_failure_mode {
-            InferenceFailureMode::Panic => helper_policy_path(func).map(|_| CallPolicySpec::Infer),
-            InferenceFailureMode::ReturnNone => {
-                if self.auto_calls {
-                    helper_policy_path(func).map(|_| CallPolicySpec::Infer)
-                } else {
-                    None
-                }
-            }
-        }
+        let auto_calls =
+            self.auto_calls || matches!(self.inference_failure_mode, InferenceFailureMode::Panic);
+        resolve_call_policy_for_probe(func, &self.call_policies, auto_calls)
     }
 
     /// Resolve the cond_call / record_known_result helper policy for

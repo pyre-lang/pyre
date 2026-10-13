@@ -38,8 +38,9 @@ mod reexports {
     pub(super) use super::helpers::{
         assert_ref_result_one_word, binding_kind_for_inline_policy, binop_f_emit_tokens,
         binop_i_accepts_constant, binop_i_const_emit_tokens, binop_i_emit_tokens,
-        binop_is_symmetric, block_has_loop_control, call_is_null_ptr, expr_has_loop_control,
-        expr_is_literal_call, expr_is_null_ptr, expr_is_ptr_is_null_method, expr_is_unsigned_int,
+        binop_is_symmetric, block_has_loop_control, call_is_null_ptr,
+        expr_has_infer_or_pipeline_call, expr_has_loop_control, expr_is_literal_call,
+        expr_is_null_ptr, expr_is_ptr_is_null_method, expr_is_unsigned_int,
         extend_int_args_with_array_identity, extract_block_tail_int, extract_bool_branch_values,
         extract_branch_int, extract_pat_switch_case_tokens, extract_pat_value_tokens,
         extract_stmts, inline_call_read_regs, inline_call_tokens, inline_call_tokens_void,
@@ -48,9 +49,9 @@ mod reexports {
         is_supported_int_cast, is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens,
         mirrored_compare_binop, opcode_for_assign_binop, opcode_for_assign_binop_f,
         opcode_for_binop, opcode_for_binop_f, opcode_for_compare_f, plain_array_identity_int_pairs,
-        quote_inline_arg_pairs, stmt_has_loop_control, type_is_raw_pointer, type_is_unsigned_int,
-        typed_call_arg_tokens, word_result_addr_for_kind, word_result_addr_tokens,
-        word_void_addr_tokens,
+        quote_inline_arg_pairs, resolve_call_policy_for_probe, stmt_has_loop_control,
+        type_is_raw_pointer, type_is_unsigned_int, typed_call_arg_tokens,
+        word_result_addr_for_kind, word_result_addr_tokens, word_void_addr_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -1283,22 +1284,14 @@ impl LowererConfig {
         native_tag_small: &[Path],
         native_identity: &[Path],
         split_dispatch: bool,
+        has_infer_call_arm: bool,
         switch_dispatch: bool,
     ) -> Self {
         let io_shims = io_shims
             .iter()
             .map(|(p, s)| (canonical_path_segments(p), s.clone()))
             .collect();
-        let calls = calls
-            .iter()
-            .map(|entry| {
-                let spec = match entry.policy {
-                    Some(kind) => CallPolicySpec::Explicit(kind),
-                    None => CallPolicySpec::Infer,
-                };
-                (canonical_path_segments(&entry.path), spec)
-            })
-            .collect();
+        let calls = call_policies_from_entries(calls);
         let (mut vable_var, mut vable_input_ref_reg, mut vable_fields, mut vable_arrays) =
             if let Some(decl) = vable_decl {
                 let var = Some(decl.var_name.to_string());
@@ -1396,15 +1389,25 @@ impl LowererConfig {
                 HashMap::new(),
             )
         };
-        // State-field `[int; virt]` arrays converge onto the standard
-        // virtualizable path: the state binding is the vable identity var and
-        // each virt array becomes a `vable_arrays` entry under its virt index.
-        // The dispatch lowerer overrides the identity ref register to 1 (the
-        // argbox order is `program`(ref reg 0), then the pushed vable identity
-        // → ref reg 1; see `with_vable_input_ref_reg(1)` in codegen_trace).
-        // `state_virt_arrays` stays populated; the raw-varray lowering branch
-        // is retired in a later task.
-        if vable_var.is_none() && !state_virt_arrays.is_empty() {
+        // State-field `[int; virt]` arrays, and machines whose scalars a
+        // sub-JitCode arm can write (`split_dispatch`, or an infer /
+        // `inline_pipeline_*` arm) — including a `str` field, a GC ref
+        // of the virtualizable — converge onto the standard
+        // virtualizable path: the state binding is the vable identity var.
+        // Each virt array becomes a `vable_arrays` entry under its virt
+        // index. The dispatch lowerer overrides the identity ref register
+        // to 1 (the argbox order is `program`(ref reg 0), then the pushed
+        // vable identity → ref reg 1; see `with_vable_input_ref_reg(1)` in
+        // codegen_trace). `state_virt_arrays` stays populated; the
+        // raw-varray lowering branch is retired in a later task.
+        if vable_var.is_none()
+            && crate::jit_interp::state_is_vable_identity(
+                vable_decl,
+                state_fields_cfg,
+                split_dispatch,
+                has_infer_call_arm,
+            )
+        {
             vable_var = Some("state".to_string());
             vable_input_ref_reg = Some(1);
             for (name, &(idx, kind)) in &state_virt_arrays {
@@ -1412,12 +1415,16 @@ impl LowererConfig {
             }
             // jtransform.py rewrite_op_getfield: all redirected fields use
             // the live virtualizable argument, including in inline callees.
+            // A `str` field is a GC ref (`rewrite_op_getfield` kind `r`;
+            // `virtualizable.py` `VirtualizableInfo` static fields of any
+            // kind), same as `ref(_)`.
             for f in &state_fields_cfg.unwrap().fields {
                 let kind = match &f.kind {
                     crate::jit_interp::StateFieldKind::Scalar { ir_type, .. } => {
                         ValueKind::from_ident(ir_type)
                     }
-                    crate::jit_interp::StateFieldKind::Ref(_) => ValueKind::Ref,
+                    crate::jit_interp::StateFieldKind::Ref(_)
+                    | crate::jit_interp::StateFieldKind::Str => ValueKind::Ref,
                     _ => continue,
                 };
                 let index = vable_fields.len();
@@ -1815,6 +1822,33 @@ pub(super) fn canonical_path_segments(path: &Path) -> Vec<String> {
         .iter()
         .map(|segment| segment.ident.to_string())
         .collect()
+}
+
+pub(super) fn call_policies_from_entries(
+    calls: &[crate::jit_interp::CallEntry],
+) -> Vec<(Vec<String>, CallPolicySpec)> {
+    calls
+        .iter()
+        .map(|entry| {
+            let spec = match entry.policy {
+                Some(kind) => CallPolicySpec::Explicit(kind),
+                None => CallPolicySpec::Infer,
+            };
+            (canonical_path_segments(&entry.path), spec)
+        })
+        .collect()
+}
+
+pub(super) fn classified_arms_have_infer_call(
+    classified: &[super::classify::ClassifiedArm],
+    calls: &[crate::jit_interp::CallEntry],
+    auto_calls: bool,
+) -> bool {
+    let policies = call_policies_from_entries(calls);
+    classified.iter().any(|arm| {
+        matches!(arm.pattern, super::classify::ArmPattern::Lowerable)
+            && expr_has_infer_or_pipeline_call(&arm.original_body, &policies, auto_calls)
+    })
 }
 
 pub(super) fn canonical_member_name(member: &syn::Member) -> String {
@@ -2401,10 +2435,179 @@ mod tests {
             &[],
             false,
             false,
+            false,
         );
         assert_eq!(config.residual_writes.len(), 1);
         assert_eq!(config.residual_writes[0].0, vec!["append_cell".to_string()]);
         assert!(config.residual_writes[0].3);
+    }
+
+    fn empty_lowerer_config(
+        state_fields: Option<&crate::jit_interp::StateFieldsConfig>,
+        split_dispatch: bool,
+        has_infer_call_arm: bool,
+    ) -> LowererConfig {
+        let state_type = syn::parse_quote!(State);
+        let env_type = syn::parse_quote!(Env);
+        LowererConfig::new(
+            &[],
+            &[],
+            false,
+            None,
+            state_fields,
+            &[],
+            &[],
+            &[],
+            &[],
+            &state_type,
+            &env_type,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            split_dispatch,
+            has_infer_call_arm,
+            false,
+        )
+    }
+
+    #[test]
+    fn split_dispatch_scalars_take_the_state_vable_path() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(acc),
+                kind: crate::jit_interp::StateFieldKind::Scalar {
+                    ir_type: syn::parse_quote!(int),
+                    rust_type: None,
+                },
+            }],
+        };
+        let config = empty_lowerer_config(Some(&state_fields), true, false);
+        assert_eq!(config.vable_var.as_deref(), Some("state"));
+        assert_eq!(config.vable_input_ref_reg, Some(1));
+        assert!(config.vable_fields.contains_key("acc"));
+        assert!(config.is_state_vable_field("acc"));
+    }
+
+    #[test]
+    fn without_split_dispatch_scalars_stay_identity_slots() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(acc),
+                kind: crate::jit_interp::StateFieldKind::Scalar {
+                    ir_type: syn::parse_quote!(int),
+                    rust_type: None,
+                },
+            }],
+        };
+        let config = empty_lowerer_config(Some(&state_fields), false, false);
+        assert!(config.vable_var.is_none());
+        assert!(config.vable_fields.is_empty());
+        assert!(!config.is_state_vable_field("acc"));
+        assert!(config.state_scalars.contains_key("acc"));
+    }
+
+    #[test]
+    fn infer_call_arm_scalars_take_the_state_vable_path() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(acc),
+                kind: crate::jit_interp::StateFieldKind::Scalar {
+                    ir_type: syn::parse_quote!(int),
+                    rust_type: None,
+                },
+            }],
+        };
+        let config = empty_lowerer_config(Some(&state_fields), false, true);
+        assert_eq!(config.vable_var.as_deref(), Some("state"));
+        assert_eq!(config.vable_input_ref_reg, Some(1));
+        assert!(config.vable_fields.contains_key("acc"));
+        assert!(config.is_state_vable_field("acc"));
+    }
+
+    fn int_and_str_state_fields() -> crate::jit_interp::StateFieldsConfig {
+        crate::jit_interp::StateFieldsConfig {
+            fields: vec![
+                crate::jit_interp::StateFieldDecl {
+                    name: syn::parse_quote!(acc),
+                    kind: crate::jit_interp::StateFieldKind::Scalar {
+                        ir_type: syn::parse_quote!(int),
+                        rust_type: None,
+                    },
+                },
+                crate::jit_interp::StateFieldDecl {
+                    name: syn::parse_quote!(s),
+                    kind: crate::jit_interp::StateFieldKind::Str,
+                },
+            ],
+        }
+    }
+
+    fn assert_int_and_str_take_the_state_vable_path(config: &LowererConfig) {
+        assert_eq!(config.vable_var.as_deref(), Some("state"));
+        assert_eq!(config.vable_input_ref_reg, Some(1));
+        assert!(config.vable_fields.contains_key("acc"));
+        assert!(config.is_state_vable_field("acc"));
+        assert!(config.is_state_vable_field("s"));
+        assert!(matches!(
+            config.vable_fields.get("s"),
+            Some(&(_, ValueKind::Ref))
+        ));
+    }
+
+    #[test]
+    fn str_field_on_infer_arm_takes_the_state_vable_path() {
+        let state_fields = int_and_str_state_fields();
+        assert!(crate::jit_interp::state_is_vable_identity(
+            None,
+            Some(&state_fields),
+            false,
+            true,
+        ));
+        let config = empty_lowerer_config(Some(&state_fields), false, true);
+        assert_int_and_str_take_the_state_vable_path(&config);
+    }
+
+    #[test]
+    fn str_field_on_split_dispatch_takes_the_state_vable_path() {
+        let state_fields = int_and_str_state_fields();
+        assert!(crate::jit_interp::state_is_vable_identity(
+            None,
+            Some(&state_fields),
+            true,
+            false,
+        ));
+        let config = empty_lowerer_config(Some(&state_fields), true, false);
+        assert_int_and_str_take_the_state_vable_path(&config);
+    }
+
+    #[test]
+    fn virt_array_is_vable_identity_even_when_a_heap_vable_is_declared() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(tape),
+                kind: crate::jit_interp::StateFieldKind::VirtArray(syn::parse_quote!(int)),
+            }],
+        };
+        let decl = crate::jit_interp::VirtualizableDecl {
+            var_name: syn::parse_quote!(frame),
+            token_offset: syn::parse_quote!(TOKEN_OFFSET),
+            fields: vec![],
+            arrays: vec![],
+        };
+        assert!(crate::jit_interp::state_is_vable_identity(
+            Some(&decl),
+            Some(&state_fields),
+            false,
+            false,
+        ));
     }
 
     #[test]

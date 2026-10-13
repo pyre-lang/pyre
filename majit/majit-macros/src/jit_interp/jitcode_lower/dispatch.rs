@@ -44,6 +44,22 @@ mod find_dispatch_loop_body_tests {
     }
 
     #[test]
+    fn inline_pipeline_call_is_an_infer_call() {
+        let policies = vec![(
+            vec!["pipeline_double".to_string()],
+            CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlinePipelineInt),
+        )];
+        let body: syn::Expr = syn::parse_quote! {
+            { state.a = pipeline_double(state.a); }
+        };
+        assert!(expr_has_infer_or_pipeline_call(&body, &policies, false));
+        let nop: syn::Expr = syn::parse_quote! {
+            { state.a = state.a + 1; }
+        };
+        assert!(!expr_has_infer_or_pipeline_call(&nop, &policies, false));
+    }
+
+    #[test]
     fn finds_while_body() {
         let blk = fn_block_from("while x < 10 { match op { 0 => {}, _ => {} } }");
         let m = first_match(&blk);
@@ -2490,37 +2506,9 @@ impl<'c> Lowerer<'c> {
     /// callee frame; a trailing green-pc advance is returned explicitly to the
     /// caller by the split path below.
     pub(super) fn arm_body_has_infer_call(&self, body: &Expr) -> bool {
-        use syn::visit::Visit;
-        struct LateRejectCallProbe<'a, 'c> {
-            lowerer: &'a Lowerer<'c>,
-            hit: bool,
-        }
-        impl<'ast, 'a, 'c> Visit<'ast> for LateRejectCallProbe<'a, 'c> {
-            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-                // `Constant(nullptr)` is not a helper. `auto_calls` would
-                // otherwise resolve `ptr::null_mut` to Infer and keep the
-                // arm off the dispatch JitCode (`has_infer_call`).
-                if !self.hit && !call_is_null_ptr(call) {
-                    match self.lowerer.resolve_call_policy(&call.func) {
-                        Some(CallPolicySpec::Infer) => self.hit = true,
-                        Some(CallPolicySpec::Explicit(
-                            crate::jit_interp::CallPolicyKind::InlinePipelineInt
-                            | crate::jit_interp::CallPolicyKind::InlinePipelineRef
-                            | crate::jit_interp::CallPolicyKind::InlinePipelineFloat
-                            | crate::jit_interp::CallPolicyKind::InlinePipelineVoid,
-                        )) => self.hit = true,
-                        _ => {}
-                    }
-                }
-                syn::visit::visit_expr_call(self, call);
-            }
-        }
-        let mut probe = LateRejectCallProbe {
-            lowerer: self,
-            hit: false,
-        };
-        probe.visit_expr(body);
-        probe.hit
+        let auto_calls =
+            self.auto_calls || matches!(self.inference_failure_mode, InferenceFailureMode::Panic);
+        expr_has_infer_or_pipeline_call(body, &self.call_policies, auto_calls)
     }
 
     /// Lower a dispatch arm `body` INLINE into this dispatch JitCode (green-pc

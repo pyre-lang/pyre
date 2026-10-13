@@ -23,15 +23,17 @@ use super::jitcode_lower::{
 /// Vable-field scalars stay in
 /// `initialize_virtualizable` / `virtualizable_boxes` and are not
 /// pushed here.
-fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
+fn plain_red_argbox_pushes(config: &JitInterpConfig, has_infer_call_arm: bool) -> TokenStream {
     let Some(sf) = config.state_fields.as_ref() else {
         return quote! {};
     };
-    let has_virt = sf
-        .fields
-        .iter()
-        .any(|f| matches!(f.kind, StateFieldKind::VirtArray(_)));
-    let int_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+    let skip_vable_scalars = super::state_is_vable_identity(
+        config.virtualizable_decl.as_ref(),
+        config.state_fields.as_ref(),
+        config.split_dispatch,
+        has_infer_call_arm,
+    );
+    let int_scalars: Vec<&super::StateFieldDecl> = if skip_vable_scalars {
         Vec::new()
     } else {
         sf.fields
@@ -46,7 +48,7 @@ fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
         .iter()
         .filter(|f| matches!(f.kind, StateFieldKind::Array(_)))
         .collect();
-    let ref_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+    let ref_scalars: Vec<&super::StateFieldDecl> = if skip_vable_scalars {
         Vec::new()
     } else {
         sf.fields
@@ -54,7 +56,7 @@ fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
             .filter(|f| matches!(f.kind, StateFieldKind::Ref(_) | StateFieldKind::Str))
             .collect()
     };
-    let float_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+    let float_scalars: Vec<&super::StateFieldDecl> = if skip_vable_scalars {
         Vec::new()
     } else {
         sf.fields
@@ -163,7 +165,11 @@ fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
     }
 }
 
-pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+pub fn generate_trace_fn(
+    config: &JitInterpConfig,
+    func: &ItemFn,
+    has_infer_call_arm: bool,
+) -> TokenStream {
     let fn_name = &func.sig.ident;
     let trace_fn_name = format_ident!("__trace_{}", fn_name);
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", fn_name);
@@ -244,6 +250,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         &config.native_tag_small,
         &config.native_identity,
         config.split_dispatch,
+        has_infer_call_arm,
         config.switch_dispatch,
     )
     .with_loop_carried_greens(
@@ -255,7 +262,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 
     let env_type = &config.env_type;
     let state_type = &config.state_type;
-    let red_argbox_pushes = plain_red_argbox_pushes(config);
+    let red_argbox_pushes = plain_red_argbox_pushes(config, has_infer_call_arm);
 
     // Dispatch JitCode singleton produced by lower_dispatch_body.
     // `__trace_*` invokes it; the install pipeline registers it as the
@@ -317,21 +324,20 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // `with_trace_ctx_and_token_resolver` split-borrow helper.
     // (Legacy identity closure `|pc| pc` retained at the
     // call site there.)
-    // State-field `[int; virt]` arrays also seed a standard-virtualizable
-    // identity: the OpRef of `virtualizable_boxes[-1]` must reach ref reg 1
-    // so the `getarrayitem_vable_*` dispatch ops resolve the same box that
+    // A state-as-vable identity (`[.. ; virt]`, or a sub-JitCode arm
+    // (`split_dispatch` / infer / `inline_pipeline_*`) with scalar/`ref(_)`/
+    // `str` fields) seeds a standard-virtualizable identity: the OpRef of
+    // `virtualizable_boxes[-1]` must reach ref reg 1 so
+    // `getfield_vable_*` / `getarrayitem_vable_*` resolve the same box that
     // `init_virtualizable_boxes` minted (identity-equal per
     // `begin_nonstandard_virtualizable` Step 3). Push the identity argbox for
-    // both the PyFrame-style declaration and the state-field virt-array case.
-    let state_has_virt_array = config
-        .state_fields
-        .as_ref()
-        .map(|sf| {
-            sf.fields
-                .iter()
-                .any(|f| matches!(f.kind, crate::jit_interp::StateFieldKind::VirtArray(_)))
-        })
-        .unwrap_or(false);
+    // both the PyFrame-style declaration and the state-as-vable case.
+    let state_has_vable_identity = super::state_is_vable_identity(
+        config.virtualizable_decl.as_ref(),
+        config.state_fields.as_ref(),
+        config.split_dispatch,
+        has_infer_call_arm,
+    );
     // `pyjitpl.py` `_nonstandard_virtualizable` step 3: the walk's vable
     // base is standard only when it IS `virtualizable_boxes[-1]`. A heap
     // frame's entry index is not that box on a bridge (fail args are not
@@ -363,7 +369,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             };
             __jitcode_args.push(__vable_argbox);
         }
-    } else if state_has_virt_array {
+    } else if state_has_vable_identity {
         quote! {
             let Some(__vable_argbox) = __ctx.standard_virtualizable_jitcode_argbox() else {
                 return TraceAction::Abort;

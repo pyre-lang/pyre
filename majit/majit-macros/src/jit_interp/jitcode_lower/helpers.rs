@@ -789,6 +789,74 @@ pub(super) fn binding_kind_for_inline_policy(
     }
 }
 
+/// Look up a call's helper policy the way dispatch's infer-call probe does
+/// (`Lowerer::resolve_call_policy` in `ReturnNone` mode when `auto_calls`
+/// is the sidecar fallback). Explicit `calls = { ... }` entries win;
+/// otherwise a path with a `_jit_helper_policy` accessor is Infer.
+pub(super) fn resolve_call_policy_for_probe(
+    func: &Expr,
+    call_policies: &[(Vec<String>, CallPolicySpec)],
+    auto_calls: bool,
+) -> Option<CallPolicySpec> {
+    let func_segments = canonical_expr_segments(func)?;
+    if let Some((_, policy)) = call_policies
+        .iter()
+        .find(|(path, _)| *path == func_segments)
+    {
+        return Some(policy.clone());
+    }
+    if auto_calls {
+        helper_policy_path(func).map(|_| CallPolicySpec::Infer)
+    } else {
+        None
+    }
+}
+
+fn call_policy_spec_is_infer_or_pipeline(spec: &CallPolicySpec) -> bool {
+    match spec {
+        CallPolicySpec::Infer => true,
+        CallPolicySpec::Explicit(kind) => kind.is_inline_pipeline(),
+    }
+}
+
+/// Whether `body` contains a call that keeps a dispatch arm on the
+/// sub-JitCode path: inferred policy, or an explicit `inline_pipeline_*`.
+/// `Constant(nullptr)` is not a helper. Same walk as
+/// `Lowerer::arm_body_has_infer_call`.
+pub(super) fn expr_has_infer_or_pipeline_call(
+    body: &Expr,
+    call_policies: &[(Vec<String>, CallPolicySpec)],
+    auto_calls: bool,
+) -> bool {
+    use syn::visit::Visit;
+    struct InferCallProbe<'a> {
+        call_policies: &'a [(Vec<String>, CallPolicySpec)],
+        auto_calls: bool,
+        hit: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for InferCallProbe<'a> {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if !self.hit && !call_is_null_ptr(call) {
+                if let Some(spec) =
+                    resolve_call_policy_for_probe(&call.func, self.call_policies, self.auto_calls)
+                {
+                    if call_policy_spec_is_infer_or_pipeline(&spec) {
+                        self.hit = true;
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut probe = InferCallProbe {
+        call_policies,
+        auto_calls,
+        hit: false,
+    };
+    probe.visit_expr(body);
+    probe.hit
+}
+
 pub(crate) fn helper_policy_path(expr: &Expr) -> Option<Path> {
     let Expr::Path(ExprPath { path, .. }) = expr else {
         return None;

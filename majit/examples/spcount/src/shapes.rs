@@ -117,6 +117,37 @@ mod tests {
             assert_eq!(got, 0, "scalar counter did not reach 0 for n={n}");
         }
     }
+
+    /// TICK stays a sub-JitCode because `scalar_tick` is Infer
+    /// (`auto_calls`, `#[dont_look_inside]`). That callee used to emit
+    /// `load_state_field` / `store_state_field` against the parent's
+    /// identity slots. The state-as-vable gate now covers that arm shape,
+    /// so `rewrite_op_getfield` / `rewrite_op_setfield` land on the live
+    /// virtualizable and no callee JitCode reads identity slots.
+    #[test]
+    fn scalar_state_callee_jitcodes_do_not_read_identity_slots() {
+        use majit_metainterp::Assembler;
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![0], vec![0], vec![]);
+        super::__prebuild_jitcode_liveness_scalar_mainloop(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let dispatch = super::__dispatch_jitcode_scalar_mainloop(&mut asm, 0i64)
+            .expect("dispatch lower must succeed for ScalarState");
+        let identity_callees: Vec<&str> = dispatch
+            .exec
+            .descrs
+            .iter()
+            .filter_map(majit_metainterp::RuntimeBhDescr::as_jitcode)
+            .filter(|jc| jc.reads_identity_slots())
+            .map(|jc| jc.name())
+            .collect();
+        assert!(
+            identity_callees.is_empty(),
+            "ScalarState TICK must use getfield_vable / setfield_vable, \
+             not load_state_field / store_state_field; \
+             callees with identity slots: {identity_callees:?}"
+        );
+    }
 }
 
 /// Ref and float stores, then a guard in the same arm.
