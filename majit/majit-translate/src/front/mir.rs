@@ -24210,11 +24210,17 @@ impl<'a> Lowering<'a> {
                     )
                 {
                     // `(s as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` is
-                    // `s.chars` (`rstr.py` `STR`). The operand is already the
-                    // string, so this is not `direct_ptradd` of a `SomePtr`.
-                    if arg_operands.get(1).is_some_and(|op| {
-                        operand_is_lowlevel_string_chars_offset(self.body, self.llbc, op)
-                    }) {
+                    // `s.chars` (`rstr.py` `STR`) only when `s` is the rstr
+                    // header and the add produces a `u8` pointer. Any other
+                    // add/sub of that constant is `rtype_direct_ptradd` with
+                    // its displacement.
+                    if self.is_string_header_chars_byte_ptr_add(
+                        &reg,
+                        &arg_locals,
+                        &arg_operands,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                    ) {
                         self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -33192,6 +33198,42 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path().as_str()))
+    }
+
+    /// `(header as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` — `s.chars`
+    /// (`rstr.py` `STR`). The add is on a `u8` pointer, the peeled base is
+    /// the low-level string header, and the dest is a `u8` pointer. `sub`
+    /// and any other pointee keep `rtype_direct_ptradd`.
+    fn is_string_header_chars_byte_ptr_add(
+        &self,
+        reg: &RegularCall,
+        arg_locals: &[Option<usize>],
+        arg_operands: &[Operand],
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        if self.ptr_offset_is_sub(reg) {
+            return false;
+        }
+        if !tyref_is_raw_u8_ptr(dest_ty, self.llbc) {
+            return false;
+        }
+        if !first_arg_ty.is_some_and(|ty| tyref_is_raw_u8_ptr(ty, self.llbc)) {
+            return false;
+        }
+        if !arg_operands
+            .get(1)
+            .is_some_and(|op| operand_is_lowlevel_string_chars_offset(self.body, self.llbc, op))
+        {
+            return false;
+        }
+        arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|local| peel_copy_and_cast(self.llbc, self.body, local))
+            .and_then(|base| self.body.locals.locals.get(base))
+            .is_some_and(|decl| tyref_is_lowlevel_string_header_ptr(&decl.ty, self.llbc))
     }
 
     /// Later intercepts in this same `RegularCall` match already lower
@@ -42575,13 +42617,38 @@ fn operand_is_lowlevel_string_chars_offset(body: &Unstructured, llbc: &Llbc, op:
     }
 }
 
+/// `LOWLEVEL_STRING_CHARS_OFFSET` (`lowlevel_string.rs`) — `size_of` the
+/// rstr `STR` header (`rstr.py` `STR`).
+const LOWLEVEL_STRING_CHARS_OFFSET_PATH: &str =
+    "pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET";
+
 fn place_is_chars_offset_global(llbc: &Llbc, place: Option<&Place>) -> bool {
     let Some(PlaceKind::Global { id, .. }) = place.map(|place| &place.kind) else {
         return false;
     };
-    llbc.global_by_id(*id).is_some_and(|global| {
-        global.item_meta.name_path() == "pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET"
-    })
+    llbc.global_by_id(*id)
+        .is_some_and(|global| global.item_meta.name_path() == LOWLEVEL_STRING_CHARS_OFFSET_PATH)
+}
+
+/// rstr `STR` (`rstr.py` `STR`) — `W_UnicodeObject._utf8` and the layout
+/// type next to `LOWLEVEL_STRING_CHARS_OFFSET`.
+fn is_lowlevel_string_header_adt_path(path: &str) -> bool {
+    matches!(
+        path,
+        "pyre_object::unicodeobject::Utf8Str"
+            | "pyre_object::lowlevel_string::LowlevelStringHeader"
+    )
+}
+
+/// `*const Utf8Str` / `*mut Utf8Str` / `*const LowlevelStringHeader` — the
+/// rstr `STR` header (`rstr.py` `STR`).
+fn tyref_is_lowlevel_string_header_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
+        return false;
+    };
+    adt_node_def_id(pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| is_lowlevel_string_header_adt_path(td.item_meta.name_path_str()))
 }
 
 fn operand_place(op: &Operand) -> Option<&Place> {
@@ -86002,6 +86069,273 @@ mod tests {
         assert!(
             graph_calls_leaf(&graph, "from_raw_parts"),
             "a length from a different base must not drop n"
+        );
+    }
+
+    /// `p.add/sub(LOWLEVEL_STRING_CHARS_OFFSET)` with no string-header peel.
+    fn ptr_offset_chars_const_fun(
+        caller_name: &str,
+        callee_path: &[&str],
+        ptr_ty: serde_json::Value,
+    ) -> Llbc {
+        let usize_t = usize_ty();
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", caller_name], "", true),
+            "signature": {"is_unsafe": true, "inputs": [ptr_ty], "output": ptr_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ptr_ty},
+                    {"index": 1, "name": "p", "span": span_json(), "ty": ptr_ty}
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": {"kind": {"Local": 1}, "ty": ptr_ty}},
+                                {"Copy": {"kind": {"Global": {
+                                    "generics": empty_generics(),
+                                    "id": 1
+                                }}, "ty": usize_t}}
+                            ],
+                            "dest": {"kind": {"Local": 0}, "ty": ptr_ty}
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(callee_path, "", false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [ptr_ty, usize_t],
+                "output": ptr_ty
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, callee],
+                "global_decls": [null, chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET")],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("chars-offset add fixture parses")
+    }
+
+    fn u8_raw_ptr_ty(mutability: &str) -> serde_json::Value {
+        serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, mutability]
+        })
+    }
+
+    fn graph_has_direct_ptradd(graph: &crate::model::FunctionGraph) -> bool {
+        graph_ops(graph)
+            .iter()
+            .any(|op| is_lltype_direct_ptradd(op))
+    }
+
+    #[test]
+    fn u8_add_of_string_chars_offset_stays_direct_ptradd() {
+        let ptr_ty = u8_raw_ptr_ty("Mut");
+        let llbc = ptr_offset_chars_const_fun(
+            "add_u8_chars_offset",
+            &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "add_u8_chars_offset")
+            .expect("lower *mut u8::add of LOWLEVEL_STRING_CHARS_OFFSET");
+        assert!(
+            graph_has_direct_ptradd(&graph),
+            "a u8 pointer add of the chars offset keeps its displacement; graph={graph:#?}"
+        );
+    }
+
+    #[test]
+    fn u8_sub_of_string_chars_offset_stays_direct_ptradd() {
+        let ptr_ty = u8_raw_ptr_ty("Mut");
+        let llbc = ptr_offset_chars_const_fun(
+            "sub_u8_chars_offset",
+            &["core", "ptr", "mut_ptr", "<Impl>", "sub"],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "sub_u8_chars_offset")
+            .expect("lower *mut u8::sub of LOWLEVEL_STRING_CHARS_OFFSET");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+            "a u8 pointer sub of the chars offset keeps its displacement; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg")),
+            "the sub must negate the count; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn i64_add_of_string_chars_offset_stays_direct_ptradd() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Const"]
+        });
+        let llbc = ptr_offset_chars_const_fun(
+            "add_i64_chars_offset",
+            &["core", "ptr", "const_ptr", "<Impl>", "add"],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "add_i64_chars_offset")
+            .expect("lower *const i64::add of LOWLEVEL_STRING_CHARS_OFFSET");
+        assert!(
+            graph_has_direct_ptradd(&graph),
+            "a non-byte pointer add of the chars offset keeps its displacement; graph={graph:#?}"
+        );
+    }
+
+    fn header_as_u8_add_chars_offset_fun(header_path: &[&str]) -> Llbc {
+        let u8_ptr = u8_raw_ptr_ty("Const");
+        let header_ptr = serde_json::json!({
+            "RawPtr": [{
+                "Adt": {
+                    "id": 0,
+                    "generics": empty_generics()
+                }
+            }, "Const"]
+        });
+        let usize_t = usize_ty();
+        let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+        let header_adt = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(header_path, "", true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": isize_t, "attr_info": null},
+                {"name": "length", "ty": usize_t, "attr_info": null}
+            ]},
+            "layout": null
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "header_chars_view"], "", true),
+            "signature": {"is_unsafe": true, "inputs": [header_ptr], "output": u8_ptr},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": u8_ptr},
+                    {"index": 1, "name": "s", "span": span_json(), "ty": header_ptr},
+                    {"index": 2, "name": null, "span": span_json(), "ty": u8_ptr}
+                ]},
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span_json(),
+                            "kind": {"Assign": [
+                                {"kind": {"Local": 2}, "ty": u8_ptr},
+                                {"UnaryOp": [
+                                    {"Cast": {"RawPtr": [header_ptr, u8_ptr]}},
+                                    {"Move": {"kind": {"Local": 1}, "ty": header_ptr}}
+                                ]}
+                            ]}
+                        }],
+                        "terminator": {"span": span_json(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Move": {"kind": {"Local": 2}, "ty": u8_ptr}},
+                                {"Copy": {"kind": {"Global": {
+                                    "generics": empty_generics(),
+                                    "id": 1
+                                }}, "ty": usize_t}}
+                            ],
+                            "dest": {"kind": {"Local": 0}, "ty": u8_ptr}
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(
+                &["core", "ptr", "const_ptr", "<Impl>", "add"],
+                "",
+                false
+            ),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [u8_ptr, usize_t],
+                "output": u8_ptr
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [header_adt],
+                "fun_decls": [caller, callee],
+                "global_decls": [null, chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET")],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes())
+            .expect("header-as-u8 chars-offset add fixture parses")
+    }
+
+    #[test]
+    fn utf8str_as_u8_add_of_chars_offset_aliases_the_header() {
+        let llbc = header_as_u8_add_chars_offset_fun(&["pyre_object", "unicodeobject", "Utf8Str"]);
+        let graph = super::lower_function(&llbc, "header_chars_view")
+            .expect("lower (Utf8Str as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)");
+        assert!(
+            !graph_has_direct_ptradd(&graph),
+            "s.chars is the STR, not a displaced byte pointer; graph={graph:#?}"
+        );
+        assert!(
+            !call_leafs(&graph_ops(&graph))
+                .iter()
+                .any(|leaf| *leaf == "add"),
+            "the header chars add must not residualize; graph={graph:#?}"
+        );
+    }
+
+    #[test]
+    fn other_module_utf8str_as_u8_add_of_chars_offset_stays_direct_ptradd() {
+        let llbc = header_as_u8_add_chars_offset_fun(&["other_crate", "Utf8Str"]);
+        let graph = super::lower_function(&llbc, "header_chars_view")
+            .expect("lower (other Utf8Str as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)");
+        assert!(
+            graph_has_direct_ptradd(&graph),
+            "a same-leaf Utf8Str outside pyre_object::unicodeobject is not rstr STR; graph={graph:#?}"
         );
     }
 
