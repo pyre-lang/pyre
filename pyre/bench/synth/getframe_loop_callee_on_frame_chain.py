@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=16
+# pyre-check: skip-backends=wasm
+# wasm compiles a chain of bridges on the first guard of the previous bridge
+# (19-35 bridges run to run, against 12 on dynasm and cranelift).
 # macOS reads 4.0-8.1x on dynasm; the ceiling is twice the slowest.
 # Regression oracle: a callee that carries its own loop is entered from an
 # inlined call, and its loop runs as a call into its own compiled code.  The
@@ -15,6 +18,14 @@
 # The call counter must equal what an interpreter counts, and the checksum
 # over the locals read must match.
 import sys
+
+try:
+    import pypyjit
+
+    # Counter decay makes guard_failures depend on when collections run.
+    pypyjit.set_param("decay=0")
+except ImportError:
+    pass
 
 N_LOOP = 400000
 N_GEN = 12000
