@@ -27984,18 +27984,15 @@ impl<'a> Lowering<'a> {
                             .is_some_and(|path| path.ends_with("pyobject_from_constant"))
                     {
                         // The address argument is an int word. The callee
-                        // takes `&ConstantData`.
+                        // takes `&ConstantData`. `lltype.cast_int_to_ptr`
+                        // is the host call `rtype_cast_int_to_ptr` accepts.
                         let cast = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
                         let bb_id = self.emit_bb(mir_bb);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(cast.clone()),
-                            kind: OpKind::UnaryOp {
-                                op: "cast_int_to_ptr".to_string(),
-                                operand: args[0].clone(),
-                                result_ty: ValueType::Ref(None),
-                            },
+                            kind: cast_int_to_ptr_call(args[0].clone()),
                         });
                         args[0] = cast;
                     }
@@ -56633,7 +56630,7 @@ fn int_to_int_cast(src: (u64, bool), dst: (u64, bool), word: u64) -> Option<IntT
 
 /// `lltype.cast_int_to_ptr` as the host call the rtyper accepts.
 /// `normalize_unary_op_name` rejects a unary op of this name.
-fn cast_int_to_ptr_call(operand: crate::flowspace::model::Variable) -> OpKind {
+pub(crate) fn cast_int_to_ptr_call(operand: crate::flowspace::model::Variable) -> OpKind {
     OpKind::Call {
         target: CallTarget::function_path([
             "rpython",
