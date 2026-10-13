@@ -164,10 +164,12 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                 );
                 continue;
             }
-            // `#[specialize_argtype(N)]` emits
-            // `_annspecialcase_argtype_<fn> = "specialize:argtype(N)"`.
-            // The const value is the whole hint (`specialize.py`
-            // `specialize_argtype`); do not prefix it again.
+            // `#[specialize_argtype(N, …)]` emits the body-local
+            // `_annspecialcase_argtype_<fn> = "specialize:argtype(0,1)"`
+            // (`objectmodel.py` `_Specialize._wrap`). The const value is
+            // the whole hint (`specialize.py` `specialize_argtype`); do
+            // not prefix it again. Multi-index form is already the
+            // comma-joined payload `parse_specializer_directive` splits.
             if leaf.starts_with("_annspecialcase_argtype_") {
                 let hint = global_marker_str(llbc, gd).unwrap_or_else(|| {
                     panic!(
@@ -601,6 +603,32 @@ mod tests {
                 &functions,
             ),
             "owner::Cache::getorbuild"
+        );
+    }
+
+    #[test]
+    fn argtype_body_local_marker_binds_trait_impl_static_method() {
+        let functions = HashSet::from(["owner::<Impl>::convert".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "crate::owner::<Impl>::convert::_annspecialcase_argtype_convert",
+                "_annspecialcase_argtype_",
+                &functions,
+            ),
+            "owner::<Impl>::convert"
+        );
+    }
+
+    #[test]
+    fn argtype_body_local_marker_binds_free_function() {
+        let functions = HashSet::from(["rstring::startswith".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "majit_rlib::rstring::startswith::_annspecialcase_argtype_startswith",
+                "_annspecialcase_argtype_",
+                &functions,
+            ),
+            "rstring::startswith"
         );
     }
 

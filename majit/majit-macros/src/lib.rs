@@ -3491,38 +3491,57 @@ impl Parse for ElidablePromoteArgs {
     }
 }
 
-/// `specialize:argtype(N)` (`annotator/specialize.py` `specialize_argtype`).
+/// `specialize:argtype(N, …)` (`objectmodel.py` `_Specialize.argtype`).
 ///
-/// The index is stored as `_annspecialcase_argtype_<fn>: &'static str =
-/// "specialize:argtype(N)"`. `harvest_hints_from_llbcs` reads that const
-/// the same way it reads an `oopspec_` string.
+/// Indices are stored as the body-local const
+/// `_annspecialcase_argtype_<fn>: &'static str = "specialize:argtype(0,1)"`
+/// (`_Specialize._wrap`). `harvest_hints_from_llbcs` reads that const
+/// the same way it reads an `oopspec_` string. Charon promotes the
+/// body-local const under `<fn>::_annspecialcase_argtype_<fn>`;
+/// `marker_path_to_fn_path` binds that parent when it is the function.
+/// A sibling associated const is illegal in a trait impl, including on
+/// a static method that has no receiver, so this expansion never infers
+/// module scope from `sig.receiver()`.
 ///
-/// Usage: `#[specialize_argtype(0)]`
+/// Usage: `#[specialize_argtype(0)]`, `#[specialize_argtype(0, 1)]`
 #[proc_macro_attribute]
 pub fn specialize_argtype(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let index: syn::LitInt = parse_macro_input!(attr as syn::LitInt);
+    let args = parse_macro_input!(attr as SpecializeArgtypeArgs);
     let func = parse_macro_input!(item as ItemFn);
+    expand_specialize_argtype(&args.indices, &func).into()
+}
+
+/// `_Specialize.argtype(*args)` indices. `_Specialize._wrap` joins them
+/// as `specialize:argtype(0,1)` with no spaces.
+struct SpecializeArgtypeArgs {
+    indices: Vec<syn::LitInt>,
+}
+
+impl Parse for SpecializeArgtypeArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let indices =
+            syn::punctuated::Punctuated::<syn::LitInt, Token![,]>::parse_separated_nonempty(input)?;
+        Ok(Self {
+            indices: indices.into_iter().collect(),
+        })
+    }
+}
+
+fn expand_specialize_argtype(indices: &[syn::LitInt], func: &ItemFn) -> proc_macro2::TokenStream {
     let attrs = &func.attrs;
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
-    let hint = format!("specialize:argtype({})", index.base10_digits());
+    let hint = format!(
+        "specialize:argtype({})",
+        indices
+            .iter()
+            .map(|index| index.base10_digits().to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let body_name = format_ident!("_annspecialcase_argtype_{}", sig.ident);
-    // A free function can carry the const beside the item. An inherent
-    // method cannot: a trait impl rejects a foreign associated item.
-    // Charon promotes the body-local const under `<method>::<const>`, and
-    // `marker_path_to_fn_path` binds that parent when it is the function.
-    let module_const = if sig.receiver().is_none() {
-        let const_name = body_name.clone();
-        Some(quote! {
-            #[doc(hidden)]
-            #[allow(non_upper_case_globals)]
-            #vis const #const_name: &'static str = #hint;
-        })
-    } else {
-        None
-    };
-    let expanded = quote! {
+    quote! {
         #(#attrs)*
         #vis #sig {
             #[doc(hidden)]
@@ -3530,9 +3549,7 @@ pub fn specialize_argtype(attr: TokenStream, item: TokenStream) -> TokenStream {
             const #body_name: &'static str = #hint;
             #block
         }
-        #module_const
-    };
-    expanded.into()
+    }
 }
 
 /// The JIT compiler won't look inside this decorated function,
@@ -5037,5 +5054,46 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("stringify ! (leaf)"), "{text}");
+    }
+
+    fn specialize_argtype_tokens(attr: &str, src: &str) -> proc_macro2::TokenStream {
+        let args: SpecializeArgtypeArgs = syn::parse_str(attr).expect("indices parse");
+        expand_specialize_argtype(&args.indices, &parse_fn(src))
+    }
+
+    #[test]
+    fn specialize_argtype_emits_wrapped_multi_index_hint() {
+        let text = specialize_argtype_tokens("0, 1", "fn convert(a: i64, b: i64) -> i64 { a }")
+            .to_string();
+        assert!(text.contains("\"specialize:argtype(0,1)\""), "{text}");
+        assert!(text.contains("_annspecialcase_argtype_convert"), "{text}");
+    }
+
+    #[test]
+    fn specialize_argtype_emits_body_local_marker_without_sibling() {
+        for src in [
+            "fn convert(a: i64) -> i64 { a }",
+            "fn method(&self, a: i64) -> i64 { a }",
+            "fn static_method(a: i64) -> i64 { a }",
+        ] {
+            let tokens = specialize_argtype_tokens("0", src);
+            let file: syn::File = syn::parse2(tokens.clone()).expect("expansion is a file");
+            assert_eq!(
+                file.items.len(),
+                1,
+                "body-local only, no sibling const: {src} => {tokens}"
+            );
+            let syn::Item::Fn(func) = &file.items[0] else {
+                panic!("expected function item");
+            };
+            let has_body_const = func.block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    syn::Stmt::Item(syn::Item::Const(item))
+                        if item.ident.to_string().starts_with("_annspecialcase_argtype_")
+                )
+            });
+            assert!(has_body_const, "missing body-local marker: {src}");
+        }
     }
 }
