@@ -1639,25 +1639,15 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // The recipe's jitcode is the operator tail that was paused
             // (`bh_len_tail` or `bh_truth_bool_tail`). Rebuilding `Len`
             // unconditionally would run the length check on a `__bool__`
-            // result.
-            if parent_recipe.jitcode_pc < 0 {
-                return None;
-            }
-            let resume_pc = parent_recipe.jitcode_pc as usize;
-            pending_tail = Some(InlineParentFrame {
-                jitcode_index: parent_recipe.jitcode_index as u32,
-                call_jitcode_pc: None,
-                call_stack_overrides: Vec::new(),
-                blackhole: None,
-                resume_coord: ParentResumeCoord::Backxlat(resume_pc),
-                resume_marker_jit_pc: Some(resume_pc),
-                boxes: Vec::new(),
-                registers_r: None,
-                registers_i: None,
-                registers_f: None,
-                frame_state: None,
-                caller_py_pc: None,
-            });
+            // result. Interned liveness at the stored `-live-` sizes the
+            // box section (`get_list_of_active_boxes`); an empty Vec here
+            // encoded 0 boxes against r0-live, and `rebuild_from_numbering`
+            // ate the next frame header.
+            pending_tail = Some(super::reconstructed_operator_continuation_parent(
+                parent_recipe.jitcode_index,
+                parent_recipe.jitcode_pc,
+                parent_recipe.registers_r.first().copied(),
+            )?);
             continue;
         }
         if let Some(instance) = parent_recipe.return_substitute {

@@ -239,6 +239,16 @@ pub(crate) fn is_installed_level(index: i32) -> bool {
     })
 }
 
+/// Which installed tail `index` names, without minting a missing level.
+pub(crate) fn tail_for_installed_index(index: i32) -> Option<OperatorTail> {
+    LEVELS.with(|cell| {
+        let slots = cell.borrow();
+        OperatorTail::ALL.into_iter().find(
+            |tail| matches!(slots[tail.slot()], Some(Some((installed, _))) if installed == index),
+        )
+    })
+}
+
 fn build(tail: OperatorTail) -> Option<(i32, usize)> {
     let mut builder = JitCodeBuilder::new();
     builder.set_name(tail.name());

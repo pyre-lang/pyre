@@ -8401,15 +8401,35 @@ fn reconstruct_inline_recipe(
         });
     }
     // An operator's tail (`crate::operator_continuation`) reconstructs no
-    // frame either, and unlike `descr_call`'s it cannot be carried out by
-    // substituting a box: its JIT-visible body is a CALL that has to run, over
-    // a value the callee has not returned yet.  The conservative blackhole
-    // resume runs it correctly, so decline the whole chain here -- named,
-    // rather than as the `NoCodeForJitcodeIndex` every check below would give
-    // it anyway.
-    // `capture_resumedata` keeps `operation.py len` on the framestack. This
-    // level is that tail: no code object, applied after `__len__` returns.
+    // Python frame. Its interned resume `-live-` names r0 so a paused
+    // in-dunder parent encodes that one box (`get_list_of_active_boxes`);
+    // decode it into `registers_r` for the drain to size the parent
+    // snapshot from the same liveness. Empty values keep the in-dunder
+    // NULL placeholder. The tail's CALL still runs over the callee's
+    // return (`walk_len_operator_tail`).
     if crate::operator_continuation::is_installed_level(frame.jitcode_index) {
+        let mut registers_r = Vec::new();
+        match frame.values.as_slice() {
+            [] => {}
+            [result_value] => {
+                let (result, _) = bridge_decode_box(
+                    ctx,
+                    result_value,
+                    Type::Ref,
+                    rd_virtuals,
+                    resume_data,
+                    fail_values,
+                    fail_types,
+                    backend,
+                    cache,
+                );
+                if result.is_none() {
+                    decline!("OperatorTailBox");
+                }
+                registers_r.push(result);
+            }
+            _ => decline!("OperatorTailArity"),
+        }
         return Some(ReconstructRecipe {
             code_ptr: std::ptr::null(),
             jitcode_index: frame.jitcode_index,
@@ -8417,7 +8437,7 @@ fn reconstruct_inline_recipe(
             nlocals: 0,
             valuestackdepth: 0,
             registers_i: Vec::new(),
-            registers_r: Vec::new(),
+            registers_r,
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
             frame: OpRef::NONE,

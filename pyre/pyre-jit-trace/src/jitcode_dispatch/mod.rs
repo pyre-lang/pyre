@@ -8034,7 +8034,47 @@ pub(crate) fn operator_continuation_parent_frame(
 ) -> Option<InlineParentFrame> {
     let jitcode_index = crate::operator_continuation::jitcode_index(tail)?;
     let resume_pc = crate::operator_continuation::resume_pc(tail)?;
-    let boxes = vec![OpRef::const_ptr(majit_ir::GcRef::NULL)];
+    reconstructed_operator_continuation_parent(
+        jitcode_index,
+        resume_pc as i32,
+        Some(OpRef::const_ptr(majit_ir::GcRef::NULL)),
+    )
+}
+
+/// Paused operator-tail parent for a reconstructed bridge chain.
+///
+/// Interned liveness at `jitcode_pc` sizes the box section
+/// (`enumerate_vars` / `get_list_of_active_boxes`). The resume `-live-`
+/// names r0; the residual's own `-live-` is empty. An empty `r0` is the
+/// in-dunder NULL placeholder `_setup_return_value_r` (`blackhole.py`)
+/// overwrites.
+pub(crate) fn reconstructed_operator_continuation_parent(
+    jitcode_index: i32,
+    jitcode_pc: i32,
+    r0: Option<OpRef>,
+) -> Option<InlineParentFrame> {
+    if jitcode_pc < 0 {
+        return None;
+    }
+    crate::operator_continuation::tail_for_installed_index(jitcode_index)?;
+    let resume_pc = jitcode_pc as usize;
+    let r0 = r0
+        .filter(|value| *value != OpRef::NONE)
+        .unwrap_or_else(|| OpRef::const_ptr(majit_ir::GcRef::NULL));
+    let banks = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+        jitcode_index,
+        jitcode_pc,
+    )?;
+    if !banks.int.is_empty() || !banks.float.is_empty() {
+        return None;
+    }
+    let mut boxes = Vec::with_capacity(banks.ref_.len());
+    for &idx in &banks.ref_ {
+        if idx != 0 {
+            return None;
+        }
+        boxes.push(r0);
+    }
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,

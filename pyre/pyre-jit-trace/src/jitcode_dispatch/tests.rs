@@ -296,6 +296,37 @@ fn every_continuation_parent_carries_the_pending_result_placeholder() {
     }
 }
 
+/// Bridge reconstruct of a paused operator tail used to emit `boxes: Vec::new()`
+/// while interned liveness at the resume `-live-` names r0. Encoder nboxes=0
+/// vs `enumerate_vars`=1 lets `rebuild_from_numbering` eat the next frame
+/// header; leftover TAGVIRTUAL(8)/TAGBOX(2) decode as `(35, 10)`.
+#[test]
+fn reconstructed_operator_tail_parent_matches_interned_resume_liveness() {
+    for tail in [
+        crate::operator_continuation::OperatorTail::Format,
+        crate::operator_continuation::OperatorTail::Len,
+        crate::operator_continuation::OperatorTail::Truth,
+    ] {
+        let index = crate::operator_continuation::jitcode_index(tail).expect("tail installs");
+        let resume_pc = crate::operator_continuation::resume_pc(tail).expect("resume pc");
+        let banks = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            index,
+            resume_pc as i32,
+        )
+        .expect("resume pc is a `-live-` startpoint");
+        let expected = banks.int.len() + banks.ref_.len() + banks.float.len();
+        assert_eq!(expected, 1, "{tail:?}: interned resume liveness names r0");
+        let parent = reconstructed_operator_continuation_parent(index, resume_pc as i32, None)
+            .expect("reconstruct sizes boxes from interned liveness");
+        assert_eq!(
+            parent.boxes.len(),
+            expected,
+            "{tail:?}: empty recipe registers still encode the interned r0 placeholder",
+        );
+        assert_eq!(parent.resume_marker_jit_pc, Some(resume_pc));
+    }
+}
+
 /// One `residual_call_r_i/iRd>i` with an empty argument varlist, whose funcbox
 /// operand names the Int-bank slot `funcbox`.
 fn residual_call_with_funcbox(funcbox: u8) -> Vec<u8> {
