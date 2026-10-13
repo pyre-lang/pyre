@@ -2215,6 +2215,11 @@ struct ResidualFrameChainGuard {
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when the chain already named `frame`.
     entered: bool,
+    /// `executioncontext.py leave`'s `got_exception`: the frame's own
+    /// execution ended in an exception.  Only a guard whose scope IS that
+    /// execution sets it (the portal call's frame); a frame that merely runs
+    /// a raising residual carries on into its handler lookup.
+    got_exception: std::cell::Cell<bool>,
 }
 
 impl ResidualFrameChainGuard {
@@ -2267,7 +2272,13 @@ impl ResidualFrameChainGuard {
             previous_published,
             previous_shadow,
             entered,
+            got_exception: std::cell::Cell::new(false),
         })
+    }
+
+    /// The execution this guard brackets left through an exception.
+    fn note_got_exception(&self) {
+        self.got_exception.set(true);
     }
 
     /// The frame as the collector last left it.  Every read below goes through
@@ -2297,7 +2308,9 @@ impl Drop for ResidualFrameChainGuard {
                 (*self.ec).topframeref = (*self.frame()).f_backref;
             }
             let frame = self.frame();
-            if (*frame).escaped() {
+            // `if frame.escaped or got_exception:` -- an exception leaves a
+            // traceback that names this frame, and through it the caller.
+            if (*frame).escaped() || self.got_exception.get() {
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
                     (*f_back).mark_as_escaped();
@@ -5495,7 +5508,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // entered, and here the caller is this residual.  After the guard
         // above, so the frame chains onto the level that calls it.
         let portal_call_frame = ctx.session.borrow().portal_call_frame;
-        let _portal_frame_chain = portal_call_frame
+        let portal_frame_chain = portal_call_frame
             .and_then(|frame| match ctx.trace_ctx.concrete_of_opref(frame) {
                 Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0),
                 _ => None,
@@ -5518,7 +5531,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             )
         });
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter(ctx.trace_ctx);
-        majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
+        let exec_result =
+            majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args);
+        // `pyframe.py execute_frame`'s `finally: ec.leave(self, w_exitvalue,
+        // got_exception)` for the frame the portal call ran.
+        if exec_result.is_err() {
+            if let Some(chain) = portal_frame_chain.as_ref() {
+                chain.note_got_exception();
+            }
+        }
+        exec_result
     };
     // Publish the Ref into the slot reserved above `residual_locals_roots`.
     // The word returned here is the address at publication. A later minor
