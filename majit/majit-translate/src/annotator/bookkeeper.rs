@@ -734,11 +734,28 @@ fn instantiate_field_spelling(
 }
 
 fn owner_type_args(owner: &str) -> Vec<&str> {
-    let Some((_, args)) = owner.split_once('<') else {
+    let Some(start) = owner.find('<') else {
         return Vec::new();
     };
-    // One delimiter. `Raw<Option<f64>>` must keep the inner `>`.
-    split_generic_args(args.strip_suffix('>').unwrap_or(args))
+    // Match the owner's `<…>` span. A variant class
+    // (`Option<(K, V)>::Some`) keeps `::Some` after that `>`;
+    // `strip_suffix('>')` cannot see it. Nested `Raw<Option<f64>>`
+    // still keeps the inner `>`.
+    let rest = &owner[start + 1..];
+    let mut depth = 1i32;
+    for (i, &b) in rest.as_bytes().iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return split_generic_args(rest[..i].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
 }
 
 /// `??TypeVar#N` is declaration parameter `N`. A bare `??TypeVar` is
@@ -3254,13 +3271,22 @@ impl Bookkeeper {
         // subject order instead of relying on that constructor side effect.
         {
             let guard = self.struct_fields.borrow();
-            if let Some(exact) = guard.as_ref().and_then(|r| r.fields.get(n)) {
+            if let Some(reg) = guard.as_ref() {
+                let exact = reg.fields.get(n);
                 for (fname, fty) in &mut fields {
-                    if let Some((_, exact_ty)) = exact.iter().find(|(en, _)| en == fname)
+                    if let Some((_, exact_ty)) =
+                        exact.and_then(|rows| rows.iter().find(|(en, _)| en == fname))
                         && fty.contains("??")
                         && !exact_ty.contains("??")
                     {
                         *fty = exact_ty.clone();
+                        continue;
+                    }
+                    // Template `??TypeVar#N` on a suffixed owner
+                    // (`Option<(K, V)>::Some`) substitutes from the
+                    // owner's type args (`instantiate_field_spelling`).
+                    if fty.contains("??TypeVar") {
+                        *fty = instantiate_field_spelling(reg, n, fty);
                     }
                 }
             }
@@ -3864,6 +3890,17 @@ impl Bookkeeper {
         // `rutf8.py` `Utf8StringBuilder._s` attribute is `SomeStringBuilder`.
         if stripped == "StringBuilder" || stripped.ends_with("rstring::StringBuilder") {
             return SomeValue::StringBuilder(super::model::SomeStringBuilder::new());
+        }
+        // `lltype.GCREF` (`llannotation.py` `lltype_to_annotation`).
+        // `GCREFOpaque` is the Rust pointee of `*mut GCREFOpaque` (= GCREF).
+        // An Input named `"GCREF"` is already seeded as that SomePtr
+        // (`derive_subject_inputcells`); a tuple item of the same spelling
+        // must project the same way, or `getitem` of a `call_once` args
+        // tuple Blocks (`binaryop.py` `tuple_integer_getitem` on Impossible).
+        if is_gcref_type_spelling(stripped) {
+            return crate::translator::rtyper::llannotation::lltype_to_annotation(
+                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+            );
         }
         match stripped {
             "i8" | "i16" | "i32" | "i64" | "isize" => {
@@ -5147,6 +5184,18 @@ pub(crate) fn normalize_class_qualname(name: &str) -> String {
         })
         .map(|(_, rest)| rest.to_string())
         .unwrap_or(lookup)
+}
+
+/// `lltype.GCREF` and the Rust pointee of `*mut GCREFOpaque`.
+/// `llannotation.py` `lltype_to_annotation` maps GCREF to `SomePtr`;
+/// `__cast_instance_intrinsic` must not mint a `GCREFOpaque` classdef
+/// (`pairtype(SomePtr, SomeObject).union` refuses Instance ∪ Ptr).
+pub(crate) fn is_gcref_type_spelling(stripped: &str) -> bool {
+    stripped == "GCREF"
+        || stripped == "gcref"
+        || stripped == "GCREFOpaque"
+        || stripped.ends_with("::GCREF")
+        || stripped.ends_with("::GCREFOpaque")
 }
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
@@ -10442,6 +10491,97 @@ mod tests {
             n_methods, 3,
             "subclass-only `req` must surface all 3 impl MethodDescs on the \
              base via attrfamily merge, got {n_methods}: {s_req:?}"
+        );
+    }
+
+    #[test]
+    fn owner_type_args_strips_variant_suffix() {
+        assert_eq!(
+            super::owner_type_args("option::Option<(??TypeVar#0,??TypeVar#1)>::Some"),
+            vec!["(??TypeVar#0,??TypeVar#1)"]
+        );
+        assert_eq!(
+            super::owner_type_args("option::Option<usize>::Some"),
+            vec!["usize"]
+        );
+        assert_eq!(
+            super::owner_type_args("Raw<Option<f64>>"),
+            vec!["Option<f64>"]
+        );
+    }
+
+    #[test]
+    fn instantiate_field_spelling_option_some_of_typevar_tuple() {
+        let reg = crate::front::StructFieldRegistry::default();
+        let concrete = super::instantiate_field_spelling(
+            &reg,
+            "option::Option<(??TypeVar#0,??TypeVar#1)>::Some",
+            "??TypeVar",
+        );
+        assert_eq!(concrete, "(??TypeVar#0,??TypeVar#1)");
+    }
+
+    #[test]
+    fn option_some_of_typevar_tuple_projects_payload_as_sometuple() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option::Some".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_enum_variant("option::Option<(??TypeVar#0,??TypeVar#1)>", "Some")
+            .expect("Option<(T0,T1)>::Some");
+        let payload = cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr")
+            .s_value
+            .clone();
+        let SomeValue::Tuple(t) = payload else {
+            panic!("Option<(T0,T1)>::Some.__pos_0 must be SomeTuple, got {payload:?}");
+        };
+        assert_eq!(t.items.len(), 2);
+        assert!(
+            matches!(t.items[0], SomeValue::Impossible),
+            "unsubstituted item stays lattice bottom, got {:?}",
+            t.items[0]
+        );
+        assert!(matches!(t.items[1], SomeValue::Impossible));
+    }
+
+    #[test]
+    fn project_gcref_and_gcrefopaque_as_someptr() {
+        let bk = bk();
+        for spelling in [
+            "GCREF",
+            "GCREFOpaque",
+            "*mut GCREFOpaque",
+            "*const GCREFOpaque",
+            "gc_hook::GCREFOpaque",
+        ] {
+            let s = bk.project_struct_field_type(spelling);
+            assert!(
+                matches!(s, SomeValue::Ptr(_)),
+                "{spelling} must project as SomePtr(GCREF), got {s:?}"
+            );
+        }
+        let s = bk.project_shaped_tuple("Tuple<*mut GCREFOpaque>");
+        let SomeValue::Tuple(t) = s else {
+            panic!("Tuple<*mut GCREFOpaque> must project as SomeTuple, got {s:?}");
+        };
+        assert_eq!(t.items.len(), 1);
+        assert!(
+            matches!(t.items[0], SomeValue::Ptr(_)),
+            "tuple item must be SomePtr(GCREF), got {:?}",
+            t.items[0]
         );
     }
 }
