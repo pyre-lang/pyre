@@ -709,7 +709,7 @@ pub(crate) fn fbw_locals_mirror_rollback() {
             // short write is recoverable, a write past the end is not.
             let n = entry.slots.len().min(dst.as_slice().len());
             for (i, &value) in entry.slots.iter().take(n).enumerate() {
-                dst[i] = value;
+                dst.set_ref(i, value);
             }
             // A restored value can be nursery-young while the frame and its
             // array are old-gen, and nothing re-traces it unless an owner is in
@@ -859,7 +859,7 @@ pub(crate) fn fbw_durable_frame_rollback_one(frame: usize) {
                 let dst = pyre_interpreter::locals_w_mut!(pf);
                 let n = entry.slots.len().min(dst.as_slice().len());
                 for (j, &value) in entry.slots.iter().take(n).enumerate() {
-                    dst[j] = value;
+                    dst.set_ref(j, value);
                 }
                 crate::state::frame_array_write_barrier(frame as *mut u8, arr_ptr);
             }
