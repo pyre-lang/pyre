@@ -3735,7 +3735,6 @@ mod tests {
         assert_eq!(graph.graph.borrow().name, "f__int_bool");
     }
 
-    #[test]
     fn argtype_desc(bk: Rc<Bookkeeper>, name: &str) -> FunctionDesc {
         let func = compiled_graph_func("def f(x):\n    return x\n", Vec::new());
         let host = HostObject::new_user_function(func.clone());
