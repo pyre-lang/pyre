@@ -157,26 +157,6 @@ fn walker_execute_gc_store<Sym: WalkSym>(
     }
 }
 
-/// Journal an executed store into an object this walk allocated.
-///
-/// The walk-end rollback leaves such a store in place, but a cut does not:
-/// a descent that declines after storing into a block allocated before it
-/// hands the call to a residual, which executes the same body against that
-/// block ([`fbw_gc_store_journal_cut`]).  The entry stays off the
-/// executed-effect odometer, as these stores were before they had an entry.
-fn walker_journal_fresh_gc_store<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    obj_ptr: i64,
-    offset: usize,
-    size: usize,
-    before: majit_ir::Value,
-) {
-    ctx.trace_ctx.set_cut_observer(fbw_gc_store_journal_cut);
-    let op_count = ctx.trace_ctx.get_trace_position()._count + 1;
-    let obj = obj_ptr as usize as pyre_object::PyObjectRef;
-    fbw_gc_store_journal_push_fresh(obj, offset, size, before, op_count);
-}
-
 /// A recorded store — or a recorded `COND_CALL` whose condition held — the
 /// walk could not execute.
 ///
@@ -595,8 +575,6 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
         if !stored {
             ctx.trace_ctx
                 .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
-        } else if let (Some((ptr, _)), Some(before)) = (slot, before) {
-            walker_journal_fresh_gc_store(ctx, ptr, offset, item_size, before);
         }
         return Ok(());
     }
@@ -733,19 +711,10 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     // `transform_generic_set` (framework.py): the barrier comes before the
     // bare store.
     pyre_object::gc_hook::try_gc_write_barrier(block as pyre_object::gc_hook::GCREF);
-    let (offset, before) = unsafe {
-        let slot = pyre_object::object_array::items_block_items_base(block).add(idx);
-        let before = *slot;
-        *slot = elem;
-        (slot as usize - block as usize, before)
-    };
-    walker_journal_fresh_gc_store(
-        ctx,
-        block as usize as i64,
-        offset,
-        std::mem::size_of::<usize>(),
-        majit_ir::Value::Ref(majit_ir::GcRef(before as usize)),
-    );
+    unsafe {
+        let base = pyre_object::object_array::items_block_items_base(block);
+        *base.add(idx) = elem;
+    }
 }
 
 /// Traced-iteration fill of a cleared `GcArray(Signed)` block from
@@ -782,21 +751,11 @@ fn fill_materialized_signed_gcarray<Sym: WalkSym>(
         revert(ctx);
         return;
     };
-    let (offset, before) = unsafe {
-        let slot = pyre_object::typed_items_block_items_base(block)
+    unsafe {
+        *pyre_object::typed_items_block_items_base(block)
             .cast::<i64>()
-            .add(idx);
-        let before = *slot;
-        *slot = word;
-        (slot as usize - block as usize, before)
-    };
-    walker_journal_fresh_gc_store(
-        ctx,
-        block as usize as i64,
-        offset,
-        std::mem::size_of::<i64>(),
-        majit_ir::Value::Int(before),
-    );
+            .add(idx) = word;
+    }
 }
 
 /// Recording-time `bh_new_array_clear` for a constant-or-known-length
@@ -1265,12 +1224,10 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
         //
         // A box this walk allocated (`heapcache.new`'s HF_SEEN_ALLOCATION,
         // set by `new/d>r` and `new_with_vtable/d>r` right after
-        // `execute_new_allocation` hands back a real, zeroed object) keeps
-        // its executed stores through a non-commit rollback: the object is
-        // abandoned with the walk, or was handed to executed code that keeps
-        // it as initialized.  A cut puts the store back for the residual
-        // that re-executes it: [`walker_journal_fresh_gc_store`].  A store
-        // into a pre-existing object is one the replay re-applies, so
+        // `execute_new_allocation` hands back a real, zeroed object) is held
+        // by nothing outside the walk, so the write needs no journal entry
+        // to survive a non-commit rollback — the abandoned allocation goes
+        // with it.  A store into a pre-existing object is observable, so
         // [`walker_execute_gc_store`] journals what it displaces.
         if ctx.trace_ctx.heap_cache().saw_allocation(obj) {
             if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj)
@@ -1278,17 +1235,7 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
             {
                 let struct_ptr = struct_ref.0 as i64;
                 if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                    let word = descr
-                        .as_field_descr()
-                        .map(|fd| (fd.offset(), fd.field_size(), fd.field_type()));
-                    let before = word.and_then(|(_, _, ty)| {
-                        ctx.trace_ctx.field_sanity_load(struct_ptr, &descr, ty)
-                    });
-                    if ctx.trace_ctx.field_store(struct_ptr, &descr, value)
-                        && let (Some((offset, size, _)), Some(before)) = (word, before)
-                    {
-                        walker_journal_fresh_gc_store(ctx, struct_ptr, offset, size, before);
-                    }
+                    ctx.trace_ctx.field_store(struct_ptr, &descr, value);
                 }
             }
         } else if ctx.trace_ctx.standard_virtualizable_box() != Some(obj)

@@ -1089,34 +1089,6 @@ pub(crate) fn fbw_gc_store_journal_push(
     before: Value,
     op_count: u32,
 ) {
-    gc_store_journal_push(obj, offset, size, before, op_count, true);
-    fbw_bump_executed_effect("gc_store_journal");
-}
-
-/// [`fbw_gc_store_journal_push`] for an object the walk allocated.  The entry
-/// exists for the descent cut alone ([`fbw_gc_store_journal_cut`], the mark
-/// rewind): the residual that replaces a cut descent re-executes the store
-/// against the object as it stood before the descent.  The whole-walk
-/// rollback skips it, and it stays off the executed-effect odometer and out
-/// of the journal-presence checks, as a store that was never journaled.
-pub(crate) fn fbw_gc_store_journal_push_fresh(
-    obj: pyre_object::PyObjectRef,
-    offset: usize,
-    size: usize,
-    before: Value,
-    op_count: u32,
-) {
-    gc_store_journal_push(obj, offset, size, before, op_count, false);
-}
-
-fn gc_store_journal_push(
-    obj: pyre_object::PyObjectRef,
-    offset: usize,
-    size: usize,
-    before: Value,
-    op_count: u32,
-    counted: bool,
-) {
     let managed = pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF);
     if fbw_debug_abort_enabled() {
         eprintln!(
@@ -1131,10 +1103,10 @@ fn gc_store_journal_push(
             size,
             before,
             managed,
-            counted,
             op_count,
         })
     });
+    fbw_bump_executed_effect("gc_store_journal");
 }
 
 /// [`majit_metainterp::trace_ctx::TraceCtx::cut_observer`] for the walker:
@@ -1153,13 +1125,9 @@ pub(crate) fn fbw_gc_store_journal_cut(pos: &majit_metainterp::recorder::TracePo
         let mut i = entries.len();
         while i > 0 {
             i -= 1;
-            if let FbwCellStore::Gc {
-                op_count, counted, ..
-            } = entries[i]
-                && op_count > pos._count
-            {
+            if matches!(entries[i], FbwCellStore::Gc { op_count, .. } if op_count > pos._count) {
                 undo_cell_store_entry(entries.remove(i));
-                undone += usize::from(counted);
+                undone += 1;
             }
         }
     });
@@ -1186,15 +1154,9 @@ pub(crate) fn fbw_gc_store_journal_keep_since(
         let mut i = entries.len();
         while i > mark.cells {
             i -= 1;
-            if let FbwCellStore::Gc {
-                obj: stored,
-                counted,
-                ..
-            } = entries[i]
-                && stored == obj
-            {
+            if matches!(entries[i], FbwCellStore::Gc { obj: stored, .. } if stored == obj) {
                 entries.remove(i);
-                kept += usize::from(counted);
+                kept += 1;
             }
         }
     });
@@ -1712,7 +1674,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
             || stack[at].body_completed
             || fbw_store_journal_len() != 0
             || FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) != 0
-            || fbw_cell_store_effect_len() != 0
+            || FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) != 0
             || fbw_has_unjournaled_effect()
         {
             return None;
@@ -1748,7 +1710,7 @@ pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usiz
             && !stack[at].body_effect_since_consume
             && fbw_store_journal_len() == 0
             && FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) == 0
-            && fbw_cell_store_effect_len() == 0
+            && FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) == 0
             && !fbw_has_unjournaled_effect()
     })
 }
@@ -1788,7 +1750,7 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
     fbw_foriter_body_effect_since_consume()
         || fbw_store_journal_len() != 0
         || FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) != 0
-        || fbw_cell_store_effect_len() != 0
+        || FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) != 0
 }
 
 /// Take the in-flight FOR_ITER continuation for delivery on a trace abort
@@ -1996,7 +1958,7 @@ pub fn fbw_foriter_inflight_take(
     };
     let store_len = fbw_store_journal_len();
     let append_len = FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len());
-    let cell_store_len = fbw_cell_store_effect_len();
+    let cell_store_len = FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len());
     let unjournaled = fbw_has_unjournaled_effect();
     // A rolled-back namespace binding the delivery cannot re-apply: the
     // reposition runs the FOR_ITER body, not the region ahead of it, so a
@@ -2633,7 +2595,7 @@ pub(crate) fn fbw_effect_journal_rollback_since(mark: FbwEffectJournalMark) {
             let Some(entry) = entries.pop() else {
                 break;
             };
-            bumped += usize::from(!matches!(entry, FbwCellStore::Gc { counted: false, .. }));
+            bumped += 1;
             undo_cell_store_entry(entry);
         }
     });
@@ -2688,13 +2650,6 @@ pub(crate) fn fbw_store_journal_rollback() {
     FBW_CELL_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some(entry) = entries.pop() {
-            // A store into an object the walk allocated stands: the object
-            // is either unreachable or was handed to executed code, which
-            // keeps the initialized object it was given.  Only a descent cut
-            // ([`fbw_gc_store_journal_cut`]) puts such a store back.
-            if matches!(entry, FbwCellStore::Gc { counted: false, .. }) {
-                continue;
-            }
             undo_cell_store_entry(entry);
         }
     });
@@ -2751,18 +2706,6 @@ pub(crate) fn fbw_store_journal_rollback() {
     });
 }
 
-/// The cell-store journal entries the whole-walk rollback undoes: every
-/// entry but a store into an object the walk allocated
-/// ([`fbw_gc_store_journal_push_fresh`]).
-fn fbw_cell_store_effect_len() -> usize {
-    FBW_CELL_STORE_JOURNAL.with(|j| {
-        j.borrow()
-            .iter()
-            .filter(|entry| !matches!(entry, FbwCellStore::Gc { counted: false, .. }))
-            .count()
-    })
-}
-
 /// Current journal length (commit-point diagnostics).
 pub(crate) fn fbw_store_journal_len() -> usize {
     FBW_STORE_JOURNAL.with(|j| j.borrow().len())
@@ -2772,13 +2715,12 @@ pub(crate) fn fbw_store_journal_len() -> usize {
 /// `(stores, appends, cell_stores)`.  Read at the walk-end epilogue before the
 /// commit/rollback, their sum is the number of executed effects
 /// [`fbw_store_journal_rollback`] is about to undo.  The traceback journal is
-/// absent because its push bumps nothing, and so is a store into an object
-/// the walk allocated ([`fbw_gc_store_journal_push_fresh`]).
+/// absent because its push bumps nothing.
 pub(crate) fn fbw_journaled_effect_lens() -> (usize, usize, usize) {
     (
         fbw_store_journal_len(),
         FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()),
-        fbw_cell_store_effect_len(),
+        FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()),
     )
 }
 
