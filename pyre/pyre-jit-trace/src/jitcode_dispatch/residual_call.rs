@@ -8872,20 +8872,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    // `divmod(a, b)` descends `space.divmod` instead of the opaque
-    // `bh_call_fn(divmod, NULL, a, b)` residual. `SubRaise` from that
-    // body (a zero divisor) propagates; any other shape falls through
-    // to the generic residual.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        if let Some(outcome) = spec_gate(SpecFold::BuiltinDivmodDescent, || {
-            try_walker_orthodox_builtin_divmod(ctx, code, op, &r_args, dst)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
-    }
 
     // A `raise Type(args)` of a canonical
     // builtin exception class arrives as two residuals — a `CallFn` that
