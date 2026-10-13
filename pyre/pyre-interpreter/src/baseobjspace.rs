@@ -7294,6 +7294,9 @@ pub fn getattr_str_impl(
             if suppress {
                 return Ok(pyre_object::PY_NULL);
             }
+            // The hook can collect; re-read the type from its slot before
+            // building the miss message.
+            let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_slot);
             return Err(PyError::attribute_error_with_context(
                 format!(
                     "'{}' object has no attribute '{name}'",
