@@ -105,6 +105,8 @@ impl QuasiImmut {
     pub fn register_loop_token(&self, token: &Arc<dyn majit_ir::QuasiImmutLoopToken>) {
         let mut tokens = self.tokens.lock();
         if self.unlinked.load(Ordering::Acquire) {
+            // `invalidate` takes this same lock; drop it before the callback.
+            drop(tokens);
             token.invalidate_for_quasi_immut();
             return;
         }

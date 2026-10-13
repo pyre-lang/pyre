@@ -1094,8 +1094,9 @@ fn ctypes_resize(
     if let Some(ba) = cdata::cdata_buffer(pyre_object::gc_roots::shadow_stack_get(args_base)) {
         unsafe {
             let old_size = pyre_object::w_bytearray_len(ba);
-            pyre_object::w_bytearray_vec_mut(ba).resize(size, 0);
-            pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+            let mut vec = pyre_object::w_bytearray_vec_mut(ba);
+            vec.resize(size, 0);
+            pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
         };
     }
     Ok(pyre_object::w_none())

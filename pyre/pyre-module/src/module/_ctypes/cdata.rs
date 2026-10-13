@@ -598,16 +598,28 @@ fn cdata_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpret
         )));
     }
     let view_offset = unsafe { view.offset() }.max(0) as usize;
-    let backing = unsafe { view.backing().as_bytes_mut() }.ok_or_else(|| {
-        pyre_interpreter::PyError::type_error("underlying buffer is not writable")
-    })?;
+    let base = match unsafe { view.backing().get_raw_address() } {
+        Ok(ptr) => ptr,
+        Err(pyre_object::buffer::RawAddressError::Memory) => {
+            return Err(pyre_interpreter::PyError::memory_error(""));
+        }
+        Err(pyre_object::buffer::RawAddressError::NoAddress) => {
+            return Err(pyre_interpreter::PyError::type_error(
+                "underlying buffer is not writable",
+            ));
+        }
+    };
+    let view = unsafe {
+        pyre_object::memoryview::w_memoryview_view(pyre_object::gc_roots::shadow_stack_get(sp))
+    };
     let start = view_offset.saturating_add(offset);
-    if start > backing.len() || size > backing.len() - start {
+    let full_len = unsafe { view.backing().as_bytes() }.len();
+    if start > full_len || size > full_len - start {
         return Err(pyre_interpreter::PyError::value_error(
             "Buffer size too small",
         ));
     }
-    let address = unsafe { backing.as_mut_ptr().add(start) } as usize;
+    let address = unsafe { base.add(start) } as usize;
     let obj = make_at_address(arg_roots.get(arg_base), address, size, pyre_object::PY_NULL);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
@@ -1064,8 +1076,16 @@ pub(super) fn cdata_buffer(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// `b_ptr` — the address of the view's first byte (stable for the instance's
 /// lifetime).  Re-read at each use; never cached across an allocation.
 pub(super) fn cdata_addr(mut obj: PyObjectRef) -> Option<usize> {
-    if let Some(ba) = pyre_object::with_roots!(obj => cdata_buffer(obj)) {
-        Some(unsafe { pyre_object::w_bytearray_data(ba).as_ptr() as usize } + boff(obj))
+    if let Some(mut ba) = pyre_object::with_roots!(obj => cdata_buffer(obj)) {
+        // Stored as `b_ptr` for the instance's lifetime, so the payload
+        // must be non-moving (`BytearrayBuffer.get_raw_address`).
+        let addr = pyre_object::with_roots!(obj, ba => unsafe {
+            pyre_object::bytearrayobject::w_bytearray_raw_address(ba)
+        });
+        if addr == 0 {
+            return None;
+        }
+        Some(addr + pyre_object::with_roots!(obj => boff(obj)))
     } else {
         pyre_object::with_roots!(obj => baddr(obj)).map(|a| a + boff(obj))
     }
@@ -2527,11 +2547,13 @@ fn encode_value_into_endian(
         keep_ref(roots.get(base + 1), key, value);
         keep_alive(roots.get(base + 1), key, roots.get(base));
         let addr =
-            unsafe { pyre_object::bytearrayobject::w_bytearray_data(roots.get(base)).as_ptr() }
-                as usize;
+            unsafe { pyre_object::bytearrayobject::w_bytearray_raw_address(roots.get(base)) };
+        if addr == 0 {
+            return Err(pyre_interpreter::PyError::memory_error(""));
+        }
         return Ok(cfield::simple_storage_value_to_bytes_endian(
             tc,
-            cfield::SimpleStorageValue::Pointer(addr),
+            cfield::SimpleStorageValue::Pointer(addr as usize),
             swapped,
         ));
     }

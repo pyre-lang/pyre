@@ -110,7 +110,7 @@ pub unsafe extern "C" fn PyByteArray_AsString(object: *mut CPyObject) -> *mut c_
         return std::ptr::null_mut();
     };
     unsafe {
-        let data = pyre_object::bytearrayobject::w_bytearray_vec_mut(value);
+        let mut data = pyre_object::bytearrayobject::w_bytearray_vec_mut(value);
         // Room for the terminator, which may move the allocation -- so it is
         // taken before the pointer this answers with is read.
         data.reserve(1);
@@ -141,8 +141,9 @@ pub unsafe extern "C" fn PyByteArray_Resize(object: *mut CPyObject, length: isiz
     }
     unsafe {
         let old = pyre_object::bytearrayobject::w_bytearray_len(value);
-        pyre_object::bytearrayobject::w_bytearray_vec_mut(value).resize(length as usize, 0);
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(value, old);
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(value);
+        vec.resize(length as usize, 0);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old);
     }
     0
 }

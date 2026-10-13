@@ -167,4 +167,41 @@ def sre_template_object():
     else:
         raise AssertionError("a tuple must be refused")
 sre_template_object()
+
+
+def buffered_reader_readinto_survives_minor_collection():
+    """BufferedReader.fill_buffer must not write into a moved bytearray payload.
+
+    fill_buffer captures dest = buffer + start, then the raw readinto
+    allocates. The buffer is a nursery-moving BytesBlock; after a minor
+    collection the write used to land in the abandoned copy and leave a NUL.
+    """
+    import io
+
+    warm = [bytes(1024) for _ in range(3000)]
+    del warm
+
+    class OneByteRaw(io.RawIOBase):
+        def __init__(self, n):
+            self.n = n
+            self.i = 0
+
+        def readable(self):
+            return True
+
+        def readinto(self, b):
+            if self.i >= self.n:
+                return 0
+            junk = [bytes(1024) for _ in range(64)]
+            b[0] = 97
+            self.i += 1
+            return 1
+
+    n = 32
+    r = io.BufferedReader(OneByteRaw(n), buffer_size=8192)
+    data = r.read(8192)
+    assert data == b"a" * n, (len(data), data.find(b"\x00"), data)
+
+
+buffered_reader_readinto_survives_minor_collection()
 print("OK")

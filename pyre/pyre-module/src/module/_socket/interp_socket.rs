@@ -322,8 +322,21 @@ fn socket_writebuf(
     obj: pyre_object::PyObjectRef,
 ) -> Result<(&'static mut [u8], pyre_object::PyObjectRef), pyre_interpreter::PyError> {
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let addr = unsafe {
+            pyre_object::bytearrayobject::w_bytearray_raw_address(
+                pyre_object::gc_roots::shadow_stack_get(slot),
+            )
+        };
+        let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        if addr == 0 {
+            return Err(pyre_interpreter::PyError::memory_error(""));
+        }
+        let len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(obj) };
         return Ok((
-            unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) },
+            unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) },
             obj,
         ));
     }
@@ -355,30 +368,44 @@ fn socket_writebuf(
                 "a read-write bytes-like object is required, not 'memoryview'",
             ));
         }
-        let view = unsafe { pyre_object::memoryview::w_memoryview_view(obj) };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let view = unsafe {
+            pyre_object::memoryview::w_memoryview_view(pyre_object::gc_roots::shadow_stack_get(
+                slot,
+            ))
+        };
         // The view itself carries the export, as it does for `readinto`. Its
         // backing is already held by the view's own construction, so nothing
         // can resize the storage underneath while this one is alive either.
-        let owner = obj;
-        // A writable view's backing is a `bytearray` or an `array.array`; both
-        // expose a mutable byte store.  Honour the view window: write only into
-        // `[offset, offset+length)` of the backing storage (itself already the
-        // `Buffer::Sub` window for a zero-copy slice), not the whole buffer.
-        let Some(full) = (unsafe { view.backing().as_bytes_mut() }) else {
-            return Err(pyre_interpreter::PyError::type_error(
-                "cannot modify read-only memory",
-            ));
+        // `get_raw_address` makes a bytearray payload non-moving before the
+        // syscall holds the interior pointer.
+        let base = match unsafe { view.backing().get_raw_address() } {
+            Ok(ptr) => ptr,
+            Err(pyre_object::buffer::RawAddressError::Memory) => {
+                return Err(pyre_interpreter::PyError::memory_error(""));
+            }
+            Err(pyre_object::buffer::RawAddressError::NoAddress) => {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "cannot modify read-only memory",
+                ));
+            }
         };
+        let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        let view = unsafe { pyre_object::memoryview::w_memoryview_view(obj) };
         let off = unsafe { view.offset() } as usize;
         let len = unsafe { pyre_object::memoryview::w_memoryview_length(obj) } as usize;
-        // The backing may have been resized after the view was taken; reject a
-        // window that no longer fits rather than panic.
-        if off.checked_add(len).is_none_or(|end| end > full.len()) {
+        let full_len = unsafe { view.backing().as_bytes() }.len();
+        if off.checked_add(len).is_none_or(|end| end > full_len) {
             return Err(pyre_interpreter::PyError::value_error(
                 "memoryview buffer is no longer valid",
             ));
         }
-        return Ok((&mut full[off..off + len], owner));
+        return Ok((
+            unsafe { std::slice::from_raw_parts_mut(base.add(off), len) },
+            obj,
+        ));
     }
     // `PyObject_GetBuffer` with `PyBUF_WRITABLE` (`w*` / `acquire_writebuf`):
     // a Python `__buffer__` exporter receives the writable flag.

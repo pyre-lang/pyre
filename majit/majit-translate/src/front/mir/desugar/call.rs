@@ -1066,6 +1066,13 @@ impl<'a> Lowering<'a> {
                     && !from_bytes_identity
                     && !regular_call_is_slice_to_vec(&reg, self.llbc) =>
             {
+                self.fill_header_view_pairs(
+                    mir_bb,
+                    &reg,
+                    &mut args,
+                    &mut pair_lens,
+                    &arg_operands,
+                )?;
                 // A pair slice's `.len()` / `.is_empty()` is its length
                 // word (`Rvalue::Len`). A string-byte-view window planted
                 // that word as `ll_strlen`; an object-list view keeps
@@ -4536,7 +4543,7 @@ impl<'a> Lowering<'a> {
                 // list's logical length may be below capacity).
                 if args.len() == 2
                     && let Some(block) =
-                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0])
+                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0], &args[1])
                 {
                     self.alias_dest_to_arg0(dest_local, block, true);
                     let target_bb = self.block_id[target];
@@ -7324,6 +7331,13 @@ impl<'a> Lowering<'a> {
                     {
                         self.keep_dyn_call_receiver(mir_bb, &mut args);
                     }
+                    self.fill_header_view_pairs(
+                        mir_bb,
+                        &reg,
+                        &mut args,
+                        &mut pair_lens,
+                        &arg_operands,
+                    )?;
                     if !pair_lens.is_empty() {
                         let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
                         self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
@@ -10090,12 +10104,14 @@ impl<'a> Lowering<'a> {
             carrier,
             self.gc_struct_ids,
         );
+        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, self.llbc, carrier);
         let token = dont_look_inside_return_token(
             &signature.output,
             self.llbc,
             carrier,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            pair_body.as_ref(),
         );
         if class_root.is_none()
             && container_root.is_none()

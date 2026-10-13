@@ -1205,6 +1205,39 @@ impl BlackholeInterpreter {
         self.jitcode.code[self.position - 1] as usize
     }
 
+    /// Dest bank of the call this frame is paused after.
+    ///
+    /// `make_result_of_lastop` (`pyjitpl.py`) reads `_resulttypes[self.pc]`.
+    /// Debug only: a helper `_returntype` that disagrees with that encoding
+    /// is a codewriter defect (`jtransform.py rewrite_call` /
+    /// `call.py RESULT == FUNC.RESULT`), not a writeback to paper over.
+    fn encoded_call_result_kind(&self) -> Option<char> {
+        self.jitcode
+            .try_body()
+            .and_then(|body| body.resulttypes.as_ref())
+            .and_then(|types| types.get(&self.position).copied())
+    }
+
+    /// Write a callee return into the dest the caller call allocated.
+    ///
+    /// `blackhole.py _leave_blackhole_interp` dispatches on the callee
+    /// `_returntype` to `_setup_return_value_*`. The dest byte is
+    /// `code[position-1]` in the bank of that kind.
+    fn setup_return_value_from_callee(
+        &mut self,
+        ret_type: BhReturnType,
+        tmp_i: i64,
+        tmp_r: i64,
+        tmp_f: i64,
+    ) {
+        match ret_type {
+            BhReturnType::Void => {}
+            BhReturnType::Int => self.setup_return_value_i(tmp_i),
+            BhReturnType::Ref => self.setup_return_value_r(tmp_r),
+            BhReturnType::Float => self.setup_return_value_f(tmp_f),
+        }
+    }
+
     /// blackhole.py _setup_return_value_i
     ///
     /// Connect the return of values from the called frame to the
@@ -1349,30 +1382,31 @@ impl BlackholeInterpreter {
 
         // blackhole.py `_resume_mainloop`: `caller._setup_return_value_r(self.get_tmpreg_r())`.
         let ret_type = self.return_type;
-        match ret_type {
-            BhReturnType::Int => {
-                let tmp_i = self.get_tmpreg_i();
-                self.nextblackholeinterp
-                    .as_mut()
-                    .unwrap()
-                    .setup_return_value_i(tmp_i);
-            }
-            BhReturnType::Ref => {
-                let tmp_r = self.get_tmpreg_r();
-                self.nextblackholeinterp
-                    .as_mut()
-                    .unwrap()
-                    .setup_return_value_r(tmp_r);
-            }
-            BhReturnType::Float => {
-                let tmp_f = self.get_tmpreg_f();
-                self.nextblackholeinterp
-                    .as_mut()
-                    .unwrap()
-                    .setup_return_value_f(tmp_f);
-            }
-            BhReturnType::Void => {}
+        let tmp_i = self.get_tmpreg_i();
+        let tmp_r = self.get_tmpreg_r();
+        let tmp_f = self.get_tmpreg_f();
+        let callee_name = self.jitcode.name();
+
+        let caller = self.nextblackholeinterp.as_mut().unwrap();
+        if crate::bh_debug_enabled() {
+            let dest = caller
+                .position
+                .checked_sub(1)
+                .and_then(|i| caller.jitcode.code.get(i).copied())
+                .unwrap_or(0xff);
+            eprintln!(
+                "[bh-ret] callee={} ret={:?} -> caller={} pos={} dest={dest} encoded={:?} banks=({},{},{})",
+                callee_name,
+                ret_type,
+                caller.jitcode.name(),
+                caller.position,
+                caller.encoded_call_result_kind(),
+                caller.registers_i.len(),
+                caller.registers_r.len(),
+                caller.registers_f.len(),
+            );
         }
+        caller.setup_return_value_from_callee(ret_type, tmp_i, tmp_r, tmp_f);
 
         // blackhole.py:1645 — return no exception
         Ok(0)
@@ -13993,20 +14027,22 @@ fn handler_debug_fatalerror(
         .collect();
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
-/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (the tagging arithmetic lives at the erase site, never here); the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `ll_assert` remains a translated runtime assertion.
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. Identity on the bits, matching
+/// `assembler.py genop_cast_ptr_to_int = _genop_same_as` and
+/// `trace_cast_ptr_to_int`. The operand is a GCREF word
+/// (`lltype._cast_to_int` returns even-aligned `id()` for a GC pointer);
+/// helper jitcode `cast_ptr_to_int` of those GCREFs is the same mov.
+/// A guard resume inside the helper re-executes this cast
+/// (`blackhole_from_resumedata` / `setposition`).
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
-/// before it is reinterpreted as a `GCREF`.
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity on the bits, matching
+/// `assembler.py genop_cast_int_to_ptr = _genop_same_as` and
+/// `trace_cast_int_to_ptr`. Round-trips the GCREF word `cast_ptr_to_int`
+/// produced.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 

@@ -7571,6 +7571,15 @@ impl<'a> Lowering<'a> {
             };
             let item_ty = self.with_item_class_root(item_ty, &place_ty);
             let zero = self.emit_const_uint(mir_bb, 0);
+            if self.item_addr_elem_is_u8(opt as usize) {
+                let item = self.emit_u8_raw_load(mir_bb, addr, zero);
+                return Ok(self.retype_word(
+                    mir_bb,
+                    item,
+                    &ValueType::Unsigned,
+                    &u8_pair_item_ty(&item_ty),
+                ));
+            }
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -7601,6 +7610,15 @@ impl<'a> Lowering<'a> {
                 offset
             };
             let item_ty = self.with_item_class_root(self.value_type_of(&place_ty), &place_ty);
+            if tyref_slice_elem_is_u8(&slice.ty, self.llbc) {
+                let item = self.emit_u8_raw_load(mir_bb, ptr, index);
+                return Ok(self.retype_word(
+                    mir_bb,
+                    item,
+                    &ValueType::Unsigned,
+                    &u8_pair_item_ty(&item_ty),
+                ));
+            }
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -8945,6 +8963,15 @@ impl<'a> Lowering<'a> {
                     {
                         let addr = self.item_addr_var(mir_bb, local)?;
                         let index = self.emit_const_uint(mir_bb, 0);
+                        if self.item_addr_elem_is_u8(local) {
+                            let item = self.emit_u8_raw_load(mir_bb, addr, index);
+                            return Ok(self.retype_word(
+                                mir_bb,
+                                item,
+                                &ValueType::Unsigned,
+                                &u8_pair_item_ty(&item_ty),
+                            ));
+                        }
                         let helper_ty = Self::pair_helper_item_ty(kind);
                         let item = self.emit_path_call(
                             mir_bb,

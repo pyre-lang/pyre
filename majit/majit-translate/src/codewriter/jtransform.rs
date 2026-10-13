@@ -5702,8 +5702,8 @@ impl<'a> Transformer<'a> {
     /// the call to the declared void so the residual_call emits a `_v`
     /// opname with no result slot.  Emitting the `Ref` slot would hand GC a
     /// register holding the void call's garbage.  The declared-void shell
-    /// case, a declared int-bank `RESULT` under a frontend `Ref` token, and
-    /// a declared raw `Ptr` (`history.py` `getkind` `'int'`) /
+    /// case, a declared int-bank or float `RESULT` under a frontend `Ref`
+    /// token, and a declared raw `Ptr` (`history.py` `getkind` `'int'`) /
     /// `llmemory.GCREF` whose frontend dest disagrees are rewritten; other
     /// calls keep `result_ty`.
     ///
@@ -5721,6 +5721,8 @@ impl<'a> Transformer<'a> {
         let resolved_kind = self.resolve_call_result(op_result, result_ty).kind;
         if declared == Some(majit_ir::value::Type::Void) && resolved_kind == 'r' {
             ValueType::Void
+        } else if declared == Some(majit_ir::value::Type::Float) && resolved_kind == 'r' {
+            ValueType::Float
         } else if matches!(result_ty, ValueType::Ref(_))
             && declared == Some(majit_ir::value::Type::Int)
         {
@@ -12541,6 +12543,106 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_operation(&helper_call, graph_name, graph);
         }
+        // `__getslice_range` on a BytesBlock / untyped byte-string view.
+        // `w_bytearray_data` stamps `ValueType::Str` but the payload is a
+        // length-prefixed GcArray of `Char` (`BytesBlock`), not rstr `STR`
+        // (no hash word). `_ll_stringslice` / `stroruni.slice` would use
+        // STR offsets and `_handle_stroruni_call` panics on `Other`.
+        // `RStringIO.read` slices `__bigbuffer` as a list of chars; mint
+        // `ll_listslice_startstop` for `[u8]` the same way a GC-array
+        // marker does. A typed `Ptr(STR)` / `Ptr(UNICODE)` keeps the
+        // list-identity miss so rtyper's stringslice path owns it.
+        if crate::codewriter::getslice::is_getslice_range(op)
+            && crate::codewriter::getslice::getslice_base_is_str(graph, op)
+            && crate::codewriter::getslice::getslice_marker_identity(graph, op).is_none()
+            && matches!(stroruni_first_arg_kind(&args[0]), StrOrUniKind::Other)
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::getslice::listslice_range_path(
+                cc,
+                &ValueType::Int,
+                Some("[u8]"),
+            );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                        segments: path.segments.clone(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return match self.rewrite_operation(&helper_call, graph_name, graph) {
+                RewriteResult::Keep => RewriteResult::Replace(vec![helper_call]),
+                other => other,
+            };
+        }
+        // Leftover `list` / `to_vec` of a STR is `rtype_bltn_list`
+        // (`rstr.py` `AbstractStringRepr.rtype_bltn_list` → `ll_string2list`,
+        // `rlist.py` `AbstractBaseListRepr.rtype_bltn_list` → `ll_copy`).
+        // The skip-spine marker has no rtyper; mint the copy helper so it
+        // does not stay a host-less residual. Do not alias the dest onto
+        // the source STR or listslice result.
+        if args.len() == 1
+            && let CallTarget::FunctionPath { segments, .. } = target
+            && (segments.as_slice() == ["list"]
+                || matches!(
+                    segments.as_slice(),
+                    [a, b, c, d]
+                        if a == "alloc" && b == "slice" && c == "<Impl>" && d == "to_vec"
+                ))
+            && crate::codewriter::getslice::value_is_str(graph, &args[0])
+        {
+            let helper_call =
+                if crate::codewriter::getslice::value_is_str_listslice_result(graph, &args[0]) {
+                    // `ll_listslice_startstop` already allocated; leftover
+                    // `list(sliced)` is `ll_copy`. `_ll_stringslice` is a STR
+                    // box and takes the `ll_str2uintlist` arm below.
+                    let path = match self.callcontrol.as_deref_mut() {
+                        Some(cc) => crate::codewriter::getslice::list_copy_path(
+                            cc,
+                            &ValueType::Int,
+                            Some("[u8]"),
+                        ),
+                        None => crate::parse::CallPath::from_segments([
+                            crate::codewriter::getslice::LL_COPY,
+                        ]),
+                    };
+                    SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                specialization: crate::parse::GraphSpecialization::Regular,
+                                segments: path.segments.clone(),
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(args.iter().cloned()),
+                            result_ty: result_ty.clone(),
+                        },
+                    }
+                } else {
+                    if let Some(cc) = self.callcontrol.as_deref_mut() {
+                        crate::front::join_chars::register_ll_str2uintlist_helper(cc);
+                    }
+                    SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::Call {
+                            target: CallTarget::function_path([
+                                crate::front::join_chars::LL_STR2UINTLIST,
+                            ]),
+                            args: crate::model::call_args(args.iter().cloned()),
+                            result_ty: ValueType::Ref(None),
+                        },
+                    }
+                };
+            return match self.rewrite_operation(&helper_call, graph_name, graph) {
+                RewriteResult::Keep => RewriteResult::Replace(vec![helper_call]),
+                other => other,
+            };
+        }
         // `core::cmp::{min,max}` — the front's residual of an Opaque
         // core call.  `rtype_builtin_min` (`rbuiltin.py`) turns the
         // lifted `simple_call(min, …)` into `ll_min`; a graph on this
@@ -14544,30 +14646,43 @@ impl<'a> Transformer<'a> {
             // `single_write_descr_array` from writeanalyze of
             // `rgc.ll_arraycopy`, whose body is `setarrayitem` on dest.
             // The residual helper has no graph, so name dest's ARRAY
-            // (`copy_args[1]`) with `newlist_clear_shape`. Fallback and
-            // Resized leave `extradescrs` unset so
+            // (`copy_args[1]`) with `newlist_clear_shape`. A minted
+            // `ll_listslice_*` dest is the `NewArrayClear` in this graph
+            // (`rlist.py` `RESLIST.ll_newlist`); that ARRAY identity is
+            // the write descr, including `[u8]` / BytesBlock. Kind-collapsed
+            // dests without a producer still fall through. A kind-collapsed
+            // `GcRef` is an erased ARRAY (`PyObjectRef` items block): naming
+            // `GcArray(OBJECTPTR)` would copy int/float items as GC pointers.
+            // The native `jit_ll_arraycopy` reads the layout at run time.
+            // Fallback and Resized leave `extradescrs` unset so
             // `effectinfo_from_writeanalyze` takes `WriteAnalyzer.top_result`.
-            // A kind-collapsed `GcRef` is an erased ARRAY (`PyObjectRef`
-            // items block): naming `GcArray(OBJECTPTR)` would copy
-            // int/float items as GC pointers. The native
-            // `jit_ll_arraycopy` reads the layout at run time.
-            let array_descrs =
-                self.callcontrol.as_deref().and_then(|cc| {
-                    match newlist_clear_shape(Some(&copy_args[1]), Some(cc)) {
-                        NewlistClearShape::Fixed {
-                            item_ty,
-                            array_type_id,
-                            array,
-                        } => Some(vec![cc.arraydescrof_for_op(
-                            &item_ty,
-                            &array_type_id,
-                            &array,
-                            value_type_to_ir_type(&item_ty),
-                            Some(0),
-                        )]),
-                        NewlistClearShape::Fallback | NewlistClearShape::Resized { .. } => None,
+            let dest_identity =
+                crate::codewriter::getslice::array_identity_of_base(graph, &copy_args[1]);
+            let array_descrs = self.callcontrol.as_deref().and_then(|cc| {
+                let shape = if let Some((item_ty, array_type_id)) = dest_identity {
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                        array: None,
                     }
-                });
+                } else {
+                    newlist_clear_shape(Some(&copy_args[1]), Some(cc))
+                };
+                match shape {
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                        array,
+                    } => Some(vec![cc.arraydescrof_for_op(
+                        &item_ty,
+                        &array_type_id,
+                        &array,
+                        value_type_to_ir_type(&item_ty),
+                        Some(0),
+                    )]),
+                    NewlistClearShape::Fallback | NewlistClearShape::Resized { .. } => None,
+                }
+            });
             // rgc.py `ll_arraycopy` `_canraise` is False (`call.py`).
             // The Rust body still has `assert!` on negative starts, which
             // the graph analyser reports as CanRaise; a transparent
@@ -16255,14 +16370,40 @@ impl<'a> Transformer<'a> {
         // qualified key (in `call.rs`) and leaves the shell body-less in
         // `drain_pending_graphs`.
         let jitcode = if let Some(cc) = self.callcontrol.as_mut() {
+            // Same graph identity `declared_result_type_for_target` reads
+            // FUNC.RESULT from: crate-stripped funcobj, `__fn_const` strip,
+            // Method-name fallback. Spelled `target_to_path` alone would
+            // mint a second shell whose dest kind is the front Ref.
             let path = cc
-                .target_to_path(target)
+                .path_for_jitcode_lookup(target)
                 .unwrap_or_else(|| target_to_call_path(target));
             crate::jitcode::JitCodeHandle::new(cc.get_jitcode(&path))
         } else {
             crate::jitcode::JitCodeHandle::new(std::sync::Arc::new(crate::jitcode::JitCode::new(
                 "<missing-callcontrol>",
             )))
+        };
+        // Assembled `calldescr.result_type` is FUNC.RESULT once the
+        // header OnceLock is set (`jitcode.py` `__init__`). A first-time
+        // shell has none; the graph returnblock path in
+        // `declared_result_type_for_target` covers that. `calldescr()` on
+        // an unset lock answers the empty default `'v'`.
+        let result_ty_from_calldescr = jitcode.calldescr.get().and_then(|d| match d.result_type {
+            'i' => Some(ValueType::Int),
+            'f' => Some(ValueType::Float),
+            'v' => Some(ValueType::Void),
+            _ => None,
+        });
+        let result_ty_owned;
+        let result_ty = match (result_ty, result_ty_from_calldescr) {
+            (
+                ValueType::Ref(_),
+                Some(scalar @ (ValueType::Int | ValueType::Float | ValueType::Void)),
+            ) => {
+                result_ty_owned = scalar;
+                &result_ty_owned
+            }
+            _ => result_ty,
         };
         // RPython jtransform.py: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
@@ -28145,6 +28286,219 @@ mod tests {
         assert!(matches!(ops[3].kind, OpKind::Live { .. }));
     }
 
+    fn getslice_is_listslice_or_arraycopy(ops: &[SpaceOperation]) -> bool {
+        ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments
+                .last()
+                .is_some_and(|leaf| leaf.starts_with("ll_listslice_") || leaf == "ll_arraycopy"),
+            OpKind::InlineCall { jitcode, .. } => jitcode.0.name.contains("ll_listslice_"),
+            OpKind::ConstFnAddr { path, .. } => {
+                path.contains("ll_listslice_") || path.contains("ll_arraycopy")
+            }
+            OpKind::NewArrayClear {
+                array_type_id: Some(id),
+                ..
+            } => id == "[u8]",
+            _ => false,
+        })
+    }
+
+    fn getslice_still_marker(ops: &[SpaceOperation]) -> bool {
+        ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__getslice_range")
+            )
+        })
+    }
+
+    fn leftover_list_or_to_vec(ops: &[SpaceOperation]) -> bool {
+        ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice()
+                    == ["alloc", "slice", "<Impl>", "to_vec"]
+                    || segments.first().map(String::as_str) == Some("list")
+            )
+        })
+    }
+
+    /// Leftover `list` / `to_vec` must mint `ll_str2uintlist` (`rtype_bltn_list`
+    /// of a STR) or `ll_copy` (`rtype_bltn_list` of a list). `ll_listslice_*`
+    /// / `ll_arraycopy` is the slice itself, not that second copy.
+    fn copy_helper_name(name: &str) -> bool {
+        name.contains("ll_str2uintlist") || name.contains("ll_copy")
+    }
+
+    fn ops_have_list_or_str_copy_helper(ops: &[SpaceOperation]) -> bool {
+        ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().is_some_and(|leaf| copy_helper_name(leaf)),
+            OpKind::InlineCall { jitcode, .. } => copy_helper_name(&jitcode.0.name),
+            OpKind::ConstFnAddr { path, .. } => copy_helper_name(path),
+            _ => false,
+        })
+    }
+
+    fn startblock_return_var(graph: &FunctionGraph) -> crate::flowspace::model::Variable {
+        graph
+            .block(graph.startblock)
+            .exits
+            .first()
+            .and_then(|link| link.args.first())
+            .and_then(LinkArg::as_variable)
+            .cloned()
+            .expect("startblock returns a value")
+    }
+
+    /// `s[start:stop]` on a `BytesBlock` Input is `ll_listslice_startstop`
+    /// for `[u8]` (`rStringIO.read` slices `__bigbuffer` as a list of
+    /// chars), not `_ll_stringslice` (STR offsets) and not a leftover
+    /// `__getslice_range` marker.
+    #[test]
+    fn transform_graph_rewrites_bytesblock_getslice_range_to_listslice() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Str,
+                    class_root: Some("BytesBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__getslice_range"]),
+                    args: crate::model::call_args(vec![s.clone(), start.clone(), stop.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !getslice_still_marker(ops),
+            "BytesBlock getslice must not stay a marker: {ops:?}"
+        );
+        assert!(
+            getslice_is_listslice_or_arraycopy(ops),
+            "BytesBlock getslice must lower to ll_listslice_startstop: {ops:?}"
+        );
+    }
+
+    /// `w_bytearray_data` stamps `ValueType::Str` with no Input identity.
+    /// The untyped byte-string view is `StrOrUniKind::Other`; mint
+    /// `ll_listslice_startstop` for `[u8]`.
+    #[test]
+    fn transform_graph_rewrites_bytearray_data_getslice_range_to_listslice() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let owner = graph.alloc_value_var();
+        let buf = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["w_bytearray_data"]),
+                    args: crate::model::call_args(vec![owner]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__getslice_range"]),
+                    args: crate::model::call_args(vec![buf.clone(), start.clone(), stop.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !getslice_still_marker(ops),
+            "bytearray_data getslice must not stay a marker: {ops:?}"
+        );
+        assert!(
+            getslice_is_listslice_or_arraycopy(ops),
+            "bytearray_data getslice must lower to ll_listslice_startstop: {ops:?}"
+        );
+    }
     fn graph_mentions_leaf(graph: &FunctionGraph, leaf: &str) -> bool {
         graph
             .blocks
@@ -28291,6 +28645,306 @@ mod tests {
                     if op == "add" && *result_ty == ValueType::Int
             )),
             "p + count must stay int add; ops: {ops:?}"
+        );
+    }
+
+    /// `buf[a..b].to_vec()` on a byte-string view is `ll_listslice_startstop`
+    /// then leftover `list()` → `ll_copy` (`rtype_bltn_list`). The slice
+    /// helper already copied; leftover `to_vec` still allocates.
+    #[test]
+    fn transform_graph_identity_to_vec_of_str_getslice() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Str,
+                    class_root: Some("BytesBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let sliced = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__getslice_range"]),
+                    args: crate::model::call_args(vec![s.clone(), start.clone(), stop.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let copied = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["alloc", "slice", "<Impl>", "to_vec"]),
+                    args: crate::model::call_args(vec![sliced.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(copied.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !leftover_list_or_to_vec(ops),
+            "to_vec of a STR getslice must not stay a leftover marker: {ops:?}"
+        );
+        assert!(
+            !getslice_still_marker(ops),
+            "STR getslice must not stay a marker: {ops:?}"
+        );
+        assert!(
+            getslice_is_listslice_or_arraycopy(ops),
+            "STR getslice must lower to ll_listslice_startstop: {ops:?}"
+        );
+        assert!(
+            ops_have_list_or_str_copy_helper(ops),
+            "leftover to_vec of a listslice must mint ll_copy: {ops:?}"
+        );
+        let ret = startblock_return_var(&transformed.graph);
+        assert_ne!(
+            ret, s,
+            "return must not alias the BytesBlock input: {ops:?}"
+        );
+        assert_ne!(
+            ret, sliced,
+            "return must not alias the listslice dest: {ops:?}"
+        );
+    }
+
+    /// `to_vec` of a live BytesBlock Input is `list(str)` → `ll_str2uintlist`,
+    /// not an identity alias of the source STR.
+    #[test]
+    fn transform_graph_to_vec_of_str_input_is_a_copy() {
+        let mut graph = FunctionGraph::new("snapshot");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Str,
+                    class_root: Some("BytesBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let copied = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["alloc", "slice", "<Impl>", "to_vec"]),
+                    args: crate::model::call_args(vec![s.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(copied.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !leftover_list_or_to_vec(ops),
+            "to_vec of a STR input must not stay a leftover marker: {ops:?}"
+        );
+        assert!(
+            ops_have_list_or_str_copy_helper(ops),
+            "to_vec of a STR input must mint ll_str2uintlist: {ops:?}"
+        );
+        let ret = startblock_return_var(&transformed.graph);
+        assert_ne!(
+            ret, s,
+            "return must not alias the BytesBlock input: {ops:?}"
+        );
+    }
+
+    /// `to_vec` of a `w_bytearray_data` view is `list(str)` → `ll_str2uintlist`,
+    /// not an identity alias of the live bytearray buffer.
+    #[test]
+    fn transform_graph_to_vec_of_bytearray_data_is_a_copy() {
+        let mut graph = FunctionGraph::new("snapshot");
+        let owner = graph.alloc_value_var();
+        let buf = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["w_bytearray_data"]),
+                    args: crate::model::call_args(vec![owner]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let copied = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["alloc", "slice", "<Impl>", "to_vec"]),
+                    args: crate::model::call_args(vec![buf.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(copied.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !leftover_list_or_to_vec(ops),
+            "to_vec of w_bytearray_data must not stay a leftover marker: {ops:?}"
+        );
+        assert!(
+            ops_have_list_or_str_copy_helper(ops),
+            "to_vec of w_bytearray_data must mint ll_str2uintlist: {ops:?}"
+        );
+        let ret = startblock_return_var(&transformed.graph);
+        assert_ne!(
+            ret, buf,
+            "return must not alias the w_bytearray_data view: {ops:?}"
+        );
+    }
+
+    /// Leftover `to_vec` of a listslice dest used independently is still
+    /// `ll_copy`; `copied` and `sliced` stay distinct SSA values.
+    #[test]
+    fn transform_graph_to_vec_of_str_getslice_keeps_copy_when_slice_is_used() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Str,
+                    class_root: Some("BytesBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let sliced = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__getslice_range"]),
+                    args: crate::model::call_args(vec![s.clone(), start.clone(), stop.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let copied = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["alloc", "slice", "<Impl>", "to_vec"]),
+                    args: crate::model::call_args(vec![sliced.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let zero = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(0), true)
+            .unwrap();
+        let ff = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(0xff), true)
+            .unwrap();
+        let _ = graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayWrite {
+                base: sliced.clone(),
+                index: zero,
+                value: LinkArg::Value(ff),
+                item_ty: ValueType::Int,
+                array_type_id: Some("[u8]".into()),
+                array: None,
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, Some(copied.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !leftover_list_or_to_vec(ops),
+            "to_vec of a used STR getslice must not stay a leftover marker: {ops:?}"
+        );
+        assert!(
+            ops_have_list_or_str_copy_helper(ops),
+            "to_vec of a used listslice must mint ll_copy: {ops:?}"
+        );
+        let ret = startblock_return_var(&transformed.graph);
+        assert_ne!(
+            ret, sliced,
+            "copied and sliced must stay distinct SSA values: {ops:?}"
         );
     }
 
