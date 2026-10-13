@@ -26,6 +26,7 @@ use crate::parse::CallPath;
 use crate::policy::JitPolicy;
 use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{AnalyzerResult, Dependency, DependencyTracker};
+use crate::translator::rtyper::call_registry::{FunctionPathKey, is_exception_object_materializer};
 
 // Decline-census gate names.  Declared in `crate::decline::gate` so a
 // gate name cannot exist without the recorder that consumes it; aliased
@@ -7594,6 +7595,16 @@ impl CallControl {
         let path = self.target_to_path(target)?;
         let graph = self.function_graphs.get(&path)?;
         Some((path, graph))
+    }
+
+    /// `call_registry::is_exception_object_materializer` on the spelled path.
+    fn target_is_exception_object_materializer(&self, target: &CallTarget) -> bool {
+        let Some(path) = self.target_to_path(target) else {
+            return false;
+        };
+        is_exception_object_materializer(&FunctionPathKey::from_segments(
+            path.segments.iter().cloned(),
+        ))
     }
 
     /// Convert a CallTarget to a CallPath for lookup.
