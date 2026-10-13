@@ -2073,7 +2073,34 @@ pub fn make_builtin_function_as_builtin_with_signature(
     func: BuiltinCodeFn,
     signature: Signature,
 ) -> PyObjectRef {
-    let code = builtin_code_new_with_signature(name, func, None, signature);
+    make_builtin_function_as_builtin_with_signature_and_opt_doc(name, func, signature, None)
+}
+
+/// [`make_builtin_function_as_builtin_with_signature`] carrying
+/// `BuiltinCode.docstring`.  `interp2app` keeps the app-visible `__doc__`
+/// on the gateway code; a `Signature` constructor that also needs the
+/// `tp_new` wrapper text (`tp_new_doc`) uses this path.
+pub fn make_builtin_function_as_builtin_with_signature_and_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Signature,
+    docstring: &'static str,
+) -> PyObjectRef {
+    make_builtin_function_as_builtin_with_signature_and_opt_doc(
+        name,
+        func,
+        signature,
+        Some(docstring),
+    )
+}
+
+fn make_builtin_function_as_builtin_with_signature_and_opt_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Signature,
+    docstring: Option<&'static str>,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_signature(name, func, docstring, signature);
     with_registered_kwonly_defaults(crate::function_new_builtin(
         code as *const (),
         name.to_string(),

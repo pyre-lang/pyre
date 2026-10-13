@@ -4007,6 +4007,21 @@ pub fn make_new_descr_with_signature(
     crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature)
 }
 
+/// [`make_new_descr_with_signature`] carrying `BuiltinCode.docstring`.
+/// `interp2app` keeps the constructor's app-visible `__doc__`; a
+/// signature-bound `__new__` that is still the `tp_new` wrapper uses
+/// this so `cell.__new__.__doc__` / `traceback.__new__.__doc__` stay
+/// the wrapper text.
+pub(crate) fn make_new_descr_with_signature_and_doc(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    signature: crate::gateway::Signature,
+    docstring: &'static str,
+) -> PyObjectRef {
+    crate::gateway::make_builtin_function_as_builtin_with_signature_and_doc(
+        "__new__", func, signature, docstring,
+    )
+}
+
 /// [`make_new_descr_with_signature`] that keeps `arity` as
 /// `fast_natural_arity` so a matching positional call stays on
 /// `fastcall_N`.  Used for `int.__new__` (`arity` 2: `cls`, `x`).
@@ -4030,6 +4045,20 @@ fn make_new_descr_posonly(
     make_new_descr_with_signature(
         func,
         crate::gateway::Signature::new(argnames, None, None, 0, n),
+    )
+}
+
+/// Positional-only [`make_new_descr_with_signature_and_doc`].
+fn make_new_descr_posonly_with_doc(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    argnames: Vec<&'static str>,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let n = argnames.len();
+    make_new_descr_with_signature_and_doc(
+        func,
+        crate::gateway::Signature::new(argnames, None, None, 0, n),
+        docstring,
     )
 }
 
@@ -10188,7 +10217,7 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_with_signature(
+            make_new_descr_with_signature_and_doc(
                 traceback_descr_new,
                 crate::gateway::Signature::new(
                     vec!["cls", "tb_next", "tb_frame", "tb_lasti", "tb_lineno"],
@@ -10197,6 +10226,7 @@ fn init_pytraceback_type(ns: PyObjectRef) {
                     0,
                     1,
                 ),
+                "Create and return a new object.  See help(type) for accurate signature.",
             )
         )
     };
@@ -19154,10 +19184,11 @@ fn init_method_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__call__",
-            crate::gateway::make_builtin_function_passthrough1(
+            crate::gateway::make_builtin_function_passthrough1_with_doc(
                 "__call__",
                 crate::function::descr_method_call,
                 crate::function::descr_method_call_args,
+                "Call self as a function.",
             )
         )
     };
@@ -20107,7 +20138,11 @@ fn init_cell_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_posonly(cell_descr_new, vec!["cls", "contents"])
+            make_new_descr_posonly_with_doc(
+                cell_descr_new,
+                vec!["cls", "contents"],
+                "Create and return a new object.  See help(type) for accurate signature.",
+            )
         );
         crate::__pyre_put_new!(
             ns_slot,
@@ -21607,9 +21642,12 @@ fn init_property_type(ns: PyObjectRef) {
                 ),
             );
             unsafe {
+                // wrapper_descriptor `tp_init` text; the type object's
+                // `__text_signature__` carries `fget`/`fset`/`fdel`/`doc`.
+                // `W_Property.init` still binds those four through Signature.
                 crate::function::fset_func_text_signature(
                     descr,
-                    w_str_new("($self, fget=None, fset=None, fdel=None, doc=None)"),
+                    w_str_new("($self, /, *args, **kwargs)"),
                 )
             };
             descr

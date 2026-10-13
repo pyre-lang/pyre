@@ -3229,6 +3229,10 @@ pub fn parse_builtin_signature(
             Some(pad.as_slice())
         }
     };
+    // Clinic `_PyArg_UnpackKeywords` names a method by its function, not
+    // `Type.function`.  All-posonly descriptors keep the qualified
+    // parse_obj spelling (`dict.get() takes no keyword arguments`).
+    let fname = clinic_method_bind_name(sig, fname);
     // [3.14-spec] clinic counts nargs+nkwargs against the declared
     // parameter total when the signature accepts keywords.  parse_obj
     // reports UnknownKwds / TooMany instead (`argument.py`).  Measured
@@ -3243,7 +3247,7 @@ pub fn parse_builtin_signature(
         && !sig.has_kwarg()
         && npos + nkw > sig.argnames.len()
     {
-        let skip = usize::from(signature_cls_constructor(sig));
+        let skip = usize::from(signature_cls_constructor(sig) || signature_method_self(sig));
         let n = sig.argnames.len() - skip;
         let m = npos + nkw - skip;
         // `_PyArg_CheckPositional` (`int("5", 10, 1)` → `int expected at most
@@ -3255,16 +3259,21 @@ pub fn parse_builtin_signature(
         // so `str("a","b","c","d")` is `str expected at most 3 arguments, got 4`
         // even though encoding/errors are positional-or-keyword. `bytes` stays
         // on the clinic form. Measured 3.14.6; `test_str.StrTest.test_str_invalid_call`.
-        if skip != 0 && nkw == 0 && (sig.posonlyargcount > skip || fname == "str") {
+        if signature_cls_constructor(sig)
+            && nkw == 0
+            && (sig.posonlyargcount > skip || fname == "str")
+        {
             let argword = if n == 1 { "argument" } else { "arguments" };
             return Err(crate::PyError::type_error(format!(
                 "{fname} expected at most {n} {argword}, got {m}"
             )));
         }
-        let argword = if n == 1 { "argument" } else { "arguments" };
-        return Err(crate::PyError::type_error(format!(
-            "{fname}() takes at most {n} {argword} ({m} given)"
-        )));
+        // Receiver excluded, same count `_PyArg_UnpackKeywords` reports:
+        // `expandtabs(2, 3)` is "takes at most 1 argument (2 given)";
+        // `expandtabs(one=1, two=2)` is "takes at most 1 keyword argument
+        // (2 given)" because no positional was supplied after `self`.
+        let npos_user = npos.saturating_sub(skip);
+        crate::builtins::clinic_arity(fname, npos_user, nkw, 0, n, 0)?;
     }
     let mut scope_w = match arguments._parse(pyre_object::PY_NULL, sig, defaults, w_kw_defs, 0) {
         Ok(scope) => scope,
@@ -3304,6 +3313,24 @@ fn signature_accepts_keywords(sig: &crate::Signature) -> bool {
 
 fn signature_cls_constructor(sig: &crate::Signature) -> bool {
     sig.argnames.first().copied() == Some("cls")
+}
+
+fn signature_method_self(sig: &crate::Signature) -> bool {
+    sig.argnames.first().copied() == Some("self") && sig.posonlyargcount >= 1
+}
+
+/// Clinic METH_KEYWORDS method wrappers report the function name
+/// (`expandtabs()`, `tobytes()`).  `Arguments.parse_obj` otherwise
+/// prefixes `Function.name`, which for a descriptor is `Type.function`.
+fn clinic_method_bind_name<'a>(sig: &crate::Signature, fname: &'a str) -> &'a str {
+    if signature_accepts_keywords(sig) && sig.argnames.first().copied() == Some("self") {
+        fname
+            .rsplit_once('.')
+            .map(|(_, name)| name)
+            .unwrap_or(fname)
+    } else {
+        fname
+    }
 }
 
 /// Clinic wording for the first required positional-or-keyword slot left
