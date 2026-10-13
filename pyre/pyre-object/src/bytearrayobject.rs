@@ -478,6 +478,24 @@ pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     }
 }
 
+/// `bytearrayobject.py` `_memcmp`.
+///
+/// `for i in range(length)`: `selfvalue[i] < buffer[i]` is -1, `>` is 1,
+/// else 0. Plain indexing, not `direct_ptradd`.
+pub fn _memcmp(selfvalue: &[u8], buffer: &[u8], length: usize) -> i32 {
+    let mut i = 0usize;
+    while i < length {
+        if selfvalue[i] < buffer[i] {
+            return -1;
+        }
+        if selfvalue[i] > buffer[i] {
+            return 1;
+        }
+        i += 1;
+    }
+    0
+}
+
 /// `_exports` — number of live buffer exports over this bytearray.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -553,6 +571,15 @@ mod tests {
             assert_eq!(w_bytearray_find(ba, 1, 0), 3);
             assert_eq!(w_bytearray_find(ba, 1, 4), -1);
         }
+    }
+
+    #[test]
+    fn memcmp_indexes_bytes_in_order() {
+        assert_eq!(_memcmp(b"abc", b"abd", 3), -1);
+        assert_eq!(_memcmp(b"abd", b"abc", 3), 1);
+        assert_eq!(_memcmp(b"abc", b"abc", 3), 0);
+        assert_eq!(_memcmp(b"abc", b"abx", 2), 0);
+        assert_eq!(_memcmp(b"", b"", 0), 0);
     }
 
     #[test]

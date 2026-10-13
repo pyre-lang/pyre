@@ -21669,72 +21669,233 @@ fn cmp_guard_tuple(b: PyObjectRef) -> bool {
 fn cmp_guard_bytes(b: PyObjectRef) -> bool {
     unsafe { pyre_object::bytesobject::is_bytes(b) }
 }
-/// `bytearrayobject.py descr_eq` / `:355 _comparison_helper` — a bytearray
-/// compares by content against **any** `BUF_SIMPLE` exporter, not only against
-/// another bytes-like: the non-bytes-like operand goes to
-/// `space.acquire_py_buffer(w_other, space.BUF_SIMPLE)`, and only the TypeError
-/// that raises becomes `NotImplemented`.
+/// `bytes` keeps the narrow [`cmp_guard_bytes`] test.  Its own comparisons
+/// never acquire a buffer, which is why `b'ab' == array.array('B', [97, 98])`
+/// is `False` while the bytearray spelling of it is `True`.
 ///
-/// `bytes` deliberately keeps the narrow [`cmp_guard_bytes`] test.  Its own
-/// comparisons never acquire a buffer, which is why
-/// `b'ab' == array.array('B', [97, 98])` is `False` while the bytearray
-/// spelling of it is `True`.
-fn bytearray_compare(
-    mut a: PyObjectRef,
-    b: PyObjectRef,
-    op: crate::objspace::descroperation::CompareOp,
-) -> Result<PyObjectRef, crate::PyError> {
-    // The bytes-like arms, and any receiver this slot was not meant for, keep
-    // the by-layout comparison.
-    if unsafe {
-        !pyre_object::bytesobject::is_bytes_like(a) || pyre_object::bytesobject::is_bytes_like(b)
-    } {
-        return crate::objspace::descroperation::compare_slot(a, b, op);
+/// Acquire a `BUF_SIMPLE` export for `W_BytearrayObject._comparison_helper`
+/// / `descr_eq` / `descr_ne`.  TypeError (and a missing buffer interface)
+/// becomes "not comparable"; every other error propagates.
+fn bytearray_acquire_compare_buffer(
+    w_other: PyObjectRef,
+) -> Result<Option<crate::baseobjspace::SimpleBufferBytes>, crate::PyError> {
+    match crate::baseobjspace::simple_buffer_bytes(w_other) {
+        Ok(Some(buffer)) => Ok(Some(buffer)),
+        Ok(None) => Ok(None),
+        Err(error) if error.kind == crate::PyErrorKind::TypeError => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// `W_BytearrayObject._comparison_helper`.
+///
+/// Returns `(success, cmp, other_len)`.  `success` is false when `w_other`
+/// is not a bytearray, bytes, or `BUF_SIMPLE` exporter.
+fn bytearray_comparison_helper(
+    mut w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<(bool, i32, usize), crate::PyError> {
+    unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(w_other) {
+            let value = pyre_object::bytearrayobject::w_bytearray_data(w_self);
+            let other = pyre_object::bytearrayobject::w_bytearray_data(w_other);
+            let other_len = pyre_object::bytearrayobject::w_bytearray_len(w_other);
+            let cmp = pyre_object::bytearrayobject::_memcmp(
+                value,
+                other,
+                pyre_object::bytearrayobject::w_bytearray_len(w_self).min(other_len),
+            );
+            return Ok((true, cmp, other_len));
+        }
+        if pyre_object::bytesobject::is_bytes(w_other) {
+            let value = pyre_object::bytearrayobject::w_bytearray_data(w_self);
+            let other = pyre_object::bytesobject::w_bytes_data(w_other);
+            let other_len = pyre_object::bytesobject::w_bytes_len(w_other);
+            let cmp = pyre_object::bytearrayobject::_memcmp(
+                value,
+                other,
+                pyre_object::bytearrayobject::w_bytearray_len(w_self).min(other_len),
+            );
+            return Ok((true, cmp, other_len));
+        }
     }
     // The export owns a bracket of its own, opened above this one; this one
-    // stays open until the export is gone.
+    // stays open until the export is gone.  `getdata()` is read after the
+    // acquisition: a `__buffer__` slot is app-level code and may have
+    // resized the receiver.  Upstream holds the list object `getdata()`
+    // returned before `acquire_py_buffer`; the payload here is a `Vec`, so
+    // the slice is re-read after the collecting call.
     let a_roots = pyre_object::gc_roots::push_roots();
-    let a_base = a_roots.pin_roots(&[a]);
-    let acquired = crate::baseobjspace::simple_buffer_bytes(b);
-    a = a_roots.get(a_base);
-    let buffer = match acquired {
-        Ok(Some(buffer)) => buffer,
-        Ok(None) => return Ok(pyre_object::w_not_implemented()),
-        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
-            return Ok(pyre_object::w_not_implemented());
-        }
-        Err(error) => return Err(error),
+    let a_base = a_roots.pin_roots(&[w_self]);
+    let acquired = bytearray_acquire_compare_buffer(w_other)?;
+    w_self = a_roots.get(a_base);
+    let Some(buffer) = acquired else {
+        return Ok((false, 0, 0));
     };
-    // `getdata()` is read after the acquisition: a `__buffer__` slot is
-    // app-level code and may have resized the receiver.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(a) }.to_vec();
-    // `_memcmp` over the common prefix, then the lengths decide — which is
-    // what a lexicographic slice comparison already is.
-    let ordering = data.as_slice().cmp(buffer.as_bytes());
+    let value = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_self) };
+    let other_len = buffer.as_bytes().len();
+    let cmp = pyre_object::bytearrayobject::_memcmp(
+        value,
+        buffer.as_bytes(),
+        unsafe { pyre_object::bytearrayobject::w_bytearray_len(w_self) }.min(other_len),
+    );
     buffer.release();
+    Ok((true, cmp, other_len))
+}
+
+/// `W_BytearrayObject.descr_eq`.
+fn bytearray_descr_eq(
+    mut w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(w_other) {
+            let value = pyre_object::bytearrayobject::w_bytearray_data(w_self);
+            let other = pyre_object::bytearrayobject::w_bytearray_data(w_other);
+            return Ok(pyre_object::w_bool_from(
+                value.len() == other.len()
+                    && pyre_object::bytearrayobject::_memcmp(value, other, value.len()) == 0,
+            ));
+        }
+    }
+    let a_roots = pyre_object::gc_roots::push_roots();
+    let a_base = a_roots.pin_roots(&[w_self]);
+    let acquired = bytearray_acquire_compare_buffer(w_other)?;
+    w_self = a_roots.get(a_base);
+    let Some(buffer) = acquired else {
+        return Ok(pyre_object::w_not_implemented());
+    };
+    let value = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_self) };
+    let buffer_len = buffer.as_bytes().len();
+    let self_len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(w_self) };
+    if self_len != buffer_len {
+        buffer.release();
+        return Ok(pyre_object::w_bool_from(false));
+    }
+    let min_length = self_len.min(buffer_len);
+    let equal = pyre_object::bytearrayobject::_memcmp(value, buffer.as_bytes(), min_length) == 0;
+    buffer.release();
+    Ok(pyre_object::w_bool_from(equal))
+}
+
+/// `W_BytearrayObject.descr_ne`.
+fn bytearray_descr_ne(
+    mut w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(w_other) {
+            let value = pyre_object::bytearrayobject::w_bytearray_data(w_self);
+            let other = pyre_object::bytearrayobject::w_bytearray_data(w_other);
+            return Ok(pyre_object::w_bool_from(
+                value.len() != other.len()
+                    || pyre_object::bytearrayobject::_memcmp(value, other, value.len()) != 0,
+            ));
+        }
+    }
+    let a_roots = pyre_object::gc_roots::push_roots();
+    let a_base = a_roots.pin_roots(&[w_self]);
+    let acquired = bytearray_acquire_compare_buffer(w_other)?;
+    w_self = a_roots.get(a_base);
+    let Some(buffer) = acquired else {
+        return Ok(pyre_object::w_not_implemented());
+    };
+    let value = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_self) };
+    let buffer_len = buffer.as_bytes().len();
+    let self_len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(w_self) };
+    if self_len != buffer_len {
+        buffer.release();
+        return Ok(pyre_object::w_bool_from(true));
+    }
+    let min_length = self_len.min(buffer_len);
+    let unequal = pyre_object::bytearrayobject::_memcmp(value, buffer.as_bytes(), min_length) != 0;
+    buffer.release();
+    Ok(pyre_object::w_bool_from(unequal))
+}
+
+/// Pin `w_self` across `_comparison_helper`: a `__buffer__` acquisition can
+/// collect, and `descr_lt` then reads `self._len()`.
+fn bytearray_comparison_helper_pinned(
+    w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<(bool, i32, usize, usize), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[w_self]);
+    let (success, cmp, other_len) = bytearray_comparison_helper(roots.get(base), w_other)?;
+    let self_len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(roots.get(base)) };
+    Ok((success, cmp, other_len, self_len))
+}
+
+/// `W_BytearrayObject.descr_lt`.
+fn bytearray_descr_lt(
+    w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (success, cmp, other_len, self_len) = bytearray_comparison_helper_pinned(w_self, w_other)?;
+    if !success {
+        return Ok(pyre_object::w_not_implemented());
+    }
     Ok(pyre_object::w_bool_from(
-        crate::objspace::descroperation::ordering_satisfies(ordering, op),
+        cmp < 0 || (cmp == 0 && self_len < other_len),
+    ))
+}
+
+/// `W_BytearrayObject.descr_le`.
+fn bytearray_descr_le(
+    w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (success, cmp, other_len, self_len) = bytearray_comparison_helper_pinned(w_self, w_other)?;
+    if !success {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    Ok(pyre_object::w_bool_from(
+        cmp < 0 || (cmp == 0 && self_len <= other_len),
+    ))
+}
+
+/// `W_BytearrayObject.descr_gt`.
+fn bytearray_descr_gt(
+    w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (success, cmp, other_len, self_len) = bytearray_comparison_helper_pinned(w_self, w_other)?;
+    if !success {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    Ok(pyre_object::w_bool_from(
+        cmp > 0 || (cmp == 0 && self_len > other_len),
+    ))
+}
+
+/// `W_BytearrayObject.descr_ge`.
+fn bytearray_descr_ge(
+    w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (success, cmp, other_len, self_len) = bytearray_comparison_helper_pinned(w_self, w_other)?;
+    if !success {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    Ok(pyre_object::w_bool_from(
+        cmp > 0 || (cmp == 0 && self_len >= other_len),
     ))
 }
 
 macro_rules! bytearray_cmp_dunder {
-    ($name:ident, $op:ident) => {
+    ($name:ident, $descr:path) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::type_methods::arity_slot(args, 1)?;
-            bytearray_compare(
-                args[0],
-                args[1],
-                crate::objspace::descroperation::CompareOp::$op,
-            )
+            $descr(args[0], args[1])
         }
     };
 }
-bytearray_cmp_dunder!(bytearray_dunder_eq, Eq);
-bytearray_cmp_dunder!(bytearray_dunder_ne, Ne);
-bytearray_cmp_dunder!(bytearray_dunder_lt, Lt);
-bytearray_cmp_dunder!(bytearray_dunder_le, Le);
-bytearray_cmp_dunder!(bytearray_dunder_gt, Gt);
-bytearray_cmp_dunder!(bytearray_dunder_ge, Ge);
+bytearray_cmp_dunder!(bytearray_dunder_eq, bytearray_descr_eq);
+bytearray_cmp_dunder!(bytearray_dunder_ne, bytearray_descr_ne);
+bytearray_cmp_dunder!(bytearray_dunder_lt, bytearray_descr_lt);
+bytearray_cmp_dunder!(bytearray_dunder_le, bytearray_descr_le);
+bytearray_cmp_dunder!(bytearray_dunder_gt, bytearray_descr_gt);
+bytearray_cmp_dunder!(bytearray_dunder_ge, bytearray_descr_ge);
 
 macro_rules! cmp_dunder {
     ($name:ident, $op:ident, $guard:path) => {
