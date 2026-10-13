@@ -5471,15 +5471,20 @@ fn run_perfn_walk<Sym: WalkSym>(
                             crate::jitcode_dispatch::census_record("MidBodyDeclineBeforeRun");
                         }
                         Err(MidBodyDecline::AfterRun(_)) => {
-                            // WalkAbort did not run. `execute_frame` already
-                            // ran the remaining callee body, then
-                            // `flush_walk_end_state_after_outer_call` failed.
-                            // That is an invariant failure of the flush:
-                            // `finishframe` installs the return in the caller
-                            // before continuing. Do not commit AfterApplied —
-                            // that flush did not happen. Falling through
-                            // leaves entry replay, which re-runs the region.
+                            // `execute_frame` already ran the remaining callee
+                            // body. `convert_and_run_from_pyjitpl`
+                            // (`blackhole.py`) continues the live frames;
+                            // entry replay would re-run that region. The
+                            // flush's remaining post-run failure is
+                            // `store_boxed_frame_local` after a collection
+                            // moved the outer frame, which cannot be known
+                            // before the run — commit AfterApplied anyway.
                             crate::jitcode_dispatch::census_record("MidBodyDeclineAfterRun");
+                            let _ = commit_walk_end(
+                                flush_committed,
+                                WalkEndCommitLeg::CalleeRebuild,
+                                WalkEndResume::AfterApplied,
+                            );
                         }
                     }
                 }

@@ -3193,6 +3193,41 @@ fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(
     Ok(saved)
 }
 
+/// Live boxes for one paused parent at the pc the snapshot will publish.
+///
+/// `ResumeDataLoopMemo.number` writes `jitcode_index, pc, [tagged...]` and
+/// `rebuild_from_numbering` splits that stream with `frame_value_count_at`
+/// at the same pc. Collecting from the paused banks is `get_list_of_active_boxes`
+/// at capture time; a stored image whose length disagrees is refused, so a
+/// parent cannot donate a tagged value into the next frame header.
+fn boxes_matching_resume_liveness(
+    frame: &InlineParentFrame,
+    pc_word: u32,
+    op_pc: usize,
+) -> Result<Vec<OpRef>, DispatchError> {
+    let expected = crate::state::frame_value_count_at(frame.jitcode_index as i32, pc_word as i32);
+    if let (Some(regs_i), Some(regs_r), Some(regs_f)) =
+        (&frame.registers_i, &frame.registers_r, &frame.registers_f)
+        && let Ok(boxes) = collect_callee_active_boxes(
+            regs_i,
+            regs_r,
+            regs_f,
+            frame.jitcode_index,
+            op_pc,
+            pc_word as i32,
+        )
+        && boxes.len() == expected
+    {
+        return Ok(boxes);
+    }
+    // No box is invented for a slot the image does not hold: a section of
+    // the wrong length cannot be numbered, so the guard is not recorded.
+    if frame.boxes.len() != expected {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    }
+    Ok(frame.boxes.clone())
+}
+
 /// A guard inside a canonical helper body, whose descent pushes no Python
 /// frame of its own: the chain is the paused levels alone.
 ///
@@ -3214,7 +3249,14 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     let saved_vable = publish_outermost_parent_vable_scalars(ctx, &parent_frames, op_pc)?;
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved_vable);
-    let mut frames: Vec<(u32, u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len());
+    // `capture_resumedata` numbers every `MetaInterp.framestack` level in one
+    // `ResumeDataLoopMemo` pass (`resume.py` `number`). Each section's tagged
+    // values are the live boxes at that frame's published pc, so the length
+    // agrees with `get_current_position_info` / `frame_value_count_at` when
+    // cranelift rebuilds the numbering. Stored `in_a_call` images can differ
+    // from that window; re-collect from the paused banks, and refuse the
+    // capture when no image of the decoder's count exists.
+    let mut captured: Vec<(u32, u32, u32, Vec<OpRef>)> = Vec::with_capacity(parent_frames.len());
     for frame in &parent_frames {
         let word = frame
             .resume_marker_jit_pc
@@ -3227,8 +3269,15 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
             .map(|offset| offset as u32)
             .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
         let py_pc = forward_snapshot_py_pc(frame.jitcode_index, pc_word)?;
-        frames.push((frame.jitcode_index, pc_word, py_pc, frame.boxes.as_slice()));
+        let boxes = boxes_matching_resume_liveness(frame, pc_word, op_pc)?;
+        captured.push((frame.jitcode_index, pc_word, py_pc, boxes));
     }
+    let frames: Vec<(u32, u32, u32, &[OpRef])> = captured
+        .iter()
+        .map(|(jitcode_index, pc_word, py_pc, boxes)| {
+            (*jitcode_index, *pc_word, *py_pc, boxes.as_slice())
+        })
+        .collect();
     match guard_stamp {
         GuardStampTarget::LastOp => ctx
             .trace_ctx

@@ -366,16 +366,14 @@ fn dummy_operator_tail_caller() -> InlineParentFrame {
 }
 
 /// `capture_vstack_mirror_image` returns `None` when the walk mirror is
-/// invalid. The latch must then return false and leave the multi-frame
-/// cell empty — publishing a `mirror_stack: None` image lets adopt decline
-/// into entry replay of a dunder that already ran.
+/// invalid. The pre-inline admission must then decline so the walk takes
+/// the ordinary residual instead of entering the dunder.
 #[test]
-fn operator_tail_latch_without_a_mirror_publishes_nothing() {
+fn operator_tail_latch_without_a_mirror_declines_before_inline() {
     reset_single_frame_blackhole();
     let mut tc = fresh_trace_ctx();
     let session = std::cell::RefCell::new(WalkSession::default());
     let caller = dummy_operator_tail_caller();
-    let result = OpRef::input_arg_ref(0);
     let wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData::default()),
         inline_callee_consts: None,
@@ -404,17 +402,23 @@ fn operator_tail_latch_without_a_mirror_publishes_nothing() {
         live_after_jit_pc: usize::MAX,
     };
     assert!(
-        !latch_operator_tail_return(
+        !operator_tail_resume_image_capturable(
+            &wc,
+            crate::operator_continuation::OperatorTail::Len,
+        ),
+        "a missing vstack mirror must refuse the resume image before inline",
+    );
+    assert!(
+        !can_latch_operator_tail_return(
             &wc,
             &caller,
             crate::operator_continuation::OperatorTail::Len,
-            result,
         ),
-        "a missing vstack mirror must refuse the latch",
+        "a missing vstack mirror must refuse the latch before inline",
     );
     assert!(
         !multi_frame_blackhole_is_latched(),
-        "a refused latch must publish nothing",
+        "a refused pre-inline admission must publish nothing",
     );
 }
 

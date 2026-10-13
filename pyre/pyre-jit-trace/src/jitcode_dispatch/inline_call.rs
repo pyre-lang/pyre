@@ -8101,6 +8101,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 return resolved_inline_decline(op.pc, line!());
             }
         };
+    // Every reason `latch_operator_tail_return` can refuse (mirror, paused
+    // parents, this caller, the tail parent, blackhole preflight) is known
+    // here. Decline to the residual CALL before the dunder body runs.
+    if let Some(tail) = operator_tail
+        && !super::residual_call::can_latch_operator_tail_return(
+            ctx,
+            &precomputed_parent_frame,
+            tail,
+        )
+    {
+        return resolved_inline_decline(op.pc, line!());
+    }
 
     let mut callable_guard_op = callable_guard_op;
     let mut callable_guard_value = callable_guard_value;
@@ -13482,6 +13494,14 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     if body_facts.owns_loop_header {
         return Ok(None);
     }
+    // `capture_resumedata` (`pyjitpl.py`) needs the tail image before the
+    // call is entered. A later latch failure would replay `__len__`.
+    if !super::residual_call::operator_tail_resume_image_capturable(
+        ctx,
+        crate::operator_continuation::OperatorTail::Len,
+    ) {
+        return Ok(None);
+    }
 
     // `[__len__, <self-placeholder>, obj]`: the method-form call header the
     // inline plumbing expects, then the one positional argument.
@@ -13566,17 +13586,16 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     {
         return Err(DispatchError::callee_inline_abort(op_pc, true));
     }
-    // Latch failed: `convert_and_run_from_pyjitpl` copies live frames, so
-    // this branch is an invariant failure. `jit_strict_mode` (`MAJIT_STRICT`
-    // / debug) panics so `pyre/check.py` turns it red. Without strict mode
-    // the interpreter replays the region and the dunder runs again.
+    // Unreachable after the pre-inline `can_latch_operator_tail_return`
+    // admission. Census + debug only: a release panic would hide the
+    // convert-in-place path `convert_and_run_from_pyjitpl` (`blackhole.py`)
+    // is supposed to take.
     crate::jitcode_dispatch::census_record("OperatorTailLatchFailed");
-    if majit_metainterp::jit_strict_mode() {
-        panic!(
-            "operator-tail latch failed after the dunder ran; \
-             convert_and_run_from_pyjitpl copies live frames"
-        );
-    }
+    debug_assert!(
+        false,
+        "operator-tail latch failed after the dunder ran; \
+         convert_and_run_from_pyjitpl copies live frames"
+    );
     let _ = ctx.session.borrow_mut().claim_abort_coordinate(true);
     Err(DispatchError::callee_inline_abort(op_pc, true))
 }
@@ -13712,6 +13731,15 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     };
     if body_facts.owns_loop_header {
         decline!("__bool__ owns a loop header");
+    }
+    // Same admission as `capture_resumedata`: the Truth tail image must be
+    // capturable before `__bool__` runs, or the residual `is_true_lookup`
+    // path is taken instead of replaying the dunder.
+    if !super::residual_call::operator_tail_resume_image_capturable(
+        ctx,
+        crate::operator_continuation::OperatorTail::Truth,
+    ) {
+        decline!("operator-tail resume image not capturable");
     }
 
     let _roots = pyre_object::gc_roots::push_roots();
@@ -16416,6 +16444,14 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
             "{}.__format__ takes {nparams} params",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
         ));
+    }
+    // Refuse before the record-time sample and the sub-walk: a latch that
+    // cannot be built after `__format__` would replay the dunder.
+    if !super::residual_call::operator_tail_resume_image_capturable(
+        ctx,
+        crate::operator_continuation::OperatorTail::Format,
+    ) {
+        decline!("operator-tail resume image not capturable");
     }
 
     // If this straight-line body is safe to sample, refuse a bad result
