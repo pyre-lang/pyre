@@ -6767,6 +6767,10 @@ pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
     if unsafe { !pyre_object::functional::is_exact_w_range(obj) } {
         return Ok(None);
     }
+    // `w_range_iter` is the range arm of `space.iter`, not the dispatching
+    // body: the type test that selects it is recorded here.
+    let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
+    walker_guard_fold_class(ctx, op_pc, r_args[0], range_type_addr)?;
     try_walker_orthodox_descent(
         ctx,
         op_pc,
