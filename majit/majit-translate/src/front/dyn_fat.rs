@@ -24,7 +24,7 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TypeDeclKind;
 
 use crate::flowspace::model::Variable;
-use crate::front::mir::tyref_is_fat_dyn;
+use crate::front::mir::{cast_int_to_ptr_call, tyref_is_fat_dyn};
 use crate::inline::splice_direct_call;
 use crate::model::{
     BlockId, ConcreteType, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation,
@@ -635,22 +635,18 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
     });
     match at {
         Some(index) => {
-            let result_ty = match &block.operations[index].kind {
-                OpKind::FieldRead { field, ty, .. }
-                    if field.vec_part == Some(VecFieldPart::FatVtable) =>
-                {
-                    Some(ty.clone())
-                }
-                _ => None,
-            };
-            if let Some(result_ty) = result_ty {
-                // Same metadata word: keep the Ref users on a cast of
-                // the Int load instead of a second getfield.
-                block.operations[index].kind = OpKind::UnaryOp {
-                    op: "cast_int_to_ptr".into(),
-                    operand: meta.clone(),
-                    result_ty,
-                };
+            let is_fat_vtable = matches!(
+                &block.operations[index].kind,
+                OpKind::FieldRead { field, .. }
+                    if field.vec_part == Some(VecFieldPart::FatVtable)
+            );
+            if is_fat_vtable {
+                // Same metadata word: keep the Ref users on
+                // `lltype.cast_int_to_ptr` of the Int load instead of a
+                // second getfield. `rtype_cast_int_to_ptr` accepts the
+                // host call; UnaryOp `cast_int_to_ptr` has no flowspace
+                // counterpart (`normalize_unary_op_name`).
+                block.operations[index].kind = cast_int_to_ptr_call(meta.clone());
                 block.operations.insert(index, op);
             } else {
                 block.operations.insert(index + 1, op);

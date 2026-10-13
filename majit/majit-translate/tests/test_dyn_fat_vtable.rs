@@ -195,7 +195,7 @@ fn w_dict_getitem_str_hashed_assembles_with_vtable_word() {
     );
 }
 
-fn has_cast_int_to_ptr_unary(graph: &FunctionGraph) -> bool {
+fn leftover_cast_int_to_ptr_unary(graph: &FunctionGraph) -> bool {
     graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| {
             matches!(
@@ -206,16 +206,40 @@ fn has_cast_int_to_ptr_unary(graph: &FunctionGraph) -> bool {
     })
 }
 
+fn is_lltype_cast_int_to_ptr_call(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.iter().any(|segment| segment == "lltype")
+                && segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "cast_int_to_ptr")
+        }
+        _ => false,
+    }
+}
+
 #[test]
-fn w_dict_store_cast_int_to_ptr_is_unary() {
+fn w_dict_store_cast_int_to_ptr_is_the_lltype_host_call() {
     let Some(llbc) = object_llbc() else {
         return;
     };
     let graph = lower_function(llbc, "w_dict_store").expect("lower w_dict_store");
     assert_vtable_reads(&graph, "method_setitem");
     assert!(
-        has_cast_int_to_ptr_unary(&graph),
-        "w_dict_store must emit UnaryOp cast_int_to_ptr of the FatMeta Int load\n{}",
+        !leftover_cast_int_to_ptr_unary(&graph),
+        "w_dict_store must not emit UnaryOp cast_int_to_ptr of the FatMeta Int load\n{}",
+        graph.dump()
+    );
+    assert!(
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if is_lltype_cast_int_to_ptr_call(target)
+                )
+            })
+        }),
+        "w_dict_store must emit lltype.cast_int_to_ptr of the FatMeta Int load\n{}",
         graph.dump()
     );
 }

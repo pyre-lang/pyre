@@ -6333,6 +6333,7 @@ mod tests {
         check("words", 3 * word, VecFieldPart::Len, "Vec<i64>", word);
         check("bytes", 0, VecFieldPart::FatData, "Vec<u8>", 1);
         check("bytes", 0, VecFieldPart::FatLen, "Vec<u8>", 1);
+        check("bytes", 0, VecFieldPart::FatMeta, "Vec<u8>", 1);
         check("imp", 0, VecFieldPart::FatVtable, "Vec<u8>", 1);
         // A pointer to the Vec (Box<Vec<_>> after the box load) adds nothing
         // but the component offset.

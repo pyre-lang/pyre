@@ -2866,9 +2866,7 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
 /// argument is a byte slice, not `Ptr(STR)` / `Ptr(UNICODE)`.
 ///
 /// Elidable only for immutable `bytes`/`bytes`. A `bytearray` operand
-/// reaches [`ll_bytes_strcmp_mutable`] instead: an in-place store
-/// (`b[i] = ...`) changes the compared bytes without changing the slice
-/// pointer or length, and `CALL_PURE` would reuse the first result.
+/// reaches `W_BytearrayObject._comparison_helper` / `_memcmp`.
 #[majit_macros::elidable]
 fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> isize {
     let cmplen = left.len().min(right.len());
@@ -2883,39 +2881,6 @@ fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> isize {
         i += 1;
     }
     left.len() as isize - right.len() as isize
-}
-
-/// Same bytewise prefix-then-length compare as [`ll_bytes_strcmp`], not
-/// elidable. `_handle_stroruni_call` raises `NotSupported` for `BYTEARRAY`;
-/// a residual call re-reads the buffer after an in-place store.
-fn ll_bytes_strcmp_mutable(left: &[u8], right: &[u8]) -> isize {
-    let cmplen = left.len().min(right.len());
-    let left_p = left.as_ptr();
-    let right_p = right.as_ptr();
-    let mut i = 0usize;
-    while i < cmplen {
-        let diff = unsafe { *left_p.add(i) as isize - *right_p.add(i) as isize };
-        if diff != 0 {
-            return diff;
-        }
-        i += 1;
-    }
-    left.len() as isize - right.len() as isize
-}
-
-/// Read a total-order result under `op` — the shape every `_memcmp`-based
-/// comparison ends in, where the common prefix and then the lengths have
-/// already been folded into one `Ordering`.
-#[inline]
-pub(crate) fn ordering_satisfies(ordering: std::cmp::Ordering, op: CompareOp) -> bool {
-    match op {
-        CompareOp::Lt => ordering.is_lt(),
-        CompareOp::Le => ordering.is_le(),
-        CompareOp::Gt => ordering.is_gt(),
-        CompareOp::Ge => ordering.is_ge(),
-        CompareOp::Eq => ordering.is_eq(),
-        CompareOp::Ne => ordering.is_ne(),
-    }
 }
 
 #[inline]
@@ -7151,23 +7116,16 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
         if is_complex_pair(a, b) && matches!(op, CompareOp::Eq | CompareOp::Ne) {
             return complex_richcompare(a, b, op);
         }
-        // bytesobject.py W_BytesObject.descr_eq / _lt / ... and the
-        // bytearray counterparts — lexicographic comparison on the raw
-        // bytes.  bytes and bytearray compare by content
-        // (b"a" == bytearray(b"a")), so both operands route through
-        // bytes_like_data. Immutable `bytes`/`bytes` keeps the elidable
-        // `ll_bytes_strcmp`; any `bytearray` operand uses the non-elidable
-        // twin, matching `_handle_stroruni_call`'s `BYTEARRAY` reject.
-        if pyre_object::bytesobject::is_bytes_like(a) && pyre_object::bytesobject::is_bytes_like(b)
-        {
-            let da = pyre_object::bytesobject::bytes_like_data(a);
-            let db = pyre_object::bytesobject::bytes_like_data(b);
-            let diff =
-                if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
-                    ll_bytes_strcmp(da, db)
-                } else {
-                    ll_bytes_strcmp_mutable(da, db)
-                };
+        // bytesobject.py W_BytesObject.descr_eq / _lt / ... — lexicographic
+        // comparison on the raw bytes. Immutable `bytes`/`bytes` keeps the
+        // elidable `ll_bytes_strcmp`. A `bytearray` operand falls through
+        // to the generic `lookup_in_type_where` / `call_function_impl_result`
+        // tail (`descroperation.py` `_make_comparison_impl`), which reaches
+        // `bytearray_dunder_*` / `W_BytearrayObject.descr_*`.
+        if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
+            let da = pyre_object::bytesobject::w_bytes_data(a);
+            let db = pyre_object::bytesobject::w_bytes_data(b);
+            let diff = ll_bytes_strcmp(da, db);
             return Ok(w_bool_from(match op {
                 CompareOp::Lt => diff < 0,
                 CompareOp::Le => diff <= 0,

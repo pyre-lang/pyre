@@ -18175,3 +18175,39 @@ fn the_traceback_walk_receivers_pin_their_class_through_the_payload() {
         "dict is acceptable as a base class, so its payload does not determine w_class",
     );
 }
+
+/// `FunctionCodeRacedRecord` is the sibling of
+/// `KwonlyDefaultsMappingRacedRecord`: a seeded inline that loses the
+/// `code?` race converts in place (`can_convert_seeded_inline`) rather than
+/// replaying the CALL from entry.
+#[test]
+fn function_code_raced_record_converts_a_seeded_inline() {
+    let raced = DispatchError::FunctionCodeRacedRecord { pc: 12 };
+    assert!(raced.can_convert_seeded_inline());
+    let sibling = DispatchError::KwonlyDefaultsMappingRacedRecord { pc: 12 };
+    assert!(sibling.can_convert_seeded_inline());
+}
+
+/// The inline seeder pins `W_Code` in `inline_code_slot`. A later `wrapint`
+/// can collect and forward that object; `Function.getcode` after
+/// `QuasiImmutDescr.__init__` must compare against the slot, not the
+/// pre-collection local, or the walk aborts as `FunctionCodeRacedRecord`
+/// when the field did not change.
+#[test]
+fn rooted_code_slot_forwards_across_collection() {
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let original = 0x5000 as pyre_object::PyObjectRef;
+    let _ = pyre_object::gc_roots::pin_root(original);
+    pyre_object::gc_roots::walk_shadow_stack(|root| {
+        if *root as usize == 0x5000 {
+            *root = 0x5080 as pyre_object::PyObjectRef;
+        }
+    });
+    let live = pyre_object::gc_roots::shadow_stack_get(slot);
+    assert_eq!(live as usize, 0x5080);
+    assert_ne!(original as usize, live as usize);
+    drop(roots);
+}

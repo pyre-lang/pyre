@@ -3665,6 +3665,7 @@ impl DispatchError {
                 | Self::PortalFrameTracerArmed { .. }
                 | Self::NotInTraceRequiresConcreteExecution { .. }
                 | Self::KwonlyDefaultsMappingRacedRecord { .. }
+                | Self::FunctionCodeRacedRecord { .. }
                 | Self::ConcreteShadowAllocationFailed { .. }
                 | Self::BranchGuardKeptStackUnsupported { .. }
                 | Self::BranchGuardKeptSlotUnsourced { .. }

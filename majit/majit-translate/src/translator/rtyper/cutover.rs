@@ -3465,19 +3465,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self"],
         LowLevelType::Float,
     ),
-    // `f64::fract(self) -> f64` is `self - trunc(self)`. No C libm
-    // `fract`; residualise like `floor` so `complex_richcompare` does
-    // not poison `_check_len_result` as an unregistered FunctionPath.
-    (
-        &["std", "f64", "<Impl>", "fract"],
-        &["self"],
-        LowLevelType::Float,
-    ),
-    (
-        &["core", "f64", "<Impl>", "fract"],
-        &["self"],
-        LowLevelType::Float,
-    ),
     (
         &["std", "f64", "<Impl>", "ceil"],
         &["self"],
