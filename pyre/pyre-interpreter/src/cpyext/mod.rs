@@ -478,9 +478,11 @@ pub fn load_extension_module(
     let _load_guard = extension_load_lock();
     ensure_linked();
     initialize();
-    // `c_dlopen` / `c_dlsym` release the GIL. `spec` is used after those calls.
+    // `c_dlopen` / `c_dlsym` release the GIL. Reload `spec` from its slot
+    // after each collecting call.
     let spec_roots = pyre_object::gc_roots::push_roots();
-    let spec = spec_roots.pin_root(spec);
+    let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = spec_roots.pin_root(spec);
     // Resolve PyPy's path cache before a second `dlopen` of the same file.
     if let Some(handle) = cached_extension_handle(path) {
         // `create_extension_module` takes the CFFI branch before it reaches the
@@ -511,22 +513,35 @@ pub fn load_extension_module(
     }
     let handle =
         majit_rlib::rdynload::dlopen(Some(path.as_os_str().as_bytes()), mode).map_err(|error| {
-            extension_import_error(
-                format!("cannot load extension '{}': {}", path.display(), error.msg),
-                name,
-                path,
-            )
+            match error {
+                majit_rlib::rdynload::DLOpenError::Message(msg) => extension_import_error(
+                    format!(
+                        "cannot load extension '{}': {}",
+                        path.display(),
+                        String::from_utf8_lossy(&msg)
+                    ),
+                    name,
+                    path,
+                ),
+                // `_retry_as_ldscript` lets `OSError` escape `load_extension_module`,
+                // which catches `DLOpenError` alone.
+                majit_rlib::rdynload::DLOpenError::OsError(errno) => {
+                    crate::error::get_converted_unexpected_exception(
+                        pyre_object::PY_NULL,
+                        &std::io::Error::from_raw_os_error(errno),
+                    )
+                }
+            }
         })? as usize;
 
-    // Every path from here leaves the library loaded, however it fails.  The
-    // handle cache keeps one `dlopen` count per library and hands the same
-    // handle back to a second open, so closing it here unloads the image
-    // outright -- and a multi-phase module never records its path in
-    // `EXTENSIONS`, so a later load of a *different* name out of the same file
-    // reaches this code while the modules the earlier loads built are still
-    // live.  Their types' `tp_traverse` is then a pointer into text nobody has
-    // mapped, which the next minor collection walks.  Upstream keeps the
-    // library on both of these failures.
+    // Every path from here leaves the library loaded, however it fails.
+    // Closing it here unmaps the image, and a multi-phase module never
+    // records its path in `EXTENSIONS`, so a later load of a *different*
+    // name out of the same file reaches this code while the modules the
+    // earlier loads built are still live. Their types' `tp_traverse` is
+    // then a pointer into text nobody has mapped, which the next minor
+    // collection walks. Upstream keeps the library on both of these
+    // failures.
     let cffi_address = lookup_cffi_init(handle, name);
     let found = lookup_init(handle, name)?;
     // `_cffi_backend` lives in `pyre-module`. Without its hooks an extension
@@ -553,15 +568,20 @@ pub fn load_extension_module(
             // The export protocol names the module itself, so the context the
             // single-phase path reads is not this path's to leave set.
             *PACKAGE_CONTEXT.lock() = old_context;
-            modsupport::create_module_from_export_slots(slots, spec, name, Some(path))
-                .map(InitResult::MultiPhase)
+            modsupport::create_module_from_export_slots(
+                slots,
+                spec_roots.get(spec_slot),
+                name,
+                Some(path),
+            )
+            .map(InitResult::MultiPhase)
         }
         InitProtocol::Init => {
             let init: unsafe extern "C" fn() -> *mut CPyObject =
                 unsafe { std::mem::transmute(address) };
             let result = unsafe { init() };
             *PACKAGE_CONTEXT.lock() = old_context;
-            finish_init(name, path, spec, result)
+            finish_init(name, path, spec_roots.get(spec_slot), result)
         }
     };
 

@@ -84,16 +84,27 @@ impl RegisterList {
     pub fn to_vec(&self) -> Vec<OpRef> {
         self.0.borrow().clone().unwrap_or_default()
     }
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn root(&self) -> RegisterListRoot {
+        self.root_with(majit_metainterp::FrontendResrefOwner::NONE)
+    }
+
+    pub(crate) fn root_with(
+        &self,
+        owner: majit_metainterp::FrontendResrefOwner,
+    ) -> RegisterListRoot {
+        let payload = super::FrontendBoxArea::new(Rc::as_ptr(&self.0), owner);
         let area = unsafe {
             majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
                 walk_register_list,
-                Rc::as_ptr(&self.0).cast(),
+                std::ptr::from_ref(payload.as_ref()).cast(),
                 "miframe_ref_list",
             )
         };
         RegisterListRoot {
             _area: area,
+            _payload: payload,
             _owner: self.clone(),
         }
     }
@@ -101,16 +112,18 @@ impl RegisterList {
 
 pub(crate) struct RegisterListRoot {
     _area: majit_gc::shadow_stack::MutatorExtraAreaGuard,
+    _payload: Box<super::FrontendBoxArea>,
     _owner: RegisterList,
 }
 
 unsafe fn walk_register_list(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // Registered storage is Rc-owned, not part of a borrowed PyreSym. All
     // mutator methods release the list borrow before any collecting call.
-    let list = unsafe { &*(data as *const RefCell<Option<Vec<OpRef>>>) };
+    let area = unsafe { &*(data as *const super::FrontendBoxArea) };
+    let list = unsafe { &*(area.storage as *const RefCell<Option<Vec<OpRef>>>) };
     if let Some(values) = list.borrow_mut().as_mut() {
         for value in values {
-            value.walk_const_ptr_refs_mut(visitor);
+            super::walk_frontend_box(value, area.owner, visitor);
         }
     }
 }

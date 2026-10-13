@@ -106,49 +106,77 @@ crate::rffi::llexternal!(
     compilation_info = ECI
 );
 
-/// `rdynload.DLOpenError`.
+/// `rdynload.DLOpenError`. `Message` is `dlerror`'s raw bytes;
+/// `OsError` is an `os.open`/`read`/`close` failure `_retry_as_ldscript`
+/// lets escape as `OSError`.
 #[derive(Debug, Clone)]
-pub struct DLOpenError {
-    pub msg: String,
+pub enum DLOpenError {
+    Message(Vec<u8>),
+    OsError(i32),
 }
 
 impl std::fmt::Display for DLOpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.msg, f)
+        match self {
+            Self::Message(msg) => f.write_str(&String::from_utf8_lossy(msg)),
+            Self::OsError(errno) => {
+                std::fmt::Display::fmt(&std::io::Error::from_raw_os_error(*errno), f)
+            }
+        }
     }
 }
 
-/// `rdynload.dlerror`.
-pub fn dlerror() -> String {
+/// `rdynload.dlerror`. Raw bytes: `charp2str` does not decode.
+pub fn dlerror() -> Vec<u8> {
     let res = unsafe { c_dlerror() };
     if res.is_null() {
-        return String::new();
+        return Vec::new();
     }
-    let bytes = unsafe { rffi::charp2str(res) };
-    String::from_utf8_lossy(&bytes).into_owned()
+    unsafe { rffi::charp2str(res) }
 }
 
-/// `rdynload._retry_as_ldscript`.
+/// Python `string.whitespace`: space, tab, LF, CR, VT (0x0b), FF (0x0c).
 #[cfg(target_os = "linux")]
-fn _retry_as_ldscript(err: &str, mode: INT) -> DLLHANDLE {
-    let parts: Vec<&str> = err.split(':').collect();
-    if parts.len() != 2 {
-        return std::ptr::null_mut();
+fn is_ldscript_whitespace(ch: u8) -> bool {
+    matches!(ch, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+#[cfg(target_os = "linux")]
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// `rdynload._retry_as_ldscript`. The path is taken from `dlerror` as raw
+/// bytes. `os.open`/`read`/`close` errors escape as `Err(errno)`.
+#[cfg(target_os = "linux")]
+fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<DLLHANDLE, i32> {
+    let mut parts = err.split(|&b| b == b':');
+    let Some(fullpath) = parts.next() else {
+        return Ok(std::ptr::null_mut());
+    };
+    if parts.next().is_none() || parts.next().is_some() {
+        return Ok(std::ptr::null_mut());
     }
-    let fullpath = parts[0];
     let mut actual = Vec::new();
     let mut last_five = [b' '; 5];
     let mut state = 0i32;
-    let ll_path = rffi::scoped_str2charp::new(Some(fullpath.as_bytes()));
+    let ll_path = rffi::scoped_str2charp::new(Some(fullpath));
     let ldscript =
         unsafe { crate::rposix::c_open(ll_path.buf.cast(), libc::O_RDONLY, 0o777 as libc::mode_t) };
     if ldscript < 0 {
-        return std::ptr::null_mut();
+        return Err(crate::rposix::get_saved_errno());
     }
     loop {
         let mut ch: u8 = 0;
         let n = unsafe { crate::rposix::c_read(ldscript, (&mut ch as *mut u8).cast(), 1) };
-        if n <= 0 {
+        if n < 0 {
+            let errno = crate::rposix::get_saved_errno();
+            unsafe { crate::rposix::c_close(ldscript) };
+            return Err(errno);
+        }
+        if n == 0 {
             break;
         }
         if state == 0 {
@@ -162,24 +190,26 @@ fn _retry_as_ldscript(err: &str, mode: INT) -> DLLHANDLE {
                 state = 2;
             }
         } else if state == 2 {
-            if !ch.is_ascii_whitespace() {
+            if !is_ldscript_whitespace(ch) {
                 actual.push(ch);
                 state = 3;
             }
         } else if state == 3 {
-            if ch.is_ascii_whitespace() || ch == b')' {
+            if is_ldscript_whitespace(ch) || ch == b')' {
                 break;
             } else {
                 actual.push(ch);
             }
         }
     }
-    unsafe { crate::rposix::c_close(ldscript) };
+    if unsafe { crate::rposix::c_close(ldscript) } < 0 {
+        return Err(crate::rposix::get_saved_errno());
+    }
     if !actual.is_empty() {
         let a = rffi::scoped_str2charp::new(Some(&actual));
-        return unsafe { c_dlopen(a.buf, mode) };
+        return Ok(unsafe { c_dlopen(a.buf, mode) });
     }
-    std::ptr::null_mut()
+    Ok(std::ptr::null_mut())
 }
 
 /// `rdynload._dlopen_default_mode`.
@@ -202,15 +232,15 @@ pub fn dlopen(name: Option<&[u8]>, mut mode: INT) -> Result<DLLHANDLE, DLOpenErr
         let err = dlerror();
         #[cfg(target_os = "linux")]
         {
-            if err.contains("invalid ELF header") {
-                let retried = _retry_as_ldscript(&err, mode);
-                if retried.is_null() {
-                    return Err(DLOpenError { msg: err });
+            if bytes_contains(&err, b"invalid ELF header") {
+                match _retry_as_ldscript(&err, mode) {
+                    Ok(retried) if !retried.is_null() => return Ok(retried),
+                    Ok(_) => return Err(DLOpenError::Message(err)),
+                    Err(errno) => return Err(DLOpenError::OsError(errno)),
                 }
-                return Ok(retried);
             }
         }
-        return Err(DLOpenError { msg: err });
+        return Err(DLOpenError::Message(err));
     }
     Ok(res)
 }
@@ -254,5 +284,18 @@ mod tests {
         let mode = super::_dlopen_default_mode();
         // `RTLD_LOCAL` is 0 on Linux, so only the combined value is portable.
         assert_eq!(mode, super::RTLD_NOW | super::RTLD_LOCAL);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_whitespace_includes_vertical_tab() {
+        assert!(super::is_ldscript_whitespace(0x0b));
+        assert!(super::is_ldscript_whitespace(0x0c));
+        assert!(super::is_ldscript_whitespace(b' '));
+        assert!(!super::is_ldscript_whitespace(b'a'));
+        assert!(super::bytes_contains(
+            b"x: invalid ELF header",
+            b"invalid ELF header"
+        ));
     }
 }

@@ -316,35 +316,59 @@ pub unsafe fn walk_walk_end_roots_area(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ActiveTrace {
+    armed: bool,
+    owner: majit_metainterp::FrontendResrefOwner,
+}
+
 thread_local! {
-    // Current execution-context state only, not a root owner or a borrowed
-    // frame pointer. Each TraceRoots independently owns all its publications.
-    static ACTIVE_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Current execution-context state only, not a root owner. `owner` is
+    // copied into each extra area at publication; walkers never read this cell.
+    static ACTIVE_TRACE: std::cell::Cell<ActiveTrace> = const {
+        std::cell::Cell::new(ActiveTrace {
+            armed: false,
+            owner: majit_metainterp::FrontendResrefOwner::NONE,
+        })
+    };
 }
 
 /// Translated stack roots for a tracing attempt. Nested attempts retain their
 /// outer roots without reaching back through a borrowed PyreSym.
 pub struct TraceRoots {
-    prev_active: bool,
+    prev: ActiveTrace,
     _register_roots: [crate::jitcode_dispatch::RegisterListRoot; 4],
     _exception_roots: [ExceptionRoot; 2],
 }
 
 impl TraceRoots {
+    #[cfg(test)]
     pub(crate) fn enter(owner: &PyreSym) -> Self {
+        Self::enter_with(owner, majit_metainterp::FrontendResrefOwner::NONE)
+    }
+
+    pub(crate) fn enter_with(
+        owner: &PyreSym,
+        resref: majit_metainterp::FrontendResrefOwner,
+    ) -> Self {
         let register_roots = [
-            owner.registers_r.root(),
-            owner.bridge_registers_r.root(),
-            owner.bridge_local_oprefs.root(),
-            owner.bridge_stack_oprefs.root(),
+            owner.registers_r.root_with(resref),
+            owner.bridge_registers_r.root_with(resref),
+            owner.bridge_local_oprefs.root_with(resref),
+            owner.bridge_stack_oprefs.root_with(resref),
         ];
         let exception_roots = [
             ExceptionRoot::new(&owner.last_exc_value),
             ExceptionRoot::new(&owner.current_exc_value),
         ];
-        let prev_active = ACTIVE_TRACE.with(|c| c.replace(true));
+        let prev = ACTIVE_TRACE.with(|c| {
+            c.replace(ActiveTrace {
+                armed: true,
+                owner: resref,
+            })
+        });
         Self {
-            prev_active,
+            prev,
             _register_roots: register_roots,
             _exception_roots: exception_roots,
         }
@@ -353,7 +377,7 @@ impl TraceRoots {
 
 impl Drop for TraceRoots {
     fn drop(&mut self) {
-        ACTIVE_TRACE.with(|c| c.set(self.prev_active));
+        ACTIVE_TRACE.with(|c| c.set(self.prev));
     }
 }
 
@@ -417,7 +441,10 @@ pub(crate) struct InlineFrameStateGuard {
 impl InlineFrameStateGuard {
     pub(crate) fn enter(state: &crate::jitcode_dispatch::WalkFrameState) -> Self {
         Self {
-            _root: ACTIVE_TRACE.with(|c| c.get().then(|| state.root())),
+            _root: ACTIVE_TRACE.with(|c| {
+                let active = c.get();
+                active.armed.then(|| state.root_with(active.owner))
+            }),
         }
     }
 }
@@ -425,7 +452,10 @@ impl InlineFrameStateGuard {
 impl InlineRegisterBankGuard {
     pub(crate) fn enter(bank: &crate::jitcode_dispatch::RegisterBank) -> Self {
         Self {
-            _root: ACTIVE_TRACE.with(|c| c.get().then(|| bank.root())),
+            _root: ACTIVE_TRACE.with(|c| {
+                let active = c.get();
+                active.armed.then(|| bank.root_with(active.owner))
+            }),
         }
     }
 }
@@ -1074,7 +1104,8 @@ pub fn trace_bytecode<Sym: WalkSym>(
 
     // Root this attempt's owned lists and exception slots through every exit,
     // including nested attempts and unwind, without publishing a PyreSym borrow.
-    let _trace_roots = sym.enter_trace_roots();
+    let _trace_roots =
+        sym.enter_trace_roots(majit_metainterp::FrontendResrefOwner::from_metainterp(meta));
 
     let ctx = meta
         .trace_ctx()

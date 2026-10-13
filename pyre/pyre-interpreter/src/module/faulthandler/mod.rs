@@ -1,7 +1,10 @@
 //! faulthandler module — PyPy: pypy/module/faulthandler/
 //!
-//! Pyre has no Python-level traceback machinery yet, so signal handlers
-//! write a short "Fatal Python error: <name>" line to fd 2 and restore the
-//! default disposition + reraise the signal so the process dies normally.
+//! Unix fatal-signal and user-signal handling lives in `cintf` (`cintf.py` +
+//! `faulthandler.c`). Traceback dump from a signal handler needs
+//! `vmprof_get_traceback`, which is not ported.
+
+#[cfg(all(unix, feature = "host_env"))]
+mod cintf;
 
 pyre_interpreter::pyre_module_init!(handler);

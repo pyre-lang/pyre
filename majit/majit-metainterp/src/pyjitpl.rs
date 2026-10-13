@@ -3695,6 +3695,24 @@ impl<M: Clone> MetaInterp<M> {
     /// `ConstPtr.value`) needs explicit walking to survive minor
     /// collection.
     ///
+    /// history.py `RefFrontendOp` identity is `_index`. A `Vec<bool>` sized
+    /// by the recorder marks a box already in the live worklist so `_heapc_deps`
+    /// is followed transitively without an OpRef-keyed side table.
+    fn push_frontend_live_box(op: OpRef, live: &mut Vec<OpRef>, visited: &mut Vec<bool>) {
+        if op.is_constant() || op.is_none() {
+            return;
+        }
+        let i = op.raw() as usize;
+        if i >= visited.len() {
+            visited.resize(i + 1, false);
+        }
+        if visited[i] {
+            return;
+        }
+        visited[i] = true;
+        live.push(op);
+    }
+
     /// When tracing is not active (`self.tracing.is_none()`) this is
     /// a no-op. Bridge / retrace paths reuse the same `TraceCtx`, so a
     /// single walker covers all in-progress trace states.
@@ -3706,6 +3724,14 @@ impl<M: Clone> MetaInterp<M> {
         // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
         // storage needs an explicit walker. Independent of `self.tracing`:
         // frames are pushed for both recording and recursive-portal calls.
+        //
+        // history.py `RefFrontendOp._resref` is a field of the FrontendOp
+        // Python object. The collector traces it only while that box is
+        // reachable (`registers_r`, `pushed_box`, heapcache boxes, …).
+        // Collect those live boxes here; `forward_concrete_ref` runs after
+        // the recorder is in hand. `cleanup_registers` (pyjitpl.py) drops
+        // `registers_r` for the same reason: leftover boxes must not keep
+        // GCREFs alive.
         for frame in self.framestack.frames.iter_mut() {
             for slot in frame.ref_regs.iter_mut() {
                 // Forward the inline `ConstPtr` gcref in place; non-Const
@@ -3713,6 +3739,17 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                     visitor(gcref);
                 }
+            }
+        }
+        if let Some(OpRef::ConstPtr(gcref)) = self.last_exc_box.as_mut() {
+            visitor(gcref);
+        }
+        if let Some((op1, op2)) = self.exc_resume.as_mut() {
+            if let OpRef::ConstPtr(gcref) = op1 {
+                visitor(gcref);
+            }
+            if let OpRef::ConstPtr(gcref) = op2 {
+                visitor(gcref);
             }
         }
         if let (Some(values), Some(types)) = (
@@ -3758,19 +3795,162 @@ impl<M: Clone> MetaInterp<M> {
         for snapshot in trace_ctx.snapshots.iter_mut() {
             snapshot.walk_const_ptr_refs(&mut visitor);
         }
+        // pyjitpl.py `MetaInterp.virtualref_boxes`: each pair is
+        // `[virtualbox, vrefbox]`. The OpRef is the Box; the `usize` is
+        // `box.getref_base()` for the concrete `JitVirtualRef*`.
+        for (op, ptr) in &mut trace_ctx.virtualref_boxes {
+            if let OpRef::ConstPtr(gcref) = op {
+                visitor(gcref);
+            }
+            if *ptr != 0 {
+                let mut gcref = GcRef(*ptr);
+                visitor(&mut gcref);
+                *ptr = gcref.0;
+            }
+        }
+        trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
+        for mp in &mut trace_ctx.current_merge_points {
+            for gb in &mut mp.green_boxes {
+                if let OpRef::ConstPtr(gcref) = &mut gb.opref {
+                    visitor(gcref);
+                }
+            }
+        }
+        if let Some(reds) = trace_ctx.live_portal_reds.as_mut() {
+            for (op, ty) in reds {
+                if *ty == Type::Ref {
+                    if let OpRef::ConstPtr(gcref) = op {
+                        visitor(gcref);
+                    }
+                }
+            }
+        }
+        if let Some(boxes) = trace_ctx.close_jump_boxes.as_mut() {
+            for (op, ty) in boxes {
+                if *ty == Type::Ref {
+                    if let OpRef::ConstPtr(gcref) = op {
+                        visitor(gcref);
+                    }
+                }
+            }
+        }
+        if let Some(OpRef::ConstPtr(mut gcref)) = trace_ctx.forced_virtualizable() {
+            visitor(&mut gcref);
+            trace_ctx.set_forced_virtualizable(Some(OpRef::const_ptr(gcref)));
+        }
+        if let Some(OpRef::ConstPtr(mut gcref)) = trace_ctx.bridge_saved_exc_op() {
+            visitor(&mut gcref);
+            trace_ctx.bridge_saved_exc_op = Some(OpRef::const_ptr(gcref));
+        }
+
+        // history.py `RefFrontendOp._resref` is a field of the FrontendOp
+        // Python object. The collector traces it only while that box is
+        // reachable (`registers_r`, `pushed_box`, heapcache boxes, …).
+        // Collect those live boxes here; `forward_concrete_ref` runs after
+        // the recorder is in hand. `cleanup_registers` (pyjitpl.py) drops
+        // `registers_r` for the same reason: leftover boxes must not keep
+        // GCREFs alive.
+        let mut visited = vec![false; trace_ctx.recorder.frontend_visited_len()];
+        let mut live_boxes: Vec<OpRef> = Vec::new();
+        for frame in self.framestack.frames.iter() {
+            for slot in frame.ref_regs.iter().flatten() {
+                Self::push_frontend_live_box(*slot, &mut live_boxes, &mut visited);
+            }
+            if let Some(op) = frame.pushed_box {
+                Self::push_frontend_live_box(op, &mut live_boxes, &mut visited);
+            }
+        }
+        // pyjitpl.py `MetaInterp.last_exc_box` is a Box, so `_resref` /
+        // `ConstPtr.value` stay reachable while the exception is pending.
+        if let Some(op) = self.last_exc_box {
+            Self::push_frontend_live_box(op, &mut live_boxes, &mut visited);
+        }
+        if let Some((op1, op2)) = self.exc_resume {
+            Self::push_frontend_live_box(op1, &mut live_boxes, &mut visited);
+            Self::push_frontend_live_box(op2, &mut live_boxes, &mut visited);
+        }
+        // resume.py snapshots hold the Box objects themselves, so a
+        // `SnapshotTagged::Box` FrontendOp keeps `_resref` alive after the
+        // register is overwritten.
+        for snapshot in &trace_ctx.snapshots {
+            let tagged = snapshot
+                .frames
+                .iter()
+                .flat_map(|frame| frame.boxes.iter())
+                .chain(snapshot.vable_boxes.iter())
+                .chain(snapshot.vref_boxes.iter());
+            for t in tagged {
+                if let crate::recorder::SnapshotTagged::Box(op, Type::Ref) = t {
+                    Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
+                }
+            }
+        }
         // `initialize_state_from_start` `self.virtualizable_boxes` stores
         // ordinary BoxPtr objects whose concrete refs the GC traces through
-        // the object graph. Forward ConstPtr gcrefs in the box list and the
-        // sync-target cell; InputArg/`*FrontendOp` refs are walked above.
+        // the object graph. InputArg/`*FrontendOp` refs are forwarded below
+        // before `walk_virtualizable_value_refs` rereads the identity.
+        if let Some(boxes) = trace_ctx.virtualizable_boxes.as_ref() {
+            for slot in boxes {
+                Self::push_frontend_live_box(*slot, &mut live_boxes, &mut visited);
+            }
+        }
+        for (op, _) in &trace_ctx.virtualref_boxes {
+            Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
+        }
+        // heapcache.py `CacheEntry` — keys (`from_ref_box`) and values
+        // (`to_field_box`) plus `quasiimmut_seen` / `last_const_box` /
+        // `loopinvariant_result`. Non-constant boxes reach the live set so
+        // their `_resref` is forwarded; ConstPtr VecMap keys stay unrewritten.
+        trace_ctx.heap_cache.for_each_cached_box(|op| {
+            Self::push_frontend_live_box(op, &mut live_boxes, &mut visited);
+        });
+        // pyjitpl.py `MetaInterp.reached_loop_header` keeps `live_arg_boxes`
+        // on `current_merge_points`.
+        for mp in &trace_ctx.current_merge_points {
+            for gb in &mp.green_boxes {
+                if gb.ty == Type::Ref {
+                    Self::push_frontend_live_box(gb.opref, &mut live_boxes, &mut visited);
+                }
+            }
+        }
+        if let Some(reds) = trace_ctx.live_portal_reds.as_ref() {
+            for (op, ty) in reds {
+                if *ty == Type::Ref {
+                    Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
+                }
+            }
+        }
+        if let Some(boxes) = trace_ctx.close_jump_boxes.as_ref() {
+            for (op, ty) in boxes {
+                if *ty == Type::Ref {
+                    Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
+                }
+            }
+        }
+        if let Some(op) = trace_ctx.forced_virtualizable() {
+            Self::push_frontend_live_box(op, &mut live_boxes, &mut visited);
+        }
+        if let Some(op) = trace_ctx.bridge_saved_exc_op() {
+            Self::push_frontend_live_box(op, &mut live_boxes, &mut visited);
+        }
+        // history.py `RefFrontendOp._heapc_deps` is a list field of the
+        // FrontendOp; follow it transitively (A → B → C) with the visited
+        // bitset so a per-area walk stays bounded to this box's dep DAG.
+        let mut i = 0;
+        while i < live_boxes.len() {
+            let op = live_boxes[i];
+            i += 1;
+            for dep in trace_ctx.recorder.heapc_dep_boxes(op) {
+                Self::push_frontend_live_box(dep, &mut live_boxes, &mut visited);
+            }
+        }
+        for op in &live_boxes {
+            trace_ctx.recorder.forward_concrete_ref(*op, &mut visitor);
+        }
+        // `virtualizable.py` rereads `virtualizable_boxes[-1].getref_base()`
+        // to sync `virtualizable_heap_ptr`; that concrete must already be
+        // the forwarded address.
         trace_ctx.walk_virtualizable_value_refs(&mut visitor);
-        // heapcache.py CacheEntry — the heapcache caches field values /
-        // replacements / loop-invariant results as `OpRef`. With inline
-        // consts (history.py `ConstPtr.value`) those value slots can be
-        // `ConstPtr(GcRef)`; they are returned on cache hits and
-        // emitted into the op-graph, so a stale gcref is a use-after-move.
-        // Forward them in place. Heapcache key ownership is a separate census
-        // from the independently rooted CALL_PURE constants below.
-        trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
         // util.py args_dict / history.py ConstPtr.value: CALL_PURE's keys and
         // results own collector-updated Const slots. Compile/optimizer handles
         // share that same dictionary; its roots survive even after this trace
@@ -3780,6 +3960,28 @@ impl<M: Clone> MetaInterp<M> {
         // `InputArgRef`, whose attached concrete value was forwarded above.
         // `registers_r[i]` is that Box and `getref_base()` reads its
         // updated `_resref`; there is no second value to refresh.
+    }
+
+    /// history.py `RefFrontendOp._resref` of one live Box, plus the
+    /// transitive `_heapc_deps` stored on that FrontendOp (and on those
+    /// deps). A recorder-sized `Vec<bool>` marks already-walked `_index`
+    /// values so a register extra-area stays bounded to this box's dep DAG.
+    pub fn forward_frontend_resref(&self, opref: OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+        let Some(trace_ctx) = self.tracing.as_ref().or(self.compile_tracing.as_ref()) else {
+            return;
+        };
+        let mut visited = vec![false; trace_ctx.recorder.frontend_visited_len()];
+        let mut live_boxes: Vec<OpRef> = Vec::new();
+        Self::push_frontend_live_box(opref, &mut live_boxes, &mut visited);
+        let mut i = 0;
+        while i < live_boxes.len() {
+            let op = live_boxes[i];
+            i += 1;
+            trace_ctx.recorder.forward_concrete_ref(op, visitor);
+            for dep in trace_ctx.recorder.heapc_dep_boxes(op) {
+                Self::push_frontend_live_box(dep, &mut live_boxes, &mut visited);
+            }
+        }
     }
 
     /// GC walker for ConstPtr GcRefs from snapshot maps during
@@ -29922,9 +30124,12 @@ mod tests {
 
     #[test]
     fn walk_active_trace_refs_forwards_op_value_ref() {
-        // The recorder stamps the concrete runtime result onto
-        // `Op.value` (`set_concrete_at`). A minor collection during tracing
-        // must forward a `Value::Ref` there; a non-Ref `Value` is untouched.
+        // Materialized-ops path (`trb is none`): the recorder stamps the
+        // concrete runtime result onto `Op.value` (`set_concrete_at`). A
+        // minor collection during tracing must forward a `Value::Ref`
+        // there; a non-Ref `Value` is untouched. Production traces keep
+        // `_resref` on `value_slots` and only forward boxes still
+        // reachable from `registers_r` / heapcache.
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
         let op = mk_op(
@@ -29933,11 +30138,18 @@ mod tests {
             5,
         );
         op.set_value(Value::Ref(GcRef(0xA000)));
+        let live = op.pos().get();
         trace_ctx.recorder.push_op_for_test(op);
         let int_op = mk_op(OpCode::IntAdd, &[OpRef::input_arg_int(0)], 6);
         int_op.set_value(Value::Int(7));
         trace_ctx.recorder.push_op_for_test(int_op);
         meta.tracing = Some(trace_ctx);
+
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        b.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
+        frame.ref_regs[0] = Some(live);
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
 
         meta.walk_active_trace_refs(|slot| {
             if slot.0 == 0xA000 {
@@ -30033,6 +30245,35 @@ mod tests {
     }
 
     #[test]
+    fn walk_active_trace_refs_forwards_virtualref_boxes() {
+        // pyjitpl.py `MetaInterp.virtualref_boxes` holds `[virtualbox, vrefbox]`
+        // Box pairs; the `.1` word is `getref_base()` of the concrete vref.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let input = trace_ctx.recorder.inputargs()[0].opref();
+        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
+        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (OpRef::const_ptr(GcRef(0xA000)), 0)];
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x7000 {
+                slot.0 = 0x8000;
+            }
+            if slot.0 == 0x9000 {
+                slot.0 = 0x9100;
+            }
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(input), Some(0x8000));
+        let boxes = &meta.tracing.as_ref().unwrap().virtualref_boxes;
+        assert_eq!(boxes[0].1, 0x9100);
+        assert_eq!(boxes[1].0, OpRef::const_ptr(GcRef(0xB000)));
+    }
+
+    #[test]
     fn walk_active_trace_refs_noop_when_not_tracing() {
         // When `MetaInterp.tracing` is `None`, the walker is a no-op;
         // pyjitpl.py only creates `History()` while tracing is
@@ -30041,6 +30282,188 @@ mod tests {
         let mut visited = 0u32;
         meta.walk_active_trace_refs(|_| visited += 1);
         assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_heapcache_key_box() {
+        // heapcache.py `CacheEntry.cache_anything` keys are Boxes; a
+        // non-constant from_ref_box that is not in registers_r still has
+        // `_resref` that the collector must forward.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let input = trace_ctx.recorder.inputargs()[0].opref();
+        let key = trace_ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[input],
+            Some(Value::Ref(GcRef(0x4100))),
+        );
+        let value = trace_ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[input],
+            Some(Value::Ref(GcRef(0x4200))),
+        );
+        trace_ctx.heap_cache_mut().getfield_now_known(
+            key,
+            7,
+            value,
+            &crate::history::ConstOprefOracle,
+        );
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x4100 {
+                slot.0 = 0x5100;
+            }
+        });
+
+        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(key), Some(0x5100));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_quasiimmut_seen_box() {
+        // heapcache.py `CacheEntry.quasiimmut_seen` holds the Box objects
+        // `quasi_immut_now_known` recorded. A non-constant entry is a live
+        // FrontendOp whose `_resref` must be forwarded.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let input = trace_ctx.recorder.inputargs()[0].opref();
+        let obj = trace_ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[input],
+            Some(Value::Ref(GcRef(0x4300))),
+        );
+        trace_ctx.heap_cache.quasi_immut_now_known(9, obj);
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x4300 {
+                slot.0 = 0x5300;
+            }
+        });
+
+        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(obj), Some(0x5300));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_heapc_deps_transitively() {
+        // history.py `RefFrontendOp._heapc_deps`: A → B → C. Only A is in
+        // registers_r; B and C are value-slot FrontendOps. The worklist
+        // must forward C's `_resref`.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let a = trace_ctx.recorder.inputargs()[0].opref();
+        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x6100)));
+        let b = trace_ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[a],
+            Some(Value::Ref(GcRef(0x6200))),
+        );
+        let c = trace_ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[b],
+            Some(Value::Ref(GcRef(0x6300))),
+        );
+        {
+            let mut view = trace_ctx.heap_cache_mut();
+            let deps = view._get_deps(a).expect("A deps");
+            deps.push(Some(b));
+        }
+        {
+            let mut view = trace_ctx.heap_cache_mut();
+            let deps = view._get_deps(b).expect("B deps");
+            deps.push(Some(c));
+        }
+        meta.tracing = Some(trace_ctx);
+
+        let mut bld = crate::jitcode::JitCodeBuilder::default();
+        bld.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(bld.finish()), 0);
+        frame.ref_regs[0] = Some(a);
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x6200 {
+                slot.0 = 0x7200;
+            }
+            if slot.0 == 0x6300 {
+                slot.0 = 0x7300;
+            }
+        });
+
+        let ctx = meta.tracing.as_ref().unwrap();
+        assert_eq!(ctx.box_bits(b), Some(0x7200), "one-level dep B");
+        assert_eq!(ctx.box_bits(c), Some(0x7300), "transitive dep C");
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_merge_point_boxes() {
+        // pyjitpl.py `reached_loop_header` stores `live_arg_boxes` on
+        // `current_merge_points`. A Ref box that lives only there still
+        // has `_resref` to forward.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let input = trace_ctx.recorder.inputargs()[0].opref();
+        let op = trace_ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[input],
+            Some(Value::Ref(GcRef(0x8100))),
+        );
+        let position = trace_ctx.get_trace_position();
+        trace_ctx
+            .current_merge_points
+            .push(crate::trace_ctx::MergePoint {
+                green_key: 0,
+                green_key_typed: None,
+                position,
+                green_boxes: vec![crate::trace_ctx::GreenBox::new(op, Type::Ref)],
+                header_pc: 0,
+                vable_ptr: 0,
+            });
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x8100 {
+                slot.0 = 0x9100;
+            }
+        });
+
+        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(op), Some(0x9100));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_before_virtualizable_sync() {
+        // `walk_virtualizable_value_refs` rereads the identity box's
+        // concrete to sync `virtualizable_heap_ptr`. That `_resref` must
+        // already have been forwarded, so a value-slot identity (not an
+        // InputArg, which the walker forwards earlier) ends up matching
+        // the forwarded address.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let input = trace_ctx.recorder.inputargs()[0].opref();
+        let ident = trace_ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[input],
+            Some(Value::Ref(GcRef(0x7000))),
+        );
+        trace_ctx.virtualizable_boxes = Some(vec![ident]);
+        trace_ctx.set_virtualizable_heap_ptr(0x7000 as *const u8);
+        meta.tracing = Some(trace_ctx);
+
+        let mut bld = crate::jitcode::JitCodeBuilder::default();
+        bld.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(bld.finish()), 0);
+        frame.ref_regs[0] = Some(ident);
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x7000 {
+                slot.0 = 0x8000;
+            }
+        });
+
+        let ctx = meta.tracing.as_ref().unwrap();
+        assert_eq!(ctx.box_bits(ident), Some(0x8000));
+        assert_eq!(ctx.virtualizable_heap_ptr(), Some(0x8000 as *const u8));
     }
 
     /// `incminimark.py old_objects_pointing_to_young`: the off-GC compiled

@@ -98,20 +98,17 @@ pub unsafe fn w_library_dealloc(obj: PyObjectRef) {
     close_lib(unsafe { &mut *(obj as *mut W_Library) });
 }
 
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(unix)]
 pub(crate) fn drop_library(handle: usize) {
     let _ = unsafe { majit_rlib::rdynload::dlclose(handle as majit_rlib::rdynload::DLLHANDLE) };
 }
 
-#[cfg(all(windows, feature = "host_env"))]
+#[cfg(windows)]
 pub(crate) fn drop_library(handle: usize) {
     rustpython_host_env::ctypes::drop_library(handle);
 }
 
-#[cfg(not(any(
-    all(unix, feature = "host_env", not(feature = "sandbox")),
-    all(windows, feature = "host_env")
-)))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn drop_library(_handle: usize) {}
 
 /// `rdynload.dlsym`, split the way the host loader splits it: a function
@@ -124,7 +121,7 @@ pub(crate) fn dlsym(handle: usize, name: &str, is_function: bool) -> Option<usiz
             .ok()
             .map(|address| address as usize)
     }
-    #[cfg(all(windows, feature = "host_env"))]
+    #[cfg(windows)]
     {
         let symbol = name.as_bytes();
         let address = if is_function {
@@ -134,7 +131,7 @@ pub(crate) fn dlsym(handle: usize, name: &str, is_function: bool) -> Option<usiz
         };
         address.ok().filter(|&a| a != 0)
     }
-    #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (handle, name, is_function);
         None
@@ -154,13 +151,18 @@ fn load_function(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         )));
     }
     let name =
-        pyre_object::with_roots!(w_ctype => pyre_interpreter::baseobjspace::text_w(args[2]))?;
-    let Some(address) = dlsym(lib.handle as usize, name, true) else {
+        pyre_object::with_roots!(w_ctype => pyre_interpreter::baseobjspace::text_w(args[2]))?
+            .to_owned();
+    // `c_dlsym` releases the GIL. Own the name and library label rather than
+    // borrow a GC string across that call, and reload `w_ctype` from its root.
+    let handle = lib.handle as usize;
+    let lib_name = lib.name().to_owned();
+    let Some(address) = pyre_object::with_roots!(w_ctype => dlsym(handle, &name, true)) else {
         return Err(PyError::attribute_error(format!(
-            "function/symbol '{name}' not found in library '{}'",
-            lib.name()
+            "function/symbol '{name}' not found in library '{lib_name}'"
         )));
     };
+    let ct = ctypeobj::ctype_arg(w_ctype)?;
     // An unbounded array decays to the pointer it was built from.
     let w_ctype = if ct.kind == ctypeobj::KIND_ARRAY && ct.length < 0 {
         ct.ctptr
@@ -200,12 +202,16 @@ fn write_variable(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// The `dlsym` both variable accessors share, whose miss is a KeyError.
 fn variable_address(lib: &W_Library, name: &str) -> Result<*const u8, PyError> {
-    dlsym(lib.handle as usize, name, false)
+    // `c_dlsym` releases the GIL. Own the name and library label rather than
+    // borrow a GC string across that call.
+    let name = name.to_owned();
+    let handle = lib.handle as usize;
+    let lib_name = lib.name().to_owned();
+    dlsym(handle, &name, false)
         .map(|address| address as *const u8)
         .ok_or_else(|| {
             PyError::key_error(format!(
-                "variable '{name}' not found in library '{}'",
-                lib.name()
+                "variable '{name}' not found in library '{lib_name}'"
             ))
         })
 }
