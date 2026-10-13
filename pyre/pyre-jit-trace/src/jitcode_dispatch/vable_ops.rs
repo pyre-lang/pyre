@@ -66,13 +66,39 @@ pub(super) fn push_helper_live(
     registers_i: &RegisterBank,
     registers_f: &RegisterBank,
     frame_state: &WalkFrameState,
+    jitcode_index: Option<usize>,
 ) {
-    session.borrow_mut().helper_live.push(LiveFrameRegs::new(
-        registers_r,
-        registers_i,
-        registers_f,
-        frame_state,
-    ));
+    let mut live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
+    live.jitcode_index = jitcode_index;
+    session.borrow_mut().helper_live.push(live);
+}
+
+/// Stamp the CALL that paused this frame. `MIFrame.run_one_step` has already
+/// advanced past that op, so `build_parent_miframe_from_live_banks` resumes
+/// at `next_pc` (`_setup_return_value_*` / `get_list_of_active_boxes(in_a_call=True)`).
+pub(super) fn mark_paused_caller_call(
+    session: &std::cell::RefCell<WalkSession>,
+    jitcode_index: u32,
+    call_jitcode_pc: usize,
+) {
+    let mut session = session.borrow_mut();
+    if let Some(live) = session.helper_live.last_mut() {
+        live.call_jitcode_pc = Some(call_jitcode_pc);
+        if live.jitcode_index.is_none() {
+            live.jitcode_index = Some(jitcode_index as usize);
+        }
+        return;
+    }
+    if let Some(live) = session
+        .framestack
+        .last_mut()
+        .and_then(|frame| frame.live.as_mut())
+    {
+        live.call_jitcode_pc = Some(call_jitcode_pc);
+        if live.jitcode_index.is_none() {
+            live.jitcode_index = Some(jitcode_index as usize);
+        }
+    }
 }
 
 pub(super) fn pop_helper_live(session: &std::cell::RefCell<WalkSession>) {
@@ -222,6 +248,7 @@ mod frame_replacement_tests {
             &RegisterBank::default(),
             &RegisterBank::default(),
             &suspended_state,
+            None,
         );
         session.borrow_mut().framestack.push(InlineFrame {
             is_portal: false,
@@ -496,6 +523,7 @@ mod frame_replacement_tests {
             &RegisterBank::default(),
             &RegisterBank::default(),
             &state,
+            None,
         );
         assert_eq!(session.borrow().helper_live.len(), 1);
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);

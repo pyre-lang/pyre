@@ -1660,26 +1660,22 @@ fn a_raise_caught_in_this_frame_reaches_its_handler() {
 
     let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
     assert_eq!(
-        summary.blocker_after_effect,
+        summary.blocker_effect_free,
         Some(symbolic),
-        "the handler is entered with the join of every state in the region, so \
-         its blocker is one no rollback covers"
+        "the handler inherits the raise site's state; nothing has executed an \
+         effect, so the blocker is rewindable"
     );
-    assert!(
-        !summary.may_execute_effect,
-        "the handler's seeded effect classifies the blocker behind it; the body \
-         itself still executes none"
-    );
+    assert_eq!(summary.blocker_after_effect, None);
+    assert!(!summary.may_execute_effect);
     assert!(!summary.body_not_walked);
 }
 
-/// The join a handler is entered with makes its registers unknown, but not the
-/// constant slots behind them: nothing writes those, so a funcbox read straight
-/// out of one holds at every point the handler can be entered from.  Blanking
-/// the whole Int bank instead would leave every blocker in every handler
-/// unnamed, which reads as a body that has none.
+/// In jitcode, `catch_exception L` directly follows the op that can raise
+/// (`jtransform.py handle_residual_call` / `blackhole.py handle_exception_in_frame`).
+/// The handler is entered when that preceding op raises, so it is reachable
+/// from this point with this point's state.
 #[test]
-fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
+fn catch_exception_handler_is_reachable_with_this_points_state() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let handler = 4 + 1;
     let mut code = catch_exception(handler);
@@ -1689,12 +1685,32 @@ fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
     code.extend(void_return());
 
     let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
-    assert_eq!(summary.blocker_after_effect, Some(symbolic));
     assert_eq!(
-        summary.blocker_effect_free, None,
-        "the handler runs behind whatever raised into it"
+        summary.blocker_effect_free,
+        Some(symbolic),
+        "the handler inherits this point's state; nothing has executed an \
+         effect, so the blocker is rewindable"
     );
+    assert_eq!(summary.blocker_after_effect, None);
     assert!(!summary.body_not_walked);
+}
+
+/// Taken-path `blocker_after_effect` still refuses descent: a wrapper that
+/// records an effect and then compiles still resumes later helper guards at
+/// the Python CALL (`walker_capture_transparent_helper_snapshot`), which
+/// replays the effect. Tracing-abort conversion is a different path.
+#[test]
+fn descent_decline_refuses_a_blocker_after_effect() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    assert!(!majit_jitcode::codewriter::call::is_symbolic_fnaddr(real));
+    let mut code = residual_call_with_funcbox(1);
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+    let summary =
+        super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert!(super::inline_call::descent_decline_from_summary(&summary).is_some());
 }
 
 /// An `inline_call` whose descr does not resolve to a JitCode is the same

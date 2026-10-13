@@ -772,6 +772,14 @@ pub(crate) struct LiveFrameRegs {
     pub(crate) registers_i: RegisterBank,
     pub(crate) registers_f: RegisterBank,
     frame_state: WalkFrameState,
+    /// Absolute `MetaInterpStaticData.jitcodes` index of this paused frame.
+    /// `None` until the owner stamps it (`run_sub_jitcode_walk`).
+    pub(crate) jitcode_index: Option<usize>,
+    /// CALL / `inline_call` / residual pc in this frame that entered the
+    /// child. `MIFrame.run_one_step` (`pyjitpl.py`) has already advanced
+    /// past that op, so the blackhole resumes at `next_pc` with the result
+    /// register pending (`_setup_return_value_*`).
+    pub(crate) call_jitcode_pc: Option<usize>,
 }
 
 impl LiveFrameRegs {
@@ -786,6 +794,8 @@ impl LiveFrameRegs {
             registers_i: registers_i.clone(),
             registers_f: registers_f.clone(),
             frame_state: frame_state.clone(),
+            jitcode_index: None,
+            call_jitcode_pc: None,
         }
     }
 
@@ -830,7 +840,9 @@ pub struct WalkSession {
     /// currently owns. `MetaInterp.replace_box` writes these in place.
     /// Each helper also has a `w_code == 0` `InlineFrame` on `framestack`
     /// while it is walking or paused under a nested helper
-    /// (`capture_resumedata` numbers that `MIFrame`).
+    /// (`capture_resumedata` numbers that `MIFrame`). Abort conversion
+    /// builds the blackhole `MIFrame` from these banks
+    /// (`convert_and_run_from_pyjitpl`).
     pub(crate) helper_live: Vec<LiveFrameRegs>,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
@@ -5680,8 +5692,16 @@ pub fn walk<Sym: WalkSym>(
                 // resume coordinate, and the enclosing Python walk must still
                 // be able to claim and latch the propagated abort. A clean
                 // decline is not an abort at all (`is_clean_decline`).
-                let coordinate_belongs_to_this_frame =
-                    walk_err_coordinate_belongs_to_this_frame(&error, ctx);
+                // A translated helper is an `MIFrame` (`blackhole.py
+                // setposition` + `run`). Latch it here, while its banks are
+                // live, together with the paused caller at the CALL's
+                // `next_pc`. A helper that cannot build that stack leaves the
+                // claim unset so the enclosing Python walk can still latch.
+                let helper_convertible = ctx.fbw_mode.transparent_helper_subwalk
+                    && ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+                    && !error.is_clean_decline();
+                let coordinate_belongs_to_this_frame = helper_convertible
+                    || walk_err_coordinate_belongs_to_this_frame(&error, ctx);
                 if fbw_state::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[walk-abort] err={:?} stop_pc={} opcode_position={} \
@@ -5786,6 +5806,15 @@ pub fn walk<Sym: WalkSym>(
                 // image it would hand the blackhole is the one that just
                 // failed to resolve ([`DispatchError::leaves_complete_image`]).
                 //
+                // A translated helper is its own MIFrame (`blackhole.py
+                // setposition`). Latch `[portal/opcode frame, ..., helper]`
+                // from the live banks; the parent sits at the CALL's `next_pc`
+                // (`MIFrame.run_one_step` / `get_list_of_active_boxes(
+                // in_a_call=True)`). A failed helper latch leaves the claim
+                // unset so the enclosing Python walk can still remap.
+                // Trace-length is not deferred: `_interpret` checks it on the
+                // helper MIFrame itself, and the post-step arm below does too.
+                //
                 // A seeded inline whose abort is a modeling gap rather than a
                 // missing value latches even when the root allow-list has not
                 // named the class: `run_blackhole_interp_to_cancel_tracing`
@@ -5811,8 +5840,16 @@ pub fn walk<Sym: WalkSym>(
                     } else {
                         Some(residual_call::abort_latch_resume_pc(ctx, opcode_position))
                     };
-                    if let Some(resume_pc) = resume_pc {
-                        let _ = latch_abort_blackhole(ctx, resume_pc, "mod2730");
+                    let latched = match resume_pc {
+                        Some(resume_pc) => latch_abort_blackhole(ctx, resume_pc, "mod2730"),
+                        None => false,
+                    };
+                    if latched && helper_convertible {
+                        let splice_ok =
+                            inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
+                        if finish_helper_abort_latch(ctx.session, splice_ok) {
+                            ctx.session.borrow_mut().abort_in_subwalk = true;
+                        }
                     }
                 }
                 if effects_moved
@@ -5877,12 +5914,14 @@ pub fn walk<Sym: WalkSym>(
         }
         // pyjitpl.py `_interpret` calls `blackhole_if_trace_too_long` after
         // every `run_one_step` of whichever MIFrame is on top. Inlined helper
-        // frames are ordinary MIFrames, so a transparent helper subwalk runs
-        // this same post-step check. Deferring it to the enclosing Python
-        // walk never comes back when the helper keeps descending (nested-tuple
-        // `isinstance` via `walk_translated_builtin_wrapper`). The abort below
-        // is the same `note_root_trace_too_long` + `TraceTooLong` path the
-        // enclosing frame already takes.
+        // frames are ordinary MIFrames (`blackhole.py` `setposition`), so a
+        // transparent helper subwalk runs this same post-step check.
+        // Deferring it to the enclosing Python walk never comes back when the
+        // helper keeps descending (nested-tuple `isinstance` via
+        // `walk_translated_builtin_wrapper`). Convertible helpers latch the
+        // live helper+caller stack; a helper without a jitcode index still
+        // raises `TraceTooLong` and the enclosing Python walk latches at the
+        // CALL (`Err(TraceTooLong)` above).
         if ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
@@ -5934,6 +5973,9 @@ pub fn walk<Sym: WalkSym>(
             if blackhole_latched && ctx.fbw_mode.transparent_helper_subwalk {
                 let splice_ok = inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
                 blackhole_latched = finish_helper_abort_latch(ctx.session, splice_ok);
+                if blackhole_latched {
+                    ctx.session.borrow_mut().abort_in_subwalk = true;
+                }
             }
             // `SwitchToBlackhole(ABORT_TOO_LONG)` always has a blackhole
             // resume upstream.  Abort only once `trace_too_long_abort_safe`

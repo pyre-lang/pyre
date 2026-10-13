@@ -1622,7 +1622,9 @@ pub(crate) fn exception_string_override_straight_line(
 /// carrying whether an effect has executed plus the Int/array-length facts it
 /// can prove.  A known condition follows one successor exactly; a red
 /// condition conservatively joins both.  It reports the two kinds of blocker
-/// separately, and only `blocker_after_effect` is a decline.
+/// separately.  Taken-path `blocker_after_effect` still declines: a guard
+/// inside a helper resumes at the Python CALL via
+/// `walker_capture_transparent_helper_snapshot` and replays the effect.
 ///
 /// The other decline is the scan admitting it did not read the whole body.
 /// Everything the walk concludes rests on having seen every path, so a body it
@@ -1660,6 +1662,15 @@ fn descent_decline(
         &[(0, entry_len)] => descent_blocker_summary_for_entry_len(jitcode_index, entry_len),
         other => summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), other),
     };
+    descent_decline_from_summary(&summary)
+}
+
+/// Taken-path `blocker_after_effect` still declines: a guard inside a helper
+/// resumes at the Python CALL via `walker_capture_transparent_helper_snapshot`
+/// and replays the effect.
+pub(crate) fn descent_decline_from_summary(
+    summary: &majit_jitcode::codewriter::jitcode::DescentBlockerSummary,
+) -> Option<DescentDecline> {
     if summary.body_not_walked {
         return Some(DescentDecline::BodyNotWalked);
     }
@@ -1740,7 +1751,7 @@ pub(crate) fn helper_resume_reaches_blocker(
 }
 
 /// Why a descent into a body is refused.
-enum DescentDecline {
+pub(crate) enum DescentDecline {
     /// An un-lowered helper the descent reaches with an effect already
     /// executed, named by the symbolic hash standing in for its funcbox.
     Helper(i64),
@@ -3259,6 +3270,9 @@ fn summarize_body_blockers_from(
                 if let Some(target) =
                     crate::jitcode_dispatch::try_catch_exception_at(code, d.next_pc)
                 {
+                    // The walk takes one path (`pyjitpl.py _interpret`). The
+                    // handler inherits this point's state rather than a join
+                    // of every protected op.
                     push!(
                         points,
                         work,
@@ -3267,7 +3281,7 @@ fn summarize_body_blockers_from(
                             // A handler is entered from any op in its region,
                             // so it may run after the resume point.
                             resumed: true,
-                            effect: true,
+                            effect,
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
                             fresh_r: vec![false; FRESH_SLOTS],
@@ -3302,11 +3316,11 @@ fn summarize_body_blockers_from(
                 }
             }
             "catch_exception" => {
-                // The exception this handler catches can be raised by any op in
-                // the region it protects, so the handler is entered with the
-                // join of every state in the body rather than this op's.
-                // Seeding it as effectful is the sound over-approximation of
-                // that join.
+                // In jitcode, `catch_exception L` directly follows the op that
+                // can raise (`jtransform.py handle_residual_call` /
+                // `blackhole.py handle_exception_in_frame`). The handler is
+                // entered when that preceding op raises, so it is reachable
+                // from this point with this point's state.
                 if let Some(target) = label {
                     push!(
                         points,
@@ -3316,7 +3330,7 @@ fn summarize_body_blockers_from(
                             // A handler is entered from any op in its region,
                             // so it may run after the resume point.
                             resumed: true,
-                            effect: true,
+                            effect,
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
                             fresh_r: vec![false; FRESH_SLOTS],
@@ -8393,6 +8407,9 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                     fbw_has_unjournaled_effect(),
                 );
             }
+            // Helper `walk()` may have latched before this rewind; drop that
+            // image so the CALL residualizes instead of converting.
+            discard_staged_abort(ctx.session);
             cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
         }
@@ -8415,6 +8432,13 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                         unjournaled_before,
                         fbw_has_unjournaled_effect(),
                     );
+                }
+                // A latched helper+caller stack already sits at the helper
+                // `stop_pc` and the CALL's `next_pc`. Remapping to `op.pc`
+                // would re-execute the CALL (`blackhole.py
+                // convert_and_run_from_pyjitpl` must not replay).
+                if abort_blackhole_latched() {
+                    return Err(error);
                 }
                 // The descent's `pc` is an offset into the callee's own
                 // jitcode.  Crossing back into this frame re-raises the abort
@@ -8870,6 +8894,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             return Err(error);
         }
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) if rewind.nothing_applied() => {
+            discard_staged_abort(ctx.session);
             cut_declined_subwalk(ctx, rewind.pre_fold_pos);
             return Ok(None);
         }
@@ -23755,12 +23780,36 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         inline_w_code,
         ..Default::default()
     });
+    // Stamp the paused caller at the CALL that enters this body
+    // (`MIFrame.run_one_step` already advanced past it). Nested helper: the
+    // outer helper is still `helper_live.last()`. First helper from a
+    // Python/portal frame: bind that frame's banks, then stamp — before
+    // `push_helper_live`, otherwise `mark_paused_caller_call` would write
+    // the child's live slot and `build_parent_miframe_from_paused_live`
+    // would see no parent jitcode (`blackhole.py _copy_data_from_miframe`).
+    // A Python-portal generator resume already entered its MIFrame
+    // (`InlineFrameGuard::enter`); binding the FOR_ITER caller's banks
+    // onto that child is the same mix. User-call inlining never rebinds
+    // here either.
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        super::vable_ops::mark_paused_caller_call(ctx.session, ctx.outer_jitcode_index, pc);
+    } else if !is_python_portal {
+        super::vable_ops::bind_paused_caller_regs(
+            ctx.session,
+            ctx.registers_r,
+            ctx.registers_i,
+            ctx.registers_f,
+            &ctx.frame_state,
+        );
+        super::vable_ops::mark_paused_caller_call(ctx.session, ctx.outer_jitcode_index, pc);
+    }
     super::vable_ops::push_helper_live(
         ctx.session,
         &callee_regs_r,
         &registers_i,
         &registers_f,
         &frame_state,
+        ctx.fbw_mode.transparent_helper_jitcode_index,
     );
     let (fbw_mode, entry_py_pc, outer_resume_marker_jit_pc, outer_jitcode_index) = match portal_site
     {
@@ -23889,23 +23938,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
-    // A nested helper's banks are not the Python frame's. Rebinding here
-    // would replace the paused `MIFrame` (`pyjitpl.py` `framestack`) with
-    // the helper register file, and a portal entered inside the helper
-    // would rebuild the caller from that file.
-    // A Python-portal generator resume already entered its MIFrame
-    // (`InlineFrameGuard::enter`); binding the FOR_ITER caller's banks
-    // onto that child is the same mix. User-call inlining never rebinds
-    // here either.
-    if !ctx.fbw_mode.transparent_helper_subwalk && !is_python_portal {
-        super::vable_ops::bind_paused_caller_regs(
-            ctx.session,
-            ctx.registers_r,
-            ctx.registers_i,
-            ctx.registers_f,
-            &ctx.frame_state,
-        );
-    }
     let result = driver.drive(ctx.trace_ctx);
     match result {
         Ok((outcome, class_state)) => {
