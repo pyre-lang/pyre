@@ -79,7 +79,7 @@ pub(crate) fn is_access_directly_path(path: &CallPath) -> bool {
 
 /// The regular path whose last segment is the AccessDirect alt_name's
 /// prefix, or `None` when `path` is not an AccessDirect copy.
-pub(crate) fn access_directly_origin_path(path: &CallPath) -> Option<CallPath> {
+pub fn access_directly_origin_path(path: &CallPath) -> Option<CallPath> {
     let last = path.last_segment()?;
     let origin_last = last.strip_suffix(ACCESS_DIRECT_ALT_SUFFIX)?;
     if origin_last.is_empty() {
