@@ -25,7 +25,9 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, GCREF, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
 use crate::translator::rtyper::rlist::ListIteratorRepr;
-use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, inputconst_from_lltype};
+use crate::translator::rtyper::rmodel::{
+    RTypeResult, Repr, ReprState, hop_arg_const_string, inputconst_from_lltype,
+};
 use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, LowLevelOpList};
 
 /// Struct hint marking the `RustVec` header lltype.
@@ -217,6 +219,29 @@ impl Repr for RustVecRepr {
             vec![self.lltype.clone()],
             LowLevelType::Signed,
         )
+    }
+
+    /// `l.length = n` (`lltypesystem/rlist.py` `ll_newlist` after the
+    /// hint allocation). `Vec::set_len` writes the header `len` word;
+    /// there is no `ll_vec_set_len` helper.
+    fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let attr = hop_arg_const_string(hop, 1)?;
+        if attr != "len" {
+            return Err(self.missing_rtype_operation(&format!("setattr_{attr}")));
+        }
+        let args_r = hop.args_r.borrow();
+        let r_value = args_r
+            .get(2)
+            .and_then(|r| r.as_ref())
+            .ok_or_else(|| TyperError::message("RustVecRepr.rtype_setattr missing value repr"))?;
+        let void = LowLevelType::Void;
+        let vlist = hop.inputargs(vec![
+            ConvertedTo::from(self),
+            ConvertedTo::from(&void),
+            ConvertedTo::from(r_value),
+        ])?;
+        hop.genop("setfield", vlist, GenopResult::Void);
+        Ok(None)
     }
 
     /// `ll_getitem_fast`: the index is in bounds.

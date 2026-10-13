@@ -114,7 +114,7 @@ fn hop_r_result(hop: &HighLevelOp) -> Result<Arc<dyn Repr>, TyperError> {
         .ok_or_else(|| TyperError::message("HighLevelOp.r_result is not set"))
 }
 
-fn hop_arg_const_string(hop: &HighLevelOp, index: usize) -> Result<String, TyperError> {
+pub(crate) fn hop_arg_const_string(hop: &HighLevelOp, index: usize) -> Result<String, TyperError> {
     let args_s = hop.args_s.borrow();
     let value = args_s
         .get(index)

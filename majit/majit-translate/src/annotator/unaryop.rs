@@ -1426,6 +1426,38 @@ fn init_somerustvec_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
+    // `Vec::set_len(n)` is `l.length = n` (`ll_newlist` after the hint
+    // allocation). Void, like `SomePtr.setattr`.
+    register(
+        reg,
+        OpKind::SetAttr,
+        SomeValueTag::RustVec,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("rustvec.setattr: attr unbound");
+                let attr = s_attr
+                    .const_()
+                    .and_then(ConstValue::as_pystr)
+                    .expect("setattr on Vec must be a constant str");
+                if attr != "len" {
+                    panic!("AnnotatorError: Cannot find attribute {attr:?} on SomeRustVec");
+                }
+                let s_value = ann
+                    .annotation(&hl.args[2])
+                    .expect("rustvec.setattr: value unbound");
+                match s_value {
+                    SomeValue::Integer(_) => {}
+                    other => {
+                        panic!("AnnotatorError: Vec len write needs an integer, got {other:?}")
+                    }
+                }
+                None
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
 }
 
 fn init_somelist_overrides(
@@ -6554,6 +6586,30 @@ mod tests {
             vec![Hlvalue::Constant(Constant::new(ConstValue::byte_str("x")))],
         );
         assert!(bad.consider(&ann).is_err());
+    }
+
+    #[test]
+    fn rust_vec_setattr_len_is_void() {
+        use crate::annotator::model::SomeRustVec;
+        use majit_ir::rvec::VecItemKind;
+        let ann = mk_ann();
+        let mut v_vec = Variable::named("v");
+        ann.setbinding(
+            &mut v_vec,
+            SomeValue::RustVec(SomeRustVec::for_kind(VecItemKind::Int)),
+        );
+        let hl = HLOperation::new(
+            OpKind::SetAttr,
+            vec![
+                Hlvalue::Variable(v_vec),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("len"))),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(3))),
+            ],
+        );
+        assert!(
+            hl.consider(&ann).expect("setattr len").is_none(),
+            "Vec len write is void"
+        );
     }
 
     #[test]

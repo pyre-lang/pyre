@@ -3097,11 +3097,24 @@ fn residual_stub_result_shell(
 /// `SomeInstance(classdef)` of a by-value ADT result
 /// (`FunctionGraph::return_class_root`), whose payload reads
 /// (`__discriminant`, `__pos_0`) the classdef-less shell cannot annotate.
-/// `None` when the token is not `ref` or the graph declares neither.
+///
+/// A one-word-item `Vec` residual is `SomeRustVec` (`project_rust_vec`).
+/// Its FUNC.RESULT token is `i64` (`history.getkind` of the raw header),
+/// so the `ref` gate would miss it and the stub would be `SomeInteger` —
+/// `Integer ∪ RustVec` at a `look_inside_iff` wrapper return
+/// (`ll_vec_alloc_and_set_nonnull_r`).
+/// `None` when the token is not `ref` (and not that `Vec` header) or the
+/// graph declares neither.
 fn declared_return_annotation(
     registry: &CallRegistry,
     graph: &LegacyGraph,
 ) -> Option<crate::annotator::model::SomeValue> {
+    if let Some(spelling) = graph.return_container_root.as_deref() {
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        if matches!(projected, crate::annotator::model::SomeValue::RustVec(_)) {
+            return Some(projected);
+        }
+    }
     if graph.return_type.as_deref() != Some("ref") {
         return None;
     }
@@ -9785,6 +9798,27 @@ mod tests {
             matches!(list.listdef.s_value(), SomeValue::Integer(_)),
             "u8 items are integers, got {:?}",
             list.listdef.s_value()
+        );
+    }
+
+    #[test]
+    fn one_word_vec_residual_on_the_i64_token_is_rustvec() {
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("ll_vec_alloc_and_set_nonnull_r_trampoline");
+        graph.return_type = Some("i64".into());
+        assert_eq!(declared_return_annotation(&registry, &graph), None);
+        graph.return_container_root = Some("Vec<*mut u8>".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a one-word Vec residual declares its annotation");
+        let SomeValue::RustVec(vec) = declared else {
+            panic!("a one-word Vec residual is SomeRustVec, got {declared:?}")
+        };
+        assert_eq!(
+            vec.item_kind(),
+            Some(majit_ir::rvec::VecItemKind::Ref),
+            "Vec<*mut u8> items are managed references"
         );
     }
 

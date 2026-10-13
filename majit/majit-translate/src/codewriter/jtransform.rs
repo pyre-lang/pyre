@@ -3681,6 +3681,14 @@ impl<'a> Transformer<'a> {
             {
                 rewritten
             }
+            // `vec_set_header_word(header, VEC_LEN_WORD, n)` (`rvec.rs`).
+            // A FieldWrite of `"len"` on the raw Vec header has no parent
+            // SizeDescr (`get_field_descr`); `setfield_gc` of that descr
+            // trips `ensure_ptr_info_arg0`. Not gated on virtualizable:
+            // `rewrite_op_raw_store` is not either.
+            OpKind::FieldWrite { field, value, .. } if is_rust_vec_header_len_write(field) => {
+                self.rewrite_rust_vec_header_len_write(op, value, graph)
+            }
             OpKind::FieldWrite {
                 field, value, ty, ..
             } if self.config.lower_virtualizable => {
@@ -6593,6 +6601,34 @@ impl<'a> Transformer<'a> {
             }]);
         }
         RewriteResult::Keep
+    }
+
+    /// `vec_set_header_word(header, VEC_LEN_WORD, n)` (`rvec.rs`).
+    /// `rewrite_op_raw_store` is not re-run on `Replace` ops, so the base
+    /// is coerced here (`cast_ptr_to_int`).
+    fn rewrite_rust_vec_header_len_write(
+        &mut self,
+        op: &SpaceOperation,
+        value: &LinkArg,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let OpKind::FieldWrite { base, .. } = &op.kind else {
+            unreachable!("rewrite_rust_vec_header_len_write on non-FieldWrite");
+        };
+        let word = crate::layout::target_word_size();
+        let offset = majit_ir::rvec::vec_word_offset(majit_ir::rvec::VEC_LEN_WORD, word);
+        let (addr, mut ops) = self.coerce_operand_to_int(graph, base);
+        let stored = if let Some(v) = value.as_variable() {
+            v.clone()
+        } else if let LinkArg::Const(c) = value
+            && let crate::flowspace::model::ConstValue::Int(n) = c.value
+        {
+            raw_list_const_int(graph, &mut ops, n as usize)
+        } else {
+            panic!("rust vec header len write value is not an int: {value:?}")
+        };
+        raw_list_header_store(graph, &mut ops, &addr, offset, word, stored);
+        RewriteResult::Replace(ops)
     }
 
     /// RPython: rewrite_op_setfield
@@ -12952,6 +12988,27 @@ fn rewrite_shaped_array_field(
             kind,
         },
     ]))
+}
+
+/// `Vec::set_len(n)` / `l.length = n` (`lltypesystem/rlist.py` `ll_newlist`).
+/// The owner is the raw header (`RustVec` from `rust_vec_lltype`, or
+/// `alloc::vec::Vec` from the front end), not a GC list's `int_items.len`.
+/// An inline `Vec` field (`inline_vec` / parent+`vec_part`) has a parent
+/// SizeDescr (`get_field_descr`) and is not this write.
+fn is_rust_vec_header_len_write(field: &FieldDescriptor) -> bool {
+    if field.inline_vec {
+        return false;
+    }
+    if field.name != "len" {
+        return false;
+    }
+    if !matches!(field.vec_part, None | Some(crate::model::VecFieldPart::Len)) {
+        return false;
+    }
+    matches!(
+        field.owner_root.as_deref(),
+        Some("alloc::vec::Vec" | "RustVec" | "rust_vec")
+    )
 }
 
 fn tuple_pos_field_index(name: &str) -> Option<usize> {
