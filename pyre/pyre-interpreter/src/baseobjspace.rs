@@ -6198,7 +6198,7 @@ unsafe fn setitem_bytearray_slice(
     if sequence2.len() as i64 != slicelength {
         crate::builtins::bytearray_check_exports(obj)?;
     }
-    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+    let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     let old_size = vec.len();
     if step == 1 {
         let cur = vec.len();
@@ -6211,7 +6211,7 @@ unsafe fn setitem_bytearray_slice(
             );
         }
         vec.splice(s..e, sequence2.iter().copied());
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
         return Ok(w_none());
     }
     // Extended slice: `descr_setitem` forbids resizing — the source length
@@ -6234,7 +6234,7 @@ unsafe fn setitem_bytearray_slice(
     let mut k = 0usize;
     while k < sequence2.len() {
         if i >= 0 && (i as usize) < vec.len() {
-            vec[i as usize] = sequence2[k];
+            vec.set_at(i as usize, sequence2[k]);
         }
         k += 1;
         if k < sequence2.len() {
@@ -26498,7 +26498,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
                 let (start, _stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-                let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+                let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
                 let old_size = vec.len();
                 // `descr_delitem`: `start == 0 and step == 1` advances
                 // `_offset` (`_delete_from_start`). pyre keeps the payload at
@@ -26509,8 +26509,13 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                         slicelength.max(0) as usize,
                     );
                 }
-                pyre_object::bytearrayobject::_delitem_slice_helper(vec, start, step, slicelength);
-                pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
+                pyre_object::bytearrayobject::_delitem_slice_helper(
+                    &mut vec,
+                    start,
+                    step,
+                    slicelength,
+                );
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
                 return Ok(());
             }
             let i = {
@@ -26529,13 +26534,9 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 // `del self._data[idx]` (`descr_delitem`). `Vec::remove` is
                 // unlowerable; `_delitem_slice_helper` with step 1 is the
                 // contiguous `del items[idx:idx+1]` move.
-                pyre_object::bytearrayobject::_delitem_slice_helper(
-                    pyre_object::bytearrayobject::w_bytearray_vec_mut(obj),
-                    idx,
-                    1,
-                    1,
-                );
-                pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, len as usize);
+                let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+                pyre_object::bytearrayobject::_delitem_slice_helper(&mut vec, idx, 1, 1);
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), len as usize);
                 return Ok(());
             }
             return Err(PyError::index_error("bytearray index out of range"));

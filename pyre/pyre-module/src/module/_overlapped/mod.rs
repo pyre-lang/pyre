@@ -209,8 +209,21 @@ fn writable_buffer(
     obj: PyObjectRef,
 ) -> Result<(&'static mut [u8], PyObjectRef), pyre_interpreter::PyError> {
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let addr = unsafe {
+            pyre_object::bytearrayobject::w_bytearray_raw_address(
+                pyre_object::gc_roots::shadow_stack_get(slot),
+            )
+        };
+        let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        if addr == 0 {
+            return Err(pyre_interpreter::PyError::memory_error(""));
+        }
+        let len = unsafe { pyre_object::bytearrayobject::w_bytearray_len(obj) };
         return Ok((
-            unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) },
+            unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) },
             obj,
         ));
     }
@@ -230,24 +243,40 @@ fn writable_buffer(
                 "buffer is not contiguous and writable",
             ));
         }
-        let view = unsafe { pyre_object::memoryview::w_memoryview_view(obj) };
-        let Some(full) = (unsafe { view.backing().as_bytes_mut() }) else {
-            return Err(pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::BufferError,
-                "buffer is not writable",
-            ));
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let view = unsafe {
+            pyre_object::memoryview::w_memoryview_view(pyre_object::gc_roots::shadow_stack_get(
+                slot,
+            ))
         };
+        let base = match unsafe { view.backing().get_raw_address() } {
+            Ok(ptr) => ptr,
+            Err(pyre_object::buffer::RawAddressError::Memory) => {
+                return Err(pyre_interpreter::PyError::memory_error(""));
+            }
+            Err(pyre_object::buffer::RawAddressError::NoAddress) => {
+                return Err(pyre_interpreter::PyError::new(
+                    pyre_interpreter::PyErrorKind::BufferError,
+                    "buffer is not writable",
+                ));
+            }
+        };
+        let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        let view = unsafe { pyre_object::memoryview::w_memoryview_view(obj) };
         let offset = unsafe { view.offset() } as usize;
         let length = unsafe { pyre_object::memoryview::w_memoryview_length(obj) } as usize;
-        if offset
-            .checked_add(length)
-            .is_none_or(|end| end > full.len())
-        {
+        let full_len = unsafe { view.backing().as_bytes() }.len();
+        if offset.checked_add(length).is_none_or(|end| end > full_len) {
             return Err(pyre_interpreter::PyError::value_error(
                 "memoryview buffer is no longer valid",
             ));
         }
-        return Ok((&mut full[offset..offset + length], obj));
+        return Ok((
+            unsafe { std::slice::from_raw_parts_mut(base.add(offset), length) },
+            obj,
+        ));
     }
     Err(pyre_interpreter::PyError::type_error(
         "a writable bytes-like object is required",

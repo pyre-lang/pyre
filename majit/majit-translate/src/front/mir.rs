@@ -4904,12 +4904,14 @@ impl SemanticFunctionHeader {
                 hints.push("elidable".to_string());
             }
         }
+        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, llbc, error_carrier);
         let signature_token = dont_look_inside_return_token(
             &signature.output,
             llbc,
             error_carrier,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            pair_body.as_ref(),
         );
         let residual_return_type = signature_token.clone();
         let return_is_str = dont_look_inside_return_is_str(&signature.output, llbc, error_carrier);
