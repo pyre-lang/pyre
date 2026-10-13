@@ -524,6 +524,11 @@ const SLICE_HELPERS: [[&str; 3]; 13] = [
 /// the array's storage.
 pub const SLICE_BUFFER_FREE: &str = "majit_rlib::lltypesystem::rvec::ll_slice_buffer_free";
 
+/// `ll_slice_bounds_panic`: DLI residual for a pair-slice index or
+/// `copy_from_slice` length mismatch. The call is not an implicit
+/// `AssertionError`, so `remove_assertion_errors` leaves the fail arm.
+pub const SLICE_BOUNDS_PANIC: &str = "majit_rlib::lltypesystem::rvec::ll_slice_bounds_panic";
+
 /// `ll_slice_len_slot_new`: the caller allocates the one-word out-param slot
 /// a slice-returning callee stores the length into.
 pub const SLICE_LEN_SLOT_NEW: &str = "majit_rlib::lltypesystem::rvec::ll_slice_len_slot_new";
