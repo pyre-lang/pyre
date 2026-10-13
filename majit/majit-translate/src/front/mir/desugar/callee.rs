@@ -2830,6 +2830,20 @@ pub(in crate::front::mir) fn str_chars_view_extra_live(
     sites
 }
 
+/// A Call whose result is the length-prefixed byte-string view
+/// (`BytesBlock` / rstr `STR`, `ValueType::Str`). The dest is that view,
+/// so `[p..p+count]` is `__getslice_range`. A host `&[u8]` pair stamps
+/// `Unsigned` and is not this view (`w_bytearray_data`).
+pub(in crate::front::mir) fn opkind_is_byte_payload_view(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            result_ty: ValueType::Str,
+            ..
+        }
+    )
+}
+
 /// `from_raw_parts(ptr, len)` where `ptr` is
 /// `(base as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` and `len` is
 /// `bh_lowlevel_string_len(base)` on that same `base`.

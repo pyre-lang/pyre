@@ -480,15 +480,12 @@ pub(crate) extern "C" fn module_dict_getdictvalue_no_unwrapping_pure_word(
     .unwrap_or(pyre_object::PY_NULL) as usize as i64
 }
 
-/// Word-ABI residual for `hash_str_hooked_bytes`. Rebuilds the `&[u8]`
-/// window `rstr.py LLHelpers._ll_strhash` already passes as pointer and
-/// length words, then calls the slice entry.
-#[inline(never)]
-pub(crate) extern "C" fn hash_str_hooked_bytes_word(ptr: i64, len: i64) -> i64 {
-    majit_ir::icf_identity!("jit_fnaddr::hash_str_hooked_bytes_word");
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len as usize) };
-    pyre_object::dict_eq_hook::hash_str_hooked_bytes(bytes)
-}
+/// Word-ABI residual for `hash_str_hooked_bytes`.
+///
+/// `dont_look_inside` emits the pair-slice descr-word adapter
+/// (`ptr`, `len`) → `i64`; `merge_macro_helper_fnaddrs` publishes that
+/// adapter into the occupied slot (`getfunctionptr`).
+pub(crate) use pyre_object::dict_eq_hook::__majit_call_target_hash_str_hooked_bytes as hash_str_hooked_bytes_word;
 
 /// One-word residual ABI for `dict_entries_insert_hashed`.
 fn dict_entries_insert_hashed_word(
@@ -3119,14 +3116,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_bytearray_new",
         pyre_object::bytearrayobject::w_bytearray_new,
     );
-    // ABI-UNSOUND: `&[u8]` does not fit one residual slot.
-    push_abi_unsound_argument_alias_pair(
-        &mut entries,
-        &mut abi_unsound_arguments,
-        "pyre_object::bytearrayobject::w_bytearray_from_bytes",
-        "pyre_object::w_bytearray_from_bytes",
-        pyre_object::bytearrayobject::w_bytearray_from_bytes as *const (),
-    );
     // ABI-UNSOUND: `W_DictObject` does not fit one residual slot.
     push_abi_unsound_argument_alias_pair(
         &mut entries,
@@ -5426,6 +5415,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `hash_str_hooked_bytes` is a slice entry; residual calls pass the
     // pointer/length words `rstr.py LLHelpers._ll_strhash` already has.
+    // Bind the pair-slice descr-word adapter (`getfunctionptr`).
     cpa2!(
         &mut entries,
         "pyre_object::dict_eq_hook::hash_str_hooked_bytes",
@@ -10170,8 +10160,7 @@ mod tests {
     }
 
     /// `space.newbytes(cdata[0])` is the 1-byte `jit_w_bytes_from_u8`
-    /// residual. `&[u8]` is two words, so the slice form declines the
-    /// `_CDataBase` convert descent.
+    /// residual.
     #[test]
     fn jit_trace_fnaddrs_covers_jit_w_bytes_from_u8() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();

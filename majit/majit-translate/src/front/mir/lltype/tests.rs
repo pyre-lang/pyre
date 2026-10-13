@@ -2541,6 +2541,7 @@ fn a_tuple_param_names_the_shape_its_reads_name() {
             crate::ErrorCarrierSpec::default(),
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
+            None,
         )
         .as_deref(),
         Some("Tuple<i64,bool>"),
@@ -2773,6 +2774,7 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         spec,
         &empty_gc,
         &harvested,
+        None,
     );
     assert!(
         harvested_token
@@ -2781,17 +2783,18 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         "residual FUNC.RESULT of &RawFlavorStruct is raw:<owner>, got {harvested_token:?}"
     );
     assert_eq!(
-            dont_look_inside_return_token(
-                &get_ptr_fd.signature.output,
-                &llbc,
-                spec,
-                &empty_gc,
-                &empty,
-            )
-            .as_deref(),
-            Some("ref"),
-            "empty flavor set keeps the residual token as ref"
-        );
+        dont_look_inside_return_token(
+            &get_ptr_fd.signature.output,
+            &llbc,
+            spec,
+            &empty_gc,
+            &empty,
+            None,
+        )
+        .as_deref(),
+        Some("ref"),
+        "empty flavor set keeps the residual token as ref"
+    );
     let graph = crate::test_support::lower_function(&llbc, "inspect").expect("lower inspect");
     let input = graph
         .blocks
@@ -12575,6 +12578,8 @@ fn stamp_option_method_inputs(
         &gc_struct_ids,
         false,
         &empty_s,
+        &[],
+        crate::ErrorCarrierSpec::default(),
     );
     graph
         .block(graph.startblock)
@@ -16885,6 +16890,7 @@ fn registered_gc_ptr_gcrefopaque_has_no_class_root() {
             crate::ErrorCarrierSpec::default(),
             &gc,
             &empty,
+            None,
         )
         .as_deref(),
         Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
@@ -16920,7 +16926,14 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
             .expect("fixture TyRef")
     };
     let token = |ty: &TyRef| {
-        dont_look_inside_return_token(ty, &llbc, crate::ErrorCarrierSpec::default(), &gc, &empty)
+        dont_look_inside_return_token(
+            ty,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &empty,
+            None,
+        )
     };
     let gcref_alias = ty(adt(3));
     let mut_gcrefopaque = ty(serde_json::json!({"RawPtr": [adt(0), "Mut"]}));

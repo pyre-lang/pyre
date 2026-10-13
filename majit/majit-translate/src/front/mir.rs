@@ -2898,6 +2898,10 @@ impl<'l> CrateLowering<'l> {
             residual,
             &self.state.raw_alloc_flavor_structs,
         );
+        let block_u8 = unstructured_if_naked_pair_slice(fd, self.llbc)
+            .as_ref()
+            .map(|body| bytes_block_chars_view_locals(body, self.llbc))
+            .unwrap_or_default();
         pygraph_initial_block(
             &mut graph,
             &locals,
@@ -2916,6 +2920,8 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
+            &block_u8,
+            self.static_addrs.error_carrier,
         );
         if declared_result_is_unit(
             &fd.signature.output,
@@ -3160,6 +3166,7 @@ impl<'l> CrateLowering<'l> {
             residual,
             &self.state.raw_alloc_flavor_structs,
         );
+        let block_u8 = bytes_block_chars_view_locals(&spec.body.body, self.llbc);
         pygraph_initial_block(
             &mut graph,
             &spec.body.body.locals,
@@ -3178,6 +3185,8 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
+            &block_u8,
+            self.static_addrs.error_carrier,
         );
         // Local 0 is the return place. A clause-spec body is the FunDecl
         // with type arguments substituted, so that local is the instantiated
@@ -3647,7 +3656,11 @@ impl SemanticFunctionHeader {
         // `dont_look_inside` / `elidable` callees and every trait-method
         // member of an indirect-call row stamp FUNC.RESULT.
         // A `repr(transparent)` scalar wrapper is that word.
-        // Aggregate `"ref"` results stay unstamped.
+        // Aggregate `"ref"` results stay unstamped. A unit `()` is the
+        // empty-tuple ADT and is stamped void so
+        // `finalize_rewritten_graph_to_jitcode`'s `declared=='v' && cfg=='r'`
+        // gate can run `widen_unit_return_to_void` (`call.py FUNC.RESULT`,
+        // `jtransform.py rewrite_call`).
         // A declaration of the `BuiltinCodeFn` pointer type is a member of
         // that indirect-call family, so it stamps the pointer type's RESULT
         // for the same reason a trait-method member does.
@@ -3670,12 +3683,14 @@ impl SemanticFunctionHeader {
                 hints.push("elidable".to_string());
             }
         }
+        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, llbc, error_carrier);
         let signature_token = dont_look_inside_return_token(
             &signature.output,
             llbc,
             error_carrier,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            pair_body.as_ref(),
         );
         let residual_return_type = signature_token.clone();
         let return_is_str = dont_look_inside_return_is_str(&signature.output, llbc, error_carrier);
@@ -3695,21 +3710,27 @@ impl SemanticFunctionHeader {
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
-        let return_type = if stamp_return_token {
-            signature_token
-        } else if signature_token.as_deref().is_some_and(scalar_result_token)
-            && !output_is_raw_address_word(
-                &signature.output,
-                llbc,
-                error_carrier,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            )
-        {
-            signature_token
-        } else {
-            None
-        };
+        // A clause-spec copy may substitute a signature whose output
+        // no longer looks like the empty-tuple ADT; the FunDecl's own
+        // output is still unit. Either one is `FUNC.RESULT = void`.
+        let mut return_type =
+            if is_unit_type(&signature.output, llbc) || is_unit_type(&fd.signature.output, llbc) {
+                Some("()".to_string())
+            } else if stamp_return_token {
+                signature_token
+            } else if signature_token.as_deref().is_some_and(scalar_result_token)
+                && !output_is_raw_address_word(
+                    &signature.output,
+                    llbc,
+                    error_carrier,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+            {
+                signature_token
+            } else {
+                None
+            };
         let return_class_root = dont_look_inside_return_class_root(
             &signature.output,
             llbc,
@@ -3913,8 +3934,14 @@ impl GraphStamp {
         if !self.hints.is_empty() {
             crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &self.hints);
         }
-        if let Some(rt) = &self.return_type {
-            graph.return_type = Some(rt.clone());
+        // A unit `()` graph is already stamped void by
+        // `declared_result_is_unit`. Keep that over a later
+        // non-void header token (a spec copy whose substituted output is
+        // coloured Ref).
+        if graph.return_type.as_deref() != Some("()") {
+            if let Some(rt) = &self.return_type {
+                graph.return_type = Some(rt.clone());
+            }
         }
         graph.residual_return_type = self.residual_return_type.clone();
         graph.return_class_root = self.return_class_root.clone();

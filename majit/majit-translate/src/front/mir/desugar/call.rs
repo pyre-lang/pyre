@@ -14,7 +14,7 @@ impl<'a> Lowering<'a> {
         if let Some(direct) = self.fn_item_call_once_direct_call(&call) {
             return self.lower_call(mir_bb, direct, target, on_unwind);
         }
-        let bb_id = self.emit_bb(mir_bb);
+        let mut bb_id = self.emit_bb(mir_bb);
         let callee_pin_gcref_arg = match &call.func {
             CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
                 .as_deref()
@@ -708,6 +708,9 @@ impl<'a> Lowering<'a> {
             }
             args.push(self.resolve_operand(mir_bb, op)?);
         }
+        // A pair-slice Index argument forks the emit cursor
+        // (`fork_in_bounds`); later ops and the close belong on that tail.
+        bb_id = self.emit_bb(mir_bb);
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
@@ -898,6 +901,13 @@ impl<'a> Lowering<'a> {
                     && !from_bytes_identity
                     && !regular_call_is_slice_to_vec(&reg, self.llbc) =>
             {
+                self.fill_header_view_pairs(
+                    mir_bb,
+                    &reg,
+                    &mut args,
+                    &mut pair_lens,
+                    &arg_operands,
+                )?;
                 // A pair slice's `.len()` / `.is_empty()` is its length
                 // word (`Rvalue::Len`). A string-byte-view window planted
                 // that word as `ll_strlen`; an object-list view keeps
@@ -2294,14 +2304,44 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `as_bytes()[a..b]` is rewritten by `front::slice_index` to
-                // `__getslice_*`, a GC-array/list slice — not
-                // `_ll_stringslice` (`rstr.py`), which would allocate a
-                // new string of length `stop-start`.  Do not mark the dest
-                // as a string byte view: `strlen` / string `eq` expect a
-                // `W_UnicodeObject`, and this dest is the slice object.
-                // `ArrayLen` on the getslice result is the length of
-                // `[a..b]`.
+                // `as_bytes()[a..b]` / `w_bytearray_data(buf)[p..p+count]`
+                // is `getslice` of the byte-string view (`RStringIO.read`
+                // `__bigbuffer[p:p+count]`). Emit the `__getslice_*`
+                // marker here so the dest is the copied `[u8]` array
+                // (`ll_listslice_startstop`), not a Rust interior
+                // subslice whose `arraylen_gc` would load payload bytes
+                // as a length. Do not mark that dest a string byte view:
+                // `strlen` / string `eq` expect a `W_UnicodeObject`, and
+                // this dest is the slice object. `ArrayLen` on the
+                // getslice result is the length of `[a..b]`.
+                if args.len() == 2
+                    && first_arg_is_string_byte_view
+                    && self.is_slice_index_path(&reg)
+                    && !self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                    && let Some((leaf, getslice_args)) =
+                        self.string_byte_view_getslice_args(&args[0], &args[1])
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                specialization: crate::parse::GraphSpecialization::Regular,
+                                segments: vec![leaf.to_string()],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(getslice_args),
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `ArrayRead` addresses its element as `base + index *
                 // itemsize`.  A scalar host element carries its spelling as
                 // the array identity so the descr computes the exact width;
@@ -3909,9 +3949,12 @@ impl<'a> Lowering<'a> {
                 // An Acquire load of a field declared quasi-immutable is
                 // that field's read: the codewriter emits
                 // `record_quasiimmut_field` and the getfield, and the
-                // descr's Acquire bit orders the executable read. SeqCst,
-                // Release, an unknown ordering, and an Acquire load of a
-                // field that is not quasi-immutable stay unsupported.
+                // descr's Acquire bit orders the executable read.
+                // A traced atomic load of a GC / pointer field is the same
+                // `getfield_gc` (`FieldDescr::load_is_acquire`);
+                // `QuasiImmutField.ptr` (`is_installed`) is that shape.
+                // SeqCst, Release, an unknown ordering, and an integer
+                // Acquire (`w_type_get_version_tag`) stay unsupported.
                 // `&self` may already alias the loaded value, NOT its
                 // address, so those cannot fall through to an ordinary
                 // `Atomic::load` call.
@@ -4145,7 +4188,7 @@ impl<'a> Lowering<'a> {
                 // list's logical length may be below capacity).
                 if args.len() == 2
                     && let Some(block) =
-                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0])
+                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0], &args[1])
                 {
                     self.alias_dest_to_arg0(dest_local, block, true);
                     let target_bb = self.block_id[target];
@@ -6819,7 +6862,7 @@ impl<'a> Lowering<'a> {
                                     let narrowed = self.graph.alloc_value_var_with_type(
                                         crate::model::ConcreteType::Unknown,
                                     );
-                                    let bb_id = self.block_id[mir_bb];
+                                    let bb_id = self.emit_bb(mir_bb);
                                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                                         result: Some(narrowed.clone()),
                                         kind: crate::model::cast_instance_call(root, recv),
@@ -6874,10 +6917,30 @@ impl<'a> Lowering<'a> {
                     {
                         self.keep_dyn_call_receiver(mir_bb, &mut args);
                     }
-                    OpKind::Call {
-                        target,
-                        args: crate::model::call_args(args),
-                        result_ty,
+                    self.fill_header_view_pairs(
+                        mir_bb,
+                        &reg,
+                        &mut args,
+                        &mut pair_lens,
+                        &arg_operands,
+                    )?;
+                    if !pair_lens.is_empty() {
+                        let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
+                        self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
+                        callee_name_path = Some(name);
+                        let target = self.pair_call_target(mir_bb, &reg, &args, &pair_lens)?;
+                        let args = splice_pair_lens(args, pair_lens);
+                        OpKind::Call {
+                            target,
+                            args: crate::model::call_args(args),
+                            result_ty,
+                        }
+                    } else {
+                        OpKind::Call {
+                            target,
+                            args: crate::model::call_args(args),
+                            result_ty,
+                        }
                     }
                 }
             }
@@ -7954,6 +8017,9 @@ impl<'a> Lowering<'a> {
         // A STR-view receiver whose dest is still a string or a shared
         // `&[u8]` keeps the mark: `&view[a..b]` is `__getslice_*` of the
         // header (`rstr.py` `LLHelpers.ll_stringslice_startstop`).
+        // A Call that stamps `ValueType::Str` is the length-prefixed
+        // byte-string view: mark dest so `[p..p+count]` emits
+        // `__getslice_range`. A host `&[u8]` pair stamps Unsigned.
         if first_arg_is_string_byte_view && tyref_is_one_word_str_view(&call.dest.ty, self.llbc) {
             if !self.string_byte_view_locals.contains(&dest_local) {
                 self.string_byte_view_locals.push(dest_local);
@@ -7962,6 +8028,11 @@ impl<'a> Lowering<'a> {
         } else {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
+            if opkind_is_byte_payload_view(&op_kind)
+                && !self.string_byte_view_locals.contains(&dest_local)
+            {
+                self.string_byte_view_locals.push(dest_local);
+            }
         }
         // Carrier `Result::expect` via FunDecl / FunctionPath spelling.
         // `core::result::<Impl>::expect` on the `Method` spelling, and
@@ -8086,6 +8157,8 @@ impl<'a> Lowering<'a> {
             let payload_ty =
                 if crate::front::result_exc::tyref_result_ok_is_unit(&call.dest.ty, self.llbc) {
                     ValueType::Void
+                } else if self.result_pair_slice_kind(&call.dest.ty).is_some() {
+                    ValueType::Unsigned
                 } else {
                     ok_ty
                         .as_ref()
@@ -9513,12 +9586,14 @@ impl<'a> Lowering<'a> {
             carrier,
             self.gc_struct_ids,
         );
+        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, self.llbc, carrier);
         let token = dont_look_inside_return_token(
             &signature.output,
             self.llbc,
             carrier,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
+            pair_body.as_ref(),
         );
         if class_root.is_none()
             && container_root.is_none()

@@ -2915,21 +2915,22 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
         crate::builtins::bytearray_check_exports(ba)?;
     }
     if count == 0 {
-        pyre_object::bytearrayobject::w_bytearray_vec_mut(ba).clear();
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        vec.clear();
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), len);
         return Ok(());
     }
     if len == 0 {
         return Ok(());
     }
     let snapshot = pyre_object::bytearrayobject::w_bytearray_data(ba).to_vec();
-    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+    let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
     vec.try_reserve_exact(new_size - len)
         .map_err(|_| crate::builtins::reservation_failed())?;
     for _ in 1..count {
         vec.extend_from_slice(&snapshot);
     }
-    pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
+    pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), len);
     Ok(())
 }
 

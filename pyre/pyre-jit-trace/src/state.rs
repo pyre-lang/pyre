@@ -779,6 +779,13 @@ fn ensure_finish_setup() {
     FRAME_VALUE_COUNT_INIT.call_once(|| {
         majit_ir::resumedata::set_frame_value_count_fn(frame_value_count_at);
     });
+    // `pyjitpl.py finish_setup_descrs` publishes `cpu.setup_descrs()` /
+    // `Assembler.descrs` before any MIFrame runs. Build-time helper
+    // jitcodes have empty `exec.descrs` and resolve `d`/`j` through that
+    // pool (`JitCode::descr_at`). A Python full-body walk never went
+    // through `drive_portal_metatrace`, so a helper-innermost blackhole
+    // was the first `descr_at` and hit an unset pool.
+    crate::jitcode_runtime::install_global_build_descr_pool();
     let snapshot = ASSEMBLER_STATE.with(|a| {
         let asm = a.borrow();
         let republishes = METAINTERP_SD.with(|r| {
@@ -1097,6 +1104,13 @@ pub fn jitcode_payload_at(jitcode_index: i32) -> Option<std::sync::Arc<crate::Py
             }
         })
     })
+}
+
+/// `descr_call` / operator tails: a jitcode with no Python code object that
+/// is still a Python-level continuation, not a translated helper.
+pub fn jitcode_is_codeless_continuation(index: i32) -> bool {
+    crate::ctor_continuation::is_installed_level(index)
+        || crate::operator_continuation::is_installed_level(index)
 }
 
 /// `MetaInterpStaticData.jitcodes[jitcode_index]`: resolve the snapshot index
@@ -2223,6 +2237,24 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     })
 }
 
+/// Whether this jitcode's reds include a Python `PyFrame` virtualizable.
+///
+/// `resume.py rebuild_from_resumedata` rebuilds a blackhole frame per
+/// jitcode section; only a portal / Python-code jitcode carries a
+/// `PyFrame` (`virtualizable`). Inspect THIS object:
+/// `MetaInterpStaticData.jitcodes[index]` collides with a helper's
+/// translator index and would mint a Python-visible frame from a helper
+/// section.
+///
+/// JitCodeBuilder Python bodies (`assembler.py`) keep
+/// `uses_global_descr_pool == false` (`JitCode::new`). The execute_frame
+/// portal is `from_canonical` (pool true) and carries a merge-point
+/// marker (`blackhole.py bhimpl_jit_merge_point`). Translator helpers are
+/// `from_canonical` with no merge point.
+pub fn jitcode_owns_python_frame(jitcode: &majit_metainterp::JitCode) -> bool {
+    !jitcode.uses_global_descr_pool() || jitcode.merge_point_green_regs().is_some()
+}
+
 /// One `(frame_ptr, stack_base)` per `framestack` level, outermost first.
 ///
 /// `blackhole.py convert_and_run_from_pyjitpl` copies each MIFrame
@@ -2242,7 +2274,7 @@ pub fn per_frame_vables_from_framestack(
                 return (0, 0);
             };
             let frame_reg = portal_red_regs_at(jitcode_index).0;
-            if frame_reg == u16::MAX {
+            if frame_reg == u16::MAX || !jitcode_owns_python_frame(&frame.jitcode) {
                 return (0, 0);
             }
             let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
@@ -8725,11 +8757,42 @@ pub(crate) fn recipe_live_boxes(recipe: &ReconstructRecipe) -> Vec<OpRef> {
     boxes
 }
 
-/// A descended helper body (`list.pop`, `w_list_getitem`, …) is a real
-/// `MIFrame` (`capture_resumedata`). Rebuild its color-indexed banks from
-/// the numbered section so the carrier can walk that jitcode from the
-/// guard (`blackhole.py` `_resume_mainloop`).
-fn reconstruct_transparent_helper_recipe(
+/// Dest color of the `inline_call` / `residual_call` that ends at
+/// `resume_pc`. `None` for a void call or when no such op ends there.
+/// `MIFrame.get_list_of_active_boxes` reads that dest as
+/// `self.bytecode[self.pc - 1]` and the bank as `self._result_argcode`.
+pub(crate) fn call_result_dest_color(code: &[u8], resume_pc: usize) -> Option<(char, usize)> {
+    match crate::jitcode_dispatch::call_result_register_in(code, resume_pc) {
+        crate::jitcode_dispatch::CallResultRegister::Reg(bank, color) => Some((bank, color)),
+        crate::jitcode_dispatch::CallResultRegister::Void
+        | crate::jitcode_dispatch::CallResultRegister::Unknown => None,
+    }
+}
+
+/// Whether `resume_pc` is the trailing `-live-` of an `inline_call` /
+/// `residual_call` (`get_list_of_active_boxes(in_a_call=True)`).
+pub fn resume_pc_is_after_call(code: &[u8], resume_pc: usize) -> bool {
+    crate::jitcode_runtime::decoded_ops(code).any(|op| {
+        op.next_pc == resume_pc
+            && (op.opname.starts_with("inline_call") || op.opname.starts_with("residual_call"))
+    })
+}
+
+/// A translated helper jitcode: `from_canonical`, no Python `code`, not a
+/// ctor/operator continuation. `resume.py rebuild_from_resumedata` still
+/// pushes an MIFrame for it.
+pub(crate) fn resume_frame_is_translated_helper(jitcode_index: i32) -> bool {
+    if jitcode_is_codeless_continuation(jitcode_index) {
+        return false;
+    }
+    pyjitcode_for_jitcode_index(jitcode_index)
+        .is_some_and(|pjc| !pjc.jitcode.code.is_empty() && !jitcode_owns_python_frame(&pjc.jitcode))
+}
+
+/// `resume.py consume_boxes` into a helper MIFrame: color-indexed banks,
+/// no Python `locals_cells_stack_w` inversion.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_helper_section_recipe(
     ctx: &mut majit_metainterp::TraceCtx,
     frame: &majit_ir::resumedata::RebuiltFrame,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
@@ -8747,30 +8810,31 @@ fn reconstruct_transparent_helper_recipe(
         }};
     }
     if frame.pc < 0 {
-        decline!("NoSnapshotPc");
+        decline!("HelperNoSnapshotPc");
     }
-    // `get_list_of_active_boxes(in_a_call=True)` keeps the dest in the
-    // list and writes NULL/0 there. Decode that box into its color so
+    let pc = frame.pc as usize;
+    let Some(pjc) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
+        decline!("HelperNoPayload");
+    };
+    // `get_list_of_active_boxes(in_a_call=True)` keeps dest in the list as
+    // CONST_NULL/0. `consume_boxes` writes that box into its color so
     // `_setup_return_value_*` can overwrite it. A paused caller whose
     // resume pc is not a call has no dest to fill.
     if in_a_call {
-        let Some(pc) = usize::try_from(frame.pc).ok() else {
-            decline!("NoPendingResultColor");
-        };
-        let Some(p) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
-            decline!("NoPendingResultColor");
-        };
         use crate::jitcode_dispatch::CallResultRegister;
-        if matches!(
-            crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc),
-            CallResultRegister::Unknown
-        ) {
-            decline!("NoPendingResultColor");
+        match crate::jitcode_dispatch::call_result_register_in(pjc.jitcode.code.as_slice(), pc) {
+            CallResultRegister::Reg('i', _)
+            | CallResultRegister::Reg('r', _)
+            | CallResultRegister::Reg('f', _)
+            | CallResultRegister::Void => {}
+            CallResultRegister::Unknown | CallResultRegister::Reg(..) => {
+                decline!("HelperPendingDest");
+            }
         }
     }
     let reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
     if reg_indices.total_len() != frame.values.len() {
-        decline!("LivenessValueCountMismatch");
+        decline!("HelperLivenessValueCountMismatch");
     }
     let int_len = reg_indices.int.len();
     let mut registers_i: Vec<OpRef> = Vec::new();
@@ -8793,12 +8857,13 @@ fn reconstruct_transparent_helper_recipe(
         }
         registers_i[reg_idx] = op;
     }
+    let float_base = int_len + reg_indices.ref_.len();
     let mut registers_r: Vec<OpRef> = Vec::new();
-    let ref_base = int_len;
+    let mut concrete_r: Vec<majit_ir::Value> = Vec::new();
     for (pos, &reg_idx) in reg_indices.ref_.iter().enumerate() {
         let (op, val) = bridge_decode_box(
             ctx,
-            &frame.values[ref_base + pos],
+            &frame.values[int_len + pos],
             Type::Ref,
             rd_virtuals,
             resume_data,
@@ -8807,18 +8872,16 @@ fn reconstruct_transparent_helper_recipe(
             backend,
             cache,
         );
-        if op.is_none() {
-            decline!("HelperRefBox");
-        }
         ctx.try_set_opref_concrete(op, val);
         let reg_idx = reg_idx as usize;
         if reg_idx >= registers_r.len() {
             registers_r.resize(reg_idx + 1, OpRef::NONE);
+            concrete_r.resize(reg_idx + 1, majit_ir::Value::Void);
         }
         registers_r[reg_idx] = op;
+        concrete_r[reg_idx] = val;
     }
     let mut registers_f: Vec<OpRef> = Vec::new();
-    let float_base = int_len + reg_indices.ref_.len();
     for (pos, &reg_idx) in reg_indices.float.iter().enumerate() {
         let (op, val) = bridge_decode_box(
             ctx,
@@ -8838,6 +8901,7 @@ fn reconstruct_transparent_helper_recipe(
         }
         registers_f[reg_idx] = op;
     }
+    crate::jitcode_dispatch::census_record("P2Recipe::HelperSectionAdmit");
     Some(ReconstructRecipe {
         code_ptr: std::ptr::null(),
         jitcode_index: frame.jitcode_index,
@@ -8847,12 +8911,13 @@ fn reconstruct_transparent_helper_recipe(
         registers_i,
         registers_r,
         registers_f,
-        concrete_r: Vec::new(),
+        concrete_r,
         registers_r_color: Vec::new(),
         frame: OpRef::NONE,
         nargs: 0,
         len_tail: false,
         ctor_tail: false,
+        helper_section: true,
         rebuilt_frame: None,
         rebuilt_ec: None,
     })
@@ -8951,6 +9016,7 @@ pub(crate) fn reconstruct_inline_recipe(
             nargs: 0,
             len_tail: false,
             ctor_tail: true,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
@@ -9002,12 +9068,21 @@ pub(crate) fn reconstruct_inline_recipe(
             nargs: 0,
             len_tail: true,
             ctor_tail: false,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
     }
-    if jitcode_is_transparent_helper(frame.jitcode_index) {
-        return reconstruct_transparent_helper_recipe(
+    // `resume.py rebuild_from_resumedata`: a helper jitcode is just another
+    // section (`newframe(jitcode)` + `consume_boxes`). It has no Python
+    // `code` object; registers stay color-indexed in the three banks.
+    // `jitcode_is_transparent_helper` is the InlineFrame (`w_code == 0`)
+    // case; `resume_frame_is_translated_helper` is the same section for a
+    // `from_canonical` body.
+    if resume_frame_is_translated_helper(frame.jitcode_index)
+        || jitcode_is_transparent_helper(frame.jitcode_index)
+    {
+        return reconstruct_helper_section_recipe(
             ctx,
             frame,
             rd_virtuals,
@@ -9464,6 +9539,7 @@ pub(crate) fn reconstruct_inline_recipe(
                 nargs: frame_nlocals,
                 len_tail: false,
                 ctor_tail: false,
+                helper_section: false,
                 rebuilt_frame: None,
                 rebuilt_ec: None,
             });
@@ -9602,6 +9678,7 @@ pub(crate) fn reconstruct_inline_recipe(
             nargs: frame_nlocals,
             len_tail: false,
             ctor_tail: false,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
@@ -9738,6 +9815,7 @@ fn bridge_decode_box(
 /// resume.py `AbstractResumeDataReader._prepare`: virtual cache then
 /// `_prepare_pendingfields`. Called before `newframe` / `consume_boxes`.
 fn apply_bridge_prepare(
+    sym: &mut PyreSym,
     ctx: &mut majit_metainterp::TraceCtx,
     resume_data: &majit_metainterp::ResumeDataResult,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
@@ -9753,6 +9831,7 @@ fn apply_bridge_prepare(
     // pending-field decode. `force_all_virtuals` is `force_from_resumedata`
     // only (direct/executing reader), not this BoxReader `_prepare`.
     prepare_bridge_pending_fields(
+        sym,
         ctx,
         resume_data,
         rd_virtuals,
@@ -9768,9 +9847,12 @@ fn apply_bridge_prepare(
 /// virtual preparation and replays every entry through `setfield` /
 /// `setarrayitem`, `ExecutionContext.sys_exc_value` included: a lazy
 /// `PUSH_EXC_INFO` store parked on the guard must land before the bridge body
-/// reads the handled exception (`executioncontext.py sys_exc_info`).
+/// reads the handled exception (`executioncontext.py sys_exc_info`). A pending
+/// `ec_sys_exc_value_descr` store also seeds `last_exc_*` / `current_exc_*`
+/// so the walker's exception channel matches the heap store.
 #[allow(clippy::too_many_arguments)]
 fn prepare_bridge_pending_fields(
+    sym: &mut PyreSym,
     ctx: &mut majit_metainterp::TraceCtx,
     resume_data: &majit_metainterp::ResumeDataResult,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
@@ -9782,10 +9864,12 @@ fn prepare_bridge_pending_fields(
     let Some(storage) = resume_data.storage.as_ref() else {
         return;
     };
+    let target_descr = crate::descr::ec_sys_exc_value_descr();
     for pending in storage.rd_pendingfields().unwrap_or(&[]) {
         let Some(descr) = pending.descr.as_ref() else {
             continue;
         };
+        let is_exc_channel = pending.item_index < 0 && std::sync::Arc::ptr_eq(descr, &target_descr);
 
         // `resume.py` `_prepare_pendingfields`: both operands use the same tagged decoder as
         // frame boxes.  Decode the target as well as the fieldbox so virtual
@@ -9806,8 +9890,10 @@ fn prepare_bridge_pending_fields(
             storage.rd_virtuals().map_or(0, <[_]>::len),
         );
 
-        // resume.py `_prepare_pendingfields`: replay the pending write as a
-        // bridge-entry SETFIELD_GC / SETARRAYITEM_GC op.
+        // resume.py `_prepare_pendingfields`: replay every pending write as a
+        // bridge-entry SETFIELD_GC / SETARRAYITEM_GC op, exception-channel
+        // descr included. Seed last_exc / current_exc from that descr; do
+        // not `continue` before the execute+emit below.
         let (target_op, target_concrete) = bridge_decode_box(
             ctx,
             &target,
@@ -9849,6 +9935,17 @@ fn prepare_bridge_pending_fields(
         // stamp above also lets the later portal-frame consume recover this
         // exact pending-target box after a moving GC.
         ctx.try_set_opref_concrete(value_op, value_concrete);
+        if is_exc_channel && let majit_ir::Value::Ref(value_ref) = value_concrete {
+            let exc = value_ref.as_usize() as pyre_object::PyObjectRef;
+            sym.last_exc_box = value_op;
+            sym.last_exc_value.set(exc);
+            sym.class_of_last_exc_is_const = false;
+            // PUSH_EXC_INFO published this same word (`pyopcode.py`
+            // current-exception slot). A nested handler's bare `raise`
+            // re-reads it via GETFIELD of `sys_exc_value`.
+            sym.current_exc_box = value_op;
+            sym.current_exc_value.set(exc);
+        }
         // ResumeDataBoxReader._prepare_pendingfields dispatches through
         // `execute_setfield_gc` / `execute_setarrayitem_gc`: execute the
         // write on the recording-time heap as well as recording it.  The
@@ -11349,7 +11446,7 @@ impl JitState for PyreJitState {
     }
 
     fn prepare_bridge_resume(
-        _sym: &mut Self::Sym,
+        sym: &mut Self::Sym,
         ctx: &mut majit_metainterp::TraceCtx,
         resume_data: &majit_metainterp::ResumeDataResult,
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
@@ -11358,6 +11455,7 @@ impl JitState for PyreJitState {
         reader: &mut BridgeVirtualCache<'_>,
     ) {
         apply_bridge_prepare(
+            sym,
             ctx,
             resume_data,
             rd_virtuals,
@@ -17058,7 +17156,10 @@ pub(crate) fn assemble_bridge_inline_pending(
 /// catching middle that cannot be reconstructed declines before any
 /// `carrier_ec_leave` shortens `topframeref`.
 fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
-    !recipe.len_tail && !recipe.ctor_tail && reconstructed_callee_recipe_is_portable(recipe)
+    !recipe.len_tail
+        && !recipe.ctor_tail
+        && !recipe.helper_section
+        && reconstructed_callee_recipe_is_portable(recipe)
 }
 
 /// Stamp a resume-decoded GCREF onto its box (`RefFrontendOp._resref` /

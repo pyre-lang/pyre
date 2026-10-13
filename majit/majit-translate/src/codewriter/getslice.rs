@@ -54,6 +54,8 @@ pub const LL_LISTSLICE_MINUSONE: &str = "ll_listslice_minusone";
 pub const LL_LISTSLICE_RANGETO: &str = "ll_listslice_rangeto";
 /// `rlist.py ll_listslice_startstop` — `l[start:end]`.
 pub const LL_LISTSLICE_STARTSTOP: &str = "ll_listslice_startstop";
+/// `rlist.py ll_copy` — leftover `list(l)` / `to_vec` of a list dest.
+pub const LL_COPY: &str = "ll_copy";
 
 /// The item kind and ARRAY identity of the GC array `base` names, read off an
 /// `ArrayRead` / `ArrayWrite` / `ArrayLen` / `NewArrayClear` on the same
@@ -250,6 +252,22 @@ pub fn listslice_range_path(
     path
 }
 
+/// The helper path for leftover `list` / `to_vec` of a list dest, minting
+/// `rlist.py ll_copy` on first use.
+pub fn list_copy_path(
+    cc: &mut CallControl,
+    item_ty: &ValueType,
+    array_type_id: Option<&str>,
+) -> CallPath {
+    let name = helper_name(LL_COPY, item_ty, array_type_id);
+    let path = CallPath::from_segments([name.as_str()]);
+    if !cc.has_function_graph(&path) {
+        let graph = build_ll_copy_graph(&name, item_ty, array_type_id);
+        register_listslice_helper(cc, path.clone(), graph);
+    }
+    path
+}
+
 /// Register a minted `ll_listslice_*` graph and admit it as a candidate.
 /// The helper is loop-free (`ll_arraycopy` is the residual), so
 /// `look_inside_graph` accepts it — the same seed `call.py` uses for a
@@ -380,6 +398,127 @@ pub fn getslice_marker_identity(
     }
     let base = args.first()?;
     array_identity_of_base(graph, base)
+}
+
+/// Whether `value` is an rstr `STR` in this graph (`ValueType::Str`, or a
+/// `__strlen` / `__string_byte_getitem` byte-view of the same box).
+///
+/// A typed `Ptr(rpy_string)` / `Utf8Str` has no `ArrayRead` sibling, so
+/// [`getslice_marker_identity`] is `None` and the list-slice mint does
+/// not fire. `AbstractStringRepr.rtype_getslice` (`rstr.py`) turns
+/// `s[start:stop]` into `ll_stringslice_startstop`.
+///
+/// A `BytesBlock` Input is rstr `STR` (`type BytesBlock = Utf8Str`), so
+/// [`getslice_marker_identity`] is `None` and `AbstractStringRepr.rtype_getslice`
+/// owns `buf[a..b]`. A `w_bytearray_data` Call result carries
+/// `ValueType::Str` without a list identity.
+///
+/// A `__getslice_*` / `_ll_stringslice` / `ll_listslice_*` whose base is
+/// a STR is itself a STR. Leftover `list` / `to_vec` of that result is
+/// `rtype_bltn_list` (`ll_copy` of a listslice dest, `ll_str2uintlist` of
+/// a STR box), not an identity alias of the source.
+pub fn value_is_str(graph: &FunctionGraph, value: &Variable) -> bool {
+    value_is_str_inner(graph, value, 0)
+}
+
+fn value_is_str_inner(graph: &FunctionGraph, value: &Variable, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let classes = LinkClasses::of(graph);
+    let same = |v: &Variable| classes.same(v, value);
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::Call {
+                result_ty: ValueType::Str,
+                ..
+            }
+            | OpKind::Input {
+                ty: ValueType::Str, ..
+            }
+            | OpKind::FieldRead {
+                ty: ValueType::Str, ..
+            } if op.result.as_ref().is_some_and(&same) => return true,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if (segments.as_slice() == ["__strlen"]
+                || segments.as_slice() == ["__string_byte_getitem"])
+                && args
+                    .first()
+                    .and_then(LinkArg::as_variable)
+                    .is_some_and(&same) =>
+            {
+                return true;
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if op.result.as_ref().is_some_and(&same) && segments_produce_str_slice(segments) => {
+                if let Some(base) = args.first().and_then(LinkArg::as_variable)
+                    && value_is_str_inner(graph, base, depth + 1)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn segments_produce_str_slice(segments: &[String]) -> bool {
+    segments_produce_listslice(segments)
+        || segments.last().map(String::as_str) == Some("_ll_stringslice")
+}
+
+fn segments_produce_listslice(segments: &[String]) -> bool {
+    is_getslice_marker(segments, "__getslice_range")
+        || is_getslice_marker(segments, "__getslice_rangefrom")
+        || is_getslice_marker(segments, "__getslice_rangeto")
+        || is_getslice_marker(segments, "__getslice_minusone")
+        || segments
+            .last()
+            .is_some_and(|leaf| leaf.starts_with("ll_listslice_"))
+}
+
+/// The `__getslice_*` marker's first argument is an rstr `STR`.
+pub fn getslice_base_is_str(graph: &FunctionGraph, op: &SpaceOperation) -> bool {
+    let OpKind::Call { args, .. } = &op.kind else {
+        return false;
+    };
+    args.first()
+        .and_then(LinkArg::as_variable)
+        .is_some_and(|base| value_is_str(graph, base))
+}
+
+/// Leftover `list` / `to_vec` of a `__getslice_*` / `ll_listslice_*` dest
+/// whose base is a STR. That dest is already a new list
+/// (`ll_listslice_startstop`); `rtype_bltn_list` is `ll_copy`.
+/// `_ll_stringslice` still yields a STR, so that leftover is
+/// `ll_str2uintlist` rather than `ll_copy`.
+pub fn value_is_str_listslice_result(graph: &FunctionGraph, value: &Variable) -> bool {
+    let classes = LinkClasses::of(graph);
+    let same = |v: &Variable| classes.same(v, value);
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if op.result.as_ref().is_some_and(&same) && segments_produce_listslice(segments) => {
+                if let Some(base) = args.first().and_then(LinkArg::as_variable)
+                    && value_is_str(graph, base)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `rlist.py ll_listslice_startonly` in the rich model, with `ll_arraycopy`
@@ -761,6 +900,63 @@ pub fn build_ll_listslice_startstop_graph(
     graph
 }
 
+/// `rlist.py ll_copy` in the rich model, with `ll_arraycopy` as the residual.
+///
+/// ```python
+/// def ll_copy(RESLIST, l):
+///     length = l.ll_length()
+///     new_lst = RESLIST.ll_newlist(length)
+///     ll_arraycopy(l, new_lst, 0, 0, length)
+///     return new_lst
+/// ```
+pub fn build_ll_copy_graph(
+    name: &str,
+    item_ty: &ValueType,
+    array_type_id: Option<&str>,
+) -> FunctionGraph {
+    let array_type_id = array_type_id.map(str::to_string);
+    let array = None;
+    let mut graph = FunctionGraph::new(name);
+    let start_block = graph.startblock;
+
+    let l = graph.alloc_value_var();
+    graph.push_inputarg_var(start_block, l.clone());
+    graph.push_op_with_result_var(
+        start_block,
+        OpKind::Input {
+            name: "l".to_string(),
+            ty: ValueType::Ref(None),
+            class_root: None,
+        },
+        l.clone(),
+    );
+
+    let length = push(
+        &mut graph,
+        start_block,
+        OpKind::ArrayLen {
+            base: l.clone(),
+            array_type_id: array_type_id.clone(),
+            array: array.clone(),
+            nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
+        },
+    );
+    let new_list = push(
+        &mut graph,
+        start_block,
+        OpKind::NewArrayClear {
+            length: length.clone(),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+            array: array.clone(),
+        },
+    );
+    let start = push(&mut graph, start_block, OpKind::ConstInt(0));
+    emit_ll_arraycopy_call(&mut graph, start_block, l, start, new_list, length);
+    graph
+}
+
 /// `ll_arraycopy(l1, l, start, 0, newlength)` as the residual call
 /// `rgc.py` / `rlist.py` emit.  jtransform's `do_fixed_list_ll_arraycopy`
 /// turns this into `OS_ARRAYCOPY`.
@@ -924,6 +1120,50 @@ mod tests {
             "minted ll_arraycopy must become OS_ARRAYCOPY; notes={:?}",
             out.notes
         );
+    }
+
+    /// `ll_listslice_startstop` of `[u8]` dest is `NewArrayClear` of Char.
+    /// OS_ARRAYCOPY's `single_write_descr_array` must be that ARRAY
+    /// (`item_size` 1, not a pointer stride): rewrite.py unrolls a
+    /// constant-length copy with `getarrayitem_for_descr`.
+    #[test]
+    fn minted_u8_listslice_arraycopy_write_descr_is_char_array() {
+        let mut cc = CallControl::new();
+        cc.mark_oopspec(
+            CallPath::from_segments(["ll_arraycopy"]),
+            "list.ll_arraycopy(source, dest, source_start, dest_start, length)".to_string(),
+        );
+        let path = listslice_range_path(&mut cc, &ValueType::Int, Some("[u8]"));
+        let graph = cc
+            .function_graphs()
+            .get(&path)
+            .expect("listslice helper is registered");
+        let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+        let mut transformer =
+            crate::codewriter::jtransform::Transformer::new(&config).with_callcontrol(&mut cc);
+        let out = transformer.transform(&graph);
+        let write = out.graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => {
+                    descriptor.extra_info.single_write_descr_array.clone()
+                }
+                _ => None,
+            })
+        });
+        let write = write.expect("OS_ARRAYCOPY must carry single_write_descr_array");
+        let ad = write
+            .as_array_descr()
+            .expect("write descr is an array descr");
+        assert_eq!(
+            ad.item_size(),
+            1,
+            "u8 listslice dest ARRAY item_size; pointers would unroll as GcArray(OBJECTPTR)"
+        );
+        assert!(
+            !ad.is_array_of_pointers(),
+            "u8 listslice dest ARRAY is Char, not OBJECTPTR"
+        );
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Int);
     }
 
     #[test]
@@ -1333,6 +1573,145 @@ mod tests {
         assert_eq!(
             getslice_marker_identity(&graph, &op),
             Some((ValueType::Float, Some("[f64]".into())))
+        );
+    }
+
+    #[test]
+    fn bytesblock_input_is_str_without_list_identity() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Str,
+                    class_root: Some("BytesBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let sliced = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                        segments: vec!["__getslice_range".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![s.clone(), start, stop]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let op = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find(|op| is_getslice_range(op))
+            .cloned()
+            .expect("getslice marker");
+        assert_eq!(getslice_marker_identity(&graph, &op), None);
+        assert!(value_is_str(&graph, &s));
+        assert!(getslice_base_is_str(&graph, &op));
+        assert!(
+            value_is_str(&graph, &sliced),
+            "a STR getslice result is itself a STR"
+        );
+    }
+
+    #[test]
+    fn bytearray_data_call_result_is_str_without_list_identity() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let owner = graph.alloc_value_var();
+        let buf = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                        segments: vec!["w_bytearray_data".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![owner]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let sliced = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                        segments: vec!["__getslice_range".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![buf.clone(), start, stop]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let op = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find(|op| is_getslice_range(op))
+            .cloned()
+            .expect("getslice marker");
+        assert_eq!(getslice_marker_identity(&graph, &op), None);
+        assert!(value_is_str(&graph, &buf));
+        assert!(getslice_base_is_str(&graph, &op));
+        assert!(
+            value_is_str(&graph, &sliced),
+            "a STR getslice result is itself a STR"
         );
     }
 }

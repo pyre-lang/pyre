@@ -2469,8 +2469,13 @@ pub struct GraphTransform {
 
 impl GraphTransform {
     fn apply(&self, graph: &mut FunctionGraph) {
-        if let Some(rt) = &self.return_type {
-            graph.return_type = Some(rt.clone());
+        // A unit `()` graph is already `FUNC.RESULT = void`. A later
+        // registration token (a spec copy whose substituted output is
+        // coloured Ref) must not recolour it.
+        if graph.return_type.as_deref() != Some("()") {
+            if let Some(rt) = &self.return_type {
+                graph.return_type = Some(rt.clone());
+            }
         }
         if let Some(root) = &self.return_class_root {
             graph.return_class_root = Some(root.clone());
@@ -6117,7 +6122,7 @@ impl CallControl {
                 // `canonical_array_type_id` joins those dump aliases.
                 let canonical = crate::front::typestr::canonical_array_type_id(atid);
                 let atid = canonical.as_ref();
-                let path_hash_u64 = majit_ir::descr::path_hash(atid);
+                let path_hash_u64 = majit_ir::descr::array_identity_hash(atid);
                 let nolength = len_offset.is_none();
                 let length_offset = len_offset.unwrap_or(0);
                 // `descr.py get_array_descr` cache-or-mint:
@@ -10095,6 +10100,57 @@ impl CallControl {
         Some(map_type_string_to_argclass(s))
     }
 
+    /// Path `handle_regular_call` hands to `get_jitcode`: `target_to_path`
+    /// then `callable_graph_path` (crate-stripped funcobj), else the
+    /// `__fn_const`-stripped FunctionPath / Method-name fallback
+    /// `jtransform.rs target_to_call_path` uses. `FUNC.RESULT` must come
+    /// from that same graph (`call.py:230` `RESULT == FUNC.RESULT`).
+    pub(crate) fn path_for_jitcode_lookup(&self, target: &CallTarget) -> Option<CallPath> {
+        if let Some(path) = self.target_to_path(target) {
+            return self.callable_graph_path(&path).or(Some(path));
+        }
+        let path = if let Some(segments) = crate::model::fn_const_segments(target) {
+            CallPath::from_segments(segments.iter().map(String::as_str))
+        } else if let CallTarget::Method { name, .. } = target {
+            CallPath::from_segments([name.as_str()])
+        } else {
+            return None;
+        };
+        self.callable_graph_path(&path).or(Some(path))
+    }
+
+    fn graph_cfg_result_type(graph: &FunctionGraph) -> Option<Type> {
+        // `codewriter.rs graph_result_kind`: FUNC.RESULT is
+        // `returnblock.inputargs[0].concretetype`. The MIR driver leaves
+        // `graph.return_type` None for a look-inside scalar (`bool` on
+        // `is_w`) unless a residual/trait stamp wrote the string; the CFG
+        // colour is still Signed and must win over a front Ref dest.
+        let Some(arg) = graph.block(graph.returnblock).inputargs.first() else {
+            return Some(Type::Void);
+        };
+        match FunctionGraph::concretetype_of(arg) {
+            crate::model::ConcreteType::Signed => Some(Type::Int),
+            crate::model::ConcreteType::GcRef => Some(Type::Ref),
+            crate::model::ConcreteType::Float => Some(Type::Float),
+            crate::model::ConcreteType::Void => Some(Type::Void),
+            crate::model::ConcreteType::Unknown => None,
+        }
+    }
+
+    fn calldescr_result_type_for_path(&self, path: &CallPath) -> Option<Type> {
+        // `JitCode.calldescr` is a header OnceLock (`jitcode.py` `__init__`).
+        // An unset shell has none; `calldescr()` would answer the empty
+        // default `'v'` and collapse a Ref dest.
+        let d = self.jitcodes.get(path)?.calldescr.get()?;
+        Some(match d.result_type {
+            'i' => Type::Int,
+            'r' => Type::Ref,
+            'f' => Type::Float,
+            'v' => Type::Void,
+            _ => return None,
+        })
+    }
+
     /// The callee's post-`?` declared `RESULT` type (`call.py:222
     /// FUNC.RESULT`) for a direct-call `target` — the same value
     /// `getcalldescr`'s direct arm derives as `expected_result`.  The
@@ -10102,9 +10158,33 @@ impl CallControl {
     /// `Ok` unwrap, so a `Result<(), PyError>` callee reads `Void`.
     /// `None` when the target resolves to no registered graph (e.g. a
     /// residual extern with no graph body).
+    ///
+    /// A `__fn_const` FunctionPath makes `target_to_path` return `None`
+    /// (the const is a function-item value, not a graph key). The call
+    /// still inlines through `get_jitcode(target_to_call_path)`, so RESULT
+    /// is read from that stripped path — otherwise a front-derived `Ref`
+    /// dest for `is_w` (`bool`) emits `inline_call_*_r` against
+    /// `int_return`. When the graph has no `return_type` string, the
+    /// assembled `calldescr.result_type` is the same FUNC.RESULT.
     pub(crate) fn declared_result_type_for_target(&self, target: &CallTarget) -> Option<Type> {
-        let (_, graph) = self.target_to_path_and_graph(target)?;
-        self.declared_graph_result_type(&graph)
+        if let Some((_, graph)) = self.target_to_path_and_graph(target) {
+            if let Some(ty) = self.declared_graph_result_type(&graph) {
+                return Some(ty);
+            }
+            if let Some(ty) = Self::graph_cfg_result_type(&graph) {
+                return Some(ty);
+            }
+        }
+        let path = self.path_for_jitcode_lookup(target)?;
+        if let Some(graph) = self.function_graphs.get(&path) {
+            if let Some(ty) = self.declared_graph_result_type(&graph) {
+                return Some(ty);
+            }
+            if let Some(ty) = Self::graph_cfg_result_type(&graph) {
+                return Some(ty);
+            }
+        }
+        self.calldescr_result_type_for_path(&path)
     }
 
     /// Raw ADT returns have a coarse `ref` frontend token but an int-bank
@@ -14953,15 +15033,19 @@ pub fn effectinfo_from_writeanalyze(
             Some(extra) => {
                 for d in extra {
                     if let Some(ad) = d.as_array_descr() {
+                        // `cpu.arraydescrof(ARRAY)` identity
+                        // (`arraydescrof_concrete` / `array_identity_hash`).
+                        // `single_write_descr_array` is this descr
+                        // (`effectinfo.py`); `_optimize_CALL_ARRAYCOPY`
+                        // reads it.
+                        let array_id = ad.cache_key();
                         let ei = d.get_ei_index();
                         if ei != u32::MAX {
                             write_descrs_arrays.push(ei);
                         }
                         array_write_descrs.push((
                             d.clone(),
-                            Some(majit_ir::effectinfo::DescrSetMember::Array {
-                                array_id: ad.cache_key(),
-                            }),
+                            Some(majit_ir::effectinfo::DescrSetMember::Array { array_id }),
                         ));
                     }
                 }
@@ -17853,7 +17937,8 @@ mod tests {
         assert!(cc.immutable_array_types.contains("[*mut PyObject]"));
     }
     use crate::model::{
-        BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
+        BlockId, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType,
+        exception_exitcase,
     };
 
     /// `cachedgraph` stores the AccessDirect copy on the identity-qualified
@@ -18513,6 +18598,81 @@ mod tests {
         assert_eq!(layout.fields[1].name, "_not_send");
         assert_eq!(layout.fields[1].offset, 8);
         assert_eq!(layout.fields[1].size, 0);
+    }
+
+    /// `handle_regular_call` inlines a `__fn_const` callee through
+    /// `get_jitcode(target_to_call_path)`, but `target_to_path` is `None`
+    /// for that spelling. RESULT still has to be the stripped graph's
+    /// `bool` so `is_w` does not emit `inline_call_*_r`.
+    #[test]
+    fn declared_result_type_follows_fn_const_stripped_path() {
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("is_w");
+        graph.return_type = Some("bool".into());
+        cc.register_function_graph(
+            CallPath::from_segments(["pyre_object", "pyobject", "is_w"]),
+            graph,
+        );
+        let target = CallTarget::function_path([
+            crate::model::FN_CONST_HEAD,
+            "pyre_object",
+            "pyobject",
+            "is_w",
+        ]);
+        assert_eq!(
+            cc.declared_result_type_for_target(&target),
+            Some(Type::Int),
+            "fn_const-stripped is_w bool RESULT must be Int"
+        );
+        let direct = CallTarget::function_path(["pyre_object", "pyobject", "is_w"]);
+        assert_eq!(
+            cc.declared_result_type_for_target(&direct),
+            Some(Type::Int),
+            "the spelled path still reads the same bool RESULT"
+        );
+    }
+
+    /// Charon `name_path()` keeps the defining crate; harvest registration
+    /// is crate-stripped. Regular classification follows that funcobj
+    /// (`callable_graph_path`); FUNC.RESULT must follow it too, or
+    /// `setitem_str` emits `inline_call_r_r` against `is_w`'s `int_return`.
+    #[test]
+    fn declared_result_type_follows_crate_stripped_funcobj() {
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            let mut cc = CallControl::new();
+            let mut graph = FunctionGraph::new("is_w");
+            graph.return_type = Some("bool".into());
+            cc.register_function_graph(CallPath::from_segments(["pyobject", "is_w"]), graph);
+            let target = CallTarget::function_path(["pyre_object", "pyobject", "is_w"]);
+            assert_eq!(
+                cc.declared_result_type_for_target(&target),
+                Some(Type::Int),
+                "crate-qualified is_w must read the stripped funcobj bool RESULT"
+            );
+            assert_eq!(
+                cc.path_for_jitcode_lookup(&target)
+                    .map(|p| p.segments.clone()),
+                Some(vec!["pyobject".into(), "is_w".into()]),
+                "get_jitcode must reuse the stripped shell, not mint a spelled one"
+            );
+        });
+    }
+
+    /// The MIR driver leaves `graph.return_type` None on a look-inside
+    /// `bool` function. FUNC.RESULT is still the returnblock colour.
+    #[test]
+    fn declared_result_type_reads_returnblock_when_string_absent() {
+        let mut cc = CallControl::new();
+        let graph = FunctionGraph::new("is_w");
+        let ret = graph.block(graph.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&ret, crate::model::ConcreteType::Signed);
+        cc.register_function_graph(CallPath::from_segments(["pyobject", "is_w"]), graph);
+        let target = CallTarget::function_path(["pyobject", "is_w"]);
+        assert_eq!(
+            cc.declared_result_type_for_target(&target),
+            Some(Type::Int),
+            "Signed returnblock is bool/int FUNC.RESULT without a return_type string"
+        );
     }
 
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.

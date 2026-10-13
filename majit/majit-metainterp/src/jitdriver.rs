@@ -4509,6 +4509,33 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 }
                 TraceAction::CloseLoop => {
+                    if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
+                        let (ops, header_pc, close_pc, merge_pts, greens) = self
+                            .meta
+                            .trace_ctx()
+                            .map(|ctx| {
+                                (
+                                    ctx.num_ops(),
+                                    ctx.header_pc,
+                                    ctx.close_green_pc,
+                                    ctx.current_merge_points.len(),
+                                    ctx.green_key_values()
+                                        .map(|k| format!("{:?}", k.values))
+                                        .unwrap_or_else(|| "?".into()),
+                                )
+                            })
+                            .unwrap_or((0, 0, None, 0, "?".into()));
+                        eprintln!(
+                            "[jit] CloseLoop ops={} header_pc={} close_pc={:?} merge_pts={} greens={} bridge={} has_partial={}",
+                            ops,
+                            header_pc,
+                            close_pc,
+                            merge_pts,
+                            greens,
+                            self.meta.bridge_info().is_some(),
+                            self.meta.partial_trace().is_some(),
+                        );
+                    }
                     // Snapshot the walk-final (pc, reds) off the active TraceCtx
                     // BEFORE `compile_loop` (below) drains it, stashing onto the
                     // MetaInterp so the `__merge` wrapper can read it after the
@@ -5011,12 +5038,18 @@ impl<S: JitState> JitDriver<S> {
                                 return;
                             }
                         } else {
-                            // No targets: consume bridge_info, fall through to
-                            // compile_loop (pyjitpl.py). The resumekey
-                            // survives because upstream never clears it in this
-                            // region (pyjitpl.py); only the attempt latch
-                            // is set.
+                            // No targets: pyjitpl.py `reached_loop_header`
+                            // skips `compile_trace` and falls into the
+                            // merge-point scan. No prior same-greenkey entry
+                            // appends and the walk continues; a prior entry
+                            // falls through to compile_loop. Compiling a loop
+                            // on this first visit left the origin guard
+                            // unbridged (`recursive_call_frame_relocation`
+                            // tid=2).
                             crate::mc_diag_bump(51); // bridge_no_targets_close
+                            if self.keep_tracing_after_declined_jump(target_key, &live_arg_boxes) {
+                                continue;
+                            }
                             self.bridge_attempt_declined = true;
                         }
                     }
@@ -5138,6 +5171,34 @@ impl<S: JitState> JitDriver<S> {
                     jump_args,
                     loop_header_pc,
                 } => {
+                    if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
+                        let (ops, header_pc, close_pc, merge_pts, greens) = self
+                            .meta
+                            .trace_ctx()
+                            .map(|ctx| {
+                                (
+                                    ctx.num_ops(),
+                                    ctx.header_pc,
+                                    ctx.close_green_pc,
+                                    ctx.current_merge_points.len(),
+                                    ctx.green_key_values()
+                                        .map(|k| format!("{:?}", k.values))
+                                        .unwrap_or_else(|| "?".into()),
+                                )
+                            })
+                            .unwrap_or((0, 0, None, 0, "?".into()));
+                        eprintln!(
+                            "[jit] CloseLoopWithArgs loop_header_pc={:?} ops={} header_pc={} close_pc={:?} merge_pts={} greens={} bridge={} has_partial={}",
+                            loop_header_pc,
+                            ops,
+                            header_pc,
+                            close_pc,
+                            merge_pts,
+                            greens,
+                            self.meta.bridge_info().is_some(),
+                            self.meta.partial_trace().is_some(),
+                        );
+                    }
                     // recorder → compile edge (`MetaInterp.compile_loop`
                     // `live_arg_boxes`). `close_loop_live_values` still
                     // unpacks the recorder-namespace OpRef list.
@@ -5250,11 +5311,15 @@ impl<S: JitState> JitDriver<S> {
                                 }
                             }
                         } else {
-                            // No targets: consume bridge_info, fall through. The
-                            // resumekey survives because upstream never clears it
-                            // in this region (pyjitpl.py:2979-3060); only the
-                            // attempt latch is set.
+                            // No targets: pyjitpl.py `reached_loop_header`
+                            // skips `compile_trace` and falls into the
+                            // merge-point scan. No prior same-greenkey entry
+                            // appends and the walk continues; a prior entry
+                            // falls through to compile_loop.
                             crate::mc_diag_bump(51); // bridge_no_targets_close
+                            if self.keep_tracing_after_declined_jump(target_key, &jump_args) {
+                                continue;
+                            }
                             self.bridge_attempt_declined = true;
                         }
                     }

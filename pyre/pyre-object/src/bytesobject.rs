@@ -2,8 +2,8 @@
 //!
 //! PyPy equivalent: pypy/objspace/std/bytesobject.py W_BytesObject
 //!
-//! Immutable byte sequence. Shares the same internal layout as
-//! W_BytearrayObject but provides no mutation functions.
+//! Immutable byte sequence. The payload is a [`BytesBlock`], the same
+//! length-prefixed Char array a `bytearray` holds.
 
 use crate::lowlevel_string::{
     LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_STRING_CHARS_OFFSET, lowlevel_str_gc_type_id,
@@ -19,11 +19,10 @@ pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
     std::mem::offset_of!(W_BytesObjectUser, map),
 );
 
-/// GC-managed byte buffer behind a `bytearray` body.
+/// GC-managed leaf box for a `Vec<u8>` payload.
 ///
-/// The `Vec<u8>` is a leaf (no inner `PyObjectRef`s); its GC box carries only
-/// drop glue that reclaims the buffer on sweep.  `bytes` holds its payload
-/// inline instead, in a [`BytesBlock`].
+/// `bytes` and `bytearray` both hold a [`BytesBlock`]; this box remains
+/// registered for any leftover `Vec<u8>` storage allocation.
 pub type BytesDataStorage = Vec<u8>;
 
 /// Runtime-assigned GC type id for [`BytesDataStorage`]. Like the set-items
@@ -202,6 +201,58 @@ pub unsafe fn bytes_block_chars(block: *const BytesBlock) -> &'static [u8] {
     }
 }
 
+/// Mutable `chars` of a block. `block.length` is the allocated capacity.
+///
+/// # Safety
+/// `block` must name a live [`BytesBlock`].
+pub unsafe fn bytes_block_chars_mut(block: *mut BytesBlock) -> &'static mut [u8] {
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            (block as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET),
+            (*block).length,
+        )
+    }
+}
+
+/// [`try_alloc_bytes_block_zeroed`] that ends the process where its twin
+/// answers `None`.
+pub fn alloc_bytes_block_zeroed(len: usize) -> *mut BytesBlock {
+    try_alloc_bytes_block_zeroed(len)
+        .unwrap_or_else(|| std::alloc::handle_alloc_error(bytes_block_layout(len)))
+}
+
+/// Allocate a replacement [`BytesBlock`] of `new_cap` chars and copy
+/// `live_len` chars from `old`. The collector reclaims `old`.
+///
+/// # Safety
+/// `old` is null or a live block; `live_len` does not exceed its length.
+pub unsafe fn try_realloc_bytes_block(
+    old: *mut BytesBlock,
+    new_cap: usize,
+    live_len: usize,
+) -> Option<*mut BytesBlock> {
+    let _roots = crate::gc_roots::push_roots();
+    let old_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(old as PyObjectRef);
+    let new = try_alloc_bytes_block_zeroed(new_cap)?;
+    let new_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(new as PyObjectRef);
+    let old = crate::gc_roots::shadow_stack_get(old_slot) as *mut BytesBlock;
+    let new = crate::gc_roots::shadow_stack_get(new_slot) as *mut BytesBlock;
+    if !old.is_null() && live_len > 0 {
+        let n = live_len.min(new_cap);
+        let n = unsafe { n.min((*old).length) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (old as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET),
+                (new as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET),
+                n,
+            );
+        }
+    }
+    Some(new)
+}
+
 /// Python bytes object — immutable byte sequence.
 ///
 /// `W_BytesObject._value` is an RPython string (`rstr.py` `STR`);
@@ -323,7 +374,8 @@ impl crate::lltype::GcType for W_BytesObjectUser {
 /// to `malloc_typed`/`malloc_raw` when no GC hook is installed (unit tests).
 ///
 /// `dont_look_inside` (`rlib/jit.py`): the tracer cannot model the box
-/// allocation, so the JIT residualises the call.
+/// allocation, so the JIT residualises the call. The residual trampoline
+/// takes the host `&[u8]` as the `(ptr, len)` pair.
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     build_bytes(bytes.len(), alloc_bytes_block(bytes))
@@ -332,9 +384,7 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
 /// Word-ABI residual of [`w_bytes_from_bytes`] for a 1-byte payload.
 ///
 /// `space.newbytes(cdata[0])` (`ctypeprim.py W_CTypePrimitiveChar.convert_to_object`).
-/// `&[u8]` is two words, so the slice form residualizes as a symbolic hash
-/// on the `_CDataBase` call descent.  One `u8` is one word, the same
-/// seam as [`jit_w_bytes_from_u8x4`].
+/// One `u8` is one word, the same seam as [`jit_w_bytes_from_u8x4`].
 #[majit_macros::dont_look_inside]
 pub fn jit_w_bytes_from_u8(b0: u8) -> PyObjectRef {
     w_bytes_from_bytes(&[b0])
@@ -342,9 +392,7 @@ pub fn jit_w_bytes_from_u8(b0: u8) -> PyObjectRef {
 
 /// Word-ABI residual of [`w_bytes_from_bytes`] for a 4-byte payload.
 ///
-/// `&[u8]` is two words, so `ResidualSlot` rejects `w_bytes_from_bytes` and
-/// the walk would abort on a symbolic hash.  Four `u8` arguments are one
-/// word each.
+/// Four `u8` arguments are one word each.
 #[majit_macros::dont_look_inside]
 pub fn jit_w_bytes_from_u8x4(b0: u8, b1: u8, b2: u8, b3: u8) -> PyObjectRef {
     w_bytes_from_bytes(&[b0, b1, b2, b3])
@@ -478,6 +526,10 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
 }
 
 /// Allocate an empty bytes object.
+///
+/// `space.newbytes('')`: zero arguments is one residual slot.
+/// `dont_look_inside` keeps the slice form out of the graph.
+#[majit_macros::dont_look_inside]
 pub fn w_bytes_empty() -> PyObjectRef {
     w_bytes_from_bytes(&[])
 }

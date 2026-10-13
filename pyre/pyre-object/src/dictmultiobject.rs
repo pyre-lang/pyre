@@ -6074,10 +6074,11 @@ pub unsafe fn w_dict_nth_item_object_strategy(
 /// promised cannot raise.
 ///
 /// The object parameters are spelled `*mut PyObject` rather than
-/// [`PyObjectRef`]: `dont_look_inside` decides syntactically whether it can
-/// emit the `__majit_call_target_*` word-ABI trampoline, and an alias path is
-/// not a raw-pointer token, so the alias spelling silently yields no
-/// trampoline — which is what the wasm backend's `call_indirect` needs.
+/// [`PyObjectRef`]: `dont_look_inside_cannot_raise` decides syntactically
+/// whether it can emit the `__majit_call_target_*` word-ABI trampoline, and
+/// an alias path is not a raw-pointer token, so the alias spelling silently
+/// yields no trampoline — which is what the wasm backend's `call_indirect`
+/// needs.
 ///
 /// The table read holds the dict's own lock, like every other reader of
 /// `dstorage`, so a concurrent `setitem` cannot resize the `IndexMap` under the
@@ -6090,7 +6091,7 @@ pub unsafe fn w_dict_nth_item_object_strategy(
 /// `w_dict` must be a live `W_DictObject` on a strategy whose storage is an
 /// `ObjectDictStorage`, and `hash` the digest `object_key_for` produces for
 /// `w_key`.
-#[majit_macros::dont_look_inside]
+#[majit_macros::dont_look_inside_cannot_raise]
 pub unsafe fn w_dict_unicode_lookup_index(
     w_dict: *mut PyObject,
     w_key: *mut PyObject,

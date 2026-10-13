@@ -491,7 +491,7 @@ impl<'a> Lowering<'a> {
         if !add_dest_used_only_as_single_read_deref(self.llbc, self.body, dest_local) {
             return Ok(false);
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -2807,7 +2807,7 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|ty| tyref_is_ptr_to_int_cast_origin(ty, self.llbc));
                     if src_is_ptr_to_int_origin {
                         let dest_int = int_cast_size_and_sign(dest_ty, self.llbc);
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         if dest_int.is_some_and(|(_, unsigned)| unsigned) {
                             let (retype, result) =
                                 push_ptr_to_unsigned_cast(&mut self.graph, bb_id, arg);
@@ -3838,6 +3838,22 @@ impl<'a> Lowering<'a> {
                         self.niche_disc_vars.insert(base.id());
                         return Ok((None, base));
                     }
+                }
+                // After `result_exc` a `Result<&[T], PyError>` residual is
+                // the pair; Err already raised, so the tag is always Ok.
+                if let PlaceKind::Local(i) = &place.kind
+                    && self
+                        .len_shadow
+                        .get(*i as usize)
+                        .copied()
+                        .flatten()
+                        .is_some()
+                    && self.result_pair_slice_kind(&place.ty).is_some()
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    return Ok((Some(OpKind::ConstInt(0)), res));
                 }
                 // The `Option<&T>` a pair-slice `get` yields is the item's
                 // address, 0 for `None`.
@@ -6540,6 +6556,15 @@ impl<'a> Lowering<'a> {
             };
             let item_ty = self.with_item_class_root(item_ty, &place_ty);
             let zero = self.emit_const_uint(mir_bb, 0);
+            if self.item_addr_elem_is_u8(opt as usize) {
+                let item = self.emit_u8_raw_load(mir_bb, addr, zero);
+                return Ok(self.retype_word(
+                    mir_bb,
+                    item,
+                    &ValueType::Unsigned,
+                    &u8_pair_item_ty(&item_ty),
+                ));
+            }
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -6570,6 +6595,15 @@ impl<'a> Lowering<'a> {
                 offset
             };
             let item_ty = self.with_item_class_root(self.value_type_of(&place_ty), &place_ty);
+            if tyref_slice_elem_is_u8(&slice.ty, self.llbc) {
+                let item = self.emit_u8_raw_load(mir_bb, ptr, index);
+                return Ok(self.retype_word(
+                    mir_bb,
+                    item,
+                    &ValueType::Unsigned,
+                    &u8_pair_item_ty(&item_ty),
+                ));
+            }
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -6601,11 +6635,14 @@ impl<'a> Lowering<'a> {
                 // A window's one-word consumer sees the `CCHARP` data
                 // word; the length stays in the shadow (`link_word`).
                 // A fat `&dyn Trait` pair's one-word consumer sees the
-                // data word the same way. Word-sized pair slices still
-                // refuse a one-word read.
+                // data word the same way. `Result<&[T], E>` local 0 is
+                // the same shape. Word-sized pair slices still refuse a
+                // one-word read.
                 let local = i as usize;
                 if self.body.locals.locals.get(local).is_some_and(|loc| {
-                    tyref_is_u8_window(&loc.ty, self.llbc) || tyref_is_fat_dyn(&loc.ty, self.llbc)
+                    tyref_is_u8_window(&loc.ty, self.llbc)
+                        || tyref_is_fat_dyn(&loc.ty, self.llbc)
+                        || self.result_pair_slice_kind(&loc.ty).is_some()
                 }) {
                     Ok(self.local_var[local]
                         .as_ref()
@@ -6653,6 +6690,18 @@ impl<'a> Lowering<'a> {
                     helper_ty.clone(),
                 );
                 Ok(self.retype_word(mir_bb, item, &helper_ty, &value_ty))
+            }
+            PlaceKind::Local(i)
+                if matches!(
+                    self.local_var
+                        .get(i as usize)
+                        .and_then(|slot| slot.as_ref()),
+                    Some(LocalValue::ItemAddr(_))
+                ) && self.option_pair_item(i as usize).is_some() =>
+            {
+                // Niche `Option<&T>`: the Option is the item address, 0
+                // for `None`. `Try::branch` / a copy reads that word.
+                self.item_addr_var(mir_bb, i as usize)
             }
             PlaceKind::Local(i)
                 if matches!(
@@ -7773,6 +7822,15 @@ impl<'a> Lowering<'a> {
                     {
                         let addr = self.item_addr_var(mir_bb, local)?;
                         let index = self.emit_const_uint(mir_bb, 0);
+                        if self.item_addr_elem_is_u8(local) {
+                            let item = self.emit_u8_raw_load(mir_bb, addr, index);
+                            return Ok(self.retype_word(
+                                mir_bb,
+                                item,
+                                &ValueType::Unsigned,
+                                &u8_pair_item_ty(&item_ty),
+                            ));
+                        }
                         let helper_ty = Self::pair_helper_item_ty(kind);
                         let item = self.emit_path_call(
                             mir_bb,

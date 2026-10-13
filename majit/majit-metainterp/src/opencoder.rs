@@ -4681,6 +4681,29 @@ mod tests {
         assert_eq!(buf._refs.len(), refs_len);
     }
 
+    /// `_encode(AbstractResOp)` tags `get_position()` as TAGBOX.
+    /// `OpRef::NONE.raw()` is `u32::MAX`; the tagged word sits outside
+    /// `[MIN_VALUE, MAX_VALUE]` and `append_int` trips `tag_overflow`.
+    /// RPython `_encode` never sees a None box (`assert False`).
+    #[test]
+    fn encode_none_resop_trips_tag_overflow() {
+        let mut buf = TraceRecordBuffer::new(0, empty_sd());
+        let tagged = buf._encode(Box::ResOp(u32::MAX));
+        assert!(
+            !(MIN_VALUE..=MAX_VALUE).contains(&tagged),
+            "TAGBOX(u32::MAX) must sit outside the append_int range, got {tagged}"
+        );
+        buf.append_int(tagged);
+        assert!(
+            buf.tag_overflow,
+            "append_int of TAGBOX(u32::MAX) must trip tag_overflow"
+        );
+        assert_eq!(
+            buf.tracing_done(),
+            Err(crate::pyjitpl::AbortReason::TooLong)
+        );
+    }
+
     /// Phase B11: an `append_int` outside [MIN_VALUE, MAX_VALUE] trips
     /// `tag_overflow`, which `tracing_done()` reports as
     /// `AbortReason::TooLong` — mirroring
